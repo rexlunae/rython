@@ -353,6 +353,13 @@ impl CodeGen for Module {
             let roots = crate::ast::tree::hierarchy::compute_roots(&items, &options);
             crate::ast::tree::hierarchy::install_roots(&roots);
             options.hierarchy_roots = std::rc::Rc::new(roots);
+            // The shared classes (shared.rs): container-stored and mutated
+            // after construction anywhere in the crate — one object behind
+            // `PyRef` wherever held. Needs the roots (family closure).
+            let shared =
+                crate::ast::tree::shared::compute_shared(&self.raw.body, &items, &options);
+            crate::ast::tree::shared::install_shared(&shared);
+            options.shared_classes = std::rc::Rc::new(shared);
         }
 
         // Functions whose unannotated parameter is isinstance-dispatched

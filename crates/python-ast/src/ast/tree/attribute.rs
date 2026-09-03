@@ -136,6 +136,9 @@ impl<'a> CodeGen for Attribute {
         // `dog.name` where `dog` is a derived-class instance, must reach
         // through the embedded base structs (or the trait's base accessors).
         let field_access = class_field_access(&self.value, &self.attr, &ctx, &symbols, &options);
+        // Computed before `ctx`/`symbols`/`options` move into the receiver's
+        // rendering: whether the receiver is a SHARED class's value.
+        let shared_recv = shared_receiver(&self.value, &ctx, &symbols, &options);
         // A Rust-module attribute (`crc32c.crc32c` where `crc32c` was
         // `import`ed from a rython.toml binding) is a path into the bound
         // crate — never a field access. The crate name comes from the spec
@@ -622,6 +625,11 @@ impl<'a> CodeGen for Attribute {
                 return Ok(quote!(#value_tokens.#attr()?));
             }
             match field_access {
+                // A SHARED class's value is a `PyRef` (shared.rs): a read
+                // borrows the one object and clones the field out.
+                None if shared_recv => {
+                    Ok(quote!((#value_tokens).borrow().#attr.clone()))
+                }
                 None => Ok(quote!(#value_tokens.#attr)),
                 Some(FieldRewrite::Accessor { field }) => {
                     let accessor = crate::safe_ident(&field);
@@ -746,6 +754,13 @@ pub(crate) fn to_rust_place_expr(
                 class_field_access(&attr.value, &attr.attr, ctx, symbols, options);
             let attr_ident = crate::safe_ident(&attr.attr);
             match field_access {
+                // A SHARED class's value is a `PyRef` (shared.rs): the
+                // store borrows the one object mutably (the assigned
+                // value is evaluated before the place, so a read of the
+                // same object in it has released its borrow).
+                None if shared_receiver(&attr.value, ctx, symbols, options) => {
+                    Ok(quote!((#recv_place).borrow_mut().#attr_ident))
+                }
                 None => Ok(quote!(#recv_place.#attr_ident)),
                 Some(FieldRewrite::Accessor { field }) => {
                     let accessor = crate::safe_ident(&format!("{}_mut", field));
@@ -913,6 +928,41 @@ pub(crate) fn class_field_access(
     } else {
         Some(FieldRewrite::Chain { depth })
     }
+}
+
+/// Whether `value` is a non-`self` receiver whose class is SHARED and not
+/// a polymorphic root (a root's sum type reaches its fields through the
+/// accessors, which borrow inside): its field reads and stores go through
+/// the `PyRef` borrow (shared.rs).
+pub(crate) fn shared_receiver(
+    value: &ExprType,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    if matches!(value, ExprType::Name(n) if n.id == "self") {
+        return false;
+    }
+    let class = match crate::receiver_class_for_read(value, ctx, symbols, options) {
+        Some((c, _)) => c.name,
+        None => {
+            let typed = match value {
+                ExprType::Name(n) => options.name_types.get(&n.id).cloned(),
+                _ => None,
+            }
+            .unwrap_or_else(|| crate::infer_type(Some(ctx), value, options, symbols));
+            match typed {
+                crate::TypeInfo::Class(c) => c,
+                crate::TypeInfo::Option(inner) => match *inner {
+                    crate::TypeInfo::Class(c) => c,
+                    _ => return false,
+                },
+                _ => return false,
+            }
+        }
+    };
+    crate::ast::tree::shared::is_shared(&class)
+        && !crate::ast::tree::hierarchy::is_polymorphic_root(&class)
 }
 
 #[derive(Clone, Debug)]

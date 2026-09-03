@@ -369,3 +369,52 @@ pub fn split_fn(
     }
     Some((attrs, head, name, names))
 }
+
+/// Whether a rendered `fn` head takes `&mut self`.
+pub fn head_takes_mut_self(head: &proc_macro2::TokenStream) -> bool {
+    use proc_macro2::{Delimiter, TokenTree};
+    for tt in head.clone() {
+        if let TokenTree::Group(g) = tt
+            && g.delimiter() == Delimiter::Parenthesis
+        {
+            let toks: Vec<TokenTree> = g.stream().into_iter().collect();
+            return toks.windows(2).any(|w| {
+                matches!(&w[0], TokenTree::Ident(i) if i == "mut")
+                    && matches!(&w[1], TokenTree::Ident(i) if i == "self")
+            });
+        }
+    }
+    false
+}
+
+/// The head with a `&mut self` receiver made `&self` (a shared family's
+/// sum type mutates through the borrow).
+pub fn head_with_shared_self(head: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    use proc_macro2::{Delimiter, Group, TokenTree};
+    let mut out = Vec::new();
+    for tt in head.clone() {
+        match tt {
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis => {
+                let toks: Vec<TokenTree> = g.stream().into_iter().collect();
+                let mut inner = Vec::new();
+                let mut i = 0;
+                while i < toks.len() {
+                    if i + 1 < toks.len()
+                        && matches!(&toks[i], TokenTree::Ident(id) if id == "mut")
+                        && matches!(&toks[i + 1], TokenTree::Ident(id) if id == "self")
+                    {
+                        i += 1;
+                        continue;
+                    }
+                    inner.push(toks[i].clone());
+                    i += 1;
+                }
+                let mut ng = Group::new(Delimiter::Parenthesis, inner.into_iter().collect());
+                ng.set_span(g.span());
+                out.push(TokenTree::Group(ng));
+            }
+            other => out.push(other),
+        }
+    }
+    out.into_iter().collect()
+}

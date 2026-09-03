@@ -14700,12 +14700,14 @@ fn sorted_over_class_valued_pairs_sorts_by_key_with_cpython_tie_panic() {
 }
 
 #[test]
-fn mutation_through_a_fetch_local_writes_back_to_the_container() {
-    // Round 99 (Directive 4's borrowed-accessor increment):
-    // `item = self.items.get(name)` then `item.qty -= qty` — the local is
-    // a VIEW of the container slot in CPython, so the mutation must reach
-    // it: the lowering writes back (mutate a copy, store the slot, rebind
-    // the local) instead of the silent-loss form.
+fn a_container_stored_mutated_class_is_shared_and_a_fetch_local_mutates_the_one_object() {
+    // The aliasing representation (issue #137, drift 1): `Item` is stored
+    // in a container (`dict[str, Item]`) and mutated after construction
+    // (`item.qty -= qty` through a non-self receiver), so it is SHARED —
+    // its slot type is `PyRef<Item>`, the fetched local is another
+    // reference to the stored object, and the mutation borrows it
+    // mutably. No write-back, no `&mut self` for the method that only
+    // mutates the shared object.
     let out = compile(
         concat!(
             "class Item:\n",
@@ -14722,60 +14724,68 @@ fn mutation_through_a_fetch_local_writes_back_to_the_container() {
             "        item.qty -= qty\n",
             "        return item.qty\n",
         ),
-        "writeback.py",
+        "shared.py",
     );
+    let flat: String = out.split_whitespace().collect();
     assert!(
-        out.contains("py_set_index"),
-        "the mutation must write back to the container slot: {}",
+        flat.contains("PyDict<String,stdpython::PyRef<Item>>"),
+        "the container holds references to the shared class: {}",
         out
     );
     assert!(
-        out.contains("__rython_v . qty = (__rython_v . qty) . py_sub")
-            || out.contains("__rython_v.qty = (__rython_v.qty).py_sub"),
-        "the mutation applies to the copy, then the slot stores it: {}",
+        flat.contains(").borrow_mut().qty-=qty") && flat.contains(").borrow().qty.clone()"),
+        "the mutation borrows the one object mutably, reading through a shared borrow: {}",
         out
     );
     assert!(
-        out.contains("fn take (& mut self") || out.contains("fn take(&mut self"),
-        "the write-back needs &mut self: {}",
+        !out.contains("py_set_index"),
+        "no write-back: the local IS the stored object: {}",
+        out
+    );
+    assert!(
+        flat.contains("fntake(&self"),
+        "mutating the shared object needs no &mut self: {}",
         out
     );
 }
 
 #[test]
-fn mutation_through_a_one_hop_fetch_method_writes_back() {
-    // The idiom corpus's take: the fetch goes through a METHOD
-    // (`self.find(name)` whose body is a single
-    // `return self.items.get(name)`) — the provenance resolves the hop
-    // and the write-back still fires (the loud aliasing error is gone).
+fn a_mutating_method_call_through_a_fetch_local_reaches_the_shared_object() {
+    // The shape the write-back could never reach (the four-drift
+    // evaluation): a MUTATING METHOD CALL on the fetched local. With the
+    // shared representation the call borrows the one object mutably;
+    // the fetch may go through a method (`find`).
     let out = compile(
         concat!(
             "class Item:\n",
             "    def __init__(self) -> None:\n",
             "        self.qty: int = 0\n",
+            "    def restock(self, n: int) -> None:\n",
+            "        self.qty += n\n",
             "\n",
             "class Bag:\n",
             "    def __init__(self) -> None:\n",
             "        self.items: dict[str, Item] = {}\n",
             "    def find(self, name: str) -> Item | None:\n",
             "        return self.items.get(name)\n",
-            "    def take(self, name: str, qty: int) -> int:\n",
+            "    def refill(self, name: str) -> int:\n",
             "        item = self.find(name)\n",
             "        if item is None:\n",
             "            raise KeyError(name)\n",
-            "        item.qty -= qty\n",
+            "        item.restock(3)\n",
             "        return item.qty\n",
         ),
-        "onehop.py",
+        "sharedcall.py",
     );
+    let flat: String = out.split_whitespace().collect();
     assert!(
-        out.contains("py_set_index"),
-        "the one-hop fetch resolves to the container slot: {}",
+        flat.contains(".borrow_mut()).restock(3)?"),
+        "the mutating call borrows the one object mutably: {}",
         out
     );
     assert!(
-        !out.contains("the derived class overrides"),
-        "no loud error: {}",
+        flat.contains("PyRef::new(Item::new()?)") || !out.contains("Item :: new ()"),
+        "a construction of a shared class is a reference: {}",
         out
     );
 }
@@ -17252,6 +17262,144 @@ fn an_aliased_imported_constructor_result_is_a_method_receiver() {
     assert!(
         out.contains(". area () ?"),
         "the aliased class's method call propagates: {}",
+        out
+    );
+}
+
+/// A shared class constructs behind `PyRef`, its slot type is `PyRef<C>`,
+/// a loop variable over a container of it borrows for a field read, a
+/// field store through it borrows mutably, and a subscript into the
+/// container is a receiver for its methods (issue #137, drift 1).
+#[test]
+fn a_shared_class_is_a_reference_everywhere_it_is_held() {
+    let out = compile(
+        concat!(
+            "class Account:\n",
+            "    def __init__(self, balance: int) -> None:\n",
+            "        self.balance = balance\n",
+            "    def deposit(self, n: int) -> None:\n",
+            "        self.balance += n\n",
+            "\n",
+            "class Bank:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.accounts: dict[str, Account] = {}\n",
+            "        self.audit: list[Account] = []\n",
+            "    def open(self, owner: str) -> Account:\n",
+            "        acct = Account(0)\n",
+            "        self.accounts[owner] = acct\n",
+            "        self.audit.append(acct)\n",
+            "        return acct\n",
+            "    def pay(self, owner: str) -> None:\n",
+            "        self.accounts[owner].deposit(5)\n",
+            "    def total(self) -> int:\n",
+            "        t = 0\n",
+            "        for a in self.audit:\n",
+            "            t += a.balance\n",
+            "        return t\n",
+            "\n",
+            "def main() -> None:\n",
+            "    bank = Bank()\n",
+            "    first = bank.open(\"x\")\n",
+            "    first.balance = 1\n",
+        ),
+        "sharedref.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(flat.contains("PyRef::new(Account::new(0)?)"), "construction is a reference: {}", out);
+    assert!(
+        flat.contains("PyDict<String,stdpython::PyRef<Account>>")
+            && flat.contains("Vec<stdpython::PyRef<Account>>"),
+        "containers hold references: {}",
+        out
+    );
+    assert!(
+        flat.contains("(self.audit).push(Clone::clone(&(acct)))"),
+        "a reference appended and read again is cloned: {}",
+        out
+    );
+    assert!(
+        flat.contains(").borrow_mut()).deposit(5)?"),
+        "a subscript into the container is a receiver that borrows mutably: {}",
+        out
+    );
+    assert!(
+        flat.contains("(a).borrow().balance.clone()"),
+        "a loop variable's field read borrows: {}",
+        out
+    );
+    assert!(
+        flat.contains("(first).borrow_mut().balance=1"),
+        "a field store through a fetched reference borrows mutably: {}",
+        out
+    );
+    assert!(
+        !out.contains("fn open (& mut self") || flat.contains("fnopen(&mutself"),
+        "{}",
+        out
+    );
+}
+
+/// A shared HIERARCHY family: the root's sum type holds `PyRef` variants,
+/// its accessors borrow, its `f_mut` is a mapped `RefMut`, and its
+/// delegators borrow — mutably when the method mutates — while taking
+/// `&self` (interior mutability). A subtree struct converts into it.
+#[test]
+fn a_shared_family_sum_type_holds_references_and_borrows_in_its_delegators() {
+    let out = compile(
+        concat!(
+            "class Item:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.qty: int = 0\n",
+            "    def restock(self, n: int) -> None:\n",
+            "        self.qty += n\n",
+            "    def label(self) -> str:\n",
+            "        return \"x\"\n",
+            "\n",
+            "class Perishable(Item):\n",
+            "    def label(self) -> str:\n",
+            "        return \"p\"\n",
+            "\n",
+            "class Bag:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items: dict[str, Item] = {}\n",
+            "    def add(self, name: str, item: Item) -> None:\n",
+            "        self.items[name] = item\n",
+            "    def refill(self, name: str) -> None:\n",
+            "        item = self.items.get(name)\n",
+            "        if item is None:\n",
+            "            raise KeyError(name)\n",
+            "        item.restock(3)\n",
+            "\n",
+            "def main() -> None:\n",
+            "    bag = Bag()\n",
+            "    bag.add(\"a\", Perishable())\n",
+        ),
+        "sharedfamily.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("pubenumAnyItem{Item(stdpython::PyRef<Item>),Perishable(stdpython::PyRef<Perishable>)}"),
+        "the family's sum type holds references: {}",
+        out
+    );
+    assert!(
+        flat.contains("pubfnqty_mut(&self)->core::cell::RefMut<'_,i64>"),
+        "the mutable accessor maps the borrow: {}",
+        out
+    );
+    assert!(
+        flat.contains("AnyItem::Item(v)=><ItemasItemTrait>::restock(&mut*v.borrow_mut(),n)"),
+        "a mutating delegator borrows mutably through the definer's trait: {}",
+        out
+    );
+    assert!(
+        flat.contains("pubfnrestock(&self,n:i64)"),
+        "the sum type's delegator takes &self: {}",
+        out
+    );
+    assert!(
+        flat.contains("PyRef::new(Perishable::new()?)}).into()"),
+        "a subtree construction converts into the sum type: {}",
         out
     );
 }

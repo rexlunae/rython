@@ -241,6 +241,11 @@ impl TypeInfo {
                 if crate::ast::tree::hierarchy::is_polymorphic_root(name) {
                     let any = crate::ast::tree::hierarchy::any_ident(name);
                     quote!(#any)
+                } else if crate::ast::tree::shared::is_shared(name) {
+                    // A SHARED class's instances are one object behind
+                    // `PyRef` wherever held (shared.rs).
+                    let ident = crate::safe_ident(name);
+                    quote!(stdpython::PyRef<#ident>)
                 } else {
                     let ident = crate::safe_ident(name);
                     quote!(#ident)
@@ -843,13 +848,14 @@ fn infer_type_inner(
         // context, no class) falls through to the PyObject arm below —
         // exactly the pre-ctx behavior (round 99).
         ExprType::Attribute(attr) => {
-            if let Some(ctx) = ctx
-                && let ExprType::Name(recv) = attr.value.as_ref()
-                && (recv.id == "self"
+            // `self` needs the class context; a class-typed NAME (a local
+            // or parameter the analysis typed) resolves in any context.
+            if let ExprType::Name(recv) = attr.value.as_ref()
+                && ((recv.id == "self" && ctx.is_some())
                     || matches!(options.name_types.get(&recv.id), Some(TypeInfo::Class(_))))
             {
                 let class_name = if recv.id == "self" {
-                    ctx.enclosing_class_name().map(str::to_string)
+                    ctx.and_then(|c| c.enclosing_class_name()).map(str::to_string)
                 } else if let Some(TypeInfo::Class(cname)) = options.name_types.get(&recv.id) {
                     Some(cname.clone())
                 } else {

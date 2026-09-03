@@ -5135,6 +5135,17 @@ impl<'a> CodeGen for Call {
                                 }
                             }
                         };
+                        // A SHARED class (shared.rs) constructs behind
+                        // `PyRef`; a shared ROOT's value is its sum type
+                        // holding the reference.
+                        if crate::ast::tree::shared::is_shared(&class.name) {
+                            let shared = quote!(stdpython::PyRef::new(#cname::new(#(#args),*)?));
+                            if crate::ast::tree::hierarchy::is_polymorphic_root(&class.name) {
+                                let any = crate::ast::tree::hierarchy::any_ident(&class.name);
+                                return Ok(quote!({ #prelude #any::from(#shared) }));
+                            }
+                            return Ok(quote!({ #prelude #shared }));
+                        }
                         return Ok(quote!({ #prelude #cname::new(#(#args),*)? }));
                     }
                     None => {
@@ -5804,7 +5815,10 @@ impl<'a> CodeGen for Call {
                         )
                     {
                         let mname = attr.attr.clone();
-                        if mutates_receiver {
+                        // A SHARED class mutates through the borrow: the
+                        // Option unwrap clones the reference either way.
+                        let shared = crate::ast::tree::shared::is_shared(&class.name);
+                        if mutates_receiver && !shared {
                             quote!((#receiver).as_mut().unwrap_or_else(|| {
                                 panic!(
                                     "AttributeError: 'NoneType' object has no attribute '{}'",
@@ -5818,6 +5832,23 @@ impl<'a> CodeGen for Call {
                                     #mname
                                 )
                             }))
+                        }
+                    } else {
+                        receiver
+                    };
+                    // A SHARED class's value is a `PyRef` (shared.rs): the
+                    // call borrows the one object — mutably when the
+                    // method mutates. `self` inside the class is the
+                    // struct itself; a shared ROOT's sum type borrows in
+                    // its delegators.
+                    let receiver = if crate::ast::tree::shared::is_shared(&class.name)
+                        && !crate::ast::tree::hierarchy::is_polymorphic_root(&class.name)
+                        && !matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self")
+                    {
+                        if mutates_receiver {
+                            quote!((#receiver).borrow_mut())
+                        } else {
+                            quote!((#receiver).borrow())
                         }
                     } else {
                         receiver
@@ -6272,11 +6303,19 @@ impl<'a> CodeGen for Call {
             } else {
                 let mut rendered_args = Vec::new();
                 for arg in &self.args {
-                    rendered_args.push(arg.clone().to_rust(
-                        ctx.clone(),
-                        options.clone(),
-                        symbols.clone(),
-                    )?);
+                    // A SHARED class's reference stored into a container
+                    // (`self.audit.append(acct)`) and read again later is
+                    // another reference to the one object: clone it.
+                    let shared_name_reused = matches!(arg, ExprType::Name(n)
+                        if options.use_counts.get(&n.id).copied().unwrap_or(0) > 1
+                            && matches!(options.name_types.get(&n.id),
+                                Some(crate::TypeInfo::Class(c)) if crate::ast::tree::shared::is_shared(c)));
+                    let rendered = arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    rendered_args.push(if shared_name_reused {
+                        quote!(Clone::clone(&(#rendered)))
+                    } else {
+                        rendered
+                    });
                 }
                 match (attr.attr.as_str(), rendered_args.as_slice()) {
                     // list.append(x) pushes one element; Vec::append (inherent)
@@ -8776,27 +8815,37 @@ pub(crate) fn receiver_class(
             let base = class.base_class(symbols)?;
             return Some((base, symbols.clone()));
         }
-        ExprType::Name(n) => match symbols.get(&n.id) {
+        ExprType::Name(n) => {
             // A local bound to a call (`c = make()`, `c = Counter()`): the
             // class the call produces, through the one authority below.
-            Some(SymbolTableNode::Assign {
-                value: ExprType::Call(call),
-                ..
-            }) => match call.func.as_ref() {
-                ExprType::Name(_) => named_call_class(call, symbols, options)?,
-                _ => return None,
-            },
-            // A TYPED PARAMETER receiver (`def f(c: C): return c.x` — the
-            // annotation resolves the class, so property reads/setter
-            // stores on the parameter route correctly). The class name is
-            // in name_types as TypeInfo::Class.
-            _ => match options.name_types.get(&n.id) {
-                Some(crate::TypeInfo::Class(cname)) => {
-                    (cname.clone(), symbols.clone())
-                }
-                _ => return None,
-            },
-        },
+            let named = match symbols.get(&n.id) {
+                Some(SymbolTableNode::Assign {
+                    value: ExprType::Call(call),
+                    ..
+                }) => match call.func.as_ref() {
+                    ExprType::Name(_) => named_call_class(call, symbols, options),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match named {
+                Some(resolved) => resolved,
+                // Otherwise the analysis's recorded type is the receiver's
+                // class: a TYPED PARAMETER (`def f(c: C): return c.x`), or
+                // a local fetched from a container (`item = self.items.get(
+                // name)` — `Item | None`, narrowed by its guard), so a
+                // method call on it is the user-method call with its `?`
+                // and, for a SHARED class, the borrow.
+                None => match options.name_types.get(&n.id) {
+                    Some(crate::TypeInfo::Class(cname)) => (cname.clone(), symbols.clone()),
+                    Some(crate::TypeInfo::Option(inner)) => match inner.as_ref() {
+                        crate::TypeInfo::Class(cname) => (cname.clone(), symbols.clone()),
+                        _ => return None,
+                    },
+                    _ => return None,
+                },
+            }
+        }
         // Composition: `self.field.method()` resolves through the owner
         // class's field types. `field_class` yields the field's class
         // NAME, resolved to its ClassDef below.
@@ -8853,7 +8902,18 @@ pub(crate) fn receiver_class(
             }
             _ => return None,
         },
-        _ => return None,
+        // Any other receiver the inferrer types as a class (a subscript
+        // into a container of a class — `self.accounts[src].withdraw(n)`,
+        // the idiom corpus's bank — or an Option of one): the one type
+        // authority resolves it.
+        other => match crate::infer_type(Some(ctx), other, options, symbols) {
+            crate::TypeInfo::Class(cname) => (cname, symbols.clone()),
+            crate::TypeInfo::Option(inner) => match *inner {
+                crate::TypeInfo::Class(cname) => (cname, symbols.clone()),
+                _ => return None,
+            },
+            _ => return None,
+        },
     };
     receiver_class_tail(&class_name, class_symbols, options)
 }
