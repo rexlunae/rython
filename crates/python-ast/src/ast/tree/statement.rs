@@ -695,9 +695,14 @@ impl CodeGen for StatementType {
                 // local like `returned_chunk` in a `-> bytes` fn: map the
                 // conversion, and the None case is a LOUD panic — Python
                 // would fail at use on a None chunk, §12.2).
-                let value_infers_pyvalue_in_typed_return = options
-                    .fn_return_typed
-                    .is_some()
+                // A ROOT-typed return has no `From<PyValue>`: a boxed
+                // value returned there stays as is (loud E0308), so the
+                // conversion below is for the primitive returns only.
+                let typed_primitive_return = matches!(
+                    options.fn_return_typed,
+                    Some(ref t) if !matches!(t, crate::TypeInfo::Class(_))
+                );
+                let value_infers_pyvalue_in_typed_return = typed_primitive_return
                     && (matches!(
                         crate::ast::tree::type_ctx::infer_type(None, 
                             &e.value,
@@ -720,9 +725,7 @@ impl CodeGen for StatementType {
                     || matches!(&e.value, ExprType::Name(n)
                         if name_binds_dropped_call(&n.id, &symbols, &options, &ctx)
                             && !options.optional_names.contains(&n.id)));
-                let value_infers_option_pyvalue_in_typed_return = options
-                    .fn_return_typed
-                    .is_some()
+                let value_infers_option_pyvalue_in_typed_return = typed_primitive_return
                     && (matches!(
                         crate::ast::tree::type_ctx::infer_type(None, 
                             &e.value,
