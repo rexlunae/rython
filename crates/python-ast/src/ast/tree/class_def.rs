@@ -5949,12 +5949,28 @@ impl ClassDef {
                     ),
                     None => fty.to_rust_type(),
                 };
+                // A cross-module ancestor's accessors live on ITS trait,
+                // which this module need not import: trait-qualified.
+                let (get_arms, set_arms): (Vec<TokenStream>, Vec<TokenStream>) = vnames
+                    .iter()
+                    .zip(vpaths.iter())
+                    .map(|(vn, vp)| match a_path {
+                        Some(_) => (
+                            quote!(#any::#vn(v) => <#vp as #trait_path>::#f(v)),
+                            quote!(#any::#vn(v) => <#vp as #trait_path>::#f_mut(v)),
+                        ),
+                        None => (
+                            quote!(#any::#vn(v) => v.#f()),
+                            quote!(#any::#vn(v) => v.#f_mut()),
+                        ),
+                    })
+                    .unzip();
                 inherent.extend(quote! {
                     pub fn #f(&self) -> #ty {
-                        match self { #(#any::#vnames(v) => v.#f()),* }
+                        match self { #(#get_arms),* }
                     }
                     pub fn #f_mut(&mut self) -> &mut #ty {
-                        match self { #(#any::#vnames(v) => v.#f_mut()),* }
+                        match self { #(#set_arms),* }
                     }
                 });
                 fwd.extend(quote! {

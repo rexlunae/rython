@@ -17182,5 +17182,62 @@ fn a_list_of_a_root_holds_the_sum_type_and_its_elements_convert() {
         "the sum type carries the runtime traits: {}",
         out
     );
+}
         flat.contains("matchself{AnyItem::Item(v)=><ItemasItemTrait>::label(v),AnyItem::Perishable(v)=><PerishableasItemTrait>::label(v)}"),
         "every method of the root's MRO dispatches by match to the variant's implementation of the definer's trait (an override re-emitted there wins, as Python's dynamic dispatch does): {}",
+
+/// A field read on a root-typed receiver whose class this module imports
+/// only under `TYPE_CHECKING` (urllib3's retry.py reading
+/// `response.status` on a `BaseHTTPResponse | None`): the sum type has
+/// no fields, so the read must take the accessor form, resolving the
+/// root through the hierarchy registry.
+#[test]
+fn a_field_read_on_a_type_checking_imported_root_takes_the_accessor_form() {
+    let response = parse(
+        concat!(
+            "class Base:\n",
+            "    def __init__(self, status: int) -> None:\n",
+            "        self.status = status\n",
+            "\n",
+            "class Derived(Base):\n",
+            "    pass\n",
+        ),
+        "response.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(
+        vec!["pkg".to_string(), "response".to_string()],
+        std::rc::Rc::new(response),
+    );
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        module_path: vec!["pkg".to_string()],
+        this_module_path: vec!["pkg".to_string(), "retry".to_string()],
+        ..Default::default()
+    };
+    let usemod = parse(
+        concat!(
+            "import typing\n",
+            "if typing.TYPE_CHECKING:\n",
+            "    from .response import Base\n",
+            "\n",
+            "def f(response: Base | None = None) -> int:\n",
+            "    if response and response.status:\n",
+            "        return response.status\n",
+            "    return 0\n",
+        ),
+        "retry.py",
+    )
+    .unwrap();
+    let symbols = usemod.clone().find_symbols(SymbolTableScopes::new());
+    let out = usemod
+        .to_rust(CodeGenContext::Module("retry".to_string()), options, symbols)
+        .unwrap()
+        .to_string();
+    assert!(
+        out.contains(". status ()") && !out.contains(". status ;") && !out.contains(". status)"),
+        "the read routes through the accessor: {}",
+        out
+    );
+}

@@ -863,7 +863,17 @@ pub(crate) fn class_field_access(
         // The receiver's class with its defining scope: the read path's
         // resolution, else the inferred type's class resolved by name.
         let resolved = crate::receiver_class_for_read(value, ctx, symbols, options).or_else(|| {
-            let name = match crate::infer_type(Some(ctx), value, options, symbols) {
+            // A NAME's recorded type first: the inferrer answers a
+            // parameter from the annotation-string map, which knows no
+            // classes (`response: BaseHTTPResponse | None` is the boxed
+            // value there), while the analysis recorded the Option of
+            // the class.
+            let typed = match value {
+                ExprType::Name(n) => options.name_types.get(&n.id).cloned(),
+                _ => None,
+            }
+            .unwrap_or_else(|| crate::infer_type(Some(ctx), value, options, symbols));
+            let name = match typed {
                 crate::TypeInfo::Class(c) => c,
                 crate::TypeInfo::Option(inner) => match *inner {
                     crate::TypeInfo::Class(c) => c,
