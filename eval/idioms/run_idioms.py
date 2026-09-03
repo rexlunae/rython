@@ -213,9 +213,16 @@ def measure(program: Path, rypip: Path, workdir: Path, keep: bool, python: str |
         return result
     result["warnings"] = sum(1 for line in convert.stderr.splitlines() if "warning" in line)
 
-    # Plain diagnostics regardless of the caller's environment: the kept
-    # build.log is for reading, and the histogram is parsed from it.
+    # The generated crate builds the same way in every environment: plain
+    # diagnostics (the kept build.log is for reading, and the histogram is
+    # parsed from it), and the DEFAULT rustc flags. CI sets RUSTFLAGS=-D
+    # warnings for the workspace, which turns every warning in a generated
+    # crate into an uncoded `error:` line -- bank measured 11 errors
+    # locally and 18 on CI -- so the ratchet would compare counts taken
+    # under different rules. The generated code's warnings are a separate
+    # signal (`warnings` in the result), not part of the error count.
     build_env = {**os.environ, "CARGO_TERM_COLOR": "never"}
+    build_env.pop("RUSTFLAGS", None)
     build = run(["cargo", "build", "--quiet"], cwd=crate, timeout=1800, env=build_env)
     log = build.stderr
     (crate / "build.log").write_text(log)

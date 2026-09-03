@@ -37,6 +37,9 @@ and the oracle's version; it carries no machine-local paths or timestamps,
 so a committed result file changes only when a measurement does. A branch that only edits `eval/`
 therefore measures, and is named by, the same converter as its merge-base.
 
+Generated crates are built with the default rustc flags whatever the
+caller's `RUSTFLAGS` says (CI's `-D warnings` would count every warning as
+an error and the ratchet would compare counts taken under different rules).
 Per-program status is one of `convert-failed`, `build-failed` (with the
 rustc error histogram), `run-failed`, `timeout` (a hang in any stage is that
 program's result, not the corpus's), `output-mismatch` (with the first
