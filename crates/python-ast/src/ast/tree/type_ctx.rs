@@ -518,43 +518,54 @@ enum Resolving {
     Return,
 }
 
+/// What identifies the thing being resolved: a node of the tree by
+/// address, or a NAME — an alias chain is followed through names the
+/// resolver synthesizes afresh at every hop (`A -> B -> A`, a string
+/// forward reference `Sequence["JsonType"]`), so its identity is the
+/// name, not a node (Devin review on #323).
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ResolveKey {
+    Node(usize),
+    Name(String),
+}
+
 thread_local! {
-    static IN_PROGRESS: std::cell::RefCell<std::collections::HashSet<(Resolving, usize)>> =
+    static IN_PROGRESS: std::cell::RefCell<std::collections::HashSet<(Resolving, ResolveKey)>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
-/// Run `body` unless the same node is already being resolved by the same
+/// Run `body` unless the same key is already being resolved by the same
 /// resolver (a cycle), in which case `on_cycle` answers.
 fn resolving<R>(
     what: Resolving,
-    node: usize,
+    key: ResolveKey,
     on_cycle: impl FnOnce() -> R,
     body: impl FnOnce() -> R,
 ) -> R {
     // The entry is removed on EVERY exit, an unwinding panic included
     // (Devin review on #323): a panic caught above (a test harness, a
-    // batch converter) must not leave the node marked in progress, or a
-    // later resolver reusing that address would read it as a cycle.
-    struct Entered(Resolving, usize);
+    // batch converter) must not leave the key marked in progress, or a
+    // later resolver reusing it would read it as a cycle.
+    struct Entered(Resolving, ResolveKey);
     impl Drop for Entered {
         fn drop(&mut self) {
-            let key = (self.0, self.1);
+            let key = (self.0, self.1.clone());
             let _ = IN_PROGRESS.try_with(|s| {
                 s.borrow_mut().remove(&key);
             });
         }
     }
-    let entered = IN_PROGRESS.with(|s| s.borrow_mut().insert((what, node)));
+    let entered = IN_PROGRESS.with(|s| s.borrow_mut().insert((what, key.clone())));
     if !entered {
         return on_cycle();
     }
-    let _guard = Entered(what, node);
+    let _guard = Entered(what, key);
     body()
 }
 
 /// The cycle guard for a function's inferred return (function_def.rs).
 pub(crate) fn resolving_return<R>(node: usize, on_cycle: impl FnOnce() -> R, body: impl FnOnce() -> R) -> R {
-    resolving(Resolving::Return, node, on_cycle, body)
+    resolving(Resolving::Return, ResolveKey::Node(node), on_cycle, body)
 }
 
 /// Infer the Rust type an expression will produce, bottom-up, from syntax
@@ -567,7 +578,7 @@ pub fn infer_type(
 ) -> TypeInfo {
     resolving(
         Resolving::ExprType,
-        expr as *const ExprType as usize,
+        ResolveKey::Node(expr as *const ExprType as usize),
         || TypeInfo::PyObject,
         || infer_type_inner(ctx, expr, options, symbols),
     )
@@ -3367,9 +3378,33 @@ pub fn resolve_alias_typeinfo(
 ) -> Option<TypeInfo> {
     resolving(
         Resolving::Alias,
-        ann as *const ExprType as usize,
+        ResolveKey::Node(ann as *const ExprType as usize),
         || Some(TypeInfo::PyValue),
         || resolve_alias_typeinfo_inner(ann, symbols, options),
+    )
+}
+
+/// Follow an alias chain by NAME (`from ._base_connection import
+/// ProxyConfig as ProxyConfig` — a self-aliasing re-export; a string
+/// forward reference `Sequence["JsonType"]` inside JsonType's own
+/// definition): the name is the stable identity a cycle re-enters, where
+/// the Name node built for each hop is fresh. A cycle answers boxed.
+fn resolve_alias_named(
+    name: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<TypeInfo> {
+    resolving(
+        Resolving::Alias,
+        ResolveKey::Name(name.to_string()),
+        || Some(TypeInfo::PyValue),
+        || {
+            resolve_alias_typeinfo(
+                &ExprType::Name(crate::ast::tree::name::Name { id: name.to_string() }),
+                symbols,
+                options,
+            )
+        },
     )
 }
 
@@ -3597,11 +3632,7 @@ fn resolve_alias_typeinfo_inner(
             if let Some(litrs::Literal::String(s)) = &c.0 {
                 let text = s.value().to_string();
                 if !text.is_empty() && text.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
-                    return resolve_alias_typeinfo(
-                        &ExprType::Name(crate::ast::tree::name::Name { id: text }),
-                        symbols,
-                        options,
-                    );
+                    return resolve_alias_named(&text, symbols, options);
                 }
             }
             annotation_type_info(ann)
@@ -3610,7 +3641,7 @@ fn resolve_alias_typeinfo_inner(
         ExprType::Name(n) => match symbols.get(&n.id) {
             // An ALIAS (`from ._base_connection import ProxyConfig as
             // ProxyConfig` — a self-aliasing re-export): follow to the
-            // canonical name (the depth guard breaks cycles) — UNLESS the
+            // canonical name (the name-keyed guard breaks cycles) — UNLESS the
             // alias came from an aliased EXTERNAL import whose canonical
             // name a later local class shadows (`_HttplibHTTPResponse`
             // vs. urllib3's own HTTPResponse): the annotation means the
@@ -3620,13 +3651,7 @@ fn resolve_alias_typeinfo_inner(
                 if crate::ast::tree::module::aliased_external_import(&n.id, options) {
                     return Some(TypeInfo::PyValue);
                 }
-                resolve_alias_typeinfo(
-                    &ExprType::Name(crate::ast::tree::name::Name {
-                        id: canonical.clone(),
-                    }),
-                    symbols,
-                    options,
-                )
+                resolve_alias_named(canonical, symbols, options)
             }
             Some(SymbolTableNode::Assign { value, .. }) => {
                 // A TypeVar (`_DT = TypeVar("_DT")`) is a compile-time

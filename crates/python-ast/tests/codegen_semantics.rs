@@ -18699,3 +18699,148 @@ fn a_lambda_yield_is_not_the_enclosing_functions_yield() {
     assert!(!err.contains("used as a value"), "error: {}", err);
     assert!(err.contains("not supported yet"), "error: {}", err);
 }
+
+/// Conversion as a Result, for pins whose point is what the conversion
+/// does NOT say (a refusal that must not fire, a crash that must not
+/// happen) rather than a fixed outcome.
+fn compile_result(src: &str, name: &str) -> Result<String, String> {
+    let module = parse(src, name).map_err(|e| format!("parse failed: {}", e))?;
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    module
+        .to_rust(
+            CodeGenContext::Module(name.replace(".py", "")),
+            PythonOptions::default(),
+            symbols,
+        )
+        .map(|t| t.to_string())
+        .map_err(|e| format!("{}", e))
+}
+
+/// A `break` skips the loop's else clause (Devin review on #323): a
+/// deletion on the break path does not reach the else, and a read after
+/// the loop, which the break path does reach, stays loud.
+#[test]
+fn a_break_skips_the_loop_else_for_deletion() {
+    let out = compile(
+        concat!(
+            "def f(xs: list[int]) -> int:\n",
+            "    x = 1\n",
+            "    for i in xs:\n",
+            "        if i > 2:\n",
+            "            del x\n",
+            "            break\n",
+            "    else:\n",
+            "        return x\n",
+            "    return 0\n",
+        ),
+        "del_break_else.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+    let err = compile_err(
+        concat!(
+            "def g(xs: list[int]) -> int:\n",
+            "    x = 1\n",
+            "    for i in xs:\n",
+            "        if i > 2:\n",
+            "            del x\n",
+            "            break\n",
+            "    return x\n",
+        ),
+        "del_break_after.py",
+    );
+    assert!(err.contains("del x"), "error: {}", err);
+}
+
+/// `finally` runs on every way out of the try, a return inside included
+/// (Devin review on #323).
+#[test]
+fn a_finally_after_a_return_still_sees_the_deletion() {
+    let err = compile_err(
+        concat!(
+            "def f() -> int:\n",
+            "    x = 1\n",
+            "    try:\n",
+            "        del x\n",
+            "        return 0\n",
+            "    finally:\n",
+            "        print(x)\n",
+        ),
+        "del_finally.py",
+    );
+    assert!(err.contains("del x"), "error: {}", err);
+}
+
+/// An exception may leave the try body between the `del` and the
+/// rebinding, so the handler sees the deletion (Devin review on #323).
+#[test]
+fn a_handler_sees_a_deletion_a_raise_may_interrupt() {
+    let err = compile_err(
+        concat!(
+            "def may_raise() -> None:\n",
+            "    raise ValueError(\"x\")\n",
+            "\n",
+            "def f() -> int:\n",
+            "    x = 1\n",
+            "    try:\n",
+            "        del x\n",
+            "        may_raise()\n",
+            "        x = 2\n",
+            "    except ValueError:\n",
+            "        return x\n",
+            "    return x\n",
+        ),
+        "del_handler.py",
+    );
+    assert!(err.contains("del x"), "error: {}", err);
+}
+
+/// A `global xs` in a nested def names the module's binding, not the
+/// enclosing parameter (Devin review on #323): mutating it is no
+/// mutation of the argument, so passing and reusing the argument is not
+/// the aliasing refusal.
+#[test]
+fn a_global_declaration_in_a_nested_def_is_not_the_outer_parameter() {
+    let result = compile_result(
+        concat!(
+            "xs: list[int] = []\n",
+            "\n",
+            "def touch(xs: list[int]) -> int:\n",
+            "    def bump() -> None:\n",
+            "        global xs\n",
+            "        xs.append(1)\n",
+            "    bump()\n",
+            "    return len(xs)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    a = [1, 2]\n",
+            "    touch(a)\n",
+            "    print(a)\n",
+        ),
+        "alias_global.py",
+    );
+    let text = match &result {
+        Ok(out) => out.clone(),
+        Err(err) => err.clone(),
+    };
+    assert!(!text.contains("mutates it"), "result: {}", text);
+}
+
+/// A self-referential alias chain is followed by NAME, so a string
+/// forward reference to the alias being defined is a cycle the guard
+/// cuts — not a fresh node at every hop until the stack overflows (Devin
+/// review on #323).
+#[test]
+fn a_self_referential_string_alias_does_not_overflow() {
+    let result = compile_result(
+        concat!(
+            "from typing import Sequence, Union\n",
+            "JsonType = Union[int, str, Sequence[\"JsonType\"]]\n",
+            "\n",
+            "def depth(x: JsonType) -> int:\n",
+            "    return 1\n",
+        ),
+        "alias_cycle.py",
+    );
+    // Either outcome is acceptable; returning at all is the pin.
+    let _ = result;
+}

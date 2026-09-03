@@ -44,7 +44,7 @@ use std::collections::HashMap;
 
 use crate::ast::tree::statement::Statement;
 use crate::ast::tree::visit::{
-    def_binds_locally, opens_scope, stmt_all_exprs, walk_stmts, Descend, Flow,
+    self, def_owns_name, opens_scope, stmt_all_exprs, walk_stmts, Descend, Flow,
 };
 use crate::ast::tree::StatementType;
 use crate::{ExprType, SymbolTableNode, SymbolTableScopes};
@@ -506,25 +506,22 @@ fn push_free_strays(exprs: Vec<&ExprType>, free: &[(usize, String)], stray: &mut
 
 /// The stray isinstance-of-parameter uses inside a nested scope that
 /// still name the OUTER function's parameters: a nested def's header
-/// (decorators and defaults run in the enclosing scope) and, in its
-/// body, every parameter the def does not bind itself — a same-named
-/// parameter or local of the nested def is its own, and an isinstance on
-/// it must not disable the outer specialization (Devin review on #323).
+/// (decorators, defaults, and annotations run in the enclosing scope)
+/// and, in its body, every parameter the def does not bind itself — a
+/// same-named parameter, local, or `global` of the nested def is its
+/// own, and an isinstance on it must not disable the outer
+/// specialization (Devin review on #323).
 /// A class body runs in place; its methods are nested defs under the
 /// same rule.
 fn stray_in_nested_scope(stmt: &Statement, free: &[(usize, String)], stray: &mut Vec<String>) {
     match &stmt.statement {
         StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
-            let header: Vec<&ExprType> = f
-                .decorator_list
-                .iter()
-                .chain(f.args.defaults.iter().map(|d| d.as_ref()))
-                .chain(f.args.kw_defaults.iter().flatten().map(|d| d.as_ref()))
-                .collect();
-            push_free_strays(header, free, stray);
+            // The header (decorators, defaults, annotations) runs in the
+            // enclosing scope: the visitor's own enumeration of it.
+            push_free_strays(visit::stmt_exprs(stmt), free, stray);
             let inner_free: Vec<(usize, String)> = free
                 .iter()
-                .filter(|(_, p)| !def_binds_locally(f, p))
+                .filter(|(_, p)| !def_owns_name(f, p))
                 .cloned()
                 .collect();
             if inner_free.is_empty() {
@@ -540,7 +537,7 @@ fn stray_in_nested_scope(stmt: &Statement, free: &[(usize, String)], stray: &mut
             });
         }
         StatementType::ClassDef(c) => {
-            push_free_strays(c.bases.iter().collect(), free, stray);
+            push_free_strays(visit::stmt_exprs(stmt), free, stray);
             walk_stmts(&c.body, Descend::SkipDefs, &mut |s| {
                 if opens_scope(s) {
                     stray_in_nested_scope(s, free, stray);

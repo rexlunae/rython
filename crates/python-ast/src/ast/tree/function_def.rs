@@ -2939,12 +2939,56 @@ pub(crate) fn check_deleted_names(body: &[Statement]) -> Result<(), String> {
     scan_deleted_names(body, &mut deleted)
 }
 
+type Deleted = std::collections::HashSet<String>;
+
 /// The deletion state on the ways out of a statement sequence: the
-/// fall-through state (None when every path returns or raises) and the
-/// states at each `break` / `continue`, which the enclosing loop merges.
+/// fall-through state (None when every path returns or raises), the
+/// states at each `break` and each `continue` (the enclosing loop merges
+/// them: a continue into the next iteration, a break past the else
+/// clause), and the union of the state at EVERY statement boundary inside
+/// — where an exception may leave from, and what a `finally` may see.
 struct DeletedPaths {
-    falls: Option<std::collections::HashSet<String>>,
-    jumps: Vec<std::collections::HashSet<String>>,
+    falls: Option<Deleted>,
+    breaks: Vec<Deleted>,
+    continues: Vec<Deleted>,
+    anywhere: Deleted,
+}
+
+impl DeletedPaths {
+    /// Take the states that leave `nested` for an outer statement — its
+    /// breaks and continues (an enclosing loop's business), and everything
+    /// it reached — and hand back its fall-through.
+    fn absorb(&mut self, nested: DeletedPaths) -> Option<Deleted> {
+        self.breaks.extend(nested.breaks);
+        self.continues.extend(nested.continues);
+        self.anywhere.extend(nested.anywhere);
+        nested.falls
+    }
+}
+
+/// The union of the continuing states, None when none continues.
+fn merge_deleted(states: Vec<Option<Deleted>>) -> Option<Deleted> {
+    let mut out: Option<Deleted> = None;
+    for state in states.into_iter().flatten() {
+        out.get_or_insert_with(Deleted::new).extend(state);
+    }
+    out
+}
+
+/// A read of a deleted name in `exprs` is the loud issue-#112 error.
+fn check_deleted_reads(deleted: &Deleted, exprs: &[&ExprType]) -> Result<(), String> {
+    if let Some(name) = deleted
+        .iter()
+        .find(|name| exprs.iter().any(|e| crate::expr_references(e, name)))
+    {
+        return Err(format!(
+            "`del {name}` then a use of `{name}`: rython cannot unbind a \
+             binding (the value would still be readable where Python raises \
+             NameError). Remove the del, or reassign `{name}` first (issue \
+             #112)"
+        ));
+    }
+    Ok(())
 }
 
 /// One pass over `body` from the incoming deletion state in `deleted`,
@@ -2957,39 +3001,30 @@ struct DeletedPaths {
 /// print(x)`), and a path that returns or raises contributes nothing to
 /// what follows (`del x; if c: x = 2; else: return 0; return x` is
 /// fine). A loop body is scanned a second time from the merged state, so
-/// a read that precedes the `del` in the next iteration is seen too.
-/// Nested defs and classes are their own scopes.
-fn scan_deleted_names(
-    body: &[Statement],
-    deleted: &mut std::collections::HashSet<String>,
-) -> Result<(), String> {
+/// a read that precedes the `del` in the next iteration is seen too; a
+/// `break` skips the else clause. A `try`'s handlers and `finally` start
+/// from every state the body reached, since an exception may leave from
+/// any statement boundary. Nested defs and classes are their own scopes.
+fn scan_deleted_names(body: &[Statement], deleted: &mut Deleted) -> Result<(), String> {
     let paths = scan_deleted_paths(body, deleted)?;
     *deleted = paths.falls.unwrap_or_default();
     Ok(())
 }
 
-fn scan_deleted_paths(
-    body: &[Statement],
-    incoming: &std::collections::HashSet<String>,
-) -> Result<DeletedPaths, String> {
-    type Deleted = std::collections::HashSet<String>;
+fn scan_deleted_paths(body: &[Statement], incoming: &Deleted) -> Result<DeletedPaths, String> {
     let mut deleted = incoming.clone();
-    let mut jumps: Vec<Deleted> = Vec::new();
-    // The union of the continuing states, None when none continues.
-    fn merge(states: Vec<Option<Deleted>>) -> Option<Deleted> {
-        let mut out: Option<Deleted> = None;
-        for state in states.into_iter().flatten() {
-            out.get_or_insert_with(Deleted::new).extend(state);
-        }
-        out
-    }
+    let mut out = DeletedPaths {
+        falls: None,
+        breaks: Vec::new(),
+        continues: Vec::new(),
+        anywhere: incoming.clone(),
+    };
     for stmt in body {
-        if visit::opens_scope(stmt) {
-            continue;
-        }
-        // A read of a deleted name: the statement's own expressions, and
-        // a store target that reads its base (`x[i] = v`, `x.a = v`); a
-        // name / tuple target only binds.
+        out.anywhere.extend(deleted.iter().cloned());
+        // A read of a deleted name: the statement's own expressions (a
+        // definition's header included), and a store target that reads
+        // its base (`x[i] = v`, `x.a = v`); a name / tuple target only
+        // binds.
         let reads: Vec<&ExprType> = visit::stmt_exprs(stmt)
             .into_iter()
             .chain(stmt_targets(stmt).into_iter().filter(|t| {
@@ -2999,16 +3034,18 @@ fn scan_deleted_paths(
                 )
             }))
             .collect();
-        if let Some(name) = deleted
-            .iter()
-            .find(|name| reads.iter().any(|e| crate::expr_references(e, name)))
-        {
-            return Err(format!(
-                "`del {name}` then a use of `{name}`: rython cannot unbind a \
-                 binding (the value would still be readable where Python raises \
-                 NameError). Remove the del, or reassign `{name}` first (issue \
-                 #112)"
-            ));
+        check_deleted_reads(&deleted, &reads)?;
+        // A definition binds its name here; its body is its own scope.
+        match &stmt.statement {
+            StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
+                deleted.remove(&f.name);
+                continue;
+            }
+            StatementType::ClassDef(c) => {
+                deleted.remove(&c.name);
+                continue;
+            }
+            _ => {}
         }
         // A store rebinds the name: an assignment / aug-assign / loop /
         // `with ... as` target, an import.
@@ -3038,112 +3075,117 @@ fn scan_deleted_paths(
             }
             // The path ends here: nothing after it in this body runs.
             StatementType::Return(_) | StatementType::Raise(_) => {
-                return Ok(DeletedPaths { falls: None, jumps });
+                out.anywhere.extend(deleted);
+                return Ok(out);
             }
-            // The path leaves for the enclosing loop's exit or next
-            // iteration, carrying its state there.
-            StatementType::Break | StatementType::Continue => {
-                jumps.push(deleted);
-                return Ok(DeletedPaths { falls: None, jumps });
+            // The path leaves for the enclosing loop, carrying its state.
+            StatementType::Break => {
+                out.anywhere.extend(deleted.iter().cloned());
+                out.breaks.push(deleted);
+                return Ok(out);
+            }
+            StatementType::Continue => {
+                out.anywhere.extend(deleted.iter().cloned());
+                out.continues.push(deleted);
+                return Ok(out);
             }
             _ => {}
         }
         // The paths through the statement's bodies.
         let next = match &stmt.statement {
             StatementType::If(i) => {
-                let then = scan_deleted_paths(&i.body, &deleted)?;
+                let then = out.absorb(scan_deleted_paths(&i.body, &deleted)?);
                 // No else: the fall-through path keeps the incoming state.
                 let other = if i.orelse.is_empty() {
-                    DeletedPaths { falls: Some(deleted.clone()), jumps: Vec::new() }
+                    Some(deleted.clone())
                 } else {
-                    scan_deleted_paths(&i.orelse, &deleted)?
+                    out.absorb(scan_deleted_paths(&i.orelse, &deleted)?)
                 };
-                jumps.extend(then.jumps);
-                jumps.extend(other.jumps);
-                merge(vec![then.falls, other.falls])
+                merge_deleted(vec![then, other])
             }
             StatementType::For(_) | StatementType::AsyncFor(_) | StatementType::While(_) => {
                 let bodies = visit::stmt_bodies(stmt);
                 let (loop_body, orelse) = (bodies[0], bodies[1]);
                 // Zero iterations keep the incoming state; a later
                 // iteration re-enters the body from the merged state (a
-                // fall-through or a `continue`; a `break` merged too,
-                // conservatively) with the loop target rebound.
+                // fall-through or a `continue`) with the loop target
+                // rebound.
                 let first = scan_deleted_paths(loop_body, &deleted)?;
                 let mut again = deleted.clone();
                 if let Some(falls) = &first.falls {
                     again.extend(falls.iter().cloned());
                 }
-                for jump in &first.jumps {
-                    again.extend(jump.iter().cloned());
+                for state in &first.continues {
+                    again.extend(state.iter().cloned());
                 }
                 for target in stmt_targets(stmt) {
                     again.retain(|name| !visit::target_binds(target, name));
                 }
+                // A `while` re-evaluates its test each iteration.
+                if matches!(stmt.statement, StatementType::While(_)) {
+                    check_deleted_reads(&again, &visit::stmt_exprs(stmt))?;
+                }
                 let second = scan_deleted_paths(loop_body, &again)?;
-                // The loop's completion: the incoming state (zero
-                // iterations) and the merged iteration states.
+                // The loop's completion (no break): the incoming state
+                // (zero iterations) and the merged iteration states.
                 let mut completed = again.clone();
                 completed.extend(deleted.iter().cloned());
                 if let Some(falls) = &second.falls {
                     completed.extend(falls.iter().cloned());
                 }
-                for jump in &second.jumps {
-                    completed.extend(jump.iter().cloned());
+                for state in &second.continues {
+                    completed.extend(state.iter().cloned());
                 }
-                // The else clause runs after a loop that completes; a
-                // break skips it and lands after the statement.
-                let after_else = scan_deleted_paths(orelse, &completed)?;
-                jumps.extend(after_else.jumps);
-                let mut exits = vec![after_else.falls];
-                if !first.jumps.is_empty() || !second.jumps.is_empty() {
-                    exits.push(Some(completed));
-                }
-                merge(exits)
+                // A break lands after the statement, skipping the else
+                // clause; the else clause runs after a completion.
+                let mut exits: Vec<Option<Deleted>> = first
+                    .breaks
+                    .iter()
+                    .chain(second.breaks.iter())
+                    .map(|b| Some(b.clone()))
+                    .collect();
+                out.anywhere.extend(first.anywhere);
+                out.anywhere.extend(second.anywhere);
+                exits.push(out.absorb(scan_deleted_paths(orelse, &completed)?));
+                merge_deleted(exits)
             }
-            StatementType::With(w) => {
-                let out = scan_deleted_paths(&w.body, &deleted)?;
-                jumps.extend(out.jumps);
-                out.falls
-            }
-            StatementType::AsyncWith(w) => {
-                let out = scan_deleted_paths(&w.body, &deleted)?;
-                jumps.extend(out.jumps);
-                out.falls
-            }
+            StatementType::With(w) => out.absorb(scan_deleted_paths(&w.body, &deleted)?),
+            StatementType::AsyncWith(w) => out.absorb(scan_deleted_paths(&w.body, &deleted)?),
             StatementType::Try(t) => {
-                // A handler may run from any point of the body: from the
-                // union of the incoming and the body's outgoing state,
-                // with its `as` name rebound; the else clause from the
-                // body's; finally from all of them.
-                let after_body = scan_deleted_paths(&t.body, &deleted)?;
-                jumps.extend(after_body.jumps.iter().cloned());
-                let mut at_handler = deleted.clone();
-                if let Some(falls) = &after_body.falls {
-                    at_handler.extend(falls.iter().cloned());
-                }
+                // An exception may leave the body from any statement
+                // boundary: a handler starts from every state the body
+                // reached, with its `as` name rebound; the else clause
+                // from the body's fall-through; `finally` runs on every
+                // way out — from every state the try reached, a return
+                // or raise inside included.
+                let body = scan_deleted_paths(&t.body, &deleted)?;
+                let at_handler = body.anywhere.clone();
+                let body_falls = out.absorb(body);
+                let mut reached = at_handler.clone();
                 let mut exits: Vec<Option<Deleted>> = Vec::new();
                 for handler in &t.handlers {
                     let mut entry = at_handler.clone();
                     if let Some(name) = &handler.name {
                         entry.remove(name);
                     }
-                    let out = scan_deleted_paths(&handler.body, &entry)?;
-                    jumps.extend(out.jumps);
-                    exits.push(out.falls);
+                    let handled = scan_deleted_paths(&handler.body, &entry)?;
+                    reached.extend(handled.anywhere.iter().cloned());
+                    exits.push(out.absorb(handled));
                 }
-                if let Some(falls) = &after_body.falls {
-                    let out = scan_deleted_paths(&t.orelse, falls)?;
-                    jumps.extend(out.jumps);
-                    exits.push(out.falls);
+                if let Some(falls) = &body_falls {
+                    let orelse = scan_deleted_paths(&t.orelse, falls)?;
+                    reached.extend(orelse.anywhere.iter().cloned());
+                    exits.push(out.absorb(orelse));
                 }
-                match merge(exits) {
-                    Some(before_finally) => {
-                        let out = scan_deleted_paths(&t.finalbody, &before_finally)?;
-                        jumps.extend(out.jumps);
-                        out.falls
+                let continuing = merge_deleted(exits);
+                if t.finalbody.is_empty() {
+                    continuing
+                } else {
+                    let finally = out.absorb(scan_deleted_paths(&t.finalbody, &reached)?);
+                    match (continuing, finally) {
+                        (Some(_), Some(after)) => Some(after),
+                        _ => None,
                     }
-                    None => None,
                 }
             }
             _ => {
@@ -3155,20 +3197,20 @@ fn scan_deleted_paths(
                 } else {
                     let mut exits = vec![Some(deleted.clone())];
                     for nested in bodies {
-                        let out = scan_deleted_paths(nested, &deleted)?;
-                        jumps.extend(out.jumps);
-                        exits.push(out.falls);
+                        exits.push(out.absorb(scan_deleted_paths(nested, &deleted)?));
                     }
-                    merge(exits)
+                    merge_deleted(exits)
                 }
             }
         };
         match next {
             Some(state) => deleted = state,
-            None => return Ok(DeletedPaths { falls: None, jumps }),
+            None => return Ok(out),
         }
     }
-    Ok(DeletedPaths { falls: Some(deleted), jumps })
+    out.anywhere.extend(deleted.iter().cloned());
+    out.falls = Some(deleted);
+    Ok(out)
 }
 
 /// Issue #115: every name this function's body declares `global`,
