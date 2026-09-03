@@ -83,6 +83,18 @@ message text, ordering, and float formatting.
   stringly-typed name lists that can drift out of sync are a defect,
   not a style choice. When adding a compiler-known runtime surface,
   give its name set an enum first.
+- **Walk the tree through the one visitor.** Every analysis that
+  descends into Python statement bodies or subexpressions asks
+  `python-ast/src/ast/tree/visit.rs` (`walk_stmts` / `any_stmt` with a
+  `Descend` policy for nested scopes, `stmt_bodies`, `stmt_exprs`,
+  `stmt_targets`, `subexprs`, `walk_expr` / `any_expr`, `is_self`) —
+  never its own `match` over `If` / `For` / `Try` / … . A hand-rolled
+  walk silently skips whatever form its author forgot (`async for`, an
+  `else` clause, a `finally` block — issue #137's round-99 audit found
+  the same omission in twenty walkers); with one enumeration, a new
+  statement form is added in one place. A deliberate exclusion (a
+  nested `def` is its own scope; a loop body owns its `break`) is a
+  visible `Flow::Skip` with a comment, not a missing arm.
 - **Respect the tiers.** Anything OS-touching is `std`-gated in
   stdpython; alloc-tier additions must build with
   `--no-default-features --features alloc` (CI cross-checks
