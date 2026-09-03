@@ -5714,6 +5714,7 @@ impl<'a> CodeGen for Call {
             if let Some((class, class_symbols)) =
                 receiver_class(&attr.value, &ctx, &symbols, &options)
             {
+                eprintln!("R99GATE {}.{} -> {}", match attr.value.as_ref() { crate::ExprType::Name(n) => format!("Name({})", n.id), crate::ExprType::Attribute(a) => format!("Attr(.{})", a.attr), crate::ExprType::Call(_) => "Call".into(), _ => "other".into() }, attr.attr, class.name);
                 if let Some(method) =
                     class.method_on_mro_with_options(&attr.attr, &class_symbols, &options)
                 {
