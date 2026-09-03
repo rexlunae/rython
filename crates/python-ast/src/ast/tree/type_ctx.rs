@@ -2582,7 +2582,8 @@ fn analyze_statement_types(
                             // the caller's seeds, not the locals typed so
                             // far.
                             let view = options.map(|o| analysis_view(o, info));
-                            call_return_typeinfo(c, symbols, view.as_ref())
+                            self_method_return_typeinfo(c, self_class, symbols, options)
+                                .or_else(|| call_return_typeinfo(c, symbols, view.as_ref()))
                                 .or_else(|| {
                                     // The ctx-aware inferrer: a dict-method
                                     // fetch (`item = self.items.get(k)` —
@@ -3972,6 +3973,33 @@ pub fn call_return_typeinfo(
         }
         _ => None,
     }
+}
+
+/// The declared return type of `self.method(...)` inside a method of
+/// `self_class` (`conn = self.connection_from_host(..)` — urllib3's
+/// poolmanager, whose `-> HTTPConnectionPool` then types `conn.urlopen(url)`
+/// and the root-typed `response` it yields): the method resolves on the
+/// class's MRO and its annotation in the class's own scope. None when the
+/// call is not on `self`, the class is unknown, or the method has no
+/// annotation.
+fn self_method_return_typeinfo(
+    call: &crate::Call,
+    self_class: Option<&str>,
+    symbols: Option<&SymbolTableScopes>,
+    options: Option<&PythonOptions>,
+) -> Option<TypeInfo> {
+    let ExprType::Attribute(attr) = call.func.as_ref() else {
+        return None;
+    };
+    if !matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+        return None;
+    }
+    let (class_name, symbols, options) = (self_class?, symbols?, options?);
+    let (class, class_symbols) =
+        crate::ast::tree::call::receiver_class_tail(class_name, symbols.clone(), options)?;
+    let method = class.method_on_mro(&attr.attr, &class_symbols)?;
+    let ann = method.returns.as_deref()?;
+    resolve_alias_typeinfo(ann, &class_symbols, options)
 }
 
 /// The symbol table of a module in options.module_defs ("" root).

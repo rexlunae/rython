@@ -17337,6 +17337,46 @@ fn an_instance_has_pythons_truth() {
     );
 }
 
+/// A local assigned from a `self.method(..)` call is typed by the method's
+/// declared return (`conn = self.connection_from_host(..)` — urllib3's
+/// poolmanager), so a root-typed value reached through it reads its
+/// fields through the accessor.
+#[test]
+fn a_local_from_a_self_method_call_is_typed_by_its_return() {
+    let out = compile(
+        concat!(
+            "class Resp:\n",
+            "    def __init__(self, status: int):\n",
+            "        self.status = status\n",
+            "\n",
+            "class HR(Resp):\n",
+            "    pass\n",
+            "\n",
+            "class Pool:\n",
+            "    def urlopen(self, url: str) -> Resp:\n",
+            "        return HR(200)\n",
+            "\n",
+            "class Manager:\n",
+            "    def __init__(self):\n",
+            "        self.pool = Pool()\n",
+            "\n",
+            "    def connection_from_host(self, host: str) -> Pool:\n",
+            "        return self.pool\n",
+            "\n",
+            "    def go(self, url: str) -> int:\n",
+            "        conn = self.connection_from_host(\"h\")\n",
+            "        response = conn.urlopen(url)\n",
+            "        return response.status\n",
+        ),
+        "selfcall.py",
+    );
+    assert!(
+        out.contains("response . status ()"),
+        "the root-typed result of the typed local's call reads through the accessor: {}",
+        out
+    );
+}
+
 /// A shared class constructs behind `PyRef`, its slot type is `PyRef<C>`,
 /// a loop variable over a container of it borrows for a field read, a
 /// field store through it borrows mutably, and a subscript into the
