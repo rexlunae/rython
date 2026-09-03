@@ -157,6 +157,9 @@ fn resolve_constant_name(
 ) -> Option<TokenStream> {
     let mut current = name.to_string();
     let mut syms = symbols.clone();
+    // The crate module the chain last crossed into (None while still in
+    // the starting scope).
+    let mut defining_module: Option<Vec<String>> = None;
     for _ in 0..16 {
         match syms.get(&current) {
             Some(SymbolTableNode::ImportFrom(ifm)) => {
@@ -174,6 +177,7 @@ fn resolve_constant_name(
                 let module: &crate::Module = module;
                 syms = module.clone().find_symbols(SymbolTableScopes::new());
                 current = defining;
+                defining_module = Some(key.to_vec());
             }
             Some(SymbolTableNode::Assign { value, .. }) => {
                 // Literal-only: the value must be a constant the caller
@@ -185,6 +189,21 @@ fn resolve_constant_name(
                         syms.clone(),
                     );
                     return rendered.ok();
+                }
+                // A COMPUTED module constant of ANOTHER crate module
+                // (`timeout: _TYPE_TIMEOUT = _DEFAULT_TIMEOUT` — urllib3's
+                // connectionpool, whose default is util/timeout.py's
+                // `_DEFAULT_TIMEOUT = _TYPE_DEFAULT.token`): the defining
+                // module emits it as a promoted LazyLock static (the same
+                // authority its own reads consult), so a caller that does
+                // not import the name reads the static by crate path.
+                if let Some(path) = &defining_module
+                    && crate::ast::tree::module::module_promoted_static_names(options, path)
+                        .contains(&current)
+                {
+                    let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+                    let ident = crate::safe_ident(&current);
+                    return Some(quote!((*crate #(::#segs)* :: #ident).clone()));
                 }
                 return None;
             }

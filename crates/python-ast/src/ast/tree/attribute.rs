@@ -1379,6 +1379,12 @@ pub(crate) fn receiver_option_inner(
     options: &PythonOptions,
 ) -> Option<proc_macro2::TokenStream> {
     match expr {
+        // A name NARROWED by the enclosing guard (`response and
+        // response.get_redirect_location()` — urllib3's Retry.increment,
+        // where `response: BaseHTTPResponse | None`; an `is not None`
+        // test; an isinstance): every narrowed read (name.rs) already
+        // renders the non-Option value, so the call takes it as is.
+        ExprType::Name(n) if options.narrowed_names.contains_key(&n.id) => None,
         ExprType::Name(n) => match options.name_types.get(&n.id) {
             Some(crate::TypeInfo::Option(inner)) => Some(inner.to_rust_type()),
             // A None-first local (`conn = None` then `conn = ...` —

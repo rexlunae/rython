@@ -351,6 +351,171 @@ fn imported_hierarchy_method_widening_crosses_modules() {
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Milo");
 }
 
+/// A DROPPED DEFAULT that names a COMPUTED constant of another crate
+/// module (urllib3's `timeout: _TYPE_TIMEOUT = _DEFAULT_TIMEOUT`, where
+/// connectionpool.py imports the sentinel from util/timeout.py and
+/// poolmanager.py calls `conn.urlopen(method, url, **kw)` without ever
+/// importing it): the defining module emits the constant as a promoted
+/// static, and the call site reads it by crate path — never a bare name
+/// the caller's module does not bind (E0425).
+#[test]
+fn a_cross_module_computed_constant_default_reads_the_static_by_crate_path() {
+    let scratch = Scratch::new("xdefault");
+    fs::create_dir_all(scratch.path().join("vendor/net")).unwrap();
+    fs::write(scratch.path().join("vendor/net/__init__.py"), "").unwrap();
+    fs::write(
+        scratch.path().join("vendor/net/settings.py"),
+        "LIMIT = len(\"seven..\")\n",
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("vendor/net/pool.py"),
+        concat!(
+            "from .settings import LIMIT\n",
+            "\n",
+            "class Pool:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "    def open(self, url: str, limit: int = LIMIT) -> str:\n",
+            "        return f\"{self.name}:{url}:{limit}\"\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("vendor/net/manager.py"),
+        concat!(
+            "from .pool import Pool\n",
+            "\n",
+            "def run(url: str) -> str:\n",
+            "    conn = Pool(\"a\")\n",
+            "    return conn.open(url)\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("rython.toml"),
+        "[python-modules]\nnet = { path = \"vendor/net\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("app.py"),
+        concat!(
+            "from net.manager import run\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(run(\"u\"))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&scratch.path().join("app.py")).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let manager_rs = fs::read_to_string(out.join("src/net/manager.rs")).unwrap();
+    assert!(
+        manager_rs.contains("(*crate::net::settings::LIMIT).clone()"),
+        "the dropped default reads the defining module's static by crate path: {}",
+        manager_rs
+    );
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "binary exited nonzero");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "a:u:7");
+}
+
+/// A method call on a receiver of ANOTHER crate module's class, whose
+/// return annotation names a polymorphic ROOT the caller's module never
+/// imports (`response = conn.urlopen(url)` in urllib3's poolmanager, where
+/// `HTTPConnectionPool.urlopen -> BaseHTTPResponse` lives in
+/// connectionpool.py): the local's type resolves in the class's own module,
+/// so a field read on it takes the sum type's accessor (`response.status()`)
+/// — not the bare field the enum does not have (E0615).
+#[test]
+fn a_cross_module_call_result_typed_with_a_root_reads_fields_through_the_accessor() {
+    let scratch = Scratch::new("xroot");
+    fs::create_dir_all(scratch.path().join("vendor/net")).unwrap();
+    fs::write(scratch.path().join("vendor/net/__init__.py"), "").unwrap();
+    fs::write(
+        scratch.path().join("vendor/net/response.py"),
+        concat!(
+            "class BaseResp:\n",
+            "    def __init__(self, status: int):\n",
+            "        self.status = status\n",
+            "\n",
+            "class HTTPResp(BaseResp):\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("vendor/net/pool.py"),
+        concat!(
+            "from .response import BaseResp, HTTPResp\n",
+            "\n",
+            "class Pool:\n",
+            "    def urlopen(self, url: str) -> BaseResp:\n",
+            "        return HTTPResp(len(url))\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("vendor/net/manager.py"),
+        concat!(
+            "from .pool import Pool\n",
+            "\n",
+            "def code(p: Pool, url: str) -> int:\n",
+            "    response = p.urlopen(url)\n",
+            "    if response.status == 303:\n",
+            "        return -1\n",
+            "    return response.status\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("rython.toml"),
+        "[python-modules]\nnet = { path = \"vendor/net\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("app.py"),
+        concat!(
+            "from net.manager import code\n",
+            "from net.pool import Pool\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(code(Pool(), \"abcd\"))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&scratch.path().join("app.py")).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let manager_rs = fs::read_to_string(out.join("src/net/manager.rs")).unwrap();
+    assert!(
+        manager_rs.contains("response.status()"),
+        "the field read on the root-typed local takes the accessor: {}",
+        manager_rs
+    );
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "binary exited nonzero");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "4");
+}
+
 /// A composition chain (`self.inner.x = v`, `self.inner.bump()`) and a
 /// tuple destructuring (`self.x, self.y = ...`) inside generic trait
 /// defaults must write through the MUTABLE accessors: in the trait default

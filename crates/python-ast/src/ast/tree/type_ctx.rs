@@ -730,6 +730,21 @@ fn infer_type_inner(
                         call_return_typeinfo(call, Some(symbols), Some(options))
                             .unwrap_or(TypeInfo::PyObject)
                     }
+                    // An IMPORTED class's construction (`HTTPResp(len(url))`
+                    // from `from .response import HTTPResp`) is an instance
+                    // of that class: the struct IS bound here by the
+                    // import, so naming it is safe — the same answer the
+                    // same-module construction gives, and what lets a
+                    // subtree class returned from a `-> Root` factory
+                    // convert into the sum type across modules.
+                    Some(crate::SymbolTableNode::ImportFrom(_))
+                        if crate::ast::tree::hierarchy::canonical_class_name(&n.id, symbols)
+                            == n.id
+                            && crate::resolve_class_referenced(&n.id, symbols, options)
+                                .is_some() =>
+                    {
+                        TypeInfo::Class(n.id.clone())
+                    }
                     _ => TypeInfo::PyObject,
                 },
             },
@@ -3867,10 +3882,16 @@ pub fn call_return_typeinfo(
         let Some(crate::TypeInfo::Class(cname)) = options.name_types.get(&recv.id) else {
             return None;
         };
-        let class = crate::resolve_class_referenced(cname, symbols, options)?;
-        let method = class.method_on_mro(&attr.attr, symbols)?;
+        // The class WITH its defining scope: a cross-module receiver's
+        // method names its return class in ITS module (`conn.urlopen(url)
+        // -> BaseHTTPResponse` in urllib3's poolmanager, which never
+        // imports the response class), so the annotation resolves there,
+        // not in the caller's scope where the name is unbound.
+        let (class, class_symbols) =
+            crate::ast::tree::call::receiver_class_tail(cname, symbols.clone(), options)?;
+        let method = class.method_on_mro(&attr.attr, &class_symbols)?;
         let ann = method.returns.as_deref()?;
-        return resolve_alias_typeinfo(ann, symbols, options);
+        return resolve_alias_typeinfo(ann, &class_symbols, options);
     };
     let symbols = symbols?;
     let options = options?;
@@ -3895,7 +3916,23 @@ pub fn call_return_typeinfo(
             // callee stayed untyped, so the local never entered
             // optional_names and the is-not-None narrowing never fired).
             let path = crate::module_defs_key(options, &path)?;
-            let (f, _) = crate::module_function_def(options, path, &callee.id)?;
+            // The name the defining module binds (`from m import X as Y`
+            // calls X).
+            let defining = i
+                .names
+                .iter()
+                .find(|a| a.asname.as_deref() == Some(&callee.id))
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| callee.id.clone());
+            // An IMPORTED class's construction (`HTTPResp(200)` from
+            // `from .response import HTTPResp`) is an instance of that
+            // class — the same answer the same-module construction gives,
+            // so a subtree class returned from a `-> Root` factory converts
+            // into the sum type across modules too.
+            if crate::module_class_def(options, path, &defining).is_some() {
+                return Some(TypeInfo::Class(defining));
+            }
+            let (f, _) = crate::module_function_def(options, path, &defining)?;
             let ann = f.returns.as_deref()?;
             return resolve_alias_typeinfo(ann, &module_symbols(options, &path), options);
         }

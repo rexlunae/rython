@@ -1646,6 +1646,17 @@ impl PyBool for bool {
     }
 }
 
+/// An optional value's truth is Python's: `None` is false, a present
+/// value has its own truth (`bool(headers.get("Retry-After"))`).
+impl<T: PyBool> PyBool for Option<T> {
+    fn py_bool(self) -> bool {
+        match self {
+            None => false,
+            Some(v) => v.py_bool(),
+        }
+    }
+}
+
 impl<T> PyBool for &PyList<T> {
     fn py_bool(self) -> bool {
         !self.inner.is_empty()
@@ -3929,6 +3940,17 @@ mod pyref_tests {
         assert_eq!(a.borrow().n, 3);
         assert!(a.py_is(&b));
         assert!(!a.py_is(&PyRef::new(Counter { n: 3 })));
+    }
+
+    /// `bool(x)` on an optional value: None is false, a present value has
+    /// its own truth (`bool(headers.get("Retry-After"))`).
+    #[test]
+    fn an_optional_value_has_pythons_truth() {
+        assert!(!crate::bool(None::<String>));
+        assert!(!crate::bool(Some(String::new())));
+        assert!(crate::bool(Some("120".to_string())));
+        assert!(!crate::bool(Some(0i64)));
+        assert!(crate::bool(Some(3i64)));
     }
 }
 

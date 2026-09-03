@@ -17266,6 +17266,40 @@ fn an_aliased_imported_constructor_result_is_a_method_receiver() {
     );
 }
 
+/// A method call on a name NARROWED by the enclosing guard (`r and
+/// r.redirect()` with `r: Resp | None` — urllib3's Retry.increment):
+/// the read already renders the unwrapped value, so the call takes it
+/// as is — never a second unwrap on a value that is no longer an Option.
+#[test]
+fn a_call_on_a_guard_narrowed_optional_name_takes_the_narrowed_value() {
+    let out = compile(
+        concat!(
+            "class Resp:\n",
+            "    def __init__(self, ok: bool):\n",
+            "        self.ok = ok\n",
+            "\n",
+            "    def redirect(self) -> bool:\n",
+            "        return self.ok\n",
+            "\n",
+            "def f(r: Resp | None) -> bool:\n",
+            "    if r and r.redirect():\n",
+            "        return True\n",
+            "    return False\n",
+        ),
+        "narrowedcall.py",
+    );
+    assert!(
+        !out.contains("unwrap_or_else"),
+        "the narrowed name is not unwrapped twice: {}",
+        out
+    );
+    assert!(
+        out.contains(". redirect ()"),
+        "the call is on the narrowed value: {}",
+        out
+    );
+}
+
 /// A shared class constructs behind `PyRef`, its slot type is `PyRef<C>`,
 /// a loop variable over a container of it borrows for a field read, a
 /// field store through it borrows mutably, and a subscript into the
