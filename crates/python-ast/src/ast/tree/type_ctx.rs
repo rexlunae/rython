@@ -2542,6 +2542,9 @@ fn analyze_statement_types(
             for b in &s.body {
                 analyze_statement_types(b, info, options, symbols, self_class);
             }
+            let after_body = narrowing
+                .as_ref()
+                .and_then(|(n, _, _)| info.name_types.get(n).cloned());
             if let Some((n, _, else_ty)) = &narrowing {
                 info.name_types.insert(n.clone(), narrowed_value_type(else_ty));
             }
@@ -2549,10 +2552,27 @@ fn analyze_statement_types(
                 analyze_statement_types(b, info, options, symbols, self_class);
             }
             if let Some((n, _, _)) = &narrowing {
-                match saved {
-                    Some(t) => info.name_types.insert(n.clone(), t),
-                    None => info.name_types.remove(n),
-                };
+                // Both branches REASSIGN the name (`label = label.decode()`
+                // in each arm): the post-if type is the join of the two
+                // branch results, as a plain sequence of stores would
+                // leave it — the narrowing is temporary, a reassignment is
+                // not (Devin review on #318). One or no reassignment
+                // restores the pre-if entry: the name may still hold the
+                // original union.
+                let both_write = s.body.iter().any(|st| crate::ast::tree::expression::stmt_writes_name(st, n))
+                    && s.orelse.iter().any(|st| crate::ast::tree::expression::stmt_writes_name(st, n));
+                if both_write
+                    && let (Some(body_result), Some(else_result)) =
+                        (after_body.as_ref(), info.name_types.get(n))
+                {
+                    let joined = unify(body_result.clone(), else_result.clone());
+                    info.name_types.insert(n.clone(), joined);
+                } else {
+                    match saved {
+                        Some(t) => info.name_types.insert(n.clone(), t),
+                        None => info.name_types.remove(n),
+                    };
+                }
             }
         }
         StatementType::While(s) => {
@@ -3823,13 +3843,35 @@ pub(crate) fn comprehension_scope(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> PythonOptions {
-    let mut scope = options.clone();
+    comprehension_prefix_scopes(generators, ctx, options, symbols)
+        .pop()
+        .unwrap_or_else(|| options.clone())
+}
+
+/// The comprehension's scopes as they build, one per generator boundary:
+/// `scopes[i]` binds the targets of generators `0..i`, so generator `i`'s
+/// ITERABLE evaluates in `scopes[i]` (it cannot see its own target, nor a
+/// later one — `[x for x in xs for x in x]` iterates the OUTER `x` in the
+/// inner clause) while its target and filters, and the element, see
+/// `scopes[i + 1]`. `scopes[0]` is the outer scope; the last entry is the
+/// complete scope. Devin review on #318.
+pub(crate) fn comprehension_prefix_scopes(
+    generators: &[crate::Comprehension],
+    ctx: Option<&CodeGenContext>,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Vec<PythonOptions> {
+    let mut scopes = Vec::with_capacity(generators.len() + 1);
+    scopes.push(options.clone());
     for g in generators {
-        if let Some(elem) = iterable_element_type(&infer_type(ctx, &g.iter, &scope, symbols)) {
-            seed_binder_types(&g.target, &elem, std::rc::Rc::make_mut(&mut scope.name_types), true);
+        let prev = scopes.last().expect("the outer scope is always present");
+        let mut next = prev.clone();
+        if let Some(elem) = iterable_element_type(&infer_type(ctx, &g.iter, prev, symbols)) {
+            seed_binder_types(&g.target, &elem, std::rc::Rc::make_mut(&mut next.name_types), true);
         }
+        scopes.push(next);
     }
-    scope
+    scopes
 }
 
 /// The typing scope of a lambda body whose parameters are known from the

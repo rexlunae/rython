@@ -228,25 +228,27 @@ impl Node for DictComp {
 /// `continue`. Generators nest left-to-right, matching Python's evaluation
 /// order, and later generators may reference earlier targets.
 ///
-/// `options` is the OUTER scope and `scope` the comprehension's own (the
-/// targets typed from their iterables — `comprehension_scope`): the first
-/// generator's iterable is evaluated outside the comprehension, everything
-/// else inside it.
+/// `options` is the OUTER scope; each generator's iterable, target and
+/// filters render in the prefix scope that binds exactly the targets
+/// before / through it (`comprehension_prefix_scopes`).
 fn build_comprehension_loops(
     generators: &[Comprehension],
     inner: TokenStream,
     ctx: &CodeGenContext,
     options: &PythonOptions,
-    scope: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    let scopes = crate::comprehension_prefix_scopes(generators, Some(ctx), options, symbols);
     let mut acc = inner;
     for (i, generator) in generators.iter().enumerate().rev() {
+        // Generator i's iterable sees the targets bound BEFORE it; its
+        // target and filters see its own binding too (the prefix scopes).
+        let iter_options = &scopes[i];
+        let scope = &scopes[i + 1];
         let target = generator
             .target
             .clone()
             .to_rust(ctx.clone(), scope.clone(), symbols.clone())?;
-        let iter_options = if i == 0 { options } else { scope };
         let iter_expr = generator
             .iter
             .clone()
@@ -313,7 +315,6 @@ impl CodeGen for ListComp {
             quote! { __rython_comp.push(#elt); },
             &ctx,
             &options,
-            &scope,
             &symbols,
         )?;
         Ok(quote! {
@@ -354,7 +355,6 @@ impl CodeGen for SetComp {
             quote! { __rython_comp.insert(#elt); },
             &ctx,
             &options,
-            &scope,
             &symbols,
         )?;
         Ok(quote! {
@@ -398,7 +398,6 @@ impl CodeGen for GeneratorExp {
             quote! { __rython_comp.push(#elt); },
             &ctx,
             &options,
-            &scope,
             &symbols,
         )?;
         Ok(quote! {
@@ -441,7 +440,6 @@ impl CodeGen for DictComp {
             quote! { __rython_comp.insert(#key, #value); },
             &ctx,
             &options,
-            &scope,
             &symbols,
         )?;
         // PyDict, like dict literals: comprehension-built dicts preserve

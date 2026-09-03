@@ -16839,3 +16839,49 @@ fn the_analysis_narrows_an_isinstance_branch_like_the_lowering() {
         out
     );
 }
+
+#[test]
+fn a_nested_comprehension_binds_each_generator_in_its_prefix_scope() {
+    // Devin review on #318: generator i's iterable sees only the targets
+    // bound before it, so `for s in group` resolves `group` from the outer
+    // generator, and `s` types from it — the inner call propagates.
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def name(self) -> str:\n",
+            "        return \"shape\"\n",
+            "\n",
+            "def names(groups: list[list[Shape]]) -> list[str]:\n",
+            "    return [s.name() for group in groups for s in group]\n",
+        ),
+        "nested_comp.py",
+    );
+    assert!(
+        out.contains(". name () ?") || out.contains(".name()?"),
+        "the inner generator's target must type from the outer target: {}",
+        out
+    );
+}
+
+#[test]
+fn a_name_reassigned_in_both_narrowed_branches_keeps_the_reassigned_type() {
+    // Devin review on #318: the narrowing is temporary, a reassignment is
+    // not — after `label = label.decode(...)` in both arms, reads of
+    // `label` are str, not the parameter's boxed union.
+    let out = compile(
+        concat!(
+            "def norm(label: str | bytes) -> str:\n",
+            "    if isinstance(label, bytes):\n",
+            "        label = label.decode(\"ascii\")\n",
+            "    else:\n",
+            "        label = label.upper()\n",
+            "    return label.lower()\n",
+        ),
+        "branch_reassign.py",
+    );
+    assert!(
+        !out.contains("py_boxed_lower"),
+        "the post-if read must be the reassigned str, not the boxed union: {}",
+        out
+    );
+}
