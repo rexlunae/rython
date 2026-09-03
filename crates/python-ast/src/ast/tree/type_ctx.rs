@@ -195,10 +195,11 @@ impl TypeInfo {
     /// (`Vec::<f64>::new()`, `PyDict::<String, i64>::from([])`).
     pub fn enum_receiver_class(
         receiver: &ExprType,
+        ctx: Option<&CodeGenContext>,
         options: &crate::PythonOptions,
         symbols: &crate::SymbolTableScopes,
     ) -> Option<String> {
-        match crate::infer_type(None, receiver, options, symbols) {
+        match crate::infer_type(ctx, receiver, options, symbols) {
             TypeInfo::Class(c) => return Some(c),
             TypeInfo::Option(inner) => {
                 if let TypeInfo::Class(c) = &*inner {

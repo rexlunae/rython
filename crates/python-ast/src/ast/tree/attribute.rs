@@ -433,16 +433,20 @@ impl<'a> CodeGen for Attribute {
             _ => None,
         };
         // The fallibility rule (the review's fix 2, round 99): a method
-        // read on an Option-typed receiver of a user class is a fallible
-        // call site — computed BEFORE the moves.
-        let option_method_call_early = matches!(
-            field_access,
-            None
-        ) && option_receiver.is_some()
-            && crate::TypeInfo::enum_receiver_class(&self.value, &options, &symbols)
-                .and_then(|c| crate::resolve_class_referenced(&c, &symbols, &options))
-                .and_then(|class| class.method_on_mro(&self.attr, &symbols))
-                .is_some();
+        let wrapped_expr = crate::ExprType::Attribute(self.clone());
+        // The boxed self-referential field's read (round 99, E0072): the
+        // field's slot is Option<Box<Class>> — the value read map-derefs to
+        // Option<Class>, the type every other slot uses. Computed BEFORE
+        // the moves.
+        let boxed_field_read = matches!(
+            crate::infer_type(Some(&ctx), &self.value, &options, &symbols),
+            crate::TypeInfo::Class(ref rc)
+                if matches!(
+                    crate::infer_type(Some(&ctx), &wrapped_expr, &options, &symbols),
+                    crate::TypeInfo::Option(ref inner)
+                        if matches!(**inner, crate::TypeInfo::Class(ref fc) if fc == rc)
+                )
+        );
         let mut value_tokens = self.value.to_rust(ctx, options, symbols)?;
         let option_receiver_some = option_receiver.is_some();
         if let Some(_inner) = option_receiver {
@@ -643,14 +647,16 @@ impl<'a> CodeGen for Attribute {
             // propagates the method's Result. `depth` in
             // `(self.left).clone().unwrap().depth()` — the boxed field's
             // chain read.
-            let option_method_call = option_method_call_early;
+            let boxed_field_read = boxed_field_read && field_access.is_none();
             match field_access {
                 // A SHARED class's value is a `PyRef` (shared.rs): a read
                 // borrows the one object and clones the field out.
                 None if shared_recv => {
                     Ok(quote!((#value_tokens).borrow().#attr.clone()))
                 }
-                None if option_method_call => Ok(quote!(#value_tokens.#attr()?)),
+                None if boxed_field_read => {
+                    Ok(quote!(#value_tokens.#attr.clone().map(| b | * b)))
+                }
                 None => Ok(quote!(#value_tokens.#attr)),
                 Some(FieldRewrite::Accessor { field }) => {
                     let accessor = crate::safe_ident(&field);

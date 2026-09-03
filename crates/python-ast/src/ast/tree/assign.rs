@@ -1582,6 +1582,19 @@ impl<'a> CodeGen for Assign {
                 // The target is a STORE into the hoisted binding — never an
                 // unwrap, even when the name is narrowed (issue #125): the
                 // binding stays Option<T> and the store wraps in Some below.
+                // A SELF-REFERENTIAL boxed slot (the annotation is
+                // `Optional[Node]` inside Node — round 99, E0072): the
+                // binding holds Option<Box<Node>> and plain-value stores
+                // wrap in Some(Box::new(...)).
+                let boxed_slot = matches!(
+                    self.annotation.as_ref(),
+                    Some(ann) if matches!(
+                        crate::resolve_alias_typeinfo(ann, &symbols, &options),
+                        Some(crate::TypeInfo::Option(ref inner))
+                            if matches!(**inner, crate::TypeInfo::Class(ref c)
+                                if c.as_str() == ctx.enclosing_class_name().unwrap_or_default())
+                    )
+                );
                 let target_code = {
                     let mut store_options = options.clone();
                     store_options.narrowed_names =
@@ -1597,13 +1610,18 @@ impl<'a> CodeGen for Assign {
                 // the Some wrap lands on the typed container, not on a bare
                 // vec![] that rustc cannot infer.
                 let value = if is_empty_container_literal(&value_expr) {
-                    quote!(Some(#value))
+                    if boxed_slot {
+                        quote!(Some(Box::new(#value)))
+                    } else {
+                        quote!(Some(#value))
+                    }
                 } else {
                     crate::lower_optional_value(
                         &value_expr,
                         ctx.clone(),
                         options.clone(),
                         symbols.clone(),
+                        boxed_slot,
                     )?
                 };
                 return Ok(quote!(#target_code = #value;));

@@ -4011,6 +4011,7 @@ pub(crate) fn lower_optional_value(
     ctx: CodeGenContext,
     options: PythonOptions,
     symbols: SymbolTableScopes,
+    boxed: bool,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
     // Conditionals recurse per arm FIRST: even when one arm makes the whole
     // expression Option-typed (e.g. an `else None`), the other arm may be a
@@ -4018,8 +4019,8 @@ pub(crate) fn lower_optional_value(
     if let ExprType::IfExp(e) = expr {
         let test =
             crate::condition_to_rust(&e.test, ctx.clone(), options.clone(), symbols.clone())?;
-        let body = lower_optional_value(&e.body, ctx.clone(), options.clone(), symbols.clone())?;
-        let orelse = lower_optional_value(&e.orelse, ctx, options, symbols)?;
+        let body = lower_optional_value(&e.body, ctx.clone(), options.clone(), symbols.clone(), boxed)?;
+        let orelse = lower_optional_value(&e.orelse, ctx, options, symbols, boxed)?;
         return Ok(quote!(if #test { #body } else { #orelse }));
     }
     if is_none_expr(expr) || expr_yields_option(expr, &options, &symbols) {
@@ -4081,6 +4082,13 @@ pub(crate) fn lower_optional_value(
         if matches!(&c.0, Some(litrs::Literal::String(_))))
     {
         return Ok(quote!(Some((#tokens).to_string())));
+    }
+    // A SELF-REFERENTIAL boxed slot (the annotation is
+    // `Optional[Node]` inside Node — round 99, E0072): the binding holds
+    // Option<Box<Node>> and the plain-value store wraps in
+    // Some(Box::new(...)).
+    if boxed {
+        return Ok(quote!(Some(Box::new((#tokens).clone()))));
     }
     Ok(quote!(Some(#tokens)))
 }

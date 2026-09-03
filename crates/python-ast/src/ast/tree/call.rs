@@ -1895,7 +1895,7 @@ impl<'a> CodeGen for Call {
                             true
                         } else {
                             crate::TypeInfo::enum_receiver_class(
-                                &attr.value, &options, &symbols,
+                                &attr.value, Some(&ctx), &options, &symbols,
                             )
                             .and_then(|c| crate::resolve_class_referenced(&c, &symbols, &options))
                             .and_then(|class| class.method_on_mro(&attr.attr, &symbols))
@@ -10357,7 +10357,7 @@ fn map_call_arguments_inner(
             // optional slot): map the conversion over the Option — None
             // passes through, Some converts loudly.
             let optional_tokens =
-                crate::lower_optional_value(expr, ctx.clone(), options.clone(), symbols.clone())?;
+                crate::lower_optional_value(expr, ctx.clone(), options.clone(), symbols.clone(), false)?;
             if let (Some(inner), crate::TypeInfo::Option(inner_arg)) =
                 (&inner_expected, &arg_infers)
             {
