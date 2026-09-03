@@ -16787,3 +16787,29 @@ fn a_comprehension_element_type_is_the_body_type_in_the_comprehension_scope() {
         out
     );
 }
+
+#[test]
+fn a_local_bound_to_a_comprehension_carries_its_element_type() {
+    // `squares = [s for s in shapes if ...]` is a list of shapes' element,
+    // so a later comprehension over `squares` resolves the receiver and
+    // propagates the method call's Result.
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def name(self) -> str:\n",
+            "        return \"shape\"\n",
+            "    def big(self) -> bool:\n",
+            "        return True\n",
+            "\n",
+            "def names(shapes: list[Shape]) -> list[str]:\n",
+            "    bigs = [s for s in shapes if s.big()]\n",
+            "    return [s.name() for s in bigs]\n",
+        ),
+        "comp_local.py",
+    );
+    assert!(
+        out.contains(". name () ?") || out.contains(".name()?"),
+        "the comprehension-bound local must carry the element type: {}",
+        out
+    );
+}

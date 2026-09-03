@@ -2242,6 +2242,25 @@ fn analyze_function_types_inner(
     info
 }
 
+/// The options a statement's inference sees: the function's incoming
+/// options with every local the analysis has typed SO FAR overlaid, so a
+/// later statement's inference sees the earlier locals (`squares = [s for
+/// s in shapes ...]` then `[s.name() for s in squares]`) the way the
+/// lowering will. The analysis is flow-sensitive through this view; the
+/// parameters are seeded into the incoming options by the caller.
+fn analysis_view(options: &PythonOptions, info: &FunctionTypeInfo) -> PythonOptions {
+    if info.name_types.is_empty() {
+        return options.clone();
+    }
+    let mut view = options.clone();
+    let mut names = view.name_types.as_ref().clone();
+    for (n, t) in &info.name_types {
+        names.insert(n.clone(), t.clone());
+    }
+    view.name_types = std::rc::Rc::new(names);
+    view
+}
+
 fn analyze_statement_types(
     stmt: &Statement,
     info: &mut FunctionTypeInfo,
@@ -2310,13 +2329,32 @@ fn analyze_statement_types(
                                         (Some(options), Some(symbols)) => Some(infer_type(
                                             analysis_ctx.as_ref(),
                                             &assign.value,
-                                            options,
+                                            &analysis_view(options, info),
                                             symbols,
                                         )),
                                         _ => None,
                                     }
                                 })
                                 .unwrap_or_else(|| syntactic_type(&assign.value))
+                        }
+                        // A COMPREHENSION value types from its body in the
+                        // comprehension's scope (`squares = [s for s in
+                        // shapes if ...]` is a Vec of shapes' element), which
+                        // only the context-aware inferrer can see; the
+                        // enclosing class makes a `self.<field>` iterable
+                        // resolvable.
+                        ExprType::ListComp(_) | ExprType::SetComp(_) | ExprType::DictComp(_) => {
+                            let analysis_ctx =
+                                self_class.map(|cl| CodeGenContext::Class(cl.to_string()));
+                            match (options, symbols) {
+                                (Some(options), Some(symbols)) => infer_type(
+                                    analysis_ctx.as_ref(),
+                                    &assign.value,
+                                    &analysis_view(options, info),
+                                    symbols,
+                                ),
+                                _ => syntactic_type(&assign.value),
+                            }
                         }
                         // A BINOP value needs the context-aware inferrer:
                         // `y = x + b"c"` is bytes (bytes + bytes), which
@@ -2326,7 +2364,7 @@ fn analyze_statement_types(
                         // only infer_type has the operand types.
                         ExprType::BinOp(_) => match (options, symbols) {
                             (Some(options), Some(symbols)) => {
-                                infer_type(None, &assign.value, options, symbols)
+                                infer_type(None, &assign.value, &analysis_view(options, info), symbols)
                             }
                             _ => syntactic_type(&assign.value),
                         },
@@ -2342,7 +2380,7 @@ fn analyze_statement_types(
                         _ if crate::ast::tree::assign::is_container_literal(&assign.value) => match (options, symbols)
                         {
                             (Some(options), Some(symbols)) => {
-                                infer_type(None, &assign.value, options, symbols)
+                                infer_type(None, &assign.value, &analysis_view(options, info), symbols)
                             }
                             _ => syntactic_type(&assign.value),
                         },
@@ -2355,7 +2393,7 @@ fn analyze_statement_types(
                         // Some-wrap (round 45).
                         ExprType::Name(_) => match (options, symbols) {
                             (Some(options), Some(symbols)) => {
-                                infer_type(None, &assign.value, options, symbols)
+                                infer_type(None, &assign.value, &analysis_view(options, info), symbols)
                             }
                             _ => syntactic_type(&assign.value),
                         },
@@ -2501,7 +2539,7 @@ fn analyze_statement_types(
                 // pre-ctx behavior stands (round 99).
                 let analysis_ctx = self_class.map(|c| CodeGenContext::Class(c.to_string()));
                 let iter_ty =
-                    infer_type(analysis_ctx.as_ref(), &s.iter, options, symbols);
+                    infer_type(analysis_ctx.as_ref(), &s.iter, &analysis_view(options, info), symbols);
                 if let Some(elem) = iterable_element_type(&iter_ty) {
                     seed_binder_types(&s.target, &elem, &mut info.name_types, false);
                 }

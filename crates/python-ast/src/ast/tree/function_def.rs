@@ -1534,9 +1534,34 @@ impl FunctionDef {
         // pinned by later use. Annotation-derived types win over
         // assignment-inferred ones, matching local_types above.
         {
+            // The body analysis sees the PARAMETERS' annotated types (the
+            // one annotation authority), so a local bound to an expression
+            // over a parameter (`bigs = [s for s in shapes if ...]`) types
+            // from it; the full parameter seeding below still runs last
+            // and wins.
+            let analysis_options = {
+                let mut seeded = options.clone();
+                let mut names = seeded.name_types.as_ref().clone();
+                for p in self
+                    .args
+                    .args
+                    .iter()
+                    .chain(self.args.posonlyargs.iter())
+                    .chain(self.args.kwonlyargs.iter())
+                {
+                    if let Some(ann) = p.annotation.as_deref()
+                        && let Some(t) = crate::resolve_alias_typeinfo(ann, &symbols, &options)
+                            .or_else(|| crate::annotation_type_info(ann))
+                    {
+                        names.entry(p.arg.clone()).or_insert(t);
+                    }
+                }
+                seeded.name_types = std::rc::Rc::new(names);
+                seeded
+            };
             let mut info = crate::analyze_function_types_with_class(
                 &effective_body,
-                Some(&options),
+                Some(&analysis_options),
                 Some(&symbols),
                 ctx.enclosing_class_name(),
             );
