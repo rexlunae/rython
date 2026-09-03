@@ -493,6 +493,25 @@ impl<'a> CodeGen for Assign {
         // name-store rule above). A value that already yields an Option
         // (another optional field, dict.get, an Optional-returning call)
         // stores through unchanged — wrapping again would nest.
+        let boxed_self_ref_field = |target: &ExprType| -> bool {
+            let ExprType::Attribute(attr) = target else {
+                return false;
+            };
+            let Some(cls) = ctx.enclosing_class_name() else {
+                return false;
+            };
+            let ExprType::Name(recv) = attr.value.as_ref() else {
+                return false;
+            };
+            if recv.id != "self" {
+                return false;
+            }
+            matches!(
+                crate::infer_type(Some(&ctx), target, &options, &symbols),
+                crate::TypeInfo::Option(inner)
+                    if matches!(*inner, crate::TypeInfo::Class(ref c) if c.as_str() == cls)
+            )
+        };
         let attr_field_is_option = |target: &ExprType| -> bool {
             let ExprType::Attribute(attr) = target else {
                 return false;
@@ -1118,8 +1137,17 @@ impl<'a> CodeGen for Assign {
                     // A reused name clones INTO the Some (the field owns
                     // the value and the name is read again later —
                     // charset_normalizer's `_last_printable_char =
-                    // character`).
-                    if stored_name_needs_clone {
+                    // character`). A SELF-REFERENTIAL boxed field owns its
+                    // children through Box (round 99, E0072): the store
+                    // wraps in Box::new so the Option<Box<Class>> slot
+                    // accepts the plain instance.
+                    if boxed_self_ref_field(target) {
+                        if stored_name_needs_clone {
+                            quote!(#target_code = Some(Box::new((#value).clone()));)
+                        } else {
+                            quote!(#target_code = Some(Box::new(#value));)
+                        }
+                    } else if stored_name_needs_clone {
                         quote!(#target_code = Some((#value).clone());)
                     } else {
                         quote!(#target_code = Some(#value);)
@@ -1554,6 +1582,22 @@ impl<'a> CodeGen for Assign {
                 // The target is a STORE into the hoisted binding — never an
                 // unwrap, even when the name is narrowed (issue #125): the
                 // binding stays Option<T> and the store wraps in Some below.
+                // A SELF-REFERENTIAL boxed slot (the annotation is
+                // `Optional[Node]` inside Node — round 99, E0072): the
+                // binding holds Option<Box<Node>> and plain-value stores
+                // wrap in Some(Box::new(...)).
+                // The slot's type comes from the ANALYSIS's record (the
+                // annotation may live on a separate AnnotatedName
+                // statement — `node: Optional[Node] = self` — whose plain
+                // re-stores carry no annotation): Option(Class(C)) where
+                // C is the enclosing class is the boxed self-referential
+                // slot (round 99, E0072).
+                let boxed_slot = matches!(
+                    options.name_types.get(&name.id),
+                    Some(crate::TypeInfo::Option(inner))
+                        if matches!(**inner, crate::TypeInfo::Class(ref c)
+                            if c.as_str() == ctx.enclosing_class_name().unwrap_or_default())
+                );
                 let target_code = {
                     let mut store_options = options.clone();
                     store_options.narrowed_names =
@@ -1569,14 +1613,27 @@ impl<'a> CodeGen for Assign {
                 // the Some wrap lands on the typed container, not on a bare
                 // vec![] that rustc cannot infer.
                 let value = if is_empty_container_literal(&value_expr) {
-                    quote!(Some(#value))
+                    if boxed_slot {
+                        quote!(Some(Box::new(#value)))
+                    } else {
+                        quote!(Some(#value))
+                    }
                 } else {
-                    crate::lower_optional_value(
+                    let tokens = crate::lower_optional_value(
                         &value_expr,
                         ctx.clone(),
                         options.clone(),
                         symbols.clone(),
-                    )?
+                        boxed_slot,
+                    )?;
+                    // A boxed slot whose value is already the PLAIN Option
+                    // (a boxed-field read — `node = node.left` — round 99):
+                    // re-box the inner to the slot's Option<Box<Class>>.
+                    if boxed_slot && value_yields_option {
+                        quote!(#tokens . map (| __rython_v | Box :: new (__rython_v)))
+                    } else {
+                        tokens
+                    }
                 };
                 return Ok(quote!(#target_code = #value;));
             }

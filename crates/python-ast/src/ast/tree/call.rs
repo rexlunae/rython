@@ -1743,6 +1743,16 @@ impl<'a> CodeGen for Call {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        if let ExprType::Attribute(a) = self.func.as_ref() {
+            if matches!(a.attr.as_str(), "insert" | "depth" | "inorder") {
+                let recv_dbg = match a.value.as_ref() {
+                    crate::ExprType::Name(n) => format!("Name({})", n.id),
+                    crate::ExprType::Attribute(x) => format!("Attr(.{})", x.attr),
+                    _ => "other".to_string(),
+                };
+                eprintln!("R99ENTRY {} recv={} ctx={:?}", a.attr, recv_dbg, std::mem::discriminant(&ctx));
+            }
+        }
         // typing-module calls are compile-time-only: TypeVar, Protocol,
         // TypeAlias, runtime_checkable, Literal, ... exist only for
         // the type system (annotations are strings under `from __future__
@@ -1879,8 +1889,28 @@ impl<'a> CodeGen for Call {
             ExprType::Attribute(attr) => {
                 let root = crate::ast::tree::call::root_name(&attr.value);
                 match root {
+                    // A USER METHOD is fallible by construction (every
+                    // generated method returns Result<_, PyException>):
+                    // the receiver's class resolves (direct, unwrap-chain,
+                    // or a fetch call — the shared helper) and the method
+                    // exists on its MRO. Fallibility is a property of the
+                    // EXPRESSION (the review's fix 2, round 99) — the
+                    // generic path renders lambdas, comprehension
+                    // elements, and print arguments, and each propagates
+                    // the same way the resolved arm does.
                     Some(root) if !crate::is_stdpython_module(&root) => {
-                        crate::ast::tree::attribute::is_module_path_chain(&attr.value, &symbols, &options)
+                        if crate::ast::tree::attribute::is_module_path_chain(
+                            &attr.value, &symbols, &options,
+                        ) {
+                            true
+                        } else {
+                            crate::TypeInfo::enum_receiver_class(
+                                &attr.value, Some(&ctx), &options, &symbols,
+                            )
+                            .and_then(|c| crate::resolve_class_referenced(&c, &symbols, &options))
+                            .and_then(|class| class.method_on_mro(&attr.attr, &symbols))
+                            .is_some()
+                        }
                     }
                     Some(root) if crate::is_stdpython_module(&root) => {
                         FALLIBLE_STDLIB_FN.contains(&attr.attr.as_str())
@@ -5717,6 +5747,9 @@ impl<'a> CodeGen for Call {
                 if let Some(method) =
                     class.method_on_mro_with_options(&attr.attr, &class_symbols, &options)
                 {
+                    if attr.attr == "depth" {
+                        eprintln!("R99DEPTHPROCEED");
+                    }
                     if method.name == "__init__" && class.init_method().is_none() {
                         return Err(format!(
                             "`self.__init__(...)` calling an inherited `__init__` is not \
@@ -5767,6 +5800,7 @@ impl<'a> CodeGen for Call {
                     // **kwargs)` — botocore's S3EndpointSetter, where the
                     // field is registered externally and never stored in
                     // __init__): the class has no stored field of this
+                        eprintln!("R99SITE5794");
                     // name, so the KEYWORD-style call cannot be the
                     // zero-parameter method — the external field is
                     // unmodeled — the call is dropped (external-field
@@ -5911,6 +5945,9 @@ impl<'a> CodeGen for Call {
                             &options,
                         )
                     {
+                        eprintln!("R99CALLOPTION {}", attr.attr);
+                        eprintln!("R99RESOLVEDOPT {} mutates={}", attr.attr, mutates_receiver);
+                        eprintln!("R99OPTARM {} mutates={}", attr.attr, mutates_receiver);
                         let mname = attr.attr.clone();
                         // A SHARED class mutates through the borrow: the
                         // Option unwrap clones the reference either way.
@@ -6003,7 +6040,36 @@ impl<'a> CodeGen for Call {
             // load form (`self.items()`) clones the field: the mutable
             // accessor (`self.items_mut()`) keeps the write on the real
             // field.
-            let mutating_self_field = (ctx.in_generic_trait()
+            // A BOXED self-referential field's mutating call
+            // (`self.left.insert(key)` — the corpus's insert, round 99):
+            // the clone-unwrap would mutate a COPY of the child — the
+            // mutation must reach the real child through the Box's
+            // as_mut. The field's slot is Option<Box<Class>> of the
+            // ENCLOSING class.
+            let boxed_self_ref_receiver = false;
+                        // A BOXED self-referential field chain (`root.left.insert(k)`
+            // in main — the local root: Class(Node), the field left: the
+            // boxed self-ref field): the clone-unwrap would mutate a COPY
+            // of the child; the mutation must reach the real child through
+            // the Box's as_mut (round 99).
+            // A BOXED self-referential field chain (`root.left.insert(k)`
+            // — the local root: Class(Node), the field left: the boxed
+            // self-ref field): the clone-unwrap would mutate a COPY of
+            // the child. The func renders through the place machinery
+            // (`self.left.as_mut().unwrap()`), keeping the method name on
+            // the call — the mutation reaches the real child (round 99).
+            let boxed_field_chain = matches!(attr.value.as_ref(), ExprType::Attribute(_))
+                && crate::TypeInfo::enum_receiver_class(&attr.value, Some(&ctx), &options, &symbols)
+                    .map(|c| {
+                        crate::resolve_class_referenced(&c, &symbols, &options)
+                            .is_some_and(|class| {
+                                class.method_needs_mut_self(&attr.attr, &symbols, &options)
+                            })
+                    })
+                    .unwrap_or(false);
+let mutating_self_field = boxed_self_ref_receiver
+                || boxed_field_chain
+                || (ctx.in_generic_trait()
                 && matches!(attr.value.as_ref(), ExprType::Attribute(_))
                 && crate::ast::tree::attribute::chain_root_is_self(&attr.value))
                 // A container field of a NARROWED root-typed name
@@ -6027,7 +6093,10 @@ impl<'a> CodeGen for Call {
             // Computed BEFORE attr.value is moved below.
             let option_receiver =
                 crate::ast::tree::attribute::receiver_option_inner(&attr.value, &ctx, &symbols, &options);
-            let receiver = if (matches!(attr.value.as_ref(), ExprType::Subscript(_))
+            if option_receiver.is_some() && matches!(attr.attr.as_str(), "insert" | "depth") {
+                eprintln!("R99GENOPT {}", attr.attr);
+            }
+                        let receiver = if (matches!(attr.value.as_ref(), ExprType::Subscript(_))
                 || mutating_self_field)
                 && crate::ast::tree::scope::mutates_receiver(&attr.attr)
             {
@@ -7854,9 +7923,40 @@ impl<'a> CodeGen for Call {
             return Ok(quote!(#module::#cname::new(#(#args),*)));
         }
 
-        let name = self
-            .func
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        // The fallibility rule's mutation half (the review's fix 2 +
+        // fix 4, round 99): a METHOD call whose receiver resolves to a
+        // user class and whose method takes &mut self renders the
+        // receiver chain as a PLACE (`self.left.insert(k)` → the
+        // `as_mut` unwrap mutates the REAL child through the Box; the
+        // read form's clone would mutate a copy).
+        let name = if let ExprType::Attribute(attr) = self.func.as_ref() {
+            let is_user_mut = crate::TypeInfo::enum_receiver_class(
+                &attr.value, Some(&ctx), &options, &symbols,
+            )
+            .and_then(|c| crate::resolve_class_referenced(&c, &symbols, &options))
+            .is_some_and(|class| {
+                class.method_on_mro(&attr.attr, &symbols).is_some()
+                    && class.method_needs_mut_self(&attr.attr, &symbols, &options)
+            });
+            if is_user_mut && crate::ast::tree::scope::mutates_receiver(&attr.attr) {
+                let place = crate::ast::tree::attribute::to_rust_place_expr(
+                    &attr.value,
+                    &ctx,
+                    &options,
+                    &symbols,
+                    false,
+                )?;
+                let m_ident = crate::safe_ident(&attr.attr);
+                // The slot is Option<Box<Class>>: as_mut gives
+                // &mut Box<Class> (autoderefs to &mut Class for the
+                // method) — the mutation reaches the real child.
+                quote!(#place . as_mut () . unwrap () . #m_ident)
+            } else {
+                self.func.to_rust(ctx.clone(), options.clone(), symbols.clone())?
+            }
+        } else {
+            self.func.to_rust(ctx.clone(), options.clone(), symbols.clone())?
+        };
 
         let mut all_args = Vec::new();
 
@@ -10329,7 +10429,7 @@ fn map_call_arguments_inner(
             // optional slot): map the conversion over the Option — None
             // passes through, Some converts loudly.
             let optional_tokens =
-                crate::lower_optional_value(expr, ctx.clone(), options.clone(), symbols.clone())?;
+                crate::lower_optional_value(expr, ctx.clone(), options.clone(), symbols.clone(), false)?;
             if let (Some(inner), crate::TypeInfo::Option(inner_arg)) =
                 (&inner_expected, &arg_infers)
             {

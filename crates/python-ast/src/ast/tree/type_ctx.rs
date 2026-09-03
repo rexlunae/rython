@@ -193,6 +193,43 @@ impl TypeInfo {
 
     /// Render the Rust type name, for typed empty containers
     /// (`Vec::<f64>::new()`, `PyDict::<String, i64>::from([])`).
+    pub fn enum_receiver_class(
+        receiver: &ExprType,
+        ctx: Option<&CodeGenContext>,
+        options: &crate::PythonOptions,
+        symbols: &crate::SymbolTableScopes,
+    ) -> Option<String> {
+        match crate::infer_type(ctx, receiver, options, symbols) {
+            TypeInfo::Class(c) => return Some(c),
+            TypeInfo::Option(inner) => {
+                if let TypeInfo::Class(c) = &*inner {
+                    return Some(c.clone());
+                }
+            }
+            _ => {}
+        }
+        if let ExprType::Call(call) = receiver {
+            match crate::call_return_typeinfo(call, Some(symbols), Some(options)) {
+                Some(TypeInfo::Class(c)) => return Some(c),
+                Some(TypeInfo::Option(inner)) => {
+                    if let TypeInfo::Class(c) = &*inner {
+                        return Some(c.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let root = crate::ast::tree::type_ctx::reuse_root_name(receiver)?;
+        match options.name_types.get(&root) {
+            Some(TypeInfo::Class(c)) => Some(c.clone()),
+            Some(TypeInfo::Option(inner)) => match &**inner {
+                TypeInfo::Class(c) => Some(c.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn to_rust_type(&self) -> TokenStream {
         match self {
             TypeInfo::Int => quote!(i64),
@@ -2622,8 +2659,16 @@ fn analyze_statement_types(
             if let Some(t) = crate::annotation_type_info(annotation)
                 .or_else(|| crate::resolve_alias_typeinfo(annotation, symbols?, options?))
             {
+                let is_option = matches!(t, TypeInfo::Option(_));
                 info.name_types.insert(name.clone(), t);
                 info.annotated_names.insert(name.clone());
+                // An `Optional[...]`-annotated local is an Option binding:
+                // the stores pass through unwrapped and None is a value
+                // (`node: Optional[Node] = self` — the corpus's contains,
+                // round 99).
+                if is_option {
+                    info.optional_names.insert(name.clone());
+                }
             }
         }
         StatementType::Assign(assign) => {
@@ -2655,7 +2700,16 @@ fn analyze_statement_types(
                     })
                 {
                     // An annotation pins the type outright.
-                    Some(ann) => ann,
+                    Some(ann) => {
+                        // An `Optional[...]`-annotated local is an Option
+                        // binding (`node: Optional[Node] = self` — the
+                        // corpus's contains, round 99): the stores pass
+                        // through unwrapped and None is a value.
+                        if matches!(ann, TypeInfo::Option(_)) {
+                            info.optional_names.insert(name.id.clone());
+                        }
+                        ann
+                    }
                     // Unparseable annotation: a call to a known function
                     // resolves through its (alias-aware) return type
                     // (`chunk_languages = cached_coherence_ratio(...)` →

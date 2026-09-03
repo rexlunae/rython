@@ -3534,6 +3534,48 @@ pub(crate) fn expr_yields_option_ctx(
                         })
                 })
         };
+    // A FIELD READ of a BOXED self-referential field (`node.left` where
+    // the slot is Option<Box<Node>> — the corpus's contains, round 99):
+    // the read yields the Option<Node> the boxing derefs to — a store
+    // into the boxed slot re-boxes it. Scoped to the boxed-self-ref shape
+    // so the broad field-read passes through stay unchanged.
+    if let ExprType::Attribute(attr) = expr
+        && let Some(c) = crate::TypeInfo::enum_receiver_class(
+            &attr.value, Some(ctx), options, symbols,
+        )
+        && crate::TypeInfo::enum_receiver_class(&attr.value, Some(ctx), options, symbols)
+            .and_then(|rc| crate::resolve_class_referenced(&rc, symbols, options))
+            .and_then(|class| {
+                class
+                    .infer_fields(symbols, options)
+                    .ok()
+                    .and_then(|fields| {
+                        fields
+                            .iter()
+                            .find(|(name, _)| name == &attr.attr)
+                            .map(|(_, t)| t.clone())
+                    })
+            })
+            .is_some_and(|t| {
+                matches!(
+                    t,
+                    crate::TypeInfo::Option(ref inner)
+                        if matches!(
+                            **inner,
+                            crate::TypeInfo::Class(ref fc) if *fc == c
+                        )
+                )
+            })
+    {
+        return true;
+    }
+    // A CONDITIONAL whose arms yield Options (`node = node.left if key <
+    // node.key else node.right` — the idiom corpus's contains, round 99):
+    // CPython's result is one of the arms — an Option when EITHER is.
+    if let ExprType::IfExp(e) = expr {
+        return expr_yields_option_ctx(&e.body, ctx, options, symbols)
+            || expr_yields_option_ctx(&e.orelse, ctx, options, symbols);
+    }
     // A SELF-FIELD ACCESSOR CALL (`self._tunnel_host()` — the field's
     // generated getter): an Option-typed field's accessor returns the
     // Option, so the call yields one — a store into an Option local must
@@ -4011,6 +4053,7 @@ pub(crate) fn lower_optional_value(
     ctx: CodeGenContext,
     options: PythonOptions,
     symbols: SymbolTableScopes,
+    boxed: bool,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
     // Conditionals recurse per arm FIRST: even when one arm makes the whole
     // expression Option-typed (e.g. an `else None`), the other arm may be a
@@ -4018,8 +4061,8 @@ pub(crate) fn lower_optional_value(
     if let ExprType::IfExp(e) = expr {
         let test =
             crate::condition_to_rust(&e.test, ctx.clone(), options.clone(), symbols.clone())?;
-        let body = lower_optional_value(&e.body, ctx.clone(), options.clone(), symbols.clone())?;
-        let orelse = lower_optional_value(&e.orelse, ctx, options, symbols)?;
+        let body = lower_optional_value(&e.body, ctx.clone(), options.clone(), symbols.clone(), boxed)?;
+        let orelse = lower_optional_value(&e.orelse, ctx, options, symbols, boxed)?;
         return Ok(quote!(if #test { #body } else { #orelse }));
     }
     if is_none_expr(expr) || expr_yields_option(expr, &options, &symbols) {
@@ -4068,9 +4111,21 @@ pub(crate) fn lower_optional_value(
         // the Python object is shared by reference, so the clone is the
         // faithful copy.
         if matches!(expr, ExprType::Attribute(_)) {
-            return Ok(quote!((#tokens).clone()));
+            // A boxed slot (round 99): the read's Option<Box<Class>>
+            // map-derefs to Option<Class> — the slot's type.
+            let read = if boxed {
+                quote!((#tokens).clone().map(| b | * b))
+            } else {
+                quote!((#tokens).clone())
+            };
+            return Ok(read);
         }
-        return Ok(tokens);
+        let read = if boxed {
+            quote!((#tokens).map(| b | * b))
+        } else {
+            tokens
+        };
+        return Ok(read);
     }
     let tokens = expr.clone().to_rust(ctx, options, symbols)?;
     // A string LITERAL lowers to `&'static str`; an Option<String> slot
@@ -4081,6 +4136,13 @@ pub(crate) fn lower_optional_value(
         if matches!(&c.0, Some(litrs::Literal::String(_))))
     {
         return Ok(quote!(Some((#tokens).to_string())));
+    }
+    // A SELF-REFERENTIAL boxed slot (the annotation is
+    // `Optional[Node]` inside Node — round 99, E0072): the binding holds
+    // Option<Box<Node>> and the plain-value store wraps in
+    // Some(Box::new(...)).
+    if boxed {
+        return Ok(quote!(Some(Box::new((#tokens).clone()))));
     }
     Ok(quote!(Some(#tokens)))
 }

@@ -432,6 +432,7 @@ impl<'a> CodeGen for Attribute {
             CodeGenContext::Trait { class, generic: true, .. } => Some(class.clone()),
             _ => None,
         };
+        // The fallibility rule (the review's fix 2, round 99): a method
         let mut value_tokens = self.value.to_rust(ctx, options, symbols)?;
         if let Some(_inner) = option_receiver {
             let attr_name = self.attr.clone();
@@ -624,11 +625,22 @@ impl<'a> CodeGen for Attribute {
             if property_getter && field_access.is_none() {
                 return Ok(quote!(#value_tokens.#attr()?));
             }
+            // The fallibility rule (the review's fix 2, round 99): a
+            // METHOD name read on an Option-typed receiver of a user class
+            // is a fallible call site — the read carries `?` so the call
+            // The value-read deref lives in lower_optional_value's boxed
+            // passthrough (one map per read — the double-map here fired
+            // twice on the nested chains, round 99); the method-receiver
+            // reads keep the plain form (Box autoderefs).
+            let boxed_field_read = false;
             match field_access {
                 // A SHARED class's value is a `PyRef` (shared.rs): a read
                 // borrows the one object and clones the field out.
                 None if shared_recv => {
                     Ok(quote!((#value_tokens).borrow().#attr.clone()))
+                }
+                None if boxed_field_read => {
+                    Ok(quote!(#value_tokens.#attr.clone().map(| b | * b)))
                 }
                 None => Ok(quote!(#value_tokens.#attr)),
                 Some(FieldRewrite::Accessor { field }) => {

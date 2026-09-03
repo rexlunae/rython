@@ -253,12 +253,42 @@ fn build_comprehension_loops(
         // loop consumes it, and a name read again later (`sum(s.area()
         // for s in shapes)` then `max(shapes, ...)` — the idiom corpus's
         // shapes) would otherwise be a use after move (E0382).
-        let iter_expr = crate::render_reused(
-            &generator.iter,
-            ctx.clone(),
-            iter_options.clone(),
-            symbols.clone(),
-        )?;
+        // An ALL-CONSTANT tuple iterable (`for k in (35, 36, 80)` — the
+        // idiom corpus's tree, round 99) iterates as an array of the
+        // element tokens, the same rule the for-statement lowering uses
+        // (E0277: the Rust tuple is not IntoIterator).
+        let iter_expr = match &generator.iter {
+            ExprType::Tuple(t)
+                if t.elts.iter().all(|e| {
+                    matches!(e, ExprType::Constant(_) | ExprType::UnaryOp(_))
+                }) =>
+            {
+                let mut elts = Vec::with_capacity(t.elts.len());
+                for elt in &t.elts {
+                    let tok = elt.clone().to_rust(
+                        ctx.clone(),
+                        iter_options.clone(),
+                        symbols.clone(),
+                    )?;
+                    if matches!(
+                        elt,
+                        ExprType::Constant(c)
+                            if matches!(&c.0, Some(litrs::Literal::String(_)))
+                    ) {
+                        elts.push(quote!((#tok).to_string()));
+                    } else {
+                        elts.push(tok);
+                    }
+                }
+                quote!([#(#elts),*])
+            }
+            _ => crate::render_reused(
+                &generator.iter,
+                ctx.clone(),
+                iter_options.clone(),
+                symbols.clone(),
+            )?,
+        };
         let conditions: Result<Vec<_>, _> = generator
             .ifs
             .iter()
