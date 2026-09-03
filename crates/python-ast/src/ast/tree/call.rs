@@ -5097,9 +5097,16 @@ impl<'a> CodeGen for Call {
                     }
                     Some(crate::SymbolTableNode::Alias(_))
                     | Some(crate::SymbolTableNode::Assign { value: ExprType::Name(_), .. }) => {
-                        crate::safe_ident(&crate::ast::tree::hierarchy::canonical_class_name(
-                            &n.id, &symbols,
-                        ))
+                        // Only a class THIS module defines: an import alias
+                        // (`Timeout as TimeoutSauce` — requests' adapters)
+                        // is bound under the alias by its `use`.
+                        let canonical =
+                            crate::ast::tree::hierarchy::canonical_class_name(&n.id, &symbols);
+                        if matches!(symbols.get(&canonical), Some(crate::SymbolTableNode::ClassDef(_))) {
+                            crate::safe_ident(&canonical)
+                        } else {
+                            crate::safe_ident(&n.id)
+                        }
                     }
                     _ => crate::safe_ident(&n.id),
                 };
