@@ -1,7 +1,7 @@
 {
-  "rypip_commit": "1e72e75",
+  "rypip_commit": "d43a840",
   "rypip_path": "/home/user/rython/target/debug/rypip",
-  "elapsed_seconds": 866.2,
+  "elapsed_seconds": 794.1,
   "packages": {
     "urllib3": {
       "total": 789,
@@ -182,10 +182,10 @@
       "build_status": 0
     },
     "idna": {
-      "total": 53,
+      "total": 52,
       "histogram": {
-        "E0308": 29,
-        "E0599": 12,
+        "E0308": 30,
+        "E0599": 10,
         "E0277": 6,
         "E0382": 5,
         "E0432": 1
@@ -198,6 +198,7 @@
         "&PyValue | &{integer}": 1,
         "&PyValue | &String": 1,
         "Vec<_> | PyValue": 1,
+        "&[u8] | Vec<u8>": 1,
         "String | PyValue": 1,
         "PyValue | Vec<u8>": 1,
         "&[Vec<u8>] | &Vec<PyValue>": 1,
