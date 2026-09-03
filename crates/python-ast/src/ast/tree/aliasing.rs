@@ -448,9 +448,25 @@ fn function_mutates_param(func: &FunctionDef, index: usize) -> bool {
 /// anywhere in a statement's expressions (`x = name.pop()` included). A
 /// bare-name store only rebinds the local, which does not touch the
 /// caller's object.
+///
+/// Scopes: a nested def that mutates a name it does NOT bind mutates the
+/// parameter through its closure (`def bump(): xs.append(1)`, called
+/// later); one that binds the name itself (its own parameter, a local)
+/// talks about its own value and is no mutation of ours (Devin review on
+/// #323). A class body runs in place, its methods under the same rule. A
+/// lambda body is read as a mutation wherever it appears — it may be
+/// called, and a false "mutates" is a loud refusal where a false "does
+/// not" would be a silent copy.
 fn scan_mutations(body: &[Statement], name: &str) -> bool {
     let rooted = |e: &ExprType| root_name_of(e) == Some(name);
-    visit::any_stmt(body, Descend::All, |stmt| {
+    visit::any_stmt(body, Descend::SkipDefs, |stmt| {
+        match &stmt.statement {
+            StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
+                return !visit::def_binds_locally(f, name) && scan_mutations(&f.body, name);
+            }
+            StatementType::ClassDef(c) => return scan_mutations(&c.body, name),
+            _ => {}
+        }
         let aug = matches!(stmt.statement, StatementType::AugAssign(_));
         let stores = visit::stmt_targets(stmt)
             .into_iter()

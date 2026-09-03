@@ -531,13 +531,25 @@ fn resolving<R>(
     on_cycle: impl FnOnce() -> R,
     body: impl FnOnce() -> R,
 ) -> R {
+    // The entry is removed on EVERY exit, an unwinding panic included
+    // (Devin review on #323): a panic caught above (a test harness, a
+    // batch converter) must not leave the node marked in progress, or a
+    // later resolver reusing that address would read it as a cycle.
+    struct Entered(Resolving, usize);
+    impl Drop for Entered {
+        fn drop(&mut self) {
+            let key = (self.0, self.1);
+            let _ = IN_PROGRESS.try_with(|s| {
+                s.borrow_mut().remove(&key);
+            });
+        }
+    }
     let entered = IN_PROGRESS.with(|s| s.borrow_mut().insert((what, node)));
     if !entered {
         return on_cycle();
     }
-    let result = body();
-    IN_PROGRESS.with(|s| s.borrow_mut().remove(&(what, node)));
-    result
+    let _guard = Entered(what, node);
+    body()
 }
 
 /// The cycle guard for a function's inferred return (function_def.rs).

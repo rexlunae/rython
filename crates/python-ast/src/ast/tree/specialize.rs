@@ -44,7 +44,7 @@ use std::collections::HashMap;
 
 use crate::ast::tree::statement::Statement;
 use crate::ast::tree::visit::{
-    opens_scope, stmt_all_exprs, stmt_bodies, walk_stmts, Descend, Flow,
+    def_binds_locally, opens_scope, stmt_all_exprs, walk_stmts, Descend, Flow,
 };
 use crate::ast::tree::StatementType;
 use crate::{ExprType, SymbolTableNode, SymbolTableScopes};
@@ -464,7 +464,8 @@ pub fn detect_specializable(
 /// order, from every body of the function's own scope — under a loop, a
 /// `try`, a `with`) and stray isinstance-of-parameter uses anywhere else.
 /// A nested `def` / `class` is its own scope the folding never enters, so
-/// every isinstance-of-parameter use inside one is stray.
+/// an isinstance-of-parameter use inside one is stray — when it names
+/// OUR parameter (see `stray_in_nested_scope`).
 fn collect_isinstance_tests(
     body: &[Statement],
     unannotated: &[(usize, String)],
@@ -474,14 +475,7 @@ fn collect_isinstance_tests(
     let is_param = |name: &str| unannotated.iter().any(|(_, p)| p == name);
     walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
         if opens_scope(stmt) {
-            for nested in stmt_bodies(stmt) {
-                walk_stmts(nested, Descend::All, &mut |s| {
-                    for e in stmt_all_exprs(s) {
-                        isinstance_args_in_expr(e, stray);
-                    }
-                    Flow::Continue
-                });
-            }
+            stray_in_nested_scope(stmt, unannotated, stray);
             return Flow::Continue;
         }
         if let StatementType::If(s) = &stmt.statement {
@@ -499,6 +493,65 @@ fn collect_isinstance_tests(
         }
         Flow::Continue
     });
+}
+
+/// The isinstance uses in `exprs` that name one of the `free` parameters.
+fn push_free_strays(exprs: Vec<&ExprType>, free: &[(usize, String)], stray: &mut Vec<String>) {
+    let mut found = Vec::new();
+    for e in exprs {
+        isinstance_args_in_expr(e, &mut found);
+    }
+    stray.extend(found.into_iter().filter(|a| free.iter().any(|(_, p)| p == a)));
+}
+
+/// The stray isinstance-of-parameter uses inside a nested scope that
+/// still name the OUTER function's parameters: a nested def's header
+/// (decorators and defaults run in the enclosing scope) and, in its
+/// body, every parameter the def does not bind itself — a same-named
+/// parameter or local of the nested def is its own, and an isinstance on
+/// it must not disable the outer specialization (Devin review on #323).
+/// A class body runs in place; its methods are nested defs under the
+/// same rule.
+fn stray_in_nested_scope(stmt: &Statement, free: &[(usize, String)], stray: &mut Vec<String>) {
+    match &stmt.statement {
+        StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
+            let header: Vec<&ExprType> = f
+                .decorator_list
+                .iter()
+                .chain(f.args.defaults.iter().map(|d| d.as_ref()))
+                .chain(f.args.kw_defaults.iter().flatten().map(|d| d.as_ref()))
+                .collect();
+            push_free_strays(header, free, stray);
+            let inner_free: Vec<(usize, String)> = free
+                .iter()
+                .filter(|(_, p)| !def_binds_locally(f, p))
+                .cloned()
+                .collect();
+            if inner_free.is_empty() {
+                return;
+            }
+            walk_stmts(&f.body, Descend::SkipDefs, &mut |s| {
+                if opens_scope(s) {
+                    stray_in_nested_scope(s, &inner_free, stray);
+                } else {
+                    push_free_strays(stmt_all_exprs(s), &inner_free, stray);
+                }
+                Flow::Continue
+            });
+        }
+        StatementType::ClassDef(c) => {
+            push_free_strays(c.bases.iter().collect(), free, stray);
+            walk_stmts(&c.body, Descend::SkipDefs, &mut |s| {
+                if opens_scope(s) {
+                    stray_in_nested_scope(s, free, stray);
+                } else {
+                    push_free_strays(stmt_all_exprs(s), free, stray);
+                }
+                Flow::Continue
+            });
+        }
+        _ => {}
+    }
 }
 
 /// The residual body: every plain `if isinstance(axis, T):` collapses to

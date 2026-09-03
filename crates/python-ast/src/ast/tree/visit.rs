@@ -113,6 +113,66 @@ pub fn stmt_targets(s: &Statement) -> Vec<&ExprType> {
     }
 }
 
+/// Whether a binding target (a store's target, a `for` target, a `with
+/// ... as`) binds `name`: a bare name, or one inside a tuple / list /
+/// starred pattern. An attribute or subscript target mutates an object
+/// and binds no name.
+pub fn target_binds(target: &ExprType, name: &str) -> bool {
+    match target {
+        ExprType::Name(n) => n.id == name,
+        ExprType::Tuple(t) => t.elts.iter().any(|e| target_binds(e, name)),
+        ExprType::List(items) => items.iter().any(|e| target_binds(e, name)),
+        ExprType::Starred(st) => target_binds(&st.value, name),
+        _ => false,
+    }
+}
+
+/// Whether a nested function binds `name` in its OWN scope — a parameter,
+/// or a store anywhere in its body (an assignment, an augmented
+/// assignment, a loop or `with ... as` target, an `except ... as`, an
+/// import, a nested def or class of that name) — and does not declare it
+/// `nonlocal` / `global`. A name the function does not bind is FREE in
+/// it: it refers to the enclosing scope's binding, so a mutation through
+/// it mutates the enclosing value and an `isinstance` on it tests the
+/// enclosing parameter (Devin review on #323).
+pub fn def_binds_locally(f: &crate::FunctionDef, name: &str) -> bool {
+    let args = &f.args;
+    let mut params = args
+        .posonlyargs
+        .iter()
+        .chain(args.args.iter())
+        .chain(args.kwonlyargs.iter())
+        .chain(args.vararg.iter())
+        .chain(args.kwarg.iter());
+    if params.any(|p| p.arg == name) {
+        return true;
+    }
+    let declared_free = any_stmt(&f.body, Descend::SkipDefs, |s| {
+        matches!(&s.statement, StatementType::Global(names) | StatementType::Nonlocal(names)
+            if names.iter().any(|n| n == name))
+    });
+    if declared_free {
+        return false;
+    }
+    any_stmt(&f.body, Descend::SkipDefs, |s| {
+        stmt_targets(s).into_iter().any(|t| target_binds(t, name))
+            || match &s.statement {
+                StatementType::Import(im) => im.names.iter().any(|a| match a.asname.as_deref() {
+                    Some(asname) => asname == name,
+                    None => a.name.split('.').next() == Some(name),
+                }),
+                StatementType::ImportFrom(im) => im
+                    .names
+                    .iter()
+                    .any(|a| a.asname.as_deref().unwrap_or(&a.name) == name),
+                StatementType::Try(t) => t.handlers.iter().any(|h| h.name.as_deref() == Some(name)),
+                StatementType::FunctionDef(d) | StatementType::AsyncFunctionDef(d) => d.name == name,
+                StatementType::ClassDef(c) => c.name == name,
+                _ => false,
+            }
+    })
+}
+
 /// The direct subexpressions of an expression: one enumeration for every
 /// walk in this module, so a call nested anywhere (`x = 1 + self.q.pop()`,
 /// `if self.items.pop():`) is seen. A comprehension's and a lambda's body

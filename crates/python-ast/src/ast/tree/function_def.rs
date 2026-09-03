@@ -2935,54 +2935,155 @@ pub(crate) fn scan_str_rebindings(
 /// still be readable where Python raises NameError. Loud error; a
 /// reassignment or import clears the deletion (Python rebinds).
 pub(crate) fn check_deleted_names(body: &[Statement]) -> Result<(), String> {
-    let mut deleted: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut error: Option<String> = None;
-    // Nested functions/classes have their own scope.
-    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
-        // A store rebinds the name: an assignment / aug-assign / loop /
-        // `with ... as` target, an import.
-        for target in stmt_targets(stmt) {
-            if let ExprType::Name(n) = target {
-                deleted.remove(&n.id);
-            }
+    let mut deleted = std::collections::HashSet::new();
+    scan_deleted_names(body, &mut deleted)
+}
+
+/// One pass over `body` from the incoming deletion state in `deleted`,
+/// leaving the outgoing state there. Deletion follows control flow, not
+/// the source order (Devin review on #323): each branch starts from the
+/// incoming state, and the state after the statement is the UNION of the
+/// paths through it — deleted on any path is deleted, so a conditional
+/// deletion stays loud, and a rebinding on one path does not revive the
+/// name for its sibling (`del x; if c: x = 2; else: print(x)`). A loop
+/// body is scanned a second time from the merged state, so a read that
+/// precedes the `del` in the next iteration is seen too. Nested defs and
+/// classes are their own scopes.
+fn scan_deleted_names(
+    body: &[Statement],
+    deleted: &mut std::collections::HashSet<String>,
+) -> Result<(), String> {
+    type Deleted = std::collections::HashSet<String>;
+    let scan_from = |body: &[Statement], from: &Deleted| -> Result<Deleted, String> {
+        let mut state = from.clone();
+        scan_deleted_names(body, &mut state)?;
+        Ok(state)
+    };
+    for stmt in body {
+        if visit::opens_scope(stmt) {
+            continue;
         }
-        if let StatementType::Import(i) = &stmt.statement {
-            for alias in &i.names {
-                deleted.remove(&alias.name);
-            }
-        } else if let StatementType::ImportFrom(i) = &stmt.statement {
-            for alias in &i.names {
-                deleted.remove(&alias.name);
-                if let Some(asname) = &alias.asname {
-                    deleted.remove(asname);
-                }
-            }
-        }
-        // A read of a deleted name in any expression the statement
-        // evaluates or binds.
-        let exprs = stmt_all_exprs(stmt);
+        // A read of a deleted name: the statement's own expressions, and
+        // a store target that reads its base (`x[i] = v`, `x.a = v`); a
+        // name / tuple target only binds.
+        let reads: Vec<&ExprType> = visit::stmt_exprs(stmt)
+            .into_iter()
+            .chain(stmt_targets(stmt).into_iter().filter(|t| {
+                !matches!(
+                    t,
+                    ExprType::Name(_) | ExprType::Tuple(_) | ExprType::List(_) | ExprType::Starred(_)
+                )
+            }))
+            .collect();
         if let Some(name) = deleted
             .iter()
-            .find(|name| exprs.iter().any(|e| crate::expr_references(e, name)))
+            .find(|name| reads.iter().any(|e| crate::expr_references(e, name)))
         {
-            error = Some(format!(
+            return Err(format!(
                 "`del {name}` then a use of `{name}`: rython cannot unbind a \
                  binding (the value would still be readable where Python raises \
                  NameError). Remove the del, or reassign `{name}` first (issue \
                  #112)"
             ));
-            return Flow::Stop;
         }
-        if let StatementType::Delete(targets) = &stmt.statement {
-            for target in targets {
-                if let ExprType::Name(n) = target {
-                    deleted.insert(n.id.clone());
+        // A store rebinds the name: an assignment / aug-assign / loop /
+        // `with ... as` target, an import.
+        for target in stmt_targets(stmt) {
+            deleted.retain(|name| !visit::target_binds(target, name));
+        }
+        match &stmt.statement {
+            StatementType::Import(i) => {
+                for alias in &i.names {
+                    deleted.remove(&alias.name);
+                }
+            }
+            StatementType::ImportFrom(i) => {
+                for alias in &i.names {
+                    deleted.remove(&alias.name);
+                    if let Some(asname) = &alias.asname {
+                        deleted.remove(asname);
+                    }
+                }
+            }
+            StatementType::Delete(targets) => {
+                for target in targets {
+                    if let ExprType::Name(n) = target {
+                        deleted.insert(n.id.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+        // The paths through the statement's bodies.
+        match &stmt.statement {
+            StatementType::If(i) => {
+                let then = scan_from(&i.body, deleted)?;
+                // No else: the fall-through path keeps the incoming state.
+                let other = if i.orelse.is_empty() {
+                    deleted.clone()
+                } else {
+                    scan_from(&i.orelse, deleted)?
+                };
+                *deleted = then;
+                deleted.extend(other);
+            }
+            StatementType::For(_)
+            | StatementType::AsyncFor(_)
+            | StatementType::While(_) => {
+                let bodies = visit::stmt_bodies(stmt);
+                let (loop_body, orelse) = (bodies[0], bodies[1]);
+                // Zero iterations keep the incoming state; a later
+                // iteration re-enters the body from the merged state with
+                // the loop target rebound.
+                let first = scan_from(loop_body, deleted)?;
+                let mut again = deleted.clone();
+                again.extend(first.iter().cloned());
+                for target in stmt_targets(stmt) {
+                    again.retain(|name| !visit::target_binds(target, name));
+                }
+                let second = scan_from(loop_body, &again)?;
+                deleted.extend(again);
+                deleted.extend(second);
+                // The else clause runs after the loop completes.
+                let after_else = scan_from(orelse, deleted)?;
+                deleted.extend(after_else);
+            }
+            StatementType::With(w) => {
+                // The body always runs.
+                let out = scan_from(&w.body, deleted)?;
+                *deleted = out;
+            }
+            StatementType::AsyncWith(w) => {
+                let out = scan_from(&w.body, deleted)?;
+                *deleted = out;
+            }
+            StatementType::Try(t) => {
+                // A handler may run from any point of the body: from the
+                // union of the incoming and the body's outgoing state;
+                // the else clause from the body's; finally from all.
+                let after_body = scan_from(&t.body, deleted)?;
+                let mut at_handler = deleted.clone();
+                at_handler.extend(after_body.iter().cloned());
+                let mut merged = at_handler.clone();
+                for handler in &t.handlers {
+                    merged.extend(scan_from(&handler.body, &at_handler)?);
+                }
+                merged.extend(scan_from(&t.orelse, &after_body)?);
+                let after_finally = scan_from(&t.finalbody, &merged)?;
+                merged.extend(after_finally);
+                *deleted = merged;
+            }
+            _ => {
+                // Any other body-carrying form: every body from the
+                // incoming state, the union afterwards.
+                let incoming = deleted.clone();
+                for nested in visit::stmt_bodies(stmt) {
+                    deleted.extend(scan_from(nested, &incoming)?);
                 }
             }
         }
-        Flow::Continue
-    });
-    error.map_or(Ok(()), Err)
+    }
+    Ok(())
 }
 
 /// Issue #115: every name this function's body declares `global`,

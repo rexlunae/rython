@@ -18465,3 +18465,167 @@ fn a_str_literal_stored_into_an_optional_field_wraps_in_some() {
         out
     );
 }
+
+/// Deletion follows control flow (Devin review on #323): after `del x`, a
+/// rebinding on one branch does not revive `x` for its sibling — the else
+/// read is still Python's NameError, so it stays loud.
+#[test]
+fn a_rebinding_on_one_branch_does_not_revive_a_deleted_name_for_its_sibling() {
+    let err = compile_err(
+        concat!(
+            "def f(flag: bool) -> int:\n",
+            "    x = 1\n",
+            "    del x\n",
+            "    if flag:\n",
+            "        x = 2\n",
+            "    else:\n",
+            "        return x\n",
+            "    return 0\n",
+        ),
+        "del_branch1.py",
+    );
+    assert!(err.contains("del x"), "error: {}", err);
+    assert!(err.contains("issue #112"), "error: {}", err);
+    // Both branches rebinding: every path reaches the read bound.
+    let out = compile(
+        concat!(
+            "def f(flag: bool) -> int:\n",
+            "    x = 1\n",
+            "    del x\n",
+            "    if flag:\n",
+            "        x = 2\n",
+            "    else:\n",
+            "        x = 3\n",
+            "    return x\n",
+        ),
+        "del_branch2.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+}
+
+/// A deletion confined to one branch does not contaminate its sibling;
+/// a read AFTER the `if` is loud (the deletion is conditional), a read on
+/// the other branch is not.
+#[test]
+fn a_del_confined_to_one_branch_does_not_reach_its_sibling() {
+    let out = compile(
+        concat!(
+            "def f(flag: bool) -> int:\n",
+            "    x = 1\n",
+            "    if flag:\n",
+            "        del x\n",
+            "        return 0\n",
+            "    else:\n",
+            "        return x\n",
+        ),
+        "del_sibling.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+    let err = compile_err(
+        concat!(
+            "def g(flag: bool) -> int:\n",
+            "    x = 1\n",
+            "    if flag:\n",
+            "        del x\n",
+            "    return x\n",
+        ),
+        "del_after_if.py",
+    );
+    assert!(err.contains("del x"), "error: {}", err);
+}
+
+/// A loop body is scanned again from the merged state: a read that
+/// precedes the `del` in the next iteration is Python's NameError.
+#[test]
+fn a_read_before_the_del_in_a_later_iteration_is_loud() {
+    let err = compile_err(
+        concat!(
+            "def f(xs: list[int]) -> int:\n",
+            "    t = 0\n",
+            "    for i in xs:\n",
+            "        t = t + i\n",
+            "        del t\n",
+            "    return 0\n",
+        ),
+        "del_loop.py",
+    );
+    assert!(err.contains("del t"), "error: {}", err);
+    // Rebinding before the read each iteration is fine.
+    let out = compile(
+        concat!(
+            "def f(xs: list[int]) -> int:\n",
+            "    for i in xs:\n",
+            "        t = i\n",
+            "        print(t)\n",
+            "        del t\n",
+            "    return 0\n",
+        ),
+        "del_loop_ok.py",
+    );
+    assert!(!out.contains("issue #112"), "generated: {}", out);
+}
+
+/// The mutation scan is scope-aware (Devin review on #323): a nested def
+/// mutating its OWN same-named parameter is no mutation of the outer
+/// parameter, while a closure mutating the free name is.
+#[test]
+fn a_nested_def_binding_the_name_itself_is_not_a_mutation_of_the_parameter() {
+    let out = compile(
+        concat!(
+            "def touch(xs: list[int]) -> int:\n",
+            "    def inner(xs: list[int]) -> int:\n",
+            "        xs.append(99)\n",
+            "        return len(xs)\n",
+            "    return inner([]) + len(xs)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    a = [1, 2]\n",
+            "    touch(a)\n",
+            "    print(a)\n",
+        ),
+        "alias_nested_own.py",
+    );
+    assert!(!out.contains("mutates it"), "generated: {}", out);
+    let err = compile_err(
+        concat!(
+            "def touch(xs: list[int]) -> int:\n",
+            "    def bump() -> None:\n",
+            "        xs.append(99)\n",
+            "    bump()\n",
+            "    return len(xs)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    a = [1, 2]\n",
+            "    touch(a)\n",
+            "    print(a)\n",
+        ),
+        "alias_nested_free.py",
+    );
+    assert!(err.contains("mutates it"), "error: {}", err);
+}
+
+/// An isinstance on a nested def's OWN same-named parameter is not a
+/// stray use of the outer parameter: the outer dispatcher still
+/// specializes (Devin review on #323).
+#[test]
+fn a_nested_def_with_its_own_same_named_parameter_keeps_the_outer_specialization() {
+    let out = compile(
+        concat!(
+            "def describe(x):\n",
+            "    def inner(x: int) -> str:\n",
+            "        if isinstance(x, int):\n",
+            "            return \"inner-int\"\n",
+            "        return \"inner\"\n",
+            "    if isinstance(x, int):\n",
+            "        return inner(x)\n",
+            "    return \"other\"\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(describe(5))\n",
+            "    print(describe(\"s\"))\n",
+        ),
+        "specialize_nested.py",
+    );
+    assert!(out.contains("fn describe_int"), "generated: {}", out);
+    assert!(out.contains("fn describe_any"), "generated: {}", out);
+}
