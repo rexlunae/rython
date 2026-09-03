@@ -16813,3 +16813,29 @@ fn a_local_bound_to_a_comprehension_carries_its_element_type() {
         out
     );
 }
+
+#[test]
+fn the_analysis_narrows_an_isinstance_branch_like_the_lowering() {
+    // idna's ulabel: the else branch of `if not isinstance(label, bytes)`
+    // reads the `str | bytes` parameter as bytes, so the alias
+    // `label_bytes = label` is bytes — not the parameter's boxed union,
+    // which would box every later byte operation (E0599 on the boxed
+    // startswith/lower/slice).
+    let out = compile(
+        concat!(
+            "def ulabel(label: str | bytes) -> str:\n",
+            "    if not isinstance(label, bytes):\n",
+            "        label_bytes = label.encode(\"ascii\")\n",
+            "    else:\n",
+            "        label_bytes = label\n",
+            "    label_bytes = label_bytes.lower()\n",
+            "    return label_bytes.decode(\"ascii\")\n",
+        ),
+        "narrow_analysis.py",
+    );
+    assert!(
+        !out.contains("PyValue :: from") && !out.contains("PyValue::from"),
+        "the alias must be typed by the narrowed branch, not boxed: {}",
+        out
+    );
+}

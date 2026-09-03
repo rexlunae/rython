@@ -2248,6 +2248,16 @@ fn analyze_function_types_inner(
 /// s in shapes ...]` then `[s.name() for s in squares]`) the way the
 /// lowering will. The analysis is flow-sensitive through this view; the
 /// parameters are seeded into the incoming options by the caller.
+/// The type a narrowed name's READ produces inside the branch: a boxed
+/// member (`PyValueMember(Bytes)`, the name.rs conversion marker) reads as
+/// the member itself, so a store from it is typed by the member.
+fn narrowed_value_type(t: &TypeInfo) -> TypeInfo {
+    match t {
+        TypeInfo::PyValueMember(inner) => (**inner).clone(),
+        other => other.clone(),
+    }
+}
+
 fn analysis_view(options: &PythonOptions, info: &FunctionTypeInfo) -> PythonOptions {
     if info.name_types.is_empty() {
         return options.clone();
@@ -2508,11 +2518,41 @@ fn analyze_statement_types(
         StatementType::Return(Some(e)) => count_expr_reads(&e.value, info),
         StatementType::If(s) => {
             count_expr_reads(&s.test, info);
+            // The analysis narrows through the SAME authority the lowering
+            // does (`isinstance_narrowing`): inside `if not isinstance(
+            // label, bytes): ... else: label_bytes = label`, the else
+            // branch reads `label` as bytes, so the alias is typed bytes,
+            // not the parameter's boxed union (idna's ulabel — a boxed
+            // alias made every later byte operation a PyValue call). The
+            // branch type is installed for the branch only and the
+            // name's prior entry restored after; stores recorded inside
+            // the branches persist, as any store does.
+            let narrowing = match (options, symbols) {
+                (Some(o), Some(sy)) => {
+                    crate::isinstance_narrowing(&s.test, &analysis_view(o, info), sy)
+                }
+                _ => None,
+            };
+            let saved = narrowing
+                .as_ref()
+                .and_then(|(n, _, _)| info.name_types.get(n).cloned());
+            if let Some((n, body_ty, _)) = &narrowing {
+                info.name_types.insert(n.clone(), narrowed_value_type(body_ty));
+            }
             for b in &s.body {
                 analyze_statement_types(b, info, options, symbols, self_class);
             }
+            if let Some((n, _, else_ty)) = &narrowing {
+                info.name_types.insert(n.clone(), narrowed_value_type(else_ty));
+            }
             for b in &s.orelse {
                 analyze_statement_types(b, info, options, symbols, self_class);
+            }
+            if let Some((n, _, _)) = &narrowing {
+                match saved {
+                    Some(t) => info.name_types.insert(n.clone(), t),
+                    None => info.name_types.remove(n),
+                };
             }
         }
         StatementType::While(s) => {
