@@ -4,6 +4,9 @@ use pyo3::{Borrowed, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
 use quote::quote;
 use serde::{Deserialize, Serialize};
 use crate::ast::tree::statement::PyStatementTrait;
+use crate::ast::tree::visit::{
+    Descend, Flow, any_expr_in, stmt_all_exprs, stmt_targets, walk_stmts,
+};
 
 use crate::{
     CodeGen, CodeGenContext, ExprType, Object, ParameterList, PythonOptions, Statement,
@@ -2702,41 +2705,14 @@ impl FunctionDef {
 
 /// Collect every `return` statement's value (None for a bare `return`)
 /// from a statement list, recursing into nested control-flow bodies but not
-/// into nested function or class definitions.
+/// into nested function or class definitions (their own return scopes).
 fn collect_returns<'a>(body: &'a [Statement], out: &mut Vec<Option<&'a ExprType>>) {
-    for stmt in body {
-        match &stmt.statement {
-            StatementType::Return(value) => {
-                out.push(value.as_ref().map(|e| &e.value));
-            }
-            StatementType::If(s) => {
-                collect_returns(&s.body, out);
-                collect_returns(&s.orelse, out);
-            }
-            StatementType::For(s) => {
-                collect_returns(&s.body, out);
-                collect_returns(&s.orelse, out);
-            }
-            StatementType::While(s) => {
-                collect_returns(&s.body, out);
-                collect_returns(&s.orelse, out);
-            }
-            StatementType::With(s) => collect_returns(&s.body, out),
-            StatementType::AsyncWith(s) => collect_returns(&s.body, out),
-            StatementType::AsyncFor(s) => collect_returns(&s.body, out),
-            StatementType::Try(s) => {
-                collect_returns(&s.body, out);
-                for handler in &s.handlers {
-                    collect_returns(&handler.body, out);
-                }
-                collect_returns(&s.orelse, out);
-                collect_returns(&s.finalbody, out);
-            }
-            // Nested defs/classes have their own return scopes; everything
-            // else contains no return statements we care about.
-            _ => {}
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if let StatementType::Return(value) = &stmt.statement {
+            out.push(value.as_ref().map(|e| &e.value));
         }
-    }
+        Flow::Continue
+    });
 }
 
 /// Whether an unannotated-return function whose return values are all
@@ -2779,43 +2755,15 @@ fn literal_returns_need_boxing(body: &[Statement]) -> bool {
 /// enclosing scope (the closure-capture divergence), so the definitions
 /// drop (statement.rs) and calls through the names drop too.
 pub(crate) fn nested_function_names(body: &[crate::Statement]) -> Vec<String> {
-    use crate::StatementType as ST;
-    fn scan(stmts: &[crate::Statement], out: &mut Vec<String>) {
-        for s in stmts {
-            match &s.statement {
-                ST::FunctionDef(f) | ST::AsyncFunctionDef(f) => out.push(f.name.clone()),
-                ST::If(i) => {
-                    scan(&i.body, out);
-                    scan(&i.orelse, out);
-                }
-                ST::While(w) => {
-                    scan(&w.body, out);
-                    scan(&w.orelse, out);
-                }
-                ST::For(f) => {
-                    scan(&f.body, out);
-                    scan(&f.orelse, out);
-                }
-                ST::AsyncFor(f) => {
-                    scan(&f.body, out);
-                    scan(&f.orelse, out);
-                }
-                ST::With(w) => scan(&w.body, out),
-                ST::AsyncWith(w) => scan(&w.body, out),
-                ST::Try(t) => {
-                    scan(&t.body, out);
-                    scan(&t.orelse, out);
-                    scan(&t.finalbody, out);
-                    for h in &t.handlers {
-                        scan(&h.body, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
     let mut out = Vec::new();
-    scan(body, &mut out);
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if let StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) =
+            &stmt.statement
+        {
+            out.push(f.name.clone());
+        }
+        Flow::Continue
+    });
     out
 }
 
@@ -2934,60 +2882,37 @@ pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {    matc
 /// non-literal (an aug-assign target, or a second assignment whose value
 /// is not a string literal). `literal_bindings` maps name → whether the
 /// (first) binding was a bare string literal; `rebound` collects names
-/// stored to by an aug-assign or a non-literal assignment.
+/// stored to by an aug-assign or a non-literal assignment. Recurses
+/// through control flow but not into nested defs/classes (their locals
+/// are their own).
 pub(crate) fn scan_str_rebindings(
     body: &[Statement],
     literal_bindings: &mut std::collections::HashMap<String, bool>,
     rebound: &mut std::collections::HashSet<String>,
 ) {
-    for stmt in body {
-        match &stmt.statement {
-            StatementType::Assign(a) => {
-                if let [ExprType::Name(name)] = a.targets.as_slice() {
-                    let is_literal = matches!(
-                        &a.value,
-                        ExprType::Constant(c)
-                            if matches!(&c.0, Some(litrs::Literal::String(_)))
-                    );
-                    literal_bindings
-                        .entry(name.id.clone())
-                        .and_modify(|first| *first |= is_literal)
-                        .or_insert(is_literal);
-                    if !is_literal {
-                        rebound.insert(name.id.clone());
-                    }
-                }
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if let StatementType::Assign(a) = &stmt.statement
+            && let [ExprType::Name(name)] = a.targets.as_slice()
+        {
+            let is_literal = matches!(
+                &a.value,
+                ExprType::Constant(c)
+                    if matches!(&c.0, Some(litrs::Literal::String(_)))
+            );
+            literal_bindings
+                .entry(name.id.clone())
+                .and_modify(|first| *first |= is_literal)
+                .or_insert(is_literal);
+            if !is_literal {
+                rebound.insert(name.id.clone());
             }
-            StatementType::AugAssign(a) => {
-                if let ExprType::Name(name) = &a.target {
-                    rebound.insert(name.id.clone());
-                }
-            }
-            StatementType::If(s) => {
-                scan_str_rebindings(&s.body, literal_bindings, rebound);
-                scan_str_rebindings(&s.orelse, literal_bindings, rebound);
-            }
-            StatementType::For(s) => {
-                scan_str_rebindings(&s.body, literal_bindings, rebound);
-                scan_str_rebindings(&s.orelse, literal_bindings, rebound);
-            }
-            StatementType::While(s) => {
-                scan_str_rebindings(&s.body, literal_bindings, rebound);
-                scan_str_rebindings(&s.orelse, literal_bindings, rebound);
-            }
-            StatementType::Try(t) => {
-                scan_str_rebindings(&t.body, literal_bindings, rebound);
-                for h in &t.handlers {
-                    scan_str_rebindings(&h.body, literal_bindings, rebound);
-                }
-                scan_str_rebindings(&t.orelse, literal_bindings, rebound);
-                scan_str_rebindings(&t.finalbody, literal_bindings, rebound);
-            }
-            StatementType::With(w) => scan_str_rebindings(&w.body, literal_bindings, rebound),
-            StatementType::AsyncWith(w) => scan_str_rebindings(&w.body, literal_bindings, rebound),
-            _ => {}
+        } else if let StatementType::AugAssign(a) = &stmt.statement
+            && let ExprType::Name(name) = &a.target
+        {
+            rebound.insert(name.id.clone());
         }
-    }
+        Flow::Continue
+    });
 }
 
 /// Issue #112: a `del name` whose name is referenced afterwards (or whose
@@ -2996,157 +2921,53 @@ pub(crate) fn scan_str_rebindings(
 /// reassignment or import clears the deletion (Python rebinds).
 pub(crate) fn check_deleted_names(body: &[Statement]) -> Result<(), String> {
     let mut deleted: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let check = |stmt: &Statement, deleted: &mut std::collections::HashSet<String>| -> Result<(), String> {
-        let walk_expr = |expr: &ExprType, deleted: &std::collections::HashSet<String>| -> Result<(), String> {
-            for name in deleted {
-                if crate::expr_references(expr, name) {
-                    return Err(format!(
-                        "`del {name}` then a use of `{name}`: rython cannot unbind a \
-                         binding (the value would still be readable where Python raises \
-                         NameError). Remove the del, or reassign `{name}` first (issue \
-                         #112)"
-                    ));
-                }
+    let mut error: Option<String> = None;
+    // Nested functions/classes have their own scope.
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        // A store rebinds the name: an assignment / aug-assign / loop /
+        // `with ... as` target, an import.
+        for target in stmt_targets(stmt) {
+            if let ExprType::Name(n) = target {
+                deleted.remove(&n.id);
             }
-            Ok(())
-        };
-        match &stmt.statement {
-            StatementType::Delete(targets) => {
-                for target in targets {
-                    if let ExprType::Name(n) = target {
-                        deleted.insert(n.id.clone());
-                    }
-                }
-                Ok(())
-            }
-            StatementType::Assign(a) => {
-                for target in &a.targets {
-                    if let ExprType::Name(n) = target {
-                        deleted.remove(&n.id);
-                    }
-                }
-                walk_expr(&a.value, deleted)?;
-                for target in &a.targets {
-                    walk_expr(target, deleted)?;
-                }
-                Ok(())
-            }
-            StatementType::AugAssign(a) => {
-                if let ExprType::Name(n) = &a.target {
-                    deleted.remove(&n.id);
-                }
-                walk_expr(&a.target, deleted)?;
-                walk_expr(&a.value, deleted)
-            }
-            StatementType::Import(i) => {
-                for alias in &i.names {
-                    deleted.remove(&alias.name);
-                }
-                Ok(())
-            }
-            StatementType::ImportFrom(i) => {
-                for alias in &i.names {
-                    deleted.remove(&alias.name);
-                    if let Some(asname) = &alias.asname {
-                        deleted.remove(asname);
-                    }
-                }
-                Ok(())
-            }
-            StatementType::For(f) => {
-                // The loop target rebinds each iteration.
-                deleted.remove(&loop_target_name(&f.target));
-                walk_expr(&f.iter, deleted)?;
-                walk_expr(&f.target, deleted)?;
-                check_deleted_names(&f.body)?;
-                check_deleted_names(&f.orelse)?;
-                Ok(())
-            }
-            StatementType::If(s) => {
-                walk_expr(&s.test, deleted)?;
-                check_deleted_names(&s.body)?;
-                check_deleted_names(&s.orelse)?;
-                Ok(())
-            }
-            StatementType::While(s) => {
-                walk_expr(&s.test, deleted)?;
-                check_deleted_names(&s.body)?;
-                check_deleted_names(&s.orelse)?;
-                Ok(())
-            }
-            StatementType::Try(t) => {
-                check_deleted_names(&t.body)?;
-                for h in &t.handlers {
-                    check_deleted_names(&h.body)?;
-                }
-                check_deleted_names(&t.orelse)?;
-                check_deleted_names(&t.finalbody)?;
-                Ok(())
-            }
-            StatementType::With(w) => check_deleted_names(&w.body),
-            StatementType::AsyncWith(w) => check_deleted_names(&w.body),
-            StatementType::AsyncFor(f) => {
-                deleted.remove(&loop_target_name(&f.target));
-                walk_expr(&f.iter, deleted)?;
-                walk_expr(&f.target, deleted)?;
-                check_deleted_names(&f.body)?;
-                check_deleted_names(&f.orelse)?;
-                Ok(())
-            }
-            StatementType::Expr(e) => walk_expr(&e.value, deleted),
-            StatementType::Return(Some(e)) => walk_expr(&e.value, deleted),
-            StatementType::Return(None) => Ok(()),
-            StatementType::Call(c) => {
-                walk_expr(&c.func, deleted)?;
-                for arg in &c.args {
-                    walk_expr(arg, deleted)?;
-                }
-                for kw in &c.keywords {
-                    walk_expr(&kw.value, deleted)?;
-                }
-                Ok(())
-            }
-            StatementType::Assert { test, msg } => {
-                walk_expr(test, deleted)?;
-                if let Some(m) = msg {
-                    walk_expr(m, deleted)?;
-                }
-                Ok(())
-            }
-            StatementType::Raise(r) => {
-                if let Some(exc) = &r.exc {
-                    walk_expr(exc, deleted)?;
-                }
-                if let Some(cause) = &r.cause {
-                    walk_expr(cause, deleted)?;
-                }
-                Ok(())
-            }
-            // Nested functions/classes have their own scope.
-            StatementType::FunctionDef(_)
-            | StatementType::AsyncFunctionDef(_)
-            | StatementType::ClassDef(_)
-            | StatementType::Global(_)
-            | StatementType::Nonlocal(_)
-            | StatementType::AnnotatedName { .. }
-            | StatementType::Pass
-            | StatementType::Break
-            | StatementType::Continue
-            | StatementType::Unimplemented(_) => Ok(()),
         }
-    };
-    for stmt in body {
-        check(stmt, &mut deleted)?;
-    }
-    Ok(())
-}
-
-/// The name bound by a for-loop target (single-name targets only).
-fn loop_target_name(target: &ExprType) -> String {
-    match target {
-        ExprType::Name(n) => n.id.clone(),
-        _ => String::new(),
-    }
+        if let StatementType::Import(i) = &stmt.statement {
+            for alias in &i.names {
+                deleted.remove(&alias.name);
+            }
+        } else if let StatementType::ImportFrom(i) = &stmt.statement {
+            for alias in &i.names {
+                deleted.remove(&alias.name);
+                if let Some(asname) = &alias.asname {
+                    deleted.remove(asname);
+                }
+            }
+        }
+        // A read of a deleted name in any expression the statement
+        // evaluates or binds.
+        let exprs = stmt_all_exprs(stmt);
+        if let Some(name) = deleted
+            .iter()
+            .find(|name| exprs.iter().any(|e| crate::expr_references(e, name)))
+        {
+            error = Some(format!(
+                "`del {name}` then a use of `{name}`: rython cannot unbind a \
+                 binding (the value would still be readable where Python raises \
+                 NameError). Remove the del, or reassign `{name}` first (issue \
+                 #112)"
+            ));
+            return Flow::Stop;
+        }
+        if let StatementType::Delete(targets) = &stmt.statement {
+            for target in targets {
+                if let ExprType::Name(n) = target {
+                    deleted.insert(n.id.clone());
+                }
+            }
+        }
+        Flow::Continue
+    });
+    error.map_or(Ok(()), Err)
 }
 
 /// Issue #115: every name this function's body declares `global`,
@@ -3154,41 +2975,12 @@ fn loop_target_name(target: &ExprType) -> String {
 /// its own scope with its own declarations).
 fn collect_global_decls(body: &[Statement]) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
-    fn walk(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
-        for stmt in stmts {
-            match &stmt.statement {
-                StatementType::Global(names) => out.extend(names.iter().cloned()),
-                StatementType::If(s) => {
-                    walk(&s.body, out);
-                    walk(&s.orelse, out);
-                }
-                StatementType::For(s) => {
-                    walk(&s.body, out);
-                    walk(&s.orelse, out);
-                }
-                StatementType::AsyncFor(s) => {
-                    walk(&s.body, out);
-                    walk(&s.orelse, out);
-                }
-                StatementType::While(s) => {
-                    walk(&s.body, out);
-                    walk(&s.orelse, out);
-                }
-                StatementType::Try(s) => {
-                    walk(&s.body, out);
-                    for h in &s.handlers {
-                        walk(&h.body, out);
-                    }
-                    walk(&s.orelse, out);
-                    walk(&s.finalbody, out);
-                }
-                StatementType::With(s) => walk(&s.body, out),
-                StatementType::AsyncWith(s) => walk(&s.body, out),
-                _ => {}
-            }
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if let StatementType::Global(names) = &stmt.statement {
+            out.extend(names.iter().cloned());
         }
-    }
-    walk(body, &mut out);
+        Flow::Continue
+    });
     out
 }
 
@@ -3263,128 +3055,107 @@ pub(crate) fn rust_type_to_py_name(ty: &proc_macro2::TokenStream) -> Option<&'st
     })
 }
 
+/// The obviously-inferable types of a body's locals, by name: an
+/// annotated or literal-valued assignment, a container literal, a local
+/// import, a bare annotated name — recursing through control flow but not
+/// into nested defs/classes (their locals are their own).
 pub(crate) fn collect_local_types(
     body: &[Statement],
     out: &mut std::collections::HashMap<String, crate::TypeInfo>,
 ) {
-    for stmt in body {
-        match &stmt.statement {
-            StatementType::Assign(assign) => {
-                if let [ExprType::Name(name)] = assign.targets.as_slice() {
-                    // An annotated local (`flags: int = _character_flags(c)`)
-                    // types from the annotation.
-                    if let Some(ann) = assign.annotation.as_ref()
-                        && let Some(t) = crate::annotation_type_info(ann)
-                    {
-                        out.insert(name.id.clone(), t);
-                    } else if let Some(ty) = simple_expr_typeinfo(&assign.value) {
-                        out.insert(name.id.clone(), ty);
-                    } else {
-                        // A CONTAINER literal local types like the literal
-                        // lowering (issue #180): a dict gets String keys and
-                        // boxes heterogeneous-but-boxable values (`{
-                        // 'ProviderType': 'sso', 'Credentials': {...}}` —
-                        // botocore), a list gets its concrete element type.
-                        // Without this, an unannotated function returning
-                        // such a local collapses to unit and every use of
-                        // the returned container breaks.
-                        match &assign.value {
-                            ExprType::Dict(d) if !d.keys.is_empty() => {
-                                if let crate::TypeInfo::Dict(k, v) =
-                                    crate::syntactic_type(&assign.value)
-                                {
-                                    let k = if matches!(
-                                        *k,
-                                        crate::TypeInfo::StrRef | crate::TypeInfo::PyObject
-                                    ) {
-                                        crate::TypeInfo::String
-                                    } else {
-                                        *k
-                                    };
-                                    let v = if matches!(*v, crate::TypeInfo::PyObject) {
-                                        crate::TypeInfo::PyValue
-                                    } else {
-                                        *v
-                                    };
-                                    out.insert(
-                                        name.id.clone(),
-                                        crate::TypeInfo::Dict(Box::new(k), Box::new(v)),
-                                    );
-                                }
-                            }
-                            ExprType::List(l) if !l.is_empty() => {
-                                if let crate::TypeInfo::Vec(elt) =
-                                    crate::syntactic_type(&assign.value)
-                                {
-                                    if !matches!(*elt, crate::TypeInfo::PyObject) {
-                                        out.insert(name.id.clone(), crate::TypeInfo::Vec(elt));
-                                    }
-                                }
-                            }
-                            // An EMPTY container local (`allowed = {}` then
-                            // `allowed[alg] = ...` — pip's Hashes): the
-                            // boxed heterogeneous container (the element
-                            // types are unknowable at the store).
-                            ExprType::Dict(d) if d.keys.is_empty() => {
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if let StatementType::Assign(assign) = &stmt.statement {
+            if let [ExprType::Name(name)] = assign.targets.as_slice() {
+                // An annotated local (`flags: int = _character_flags(c)`)
+                // types from the annotation.
+                if let Some(ann) = assign.annotation.as_ref()
+                    && let Some(t) = crate::annotation_type_info(ann)
+                {
+                    out.insert(name.id.clone(), t);
+                } else if let Some(ty) = simple_expr_typeinfo(&assign.value) {
+                    out.insert(name.id.clone(), ty);
+                } else {
+                    // A CONTAINER literal local types like the literal
+                    // lowering (issue #180): a dict gets String keys and
+                    // boxes heterogeneous-but-boxable values (`{
+                    // 'ProviderType': 'sso', 'Credentials': {...}}` —
+                    // botocore), a list gets its concrete element type.
+                    // Without this, an unannotated function returning
+                    // such a local collapses to unit and every use of
+                    // the returned container breaks.
+                    match &assign.value {
+                        ExprType::Dict(d) if !d.keys.is_empty() => {
+                            if let crate::TypeInfo::Dict(k, v) =
+                                crate::syntactic_type(&assign.value)
+                            {
+                                let k = if matches!(
+                                    *k,
+                                    crate::TypeInfo::StrRef | crate::TypeInfo::PyObject
+                                ) {
+                                    crate::TypeInfo::String
+                                } else {
+                                    *k
+                                };
+                                let v = if matches!(*v, crate::TypeInfo::PyObject) {
+                                    crate::TypeInfo::PyValue
+                                } else {
+                                    *v
+                                };
                                 out.insert(
                                     name.id.clone(),
-                                    crate::TypeInfo::Dict(
-                                        Box::new(crate::TypeInfo::String),
-                                        Box::new(crate::TypeInfo::PyValue),
-                                    ),
+                                    crate::TypeInfo::Dict(Box::new(k), Box::new(v)),
                                 );
                             }
-                            ExprType::List(l) if l.is_empty() => {
-                                out.insert(
-                                    name.id.clone(),
-                                    crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue)),
-                                );
-                            }
-                            _ => {}
                         }
+                        ExprType::List(l) if !l.is_empty() => {
+                            if let crate::TypeInfo::Vec(elt) =
+                                crate::syntactic_type(&assign.value)
+                            {
+                                if !matches!(*elt, crate::TypeInfo::PyObject) {
+                                    out.insert(name.id.clone(), crate::TypeInfo::Vec(elt));
+                                }
+                            }
+                        }
+                        // An EMPTY container local (`allowed = {}` then
+                        // `allowed[alg] = ...` — pip's Hashes): the
+                        // boxed heterogeneous container (the element
+                        // types are unknowable at the store).
+                        ExprType::Dict(d) if d.keys.is_empty() => {
+                            out.insert(
+                                name.id.clone(),
+                                crate::TypeInfo::Dict(
+                                    Box::new(crate::TypeInfo::String),
+                                    Box::new(crate::TypeInfo::PyValue),
+                                ),
+                            );
+                        }
+                        ExprType::List(l) if l.is_empty() => {
+                            out.insert(
+                                name.id.clone(),
+                                crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue)),
+                            );
+                        }
+                        _ => {}
                     }
                 }
             }
+        } else if let StatementType::Import(im) = &stmt.statement {
             // A local IMPORT (`import keyring` inside __init__, then
             // `self.keyring = keyring` — pip's KeyRingPythonProvider): a
             // module object — a boxed value.
-            StatementType::Import(im) => {
-                for a in &im.names {
-                    out.insert(a.name.clone(), crate::TypeInfo::PyValue);
-                }
+            for a in &im.names {
+                out.insert(a.name.clone(), crate::TypeInfo::PyValue);
             }
+        } else if let StatementType::AnnotatedName { name, annotation } = &stmt.statement
+            && let Some(t) = crate::annotation_type_info(annotation)
+        {
             // A bare annotated local (`key: str` / `value: str` — urllib3's
             // ssl_match_hostname): types the name for downstream use
             // (dnsnames.append(value) pins Vec<String>).
-            StatementType::AnnotatedName { name, annotation } => {
-                if let Some(t) = crate::annotation_type_info(annotation) {
-                    out.insert(name.clone(), t);
-                }
-            }
-            StatementType::Try(s) => {
-                collect_local_types(&s.body, out);
-                for h in &s.handlers {
-                    collect_local_types(&h.body, out);
-                }
-                collect_local_types(&s.orelse, out);
-                collect_local_types(&s.finalbody, out);
-            }
-            StatementType::If(s) => {
-                collect_local_types(&s.body, out);
-                collect_local_types(&s.orelse, out);
-            }
-            StatementType::For(s) => {
-                collect_local_types(&s.body, out);
-                collect_local_types(&s.orelse, out);
-            }
-            StatementType::While(s) => {
-                collect_local_types(&s.body, out);
-                collect_local_types(&s.orelse, out);
-            }
-            StatementType::With(s) => collect_local_types(&s.body, out),
-            _ => {}
+            out.insert(name.clone(), t);
         }
-    }
+        Flow::Continue
+    });
 }
 
 /// Whether an annotation expression means `None` (`-> None` marks a
@@ -3796,26 +3567,14 @@ pub(crate) fn expr_yields_pyvalue(
     }
 }
 
-/// Whether a function body contains a `yield`/`yield from` anywhere
-/// (control-flow nested included): the body is a GENERATOR and lowers to
+/// Whether a function body contains a `yield`/`yield from` anywhere in
+/// its own scope (control-flow nested, and inside a larger expression —
+/// `x = yield v`, `f((yield))`; a nested def's yields make THAT function
+/// the generator): the body is a GENERATOR and lowers to
 /// build-and-return-a-list (issue #122-family).
 pub(crate) fn body_has_yields(body: &[Statement]) -> bool {
-    body.iter().any(|s| match &s.statement {
-        StatementType::Expr(e) => matches!(
-            e.value,
-            ExprType::Yield(_) | ExprType::YieldFrom(_)
-        ),
-        StatementType::If(s) => body_has_yields(&s.body) || body_has_yields(&s.orelse),
-        StatementType::While(s) => body_has_yields(&s.body),
-        StatementType::For(s) => body_has_yields(&s.body) || body_has_yields(&s.orelse),
-        StatementType::With(s) => body_has_yields(&s.body),
-        StatementType::Try(s) => {
-            body_has_yields(&s.body)
-                || s.handlers.iter().any(|h| body_has_yields(&h.body))
-                || body_has_yields(&s.orelse)
-                || body_has_yields(&s.finalbody)
-        }
-        _ => false,
+    any_expr_in(body, Descend::SkipDefs, |e| {
+        matches!(e, ExprType::Yield(_) | ExprType::YieldFrom(_))
     })
 }
 
@@ -3859,46 +3618,28 @@ pub(crate) fn generator_element_type(
     first_yield_type(body, options, symbols)
 }
 
-/// The inferred type of the first `yield <value>` in a body.
+/// The inferred type of the first `yield <value>` (in source order,
+/// anywhere in the function's own scope) whose value infers to a
+/// concrete type.
 fn first_yield_type(
     body: &[Statement],
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Option<crate::TypeInfo> {
-    for s in body {
-        match &s.statement {
-            StatementType::Expr(e) => {
-                if let ExprType::Yield(y) = &e.value
-                    && let Some(v) = y.value.as_ref()
-                {
-                    let t = crate::infer_type(None, v, options, symbols);
-                    if !matches!(t, crate::TypeInfo::PyObject) {
-                        return Some(t);
-                    }
-                }
+    let mut found = None;
+    any_expr_in(body, Descend::SkipDefs, |e| {
+        if let ExprType::Yield(y) = e
+            && let Some(v) = y.value.as_ref()
+        {
+            let t = crate::infer_type(None, v, options, symbols);
+            if !matches!(t, crate::TypeInfo::PyObject) {
+                found = Some(t);
+                return true;
             }
-            StatementType::If(s) => {
-                if let Some(t) = first_yield_type(&s.body, options, symbols) {
-                    return Some(t);
-                }
-                if let Some(t) = first_yield_type(&s.orelse, options, symbols) {
-                    return Some(t);
-                }
-            }
-            StatementType::For(f) => {
-                if let Some(t) = first_yield_type(&f.body, options, symbols) {
-                    return Some(t);
-                }
-            }
-            StatementType::While(w) => {
-                if let Some(t) = first_yield_type(&w.body, options, symbols) {
-                    return Some(t);
-                }
-            }
-            _ => {}
         }
-    }
-    None
+        false
+    });
+    found
 }
 
 /// Whether `param` is a None-defaulted, unannotated parameter of `func`

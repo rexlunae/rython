@@ -52,6 +52,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 
 use crate::ast::tree::{BinOps, Compares, StatementType};
+use crate::ast::tree::visit::{Descend, Flow, any_stmt, walk_stmts};
 use crate::{ExprType, Statement, SymbolTableScopes, TypeInfo};
 
 /// The requirement one use of a parameter places on it: the weakest bound
@@ -315,59 +316,34 @@ fn loop_element_names(body: &[Statement], unannotated: &HashSet<String>) -> Vec<
             _ => {}
         }
     }
-    fn walk(
-        stmts: &[Statement],
-        unannotated: &HashSet<String>,
-        alias: &mut HashMap<String, String>,
-        out: &mut Vec<String>,
-    ) {
-        for stmt in stmts {
-            match &stmt.statement {
-                StatementType::Assign(a) => {
-                    if let [ExprType::Name(target)] = a.targets.as_slice()
-                        && let ExprType::Name(src) = &a.value
-                        && (unannotated.contains(&src.id) || alias.contains_key(&src.id))
-                    {
-                        alias.insert(target.id.clone(), src.id.clone());
-                    }
-                    scan_expr(&a.value, unannotated, alias, out);
-                }
-                StatementType::For(s) => {
-                    if let ExprType::Name(n) = &s.iter
-                        && let ExprType::Name(t) = &s.target
-                        && root(&n.id, alias).is_some_and(|r| unannotated.contains(r))
-                        && !out.contains(&t.id)
-                    {
-                        out.push(t.id.clone());
-                    }
-                    walk(&s.body, unannotated, alias, out);
-                    walk(&s.orelse, unannotated, alias, out);
-                }
-                StatementType::If(s) => {
-                    walk(&s.body, unannotated, alias, out);
-                    walk(&s.orelse, unannotated, alias, out);
-                }
-                StatementType::While(s) => {
-                    walk(&s.body, unannotated, alias, out);
-                    walk(&s.orelse, unannotated, alias, out);
-                }
-                StatementType::Try(t) => {
-                    walk(&t.body, unannotated, alias, out);
-                    for h in &t.handlers {
-                        walk(&h.body, unannotated, alias, out);
-                    }
-                    walk(&t.orelse, unannotated, alias, out);
-                    walk(&t.finalbody, unannotated, alias, out);
-                }
-                StatementType::With(w) => walk(&w.body, unannotated, alias, out),
-                StatementType::AsyncWith(w) => walk(&w.body, unannotated, alias, out),
-                StatementType::Return(Some(e)) => scan_expr(&e.value, unannotated, alias, out),
-                StatementType::Expr(e) => scan_expr(&e.value, unannotated, alias, out),
-                _ => {}
+    // A nested def's loops bind its own locals, not this function's.
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        let mut loop_over = |iter: &ExprType, target: &ExprType| {
+            if let ExprType::Name(n) = iter
+                && let ExprType::Name(t) = target
+                && root(&n.id, &alias).is_some_and(|r| unannotated.contains(r))
+                && !out.contains(&t.id)
+            {
+                out.push(t.id.clone());
             }
+        };
+        if let StatementType::Assign(a) = &stmt.statement {
+            if let [ExprType::Name(target)] = a.targets.as_slice()
+                && let ExprType::Name(src) = &a.value
+                && (unannotated.contains(&src.id) || alias.contains_key(&src.id))
+            {
+                alias.insert(target.id.clone(), src.id.clone());
+            }
+            scan_expr(&a.value, unannotated, &alias, &mut out);
+        } else if let StatementType::For(s) = &stmt.statement {
+            loop_over(&s.iter, &s.target);
+        } else if let StatementType::AsyncFor(s) = &stmt.statement {
+            loop_over(&s.iter, &s.target);
+        } else if let StatementType::Return(Some(e)) | StatementType::Expr(e) = &stmt.statement {
+            scan_expr(&e.value, unannotated, &alias, &mut out);
         }
-    }
-    walk(body, unannotated, &mut alias, &mut out);
+        Flow::Continue
+    });
     out
 }
 
@@ -1061,62 +1037,38 @@ pub fn infer_unannotated_signature(
         };
         let mut pins: Vec<(String, TokenStream)> = Vec::new();
         let info = crate::analyze_function_types(body, Some(options), Some(symbols));
-        let mut stack: Vec<&[Statement]> = vec![body];
-        while let Some(stmts) = stack.pop() {
-            for stmt in stmts {
-                match &stmt.statement {
-                    crate::StatementType::Assign(a) => {
-                        let [ExprType::Name(t)] = a.targets.as_slice() else {
-                            continue;
-                        };
-                        match &a.value {
-                            ExprType::List(elts) => {
-                                let Some(TypeInfo::Vec(inner)) = info.name_types.get(&t.id)
-                                else {
-                                    continue;
-                                };
-                                let Some(ety) = scalar(inner) else { continue };
-                                for e in elts {
-                                    if let Some(p) = sum_on_param(e, &collector) {
-                                        pins.push((p, ety.clone()));
-                                    }
-                                }
-                            }
-                            other => {
-                                if let Some(p) = sum_on_param(other, &collector)
-                                    && let Some(ety) =
-                                        info.name_types.get(&t.id).and_then(&scalar)
-                                {
-                                    pins.push((p, ety));
-                                }
-                            }
+        // A nested def's sums are over its own parameters, not these.
+        walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+            let crate::StatementType::Assign(a) = &stmt.statement else {
+                return Flow::Continue;
+            };
+            let [ExprType::Name(t)] = a.targets.as_slice() else {
+                return Flow::Continue;
+            };
+            match &a.value {
+                ExprType::List(elts) => {
+                    let Some(TypeInfo::Vec(inner)) = info.name_types.get(&t.id)
+                    else {
+                        return Flow::Continue;
+                    };
+                    let Some(ety) = scalar(inner) else { return Flow::Continue };
+                    for e in elts {
+                        if let Some(p) = sum_on_param(e, &collector) {
+                            pins.push((p, ety.clone()));
                         }
                     }
-                    crate::StatementType::If(s) => {
-                        stack.push(&s.body);
-                        stack.push(&s.orelse);
+                }
+                other => {
+                    if let Some(p) = sum_on_param(other, &collector)
+                        && let Some(ety) =
+                            info.name_types.get(&t.id).and_then(&scalar)
+                    {
+                        pins.push((p, ety));
                     }
-                    crate::StatementType::For(s) => {
-                        stack.push(&s.body);
-                        stack.push(&s.orelse);
-                    }
-                    crate::StatementType::While(s) => {
-                        stack.push(&s.body);
-                        stack.push(&s.orelse);
-                    }
-                    crate::StatementType::With(s) => stack.push(&s.body),
-                    crate::StatementType::Try(s) => {
-                        stack.push(&s.body);
-                        stack.push(&s.orelse);
-                        stack.push(&s.finalbody);
-                        for h in &s.handlers {
-                            stack.push(&h.body);
-                        }
-                    }
-                    _ => {}
                 }
             }
-        }
+            Flow::Continue
+        });
         for (p, ety) in pins {
             if let Some(tv) = tv_names.get(&p) {
                 let tv = quote::format_ident!("{}", tv);
@@ -1476,64 +1428,22 @@ fn return_type_of(
                         // stores into the source): the recursive call
                         // returns the unit too.
                         fn returns_void(body: &[Statement], self_name: &str) -> bool {
-                            for s in body {
-                                match &s.statement {
-                                    crate::StatementType::Return(Some(e)) => {
-                                        let is_self = matches!(
+                            // A return inside a nested def is not this
+                            // function's.
+                            !any_stmt(body, Descend::SkipDefs, |s| {
+                                matches!(
+                                    &s.statement,
+                                    crate::StatementType::Return(Some(e))
+                                        if !matches!(
                                             &e.value,
                                             ExprType::Call(rc)
                                                 if matches!(
                                                     rc.func.as_ref(),
                                                     ExprType::Name(n) if n.id == self_name
                                                 )
-                                        );
-                                        if !is_self {
-                                            return false;
-                                        }
-                                    }
-                                    crate::StatementType::If(i) => {
-                                        if !returns_void(&i.body, self_name)
-                                            || !returns_void(&i.orelse, self_name)
-                                        {
-                                            return false;
-                                        }
-                                    }
-                                    crate::StatementType::For(f) => {
-                                        if !returns_void(&f.body, self_name)
-                                            || !returns_void(&f.orelse, self_name)
-                                        {
-                                            return false;
-                                        }
-                                    }
-                                    crate::StatementType::While(w) => {
-                                        if !returns_void(&w.body, self_name)
-                                            || !returns_void(&w.orelse, self_name)
-                                        {
-                                            return false;
-                                        }
-                                    }
-                                    crate::StatementType::Try(t) => {
-                                        if !returns_void(&t.body, self_name)
-                                            || !returns_void(&t.orelse, self_name)
-                                            || !returns_void(&t.finalbody, self_name)
-                                        {
-                                            return false;
-                                        }
-                                        for h in &t.handlers {
-                                            if !returns_void(&h.body, self_name) {
-                                                return false;
-                                            }
-                                        }
-                                    }
-                                    crate::StatementType::With(w) => {
-                                        if !returns_void(&w.body, self_name) {
-                                            return false;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            true
+                                        )
+                                )
+                            })
                         }
                         if returns_void(&callee.body, &callee.name) {
                             return Ok(quote!(()));
@@ -2406,76 +2316,33 @@ fn callee_return_type(
     result
 }
 
-/// Collect every return expression in a body (walks nested statements).
+/// Collect every return expression in a body: every control-flow body's
+/// returns are the function's (a `with` body's included — `with
+/// sessions.Session() as session: return session.request(...)`, requests'
+/// api.request, whose M4 callers failed with "no return statements";
+/// issue #137), a nested def's are not.
 fn collect_return_exprs(body: &[Statement], out: &mut Vec<ExprType>) {
-    for stmt in body {
-        match &stmt.statement {
-            StatementType::Return(Some(e)) => out.push(e.value.clone()),
-            StatementType::If(s) => {
-                collect_return_exprs(&s.body, out);
-                collect_return_exprs(&s.orelse, out);
-            }
-            StatementType::For(s) => {
-                collect_return_exprs(&s.body, out);
-                collect_return_exprs(&s.orelse, out);
-            }
-            StatementType::While(s) => {
-                collect_return_exprs(&s.body, out);
-                collect_return_exprs(&s.orelse, out);
-            }
-            StatementType::Try(t) => {
-                collect_return_exprs(&t.body, out);
-                for h in &t.handlers {
-                    collect_return_exprs(&h.body, out);
-                }
-                collect_return_exprs(&t.orelse, out);
-                collect_return_exprs(&t.finalbody, out);
-            }
-            // A `with` body's returns are the function's returns
-            // (`with sessions.Session() as session: return
-            // session.request(...)` — requests' api.request, whose M4
-            // callers failed with "no return statements"; issue #137).
-            StatementType::With(s) => collect_return_exprs(&s.body, out),
-            StatementType::AsyncWith(s) => collect_return_exprs(&s.body, out),
-            _ => {}
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if let StatementType::Return(Some(e)) = &stmt.statement {
+            out.push(e.value.clone());
         }
-    }
+        Flow::Continue
+    });
 }
 
 /// Collect the return expressions that do NOT contain a self-recursive
 /// call (`regex_opt_inner(strings[1:], '(?:')` and BinOps around it —
-/// pygments' regexopt): only the recursion's concrete base returns.
+/// pygments' regexopt): only the recursion's concrete base returns. A
+/// return inside a nested def is not this function's.
 fn collect_non_self_returns(body: &[Statement], self_name: &str, out: &mut Vec<ExprType>) {
-    for stmt in body {
-        match &stmt.statement {
-            StatementType::Return(Some(e)) => {
-                if !expr_contains_call_to(&e.value, self_name) {
-                    out.push(e.value.clone());
-                }
-            }
-            StatementType::If(s) => {
-                collect_non_self_returns(&s.body, self_name, out);
-                collect_non_self_returns(&s.orelse, self_name, out);
-            }
-            StatementType::For(s) => {
-                collect_non_self_returns(&s.body, self_name, out);
-                collect_non_self_returns(&s.orelse, self_name, out);
-            }
-            StatementType::While(s) => {
-                collect_non_self_returns(&s.body, self_name, out);
-                collect_non_self_returns(&s.orelse, self_name, out);
-            }
-            StatementType::Try(t) => {
-                collect_non_self_returns(&t.body, self_name, out);
-                for h in &t.handlers {
-                    collect_non_self_returns(&h.body, self_name, out);
-                }
-                collect_non_self_returns(&t.orelse, self_name, out);
-                collect_non_self_returns(&t.finalbody, self_name, out);
-            }
-            _ => {}
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if let StatementType::Return(Some(e)) = &stmt.statement
+            && !expr_contains_call_to(&e.value, self_name)
+        {
+            out.push(e.value.clone());
         }
-    }
+        Flow::Continue
+    });
 }
 
 /// Whether an expression contains a call to `name` anywhere (`x +
@@ -2913,57 +2780,28 @@ fn callee_returned_param(callee: &crate::FunctionDef) -> Option<usize> {
         .map(|p| p.arg.as_str())
         .collect();
     let mut found: Option<usize> = None;
-    fn walk_returns(
-        body: &[Statement],
-        params: &[&str],
-        found: &mut Option<usize>,
-        conflict: &mut bool,
-    ) {
-        for stmt in body {
-            match &stmt.statement {
-                StatementType::Return(Some(e)) => {
-                    // A bare-parameter return — also inside an if-expression
-                    // (`return x if ... else ...`).
-                    let mut expr_returns = Vec::new();
-                    collect_expr_branches(&e.value, &mut expr_returns);
-                    for expr in expr_returns {
-                        if let ExprType::Name(n) = expr {
-                            if let Some(i) = params.iter().position(|p| p == &n.id.as_str()) {
-                                match found {
-                                    None => *found = Some(i),
-                                    Some(prev) if *prev != i => *conflict = true,
-                                    _ => {}
-                                }
-                            }
-                        }
+    let mut conflict = false;
+    // A return inside a nested def is not this function's.
+    walk_stmts(&callee.body, Descend::SkipDefs, &mut |stmt| {
+        if let StatementType::Return(Some(e)) = &stmt.statement {
+            // A bare-parameter return — also inside an if-expression
+            // (`return x if ... else ...`).
+            let mut expr_returns = Vec::new();
+            collect_expr_branches(&e.value, &mut expr_returns);
+            for expr in expr_returns {
+                if let ExprType::Name(n) = expr
+                    && let Some(i) = params.iter().position(|p| p == &n.id.as_str())
+                {
+                    match found {
+                        None => found = Some(i),
+                        Some(prev) if prev != i => conflict = true,
+                        _ => {}
                     }
                 }
-                StatementType::If(s) => {
-                    walk_returns(&s.body, params, found, conflict);
-                    walk_returns(&s.orelse, params, found, conflict);
-                }
-                StatementType::For(s) => {
-                    walk_returns(&s.body, params, found, conflict);
-                    walk_returns(&s.orelse, params, found, conflict);
-                }
-                StatementType::While(s) => {
-                    walk_returns(&s.body, params, found, conflict);
-                    walk_returns(&s.orelse, params, found, conflict);
-                }
-                StatementType::Try(t) => {
-                    walk_returns(&t.body, params, found, conflict);
-                    for h in &t.handlers {
-                        walk_returns(&h.body, params, found, conflict);
-                    }
-                    walk_returns(&t.orelse, params, found, conflict);
-                    walk_returns(&t.finalbody, params, found, conflict);
-                }
-                _ => {}
             }
         }
-    }
-    let mut conflict = false;
-    walk_returns(&callee.body, &params, &mut found, &mut conflict);
+        Flow::Continue
+    });
     if conflict {
         None
     } else {
