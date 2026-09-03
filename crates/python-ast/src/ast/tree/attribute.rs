@@ -860,18 +860,25 @@ pub(crate) fn class_field_access(
     // may be any expression the inferrer types (`self.items[k].qty`, a
     // subscript into a dict of the root; an unwrapped `Option` local).
     if !is_self {
-        let root_typed = match crate::receiver_class_for_read(value, ctx, symbols, options) {
-            Some((class, _)) => crate::ast::tree::hierarchy::is_polymorphic_root(&class.name),
-            None => match crate::infer_type(Some(ctx), value, options, symbols) {
-                crate::TypeInfo::Class(c) => crate::ast::tree::hierarchy::is_polymorphic_root(&c),
-                crate::TypeInfo::Option(inner) => matches!(
-                    *inner,
-                    crate::TypeInfo::Class(ref c) if crate::ast::tree::hierarchy::is_polymorphic_root(c)
-                ),
-                _ => false,
-            },
-        };
-        if root_typed {
+        // The receiver's class with its defining scope: the read path's
+        // resolution, else the inferred type's class resolved by name.
+        let resolved = crate::receiver_class_for_read(value, ctx, symbols, options).or_else(|| {
+            let name = match crate::infer_type(Some(ctx), value, options, symbols) {
+                crate::TypeInfo::Class(c) => c,
+                crate::TypeInfo::Option(inner) => match *inner {
+                    crate::TypeInfo::Class(c) => c,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            crate::ast::tree::call::receiver_class_tail(&name, symbols.clone(), options)
+        });
+        if let Some((class, class_symbols)) = resolved
+            && crate::ast::tree::hierarchy::is_polymorphic_root(&class.name)
+            // A FIELD of the root's chain (its accessors are what the sum
+            // type carries); a method or property keeps the call path.
+            && class.field_owner_depth(attr, &class_symbols, options).is_some()
+        {
             return Some(FieldRewrite::Accessor {
                 field: attr.to_string(),
             });

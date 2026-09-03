@@ -2190,9 +2190,17 @@ fn qualify_tokens(
                     ) {
                     None
                 } else if is_capword {
+                    // A root's SUM TYPE (`AnyContentDecoder` — hierarchy.rs)
+                    // lives beside its root class.
+                    let root_of_any = name
+                        .strip_prefix("Any")
+                        .filter(|r| crate::ast::tree::hierarchy::is_polymorphic_root(r));
                     if crate::ast::tree::module::module_class_traits(a_opts, definer_path)
                         .contains_key(&name)
                         || crate::module_class_def(a_opts, definer_path, &name).is_some()
+                        || root_of_any.is_some_and(|r| {
+                            crate::module_class_def(a_opts, definer_path, r).is_some()
+                        })
                     {
                         Some(definer_path.to_vec())
                     } else {
@@ -5927,7 +5935,20 @@ impl ClassDef {
                 }
                 let f = crate::safe_ident(fname);
                 let f_mut = format_ident!("{}_mut", fname);
-                let ty = fty.to_rust_type();
+                // A cross-module ancestor's field type names classes of
+                // ITS module bare: qualify to crate paths (this module
+                // need not import them) — the same rule the derived
+                // class's own ancestor impls apply.
+                let ty = match a_path {
+                    Some(path) => qualify_cross_module_types(
+                        fty.to_rust_type(),
+                        path,
+                        a_syms,
+                        a_opts,
+                        options,
+                    ),
+                    None => fty.to_rust_type(),
+                };
                 inherent.extend(quote! {
                     pub fn #f(&self) -> #ty {
                         match self { #(#any::#vnames(v) => v.#f()),* }
@@ -5968,15 +5989,41 @@ impl ClassDef {
                     force_mut_self,
                 };
                 let rendered = emitted.to_rust(trait_ctx, a_opts.clone(), a_syms.clone())?;
+                let rendered = match a_path {
+                    Some(path) => qualify_cross_module_types(rendered, path, a_syms, a_opts, options),
+                    None => rendered,
+                };
                 let Some((head, name, args)) = h::split_fn(&rendered) else {
                     continue;
                 };
                 let call_args = quote!(#(#args),*);
                 let fwd_args = quote!(#(, #args)*);
                 if first_seen {
+                    // Dispatch through the DEFINER's trait when it carries
+                    // the method: every variant implements it with the
+                    // trait's one signature (a conforming override is
+                    // re-emitted there; a non-conforming one falls to the
+                    // default, the covariant-override divergence the
+                    // trait path already documents). A variant's inherent
+                    // override may take different parameters (`urlopen(
+                    // method, url, redirect, **kw)` on PoolManager vs the
+                    // RequestMethods signature — urllib3), which the
+                    // uniform arm cannot call.
+                    let arms: Vec<TokenStream> = vnames
+                        .iter()
+                        .zip(vpaths.iter())
+                        .map(|(vn, vp)| {
+                            let call = if full_trait && is_definer {
+                                quote!(<#vp as #trait_path>::#name(v #fwd_args))
+                            } else {
+                                quote!(v.#name(#call_args))
+                            };
+                            quote!(#any::#vn(v) => #call)
+                        })
+                        .collect();
                     inherent.extend(quote! {
                         pub #head {
-                            match self { #(#any::#vnames(v) => v.#name(#call_args)),* }
+                            match self { #(#arms),* }
                         }
                     });
                 }

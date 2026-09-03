@@ -17060,6 +17060,7 @@ fn an_aliased_imported_constructor_result_is_a_method_receiver() {
         out
     );
 }
+}
     // `Inner` has a subclass here, so the `inner: Inner` field is the
     // hierarchy sum type (§7) and its field is reached through the
     // accessor: `self.inner_mut().nums_mut()`.
@@ -17181,4 +17182,5 @@ fn a_list_of_a_root_holds_the_sum_type_and_its_elements_convert() {
         "the sum type carries the runtime traits: {}",
         out
     );
-}
+        flat.contains("matchself{AnyItem::Item(v)=><ItemasItemTrait>::label(v),AnyItem::Perishable(v)=><PerishableasItemTrait>::label(v)}"),
+        "every method of the root's MRO dispatches by match to the variant's implementation of the definer's trait (an override re-emitted there wins, as Python's dynamic dispatch does): {}",

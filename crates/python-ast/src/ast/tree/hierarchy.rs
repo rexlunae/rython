@@ -135,8 +135,22 @@ pub fn compute_roots(this_classes: &[ClassDef], options: &PythonOptions) -> Hier
         if path[..] == options.this_module_path[..] {
             continue;
         }
-        let mut defs = Vec::new();
-        crate::ast::tree::module::collect_class_defs(&module.raw.body, &mut defs);
+        // The other module's scope, as its own emission sees it (an
+        // __init__ module is its own package — mirrors
+        // cross_module_chain), so its gates and relative imports fold
+        // exactly as they do when it is converted.
+        let mut module_opts = options.clone();
+        let is_package = options
+            .module_defs
+            .keys()
+            .any(|k| k.len() > path.len() && k[..path.len()] == path[..]);
+        module_opts.module_path = if is_package {
+            path.clone()
+        } else {
+            path[..path.len().saturating_sub(1)].to_vec()
+        };
+        module_opts.this_module_path = path.clone();
+        let defs = crate::ast::tree::module::emitted_class_defs(module, &module_opts);
         for c in defs {
             if participates(&c) {
                 classes

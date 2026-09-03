@@ -289,51 +289,8 @@ impl CodeGen for Module {
         // `global` are excluded (they are mutable statics, not
         // constants).
         {
-            let mut none_names = std::collections::HashSet::new();
-            let mut false_names = std::collections::HashSet::new();
-            for stmt in &self.raw.body {
-                if let crate::StatementType::Assign(a) = &stmt.statement
-                    && a.targets.len() == 1
-                    && let ExprType::Name(n) = &a.targets[0]
-                    && module_assign_counts.get(&n.id).copied().unwrap_or(0) == 1
-                    && !global_mutables.contains_key(&n.id)
-                {
-                    if crate::is_none_expr(&a.value) {
-                        none_names.insert(n.id.clone());
-                    } else if matches!(
-                        &a.value,
-                        ExprType::Constant(c)
-                            if matches!(&c.0, Some(litrs::Literal::Bool(b)) if !b.value())
-                    ) {
-                        false_names.insert(n.id.clone());
-                    }
-                }
-            }
-            // A RESOLVABLE top-level `import X` never reassigned is a
-            // statically-truthy module name: `if not ssl:` fallbacks
-            // (urllib3's connection.py DummyConnection) fold away, the
-            // branches CPython never enters when the import succeeds.
-            let mut module_names = std::collections::HashSet::new();
-            for stmt in &self.raw.body {
-                if let crate::StatementType::Import(imp) = &stmt.statement {
-                    for al in &imp.names {
-                        let root = al.name.split('.').next().unwrap_or("");
-                        let bound = al.asname.clone().unwrap_or_else(|| root.to_string());
-                        let resolvable = crate::ast::tree::import::is_stdpython_module(root)
-                            || options.python_modules.contains(&root.to_string())
-                            || options
-                                .module_defs
-                                .keys()
-                                .any(|k| k.first().map(String::as_str) == Some(root));
-                        if resolvable
-                            && module_assign_counts.get(&bound).copied().unwrap_or(0) == 0
-                            && !global_mutables.contains_key(&bound)
-                        {
-                            module_names.insert(bound);
-                        }
-                    }
-                }
-            }
+            let (none_names, false_names, module_names) =
+                static_gate_names(&self.raw.body, &module_assign_counts, &global_mutables, &options);
             options.statically_none_names = std::rc::Rc::new(none_names);
             options.statically_false_names = std::rc::Rc::new(false_names);
             options.statically_module_names = std::rc::Rc::new(module_names);
@@ -356,8 +313,15 @@ impl CodeGen for Module {
         // (`if __name__ == "__main__":` and friends) count too — their
         // class statements lower the same way.
         {
+            // The module's EMITTED classes (the static-name gates fold at
+            // emission, after the splice above ran without their names):
+            // a class the emission drops is neither a hierarchy member
+            // nor a sum-type variant.
             let mut classes = Vec::new();
-            collect_class_defs(&self.raw.body, &mut classes);
+            collect_class_defs(
+                &splice_gated_branches(self.raw.body.clone(), &options),
+                &mut classes,
+            );
             let mut hierarchy = std::collections::HashSet::new();
             for c in &classes {
                 let has_real_base = c
@@ -3113,6 +3077,71 @@ fn module_global_class_stores(
 /// Returns the folded body plus the HANDLER statements the fold made
 /// live (spliced in place of a try whose imports all fail): those were
 /// skipped by Try::find_symbols and need registering.
+/// The statically-decided module names of a module body (issue #137): the
+/// single-store None / False constants (typically the folded handler of a
+/// failed import guard) and the resolvable never-reassigned `import X`
+/// bindings. The ONE definition: the module's own emission installs these
+/// on its options, and the crate-wide class index (hierarchy.rs) computes
+/// them for every other module so a class under `if brotli is not None:`
+/// that the emission folds away is not a sum-type variant either.
+pub(crate) fn static_gate_names(
+    body: &[crate::Statement],
+    module_assign_counts: &std::collections::HashMap<String, usize>,
+    global_mutables: &std::collections::HashMap<String, crate::MutableGlobalKind>,
+    options: &PythonOptions,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
+    let mut none_names = std::collections::HashSet::new();
+    let mut false_names = std::collections::HashSet::new();
+    for stmt in body {
+        if let crate::StatementType::Assign(a) = &stmt.statement
+            && a.targets.len() == 1
+            && let ExprType::Name(n) = &a.targets[0]
+            && module_assign_counts.get(&n.id).copied().unwrap_or(0) == 1
+            && !global_mutables.contains_key(&n.id)
+        {
+            if crate::is_none_expr(&a.value) {
+                none_names.insert(n.id.clone());
+            } else if matches!(
+                &a.value,
+                ExprType::Constant(c)
+                    if matches!(&c.0, Some(litrs::Literal::Bool(b)) if !b.value())
+            ) {
+                false_names.insert(n.id.clone());
+            }
+        }
+    }
+    // A RESOLVABLE top-level `import X` never reassigned is a
+    // statically-truthy module name: `if not ssl:` fallbacks
+    // (urllib3's connection.py DummyConnection) fold away, the
+    // branches CPython never enters when the import succeeds.
+    let mut module_names = std::collections::HashSet::new();
+    for stmt in body {
+        if let crate::StatementType::Import(imp) = &stmt.statement {
+            for al in &imp.names {
+                let root = al.name.split('.').next().unwrap_or("");
+                let bound = al.asname.clone().unwrap_or_else(|| root.to_string());
+                let resolvable = crate::ast::tree::import::is_stdpython_module(root)
+                    || options.python_modules.contains(&root.to_string())
+                    || options
+                        .module_defs
+                        .keys()
+                        .any(|k| k.first().map(String::as_str) == Some(root));
+                if resolvable
+                    && module_assign_counts.get(&bound).copied().unwrap_or(0) == 0
+                    && !global_mutables.contains_key(&bound)
+                {
+                    module_names.insert(bound);
+                }
+            }
+        }
+    }
+    (none_names, false_names, module_names)
+}
+
 /// Replace module-level `if` blocks whose branch is statically decided
 /// (`sys.version_info` gates and single-store-name gates) with the taken
 /// branch's statements, recursively. Defs and class bodies inside the
@@ -4957,6 +4986,65 @@ def foo():
         );
         info!("module: {:?}", code);
     }
+}
+
+/// The classes a module EMITS: `collect_class_defs` over the body after
+/// the same folds the emission applies — the failed-import try fold, the
+/// version gates, and the static-name gates (`if brotli is not None:` —
+/// urllib3's response.py, whose BrotliDecoder never exists in the crate).
+/// The one authority for "is this class in the crate", so a crate-wide
+/// index (the hierarchy's sum-type variants) agrees with the emission.
+/// `options` must be the module's own scope (module_path /
+/// this_module_path), as the emission's are.
+pub(crate) fn emitted_class_defs(
+    module: &crate::Module,
+    options: &PythonOptions,
+) -> Vec<crate::ClassDef> {
+    let mut out = Vec::new();
+    // No class under a gate: the plain walk is exact, and the per-module
+    // symbol table (the gate names need it) is never built.
+    if !has_gated_class(&module.raw.body) {
+        collect_class_defs(&module.raw.body, &mut out);
+        return out;
+    }
+    let (body, _) = fold_static_import_trys(&module.raw.body, options);
+    let body = splice_gated_branches(body, options);
+    let mut counts = std::collections::HashMap::new();
+    count_module_stores(&body, &mut counts);
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let global_mutables = module_global_mutable_names(&body, &counts, &symbols, options);
+    let (none_names, false_names, module_names) =
+        static_gate_names(&body, &counts, &global_mutables, options);
+    let mut gated = options.clone();
+    gated.statically_none_names = std::rc::Rc::new(none_names);
+    gated.statically_false_names = std::rc::Rc::new(false_names);
+    gated.statically_module_names = std::rc::Rc::new(module_names);
+    let body = splice_gated_branches(body, &gated);
+    collect_class_defs(&body, &mut out);
+    out
+}
+
+/// Whether any class statement sits under a module-level `if` or `try`
+/// (the shapes whose branch the emission may fold away).
+fn has_gated_class(stmts: &[crate::Statement]) -> bool {
+    stmts.iter().any(|s| match &s.statement {
+        crate::StatementType::If(i) => {
+            has_class(&i.body) || has_class(&i.orelse)
+        }
+        crate::StatementType::Try(t) => {
+            has_class(&t.body)
+                || t.handlers.iter().any(|h| has_class(&h.body))
+                || has_class(&t.orelse)
+                || has_class(&t.finalbody)
+        }
+        _ => false,
+    })
+}
+
+fn has_class(stmts: &[crate::Statement]) -> bool {
+    let mut out = Vec::new();
+    collect_class_defs(stmts, &mut out);
+    !out.is_empty()
 }
 
 /// Every `ClassDef` in the module, recursing into container statements
