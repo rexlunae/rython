@@ -7,6 +7,9 @@
     "inventory": {
       "status": "pass"
     },
+    "ledger": {
+      "status": "pass"
+    },
     "matrix": {
       "status": "build-failed",
       "errors": 4
