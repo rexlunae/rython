@@ -3915,6 +3915,14 @@ impl<T: PyRepr> PyRepr for PyRef<T> {
     }
 }
 
+/// A shared instance's truth is the object's (Python asks the one object
+/// whichever reference holds it).
+impl<T: PyBool + Clone> PyBool for PyRef<T> {
+    fn py_bool(self) -> bool {
+        self.borrow().clone().py_bool()
+    }
+}
+
 impl<T> PyIsNone for PyRef<T> {
     fn py_is_none(&self) -> bool {
         false
