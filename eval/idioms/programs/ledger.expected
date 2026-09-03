@@ -8,3 +8,5 @@ alice: 1 (2 moves)
 True True False False
 True False no
 True 1 yes
+False True 2
+2 2

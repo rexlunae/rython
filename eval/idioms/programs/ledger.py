@@ -65,6 +65,27 @@ class Journal(Book):
     pass
 
 
+class Probe:
+    # Truth with a side effect: every bool() counts, on the one object.
+    def __init__(self):
+        self.checks = 0
+
+    def __bool__(self) -> bool:
+        self.checks += 1
+        return self.checks > 1
+
+
+class Backlog:
+    # Its only mutation sits in a condition.
+    def __init__(self):
+        self.items: list[int] = [3, 2, 1]
+
+    def drain(self) -> int:
+        if self.items.pop() > 0:
+            return len(self.items)
+        return -1
+
+
 def has_entries(b: Book) -> str:
     # Truth through the root's sum type: an empty book is False.
     if bool(b):
@@ -97,6 +118,12 @@ def main() -> None:
     shelf[1].add(3)
     j = shelf[1]
     print(bool(j), len(j.entries), has_entries(shelf[1]))
+    probes: list[Probe] = [Probe()]
+    p = probes[0]
+    print(bool(probes[0]), bool(p), probes[0].checks)
+    queues: list[Backlog] = [Backlog()]
+    q = queues[0]
+    print(q.drain(), len(queues[0].items))
 
 
 if __name__ == "__main__":

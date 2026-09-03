@@ -3860,11 +3860,26 @@ impl<T> PyRef<T> {
     pub fn new(value: T) -> Self {
         PyRef(alloc::rc::Rc::new(core::cell::RefCell::new(value)))
     }
+    /// A read of the one object. Loud (§12.2) when a mutating method on
+    /// another reference to it is still running — `a.merge(a)`, the
+    /// aliasing-under-mutation boundary the spec names.
     pub fn borrow(&self) -> core::cell::Ref<'_, T> {
-        self.0.borrow()
+        self.0.try_borrow().unwrap_or_else(|_| {
+            panic!(
+                "RuntimeError: a shared object is read through one reference while a \
+                 mutating method runs on another (aliasing under mutation, issue #137)"
+            )
+        })
     }
+    /// A mutation of the one object; loud like `borrow` when any other
+    /// reference to it is in use.
     pub fn borrow_mut(&self) -> core::cell::RefMut<'_, T> {
-        self.0.borrow_mut()
+        self.0.try_borrow_mut().unwrap_or_else(|_| {
+            panic!(
+                "RuntimeError: a shared object is mutated through one reference while \
+                 another reference to it is in use (aliasing under mutation, issue #137)"
+            )
+        })
     }
     /// Python's `is`: the same object.
     pub fn py_is(&self, other: &Self) -> bool {
@@ -3923,11 +3938,17 @@ impl<T: PyRepr> PyRepr for PyRef<T> {
     }
 }
 
-/// A shared instance's truth is the object's (Python asks the one object
-/// whichever reference holds it).
-impl<T: PyBool + Clone> PyBool for PyRef<T> {
+/// A shared instance's truth is the ONE object's (the converter
+/// implements this for every shared class): `__bool__` / `__len__` run on
+/// the object behind the reference — mutably when the method mutates —
+/// so a side effect in either is what every other reference sees.
+pub trait PyRefTruth: Sized {
+    fn ref_truth(r: &PyRef<Self>) -> bool;
+}
+
+impl<T: PyRefTruth> PyBool for PyRef<T> {
     fn py_bool(self) -> bool {
-        self.borrow().clone().py_bool()
+        T::ref_truth(&self)
     }
 }
 
@@ -3961,6 +3982,39 @@ mod pyref_tests {
         // aliases are equal, two distinct equal-field objects are not.
         assert!(a == b);
         assert!(a != PyRef::new(Counter { n: 3 }));
+    }
+
+    /// A read through one reference while a mutating method runs on
+    /// another is loud, with the boundary named (`a.merge(a)`).
+    #[test]
+    #[should_panic(expected = "aliasing under mutation")]
+    fn a_read_under_a_mutating_borrow_is_loud() {
+        let a = PyRef::new(Counter { n: 1 });
+        let b = a.clone();
+        let held = a.borrow_mut();
+        let _ = b.borrow().n;
+        drop(held);
+    }
+
+    /// A shared instance's truth runs on the one object: a `__bool__`
+    /// that counts its calls is seen through the other reference.
+    #[test]
+    fn a_shared_truth_runs_on_the_one_object() {
+        struct Probe {
+            checks: i64,
+        }
+        impl PyRefTruth for Probe {
+            fn ref_truth(r: &PyRef<Self>) -> bool {
+                let mut p = r.borrow_mut();
+                p.checks += 1;
+                p.checks > 1
+            }
+        }
+        let a = PyRef::new(Probe { checks: 0 });
+        let b = a.clone();
+        assert!(!bool(a.clone()));
+        assert!(bool(b.clone()));
+        assert_eq!(a.borrow().checks, 2);
     }
 
     /// `bool(x)` on an optional value: None is false, a present value has

@@ -3295,15 +3295,58 @@ impl CodeGen for ClassDef {
         // derived instance's truth too (Devin review on #321); the call
         // reaches it through the ancestor's trait, in scope with the class.
         let truth_impl = if options.with_std_python {
-            let body = if self.method_on_mro("__bool__", &symbols).is_some() {
-                quote!(self.__bool__().expect("__bool__ raised"))
-            } else if self.method_on_mro("__len__", &symbols).is_some() {
-                quote!(self.__len__().expect("__len__ raised") != 0)
-            } else {
-                quote!(true)
+            let dunder = ["__bool__", "__len__"]
+                .into_iter()
+                .find(|d| self.method_on_mro(d, &symbols).is_some());
+            let body = match dunder {
+                Some("__bool__") => quote!(self.__bool__().expect("__bool__ raised")),
+                Some(_) => quote!(self.__len__().expect("__len__ raised") != 0),
+                None => quote!(true),
+            };
+            // A dunder that mutates takes `&mut self`: the consumed value
+            // is declared mutable for it.
+            let receiver = match dunder {
+                Some(d) if self.method_needs_mut_self(d, &symbols, &options) => quote!(mut self),
+                _ => quote!(self),
             };
             quote!(impl stdpython::PyBool for #class_name {
-                fn py_bool(self) -> bool {
+                fn py_bool(#receiver) -> bool {
+                    #body
+                }
+            })
+        } else {
+            quote!()
+        };
+        // A SHARED class's truth runs on the ONE object behind the
+        // reference (`PyRefTruth`, shared.rs): the dunder is called through
+        // the borrow — mutable when the method mutates — so its side
+        // effects are what every other reference sees (Devin review on
+        // #321), never on a clone.
+        let ref_truth_impl = if options.with_std_python
+            && crate::ast::tree::shared::is_shared(&self.name)
+        {
+            let dunder = ["__bool__", "__len__"]
+                .into_iter()
+                .find(|d| self.method_on_mro(d, &symbols).is_some());
+            let body = match dunder {
+                Some(d) => {
+                    let borrow = if self.method_needs_mut_self(d, &symbols, &options) {
+                        quote!(r.borrow_mut())
+                    } else {
+                        quote!(r.borrow())
+                    };
+                    let call = format_ident!("{}", d);
+                    let raised = format!("{} raised", d);
+                    if d == "__bool__" {
+                        quote!(#borrow.#call().expect(#raised))
+                    } else {
+                        quote!(#borrow.#call().expect(#raised) != 0)
+                    }
+                }
+                None => quote!(true),
+            };
+            quote!(impl stdpython::PyRefTruth for #class_name {
+                fn ref_truth(r: &stdpython::PyRef<Self>) -> bool {
                     #body
                 }
             })
@@ -3442,7 +3485,7 @@ impl CodeGen for ClassDef {
             // so `x is None` on an instance lowers through PyIsNone to
             // false — same contract the PyInherits tree carries for
             // ancestry bounds.
-            #is_none_impl #truth_impl #ref_eq_impl
+            #is_none_impl #truth_impl #ref_truth_impl #ref_eq_impl
             // Class-level COMPUTED constants live at module scope under
             // class-mangled names: associated statics are not legal Rust
             // (issue #137).
