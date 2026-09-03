@@ -5954,15 +5954,25 @@ impl<'a> CodeGen for Call {
                     };
                     let method_name = crate::safe_ident(&attr.attr);
                     if shared_borrow {
-                        // The borrow ends WITH the call: bound to a local,
-                        // the `Ref`/`RefMut` temporary drops at the `let`
-                        // (a tail expression's temporary would live to the
+                        // The ARGUMENTS evaluate before the borrow, as
+                        // Python evaluates them before the method body
+                        // runs: bound to locals in source order, so an
+                        // argument reading or mutating the same object
+                        // (`a.set(a.value)`, `q.note(q.drain())`) completes
+                        // first (Devin review on #321). Then the borrow
+                        // ends WITH the call: bound to a local, the
+                        // `Ref`/`RefMut` temporary drops at the `let` (a
+                        // tail expression's temporary would live to the
                         // enclosing statement's end — `print(q.drain(),
                         // len(queues[0].items))` reads the same object
                         // next, as Python's left-to-right evaluation may).
+                        let arg_names: Vec<proc_macro2::Ident> = (0..args.len())
+                            .map(|i| format_ident!("__rython_sarg{}", i))
+                            .collect();
                         return Ok(quote!({
                             #prelude
-                            let __rython_call = (#receiver).#method_name(#(#args),*)?;
+                            #(let #arg_names = #args;)*
+                            let __rython_call = (#receiver).#method_name(#(#arg_names),*)?;
                             __rython_call
                         }));
                     }
