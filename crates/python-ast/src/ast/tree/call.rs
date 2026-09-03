@@ -5851,10 +5851,17 @@ impl<'a> CodeGen for Call {
                     // view (`s.center.bump()` — Devin review on #319).
                     let narrowed_class_chain =
                         crate::ast::tree::attribute::chain_root_is_narrowed_class(&attr.value, &options);
+                    // A field chain rooted at a SHARED instance (`a.center
+                    // .bump()`): the place through the mutable borrow, or
+                    // the call lands on the read's clone of the field.
+                    let shared_chain = crate::ast::tree::attribute::chain_root_is_shared_instance(
+                        &attr.value, &ctx, &symbols, &options,
+                    );
                     let receiver =
                         if mutates_receiver
                             && (crate::ast::tree::attribute::chain_root_is_self(&attr.value)
-                                || narrowed_class_chain)
+                                || narrowed_class_chain
+                                || shared_chain)
                         {
                             // The WHOLE chain renders as a place:
                             // `self.outer.inner.bump()` goes through
@@ -5978,7 +5985,13 @@ impl<'a> CodeGen for Call {
                 // from the mutable view, or the push lands on the read
                 // view's clone.
                 || (matches!(attr.value.as_ref(), ExprType::Attribute(_))
-                    && crate::ast::tree::attribute::chain_root_is_narrowed_class(&attr.value, &options));
+                    && crate::ast::tree::attribute::chain_root_is_narrowed_class(&attr.value, &options))
+                // A container field of a SHARED instance (`a.items.append(x)`
+                // where `a = accounts[k]` — Devin review on #321): the place
+                // through the mutable borrow, never the read's clone.
+                || crate::ast::tree::attribute::chain_root_is_shared_instance(
+                    &attr.value, &ctx, &symbols, &options,
+                );
             // Issue #137's Option-aware access, the CALL side: a method
             // call through an Option-typed receiver (`conn.close()` where
             // conn is `BaseHTTPConnection | None` — urllib3's

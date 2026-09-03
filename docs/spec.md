@@ -413,8 +413,9 @@ through subscript/attribute stores marks the chain's base variable.
   object. The registry is keyed by the class name the type side carries,
   so a name two modules of the crate both define is excluded from sharing
   with a conversion warning (as the hierarchy index excludes it); a store
-  through a non-`self` receiver counts for the class the receiver's scope
-  names, and for every class with that field when it names none (a side
+  through a non-`self` receiver — a field store, or a mutating call on a
+  field's container — counts for the class the receiver's scope names, and
+  for every class with that field when it names none (a side
   effect in `__bool__` is what every reference sees). One boundary: a
   mutating method on a shared object holds the object for its duration,
   so a read of the SAME object through another reference inside that

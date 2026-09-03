@@ -2679,7 +2679,16 @@ fn analyze_statement_types(
                         // form).
                         ExprType::Subscript(_) => match (options, symbols) {
                             (Some(options), Some(symbols)) => {
-                                match infer_type(None, &assign.value, &analysis_view(options, info), symbols) {
+                                // The class context: `a = self.accounts[k]`
+                                // reads a field of the enclosing class.
+                                let analysis_ctx =
+                                    self_class.map(|cl| CodeGenContext::Class(cl.to_string()));
+                                match infer_type(
+                                    analysis_ctx.as_ref(),
+                                    &assign.value,
+                                    &analysis_view(options, info),
+                                    symbols,
+                                ) {
                                     TypeInfo::PyObject => syntactic_type(&assign.value),
                                     t => t,
                                 }
