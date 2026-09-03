@@ -14779,7 +14779,7 @@ fn a_mutating_method_call_through_a_fetch_local_reaches_the_shared_object() {
     );
     let flat: String = out.split_whitespace().collect();
     assert!(
-        flat.contains(".borrow_mut()).restock(3)?"),
+        flat.contains("let__rython_sarg0=3;let__rython_call=(((item).clone().unwrap()).borrow_mut()).restock(__rython_sarg0)?;"),
         "the mutating call borrows the one object mutably: {}",
         out
     );
@@ -17901,6 +17901,47 @@ fn a_tuple_holds_its_elements_and_an_alias_constructor_resolves_to_its_class() {
     );
 }
 
+/// A shared call's ARGUMENTS evaluate before the receiver's borrow, as
+/// Python evaluates them before the method body runs: bound to locals in
+/// source order, so `a.deposit(a.balance)` reads the object first and
+/// `q.note(q.drain())` mutates it first (Devin review on #321).
+#[test]
+fn a_shared_calls_arguments_evaluate_before_the_borrow() {
+    let out = compile(
+        concat!(
+            "class Account:\n",
+            "    def __init__(self, balance: int):\n",
+            "        self.balance = balance\n",
+            "\n",
+            "    def deposit(self, amount: int) -> None:\n",
+            "        self.balance += amount\n",
+            "\n",
+            "    def note(self, n: int) -> int:\n",
+            "        return n + self.balance\n",
+            "\n",
+            "class Bank:\n",
+            "    def __init__(self):\n",
+            "        self.accounts: dict[str, Account] = {}\n",
+            "\n",
+            "def double(a: Account) -> int:\n",
+            "    a.deposit(a.balance)\n",
+            "    return a.note(a.balance)\n",
+        ),
+        "shared_call_args.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("let__rython_sarg0=(a).borrow().balance.clone();let__rython_call=((a).borrow_mut()).deposit(__rython_sarg0)?;"),
+        "the argument's read completes before the mutable borrow: {}",
+        out
+    );
+    assert!(
+        flat.contains("let__rython_sarg0=(a).borrow().balance.clone();let__rython_call=((a).borrow()).note(__rython_sarg0)?;"),
+        "the argument evaluates before the shared borrow: {}",
+        out
+    );
+}
+
 /// A shared class constructs behind `PyRef`, its slot type is `PyRef<C>`,
 /// a loop variable over a container of it borrows for a field read, a
 /// field store through it borrows mutably, and a subscript into the
@@ -17953,7 +17994,7 @@ fn a_shared_class_is_a_reference_everywhere_it_is_held() {
         out
     );
     assert!(
-        flat.contains(").borrow_mut()).deposit(5)?"),
+        flat.contains("let__rython_sarg0=5;let__rython_call=(((self.accounts).py_index(owner)?).borrow_mut()).deposit(__rython_sarg0)?;"),
         "a subscript into the container is a receiver that borrows mutably: {}",
         out
     );

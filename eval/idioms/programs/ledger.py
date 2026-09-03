@@ -138,6 +138,9 @@ class Backlog:
             return len(self.items)
         return -1
 
+    def note(self, n: int) -> int:
+        return n * 10 + len(self.items)
+
 
 def has_entries(b: Book) -> str:
     # Truth through the root's sum type: an empty book is False.
@@ -200,6 +203,11 @@ def main() -> None:
     dials: list[Knob] = [d]
     d.level = 6
     print(dials[0].level)
+    # An argument that reads or mutates the receiver's own object runs
+    # before the call, as Python evaluates arguments first.
+    alice.deposit(alice.balance)
+    print(bank.find("alice").describe())
+    print(q.note(q.drain()), len(queues[0].items))
 
 
 if __name__ == "__main__":
