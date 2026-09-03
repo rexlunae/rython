@@ -897,6 +897,37 @@ fn infer_type_inner(
         ExprType::Subscript(sub) => match infer_type_inner(ctx, &sub.value, options, symbols) {
             TypeInfo::Vec(inner) => *inner,
             TypeInfo::Dict(_, v) => *v,
+            // A TUPLE indexed by a constant (`pair[0]`, `pair[-1]`) is that
+            // element's type (a tuple holds its elements as a list does —
+            // shared.rs; Devin review on #321).
+            TypeInfo::Tuple(items) => {
+                let literal = |e: &ExprType| match e {
+                    ExprType::Constant(c) => match &c.0 {
+                        Some(litrs::Literal::Integer(v)) => v.value::<i64>(),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let index = match &sub.kind {
+                    crate::SubscriptKind::Index(i) => match i.as_ref() {
+                        ExprType::UnaryOp(u)
+                            if matches!(u.op, crate::ast::tree::unary_op::Ops::USub) =>
+                        {
+                            literal(&u.operand).map(|v| -v)
+                        }
+                        other => literal(other),
+                    },
+                    _ => None,
+                };
+                match index {
+                    Some(i) => {
+                        let n = items.len() as i64;
+                        let i = if i < 0 { i + n } else { i };
+                        if i >= 0 && i < n { items[i as usize].clone() } else { TypeInfo::PyObject }
+                    }
+                    None => TypeInfo::PyObject,
+                }
+            }
             // An OPTION-wrapped base (`request_context["scheme"]` where
             // request_context is `dict[str, Any] | None` — urllib3's
             // poolmanager): the read unwraps the Option, so the element

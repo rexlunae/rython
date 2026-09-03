@@ -109,6 +109,15 @@ def fill(b: Bin, v: int) -> None:
     b.values.append(v)
 
 
+class Knob:
+    # Constructed through an alias name; mutated only from outside.
+    def __init__(self):
+        self.level = 0
+
+
+Dial = Knob
+
+
 class Probe:
     # Truth with a side effect: every bool() counts, on the one object.
     def __init__(self):
@@ -182,6 +191,15 @@ def main() -> None:
     fill(b, 7)
     b.values.append(8)
     print(bins[0].values)
+    print(ta is ta is not tb, tb is not ta is ta)
+    pair: tuple[Bin, Bin] = (Bin(), Bin())
+    first_bin = pair[0]
+    first_bin.values.append(1)
+    print(pair[0].values, pair[1].values)
+    d = Dial()
+    dials: list[Knob] = [d]
+    d.level = 6
+    print(dials[0].level)
 
 
 if __name__ == "__main__":

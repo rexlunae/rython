@@ -302,7 +302,10 @@ impl ExprType {
                             spreads.push(quote!(#inner));
                             continue;
                         }
-                        elements.push(crate::render_typed(
+                        // A NAME element read again later takes the
+                        // reuse-clone (`dials = [d]` then `d.level = 6` —
+                        // a shared reference; the corpus's ledger).
+                        elements.push(crate::render_typed_reused(
                             li,
                             ctx.clone(),
                             options.clone(),
@@ -453,7 +456,7 @@ impl ExprType {
                         starred_vals.push(inner);
                         continue;
                     }
-                    let code = crate::render_typed(
+                    let code = crate::render_typed_reused(
                         &li,
                         ctx.clone(),
                         options.clone(),

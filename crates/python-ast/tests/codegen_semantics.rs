@@ -17815,6 +17815,92 @@ fn an_external_container_mutating_call_shares_the_class() {
     );
 }
 
+/// A CHAINED identity test on shared references (`a is b is not c`) is
+/// identity per link — the same rule as the single comparison, never the
+/// `==` a class defines (Devin review on #321).
+#[test]
+fn a_chained_identity_on_shared_references_is_never_equality() {
+    let out = compile(
+        concat!(
+            "class Tag:\n",
+            "    def __init__(self):\n",
+            "        self.hits = 0\n",
+            "\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        return False\n",
+            "\n",
+            "    def hit(self) -> None:\n",
+            "        self.hits += 1\n",
+            "\n",
+            "class Board:\n",
+            "    def __init__(self):\n",
+            "        self.tags: list[Tag] = []\n",
+            "\n",
+            "def chain(a: Tag, b: Tag, c: Tag) -> bool:\n",
+            "    return a is b is not c\n",
+        ),
+        "chained_identity.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("(__rython_cmp0).py_is(__rython_cmp1)")
+            && flat.contains("!(__rython_cmp1).py_is(__rython_cmp2)"),
+        "each link is identity: {}",
+        out
+    );
+    assert!(
+        !flat.contains("==(__rython_cmp") && !flat.contains("!=(__rython_cmp"),
+        "no link goes through PartialEq: {}",
+        out
+    );
+}
+
+/// A TUPLE holds its elements as a list does: a mutable class held only
+/// in a tuple shares; and a constructor through an ALIAS (`Dial = Knob`)
+/// keys its external stores to the class the registry knows (Devin review
+/// on #321).
+#[test]
+fn a_tuple_holds_its_elements_and_an_alias_constructor_resolves_to_its_class() {
+    let out = compile(
+        concat!(
+            "class Item:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.n += 1\n",
+            "\n",
+            "class Knob:\n",
+            "    def __init__(self):\n",
+            "        self.level = 0\n",
+            "\n",
+            "Dial = Knob\n",
+            "\n",
+            "class Panel:\n",
+            "    def __init__(self):\n",
+            "        self.pair: tuple[Item, Item] = (Item(), Item())\n",
+            "        self.knobs: list[Knob] = []\n",
+            "\n",
+            "def turn() -> int:\n",
+            "    d = Dial()\n",
+            "    d.level = 5\n",
+            "    return d.level\n",
+        ),
+        "tuple_alias.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("(stdpython::PyRef<Item>,stdpython::PyRef<Item>)"),
+        "a tuple-held mutable class shares: {}",
+        out
+    );
+    assert!(
+        flat.contains("Vec<stdpython::PyRef<Knob>>"),
+        "the alias-constructed local's store keys to the class: {}",
+        out
+    );
+}
+
 /// A shared class constructs behind `PyRef`, its slot type is `PyRef<C>`,
 /// a loop variable over a container of it borrows for a field read, a
 /// field store through it borrows mutably, and a subscript into the

@@ -5088,9 +5088,18 @@ impl<'a> CodeGen for Call {
                 // `cls(...)` the receiver identifier `cls` is not a Rust
                 // type in scope — the class's OWN name is (urllib3's
                 // Retry.from_int).
+                // A LOCAL alias names the class it stands for (`Dial = Knob;
+                // Dial()` — Devin review on #321); an imported name is bound
+                // as written.
                 let cname = match symbols.get(&n.id) {
                     Some(crate::SymbolTableNode::ClassDef(c)) => {
                         crate::safe_ident(&c.name)
+                    }
+                    Some(crate::SymbolTableNode::Alias(_))
+                    | Some(crate::SymbolTableNode::Assign { value: ExprType::Name(_), .. }) => {
+                        crate::safe_ident(&crate::ast::tree::hierarchy::canonical_class_name(
+                            &n.id, &symbols,
+                        ))
                     }
                     _ => crate::safe_ident(&n.id),
                 };

@@ -431,33 +431,8 @@ impl CodeGen for Compare {
             // first), a plain one by its type, and an OPTIONAL one
             // (`a: C | None`) compares the two options by identity
             // (Devin review on #321).
-            let identity_type = match left_ast {
-                ExprType::Name(n) if options.narrowed_names.contains_key(&n.id) => {
-                    options.narrowed_names[&n.id].clone()
-                }
-                // The analysis's record of a name (a parameter's `C | None`
-                // is the Option of the class there; the inferrer's
-                // annotation map knows no classes).
-                ExprType::Name(n) if options.name_types.contains_key(&n.id) => {
-                    options.name_types[&n.id].clone()
-                }
-                _ => crate::infer_type(Some(&ctx), left_ast, &options, &symbols),
-            };
-            let is_shared_class = |t: &crate::TypeInfo| {
-                matches!(t, crate::TypeInfo::Class(c) if crate::ast::tree::shared::is_shared(c))
-            };
-            let is_shared_option = |t: &crate::TypeInfo| {
-                matches!(t, crate::TypeInfo::Option(inner) if is_shared_class(inner))
-            };
-            let comparator_identity_type = match comparator_ast {
-                ExprType::Name(n) if options.narrowed_names.contains_key(&n.id) => {
-                    options.narrowed_names[&n.id].clone()
-                }
-                ExprType::Name(n) if options.name_types.contains_key(&n.id) => {
-                    options.name_types[&n.id].clone()
-                }
-                _ => crate::infer_type(Some(&ctx), comparator_ast, &options, &symbols),
-            };
+            let identity_type = identity_type_of(left_ast, &ctx, &options, &symbols);
+            let comparator_identity_type = identity_type_of(comparator_ast, &ctx, &options, &symbols);
             // A MIXED pair (`ta is not board.tags[1]`: an optional reference
             // against a plain one) lifts the plain side into the option.
             let (left_is_opt, right_is_opt) = (
@@ -836,6 +811,30 @@ impl Compare {
                     });
                 }
             }
+            // `is` on SHARED references is identity of the one object,
+            // never the `==` a class may define — the same rule as the
+            // single comparison, per link (Devin review on #321). The
+            // operands are bound as references, so a plain side lifts by
+            // a clone of the reference.
+            if matches!(op, Compares::Is | Compares::IsNot) {
+                let lt = identity_type_of(operands[i], &ctx, &options, &symbols);
+                let rt = identity_type_of(operands[i + 1], &ctx, &options, &symbols);
+                let (lo, ro) = (is_shared_option(&lt), is_shared_option(&rt));
+                if lo || ro {
+                    let ls = if lo { quote!(#l) } else { quote!(&Some((#l).clone())) };
+                    let rs = if ro { quote!(#r) } else { quote!(&Some((#r).clone())) };
+                    return Ok(match op {
+                        Compares::Is => quote!(stdpython::py_is_opt(#ls, #rs)),
+                        _ => quote!(!stdpython::py_is_opt(#ls, #rs)),
+                    });
+                }
+                if is_shared_class(&lt) {
+                    return Ok(match op {
+                        Compares::Is => quote!((#l).py_is(#r)),
+                        _ => quote!(!(#l).py_is(#r)),
+                    });
+                }
+            }
             Ok(match op {
                 Compares::Eq => quote!((#l).py_eq(#r)),
                 Compares::NotEq => quote!((#l).py_ne(#r)),
@@ -866,6 +865,37 @@ impl Compare {
         let body = acc.expect("a chained comparison has at least one operator");
         Ok(quote!({ #first_bind #body }))
     }
+}
+
+/// The type the IDENTITY lowering (`is` / `is not`) reads for an operand:
+/// the guard's flow state for a narrowed name first, then the analysis's
+/// record (a parameter's `C | None` is the Option of the class there; the
+/// inferrer's annotation map knows no classes), then the inferrer. One
+/// function for the single and the chained comparison (Devin review on
+/// #321).
+fn identity_type_of(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> crate::TypeInfo {
+    match expr {
+        ExprType::Name(n) if options.narrowed_names.contains_key(&n.id) => {
+            options.narrowed_names[&n.id].clone()
+        }
+        ExprType::Name(n) if options.name_types.contains_key(&n.id) => {
+            options.name_types[&n.id].clone()
+        }
+        _ => crate::infer_type(Some(ctx), expr, options, symbols),
+    }
+}
+
+fn is_shared_class(t: &crate::TypeInfo) -> bool {
+    matches!(t, crate::TypeInfo::Class(c) if crate::ast::tree::shared::is_shared(c))
+}
+
+fn is_shared_option(t: &crate::TypeInfo) -> bool {
+    matches!(t, crate::TypeInfo::Option(inner) if is_shared_class(inner))
 }
 
 #[cfg(test)]
