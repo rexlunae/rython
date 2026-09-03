@@ -5949,6 +5949,7 @@ impl<'a> CodeGen for Call {
                             &options,
                         )
                     {
+                        eprintln!("R99CALLOPTION {}", attr.attr);
                         eprintln!("R99RESOLVEDOPT {} mutates={}", attr.attr, mutates_receiver);
                         eprintln!("R99OPTARM {} mutates={}", attr.attr, mutates_receiver);
                         let mname = attr.attr.clone();
@@ -6043,7 +6044,30 @@ impl<'a> CodeGen for Call {
             // load form (`self.items()`) clones the field: the mutable
             // accessor (`self.items_mut()`) keeps the write on the real
             // field.
-            let mutating_self_field = (ctx.in_generic_trait()
+            // A BOXED self-referential field's mutating call
+            // (`self.left.insert(key)` — the corpus's insert, round 99):
+            // the clone-unwrap would mutate a COPY of the child — the
+            // mutation must reach the real child through the Box's
+            // as_mut. The field's slot is Option<Box<Class>> of the
+            // ENCLOSING class.
+            let boxed_self_ref_receiver = false;
+                        // A BOXED self-referential field chain (`root.left.insert(k)`
+            // in main — the local root: Class(Node), the field left: the
+            // boxed self-ref field): the clone-unwrap would mutate a COPY
+            // of the child; the mutation must reach the real child through
+            // the Box's as_mut (round 99).
+            let boxed_field_chain = matches!(attr.value.as_ref(), ExprType::Attribute(_))
+                && crate::TypeInfo::enum_receiver_class(&attr.value, Some(&ctx), &options, &symbols)
+                    .map(|c| {
+                        crate::resolve_class_referenced(&c, &symbols, &options)
+                            .is_some_and(|class| {
+                                class.method_needs_mut_self(&attr.attr, &symbols, &options)
+                            })
+                    })
+                    .unwrap_or(false);
+let mutating_self_field = boxed_self_ref_receiver
+                || boxed_field_chain
+                || (ctx.in_generic_trait()
                 && matches!(attr.value.as_ref(), ExprType::Attribute(_))
                 && crate::ast::tree::attribute::chain_root_is_self(&attr.value))
                 // A container field of a NARROWED root-typed name
@@ -6067,7 +6091,10 @@ impl<'a> CodeGen for Call {
             // Computed BEFORE attr.value is moved below.
             let option_receiver =
                 crate::ast::tree::attribute::receiver_option_inner(&attr.value, &ctx, &symbols, &options);
-            let receiver = if (matches!(attr.value.as_ref(), ExprType::Subscript(_))
+            if option_receiver.is_some() && matches!(attr.attr.as_str(), "insert" | "depth") {
+                eprintln!("R99GENOPT {}", attr.attr);
+            }
+                        let receiver = if (matches!(attr.value.as_ref(), ExprType::Subscript(_))
                 || mutating_self_field)
                 && crate::ast::tree::scope::mutates_receiver(&attr.attr)
             {
@@ -7894,9 +7921,35 @@ impl<'a> CodeGen for Call {
             return Ok(quote!(#module::#cname::new(#(#args),*)));
         }
 
-        let name = self
-            .func
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        // The fallibility rule's mutation half (the review's fix 2 +
+        // fix 4, round 99): a METHOD call whose receiver resolves to a
+        // user class and whose method takes &mut self renders the
+        // receiver chain as a PLACE (`self.left.insert(k)` → the
+        // `as_mut` unwrap mutates the REAL child through the Box; the
+        // read form's clone would mutate a copy).
+        let name = if let ExprType::Attribute(attr) = self.func.as_ref() {
+            let is_user_mut = crate::TypeInfo::enum_receiver_class(
+                &attr.value, Some(&ctx), &options, &symbols,
+            )
+            .and_then(|c| crate::resolve_class_referenced(&c, &symbols, &options))
+            .is_some_and(|class| {
+                class.method_on_mro(&attr.attr, &symbols).is_some()
+                    && class.method_needs_mut_self(&attr.attr, &symbols, &options)
+            });
+            if is_user_mut && crate::ast::tree::scope::mutates_receiver(&attr.attr) {
+                crate::ast::tree::attribute::to_rust_place_expr(
+                    &attr.value,
+                    &ctx,
+                    &options,
+                    &symbols,
+                    false,
+                )?
+            } else {
+                self.func.to_rust(ctx.clone(), options.clone(), symbols.clone())?
+            }
+        } else {
+            self.func.to_rust(ctx.clone(), options.clone(), symbols.clone())?
+        };
 
         let mut all_args = Vec::new();
 

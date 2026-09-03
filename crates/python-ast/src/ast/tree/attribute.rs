@@ -675,11 +675,11 @@ impl<'a> CodeGen for Attribute {
             // The fallibility rule (the review's fix 2, round 99): a
             // METHOD name read on an Option-typed receiver of a user class
             // is a fallible call site — the read carries `?` so the call
-            // splice (which renders raw through the generic path) still
-            // propagates the method's Result. `depth` in
-            // `(self.left).clone().unwrap().depth()` — the boxed field's
-            // chain read.
-            let boxed_field_read = boxed_field_read && field_access.is_none();
+            // The value-read deref lives in lower_optional_value's boxed
+            // passthrough (one map per read — the double-map here fired
+            // twice on the nested chains, round 99); the method-receiver
+            // reads keep the plain form (Box autoderefs).
+            let boxed_field_read = false;
             match field_access {
                 // A SHARED class's value is a `PyRef` (shared.rs): a read
                 // borrows the one object and clones the field out.
