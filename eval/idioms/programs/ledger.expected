@@ -1,0 +1,21 @@
+True
+False
+False
+alice: 75 (2 moves)
+bob: 50 (1 moves)
+alice: 1 (2 moves)
+51
+True True False False
+True False no
+True 1 yes
+False True 2
+same distinct one same
+1 True
+2 2
+3 9
+[7, 8]
+True True
+[1] []
+6
+alice: 2 (3 moves)
+22 2

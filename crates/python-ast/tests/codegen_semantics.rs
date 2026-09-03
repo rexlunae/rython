@@ -14700,12 +14700,14 @@ fn sorted_over_class_valued_pairs_sorts_by_key_with_cpython_tie_panic() {
 }
 
 #[test]
-fn mutation_through_a_fetch_local_writes_back_to_the_container() {
-    // Round 99 (Directive 4's borrowed-accessor increment):
-    // `item = self.items.get(name)` then `item.qty -= qty` — the local is
-    // a VIEW of the container slot in CPython, so the mutation must reach
-    // it: the lowering writes back (mutate a copy, store the slot, rebind
-    // the local) instead of the silent-loss form.
+fn a_container_stored_mutated_class_is_shared_and_a_fetch_local_mutates_the_one_object() {
+    // The aliasing representation (issue #137, drift 1): `Item` is stored
+    // in a container (`dict[str, Item]`) and mutated after construction
+    // (`item.qty -= qty` through a non-self receiver), so it is SHARED —
+    // its slot type is `PyRef<Item>`, the fetched local is another
+    // reference to the stored object, and the mutation borrows it
+    // mutably. No write-back, no `&mut self` for the method that only
+    // mutates the shared object.
     let out = compile(
         concat!(
             "class Item:\n",
@@ -14722,60 +14724,68 @@ fn mutation_through_a_fetch_local_writes_back_to_the_container() {
             "        item.qty -= qty\n",
             "        return item.qty\n",
         ),
-        "writeback.py",
+        "shared.py",
     );
+    let flat: String = out.split_whitespace().collect();
     assert!(
-        out.contains("py_set_index"),
-        "the mutation must write back to the container slot: {}",
+        flat.contains("PyDict<String,stdpython::PyRef<Item>>"),
+        "the container holds references to the shared class: {}",
         out
     );
     assert!(
-        out.contains("__rython_v . qty = (__rython_v . qty) . py_sub")
-            || out.contains("__rython_v.qty = (__rython_v.qty).py_sub"),
-        "the mutation applies to the copy, then the slot stores it: {}",
+        flat.contains(").borrow_mut().qty-=qty") && flat.contains(").borrow().qty.clone()"),
+        "the mutation borrows the one object mutably, reading through a shared borrow: {}",
         out
     );
     assert!(
-        out.contains("fn take (& mut self") || out.contains("fn take(&mut self"),
-        "the write-back needs &mut self: {}",
+        !out.contains("py_set_index"),
+        "no write-back: the local IS the stored object: {}",
+        out
+    );
+    assert!(
+        flat.contains("fntake(&self"),
+        "mutating the shared object needs no &mut self: {}",
         out
     );
 }
 
 #[test]
-fn mutation_through_a_one_hop_fetch_method_writes_back() {
-    // The idiom corpus's take: the fetch goes through a METHOD
-    // (`self.find(name)` whose body is a single
-    // `return self.items.get(name)`) — the provenance resolves the hop
-    // and the write-back still fires (the loud aliasing error is gone).
+fn a_mutating_method_call_through_a_fetch_local_reaches_the_shared_object() {
+    // The shape the write-back could never reach (the four-drift
+    // evaluation): a MUTATING METHOD CALL on the fetched local. With the
+    // shared representation the call borrows the one object mutably;
+    // the fetch may go through a method (`find`).
     let out = compile(
         concat!(
             "class Item:\n",
             "    def __init__(self) -> None:\n",
             "        self.qty: int = 0\n",
+            "    def restock(self, n: int) -> None:\n",
+            "        self.qty += n\n",
             "\n",
             "class Bag:\n",
             "    def __init__(self) -> None:\n",
             "        self.items: dict[str, Item] = {}\n",
             "    def find(self, name: str) -> Item | None:\n",
             "        return self.items.get(name)\n",
-            "    def take(self, name: str, qty: int) -> int:\n",
+            "    def refill(self, name: str) -> int:\n",
             "        item = self.find(name)\n",
             "        if item is None:\n",
             "            raise KeyError(name)\n",
-            "        item.qty -= qty\n",
+            "        item.restock(3)\n",
             "        return item.qty\n",
         ),
-        "onehop.py",
+        "sharedcall.py",
     );
+    let flat: String = out.split_whitespace().collect();
     assert!(
-        out.contains("py_set_index"),
-        "the one-hop fetch resolves to the container slot: {}",
+        flat.contains("let__rython_sarg0=3;let__rython_call=(((item).clone().unwrap()).borrow_mut()).restock(__rython_sarg0)?;"),
+        "the mutating call borrows the one object mutably: {}",
         out
     );
     assert!(
-        !out.contains("the derived class overrides"),
-        "no loud error: {}",
+        flat.contains("PyRef::new(Item::new()?)") || !out.contains("Item :: new ()"),
+        "a construction of a shared class is a reference: {}",
         out
     );
 }
@@ -17256,6 +17266,755 @@ fn an_aliased_imported_constructor_result_is_a_method_receiver() {
     );
 }
 
+/// A method call on a name NARROWED by the enclosing guard (`r and
+/// r.redirect()` with `r: Resp | None` — urllib3's Retry.increment):
+/// the read already renders the unwrapped value, so the call takes it
+/// as is — never a second unwrap on a value that is no longer an Option.
+#[test]
+fn a_call_on_a_guard_narrowed_optional_name_takes_the_narrowed_value() {
+    let out = compile(
+        concat!(
+            "class Resp:\n",
+            "    def __init__(self, ok: bool):\n",
+            "        self.ok = ok\n",
+            "\n",
+            "    def redirect(self) -> bool:\n",
+            "        return self.ok\n",
+            "\n",
+            "def f(r: Resp | None) -> bool:\n",
+            "    if r and r.redirect():\n",
+            "        return True\n",
+            "    return False\n",
+        ),
+        "narrowedcall.py",
+    );
+    assert!(
+        !out.contains("unwrap_or_else"),
+        "the narrowed name is not unwrapped twice: {}",
+        out
+    );
+    assert!(
+        out.contains(". redirect ()"),
+        "the call is on the narrowed value: {}",
+        out
+    );
+}
+
+/// An instance's truth is Python's: `__bool__`, else `__len__() != 0`,
+/// else True — so `bool(x)` on a class value, or on an `Option` of one
+/// (`bool(self.proxy)` with `proxy: Url | None` — urllib3's connection),
+/// has an answer.
+#[test]
+fn an_instance_has_pythons_truth() {
+    let out = compile(
+        concat!(
+            "class Plain:\n",
+            "    def __init__(self):\n",
+            "        self.x = 0\n",
+            "\n",
+            "class Sized:\n",
+            "    def __init__(self):\n",
+            "        self.items: list[int] = []\n",
+            "\n",
+            "    def __len__(self) -> int:\n",
+            "        return len(self.items)\n",
+            "\n",
+            "def truth(p: Plain, s: Sized, q: Plain | None) -> bool:\n",
+            "    return bool(p) and bool(s) and bool(q)\n",
+        ),
+        "truth.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("implstdpython::PyBoolforPlain{fnpy_bool(self)->bool{true}}"),
+        "a plain instance is true: {}",
+        out
+    );
+    assert!(
+        flat.contains("implstdpython::PyBoolforSized{fnpy_bool(self)->bool{self.__len__().expect(\"__len__raised\")!=0}}"),
+        "a sized instance is its length's truth: {}",
+        out
+    );
+}
+
+/// A local assigned from a `self.method(..)` call is typed by the method's
+/// declared return (`conn = self.connection_from_host(..)` — urllib3's
+/// poolmanager), so a root-typed value reached through it reads its
+/// fields through the accessor.
+#[test]
+fn a_local_from_a_self_method_call_is_typed_by_its_return() {
+    let out = compile(
+        concat!(
+            "class Resp:\n",
+            "    def __init__(self, status: int):\n",
+            "        self.status = status\n",
+            "\n",
+            "class HR(Resp):\n",
+            "    pass\n",
+            "\n",
+            "class Pool:\n",
+            "    def urlopen(self, url: str) -> Resp:\n",
+            "        return HR(200)\n",
+            "\n",
+            "class Manager:\n",
+            "    def __init__(self):\n",
+            "        self.pool = Pool()\n",
+            "\n",
+            "    def connection_from_host(self, host: str) -> Pool:\n",
+            "        return self.pool\n",
+            "\n",
+            "    def go(self, url: str) -> int:\n",
+            "        conn = self.connection_from_host(\"h\")\n",
+            "        response = conn.urlopen(url)\n",
+            "        return response.status\n",
+        ),
+        "selfcall.py",
+    );
+    assert!(
+        out.contains("response . status ()"),
+        "the root-typed result of the typed local's call reads through the accessor: {}",
+        out
+    );
+}
+
+/// A derived instance inherits its truth: `__len__` defined on the base
+/// is the subclass's `bool()` too (Devin review on #321).
+#[test]
+fn an_inherited_len_is_the_derived_instances_truth() {
+    let out = compile(
+        concat!(
+            "class Book:\n",
+            "    def __init__(self):\n",
+            "        self.entries: list[int] = []\n",
+            "\n",
+            "    def __len__(self) -> int:\n",
+            "        return len(self.entries)\n",
+            "\n",
+            "class Journal(Book):\n",
+            "    pass\n",
+        ),
+        "inherited_truth.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("implstdpython::PyBoolforJournal{fnpy_bool(self)->bool{self.__len__().expect(\"__len__raised\")!=0}}"),
+        "the inherited __len__ decides the subclass's truth: {}",
+        out
+    );
+}
+
+/// A shared class's `==` is identity by default (`PyRefEq`); one that
+/// defines `__eq__` cannot route `==` through it, so its references panic
+/// on `==` and the conversion warns — never the identity default in
+/// silence. `is` on shared references is `py_is` (Devin review on #321).
+#[test]
+fn a_shared_class_defining_eq_is_loud_on_equality_and_is_stays_identity() {
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "class Tag:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "        self.uses = 0\n",
+            "\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        return isinstance(other, Tag) and other.name == self.name\n",
+            "\n",
+            "    def use(self) -> None:\n",
+            "        self.uses += 1\n",
+            "\n",
+            "class Plain:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.n += 1\n",
+            "\n",
+            "def same(a: Plain, b: Plain) -> bool:\n",
+            "    return a is b\n",
+            "\n",
+            "def main() -> None:\n",
+            "    tags: list[Tag] = [Tag(\"a\")]\n",
+            "    plains: list[Plain] = [Plain()]\n",
+            "    tags[0].use()\n",
+            "    plains[0].bump()\n",
+        ),
+        "shared_eq.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("implstdpython::PyRefEqforTag{fnref_eq(") && flat.contains("panic!("),
+        "== on a shared __eq__ class is a loud panic: {}",
+        out
+    );
+    assert!(
+        flat.contains("implstdpython::PyRefEqforPlain{}"),
+        "a shared class without __eq__ takes the identity default: {}",
+        out
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("defines __eq__ and is shared")),
+        "the conversion names the boundary: {:?}",
+        warnings
+    );
+    assert!(
+        flat.contains("(a).py_is(&b)"),
+        "`is` on shared references is identity: {}",
+        out
+    );
+}
+
+/// Sharing is decided by what the crate STORES and MUTATES through the
+/// typed authorities (Devin review on #321): an inferred container store
+/// (`self.items = [Item(1)]`), a mutator inherited from a base, and a
+/// `del` on a field each make the class shared.
+#[test]
+fn sharing_follows_the_typed_storage_and_inherited_or_del_mutation() {
+    let out = compile(
+        concat!(
+            "class Item:\n",
+            "    def __init__(self, qty: int):\n",
+            "        self.qty = qty\n",
+            "\n",
+            "    def take(self) -> None:\n",
+            "        self.qty -= 1\n",
+            "\n",
+            "class Slot:\n",
+            "    def __init__(self):\n",
+            "        self.tags: list[str] = []\n",
+            "\n",
+            "    def drop_first(self) -> None:\n",
+            "        del self.tags[0]\n",
+            "\n",
+            "class Base:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.n += 1\n",
+            "\n",
+            "class Sub(Base):\n",
+            "    pass\n",
+            "\n",
+            "class Store:\n",
+            "    def __init__(self):\n",
+            "        self.items = [Item(1)]\n",
+            "        self.slots: list[Slot] = []\n",
+            "        self.subs: list[Sub] = []\n",
+        ),
+        "sharing_rules.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("pubitems:Vec<stdpython::PyRef<Item>>"),
+        "an inferred container store shares its element class: {}",
+        out
+    );
+    assert!(
+        flat.contains("Vec<stdpython::PyRef<Slot>>"),
+        "a del on a field is a mutation: {}",
+        out
+    );
+    assert!(
+        flat.contains("Vec<stdpython::PyRef<Sub>>"),
+        "an inherited mutator makes the stored subclass shared: {}",
+        out
+    );
+    assert!(
+        flat.contains("PyRef<Base>") && flat.contains("PyRef<Sub>"),
+        "the family shares as a whole: {}",
+        out
+    );
+}
+
+/// An ALIASED container annotation (`Items = list[Item]`) stores the
+/// class the alias names: the alias-aware annotation authority decides,
+/// not the spelling at the parameter (Devin review on #321).
+#[test]
+fn an_aliased_container_annotation_shares_its_element_class() {
+    let out = compile(
+        concat!(
+            "Items = list[\"Item\"]\n",
+            "\n",
+            "class Item:\n",
+            "    def __init__(self, qty: int):\n",
+            "        self.qty = qty\n",
+            "\n",
+            "    def take(self) -> None:\n",
+            "        self.qty -= 1\n",
+            "\n",
+            "def listed(items: Items) -> int:\n",
+            "    return len(items)\n",
+        ),
+        "sharing_alias.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("fnlisted(items:Vec<stdpython::PyRef<Item>>)"),
+        "the alias's element class is shared: {}",
+        out
+    );
+}
+
+/// A mutation that sits only in a statement's own expression — the test
+/// of an `if`, the iterable of a `for`, a nested call — is a mutation
+/// (Devin review on #321): the class shares.
+#[test]
+fn a_condition_only_mutation_shares_the_class() {
+    let out = compile(
+        concat!(
+            "class Queue:\n",
+            "    def __init__(self):\n",
+            "        self.items: list[int] = [1]\n",
+            "\n",
+            "    def drain(self) -> int:\n",
+            "        if self.items.pop() > 0:\n",
+            "            return 1\n",
+            "        return 0\n",
+            "\n",
+            "class Nested:\n",
+            "    def __init__(self):\n",
+            "        self.items: list[int] = [1]\n",
+            "\n",
+            "    def total(self) -> int:\n",
+            "        return 1 + self.items.pop()\n",
+            "\n",
+            "class Store:\n",
+            "    def __init__(self):\n",
+            "        self.queues: list[Queue] = []\n",
+            "        self.nested: list[Nested] = []\n",
+        ),
+        "condition_mutation.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("Vec<stdpython::PyRef<Queue>>"),
+        "a container-mutating call in an if test is a mutation: {}",
+        out
+    );
+    assert!(
+        flat.contains("Vec<stdpython::PyRef<Nested>>"),
+        "a container-mutating call nested in an expression is a mutation: {}",
+        out
+    );
+}
+
+/// A shared class's truth runs on the ONE object: `PyRefTruth` calls the
+/// dunder through the borrow — mutable when the dunder mutates — never on
+/// a clone (Devin review on #321).
+#[test]
+fn a_shared_classs_truth_runs_through_the_reference() {
+    let out = compile(
+        concat!(
+            "class Probe:\n",
+            "    def __init__(self):\n",
+            "        self.checks = 0\n",
+            "\n",
+            "    def __bool__(self) -> bool:\n",
+            "        self.checks += 1\n",
+            "        return self.checks > 1\n",
+            "\n",
+            "class Plain:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.n += 1\n",
+            "\n",
+            "class Store:\n",
+            "    def __init__(self):\n",
+            "        self.probes: list[Probe] = []\n",
+            "        self.plains: list[Plain] = []\n",
+        ),
+        "ref_truth.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("implstdpython::PyRefTruthforProbe{fnref_truth(r:&stdpython::PyRef<Self>)->bool{r.borrow_mut().__bool__().expect(\"__bool__raised\")}}"),
+        "a mutating __bool__ runs through the mutable borrow: {}",
+        out
+    );
+    assert!(
+        flat.contains("implstdpython::PyRefTruthforPlain{fnref_truth(r:&stdpython::PyRef<Self>)->bool{true}}"),
+        "a plain shared instance is true: {}",
+        out
+    );
+}
+
+/// An external store counts for the class its receiver names (an
+/// annotated parameter, a constructed local, an element of an annotated
+/// container), not for every class with that field name (Devin review on
+/// #321): `Gauge` and `Label` both have `value`; only `Gauge` is written
+/// from outside, so only `Gauge` shares.
+#[test]
+fn an_external_store_is_keyed_by_its_receivers_class() {
+    let out = compile(
+        concat!(
+            "class Gauge:\n",
+            "    def __init__(self):\n",
+            "        self.value = 0\n",
+            "\n",
+            "class Label:\n",
+            "    def __init__(self):\n",
+            "        self.value = 0\n",
+            "\n",
+            "class Panel:\n",
+            "    def __init__(self):\n",
+            "        self.gauges: list[Gauge] = []\n",
+            "        self.labels: list[Label] = []\n",
+            "\n",
+            "def set_gauge(g: Gauge, v: int) -> None:\n",
+            "    g.value = v\n",
+        ),
+        "keyed_store.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("Vec<stdpython::PyRef<Gauge>>"),
+        "the class the store's receiver names shares: {}",
+        out
+    );
+    assert!(
+        flat.contains("Vec<Label>"),
+        "a class with the same field name but no store of its own stays a value: {}",
+        out
+    );
+}
+
+/// `is` / `is not` on OPTIONAL shared references — and on a name narrowed
+/// by its guard — is identity of the one object, never the `==` a class
+/// defines (Devin review on #321).
+#[test]
+fn identity_on_optional_and_narrowed_shared_references_is_never_equality() {
+    let out = compile(
+        concat!(
+            "class Tag:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "        self.hits = 0\n",
+            "\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        return False\n",
+            "\n",
+            "    def hit(self) -> None:\n",
+            "        self.hits += 1\n",
+            "\n",
+            "class Board:\n",
+            "    def __init__(self):\n",
+            "        self.tags: list[Tag] = []\n",
+            "\n",
+            "    def find(self, name: str) -> Tag | None:\n",
+            "        for t in self.tags:\n",
+            "            if t.name == name:\n",
+            "                return t\n",
+            "        return None\n",
+            "\n",
+            "def same(a: Tag | None, b: Tag | None) -> bool:\n",
+            "    if a is b:\n",
+            "        return True\n",
+            "    if a is not None:\n",
+            "        return a is board_first()\n",
+            "    return a is not b\n",
+            "\n",
+            "def board_first() -> Tag:\n",
+            "    return Tag(\"a\")\n",
+        ),
+        "opt_identity.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("stdpython::py_is_opt(&a,&b)"),
+        "two optional shared references compare by identity: {}",
+        out
+    );
+    assert!(
+        flat.contains(".clone().unwrap()).py_is(&board_first()?)"),
+        "the narrowed name compares by identity: {}",
+        out
+    );
+    assert!(
+        !flat.contains("&a==&b") && !flat.contains("&a!=&b"),
+        "no identity test goes through PartialEq: {}",
+        out
+    );
+}
+
+/// A mutation through a FIELD of a shared instance (`a.items.append(x)`,
+/// `a.center.bump()` where `a = accounts[k]`) renders the chain as a place
+/// through the mutable borrow, never through the read's clone of the
+/// field (Devin review on #321).
+#[test]
+fn a_field_mutated_through_a_shared_receiver_takes_the_mutable_borrow() {
+    let out = compile(
+        concat!(
+            "class Point:\n",
+            "    def __init__(self):\n",
+            "        self.x = 0\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.x += 1\n",
+            "\n",
+            "class Account:\n",
+            "    def __init__(self):\n",
+            "        self.items: list[int] = []\n",
+            "        self.center = Point()\n",
+            "\n",
+            "    def deposit(self, n: int) -> None:\n",
+            "        self.items.append(n)\n",
+            "\n",
+            "class Bank:\n",
+            "    def __init__(self):\n",
+            "        self.accounts: dict[str, Account] = {}\n",
+            "\n",
+            "    def touch(self, k: str) -> int:\n",
+            "        a = self.accounts[k]\n",
+            "        a.items.append(1)\n",
+            "        a.center.bump()\n",
+            "        return len(a.items)\n",
+        ),
+        "shared_field_mutation.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("((a).borrow_mut().items).push("),
+        "the container field mutates through the mutable borrow: {}",
+        out
+    );
+    assert!(
+        flat.contains("((a).borrow_mut().center).bump()"),
+        "the composed field's mutating call goes through the mutable borrow: {}",
+        out
+    );
+}
+
+/// An EXTERNAL container-mutating call on a class's field
+/// (`item.values.append(x)` in a function) is a mutation of the class, so a
+/// container-stored instance of it shares even with no mutator of its own
+/// (Devin review on #321).
+#[test]
+fn an_external_container_mutating_call_shares_the_class() {
+    let out = compile(
+        concat!(
+            "class Bin:\n",
+            "    def __init__(self):\n",
+            "        self.values: list[int] = []\n",
+            "\n",
+            "class Rack:\n",
+            "    def __init__(self):\n",
+            "        self.bins: list[Bin] = [Bin()]\n",
+            "\n",
+            "def fill(b: Bin, v: int) -> None:\n",
+            "    b.values.append(v)\n",
+        ),
+        "external_container_mutation.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("Vec<stdpython::PyRef<Bin>>"),
+        "the class mutated through an external container call shares: {}",
+        out
+    );
+}
+
+/// A CHAINED identity test on shared references (`a is b is not c`) is
+/// identity per link — the same rule as the single comparison, never the
+/// `==` a class defines (Devin review on #321).
+#[test]
+fn a_chained_identity_on_shared_references_is_never_equality() {
+    let out = compile(
+        concat!(
+            "class Tag:\n",
+            "    def __init__(self):\n",
+            "        self.hits = 0\n",
+            "\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        return False\n",
+            "\n",
+            "    def hit(self) -> None:\n",
+            "        self.hits += 1\n",
+            "\n",
+            "class Board:\n",
+            "    def __init__(self):\n",
+            "        self.tags: list[Tag] = []\n",
+            "\n",
+            "def chain(a: Tag, b: Tag, c: Tag) -> bool:\n",
+            "    return a is b is not c\n",
+        ),
+        "chained_identity.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("(__rython_cmp0).py_is(__rython_cmp1)")
+            && flat.contains("!(__rython_cmp1).py_is(__rython_cmp2)"),
+        "each link is identity: {}",
+        out
+    );
+    assert!(
+        !flat.contains("==(__rython_cmp") && !flat.contains("!=(__rython_cmp"),
+        "no link goes through PartialEq: {}",
+        out
+    );
+}
+
+/// A TUPLE holds its elements as a list does: a mutable class held only
+/// in a tuple shares; and a constructor through an ALIAS (`Dial = Knob`)
+/// keys its external stores to the class the registry knows (Devin review
+/// on #321).
+#[test]
+fn a_tuple_holds_its_elements_and_an_alias_constructor_resolves_to_its_class() {
+    let out = compile(
+        concat!(
+            "class Item:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.n += 1\n",
+            "\n",
+            "class Knob:\n",
+            "    def __init__(self):\n",
+            "        self.level = 0\n",
+            "\n",
+            "Dial = Knob\n",
+            "\n",
+            "class Panel:\n",
+            "    def __init__(self):\n",
+            "        self.pair: tuple[Item, Item] = (Item(), Item())\n",
+            "        self.knobs: list[Knob] = []\n",
+            "\n",
+            "def turn() -> int:\n",
+            "    d = Dial()\n",
+            "    d.level = 5\n",
+            "    return d.level\n",
+        ),
+        "tuple_alias.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("(stdpython::PyRef<Item>,stdpython::PyRef<Item>)"),
+        "a tuple-held mutable class shares: {}",
+        out
+    );
+    assert!(
+        flat.contains("Vec<stdpython::PyRef<Knob>>"),
+        "the alias-constructed local's store keys to the class: {}",
+        out
+    );
+}
+
+/// A shared call's ARGUMENTS evaluate before the receiver's borrow, as
+/// Python evaluates them before the method body runs: bound to locals in
+/// source order, so `a.deposit(a.balance)` reads the object first and
+/// `q.note(q.drain())` mutates it first (Devin review on #321).
+#[test]
+fn a_shared_calls_arguments_evaluate_before_the_borrow() {
+    let out = compile(
+        concat!(
+            "class Account:\n",
+            "    def __init__(self, balance: int):\n",
+            "        self.balance = balance\n",
+            "\n",
+            "    def deposit(self, amount: int) -> None:\n",
+            "        self.balance += amount\n",
+            "\n",
+            "    def note(self, n: int) -> int:\n",
+            "        return n + self.balance\n",
+            "\n",
+            "class Bank:\n",
+            "    def __init__(self):\n",
+            "        self.accounts: dict[str, Account] = {}\n",
+            "\n",
+            "def double(a: Account) -> int:\n",
+            "    a.deposit(a.balance)\n",
+            "    return a.note(a.balance)\n",
+        ),
+        "shared_call_args.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("let__rython_sarg0=(a).borrow().balance.clone();let__rython_call=((a).borrow_mut()).deposit(__rython_sarg0)?;"),
+        "the argument's read completes before the mutable borrow: {}",
+        out
+    );
+    assert!(
+        flat.contains("let__rython_sarg0=(a).borrow().balance.clone();let__rython_call=((a).borrow()).note(__rython_sarg0)?;"),
+        "the argument evaluates before the shared borrow: {}",
+        out
+    );
+}
+
+/// A shared class constructs behind `PyRef`, its slot type is `PyRef<C>`,
+/// a loop variable over a container of it borrows for a field read, a
+/// field store through it borrows mutably, and a subscript into the
+/// container is a receiver for its methods (issue #137, drift 1).
+#[test]
+fn a_shared_class_is_a_reference_everywhere_it_is_held() {
+    let out = compile(
+        concat!(
+            "class Account:\n",
+            "    def __init__(self, balance: int) -> None:\n",
+            "        self.balance = balance\n",
+            "    def deposit(self, n: int) -> None:\n",
+            "        self.balance += n\n",
+            "\n",
+            "class Bank:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.accounts: dict[str, Account] = {}\n",
+            "        self.audit: list[Account] = []\n",
+            "    def open(self, owner: str) -> Account:\n",
+            "        acct = Account(0)\n",
+            "        self.accounts[owner] = acct\n",
+            "        self.audit.append(acct)\n",
+            "        return acct\n",
+            "    def pay(self, owner: str) -> None:\n",
+            "        self.accounts[owner].deposit(5)\n",
+            "    def total(self) -> int:\n",
+            "        t = 0\n",
+            "        for a in self.audit:\n",
+            "            t += a.balance\n",
+            "        return t\n",
+            "\n",
+            "def main() -> None:\n",
+            "    bank = Bank()\n",
+            "    first = bank.open(\"x\")\n",
+            "    first.balance = 1\n",
+        ),
+        "sharedref.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(flat.contains("PyRef::new(Account::new(0)?)"), "construction is a reference: {}", out);
+    assert!(
+        flat.contains("PyDict<String,stdpython::PyRef<Account>>")
+            && flat.contains("Vec<stdpython::PyRef<Account>>"),
+        "containers hold references: {}",
+        out
+    );
+    assert!(
+        flat.contains("(self.audit).push(Clone::clone(&(acct)))"),
+        "a reference appended and read again is cloned: {}",
+        out
+    );
+    assert!(
+        flat.contains("let__rython_sarg0=5;let__rython_call=(((self.accounts).py_index(owner)?).borrow_mut()).deposit(__rython_sarg0)?;"),
+        "a subscript into the container is a receiver that borrows mutably: {}",
+        out
+    );
+    assert!(
+        flat.contains("(a).borrow().balance.clone()"),
+        "a loop variable's field read borrows: {}",
+        out
+    );
+    assert!(
+        flat.contains("(first).borrow_mut().balance=1"),
+        "a field store through a fetched reference borrows mutably: {}",
+        out
+    );
+    assert!(
+        !out.contains("fn open (& mut self") || flat.contains("fnopen(&mutself"),
+        "{}",
+        out
+    );
+}
+
 /// A class that both DERIVES from a root and HOLDS one (`Outer(Inner)`
 /// with `self.inner: Inner`) would make the sum type recursive without
 /// indirection: that variant's payload is boxed, and the store into the
@@ -17287,6 +18046,71 @@ fn a_variant_holding_its_family_inline_is_boxed_and_the_field_store_converts() {
     assert!(
         flat.contains("self.inner=({Inner::new(0)?}).into();"),
         "the store into the root-typed field converts: {}",
+        out
+    );
+}
+
+/// A shared HIERARCHY family: the root's sum type holds `PyRef` variants,
+/// its accessors borrow, its `f_mut` is a mapped `RefMut`, and its
+/// delegators borrow — mutably when the method mutates — while taking
+/// `&self` (interior mutability). A subtree struct converts into it.
+#[test]
+fn a_shared_family_sum_type_holds_references_and_borrows_in_its_delegators() {
+    let out = compile(
+        concat!(
+            "class Item:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.qty: int = 0\n",
+            "    def restock(self, n: int) -> None:\n",
+            "        self.qty += n\n",
+            "    def label(self) -> str:\n",
+            "        return \"x\"\n",
+            "\n",
+            "class Perishable(Item):\n",
+            "    def label(self) -> str:\n",
+            "        return \"p\"\n",
+            "\n",
+            "class Bag:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items: dict[str, Item] = {}\n",
+            "    def add(self, name: str, item: Item) -> None:\n",
+            "        self.items[name] = item\n",
+            "    def refill(self, name: str) -> None:\n",
+            "        item = self.items.get(name)\n",
+            "        if item is None:\n",
+            "            raise KeyError(name)\n",
+            "        item.restock(3)\n",
+            "\n",
+            "def main() -> None:\n",
+            "    bag = Bag()\n",
+            "    bag.add(\"a\", Perishable())\n",
+        ),
+        "sharedfamily.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("pubenumAnyItem{Item(stdpython::PyRef<Item>),Perishable(stdpython::PyRef<Perishable>)}"),
+        "the family's sum type holds references: {}",
+        out
+    );
+    assert!(
+        flat.contains("pubfnqty_mut(&self)->core::cell::RefMut<'_,i64>"),
+        "the mutable accessor maps the borrow: {}",
+        out
+    );
+    assert!(
+        flat.contains("AnyItem::Item(v)=><ItemasItemTrait>::restock(&mut*v.borrow_mut(),n)"),
+        "a mutating delegator borrows mutably through the definer's trait: {}",
+        out
+    );
+    assert!(
+        flat.contains("pubfnrestock(&self,n:i64)"),
+        "the sum type's delegator takes &self: {}",
+        out
+    );
+    assert!(
+        flat.contains("PyRef::new(Perishable::new()?)}).into()"),
+        "a subtree construction converts into the sum type: {}",
         out
     );
 }

@@ -1,0 +1,124 @@
+{
+  "converter_commit": "f3d1a17",
+  "repo_head": "f3d1a17",
+  "rypip_path": "target/release/rypip",
+  "oracle": "CPython 3.11.15",
+  "passed": 4,
+  "total": 12,
+  "passing": [
+    "inventory",
+    "ledger",
+    "shapes",
+    "views"
+  ],
+  "programs": {
+    "bank": {
+      "program": "bank",
+      "warnings": 3,
+      "status": "build-failed",
+      "errors": 11,
+      "histogram": {
+        "E0308": 8,
+        "E0425": 2,
+        "E0599": 1
+      }
+    },
+    "inventory": {
+      "program": "inventory",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "ledger": {
+      "program": "ledger",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "matrix": {
+      "program": "matrix",
+      "warnings": 0,
+      "status": "build-failed",
+      "errors": 4,
+      "histogram": {
+        "E0425": 2,
+        "E0061": 1,
+        "E0277": 1
+      }
+    },
+    "pipeline": {
+      "program": "pipeline",
+      "warnings": 13,
+      "status": "build-failed",
+      "errors": 6,
+      "histogram": {
+        "E0277": 3,
+        "E0308": 2,
+        "E0282": 1
+      }
+    },
+    "records": {
+      "program": "records",
+      "warnings": 4,
+      "status": "build-failed",
+      "errors": 16,
+      "histogram": {
+        "E0308": 5,
+        "E0277": 4,
+        "E0599": 3,
+        "E0615": 3,
+        "E0369": 1
+      }
+    },
+    "schedule": {
+      "program": "schedule",
+      "warnings": 1,
+      "status": "build-failed",
+      "errors": 10,
+      "histogram": {
+        "E0308": 5,
+        "E0277": 2,
+        "E0599": 2,
+        "E0369": 1
+      }
+    },
+    "shapes": {
+      "program": "shapes",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "text_stats": {
+      "program": "text_stats",
+      "warnings": 1,
+      "status": "build-failed",
+      "errors": 9,
+      "histogram": {
+        "E0599": 4,
+        "E0308": 3,
+        "E0277": 2
+      }
+    },
+    "tokenizer": {
+      "program": "tokenizer",
+      "warnings": 0,
+      "status": "build-failed",
+      "errors": 6,
+      "histogram": {
+        "E0308": 5,
+        "E0599": 1
+      }
+    },
+    "tree": {
+      "program": "tree",
+      "warnings": 0,
+      "status": "build-failed",
+      "errors": 1,
+      "histogram": {
+        "E0072": 1
+      }
+    },
+    "views": {
+      "program": "views",
+      "warnings": 0,
+      "status": "pass"
+    }
+  }
+}

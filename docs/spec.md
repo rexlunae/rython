@@ -376,20 +376,53 @@ through subscript/attribute stores marks the chain's base variable.
 - **Chained assignment** `a = b = <container literal>` is a loud error:
   CPython binds both names to one object, and the value-semantics
   lowering cannot preserve that aliasing (issue #104).
-- **Aliasing in general** (`b = a` then mutating either) is not modeled;
-  see §12.3 and issue #79.
-- **Get-then-mutate through a fetched object** (`item =
-  self.find(name)` then `item.qty -= qty`, where `find` returns an
-  `Item | None` read from a container) is a loud conversion error
-  naming the construct and the rewrite: the local holds a COPY of the
-  container-stored object, and the mutation would apply to the copy
-  and be lost — CPython's mutation reaches the stored object through
-  the reference. The rewrite is to mutate through the container
-  (`self.items[name].qty -= qty`, which lowers through the existing
-  in-place `py_index_mut`). Mutation through a `self.<field>` copy
-  local (`tmp = self.item; tmp.f = 1`) is the same class and is
-  tracked with it; borrowed-accessor lowering (reads return references
-  into the container) is the planned fix (issue #137, Directive 4).
+- **Aliasing in general** (`b = a` then mutating either) is not modeled
+  for plain-struct classes and containers; see §12.3 and issue #79. A
+  SHARED class (below) is the exception: its references alias.
+- **Shared instances (the aliasing representation, issue #137).** A
+  class whose instances are stored in a container anywhere in the crate
+  (a `list[C]`, `dict[K, C]`, `set[C]`, … slot, as the typed annotation
+  authority resolves it — an alias `Items = list[C]`, a class's inferred
+  field table, an un-annotated store the inferrer types — count; the
+  boxed generics `Sequence[C]`, `Iterable[C]` hold no struct and do not)
+  AND mutated after construction anywhere in the crate (a method, an
+  `async def` included, that stores into or `del`s a `self` field, a
+  container-mutating call on one, a field of the class stored through a
+  non-`self` receiver — or the same on any base class, since a mutator
+  is inherited) is SHARED: its values are
+  `stdpython::PyRef<C>` (`Rc<RefCell<C>>`), so the container slot, a
+  local fetched from it (`item = self.find(name)`), a loop variable, and
+  a parameter are ONE object, as every CPython reference is. Reads go
+  through `borrow()`, stores and mutating method calls through
+  `borrow_mut()` (`item.qty -= qty`, `acct.deposit(5)`, `first.balance =
+  1` all reach the stored object); a hierarchy family (a root and its
+  subtree) shares one representation, the root's sum type holding the
+  references. Every other class stays a plain struct (cloning an
+  immutable object, or one no container holds, is unobservable). The
+  `shared.rs` analysis is the one authority; a shared class's method
+  that lets `self` escape (stores or returns `self`) is loud in rustc
+  (the struct is not the reference). On shared references `is` is
+  identity of the one object, `==` is CPython's default (identity) —
+  a shared class that defines `__eq__` (own or inherited) cannot route
+  `==` through it (the emitted `__eq__` takes the boxed value), so `==`
+  on its references panics at runtime and the conversion warns. An
+  instance's truth (`bool(x)`, also through `Option` and the sum type)
+  is `__bool__`, else `__len__() != 0`, else True, the dunder resolved
+  on the MRO — on a shared instance it runs on the one object. `is` on
+  shared references, optional ones included, is identity of the one
+  object. The registry is keyed by the class name the type side carries,
+  so a name two modules of the crate both define is excluded from sharing
+  with a conversion warning (as the hierarchy index excludes it); a store
+  through a non-`self` receiver — a field store, or a mutating call on a
+  field's container — counts for the class the receiver's scope names
+  (through its aliases), and for every class with that field when it
+  names none; a tuple holds its elements as a list does (a side
+  effect in `__bool__` is what every reference sees). One boundary: a
+  mutating method on a shared object holds the object for its duration,
+  so a read of the SAME object through another reference inside that
+  call (`a.merge(a)`, where `merge` mutates `self` and reads its
+  argument) is a loud runtime error naming the aliasing, not a silent
+  copy; every other alias shape is exact.
 - Names first assigned inside a `try` body (which lowers to a closure)
   are pre-initialized with `Default::default()` to satisfy rustc's
   capture rules; behavior is unchanged on the paths Python defines.

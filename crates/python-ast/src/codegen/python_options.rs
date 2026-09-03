@@ -447,6 +447,7 @@ pub struct PythonOptions {
     /// module of the crate; empty outside module generation.
     pub hierarchy_roots: std::rc::Rc<crate::ast::tree::hierarchy::HierarchyRoots>,
 
+
     /// Names narrowed by `isinstance` from a polymorphic ROOT to a class of
     /// its subtree (if_stmt.rs), mapped to the root: a read of the name in
     /// the narrowed branch is the sum type's view of that class.

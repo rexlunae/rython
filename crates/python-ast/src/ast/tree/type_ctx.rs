@@ -241,6 +241,11 @@ impl TypeInfo {
                 if crate::ast::tree::hierarchy::is_polymorphic_root(name) {
                     let any = crate::ast::tree::hierarchy::any_ident(name);
                     quote!(#any)
+                } else if crate::ast::tree::shared::is_shared(name) {
+                    // A SHARED class's instances are one object behind
+                    // `PyRef` wherever held (shared.rs).
+                    let ident = crate::safe_ident(name);
+                    quote!(stdpython::PyRef<#ident>)
                 } else {
                     let ident = crate::safe_ident(name);
                     quote!(#ident)
@@ -725,6 +730,21 @@ fn infer_type_inner(
                         call_return_typeinfo(call, Some(symbols), Some(options))
                             .unwrap_or(TypeInfo::PyObject)
                     }
+                    // An IMPORTED class's construction (`HTTPResp(len(url))`
+                    // from `from .response import HTTPResp`) is an instance
+                    // of that class: the struct IS bound here by the
+                    // import, so naming it is safe — the same answer the
+                    // same-module construction gives, and what lets a
+                    // subtree class returned from a `-> Root` factory
+                    // convert into the sum type across modules.
+                    Some(crate::SymbolTableNode::ImportFrom(_))
+                        if crate::ast::tree::hierarchy::canonical_class_name(&n.id, symbols)
+                            == n.id
+                            && crate::resolve_class_referenced(&n.id, symbols, options)
+                                .is_some() =>
+                    {
+                        TypeInfo::Class(n.id.clone())
+                    }
                     _ => TypeInfo::PyObject,
                 },
             },
@@ -843,13 +863,14 @@ fn infer_type_inner(
         // context, no class) falls through to the PyObject arm below —
         // exactly the pre-ctx behavior (round 99).
         ExprType::Attribute(attr) => {
-            if let Some(ctx) = ctx
-                && let ExprType::Name(recv) = attr.value.as_ref()
-                && (recv.id == "self"
+            // `self` needs the class context; a class-typed NAME (a local
+            // or parameter the analysis typed) resolves in any context.
+            if let ExprType::Name(recv) = attr.value.as_ref()
+                && ((recv.id == "self" && ctx.is_some())
                     || matches!(options.name_types.get(&recv.id), Some(TypeInfo::Class(_))))
             {
                 let class_name = if recv.id == "self" {
-                    ctx.enclosing_class_name().map(str::to_string)
+                    ctx.and_then(|c| c.enclosing_class_name()).map(str::to_string)
                 } else if let Some(TypeInfo::Class(cname)) = options.name_types.get(&recv.id) {
                     Some(cname.clone())
                 } else {
@@ -876,6 +897,37 @@ fn infer_type_inner(
         ExprType::Subscript(sub) => match infer_type_inner(ctx, &sub.value, options, symbols) {
             TypeInfo::Vec(inner) => *inner,
             TypeInfo::Dict(_, v) => *v,
+            // A TUPLE indexed by a constant (`pair[0]`, `pair[-1]`) is that
+            // element's type (a tuple holds its elements as a list does —
+            // shared.rs; Devin review on #321).
+            TypeInfo::Tuple(items) => {
+                let literal = |e: &ExprType| match e {
+                    ExprType::Constant(c) => match &c.0 {
+                        Some(litrs::Literal::Integer(v)) => v.value::<i64>(),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let index = match &sub.kind {
+                    crate::SubscriptKind::Index(i) => match i.as_ref() {
+                        ExprType::UnaryOp(u)
+                            if matches!(u.op, crate::ast::tree::unary_op::Ops::USub) =>
+                        {
+                            literal(&u.operand).map(|v| -v)
+                        }
+                        other => literal(other),
+                    },
+                    _ => None,
+                };
+                match index {
+                    Some(i) => {
+                        let n = items.len() as i64;
+                        let i = if i < 0 { i + n } else { i };
+                        if i >= 0 && i < n { items[i as usize].clone() } else { TypeInfo::PyObject }
+                    }
+                    None => TypeInfo::PyObject,
+                }
+            }
             // An OPTION-wrapped base (`request_context["scheme"]` where
             // request_context is `dict[str, Any] | None` — urllib3's
             // poolmanager): the read unwraps the Option, so the element
@@ -1405,7 +1457,12 @@ pub fn render_reused(
     let tokens = expr
         .clone()
         .to_rust(ctx, options.clone(), symbols.clone())?;
-    if let Some(root) = reuse_root_name(expr) {
+    // A field chain rooted at `self` can never be MOVED out of the
+    // method's receiver (`for t in self.tags` in a `&self` method —
+    // E0507), whatever `self`'s use count: it is reused by definition.
+    let self_field = matches!(expr, ExprType::Attribute(_))
+        && crate::ast::tree::attribute::chain_root_is_self(expr);
+    if let Some(root) = reuse_root_name(expr).or_else(|| self_field.then(|| "self".to_string())) {
         let uses = options.use_counts.get(&root).copied().unwrap_or(0);
         // A NARROWED name already reads as an owned value (the unwrap or
         // member conversion clones — name.rs), so the reuse-clone would
@@ -1415,7 +1472,7 @@ pub fn render_reused(
             && options.narrowed_names.get(&root).is_some_and(|t| {
                 !matches!(t, TypeInfo::StrOrBytes | TypeInfo::PyValue)
             });
-        if uses > 1 && !narrowed_owned {
+        if (uses > 1 || self_field) && !narrowed_owned {
             let t = infer_type(None, expr, &options, &symbols);
             // Round 92: clone whenever the name is not statically Copy —
             // INCLUDING an inferrer-unknown (PyObject) name, which the
@@ -2561,7 +2618,8 @@ fn analyze_statement_types(
                             // the caller's seeds, not the locals typed so
                             // far.
                             let view = options.map(|o| analysis_view(o, info));
-                            call_return_typeinfo(c, symbols, view.as_ref())
+                            self_method_return_typeinfo(c, self_class, symbols, options)
+                                .or_else(|| call_return_typeinfo(c, symbols, view.as_ref()))
                                 .or_else(|| {
                                     // The ctx-aware inferrer: a dict-method
                                     // fetch (`item = self.items.get(k)` —
@@ -2639,6 +2697,32 @@ fn analyze_statement_types(
                         ExprType::Name(_) => match (options, symbols) {
                             (Some(options), Some(symbols)) => {
                                 infer_type(None, &assign.value, &analysis_view(options, info), symbols)
+                            }
+                            _ => syntactic_type(&assign.value),
+                        },
+                        // A SUBSCRIPT value (`q = queues[0]` where `queues:
+                        // list[Backlog]` — the corpus's ledger): the
+                        // context-aware inferrer reads the element type
+                        // through the container's recorded type, so the
+                        // local is the class and a method call on it
+                        // resolves (the context-free path saw an untyped
+                        // element and the call fell to the callable-field
+                        // form).
+                        ExprType::Subscript(_) => match (options, symbols) {
+                            (Some(options), Some(symbols)) => {
+                                // The class context: `a = self.accounts[k]`
+                                // reads a field of the enclosing class.
+                                let analysis_ctx =
+                                    self_class.map(|cl| CodeGenContext::Class(cl.to_string()));
+                                match infer_type(
+                                    analysis_ctx.as_ref(),
+                                    &assign.value,
+                                    &analysis_view(options, info),
+                                    symbols,
+                                ) {
+                                    TypeInfo::PyObject => syntactic_type(&assign.value),
+                                    t => t,
+                                }
                             }
                             _ => syntactic_type(&assign.value),
                         },
@@ -3861,10 +3945,16 @@ pub fn call_return_typeinfo(
         let Some(crate::TypeInfo::Class(cname)) = options.name_types.get(&recv.id) else {
             return None;
         };
-        let class = crate::resolve_class_referenced(cname, symbols, options)?;
-        let method = class.method_on_mro(&attr.attr, symbols)?;
+        // The class WITH its defining scope: a cross-module receiver's
+        // method names its return class in ITS module (`conn.urlopen(url)
+        // -> BaseHTTPResponse` in urllib3's poolmanager, which never
+        // imports the response class), so the annotation resolves there,
+        // not in the caller's scope where the name is unbound.
+        let (class, class_symbols) =
+            crate::ast::tree::call::receiver_class_tail(cname, symbols.clone(), options)?;
+        let method = class.method_on_mro(&attr.attr, &class_symbols)?;
         let ann = method.returns.as_deref()?;
-        return resolve_alias_typeinfo(ann, symbols, options);
+        return resolve_alias_typeinfo(ann, &class_symbols, options);
     };
     let symbols = symbols?;
     let options = options?;
@@ -3889,7 +3979,23 @@ pub fn call_return_typeinfo(
             // callee stayed untyped, so the local never entered
             // optional_names and the is-not-None narrowing never fired).
             let path = crate::module_defs_key(options, &path)?;
-            let (f, _) = crate::module_function_def(options, path, &callee.id)?;
+            // The name the defining module binds (`from m import X as Y`
+            // calls X).
+            let defining = i
+                .names
+                .iter()
+                .find(|a| a.asname.as_deref() == Some(&callee.id))
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| callee.id.clone());
+            // An IMPORTED class's construction (`HTTPResp(200)` from
+            // `from .response import HTTPResp`) is an instance of that
+            // class — the same answer the same-module construction gives,
+            // so a subtree class returned from a `-> Root` factory converts
+            // into the sum type across modules too.
+            if crate::module_class_def(options, path, &defining).is_some() {
+                return Some(TypeInfo::Class(defining));
+            }
+            let (f, _) = crate::module_function_def(options, path, &defining)?;
             let ann = f.returns.as_deref()?;
             return resolve_alias_typeinfo(ann, &module_symbols(options, &path), options);
         }
@@ -3929,6 +4035,33 @@ pub fn call_return_typeinfo(
         }
         _ => None,
     }
+}
+
+/// The declared return type of `self.method(...)` inside a method of
+/// `self_class` (`conn = self.connection_from_host(..)` — urllib3's
+/// poolmanager, whose `-> HTTPConnectionPool` then types `conn.urlopen(url)`
+/// and the root-typed `response` it yields): the method resolves on the
+/// class's MRO and its annotation in the class's own scope. None when the
+/// call is not on `self`, the class is unknown, or the method has no
+/// annotation.
+fn self_method_return_typeinfo(
+    call: &crate::Call,
+    self_class: Option<&str>,
+    symbols: Option<&SymbolTableScopes>,
+    options: Option<&PythonOptions>,
+) -> Option<TypeInfo> {
+    let ExprType::Attribute(attr) = call.func.as_ref() else {
+        return None;
+    };
+    if !matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+        return None;
+    }
+    let (class_name, symbols, options) = (self_class?, symbols?, options?);
+    let (class, class_symbols) =
+        crate::ast::tree::call::receiver_class_tail(class_name, symbols.clone(), options)?;
+    let method = class.method_on_mro(&attr.attr, &class_symbols)?;
+    let ann = method.returns.as_deref()?;
+    resolve_alias_typeinfo(ann, &class_symbols, options)
 }
 
 /// The symbol table of a module in options.module_defs ("" root).

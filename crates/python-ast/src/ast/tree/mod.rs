@@ -32,8 +32,8 @@ pub mod constant;
 pub use constant::*;
 
 pub mod expression;
-pub mod fetch_provenance;
 pub mod hierarchy;
+pub mod shared;
 pub use expression::*;
 
 pub mod function_def;

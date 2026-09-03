@@ -2112,6 +2112,7 @@ pub fn convert(
         }
     }
 
+    let mut written: HashSet<Vec<String>> = HashSet::new();
     for (module, code) in &transpiled {
         if is_dunder_main(module) {
             continue; // handled as the binary below
@@ -2134,7 +2135,11 @@ pub fn convert(
         }
         fs::write(&file, format_rust(&contents))
             .with_context(|| format!("writing {}", file.display()))?;
+        if module.is_init {
+            written.insert(module.path.clone());
+        }
     }
+    write_missing_containers(&src_dir, &children, &written)?;
 
     // Ensure lib.rs exists even when the package has no root __init__.py.
     let lib_rs = src_dir.join("lib.rs");
@@ -2477,6 +2482,7 @@ fn convert_driver(
                 }
             }
         }
+        let mut written: HashSet<Vec<String>> = HashSet::new();
         for (dep_module, dep_code) in &dep_transpiled {
             let decls = mod_decls(&children, &dep_module.path, dep_module.is_init);
             let contents = format!("{}\n{}", dep_code, decls);
@@ -2486,7 +2492,11 @@ fn convert_driver(
             }
             fs::write(&file, format_rust(&contents))
                 .with_context(|| format!("writing {}", file.display()))?;
+            if dep_module.is_init {
+                written.insert(dep_module.path.clone());
+            }
         }
+        write_missing_containers(&src_dir, &children, &written)?;
         for name in children.get(&Vec::new()).cloned().unwrap_or_default() {
             lib.push_str(&format!("\npub mod {};", name));
         }
@@ -3115,6 +3125,32 @@ fn mod_decls(
         }
     }
     out
+}
+
+/// A package whose `__init__` the crate does not emit (nothing imports
+/// it — the entry reaches `net.manager` straight through the package)
+/// still needs its `mod.rs`, or rustc finds no file for `pub mod net;`
+/// and every submodule under it is silently dropped: write one holding
+/// only the `pub mod child;` declarations for each such container.
+fn write_missing_containers(
+    src_dir: &Path,
+    children: &BTreeMap<Vec<String>, Vec<String>>,
+    written: &HashSet<Vec<String>>,
+) -> Result<()> {
+    for path in children.keys() {
+        if path.is_empty() || written.contains(path) {
+            continue;
+        }
+        let mut dir = src_dir.to_path_buf();
+        for part in path {
+            dir = dir.join(part);
+        }
+        fs::create_dir_all(&dir)?;
+        let file = dir.join("mod.rs");
+        fs::write(&file, format_rust(&mod_decls(children, path, true)))
+            .with_context(|| format!("writing {}", file.display()))?;
+    }
+    Ok(())
 }
 
 /// Where a module's Rust file lives within src/.

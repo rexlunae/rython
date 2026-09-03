@@ -1646,6 +1646,17 @@ impl PyBool for bool {
     }
 }
 
+/// An optional value's truth is Python's: `None` is false, a present
+/// value has its own truth (`bool(headers.get("Retry-After"))`).
+impl<T: PyBool> PyBool for Option<T> {
+    fn py_bool(self) -> bool {
+        match self {
+            None => false,
+            Some(v) => v.py_bool(),
+        }
+    }
+}
+
 impl<T> PyBool for &PyList<T> {
     fn py_bool(self) -> bool {
         !self.inner.is_empty()
@@ -3833,6 +3844,199 @@ impl<T: Truthy> Truthy for Option<T> {
 /// are never None (a non-Option Rust value always holds something).
 pub trait PyIsNone {
     fn py_is_none(&self) -> bool;
+}
+
+/// A SHARED class instance: `Rc<RefCell<T>>` behind one name, so every
+/// holder — a container slot, a local fetched from it, a parameter — is
+/// the same object, as every Python reference is. The converter gives
+/// this representation to a class that is both container-stored and
+/// mutated after construction anywhere in the crate (issue #137, the
+/// aliasing representation): reads go through `borrow()`, mutations
+/// through `borrow_mut()`, and a clone is another reference to the one
+/// object. Everything else stays a plain struct.
+pub struct PyRef<T>(pub alloc::rc::Rc<core::cell::RefCell<T>>);
+
+impl<T> PyRef<T> {
+    pub fn new(value: T) -> Self {
+        PyRef(alloc::rc::Rc::new(core::cell::RefCell::new(value)))
+    }
+    /// A read of the one object. Loud (§12.2) when a mutating method on
+    /// another reference to it is still running — `a.merge(a)`, the
+    /// aliasing-under-mutation boundary the spec names.
+    pub fn borrow(&self) -> core::cell::Ref<'_, T> {
+        self.0.try_borrow().unwrap_or_else(|_| {
+            panic!(
+                "RuntimeError: a shared object is read through one reference while a \
+                 mutating method runs on another (aliasing under mutation, issue #137)"
+            )
+        })
+    }
+    /// A mutation of the one object; loud like `borrow` when any other
+    /// reference to it is in use.
+    pub fn borrow_mut(&self) -> core::cell::RefMut<'_, T> {
+        self.0.try_borrow_mut().unwrap_or_else(|_| {
+            panic!(
+                "RuntimeError: a shared object is mutated through one reference while \
+                 another reference to it is in use (aliasing under mutation, issue #137)"
+            )
+        })
+    }
+    /// Python's `is`: the same object.
+    pub fn py_is(&self, other: &Self) -> bool {
+        alloc::rc::Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Python's `is` on two OPTIONAL shared references (`a: C | None`): both
+/// None, or the same object — never the `==` a class may define.
+pub fn py_is_opt<T>(a: &Option<PyRef<T>>, b: &Option<PyRef<T>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.py_is(y),
+        _ => false,
+    }
+}
+
+impl<T> Clone for PyRef<T> {
+    fn clone(&self) -> Self {
+        PyRef(self.0.clone())
+    }
+}
+
+impl<T: Default> Default for PyRef<T> {
+    fn default() -> Self {
+        PyRef::new(T::default())
+    }
+}
+
+impl<T: core::fmt::Debug> core::fmt::Debug for PyRef<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.borrow().fmt(f)
+    }
+}
+
+/// A shared class's `==` (the converter implements this for every shared
+/// class): identity by default, as CPython's default `__eq__` is; a class
+/// whose `__eq__` the reference form cannot call overrides it to panic.
+pub trait PyRefEq: Sized {
+    fn ref_eq(a: &PyRef<Self>, b: &PyRef<Self>) -> bool {
+        a.py_is(b)
+    }
+}
+
+impl<T: PyRefEq> PartialEq for PyRef<T> {
+    fn eq(&self, other: &Self) -> bool {
+        T::ref_eq(self, other)
+    }
+}
+
+impl<T> From<T> for PyRef<T> {
+    fn from(value: T) -> Self {
+        PyRef::new(value)
+    }
+}
+
+impl<T: PyDisplay> PyDisplay for PyRef<T> {
+    fn py_display(&self) -> String {
+        self.0.borrow().py_display()
+    }
+}
+
+impl<T: PyRepr> PyRepr for PyRef<T> {
+    fn py_repr(&self) -> String {
+        self.0.borrow().py_repr()
+    }
+}
+
+/// A shared instance's truth is the ONE object's (the converter
+/// implements this for every shared class): `__bool__` / `__len__` run on
+/// the object behind the reference — mutably when the method mutates —
+/// so a side effect in either is what every other reference sees.
+pub trait PyRefTruth: Sized {
+    fn ref_truth(r: &PyRef<Self>) -> bool;
+}
+
+impl<T: PyRefTruth> PyBool for PyRef<T> {
+    fn py_bool(self) -> bool {
+        T::ref_truth(&self)
+    }
+}
+
+impl<T> PyIsNone for PyRef<T> {
+    fn py_is_none(&self) -> bool {
+        false
+    }
+}
+
+impl<T: PyInherits<Base>, Base> PyInherits<Base> for PyRef<T> {}
+
+#[cfg(test)]
+mod pyref_tests {
+    use super::*;
+
+    #[derive(Default, Debug)]
+    struct Counter {
+        n: i64,
+    }
+    impl PyRefEq for Counter {}
+
+    #[test]
+    fn a_clone_is_the_same_object() {
+        let a = PyRef::new(Counter { n: 1 });
+        let b = a.clone();
+        b.borrow_mut().n += 2;
+        assert_eq!(a.borrow().n, 3);
+        assert!(a.py_is(&b));
+        assert!(!a.py_is(&PyRef::new(Counter { n: 3 })));
+        // `==` is identity by default (CPython's default __eq__): two
+        // aliases are equal, two distinct equal-field objects are not.
+        assert!(a == b);
+        assert!(a != PyRef::new(Counter { n: 3 }));
+    }
+
+    /// A read through one reference while a mutating method runs on
+    /// another is loud, with the boundary named (`a.merge(a)`).
+    #[test]
+    #[should_panic(expected = "aliasing under mutation")]
+    fn a_read_under_a_mutating_borrow_is_loud() {
+        let a = PyRef::new(Counter { n: 1 });
+        let b = a.clone();
+        let held = a.borrow_mut();
+        let _ = b.borrow().n;
+        drop(held);
+    }
+
+    /// A shared instance's truth runs on the one object: a `__bool__`
+    /// that counts its calls is seen through the other reference.
+    #[test]
+    fn a_shared_truth_runs_on_the_one_object() {
+        struct Probe {
+            checks: i64,
+        }
+        impl PyRefTruth for Probe {
+            fn ref_truth(r: &PyRef<Self>) -> bool {
+                let mut p = r.borrow_mut();
+                p.checks += 1;
+                p.checks > 1
+            }
+        }
+        let a = PyRef::new(Probe { checks: 0 });
+        let b = a.clone();
+        assert!(!bool(a.clone()));
+        assert!(bool(b.clone()));
+        assert_eq!(a.borrow().checks, 2);
+    }
+
+    /// `bool(x)` on an optional value: None is false, a present value has
+    /// its own truth (`bool(headers.get("Retry-After"))`).
+    #[test]
+    fn an_optional_value_has_pythons_truth() {
+        assert!(!crate::bool(None::<String>));
+        assert!(!crate::bool(Some(String::new())));
+        assert!(crate::bool(Some("120".to_string())));
+        assert!(!crate::bool(Some(0i64)));
+        assert!(crate::bool(Some(3i64)));
+    }
 }
 
 impl<T> PyIsNone for Option<T> {
