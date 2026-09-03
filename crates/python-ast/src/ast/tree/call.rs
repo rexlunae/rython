@@ -1879,8 +1879,28 @@ impl<'a> CodeGen for Call {
             ExprType::Attribute(attr) => {
                 let root = crate::ast::tree::call::root_name(&attr.value);
                 match root {
+                    // A USER METHOD is fallible by construction (every
+                    // generated method returns Result<_, PyException>):
+                    // the receiver's class resolves (direct, unwrap-chain,
+                    // or a fetch call — the shared helper) and the method
+                    // exists on its MRO. Fallibility is a property of the
+                    // EXPRESSION (the review's fix 2, round 99) — the
+                    // generic path renders lambdas, comprehension
+                    // elements, and print arguments, and each propagates
+                    // the same way the resolved arm does.
                     Some(root) if !crate::is_stdpython_module(&root) => {
-                        crate::ast::tree::attribute::is_module_path_chain(&attr.value, &symbols, &options)
+                        if crate::ast::tree::attribute::is_module_path_chain(
+                            &attr.value, &symbols, &options,
+                        ) {
+                            true
+                        } else {
+                            crate::TypeInfo::enum_receiver_class(
+                                &attr.value, &options, &symbols,
+                            )
+                            .and_then(|c| crate::resolve_class_referenced(&c, &symbols, &options))
+                            .and_then(|class| class.method_on_mro(&attr.attr, &symbols))
+                            .is_some()
+                        }
                     }
                     Some(root) if crate::is_stdpython_module(&root) => {
                         FALLIBLE_STDLIB_FN.contains(&attr.attr.as_str())
@@ -5295,6 +5315,7 @@ impl<'a> CodeGen for Call {
             // produced `urlparse::new(...)` (E0433 — a function used as a
             // module path) at every requests/urllib3/charset_normalizer call
             // site (round 55). Direct from-imports check the module's class
+                        eprintln!("R99SITE5318");
             // registry; re-export chains (requests' compat re-exports
             // urllib.parse's functions) check the terminal item.
             let stdpython_class = !stdpython_fn
@@ -5432,6 +5453,7 @@ impl<'a> CodeGen for Call {
                     if !sig.args.posonlyargs.is_empty() {
                         sig.args.posonlyargs.remove(0);
                     } else if !sig.args.args.is_empty() {
+                        eprintln!("R99SITE5455");
                         sig.args.args.remove(0);
                     }
                 }
@@ -5535,6 +5557,7 @@ impl<'a> CodeGen for Call {
                                     super_owner
                                 )
                                 .into());
+                        eprintln!("R99SITE5558");
                             }
                         }
                     }
@@ -5715,9 +5738,12 @@ impl<'a> CodeGen for Call {
                 receiver_class(&attr.value, &ctx, &symbols, &options)
             {
                 eprintln!("R99GATE {}.{} -> {}", match attr.value.as_ref() { crate::ExprType::Name(n) => format!("Name({})", n.id), crate::ExprType::Attribute(a) => format!("Attr(.{})", a.attr), crate::ExprType::Call(_) => "Call".into(), _ => "other".into() }, attr.attr, class.name);
-                if let Some(method) =
+                if let Some(mut method) =
                     class.method_on_mro_with_options(&attr.attr, &class_symbols, &options)
                 {
+                    if attr.attr == "depth" {
+                        eprintln!("R99DEPTHPROCEED");
+                    }
                     if method.name == "__init__" && class.init_method().is_none() {
                         return Err(format!(
                             "`self.__init__(...)` calling an inherited `__init__` is not \
@@ -5768,6 +5794,7 @@ impl<'a> CodeGen for Call {
                     // **kwargs)` — botocore's S3EndpointSetter, where the
                     // field is registered externally and never stored in
                     // __init__): the class has no stored field of this
+                        eprintln!("R99SITE5794");
                     // name, so the KEYWORD-style call cannot be the
                     // zero-parameter method — the external field is
                     // unmodeled — the call is dropped (external-field

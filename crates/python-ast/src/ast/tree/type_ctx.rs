@@ -193,6 +193,42 @@ impl TypeInfo {
 
     /// Render the Rust type name, for typed empty containers
     /// (`Vec::<f64>::new()`, `PyDict::<String, i64>::from([])`).
+    pub fn enum_receiver_class(
+        receiver: &ExprType,
+        options: &crate::PythonOptions,
+        symbols: &crate::SymbolTableScopes,
+    ) -> Option<String> {
+        match crate::infer_type(None, receiver, options, symbols) {
+            TypeInfo::Class(c) => return Some(c),
+            TypeInfo::Option(inner) => {
+                if let TypeInfo::Class(c) = &*inner {
+                    return Some(c.clone());
+                }
+            }
+            _ => {}
+        }
+        if let ExprType::Call(call) = receiver {
+            match crate::call_return_typeinfo(call, Some(symbols), Some(options)) {
+                Some(TypeInfo::Class(c)) => return Some(c),
+                Some(TypeInfo::Option(inner)) => {
+                    if let TypeInfo::Class(c) = &*inner {
+                        return Some(c.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let root = crate::ast::tree::type_ctx::reuse_root_name(receiver)?;
+        match options.name_types.get(&root) {
+            Some(TypeInfo::Class(c)) => Some(c.clone()),
+            Some(TypeInfo::Option(inner)) => match &**inner {
+                TypeInfo::Class(c) => Some(c.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn to_rust_type(&self) -> TokenStream {
         match self {
             TypeInfo::Int => quote!(i64),
