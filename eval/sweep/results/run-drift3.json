@@ -1,12 +1,12 @@
 {
-  "rypip_commit": "d43a840",
-  "rypip_path": "/home/user/rython/target/debug/rypip",
-  "elapsed_seconds": 794.1,
+  "rypip_commit": "e190abd",
+  "rypip_path": "target/release/rypip",
+  "elapsed_seconds": 710.6,
   "packages": {
     "urllib3": {
-      "total": 789,
+      "total": 788,
       "histogram": {
-        "E0308": 322,
+        "E0308": 321,
         "E0599": 172,
         "E0277": 126,
         "E0609": 88,
@@ -32,7 +32,7 @@
         "Vec<u8> | PyValue": 14,
         "Socket | PyValue": 12,
         "PyValue | PyException": 9,
-        "String | PyValue": 8,
+        "String | PyValue": 7,
         "i64 | PyValue": 7,
         "bool | PyValue": 7,
         "PyException | PyValue": 6,
