@@ -7360,6 +7360,20 @@ impl<'a> CodeGen for Call {
                     symbols.clone(),
                 )?);
             }
+            // A morph for a polymorphic ROOT (hierarchy.rs) takes the
+            // root's sum type: a concrete struct of the subtree converts
+            // on the way in.
+            for site in &sites {
+                if site.is_class
+                    && let Some(py_ty) = &site.py_ty
+                    && let Some(variant) = crate::ast::tree::specialize::axis_dispatch_suffix(site.axis, py_ty, true)
+                    && crate::ast::tree::hierarchy::is_polymorphic_root(variant)
+                    && let Some(a) = rendered.get_mut(site.axis.index)
+                {
+                    let inner = a.clone();
+                    *a = quote!((#inner).into());
+                }
+            }
             let call = quote!(#mangled(#(#rendered),*));
             return Ok(if propagates_exceptions {
                 quote!((#call)?)
