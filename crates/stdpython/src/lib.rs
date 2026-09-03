@@ -3887,6 +3887,16 @@ impl<T> PyRef<T> {
     }
 }
 
+/// Python's `is` on two OPTIONAL shared references (`a: C | None`): both
+/// None, or the same object — never the `==` a class may define.
+pub fn py_is_opt<T>(a: &Option<PyRef<T>>, b: &Option<PyRef<T>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.py_is(y),
+        _ => false,
+    }
+}
+
 impl<T> Clone for PyRef<T> {
     fn clone(&self) -> Self {
         PyRef(self.0.clone())

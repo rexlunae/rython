@@ -516,6 +516,88 @@ fn a_cross_module_call_result_typed_with_a_root_reads_fields_through_the_accesso
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "4");
 }
 
+/// A class name two modules both define is AMBIGUOUS to the sharing
+/// registry (keyed by the bare name, like the hierarchy index): neither
+/// shares, and the conversion says so when one of them would have — never
+/// a silent merge of the two definitions (Devin review on #321). The
+/// program still converts, builds, and runs.
+#[test]
+fn a_class_name_two_modules_define_is_excluded_from_sharing_loudly() {
+    let scratch = Scratch::new("xdup");
+    fs::create_dir_all(scratch.path().join("vendor/store")).unwrap();
+    fs::write(scratch.path().join("vendor/store/__init__.py"), "").unwrap();
+    fs::write(
+        scratch.path().join("vendor/store/a.py"),
+        concat!(
+            "class Item:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.n += 1\n",
+            "\n",
+            "class Shelf:\n",
+            "    def __init__(self):\n",
+            "        self.items: list[Item] = [Item(1)]\n",
+            "\n",
+            "    def first(self) -> int:\n",
+            "        return self.items[0].n\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("vendor/store/b.py"),
+        concat!(
+            "class Item:\n",
+            "    def __init__(self, label: str):\n",
+            "        self.label = label\n",
+            "\n",
+            "def label_of(i: Item) -> str:\n",
+            "    return i.label\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("rython.toml"),
+        "[python-modules]\nstore = { path = \"vendor/store\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("app.py"),
+        concat!(
+            "from store.a import Shelf\n",
+            "from store.b import label_of, Item\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(Shelf().first(), label_of(Item(\"x\")))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&scratch.path().join("app.py")).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    assert!(
+        krate.warnings.iter().any(|w| w.contains("class `Item` is defined by more than one module")),
+        "the ambiguous name is named in the conversion's warnings: {:?}",
+        krate.warnings
+    );
+    let a_rs = fs::read_to_string(out.join("src/store/a.rs")).unwrap();
+    assert!(
+        !a_rs.contains("PyRef<Item>"),
+        "an ambiguous name is not shared: {}",
+        a_rs
+    );
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "binary exited nonzero");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1 x");
+}
+
 /// A composition chain (`self.inner.x = v`, `self.inner.bump()`) and a
 /// tuple destructuring (`self.x, self.y = ...`) inside generic trait
 /// defaults must write through the MUTABLE accessors: in the trait default

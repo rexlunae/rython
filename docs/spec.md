@@ -408,7 +408,13 @@ through subscript/attribute stores marks the chain's base variable.
   on its references panics at runtime and the conversion warns. An
   instance's truth (`bool(x)`, also through `Option` and the sum type)
   is `__bool__`, else `__len__() != 0`, else True, the dunder resolved
-  on the MRO — on a shared instance it runs on the one object (a side
+  on the MRO — on a shared instance it runs on the one object. `is` on
+  shared references, optional ones included, is identity of the one
+  object. The registry is keyed by the class name the type side carries,
+  so a name two modules of the crate both define is excluded from sharing
+  with a conversion warning (as the hierarchy index excludes it); a store
+  through a non-`self` receiver counts for the class the receiver's scope
+  names, and for every class with that field when it names none (a side
   effect in `__bool__` is what every reference sees). One boundary: a
   mutating method on a shared object holds the object for its duration,
   so a read of the SAME object through another reference inside that
