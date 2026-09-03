@@ -25,9 +25,10 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use std::collections::{HashMap, HashSet};
 
+use crate::ast::tree::visit::{self, Descend, Flow};
 use crate::{
-    CodeGen, CodeGenContext, ExprType, PythonOptions, Statement, StatementType,
-    SymbolTableNode, SymbolTableScopes,
+    AsyncFor, AsyncWith, CodeGen, CodeGenContext, ExprType, For, PythonOptions, Statement,
+    StatementType, SymbolTableNode, SymbolTableScopes, With,
 };
 
 /// The Rust types codegen produces for Python expressions, at the
@@ -2067,290 +2068,281 @@ pub fn analyze_function_types_with_class(
         && let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(class_name)
         && let Ok(_) = class.infer_fields(symbols, options)
     {
-        // Recurse into nested bodies: the Option-widening stores sit
+        // Seed from every store in the function's OWN scope (a nested
+        // definition is its own analysis): the Option-widening stores sit
         // inside `if`/`with` blocks (`server_hostname = self._tunnel_host`
         // inside `if self._tunnel_host is not None:`).
-        fn walk_stmts(
-            stmts: &[crate::Statement],
+        fn seed_from_store(
+            stmt: &crate::Statement,
             class: &crate::ClassDef,
             info: &mut FunctionTypeInfo,
             options: &PythonOptions,
             symbols: &SymbolTableScopes,
         ) {
-            for stmt in stmts {
-                let inner: Option<&[crate::Statement]> = match &stmt.statement {
-                    crate::StatementType::If(s) => Some(s.body.as_slice()),
-                    crate::StatementType::While(s) => Some(s.body.as_slice()),
-                    crate::StatementType::For(s) => Some(s.body.as_slice()),
-                    crate::StatementType::With(s) => Some(s.body.as_slice()),
-                    crate::StatementType::Try(s) => Some(s.body.as_slice()),
-                    _ => None,
-                };
-                if let Some(inner) = inner {
-                    walk_stmts(inner, class, info, options, symbols);
+            let crate::StatementType::Assign(a) = &stmt.statement else {
+                return;
+            };
+            let [crate::ExprType::Name(n)] = a.targets.as_slice() else {
+                return;
+            };
+            if info.optional_names.contains(&n.id) {
+                return;
+            }
+            // A name the plain analysis already typed as OPTION stays
+            // as it is; a PLAIN-typed name may still be WIDENED by an
+            // Option-typed field store below (`server_hostname: str =
+            // self.host` then `server_hostname = self._tunnel_host` —
+            // the Python value becomes None-able; the annotation was a
+            // hint, not a constraint).
+            let already_option = matches!(
+                info.name_types.get(&n.id),
+                Some(crate::TypeInfo::Option(_))
+            );
+            // A `typing.cast(T, value)` assignment (`proxy_config =
+            // typing.cast(ProxyConfig, self.proxy_config)` — urllib3's
+            // _connect_tls_proxy): the cast is a runtime identity, so
+            // the VALUE's shape seeds the local exactly like the
+            // direct form (round 95 — without it the cast-assigned
+            // local stayed unknown and the Option-field reads on it
+            // never unwrapped, E0609).
+            let cast_value = match &a.value {
+                crate::ExprType::Call(call)
+                    if call.args.len() == 2
+                        && (matches!(
+                            call.func.as_ref(),
+                            crate::ExprType::Name(n)
+                                if n.id == "cast"
+                                    && matches!(
+                                        symbols.get(&n.id),
+                                        Some(crate::SymbolTableNode::ImportFrom(i))
+                                            if crate::AnnotationModule::from_name(
+                                                i.module.split('.').next().unwrap_or("")
+                                            ) == Some(crate::AnnotationModule::Typing)
+                                    )
+                        ) || matches!(
+                            call.func.as_ref(),
+                            crate::ExprType::Attribute(attr)
+                                if attr.attr == "cast"
+                                    && matches!(
+                                        attr.value.as_ref(),
+                                        crate::ExprType::Name(m)
+                                            if crate::is_typing(&m.id)
+                                    )
+                        )) =>
+                {
+                    Some(&call.args[1])
                 }
-                let crate::StatementType::Assign(a) = &stmt.statement else {
-                    continue;
-                };
-                let [crate::ExprType::Name(n)] = a.targets.as_slice() else {
-                    continue;
-                };
-                if info.optional_names.contains(&n.id) {
-                    continue;
-                }
-                // A name the plain analysis already typed as OPTION stays
-                // as it is; a PLAIN-typed name may still be WIDENED by an
-                // Option-typed field store below (`server_hostname: str =
-                // self.host` then `server_hostname = self._tunnel_host` —
-                // the Python value becomes None-able; the annotation was a
-                // hint, not a constraint).
-                let already_option = matches!(
-                    info.name_types.get(&n.id),
-                    Some(crate::TypeInfo::Option(_))
-                );
-                // A `typing.cast(T, value)` assignment (`proxy_config =
-                // typing.cast(ProxyConfig, self.proxy_config)` — urllib3's
-                // _connect_tls_proxy): the cast is a runtime identity, so
-                // the VALUE's shape seeds the local exactly like the
-                // direct form (round 95 — without it the cast-assigned
-                // local stayed unknown and the Option-field reads on it
-                // never unwrapped, E0609).
-                let cast_value = match &a.value {
-                    crate::ExprType::Call(call)
-                        if call.args.len() == 2
-                            && (matches!(
-                                call.func.as_ref(),
-                                crate::ExprType::Name(n)
-                                    if n.id == "cast"
-                                        && matches!(
-                                            symbols.get(&n.id),
-                                            Some(crate::SymbolTableNode::ImportFrom(i))
-                                                if crate::AnnotationModule::from_name(
-                                                    i.module.split('.').next().unwrap_or("")
-                                                ) == Some(crate::AnnotationModule::Typing)
-                                        )
-                            ) || matches!(
-                                call.func.as_ref(),
-                                crate::ExprType::Attribute(attr)
-                                    if attr.attr == "cast"
-                                        && matches!(
-                                            attr.value.as_ref(),
-                                            crate::ExprType::Name(m)
-                                                if crate::is_typing(&m.id)
-                                        )
-                            )) =>
+                _ => None,
+            };
+            let value_ref = cast_value.unwrap_or(&a.value);
+            match value_ref {
+                // `request_context = self._merge_pool_kwargs(
+                // pool_kwargs)` — a local assigned from a SELF-METHOD
+                // CALL whose callee returns a dict (`-> dict[str,
+                // typing.Any]` — the poolmanager): the local is the
+                // callee's return type. NARROW: only Dict-returning
+                // callees seed the local — typing every self-method
+                // return was a wash in round 44 (conn locals exposed
+                // close-on-Option and From<Option<String>> cascades),
+                // but a Dict-typed local is exactly what the
+                // subscript-store lowering needs (string_keyed/
+                // pyvalue_valued ownership, round 46) and only the
+                // py_set_index/key handling changes for it.
+                crate::ExprType::Call(call) => {
+                    if info.name_types.contains_key(&n.id) {
+                        return;
+                    }
+                    let crate::ExprType::Attribute(attr) = call.func.as_ref() else {
+                        return;
+                    };
+                    if !crate::ast::tree::visit::is_self(attr.value.as_ref()) {
+                        return;
+                    }
+                    if let Some(method) = class.method_on_mro(&attr.attr, symbols)
+                        && let Some(ann) = method.returns.as_deref()
+                        && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
+                        && matches!(t, crate::TypeInfo::Dict(_, _))
                     {
-                        Some(&call.args[1])
+                        info.name_types.insert(n.id.clone(), t);
                     }
-                    _ => None,
-                };
-                let value_ref = cast_value.unwrap_or(&a.value);
-                match value_ref {
-                    // `request_context = self._merge_pool_kwargs(
-                    // pool_kwargs)` — a local assigned from a SELF-METHOD
-                    // CALL whose callee returns a dict (`-> dict[str,
-                    // typing.Any]` — the poolmanager): the local is the
-                    // callee's return type. NARROW: only Dict-returning
-                    // callees seed the local — typing every self-method
-                    // return was a wash in round 44 (conn locals exposed
-                    // close-on-Option and From<Option<String>> cascades),
-                    // but a Dict-typed local is exactly what the
-                    // subscript-store lowering needs (string_keyed/
-                    // pyvalue_valued ownership, round 46) and only the
-                    // py_set_index/key handling changes for it.
-                    crate::ExprType::Call(call) => {
-                        if info.name_types.contains_key(&n.id) {
-                            continue;
-                        }
-                        let crate::ExprType::Attribute(attr) = call.func.as_ref() else {
-                            continue;
-                        };
-                        if !crate::ast::tree::visit::is_self(attr.value.as_ref()) {
-                            continue;
-                        }
-                        if let Some(method) = class.method_on_mro(&attr.attr, symbols)
-                            && let Some(ann) = method.returns.as_deref()
-                            && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
-                            && matches!(t, crate::TypeInfo::Dict(_, _))
-                        {
-                            info.name_types.insert(n.id.clone(), t);
-                        }
-                        // Round 87: a CLASS-returning self-method call
-                        // (`timeout_obj = self._get_timeout()` — urllib3's
-                        // `-> Timeout` callee) seeds the local with the
-                        // class, so a later property read on it
-                        // (`timeout_obj.read_timeout` — an
-                        // `Option<f64>`-returning accessor) resolves its
-                        // receiver's class. The Dict arm above was the
-                        // narrow survivor of round 44's wash (typing EVERY
-                        // self-method return exposed close/From cascades);
-                        // the CLASS arm is safe — the local IS the
-                        // instance, and the property arm below consumes it.
-                        if let Some(method) = class.method_on_mro(&attr.attr, symbols)
-                            && let Some(ann) = method.returns.as_deref()
-                            && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
-                            && matches!(t, crate::TypeInfo::Class(_))
-                        {
-                            info.name_types.insert(n.id.clone(), t);
-                        }
-                        // An OPTION-of-CLASS-returning self-method call
-                        // (`item = self.find(name)` — a `-> Optional[Item]`
-                        // finder whose result the caller narrows with an
-                        // early-exit guard, the idiom corpus's take()):
-                        // seed the local as the Option BINDING — name_types
-                        // AND optional_names — so the `is None`-guard
-                        // narrowing fires and later field reads unwrap the
-                        // class (the corpus's four `Option<Item>` errors).
-                        // The round-44 wash came from typing EVERY
-                        // self-method return; an Option<Class> local is the
-                        // narrow shape the guard narrowing consumes.
-                        if let Some(method) = class.method_on_mro(&attr.attr, symbols)
-                            && let Some(ann) = method.returns.as_deref()
-                            && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
-                            && matches!(
-                                &t,
-                                crate::TypeInfo::Option(inner)
-                                    if matches!(**inner, crate::TypeInfo::Class(_))
-                            )
-                        {
-                            info.optional_names.insert(n.id.clone());
-                            info.name_types.insert(n.id.clone(), t);
-                        }
+                    // Round 87: a CLASS-returning self-method call
+                    // (`timeout_obj = self._get_timeout()` — urllib3's
+                    // `-> Timeout` callee) seeds the local with the
+                    // class, so a later property read on it
+                    // (`timeout_obj.read_timeout` — an
+                    // `Option<f64>`-returning accessor) resolves its
+                    // receiver's class. The Dict arm above was the
+                    // narrow survivor of round 44's wash (typing EVERY
+                    // self-method return exposed close/From cascades);
+                    // the CLASS arm is safe — the local IS the
+                    // instance, and the property arm below consumes it.
+                    if let Some(method) = class.method_on_mro(&attr.attr, symbols)
+                        && let Some(ann) = method.returns.as_deref()
+                        && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
+                        && matches!(t, crate::TypeInfo::Class(_))
+                    {
+                        info.name_types.insert(n.id.clone(), t);
                     }
-                    crate::ExprType::Attribute(attr) => {
-                        // A SELF-field read (`resp_options =
-                        // self._response_options` — the enclosing class's
-                        // own field table). The field may live on a BASE
-                        // whose struct is embedded (`self._tunnel_host` in
-                        // a derived method): walk the chain.
-                        let self_read = crate::ast::tree::visit::is_self(attr.value.as_ref());
-                        let field_ty = if self_read {
-                            class
-                                .base_chain(symbols)
-                                .iter()
-                                .find_map(|c| {
-                                    c.infer_fields(symbols, options).ok().and_then(|fs| {
-                                        fs.iter()
-                                            .find(|(name, _)| *name == attr.attr)
-                                            .map(|(_, ty)| ty.clone())
-                                    })
+                    // An OPTION-of-CLASS-returning self-method call
+                    // (`item = self.find(name)` — a `-> Optional[Item]`
+                    // finder whose result the caller narrows with an
+                    // early-exit guard, the idiom corpus's take()):
+                    // seed the local as the Option BINDING — name_types
+                    // AND optional_names — so the `is None`-guard
+                    // narrowing fires and later field reads unwrap the
+                    // class (the corpus's four `Option<Item>` errors).
+                    // The round-44 wash came from typing EVERY
+                    // self-method return; an Option<Class> local is the
+                    // narrow shape the guard narrowing consumes.
+                    if let Some(method) = class.method_on_mro(&attr.attr, symbols)
+                        && let Some(ann) = method.returns.as_deref()
+                        && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
+                        && matches!(
+                            &t,
+                            crate::TypeInfo::Option(inner)
+                                if matches!(**inner, crate::TypeInfo::Class(_))
+                        )
+                    {
+                        info.optional_names.insert(n.id.clone());
+                        info.name_types.insert(n.id.clone(), t);
+                    }
+                }
+                crate::ExprType::Attribute(attr) => {
+                    // A SELF-field read (`resp_options =
+                    // self._response_options` — the enclosing class's
+                    // own field table). The field may live on a BASE
+                    // whose struct is embedded (`self._tunnel_host` in
+                    // a derived method): walk the chain.
+                    let self_read = crate::ast::tree::visit::is_self(attr.value.as_ref());
+                    let field_ty = if self_read {
+                        class
+                            .base_chain(symbols)
+                            .iter()
+                            .find_map(|c| {
+                                c.infer_fields(symbols, options).ok().and_then(|fs| {
+                                    fs.iter()
+                                        .find(|(name, _)| *name == attr.attr)
+                                        .map(|(_, ty)| ty.clone())
                                 })
-                        } else if let Some((owner, owner_symbols)) =
+                            })
+                    } else if let Some((owner, owner_symbols)) =
+                        crate::receiver_class_for_read(
+                            &attr.value,
+                            &crate::CodeGenContext::Module(String::new()),
+                            symbols,
+                            options,
+                        )
+                    {
+                        // A field of ANOTHER object whose class
+                        // resolves (`destination_scheme =
+                        // parsed_url.scheme` where parsed_url is a
+                        // factory local — the same Option seeding as
+                        // the self-field arm; without it the local
+                        // stays untyped and an Option-slot argument
+                        // double-wraps `Some(destination_scheme)`).
+                        owner
+                            .infer_fields(&owner_symbols, options)
+                            .ok()
+                            .and_then(|fs| {
+                                fs.iter()
+                                    .find(|(name, _)| *name == attr.attr)
+                                    .map(|(_, ty)| ty.clone())
+                            })
+                    } else {
+                        None
+                    };
+                    // An OPTION field widens the local — including a
+                    // name the plain analysis typed PLAIN
+                    // (`server_hostname: str = self.host` then
+                    // `server_hostname = self._tunnel_host`: the Python
+                    // value becomes None-able — the annotation was a
+                    // hint). name_types only — the local IS the Option
+                    // (its stores are already Option and must not
+                    // Some-wrap again), and reads unwrap through the
+                    // Option receiver lowering.
+                    if let Some(ty) = field_ty
+                        && matches!(ty, crate::TypeInfo::Option(_))
+                        && !already_option
+                    {
+                        // The REAL field type (`Option<ProxyConfig>` —
+                        // the `proxy_config = cast(ProxyConfig,
+                        // self.proxy_config)` local, whose reads must
+                        // resolve the inner class's fields) — not the
+                        // unknown placeholder: the local IS the field's
+                        // Option, and an Option<Class> inner lets the
+                        // receiver resolution and the Option-slot
+                        // coercions see through it (round 95).
+                        info.name_types.insert(n.id.clone(), ty);
+                    }
+                    // Round 87: a PROPERTY read on a class-resolved
+                    // receiver (`read_timeout = timeout_obj.read_timeout`
+                    // — urllib3's `@property def read_timeout(self) ->
+                    // float | None` on the Timeout instance the
+                    // class-seeding arm typed): the getter's return
+                    // annotation types the local, so an Option getter
+                    // makes it an Option binding (the `_raise_timeout(
+                    // e, url, read_timeout)` argument then coerces
+                    // instead of going in raw). The receiver's class
+                    // comes from the WALK's own seeding
+                    // (`info.name_types` — a local the plain analysis
+                    // left PyObject) as well as the plain analysis.
+                    let info_receiver_class = match attr.value.as_ref() {
+                        crate::ExprType::Name(rn) => match info.name_types.get(&rn.id) {
+                            Some(crate::TypeInfo::Class(c)) => {
+                                crate::receiver_class_tail(c, symbols.clone(), options)
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((owner, owner_symbols)) = info_receiver_class
+                        .or_else(|| {
                             crate::receiver_class_for_read(
                                 &attr.value,
                                 &crate::CodeGenContext::Module(String::new()),
                                 symbols,
                                 options,
                             )
-                        {
-                            // A field of ANOTHER object whose class
-                            // resolves (`destination_scheme =
-                            // parsed_url.scheme` where parsed_url is a
-                            // factory local — the same Option seeding as
-                            // the self-field arm; without it the local
-                            // stays untyped and an Option-slot argument
-                            // double-wraps `Some(destination_scheme)`).
-                            owner
-                                .infer_fields(&owner_symbols, options)
-                                .ok()
-                                .and_then(|fs| {
-                                    fs.iter()
-                                        .find(|(name, _)| *name == attr.attr)
-                                        .map(|(_, ty)| ty.clone())
-                                })
-                        } else {
-                            None
-                        };
-                        // An OPTION field widens the local — including a
-                        // name the plain analysis typed PLAIN
-                        // (`server_hostname: str = self.host` then
-                        // `server_hostname = self._tunnel_host`: the Python
-                        // value becomes None-able — the annotation was a
-                        // hint). name_types only — the local IS the Option
-                        // (its stores are already Option and must not
-                        // Some-wrap again), and reads unwrap through the
-                        // Option receiver lowering.
-                        if let Some(ty) = field_ty
-                            && matches!(ty, crate::TypeInfo::Option(_))
-                            && !already_option
-                        {
-                            // The REAL field type (`Option<ProxyConfig>` —
-                            // the `proxy_config = cast(ProxyConfig,
-                            // self.proxy_config)` local, whose reads must
-                            // resolve the inner class's fields) — not the
-                            // unknown placeholder: the local IS the field's
-                            // Option, and an Option<Class> inner lets the
-                            // receiver resolution and the Option-slot
-                            // coercions see through it (round 95).
-                            info.name_types.insert(n.id.clone(), ty);
-                        }
-                        // Round 87: a PROPERTY read on a class-resolved
-                        // receiver (`read_timeout = timeout_obj.read_timeout`
-                        // — urllib3's `@property def read_timeout(self) ->
-                        // float | None` on the Timeout instance the
-                        // class-seeding arm typed): the getter's return
-                        // annotation types the local, so an Option getter
-                        // makes it an Option binding (the `_raise_timeout(
-                        // e, url, read_timeout)` argument then coerces
-                        // instead of going in raw). The receiver's class
-                        // comes from the WALK's own seeding
-                        // (`info.name_types` — a local the plain analysis
-                        // left PyObject) as well as the plain analysis.
-                        let info_receiver_class = match attr.value.as_ref() {
-                            crate::ExprType::Name(rn) => match info.name_types.get(&rn.id) {
-                                Some(crate::TypeInfo::Class(c)) => {
-                                    crate::receiver_class_tail(c, symbols.clone(), options)
-                                }
-                                _ => None,
-                            },
-                            _ => None,
-                        };
-                        if let Some((owner, owner_symbols)) = info_receiver_class
-                            .or_else(|| {
-                                crate::receiver_class_for_read(
-                                    &attr.value,
-                                    &crate::CodeGenContext::Module(String::new()),
-                                    symbols,
-                                    options,
-                                )
-                            })
-                            && !already_option
-                            && let Some(inner) =
-                                owner.method_on_mro(&attr.attr, symbols).and_then(|m| {
-                                    let is_property = m
-                                        .decorator_list
-                                        .iter()
-                                        .any(|d| match d {
-                                            crate::ExprType::Name(n) => n.id == "property",
-                                            crate::ExprType::Attribute(a) => {
-                                                a.attr == "property"
-                                            }
-                                            _ => false,
-                                        });
-                                    if !is_property {
-                                        return None;
-                                    }
-                                    m.returns.as_deref().and_then(|r| {
-                                        match crate::resolve_alias_typeinfo(
-                                            r, &owner_symbols, options,
-                                        ) {
-                                            Some(crate::TypeInfo::Option(inner)) => Some(*inner),
-                                            _ => None,
+                        })
+                        && !already_option
+                        && let Some(inner) =
+                            owner.method_on_mro(&attr.attr, symbols).and_then(|m| {
+                                let is_property = m
+                                    .decorator_list
+                                    .iter()
+                                    .any(|d| match d {
+                                        crate::ExprType::Name(n) => n.id == "property",
+                                        crate::ExprType::Attribute(a) => {
+                                            a.attr == "property"
                                         }
-                                    })
+                                        _ => false,
+                                    });
+                                if !is_property {
+                                    return None;
+                                }
+                                m.returns.as_deref().and_then(|r| {
+                                    match crate::resolve_alias_typeinfo(
+                                        r, &owner_symbols, options,
+                                    ) {
+                                        Some(crate::TypeInfo::Option(inner)) => Some(*inner),
+                                        _ => None,
+                                    }
                                 })
-                        {
-                            info.name_types.insert(
-                                n.id.clone(),
-                                crate::TypeInfo::Option(Box::new(inner)),
-                            );
-                        }
+                            })
+                    {
+                        info.name_types.insert(
+                            n.id.clone(),
+                            crate::TypeInfo::Option(Box::new(inner)),
+                        );
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
-        walk_stmts(body, class, &mut info, options, symbols);
+        visit::walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+            seed_from_store(stmt, class, &mut info, options, symbols);
+            Flow::Continue
+        });
     }
     info
 }
@@ -2499,14 +2491,16 @@ fn definitely_writes(stmts: &[Statement], name: &str) -> Option<bool> {
                 _ => {}
             },
             // `with ... as name:` binds before the body runs.
-            StatementType::With(s)
-                if s.items.iter().any(|it| {
+            StatementType::With(With { items, .. })
+            | StatementType::AsyncWith(AsyncWith { items, .. })
+                if items.iter().any(|it| {
                     it.optional_vars.as_ref().is_some_and(|v| assign_target_writes(v, name))
                 }) =>
             {
                 return Some(true);
             }
-            StatementType::With(s) => match definitely_writes(&s.body, name) {
+            StatementType::With(With { body, .. })
+            | StatementType::AsyncWith(AsyncWith { body, .. }) => match definitely_writes(body, name) {
                 Some(true) => return Some(true),
                 None => return None,
                 _ => {}
@@ -2945,9 +2939,10 @@ fn analyze_statement_types(
                 analyze_statement_types(b, info, options, symbols, self_class);
             }
         }
-        StatementType::For(s) => {
-            count_expr_reads(&s.iter, info);
-            count_target_reads(&s.target, info);
+        StatementType::For(For { target, iter, body, orelse, .. })
+        | StatementType::AsyncFor(AsyncFor { target, iter, body, orelse, .. }) => {
+            count_expr_reads(iter, info);
+            count_target_reads(target, info);
             // Seed the loop-target types from the iterable's element type
             // (`for (i, (name, item)) in enumerate(sorted(self.items.items()))`
             // — the idiom corpus's report: the element (int, (str, Item))
@@ -2960,26 +2955,27 @@ fn analyze_statement_types(
                 // pre-ctx behavior stands (round 99).
                 let analysis_ctx = self_class.map(|c| CodeGenContext::Class(c.to_string()));
                 let iter_ty =
-                    infer_type(analysis_ctx.as_ref(), &s.iter, &analysis_view(options, info), symbols);
+                    infer_type(analysis_ctx.as_ref(), iter, &analysis_view(options, info), symbols);
                 if let Some(elem) = iterable_element_type(&iter_ty) {
-                    seed_binder_types(&s.target, &elem, &mut info.name_types, false);
+                    seed_binder_types(target, &elem, &mut info.name_types, false);
                 }
             }
-            for b in &s.body {
+            for b in body {
                 analyze_statement_types(b, info, options, symbols, self_class);
             }
-            for b in &s.orelse {
+            for b in orelse {
                 analyze_statement_types(b, info, options, symbols, self_class);
             }
         }
-        StatementType::With(s) => {
-            for item in &s.items {
+        StatementType::With(With { items, body, .. })
+        | StatementType::AsyncWith(AsyncWith { items, body, .. }) => {
+            for item in items {
                 count_expr_reads(&item.context_expr, info);
                 if let Some(vars) = &item.optional_vars {
                     count_target_reads(vars, info);
                 }
             }
-            for b in &s.body {
+            for b in body {
                 analyze_statement_types(b, info, options, symbols, self_class);
             }
         }
@@ -3005,7 +3001,7 @@ fn analyze_statement_types(
                 analyze_statement_types(b, info, options, symbols, self_class);
             }
         }
-        StatementType::FunctionDef(f) => {
+        StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
             // A nested function is a new scope: its locals do not belong to
             // the enclosing function's type analysis. BUT its ANNOTATED
             // parameter types are usable for empty-container pinning — a
@@ -3108,9 +3104,16 @@ pub fn pin_empty_containers(
     options: Option<&PythonOptions>,
 ) {
     let mut suggested: HashMap<String, TypeInfo> = HashMap::new();
-    for stmt in body {
+    // Every body, a NESTED definition's included: a nested function
+    // captures enclosing names (Python closure semantics), so
+    // `md_ratios.append(x)` inside a nested def pins the outer
+    // `md_ratios = []` (charset_normalizer's from_bytes). The nested
+    // function's OWN locals must not pollute the enclosing analysis, but
+    // a use of an enclosing empty container is exactly the pin we want.
+    visit::walk_stmts(body, Descend::All, &mut |stmt| {
         collect_use_suggestions(stmt, info, symbols, options, &mut suggested);
-    }
+        Flow::Continue
+    });
     for (name, t) in suggested {
         if info.empty_pinned.contains_key(&name) {
             // Unify with any existing (annotated) type: an annotated
@@ -3126,6 +3129,9 @@ pub fn pin_empty_containers(
     }
 }
 
+/// The use suggestions of ONE statement (its bodies are the caller's
+/// walk): what a store, an expression statement or a return says about
+/// the type of an empty container it uses.
 fn collect_use_suggestions(
     stmt: &Statement,
     info: &FunctionTypeInfo,
@@ -3315,33 +3321,6 @@ fn collect_use_suggestions(
                 }
             }
         }
-        _ => {}
-    }
-    // Recurse into control flow.
-    match &stmt.statement {
-        StatementType::If(s) => {
-            for b in &s.body {
-                collect_use_suggestions(b, info, symbols, options, out);
-            }
-            for b in &s.orelse {
-                collect_use_suggestions(b, info, symbols, options, out);
-            }
-        }
-        StatementType::While(s) => {
-            for b in &s.body {
-                collect_use_suggestions(b, info, symbols, options, out);
-            }
-        }
-        StatementType::For(s) => {
-            for b in &s.body {
-                collect_use_suggestions(b, info, symbols, options, out);
-            }
-        }
-        StatementType::With(s) => {
-            for b in &s.body {
-                collect_use_suggestions(b, info, symbols, options, out);
-            }
-        }
         // `return "; ".join(parts)` — a str join in return position pins its
         // list argument to Vec<String> (urllib3's fields.py `_render_parts`).
         StatementType::Return(Some(e)) => {
@@ -3356,27 +3335,6 @@ fn collect_use_suggestions(
                 out.entry(arg_name.id.clone())
                     .and_modify(|t| *t = unify(t.clone(), suggestion.clone()))
                     .or_insert(suggestion);
-            }
-        }
-        StatementType::Try(s) => {
-            for b in &s.body {
-                collect_use_suggestions(b, info, symbols, options, out);
-            }
-            for h in &s.handlers {
-                for b in &h.body {
-                    collect_use_suggestions(b, info, symbols, options, out);
-                }
-            }
-        }
-        // A NESTED function captures enclosing names (Python closure
-        // semantics): `md_ratios.append(x)` inside a nested def pins the
-        // outer `md_ratios = []` (charset_normalizer's from_bytes). The
-        // nested function's OWN locals must not pollute the enclosing
-        // analysis, but a use of an enclosing empty container is exactly
-        // the pin we want.
-        StatementType::FunctionDef(f) => {
-            for b in &f.body {
-                collect_use_suggestions(b, info, symbols, options, out);
             }
         }
         _ => {}
@@ -4481,71 +4439,22 @@ fn count_target_reads(target: &ExprType, info: &mut FunctionTypeInfo) {
 /// in botocore's MaxAttemptsDecorator, stored into a field and later
 /// matched against in `except self._retryable_exceptions:`).
 pub(crate) fn name_read_as_value(name: &str, stmts: &[Statement]) -> bool {
-    stmts.iter().any(|s| statement_reads_name_as_value(name, s))
-}
-
-fn statement_reads_name_as_value(name: &str, s: &Statement) -> bool {
-    use crate::StatementType as ST;
-    match &s.statement {
-        ST::Expr(e) => expr_reads_name_as_value(name, &e.value),
-        ST::Assign(a) => {
-            expr_reads_name_as_value(name, &a.value)
-                || a.targets
-                    .iter()
-                    .any(|t| target_reads_name_as_value(name, t))
-        }
-        ST::AugAssign(a) => {
-            expr_reads_name_as_value(name, &a.target)
-                || expr_reads_name_as_value(name, &a.value)
-        }
-        ST::Return(Some(e)) => expr_reads_name_as_value(name, &e.value),
-        ST::Assert { test, msg } => {
-            expr_reads_name_as_value(name, test)
-                || msg
-                    .as_ref()
-                    .is_some_and(|m| expr_reads_name_as_value(name, m))
-        }
-        ST::Raise(r) => {
-            r.exc.as_ref().is_some_and(|e| expr_reads_name_as_value(name, e))
-                || r.cause.as_ref().is_some_and(|e| expr_reads_name_as_value(name, e))
-        }
-        ST::If(i) => {
-            expr_reads_name_as_value(name, &i.test)
-                || i.body.iter().any(|b| statement_reads_name_as_value(name, b))
-                || i.orelse.iter().any(|b| statement_reads_name_as_value(name, b))
-        }
-        ST::While(w) => {
-            expr_reads_name_as_value(name, &w.test)
-                || w.body.iter().any(|b| statement_reads_name_as_value(name, b))
-                || w.orelse.iter().any(|b| statement_reads_name_as_value(name, b))
-        }
-        ST::For(f) => {
-            expr_reads_name_as_value(name, &f.iter)
-                || f.body.iter().any(|b| statement_reads_name_as_value(name, b))
-                || f.orelse.iter().any(|b| statement_reads_name_as_value(name, b))
-        }
-        ST::With(w) => {
-            w.items.iter().any(|item| {
-                expr_reads_name_as_value(name, &item.context_expr)
-                    || item
-                        .optional_vars
-                        .as_ref()
-                        .is_some_and(|v| target_reads_name_as_value(name, v))
-            }) || w.body.iter().any(|b| statement_reads_name_as_value(name, b))
-        }
-        ST::Try(t) => {
-            t.body.iter().any(|b| statement_reads_name_as_value(name, b))
-                || t.orelse.iter().any(|b| statement_reads_name_as_value(name, b))
-                || t.finalbody.iter().any(|b| statement_reads_name_as_value(name, b))
-                || t.handlers.iter().any(|h| {
+    visit::any_stmt(stmts, Descend::All, |s| {
+        visit::stmt_exprs(s).into_iter().any(|e| expr_reads_name_as_value(name, e))
+            || match &s.statement {
+                // An augmented assignment reads its target before it writes it.
+                StatementType::AugAssign(a) => expr_reads_name_as_value(name, &a.target),
+                // A handler's exception class is evaluated when the body raises.
+                StatementType::Try(t) => t.handlers.iter().any(|h| {
                     h.exception_type
                         .as_ref()
                         .is_some_and(|et| expr_reads_name_as_value(name, et))
-                        || h.body.iter().any(|b| statement_reads_name_as_value(name, b))
-                })
-        }
-        _ => false,
-    }
+                }),
+                _ => visit::stmt_targets(s)
+                    .into_iter()
+                    .any(|target| target_reads_name_as_value(name, target)),
+            }
+    })
 }
 
 fn target_reads_name_as_value(name: &str, t: &ExprType) -> bool {
@@ -4662,96 +4571,25 @@ fn expr_reads_name_as_value(name: &str, e: &ExprType) -> bool {
 }
 
 /// Whether a name is referenced anywhere inside a statement list (used for
-/// unused loop-index detection).
+/// unused loop-index detection): in any expression a statement evaluates
+/// or binds — an assert's and a raise's too (Devin review on #103), and a
+/// `del d[k]`'s key (`for key in none_keys: del merged_setting[key]` —
+/// requests' merge_setting, whose loop target must not lower to `_`) —
+/// in a handler's exception class, nested bodies and definitions included.
 pub fn name_referenced_in(body: &[Statement], name: &str) -> bool {
-    body.iter().any(|s| statement_references(s, name))
-}
-
-fn statement_references(stmt: &Statement, name: &str) -> bool {
-    match &stmt.statement {
-        StatementType::Assign(a) => {
-            expr_references(&a.value, name)
-                || a.targets.iter().any(|t| target_references(t, name))
-        }
-        StatementType::AugAssign(a) => {
-            expr_references(&a.target, name) || expr_references(&a.value, name)
-        }
-        StatementType::Expr(e) => expr_references(&e.value, name),
-        StatementType::Return(r) => {
-            r.as_ref().map(|e| expr_references(&e.value, name)).unwrap_or(false)
-        }
-        // Assert and raise read their expressions too: a loop index used
-        // only there is still a real reference (Devin review on #103).
-        StatementType::Assert { test, msg } => {
-            expr_references(test, name)
-                || msg.as_ref().map(|m| expr_references(m, name)).unwrap_or(false)
-        }
-        StatementType::Raise(r) => {
-            r.exc.as_ref().map(|e| expr_references(e, name)).unwrap_or(false)
-                || r.cause.as_ref().map(|e| expr_references(e, name)).unwrap_or(false)
-        }
-        // `del d[k]` reads the subscript's key (`for key in none_keys:
-        // del merged_setting[key]` — requests' merge_setting): without
-        // this arm the loop-target analysis declared `key` unused and
-        // lowered the target to `_` while the body's `py_pop(key)` still
-        // referenced it (E0425 in the generated crate).
-        StatementType::Delete(targets) => {
-            targets.iter().any(|t| expr_references(t, name))
-        }
-        StatementType::If(s) => {
-            expr_references(&s.test, name)
-                || s.body.iter().any(|b| statement_references(b, name))
-                || s.orelse.iter().any(|b| statement_references(b, name))
-        }
-        StatementType::While(s) => {
-            expr_references(&s.test, name)
-                || s.body.iter().any(|b| statement_references(b, name))
-                || s.orelse.iter().any(|b| statement_references(b, name))
-        }
-        StatementType::For(s) => {
-            expr_references(&s.iter, name)
-                || target_references(&s.target, name)
-                || s.body.iter().any(|b| statement_references(b, name))
-                || s.orelse.iter().any(|b| statement_references(b, name))
-        }
-        StatementType::With(s) => {
-            s.items.iter().any(|i| expr_references(&i.context_expr, name))
-                || s.body.iter().any(|b| statement_references(b, name))
-        }
-        StatementType::Try(s) => {
-            s.body.iter().any(|b| statement_references(b, name))
-                || s.handlers.iter().any(|h| {
-                    h.exception_type
-                        .as_ref()
-                        .map(|t| expr_references(t, name))
-                        .unwrap_or(false)
-                        || h.body.iter().any(|b| statement_references(b, name))
-                })
-                || s.orelse.iter().any(|b| statement_references(b, name))
-                || s.finalbody.iter().any(|b| statement_references(b, name))
-        }
-        _ => false,
-    }
-}
-
-fn target_references(target: &ExprType, name: &str) -> bool {
-    match target {
-        ExprType::Name(n) => n.id == name,
-        ExprType::Subscript(s) => {
-            expr_references(&s.value, name)
-                || match &s.kind {
-                    crate::SubscriptKind::Index(i) => expr_references(i, name),
-                    crate::SubscriptKind::Slice { lower, upper, step } => {
-                        [lower, upper, step]
-                            .into_iter()
-                            .flatten()
-                            .any(|b| expr_references(b, name))
-                    }
-                }
-        }
-        ExprType::Tuple(t) => t.elts.iter().any(|e| target_references(e, name)),
-        _ => expr_references(target, name),
-    }
+    let is_name = |e: &ExprType| matches!(e, ExprType::Name(n) if n.id == name);
+    visit::any_stmt(body, Descend::All, |s| {
+        let handler_types: Vec<&ExprType> = match &s.statement {
+            StatementType::Try(t) => {
+                t.handlers.iter().filter_map(|h| h.exception_type.as_ref()).collect()
+            }
+            _ => Vec::new(),
+        };
+        visit::stmt_all_exprs(s)
+            .into_iter()
+            .chain(handler_types)
+            .any(|e| visit::any_expr(e, is_name))
+    })
 }
 
 pub(crate) fn expr_references(expr: &ExprType, name: &str) -> bool {

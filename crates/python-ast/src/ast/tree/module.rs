@@ -7,6 +7,10 @@ use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
 
 use crate::{ASYNC_RUNTIME_FEATURE, CodeGen, CodeGenContext, CrossModuleClasses, CrossModuleMutSelf, ModuleClassInfo, Name, Object, PythonOptions, Statement, StatementType, ExprType, SymbolTableNode, SymbolTableScopes};
+use crate::ast::tree::visit::{
+    Descend, Flow, any_expr, any_stmt, opens_scope, stmt_all_exprs, stmt_bodies,
+    stmt_bodies_for, stmt_exprs, stmt_targets, walk_stmts,
+};
 
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2024,133 +2028,16 @@ impl CodeGen for Module {
 /// the async-runtime import and the async entry-point decision. Function
 /// and class bodies count (their code runs in this module).
 pub fn module_contains_async(body: &[crate::Statement]) -> bool {
-    fn expr_contains_async(expr: &crate::ExprType) -> bool {
-        match expr {
-            crate::ExprType::Await(_) => true,
-            crate::ExprType::Call(c) => {
-                expr_contains_async(&c.func)
-                    || c.args.iter().any(expr_contains_async)
-                    || c.keywords.iter().any(|k| expr_contains_async(&k.value))
-            }
-            crate::ExprType::BoolOp(b) => b.values.iter().any(expr_contains_async),
-            crate::ExprType::BinOp(b) => {
-                expr_contains_async(&b.left) || expr_contains_async(&b.right)
-            }
-            crate::ExprType::UnaryOp(u) => expr_contains_async(&u.operand),
-            crate::ExprType::IfExp(i) => {
-                expr_contains_async(&i.test)
-                    || expr_contains_async(&i.body)
-                    || expr_contains_async(&i.orelse)
-            }
-            crate::ExprType::Dict(d) => {
-                d.keys.iter().flatten().any(expr_contains_async)
-                    || d.values.iter().any(expr_contains_async)
-            }
-            crate::ExprType::Set(s) => s.elts.iter().any(expr_contains_async),
-            crate::ExprType::List(items) => items.iter().any(expr_contains_async),
-            crate::ExprType::Tuple(t) => t.elts.iter().any(expr_contains_async),
-            crate::ExprType::Compare(c) => {
-                expr_contains_async(&c.left) || c.comparators.iter().any(expr_contains_async)
-            }
-            crate::ExprType::Attribute(a) => expr_contains_async(&a.value),
-            crate::ExprType::Subscript(s) => {
-                expr_contains_async(&s.value)
-                    || match &s.kind {
-                        crate::SubscriptKind::Index(e) => expr_contains_async(e),
-                        crate::SubscriptKind::Slice { lower, upper, step } => {
-                            lower.as_deref().is_some_and(expr_contains_async)
-                                || upper.as_deref().is_some_and(expr_contains_async)
-                                || step.as_deref().is_some_and(expr_contains_async)
-                        }
-                    }
-            }
-            crate::ExprType::Starred(s) => expr_contains_async(&s.value),
-            crate::ExprType::NamedExpr(n) => {
-                expr_contains_async(&n.left) || expr_contains_async(&n.right)
-            }
-            crate::ExprType::Yield(y) => y.value.as_deref().is_some_and(expr_contains_async),
-            crate::ExprType::YieldFrom(y) => expr_contains_async(&y.value),
-            crate::ExprType::Lambda(l) => expr_contains_async(&l.body),
-            crate::ExprType::JoinedStr(f) => f.values.iter().any(expr_contains_async),
-            crate::ExprType::FormattedValue(f) => {
-                expr_contains_async(&f.value)
-                    || f.format_spec.as_deref().is_some_and(expr_contains_async)
-            }
-            crate::ExprType::ListComp(l) => {
-                expr_contains_async(&l.elt)
-                    || l.generators.iter().any(|g| {
-                        expr_contains_async(&g.iter) || g.ifs.iter().any(expr_contains_async)
-                    })
-            }
-            crate::ExprType::SetComp(s) => {
-                expr_contains_async(&s.elt)
-                    || s.generators.iter().any(|g| {
-                        expr_contains_async(&g.iter) || g.ifs.iter().any(expr_contains_async)
-                    })
-            }
-            crate::ExprType::DictComp(d) => {
-                expr_contains_async(&d.value)
-                    || d.generators.iter().any(|g| {
-                        expr_contains_async(&g.iter) || g.ifs.iter().any(expr_contains_async)
-                    })
-            }
-            crate::ExprType::GeneratorExp(g) => {
-                expr_contains_async(&g.elt)
-                    || g.generators.iter().any(|gg| {
-                        expr_contains_async(&gg.iter) || gg.ifs.iter().any(expr_contains_async)
-                    })
-            }
-            _ => false,
-        }
-    }
-
-    fn stmt_contains_async(stmt: &crate::Statement) -> bool {
-        match &stmt.statement {
+    any_stmt(body, Descend::All, |s| {
+        matches!(
+            s.statement,
             crate::StatementType::AsyncFunctionDef(_)
-            | crate::StatementType::AsyncFor(_)
-            | crate::StatementType::AsyncWith(_) => true,
-            crate::StatementType::FunctionDef(f) => f.body.iter().any(stmt_contains_async),
-            crate::StatementType::ClassDef(c) => c.body.iter().any(stmt_contains_async),
-            crate::StatementType::If(i) => {
-                i.body.iter().any(stmt_contains_async) || i.orelse.iter().any(stmt_contains_async)
-            }
-            crate::StatementType::For(f) => {
-                expr_contains_async(&f.iter)
-                    || f.body.iter().any(stmt_contains_async)
-                    || f.orelse.iter().any(stmt_contains_async)
-            }
-            crate::StatementType::While(w) => {
-                w.body.iter().any(stmt_contains_async) || w.orelse.iter().any(stmt_contains_async)
-            }
-            crate::StatementType::Try(t) => {
-                t.body.iter().any(stmt_contains_async)
-                    || t.handlers.iter().any(|h| h.body.iter().any(stmt_contains_async))
-                    || t.orelse.iter().any(stmt_contains_async)
-                    || t.finalbody.iter().any(stmt_contains_async)
-            }
-            crate::StatementType::With(w) => w.body.iter().any(stmt_contains_async),
-            crate::StatementType::Expr(e) => expr_contains_async(&e.value),
-            crate::StatementType::Assign(a) => {
-                expr_contains_async(&a.value)
-                    || a.targets.iter().any(expr_contains_async)
-            }
-            crate::StatementType::AugAssign(a) => {
-                expr_contains_async(&a.target) || expr_contains_async(&a.value)
-            }
-            crate::StatementType::Return(Some(e)) => expr_contains_async(&e.value),
-            crate::StatementType::Raise(r) => {
-                r.exc.as_ref().is_some_and(expr_contains_async)
-                    || r.cause.as_ref().is_some_and(expr_contains_async)
-            }
-            crate::StatementType::Assert { test, msg } => {
-                expr_contains_async(test)
-                    || msg.as_deref().is_some_and(expr_contains_async)
-            }
-            _ => false,
-        }
-    }
-
-    body.iter().any(stmt_contains_async)
+                | crate::StatementType::AsyncFor(_)
+                | crate::StatementType::AsyncWith(_)
+        ) || stmt_all_exprs(s)
+            .into_iter()
+            .any(|e| any_expr(e, |e| matches!(e, crate::ExprType::Await(_))))
+    })
 }
 
 /// Whether a module body imports a module with the given ROOT name (plain
@@ -2158,34 +2045,16 @@ pub fn module_contains_async(body: &[crate::Statement]) -> bool {
 /// the feature-gated stdpython surfaces: `asyncio` needs `async-tokio`,
 /// `urllib` (urllib.request) needs `http-ureq`.
 pub fn module_imports_root(body: &[crate::Statement], root: &str) -> bool {
-    fn stmt_imports_root(stmt: &crate::Statement, root: &str) -> bool {
-        let any = |stmts: &[crate::Statement]| stmts.iter().any(|s| stmt_imports_root(s, root));
-        match &stmt.statement {
-            crate::StatementType::Import(imp) => imp
-                .names
-                .iter()
-                .any(|a| a.name.split('.').next().is_some_and(|r| r == root)),
-            crate::StatementType::ImportFrom(imp) => {
-                imp.module.split('.').next().is_some_and(|r| r == root)
-            }
-            crate::StatementType::If(i) => any(&i.body) || any(&i.orelse),
-            crate::StatementType::For(f) => any(&f.body) || any(&f.orelse),
-            crate::StatementType::While(w) => any(&w.body) || any(&w.orelse),
-            crate::StatementType::Try(t) => {
-                any(&t.body)
-                    || t.handlers.iter().any(|h| any(&h.body))
-                    || any(&t.orelse)
-                    || any(&t.finalbody)
-            }
-            crate::StatementType::With(w) => any(&w.body),
-            crate::StatementType::AsyncWith(w) => any(&w.body),
-            crate::StatementType::AsyncFor(f) => any(&f.body) || any(&f.orelse),
-            crate::StatementType::FunctionDef(f) => any(&f.body),
-            crate::StatementType::AsyncFunctionDef(f) => any(&f.body),
-            _ => false,
+    any_stmt(body, Descend::All, |s| match &s.statement {
+        crate::StatementType::Import(imp) => imp
+            .names
+            .iter()
+            .any(|a| a.name.split('.').next().is_some_and(|r| r == root)),
+        crate::StatementType::ImportFrom(imp) => {
+            imp.module.split('.').next().is_some_and(|r| r == root)
         }
-    }
-    body.iter().any(|s| stmt_imports_root(s, root))
+        _ => false,
+    })
 }
 
 /// Whether a module body imports `asyncio` — see [`module_imports_root`].
@@ -2278,64 +2147,24 @@ fn count_module_stores(
         }
     }
     for s in body {
-        match &s.statement {
-            crate::StatementType::Assign(a) => {
-                for target in &a.targets {
-                    bump_target(target, 1, counts);
-                }
-            }
-            crate::StatementType::AugAssign(a) => bump_target(&a.target, 2, counts),
-            crate::StatementType::If(i) => {
-                let mut nested = std::collections::HashMap::new();
-                count_module_stores(&i.body, &mut nested);
-                count_module_stores(&i.orelse, &mut nested);
-                for (name, n) in nested {
-                    *counts.entry(name).or_insert(0) += n * 2;
-                }
-            }
-            crate::StatementType::While(w) => {
-                let mut nested = std::collections::HashMap::new();
-                count_module_stores(&w.body, &mut nested);
-                count_module_stores(&w.orelse, &mut nested);
-                for (name, n) in nested {
-                    *counts.entry(name).or_insert(0) += n * 2;
-                }
-            }
-            crate::StatementType::For(f) => {
-                bump_target(&f.target, 2, counts);
-                let mut nested = std::collections::HashMap::new();
-                count_module_stores(&f.body, &mut nested);
-                count_module_stores(&f.orelse, &mut nested);
-                for (name, n) in nested {
-                    *counts.entry(name).or_insert(0) += n * 2;
-                }
-            }
-            crate::StatementType::With(w) => {
-                for item in &w.items {
-                    if let Some(vars) = &item.optional_vars {
-                        bump_target(vars, 2, counts);
-                    }
-                }
-                let mut nested = std::collections::HashMap::new();
-                count_module_stores(&w.body, &mut nested);
-                for (name, n) in nested {
-                    *counts.entry(name).or_insert(0) += n * 2;
-                }
-            }
-            crate::StatementType::Try(t) => {
-                let mut nested = std::collections::HashMap::new();
-                count_module_stores(&t.body, &mut nested);
-                for h in &t.handlers {
-                    count_module_stores(&h.body, &mut nested);
-                }
-                count_module_stores(&t.orelse, &mut nested);
-                count_module_stores(&t.finalbody, &mut nested);
-                for (name, n) in nested {
-                    *counts.entry(name).or_insert(0) += n * 2;
-                }
-            }
-            // Function and class bodies are separate scopes.
-            _ => {}
+        // A top-level assignment counts once; every other binder (an
+        // augmented assignment, a loop or `with` target) rebinds, so it
+        // counts double like a nested store.
+        let by = if matches!(s.statement, crate::StatementType::Assign(_)) { 1 } else { 2 };
+        for target in stmt_targets(s) {
+            bump_target(target, by, counts);
+        }
+        // Function and class bodies are separate scopes.
+        let bodies = stmt_bodies_for(s, Descend::SkipDefs);
+        if bodies.is_empty() {
+            continue;
+        }
+        let mut nested = std::collections::HashMap::new();
+        for nested_body in bodies {
+            count_module_stores(nested_body, &mut nested);
+        }
+        for (name, n) in nested {
+            *counts.entry(name).or_insert(0) += n * 2;
         }
     }
 }
@@ -2789,146 +2618,63 @@ pub(crate) fn module_global_write_sets(
         bound: &mut std::collections::HashSet<String>,
     ) {
         use crate::StatementType as ST;
-        for s in stmts {
+        walk_stmts(stmts, Descend::SkipDefs, &mut |s| {
             match &s.statement {
                 ST::Global(names) => globals.extend(names.iter().cloned()),
-                ST::Assign(a) => {
-                    for t in &a.targets {
-                        bind_target(t, bound);
-                    }
-                }
-                ST::AugAssign(a) => bind_target(&a.target, bound),
                 ST::AnnotatedName { name, .. } => {
                     bound.insert(name.clone());
                 }
-                ST::For(f) => {
-                    bind_target(&f.target, bound);
-                    scan_scope(&f.body, globals, bound);
-                    scan_scope(&f.orelse, globals, bound);
-                }
-                ST::AsyncFor(f) => {
-                    bind_target(&f.target, bound);
-                    scan_scope(&f.body, globals, bound);
-                    scan_scope(&f.orelse, globals, bound);
-                }
-                ST::While(w) => {
-                    scan_scope(&w.body, globals, bound);
-                    scan_scope(&w.orelse, globals, bound);
-                }
-                ST::If(i) => {
-                    scan_scope(&i.body, globals, bound);
-                    scan_scope(&i.orelse, globals, bound);
-                }
+                // `except E as e` binds `e` in the scope.
                 ST::Try(t) => {
-                    scan_scope(&t.body, globals, bound);
                     for h in &t.handlers {
                         if let Some(n) = &h.name {
                             bound.insert(n.clone());
                         }
-                        scan_scope(&h.body, globals, bound);
                     }
-                    scan_scope(&t.orelse, globals, bound);
-                    scan_scope(&t.finalbody, globals, bound);
-                }
-                ST::With(w) => {
-                    for item in &w.items {
-                        if let Some(v) = &item.optional_vars {
-                            bind_target(v, bound);
-                        }
-                    }
-                    scan_scope(&w.body, globals, bound);
-                }
-                ST::AsyncWith(w) => {
-                    for item in &w.items {
-                        if let Some(v) = &item.optional_vars {
-                            bind_target(v, bound);
-                        }
-                    }
-                    scan_scope(&w.body, globals, bound);
                 }
                 _ => {}
             }
-        }
+            for t in stmt_targets(s) {
+                bind_target(t, bound);
+            }
+            Flow::Continue
+        });
     }
 
     // Visit every function scope anywhere in the module (top-level defs,
     // class methods, nested defs, defs under module-level control flow).
-    fn visit_defs(
-        stmts: &[crate::Statement],
-        global_written: &mut std::collections::HashSet<String>,
-        bound_without_global: &mut std::collections::HashSet<String>,
-    ) {
-        use crate::StatementType as ST;
-        for s in stmts {
-            let f = match &s.statement {
-                ST::FunctionDef(f) | ST::AsyncFunctionDef(f) => f,
-                ST::ClassDef(c) => {
-                    visit_defs(&c.body, global_written, bound_without_global);
-                    continue;
-                }
-                ST::If(i) => {
-                    visit_defs(&i.body, global_written, bound_without_global);
-                    visit_defs(&i.orelse, global_written, bound_without_global);
-                    continue;
-                }
-                ST::Try(t) => {
-                    visit_defs(&t.body, global_written, bound_without_global);
-                    for h in &t.handlers {
-                        visit_defs(&h.body, global_written, bound_without_global);
-                    }
-                    visit_defs(&t.orelse, global_written, bound_without_global);
-                    visit_defs(&t.finalbody, global_written, bound_without_global);
-                    continue;
-                }
-                ST::For(f) => {
-                    visit_defs(&f.body, global_written, bound_without_global);
-                    visit_defs(&f.orelse, global_written, bound_without_global);
-                    continue;
-                }
-                ST::While(w) => {
-                    visit_defs(&w.body, global_written, bound_without_global);
-                    visit_defs(&w.orelse, global_written, bound_without_global);
-                    continue;
-                }
-                ST::With(w) => {
-                    visit_defs(&w.body, global_written, bound_without_global);
-                    continue;
-                }
-                ST::AsyncWith(w) => {
-                    visit_defs(&w.body, global_written, bound_without_global);
-                    continue;
-                }
-                _ => continue,
-            };
-            let mut globals = std::collections::HashSet::new();
-            let mut bound = std::collections::HashSet::new();
-            for p in f
-                .args
-                .args
-                .iter()
-                .chain(f.args.posonlyargs.iter())
-                .chain(f.args.kwonlyargs.iter())
-                .chain(f.args.vararg.iter())
-                .chain(f.args.kwarg.iter())
-            {
-                bound.insert(p.arg.clone());
-            }
-            scan_scope(&f.body, &mut globals, &mut bound);
-            for n in &bound {
-                if globals.contains(n) {
-                    global_written.insert(n.clone());
-                } else {
-                    bound_without_global.insert(n.clone());
-                }
-            }
-            // Nested defs inside this function are their own scopes.
-            visit_defs(&f.body, global_written, bound_without_global);
-        }
-    }
-
+    // Nested defs inside a function are their own scopes, reached as the
+    // walk enters the body.
     let mut global_written = std::collections::HashSet::new();
     let mut bound_without_global = std::collections::HashSet::new();
-    visit_defs(body, &mut global_written, &mut bound_without_global);
+    walk_stmts(body, Descend::All, &mut |s| {
+        let (StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f)) = &s.statement
+        else {
+            return Flow::Continue;
+        };
+        let mut globals = std::collections::HashSet::new();
+        let mut bound = std::collections::HashSet::new();
+        for p in f
+            .args
+            .args
+            .iter()
+            .chain(f.args.posonlyargs.iter())
+            .chain(f.args.kwonlyargs.iter())
+            .chain(f.args.vararg.iter())
+            .chain(f.args.kwarg.iter())
+        {
+            bound.insert(p.arg.clone());
+        }
+        scan_scope(&f.body, &mut globals, &mut bound);
+        for n in &bound {
+            if globals.contains(n) {
+                global_written.insert(n.clone());
+            } else {
+                bound_without_global.insert(n.clone());
+            }
+        }
+        Flow::Continue
+    });
     (global_written, bound_without_global)
 }
 
@@ -2987,9 +2733,11 @@ fn module_global_class_stores(
         stores: &mut std::collections::HashMap<String, Stores>,
         symbols: &crate::SymbolTableScopes,
     ) {
-        for s in stmts {
+        walk_stmts(stmts, Descend::SkipDefs, &mut |s| {
             match &s.statement {
                 ST::Global(names) => globals.extend(names.iter().cloned()),
+                // A single-Name assignment is the store whose value is
+                // classified.
                 ST::Assign(a) => {
                     if let [crate::ExprType::Name(n)] = a.targets.as_slice()
                         && globals.contains(&n.id)
@@ -3000,46 +2748,19 @@ fn module_global_class_stores(
                             .record(&a.value, symbols);
                     }
                 }
-                ST::AugAssign(a) => {
-                    if let crate::ExprType::Name(n) = &a.target && globals.contains(&n.id) {
-                        stores.entry(n.id.clone()).or_default().other = true;
+                // Every other binder of a global (an augmented assignment,
+                // a loop or `with` target) is a shape the typed static
+                // cannot hold.
+                _ => {
+                    for t in stmt_targets(s) {
+                        if let crate::ExprType::Name(n) = t && globals.contains(&n.id) {
+                            stores.entry(n.id.clone()).or_default().other = true;
+                        }
                     }
                 }
-                ST::If(i) => {
-                    scan_scope(&i.body, globals, stores, symbols);
-                    scan_scope(&i.orelse, globals, stores, symbols);
-                }
-                ST::While(w) => {
-                    scan_scope(&w.body, globals, stores, symbols);
-                    scan_scope(&w.orelse, globals, stores, symbols);
-                }
-                ST::For(f) => {
-                    if let crate::ExprType::Name(n) = &f.target && globals.contains(&n.id) {
-                        stores.entry(n.id.clone()).or_default().other = true;
-                    }
-                    scan_scope(&f.body, globals, stores, symbols);
-                    scan_scope(&f.orelse, globals, stores, symbols);
-                }
-                ST::AsyncFor(f) => {
-                    if let crate::ExprType::Name(n) = &f.target && globals.contains(&n.id) {
-                        stores.entry(n.id.clone()).or_default().other = true;
-                    }
-                    scan_scope(&f.body, globals, stores, symbols);
-                    scan_scope(&f.orelse, globals, stores, symbols);
-                }
-                ST::Try(t) => {
-                    scan_scope(&t.body, globals, stores, symbols);
-                    for h in &t.handlers {
-                        scan_scope(&h.body, globals, stores, symbols);
-                    }
-                    scan_scope(&t.orelse, globals, stores, symbols);
-                    scan_scope(&t.finalbody, globals, stores, symbols);
-                }
-                ST::With(w) => scan_scope(&w.body, globals, stores, symbols),
-                ST::AsyncWith(w) => scan_scope(&w.body, globals, stores, symbols),
-                _ => {}
             }
-        }
+            Flow::Continue
+        });
     }
 
     let mut out: std::collections::HashMap<String, Stores> = std::collections::HashMap::new();
@@ -3190,29 +2911,20 @@ pub(crate) fn fold_static_import_trys(
     body: &[crate::Statement],
     options: &crate::PythonOptions,
 ) -> (Vec<crate::Statement>, Vec<crate::Statement>) {
+    // The imports a try body runs at module init: nested control flow
+    // included, a def's own imports excluded (they run when it is called).
     fn collect_imports<'a>(
         stmts: &'a [crate::Statement],
         out: &mut Vec<&'a crate::StatementType>,
     ) {
-        for s in stmts {
-            match &s.statement {
-                st @ (crate::StatementType::Import(_)
-                | crate::StatementType::ImportFrom(_)) => out.push(st),
-                crate::StatementType::Try(t) => {
-                    collect_imports(&t.body, out);
-                    for h in &t.handlers {
-                        collect_imports(&h.body, out);
-                    }
-                    collect_imports(&t.orelse, out);
-                    collect_imports(&t.finalbody, out);
-                }
-                crate::StatementType::If(i) => {
-                    collect_imports(&i.body, out);
-                    collect_imports(&i.orelse, out);
-                }
-                _ => {}
+        walk_stmts(stmts, Descend::SkipDefs, &mut |s| {
+            if let st @ (crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)) =
+                &s.statement
+            {
+                out.push(st);
             }
-        }
+            Flow::Continue
+        });
     }
     let root_resolvable = |root: &str| -> bool {
         crate::ast::tree::import::is_stdpython_module(root)
@@ -3618,82 +3330,39 @@ fn module_function_free_reads(body: &[crate::Statement]) -> std::collections::Ha
         }
     }
 
-    fn walk_stmt(
+    // The binders and reads of ONE statement (its bodies are left to the
+    // walk): the special binders first — a def's name and parameters, a
+    // class's name, an `except ... as` name, an annotated name — then the
+    // targets every statement form binds and the expressions it evaluates.
+    fn visit_stmt(
         stmt: &crate::Statement,
         all: &mut std::collections::HashSet<String>,
         bound: &mut std::collections::HashSet<String>,
     ) {
         match &stmt.statement {
-            ST::Assign(a) => {
-                for t in &a.targets {
-                    bind_target(t, bound);
-                }
-                if let Some(ann) = &a.annotation {
-                    walk_expr(ann, all, bound);
-                }
-                walk_expr(&a.value, all, bound);
+            ST::FunctionDef(f) | ST::AsyncFunctionDef(f) => {
+                bound.insert(f.name.clone());
+                param_names(&f.args, bound);
             }
-            ST::AugAssign(a) => {
-                bind_target(&a.target, bound);
-                walk_expr(&a.target, all, bound);
-                walk_expr(&a.value, all, bound);
+            // Class METHOD bodies read module values; the class body's
+            // own assignments bind class attrs (method reads of a bare
+            // name resolve to module scope in Python, but over-binding
+            // only skips a promotion — never mis-promotes).
+            ST::ClassDef(c) => {
+                bound.insert(c.name.clone());
             }
             ST::AnnotatedName { name, annotation } => {
                 bound.insert(name.clone());
                 walk_expr(annotation, all, bound);
             }
-            ST::For(f) => {
-                bind_target(&f.target, bound);
-                walk_expr(&f.iter, all, bound);
-                for s in f.body.iter().chain(f.orelse.iter()) {
-                    walk_stmt(s, all, bound);
+            ST::Assign(a) => {
+                if let Some(ann) = &a.annotation {
+                    walk_expr(ann, all, bound);
                 }
             }
-            ST::AsyncFor(f) => {
-                bind_target(&f.target, bound);
-                walk_expr(&f.iter, all, bound);
-                for s in f.body.iter().chain(f.orelse.iter()) {
-                    walk_stmt(s, all, bound);
-                }
-            }
-            ST::While(w) => {
-                walk_expr(&w.test, all, bound);
-                for s in w.body.iter().chain(w.orelse.iter()) {
-                    walk_stmt(s, all, bound);
-                }
-            }
-            ST::If(i) => {
-                walk_expr(&i.test, all, bound);
-                for s in i.body.iter().chain(i.orelse.iter()) {
-                    walk_stmt(s, all, bound);
-                }
-            }
-            ST::With(w) => {
-                for item in &w.items {
-                    walk_expr(&item.context_expr, all, bound);
-                    if let Some(v) = &item.optional_vars {
-                        bind_target(v, bound);
-                    }
-                }
-                for s in &w.body {
-                    walk_stmt(s, all, bound);
-                }
-            }
-            ST::AsyncWith(w) => {
-                for item in &w.items {
-                    walk_expr(&item.context_expr, all, bound);
-                    if let Some(v) = &item.optional_vars {
-                        bind_target(v, bound);
-                    }
-                }
-                for s in &w.body {
-                    walk_stmt(s, all, bound);
-                }
-            }
+            // An augmented target is read as well as bound.
+            ST::AugAssign(a) => walk_expr(&a.target, all, bound),
             ST::Try(t) => {
-                for s in &t.body {
-                    walk_stmt(s, all, bound);
-                }
                 for h in &t.handlers {
                     if let Some(e) = &h.exception_type {
                         walk_expr(e, all, bound);
@@ -3701,132 +3370,46 @@ fn module_function_free_reads(body: &[crate::Statement]) -> std::collections::Ha
                     if let Some(n) = &h.name {
                         bound.insert(n.clone());
                     }
-                    for s in &h.body {
-                        walk_stmt(s, all, bound);
-                    }
-                }
-                for s in t.orelse.iter().chain(t.finalbody.iter()) {
-                    walk_stmt(s, all, bound);
                 }
             }
-            ST::FunctionDef(f) | ST::AsyncFunctionDef(f) => {
-                bound.insert(f.name.clone());
-                param_names(&f.args, bound);
-                for s in &f.body {
-                    walk_stmt(s, all, bound);
-                }
-            }
-            ST::ClassDef(c) => {
-                bound.insert(c.name.clone());
-                // Class METHOD bodies read module values; the class body's
-                // own assignments bind class attrs (method reads of a bare
-                // name resolve to module scope in Python, but over-binding
-                // only skips a promotion — never mis-promotes).
-                for s in &c.body {
-                    walk_stmt(s, all, bound);
-                }
-            }
-            ST::Expr(e) => walk_expr(&e.value, all, bound),
-            ST::Return(Some(e)) => walk_expr(&e.value, all, bound),
-            ST::Call(c) => walk_expr(
-                &crate::ExprType::Call(c.clone()),
-                all,
-                bound,
-            ),
-            ST::Assert { test, msg, .. } => {
-                walk_expr(test, all, bound);
-                if let Some(m) = msg {
-                    walk_expr(m, all, bound);
-                }
-            }
-            ST::Raise(r) => {
-                if let Some(e) = &r.exc {
-                    walk_expr(e, all, bound);
-                }
-                if let Some(c) = &r.cause {
-                    walk_expr(c, all, bound);
-                }
-            }
-            ST::Delete(targets) => {
-                for t in targets {
-                    walk_expr(t, all, bound);
-                }
-            }
+            ST::Call(c) => walk_expr(&crate::ExprType::Call(c.clone()), all, bound),
             _ => {}
+        }
+        for t in stmt_targets(stmt) {
+            bind_target(t, bound);
+        }
+        for e in stmt_exprs(stmt) {
+            walk_expr(e, all, bound);
         }
     }
 
-    fn walk_module_defs(
-            stmt: &crate::Statement,
-            all: &mut std::collections::HashSet<String>,
-            bound: &mut std::collections::HashSet<String>,
-        ) {
-            use crate::StatementType as ST2;
-            match &stmt.statement {
-                // A def/class body anywhere under module-level control flow
-                // reads module values; walk it with the full walker (which
-                // binds the def's own scope).
-                ST2::FunctionDef(_) | ST2::AsyncFunctionDef(_) | ST2::ClassDef(_) => {
-                    walk_stmt(stmt, all, bound);
-                }
-                // Control-flow shells only HOST defs — their own
-                // assignments bind MODULE scope, not a function's locals,
-                // so they must not enter the bound set.
-                ST2::If(i) => {
-                    let is_type_checking = matches!(
-                        &i.test,
-                        crate::ExprType::Name(n) if n.id == "TYPE_CHECKING"
-                    ) || matches!(
-                        &i.test,
-                        crate::ExprType::Attribute(a) if a.attr == "TYPE_CHECKING"
-                    );
-                    if !is_type_checking {
-                        for s in i.body.iter().chain(i.orelse.iter()) {
-                            walk_module_defs(s, all, bound);
-                        }
-                    }
-                }
-                ST2::While(w) => {
-                    for s in w.body.iter().chain(w.orelse.iter()) {
-                        walk_module_defs(s, all, bound);
-                    }
-                }
-                ST2::For(f) => {
-                    for s in f.body.iter().chain(f.orelse.iter()) {
-                        walk_module_defs(s, all, bound);
-                    }
-                }
-                ST2::AsyncFor(f) => {
-                    for s in f.body.iter().chain(f.orelse.iter()) {
-                        walk_module_defs(s, all, bound);
-                    }
-                }
-                ST2::With(w) => {
-                    for s in &w.body {
-                        walk_module_defs(s, all, bound);
-                    }
-                }
-                ST2::AsyncWith(w) => {
-                    for s in &w.body {
-                        walk_module_defs(s, all, bound);
-                    }
-                }
-                ST2::Try(t) => {
-                    for s in t.body.iter().chain(t.orelse.iter()).chain(t.finalbody.iter()) {
-                        walk_module_defs(s, all, bound);
-                    }
-                    for h in &t.handlers {
-                        for s in &h.body {
-                            walk_module_defs(s, all, bound);
-                        }
-                    }
-                }
-                _ => {}
+    // A def/class body anywhere under module-level control flow reads
+    // module values; walk it with the full binder (which binds the def's
+    // own scope). The control-flow shells only HOST defs — their own
+    // assignments bind MODULE scope, not a function's locals, so they must
+    // not enter the bound set — and a TYPE_CHECKING block never runs.
+    walk_stmts(body, Descend::SkipDefs, &mut |s| {
+        if opens_scope(s) {
+            walk_stmts(std::slice::from_ref(s), Descend::All, &mut |inner| {
+                visit_stmt(inner, &mut all_names, &mut bound);
+                Flow::Continue
+            });
+            return Flow::Skip;
+        }
+        if let ST::If(i) = &s.statement {
+            let is_type_checking = matches!(
+                &i.test,
+                crate::ExprType::Name(n) if n.id == "TYPE_CHECKING"
+            ) || matches!(
+                &i.test,
+                crate::ExprType::Attribute(a) if a.attr == "TYPE_CHECKING"
+            );
+            if is_type_checking {
+                return Flow::Skip;
             }
         }
-        for s in body {
-            walk_module_defs(s, &mut all_names, &mut bound);
-        }
+        Flow::Continue
+    });
 
     all_names
         .difference(&bound)
@@ -3849,120 +3432,53 @@ pub(crate) fn module_def_has_runtime_item(
         return false;
     };
     let module: &crate::Module = module;
-    fn scan(body: &[crate::Statement], name: &str, in_type_checking: bool) -> bool {
+    // Module-scope items only (a def's body is its own scope). A
+    // TYPE_CHECKING block — `if TYPE_CHECKING:` (bare) or `if
+    // typing.TYPE_CHECKING:` (attribute), its `else` included — is
+    // compile-time only, so nothing under it is a runtime item.
+    if !walk_stmts(&module.raw.body, Descend::SkipDefs, &mut |s| {
         use crate::StatementType as ST;
-        for s in body {
-            match &s.statement {
-                ST::FunctionDef(f) | ST::AsyncFunctionDef(f) => {
-                    if !in_type_checking && f.name == name {
-                        return true;
-                    }
-                }
-                ST::ClassDef(c) => {
-                    if !in_type_checking && c.name == name {
-                        return true;
-                    }
-                }
-                ST::Assign(a) => {
-                    if !in_type_checking
-                        && a.targets.iter().any(|t| {
-                            matches!(t, crate::ExprType::Name(n) if n.id == name)
-                        })
-                        // A dropped BUILTIN-CLASS SELF-alias (`str = str` /
-                        // `bytes = bytes` — requests' compat's py2 shim):
-                        // the no-op self-assign is removed by
-                        // fold_static_import_trys and emits no runtime
-                        // item, so a sibling re-export of the name
-                        // (`from .compat import str` — auth.py) must NOT
-                        // emit `use crate::requests::compat::str` (E0603:
-                        // nothing public to point at). The name still means
-                        // the builtin (calls dispatch to the builtin arm;
-                        // the import drops loudly in import.rs).
-                        && !(a.targets.len() == 1
-                            && matches!(&a.targets[0], crate::ExprType::Name(n) if n.id == name)
-                            && matches!(&a.value, crate::ExprType::Name(v) if v.id == name)
-                            && crate::ast::tree::assign::is_builtin_class_name(name))
-                    {
-                        return true;
-                    }
-                }
-                // A stdpython-module RE-EXPORT (`from urllib.parse import
-                // urlparse` — requests' compat, round 55): the import
-                // emits a `pub use stdpython::...` when the name has a
-                // runtime item, so it IS a runtime item of this module.
-                ST::ImportFrom(i) => {
-                    if !in_type_checking {
-                        let first = i.module.split('.').next().unwrap_or("");
-                        let hit = i.names.iter().any(|a| {
-                            let imported = a.asname.as_deref().unwrap_or(&a.name);
-                            imported == name
-                                && crate::ast::tree::import::stdpython_module_item(
-                                    first, &a.name,
-                                )
-                        });
-                        if hit {
-                            return true;
-                        }
-                    }
-                }
-                ST::If(i) => {
-                    // `if TYPE_CHECKING:` (bare) or `if typing.TYPE_CHECKING:`
-                    // (attribute) marks a compile-time-only block.
-                    let tc = in_type_checking
-                        || matches!(
-                            &i.test,
-                            crate::ExprType::Name(n) if n.id == "TYPE_CHECKING"
-                        )
-                        || matches!(
-                            &i.test,
-                            crate::ExprType::Attribute(a)
-                                if a.attr == "TYPE_CHECKING"
-                                    && matches!(
-                                        a.value.as_ref(),
-                                        crate::ExprType::Name(m) if crate::is_typing(&m.id)
-                                    )
-                        );
-                    if scan(&i.body, name, tc) || scan(&i.orelse, name, tc) {
-                        return true;
-                    }
-                }
-                ST::While(w) => {
-                    if scan(&w.body, name, in_type_checking)
-                        || scan(&w.orelse, name, in_type_checking)
-                    {
-                        return true;
-                    }
-                }
-                ST::For(f) => {
-                    if scan(&f.body, name, in_type_checking)
-                        || scan(&f.orelse, name, in_type_checking)
-                    {
-                        return true;
-                    }
-                }
-                ST::With(w) => {
-                    if scan(&w.body, name, in_type_checking) {
-                        return true;
-                    }
-                }
-                ST::Try(t) => {
-                    for part in [&t.body, &t.orelse, &t.finalbody] {
-                        if scan(part, name, in_type_checking) {
-                            return true;
-                        }
-                    }
-                    for h in &t.handlers {
-                        if scan(&h.body, name, in_type_checking) {
-                            return true;
-                        }
-                    }
-                }
-                _ => {}
+        match &s.statement {
+            ST::FunctionDef(f) | ST::AsyncFunctionDef(f) if f.name == name => Flow::Stop,
+            ST::ClassDef(c) if c.name == name => Flow::Stop,
+            ST::Assign(a)
+                if a.targets.iter().any(|t| {
+                    matches!(t, crate::ExprType::Name(n) if n.id == name)
+                })
+                // A dropped BUILTIN-CLASS SELF-alias (`str = str` /
+                // `bytes = bytes` — requests' compat's py2 shim):
+                // the no-op self-assign is removed by
+                // fold_static_import_trys and emits no runtime
+                // item, so a sibling re-export of the name
+                // (`from .compat import str` — auth.py) must NOT
+                // emit `use crate::requests::compat::str` (E0603:
+                // nothing public to point at). The name still means
+                // the builtin (calls dispatch to the builtin arm;
+                // the import drops loudly in import.rs).
+                && !(a.targets.len() == 1
+                    && matches!(&a.targets[0], crate::ExprType::Name(n) if n.id == name)
+                    && matches!(&a.value, crate::ExprType::Name(v) if v.id == name)
+                    && crate::ast::tree::assign::is_builtin_class_name(name)) =>
+            {
+                Flow::Stop
             }
+            // A stdpython-module RE-EXPORT (`from urllib.parse import
+            // urlparse` — requests' compat, round 55): the import
+            // emits a `pub use stdpython::...` when the name has a
+            // runtime item, so it IS a runtime item of this module.
+            ST::ImportFrom(i) => {
+                let first = i.module.split('.').next().unwrap_or("");
+                let hit = i.names.iter().any(|a| {
+                    let imported = a.asname.as_deref().unwrap_or(&a.name);
+                    imported == name
+                        && crate::ast::tree::import::stdpython_module_item(first, &a.name)
+                });
+                if hit { Flow::Stop } else { Flow::Continue }
+            }
+            ST::If(i) if Module::is_type_checking_test(&i.test) => Flow::Skip,
+            _ => Flow::Continue,
         }
-        false
-    }
-    if scan(&module.raw.body, name, false) {
+    }) {
         return true;
     }
     // The name may be a SUBMODULE of the package (`from .util import
@@ -4097,44 +3613,23 @@ pub(crate) fn aliased_external_import(
         return false;
     };
     let module: &crate::Module = module;
-    fn scan(
-        body: &[crate::Statement],
-        name: &str,
-        options: &crate::PythonOptions,
-    ) -> bool {
-        use crate::StatementType as ST;
-        for s in body {
-            match &s.statement {
-                ST::ImportFrom(i) => {
-                    if i.names
-                        .iter()
-                        .any(|a| a.asname.as_deref() == Some(name))
-                    {
-                        let root = i.module.split('.').next().unwrap_or("");
-                        let external = i.level == 0
-                            && !crate::ast::tree::import::is_stdpython_module(root)
-                            && !options
-                                .python_modules
-                                .contains(&root.to_string())
-                            && !options
-                                .module_defs
-                                .contains_key(&i.resolved_module_path(options));
-                        if external {
-                            return true;
-                        }
-                    }
-                }
-                ST::Try(t) => {
-                    if scan(&t.body, name, options) {
-                        return true;
-                    }
-                }
-                _ => {}
-            }
+    // A module-scope binding (a def's own imports bind its locals), under
+    // any control flow — the try/except import fallback included.
+    any_stmt(&module.raw.body, Descend::SkipDefs, |s| {
+        let crate::StatementType::ImportFrom(i) = &s.statement else {
+            return false;
+        };
+        if !i.names.iter().any(|a| a.asname.as_deref() == Some(name)) {
+            return false;
         }
-        false
-    }
-    scan(&module.raw.body, name, options)
+        let root = i.module.split('.').next().unwrap_or("");
+        i.level == 0
+            && !crate::ast::tree::import::is_stdpython_module(root)
+            && !options.python_modules.contains(&root.to_string())
+            && !options
+                .module_defs
+                .contains_key(&i.resolved_module_path(options))
+    })
 }
 
 pub(crate) fn module_def_exception_alias(
@@ -4144,35 +3639,25 @@ pub(crate) fn module_def_exception_alias(
 ) -> Option<&'static str> {
     let module = options.module_defs.get(path)?;
     let module: &crate::Module = module;
-    fn scan(body: &[crate::Statement], name: &str) -> Option<&'static str> {
-        use crate::StatementType as ST;
-        for s in body {
-            match &s.statement {
-                ST::Assign(a) => {
-                    if a.targets
-                        .iter()
-                        .any(|t| matches!(t, crate::ExprType::Name(n) if n.id == name))
-                        && let crate::ExprType::Attribute(attr) = &a.value
-                        && let crate::ExprType::Name(m) = attr.value.as_ref()
-                        && let Some(c) =
-                            crate::ast::tree::raise_stmt::stdlib_exception_canonical(
-                                &m.id, &attr.attr,
-                            )
-                    {
-                        return Some(c);
-                    }
-                }
-                ST::Try(t) => {
-                    if let Some(c) = scan(&t.body, name) {
-                        return Some(c);
-                    }
-                }
-                _ => {}
-            }
+    // A module-scope alias (`Error = socket.error`), under any control
+    // flow — the try/except import fallback included.
+    let mut found = None;
+    walk_stmts(&module.raw.body, Descend::SkipDefs, &mut |s| {
+        if let crate::StatementType::Assign(a) = &s.statement
+            && a.targets
+                .iter()
+                .any(|t| matches!(t, crate::ExprType::Name(n) if n.id == name))
+            && let crate::ExprType::Attribute(attr) = &a.value
+            && let crate::ExprType::Name(m) = attr.value.as_ref()
+            && let Some(c) =
+                crate::ast::tree::raise_stmt::stdlib_exception_canonical(&m.id, &attr.attr)
+        {
+            found = Some(c);
+            return Flow::Stop;
         }
-        None
-    }
-    scan(&module.raw.body, name)
+        Flow::Continue
+    });
+    found
 }
 
 /// Whether the module at `path` actually generates a PATH ITEM named
@@ -4337,71 +3822,28 @@ fn scan_module_body_for_item(
         return false;
     };
     let module: &crate::Module = module;
-    fn scan(body: &[crate::Statement], name: &str, in_type_checking: bool) -> bool {
+    // A conditional DEFINITION (`if sys.version_info >= (3, 11):
+    // def where(): ...` — certifi's core.py): the function is
+    // emitted (the version branch is the modern one), so a
+    // sibling import of it resolves. Nested statement lists are
+    // entered (a def's body is its own scope), TYPE_CHECKING blocks
+    // skipped.
+    !walk_stmts(&module.raw.body, Descend::SkipDefs, &mut |s| {
         use crate::StatementType as ST;
-        for s in body {
-            match &s.statement {
-                ST::FunctionDef(f) | ST::AsyncFunctionDef(f) => {
-                    if !in_type_checking && f.name == name {
-                        return true;
-                    }
-                }
-                ST::ClassDef(c) => {
-                    if !in_type_checking && c.name == name {
-                        return true;
-                    }
-                }
-                ST::Assign(a) => {
-                    if !in_type_checking
-                        && a.targets.iter().any(|t| {
-                            matches!(t, crate::ExprType::Name(n) if n.id == name)
-                        })
-                    {
-                        return true;
-                    }
-                }
-                // A conditional DEFINITION (`if sys.version_info >= (3, 11):
-                // def where(): ...` — certifi's core.py): the function is
-                // emitted (the version branch is the modern one), so a
-                // sibling import of it resolves. Recurse into nested
-                // statement lists, skipping TYPE_CHECKING blocks.
-                ST::If(i) => {
-                    let tc = in_type_checking
-                        || matches!(
-                            &i.test,
-                            crate::ExprType::Name(n) if n.id == "TYPE_CHECKING"
-                        )
-                        || matches!(
-                            &i.test,
-                            crate::ExprType::Attribute(a)
-                                if a.attr == "TYPE_CHECKING"
-                                    && matches!(
-                                        a.value.as_ref(),
-                                        crate::ExprType::Name(m) if crate::is_typing(&m.id)
-                                    )
-                        );
-                    if scan(&i.body, name, tc) || scan(&i.orelse, name, tc) {
-                        return true;
-                    }
-                }
-                ST::Try(t) => {
-                    for part in [&t.body, &t.orelse, &t.finalbody] {
-                        if scan(part, name, in_type_checking) {
-                            return true;
-                        }
-                    }
-                    for h in &t.handlers {
-                        if scan(&h.body, name, in_type_checking) {
-                            return true;
-                        }
-                    }
-                }
-                _ => {}
+        match &s.statement {
+            ST::FunctionDef(f) | ST::AsyncFunctionDef(f) if f.name == name => Flow::Stop,
+            ST::ClassDef(c) if c.name == name => Flow::Stop,
+            ST::Assign(a)
+                if a.targets.iter().any(|t| {
+                    matches!(t, crate::ExprType::Name(n) if n.id == name)
+                }) =>
+            {
+                Flow::Stop
             }
+            ST::If(i) if Module::is_type_checking_test(&i.test) => Flow::Skip,
+            _ => Flow::Continue,
         }
-        false
-    }
-    scan(&module.raw.body, name, false)
+    })
 }
 
 fn is_type_alias_value(value: &crate::ExprType) -> bool {
@@ -5055,67 +4497,28 @@ fn top_level_class_defs(stmts: &[crate::Statement], out: &mut Vec<crate::ClassDe
 /// Whether any class statement sits under a module-level `if` or `try`
 /// (the shapes whose branch the emission may fold away).
 fn has_gated_class(stmts: &[crate::Statement]) -> bool {
-    stmts.iter().any(|s| match &s.statement {
-        crate::StatementType::If(i) => {
-            has_class(&i.body) || has_class(&i.orelse)
-        }
-        crate::StatementType::Try(t) => {
-            has_class(&t.body)
-                || t.handlers.iter().any(|h| has_class(&h.body))
-                || has_class(&t.orelse)
-                || has_class(&t.finalbody)
-        }
-        _ => false,
+    stmts.iter().any(|s| {
+        matches!(s.statement, crate::StatementType::If(_) | crate::StatementType::Try(_))
+            && stmt_bodies(s).into_iter().any(has_class)
     })
 }
 
 fn has_class(stmts: &[crate::Statement]) -> bool {
-    let mut out = Vec::new();
-    collect_class_defs(stmts, &mut out);
-    !out.is_empty()
+    any_stmt(stmts, Descend::All, |s| matches!(s.statement, crate::StatementType::ClassDef(_)))
 }
 
-/// Every `ClassDef` in the module, recursing into container statements
-/// (if/for/while/with/try/async/function bodies), so classes defined under
-/// an `if __name__ == "__main__":` guard take part in the same hierarchy
-/// and trait-signature precomputes as top-level classes — their class
-/// statements lower through the same machinery.
+/// Every `ClassDef` in the module, recursing into every nested body
+/// (if/for/while/with/try/async, function and class bodies), so classes
+/// defined under an `if __name__ == "__main__":` guard take part in the
+/// same hierarchy and trait-signature precomputes as top-level classes —
+/// their class statements lower through the same machinery.
 pub(crate) fn collect_class_defs(stmts: &[crate::Statement], out: &mut Vec<crate::ClassDef>) {
-    for s in stmts {
-        match &s.statement {
-            crate::StatementType::ClassDef(c) => out.push(c.clone()),
-            crate::StatementType::If(i) => {
-                collect_class_defs(&i.body, out);
-                collect_class_defs(&i.orelse, out);
-            }
-            crate::StatementType::For(f) => {
-                collect_class_defs(&f.body, out);
-                collect_class_defs(&f.orelse, out);
-            }
-            crate::StatementType::While(w) => {
-                collect_class_defs(&w.body, out);
-                collect_class_defs(&w.orelse, out);
-            }
-            crate::StatementType::With(w) => collect_class_defs(&w.body, out),
-            crate::StatementType::AsyncWith(w) => collect_class_defs(&w.body, out),
-            crate::StatementType::AsyncFor(f) => {
-                collect_class_defs(&f.body, out);
-                collect_class_defs(&f.orelse, out);
-            }
-            crate::StatementType::Try(t) => {
-                collect_class_defs(&t.body, out);
-                for h in &t.handlers {
-                    collect_class_defs(&h.body, out);
-                }
-                collect_class_defs(&t.orelse, out);
-                collect_class_defs(&t.finalbody, out);
-            }
-            crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
-                collect_class_defs(&f.body, out);
-            }
-            _ => {}
+    walk_stmts(stmts, Descend::All, &mut |s| {
+        if let crate::StatementType::ClassDef(c) = &s.statement {
+            out.push(c.clone());
         }
-    }
+        Flow::Continue
+    });
 }
 
 /// Is `name` — a class of the CURRENT module (options.this_module_path) —
@@ -5135,21 +4538,18 @@ pub(crate) fn class_subclassed_crate_wide(name: &str, options: &crate::PythonOpt
     let Some(this_leaf) = options.this_module_path.last() else {
         return false;
     };
+    // A module-scope from-import, under any control flow (the try/except
+    // import fallback included).
     fn imports_name_from(stmts: &[crate::Statement], name: &str, leaf: &str) -> bool {
-        use crate::StatementType as ST;
-        stmts.iter().any(|s| match &s.statement {
-            ST::ImportFrom(i) => {
-                i.module.rsplit('.').next() == Some(leaf)
-                    && i.names
-                        .iter()
-                        .any(|a| a.asname.as_deref().unwrap_or(&a.name) == name)
-            }
-            ST::If(b) => imports_name_from(&b.body, name, leaf) || imports_name_from(&b.orelse, name, leaf),
-            ST::Try(t) => {
-                imports_name_from(&t.body, name, leaf)
-                    || t.handlers.iter().any(|h| imports_name_from(&h.body, name, leaf))
-            }
-            _ => false,
+        any_stmt(stmts, Descend::SkipDefs, |s| {
+            matches!(
+                &s.statement,
+                crate::StatementType::ImportFrom(i)
+                    if i.module.rsplit('.').next() == Some(leaf)
+                        && i.names
+                            .iter()
+                            .any(|a| a.asname.as_deref().unwrap_or(&a.name) == name)
+            )
         })
     }
     for (path, module) in options.module_defs.iter() {
@@ -5632,43 +5032,21 @@ pub(crate) fn module_reexports_stdpython_module(
 ) -> Option<String> {
     let module = options.module_defs.get(path)?;
     let module: &crate::Module = module;
-    fn walk(body: &[crate::Statement], name: &str) -> Option<String> {
-        use crate::StatementType as ST;
-        for s in body {
-            let found: Option<String> = match &s.statement {
-                ST::Import(im) => im
-                    .names
-                    .iter()
-                    .find(|a| {
-                        a.asname.as_deref() == Some(name)
-                            || (a.asname.is_none() && a.name.split('.').next() == Some(name))
-                    })
-                    .map(|a| a.name.split('.').next().unwrap_or("").to_string())
-                    .filter(|m| crate::is_stdpython_module(m)),
-                ST::If(i) => walk(&i.body, name).or_else(|| walk(&i.orelse, name)),
-                ST::Try(t) => {
-                    for part in [&t.body, &t.orelse, &t.finalbody] {
-                        if let Some(m) = walk(part, name) {
-                            return Some(m);
-                        }
-                    }
-                    for h in &t.handlers {
-                        if let Some(m) = walk(&h.body, name) {
-                            return Some(m);
-                        }
-                    }
-                    None
-                }
-                ST::While(w) => walk(&w.body, name).or_else(|| walk(&w.orelse, name)),
-                ST::For(f) => walk(&f.body, name).or_else(|| walk(&f.orelse, name)),
-                ST::With(w) => walk(&w.body, name),
-                _ => None,
-            };
-            if found.is_some() {
-                return found;
-            }
-        }
-        None
-    }
-    walk(&module.raw.body, name)
+    let mut found = None;
+    walk_stmts(&module.raw.body, Descend::SkipDefs, &mut |s| {
+        let crate::StatementType::Import(im) = &s.statement else {
+            return Flow::Continue;
+        };
+        found = im
+            .names
+            .iter()
+            .find(|a| {
+                a.asname.as_deref() == Some(name)
+                    || (a.asname.is_none() && a.name.split('.').next() == Some(name))
+            })
+            .map(|a| a.name.split('.').next().unwrap_or("").to_string())
+            .filter(|m| crate::is_stdpython_module(m));
+        if found.is_some() { Flow::Stop } else { Flow::Continue }
+    });
+    found
 }

@@ -43,6 +43,9 @@
 use std::collections::HashMap;
 
 use crate::ast::tree::statement::Statement;
+use crate::ast::tree::visit::{
+    opens_scope, stmt_all_exprs, stmt_bodies, walk_stmts, Descend, Flow,
+};
 use crate::ast::tree::StatementType;
 use crate::{ExprType, SymbolTableNode, SymbolTableScopes};
 
@@ -458,7 +461,10 @@ pub fn detect_specializable(
 }
 
 /// Walk statements collecting plain `if isinstance(p, T):` tests (in
-/// order) and stray isinstance-of-parameter uses anywhere else.
+/// order, from every body of the function's own scope — under a loop, a
+/// `try`, a `with`) and stray isinstance-of-parameter uses anywhere else.
+/// A nested `def` / `class` is its own scope the folding never enters, so
+/// every isinstance-of-parameter use inside one is stray.
 fn collect_isinstance_tests(
     body: &[Statement],
     unannotated: &[(usize, String)],
@@ -466,78 +472,33 @@ fn collect_isinstance_tests(
     stray: &mut Vec<String>,
 ) {
     let is_param = |name: &str| unannotated.iter().any(|(_, p)| p == name);
-    for stmt in body {
-        match &stmt.statement {
-            StatementType::If(s) => {
-                if let Some((arg, target)) = isinstance_parts(&s.test) {
-                    if is_param(arg) {
-                        tests.push((arg.to_string(), target.to_string()));
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if opens_scope(stmt) {
+            for nested in stmt_bodies(stmt) {
+                walk_stmts(nested, Descend::All, &mut |s| {
+                    for e in stmt_all_exprs(s) {
+                        isinstance_args_in_expr(e, stray);
                     }
-                } else {
-                    isinstance_args_in_expr(&s.test, stray);
+                    Flow::Continue
+                });
+            }
+            return Flow::Continue;
+        }
+        if let StatementType::If(s) = &stmt.statement {
+            if let Some((arg, target)) = isinstance_parts(&s.test) {
+                if is_param(arg) {
+                    tests.push((arg.to_string(), target.to_string()));
                 }
-                collect_isinstance_tests(&s.body, unannotated, tests, stray);
-                collect_isinstance_tests(&s.orelse, unannotated, tests, stray);
+            } else {
+                isinstance_args_in_expr(&s.test, stray);
             }
-            other => visit_statement_exprs(other, &mut |e| {
-                isinstance_args_in_expr(e, stray)
-            }),
-        }
-    }
-}
-
-/// Visit the expressions directly held by a statement (shallow — nested
-/// statement bodies are walked by the caller where needed; for stray
-/// detection a full walk of non-If statements suffices via their nested
-/// statements' own visits).
-fn visit_statement_exprs(stmt: &StatementType, f: &mut impl FnMut(&ExprType)) {
-    match stmt {
-        StatementType::Expr(e) => f(&e.value),
-        StatementType::Return(Some(r)) => f(&r.value),
-        StatementType::Assign(a) => {
-            f(&a.value);
-            for t in &a.targets {
-                f(t);
+        } else {
+            for e in stmt_all_exprs(stmt) {
+                isinstance_args_in_expr(e, stray);
             }
         }
-        StatementType::AugAssign(a) => {
-            f(&a.target);
-            f(&a.value);
-        }
-        StatementType::While(s) => {
-            f(&s.test);
-            for b in s.body.iter().chain(s.orelse.iter()) {
-                visit_statement_exprs(&b.statement, f);
-            }
-        }
-        StatementType::For(s) => {
-            f(&s.iter);
-            for b in s.body.iter().chain(s.orelse.iter()) {
-                visit_statement_exprs(&b.statement, f);
-            }
-        }
-        StatementType::With(s) => {
-            for b in &s.body {
-                visit_statement_exprs(&b.statement, f);
-            }
-        }
-        StatementType::Try(t) => {
-            for b in t
-                .body
-                .iter()
-                .chain(t.orelse.iter())
-                .chain(t.finalbody.iter())
-            {
-                visit_statement_exprs(&b.statement, f);
-            }
-            for h in &t.handlers {
-                for b in &h.body {
-                    visit_statement_exprs(&b.statement, f);
-                }
-            }
-        }
-        _ => {}
-    }
+        Flow::Continue
+    });
 }
 
 /// The residual body: every plain `if isinstance(axis, T):` collapses to
@@ -913,33 +874,12 @@ fn variant_expr_type(
 /// Every value-carrying `return` expression in the body (nested statement
 /// bodies included; nested function definitions excluded).
 pub(crate) fn collect_return_exprs(body: &[Statement], out: &mut Vec<ExprType>) {
-    for stmt in body {
-        match &stmt.statement {
-            StatementType::Return(Some(r)) => out.push(r.value.clone()),
-            StatementType::If(s) => {
-                collect_return_exprs(&s.body, out);
-                collect_return_exprs(&s.orelse, out);
-            }
-            StatementType::While(s) => {
-                collect_return_exprs(&s.body, out);
-                collect_return_exprs(&s.orelse, out);
-            }
-            StatementType::For(s) => {
-                collect_return_exprs(&s.body, out);
-                collect_return_exprs(&s.orelse, out);
-            }
-            StatementType::With(s) => collect_return_exprs(&s.body, out),
-            StatementType::Try(t) => {
-                collect_return_exprs(&t.body, out);
-                collect_return_exprs(&t.orelse, out);
-                collect_return_exprs(&t.finalbody, out);
-                for h in &t.handlers {
-                    collect_return_exprs(&h.body, out);
-                }
-            }
-            _ => {}
+    walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if let StatementType::Return(Some(r)) = &stmt.statement {
+            out.push(r.value.clone());
         }
-    }
+        Flow::Continue
+    });
 }
 
 /// Underscore-prefix parameters a folded variant/residual body no longer
@@ -965,49 +905,31 @@ fn collect_stmt_names(
     body: &[Statement],
     out: &mut std::collections::HashSet<String>,
 ) -> bool {
-    for stmt in body {
-        let ok = match &stmt.statement {
-            StatementType::Expr(e) => collect_expr_names(&e.value, out),
-            StatementType::Return(Some(r)) => collect_expr_names(&r.value, out),
-            StatementType::Return(None)
-            | StatementType::Pass
-            | StatementType::Break
-            | StatementType::Continue => true,
-            StatementType::Assign(a) => {
-                a.targets.iter().all(|t| collect_expr_names(t, out))
-                    && collect_expr_names(&a.value, out)
-            }
-            StatementType::AugAssign(a) => {
-                collect_expr_names(&a.target, out) && collect_expr_names(&a.value, out)
-            }
-            StatementType::AnnotatedName { .. } => true,
-            StatementType::If(s) => {
-                collect_expr_names(&s.test, out)
-                    && collect_stmt_names(&s.body, out)
-                    && collect_stmt_names(&s.orelse, out)
-            }
-            StatementType::While(s) => {
-                collect_expr_names(&s.test, out)
-                    && collect_stmt_names(&s.body, out)
-                    && collect_stmt_names(&s.orelse, out)
-            }
-            StatementType::For(s) => {
-                collect_expr_names(&s.target, out)
-                    && collect_expr_names(&s.iter, out)
-                    && collect_stmt_names(&s.body, out)
-                    && collect_stmt_names(&s.orelse, out)
-            }
-            StatementType::Raise(r) => {
-                r.exc.as_ref().map_or(true, |e| collect_expr_names(e, out))
-                    && r.cause.as_ref().map_or(true, |e| collect_expr_names(e, out))
-            }
-            _ => false,
+    walk_stmts(body, Descend::All, &mut |stmt| {
+        let modeled = match &stmt.statement {
+            // A handler mentions its exception class and binds its `as`
+            // name.
+            StatementType::Try(t) => t.handlers.iter().all(|h| {
+                if let Some(n) = &h.name {
+                    out.insert(n.clone());
+                }
+                h.exception_type.as_ref().map_or(true, |e| collect_expr_names(e, out))
+            }),
+            // A nested definition's decorators, defaults, annotations and
+            // bases are not among the visitor's expressions: unmodeled.
+            StatementType::FunctionDef(_)
+            | StatementType::AsyncFunctionDef(_)
+            | StatementType::ClassDef(_) => false,
+            // Every other form's mentions are the expressions it
+            // evaluates or binds.
+            _ => true,
         };
-        if !ok {
-            return false;
+        if modeled && stmt_all_exprs(stmt).into_iter().all(|e| collect_expr_names(e, out)) {
+            Flow::Continue
+        } else {
+            Flow::Stop
         }
-    }
-    true
+    })
 }
 
 /// Collect every Name in the expression; false on an unmodeled variant.
