@@ -1609,7 +1609,9 @@ impl Point {
   every target form consults: a class name (through its aliases), each
   element of a tuple of classes (their OR; an ancestor among them is true
   outright), and `type(self)` (the enclosing class); inside the guarded
-  branch the name reads as the sum type's view of `T`
+  branch the name reads as the sum type's view of `T`, and a store or a
+  mutating call through it — or through a field chain rooted at it
+  (`s.tags.append(..)`, `s.center.bump()`) — takes the mutable view
   (`x.__rython_as_T()`, an owned clone), so `T`'s own fields and methods
   resolve. A leaf class IS its struct, and `isinstance` on it folds
   exactly through the class tree. Every class implements `PyDisplay`
