@@ -356,10 +356,13 @@ impl CodeGen for Module {
             // The shared classes (shared.rs): container-stored and mutated
             // after construction anywhere in the crate — one object behind
             // `PyRef` wherever held. Needs the roots (family closure).
-            let shared =
-                crate::ast::tree::shared::compute_shared(&self.raw.body, &items, &options);
+            let shared = crate::ast::tree::shared::compute_shared(
+                &self.raw.body,
+                &items,
+                &symbols,
+                &options,
+            );
             crate::ast::tree::shared::install_shared(&shared);
-            options.shared_classes = std::rc::Rc::new(shared);
         }
 
         // Functions whose unannotated parameter is isinstance-dispatched

@@ -13,12 +13,12 @@
 //! the crate (the same crate-wide walk the hierarchy index takes) and
 //! closed over hierarchy families: a root and its subtree share one
 //! representation, since the root's sum type holds the members.
-//! Consumers ask [`is_shared`] (the thread-local registry the module
-//! installs) or `options.shared_classes`.
+//! Consumers ask [`is_shared`] — the one registry, installed per module
+//! conversion like the hierarchy index (`hierarchy::install_roots`).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::{ClassDef, ExprType, PythonOptions, Statement, StatementType};
+use crate::{ClassDef, CodeGen, ExprType, FunctionDef, PythonOptions, Statement, StatementType, SymbolTableScopes, TypeInfo};
 
 thread_local! {
     static SHARED: std::cell::RefCell<std::rc::Rc<HashSet<String>>> =
@@ -35,35 +35,27 @@ pub fn install_shared(shared: &HashSet<String>) {
     SHARED.with(|s| *s.borrow_mut() = std::rc::Rc::new(shared.clone()));
 }
 
-/// The container annotations whose element (or value, for the mappings)
-/// is a stored instance.
-const SEQUENCE_CONTAINERS: &[&str] = &[
-    "list", "List", "set", "Set", "frozenset", "FrozenSet", "Sequence", "MutableSequence",
-    "Iterable", "Collection", "deque", "Deque",
-];
-const MAPPING_CONTAINERS: &[&str] = &[
-    "dict", "Dict", "Mapping", "MutableMapping", "OrderedDict", "defaultdict", "DefaultDict",
-];
-
 /// Compute the shared set: `this_body` and `this_classes` are the module
-/// being converted; every other module comes from `options.module_defs`
-/// (its emitted classes, as the hierarchy index sees them).
+/// being converted (with its symbols); every other module comes from
+/// `options.module_defs` (its emitted classes, as the hierarchy index
+/// sees them).
 pub fn compute_shared(
     this_body: &[Statement],
     this_classes: &[ClassDef],
+    this_symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> HashSet<String> {
     let mut classes: BTreeMap<String, ClassDef> = BTreeMap::new();
     let mut stored: HashSet<String> = HashSet::new();
     let mut external_store_fields: HashSet<String> = HashSet::new();
-    let mut register = |body: &[Statement], defs: Vec<ClassDef>| {
+    let mut register = |body: &[Statement], defs: Vec<ClassDef>, symbols: &SymbolTableScopes, opts: &PythonOptions| {
         for c in defs {
             classes.entry(c.name.clone()).or_insert(c);
         }
-        collect_container_elements(body, &mut stored);
+        collect_container_elements(body, symbols, opts, &mut stored);
         collect_external_store_fields(body, &mut external_store_fields);
     };
-    register(this_body, this_classes.to_vec());
+    register(this_body, this_classes.to_vec(), this_symbols, options);
     for (path, module) in options.module_defs.iter() {
         if path[..] == options.this_module_path[..] {
             continue;
@@ -80,17 +72,23 @@ pub fn compute_shared(
         };
         module_opts.this_module_path = path.clone();
         let defs = crate::ast::tree::module::emitted_class_defs(module, &module_opts);
-        register(&module.raw.body, defs);
+        let module: &crate::Module = module;
+        let module_symbols = module.clone().find_symbols(SymbolTableScopes::new());
+        register(&module.raw.body, defs, &module_symbols, &module_opts);
     }
-    let mut shared: HashSet<String> = classes
+    // Mutability is INHERITED: a stored subclass whose only mutator is
+    // its base's is mutated through it (Devin review on #321).
+    let mut memo: HashMap<String, bool> = HashMap::new();
+    let names: Vec<String> = classes.keys().cloned().collect();
+    let mut shared: HashSet<String> = names
         .iter()
-        .filter(|(name, c)| {
+        .filter(|name| {
+            let c = &classes[*name];
             stored.contains(*name)
                 && !crate::ast::tree::class_def::is_exception_class(c)
-                && (has_mutating_method(c)
-                    || own_field_names(c).iter().any(|f| external_store_fields.contains(f)))
+                && class_mutates(name, &classes, &external_store_fields, &mut memo)
         })
-        .map(|(name, _)| name.clone())
+        .cloned()
         .collect();
     // Family closure: a root's sum type holds its members, so the root
     // and every class of its subtree take the one representation.
@@ -114,61 +112,42 @@ pub fn compute_shared(
     shared
 }
 
-/// The class names in element position of a container annotation, over
-/// every annotation in `stmts` (parameters, returns, annotated stores),
-/// recursing through nested containers and every statement body.
-fn collect_container_elements(stmts: &[Statement], out: &mut HashSet<String>) {
-    fn from_annotation(ann: &ExprType, in_container: bool, out: &mut HashSet<String>) {
-        // A string annotation re-parses like the annotation authority.
-        let unquoted = crate::ast::tree::arguments::unquote_annotation(ann);
-        let ann: &ExprType = unquoted.as_ref().unwrap_or(ann);
-        match ann {
-            ExprType::Name(n) => {
+/// The classes held in element position of a container type anywhere in
+/// `stmts` — a parameter, return, or annotated store (through the
+/// alias-aware annotation authority, so `Items = list[Item]` counts), an
+/// un-annotated store typed by the inferrer (`{"x": Item()}`), and every
+/// class's inferred field table (the stores its methods make) — recursing
+/// through nested containers and every statement body. What is a
+/// container is what `TypeInfo` renders as one: the boxed generics
+/// (`Sequence[T]`, `Iterable[T]`) hold no struct, so they hold no
+/// instance to share.
+fn collect_container_elements(
+    stmts: &[Statement],
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+    out: &mut HashSet<String>,
+) {
+    fn from_type(t: &TypeInfo, in_container: bool, out: &mut HashSet<String>) {
+        match t {
+            TypeInfo::Vec(inner) | TypeInfo::HashSet(inner) => from_type(inner, true, out),
+            TypeInfo::Dict(_, v) => from_type(v, true, out),
+            TypeInfo::Tuple(items) => items.iter().for_each(|i| from_type(i, in_container, out)),
+            TypeInfo::Option(inner) => from_type(inner, in_container, out),
+            TypeInfo::Class(c) => {
                 if in_container {
-                    out.insert(n.id.clone());
+                    out.insert(c.clone());
                 }
-            }
-            ExprType::Subscript(sub) => {
-                let head = match sub.value.as_ref() {
-                    ExprType::Name(n) => Some(n.id.as_str()),
-                    ExprType::Attribute(a) => Some(a.attr.as_str()),
-                    _ => None,
-                };
-                let crate::SubscriptKind::Index(index) = &sub.kind else {
-                    return;
-                };
-                let elts: Vec<&ExprType> = match index.as_ref() {
-                    ExprType::Tuple(t) => t.elts.iter().collect(),
-                    other => vec![other],
-                };
-                match head {
-                    Some(h) if SEQUENCE_CONTAINERS.contains(&h) => {
-                        for e in elts {
-                            from_annotation(e, true, out);
-                        }
-                    }
-                    Some(h) if MAPPING_CONTAINERS.contains(&h) => {
-                        if let Some(v) = elts.last() {
-                            from_annotation(v, true, out);
-                        }
-                    }
-                    // `Optional[T]`, `tuple[...]`, `type[T]`, ...: the
-                    // element keeps the enclosing container's status.
-                    _ => {
-                        for e in elts {
-                            from_annotation(e, in_container, out);
-                        }
-                    }
-                }
-            }
-            // `T | None`, `list[A] | list[B]`.
-            ExprType::BinOp(b) => {
-                from_annotation(&b.left, in_container, out);
-                from_annotation(&b.right, in_container, out);
             }
             _ => {}
         }
     }
+    let from_annotation = |ann: &ExprType, out: &mut HashSet<String>| {
+        if let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
+            .or_else(|| crate::annotation_type_info(ann))
+        {
+            from_type(&t, false, out);
+        }
+    };
     for s in stmts {
         match &s.statement {
             StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
@@ -180,43 +159,49 @@ fn collect_container_elements(stmts: &[Statement], out: &mut HashSet<String>) {
                     .chain(f.args.kwonlyargs.iter())
                 {
                     if let Some(a) = p.annotation.as_deref() {
-                        from_annotation(a, false, out);
+                        from_annotation(a, out);
                     }
                 }
                 if let Some(r) = f.returns.as_deref() {
-                    from_annotation(r, false, out);
+                    from_annotation(r, out);
                 }
-                collect_container_elements(&f.body, out);
+                collect_container_elements(&f.body, symbols, options, out);
             }
-            StatementType::ClassDef(c) => collect_container_elements(&c.body, out),
-            StatementType::Assign(a) => {
-                if let Some(ann) = a.annotation.as_ref() {
-                    from_annotation(ann, false, out);
+            StatementType::ClassDef(c) => {
+                if let Ok(fields) = c.infer_fields(symbols, options) {
+                    for (_, t) in &fields {
+                        from_type(t, false, out);
+                    }
                 }
+                collect_container_elements(&c.body, symbols, options, out);
             }
+            StatementType::Assign(a) => match a.annotation.as_ref() {
+                Some(ann) => from_annotation(ann, out),
+                None => from_type(&crate::infer_type(None, &a.value, options, symbols), false, out),
+            },
             StatementType::AnnotatedName { annotation, .. } => {
-                from_annotation(annotation, false, out);
+                from_annotation(annotation, out);
             }
             StatementType::If(i) => {
-                collect_container_elements(&i.body, out);
-                collect_container_elements(&i.orelse, out);
+                collect_container_elements(&i.body, symbols, options, out);
+                collect_container_elements(&i.orelse, symbols, options, out);
             }
             StatementType::For(f) => {
-                collect_container_elements(&f.body, out);
-                collect_container_elements(&f.orelse, out);
+                collect_container_elements(&f.body, symbols, options, out);
+                collect_container_elements(&f.orelse, symbols, options, out);
             }
             StatementType::While(w) => {
-                collect_container_elements(&w.body, out);
-                collect_container_elements(&w.orelse, out);
+                collect_container_elements(&w.body, symbols, options, out);
+                collect_container_elements(&w.orelse, symbols, options, out);
             }
-            StatementType::With(w) => collect_container_elements(&w.body, out),
+            StatementType::With(w) => collect_container_elements(&w.body, symbols, options, out),
             StatementType::Try(t) => {
-                collect_container_elements(&t.body, out);
+                collect_container_elements(&t.body, symbols, options, out);
                 for h in &t.handlers {
-                    collect_container_elements(&h.body, out);
+                    collect_container_elements(&h.body, symbols, options, out);
                 }
-                collect_container_elements(&t.orelse, out);
-                collect_container_elements(&t.finalbody, out);
+                collect_container_elements(&t.orelse, symbols, options, out);
+                collect_container_elements(&t.finalbody, symbols, options, out);
             }
             _ => {}
         }
@@ -273,10 +258,56 @@ fn collect_external_store_fields(stmts: &[Statement], out: &mut HashSet<String>)
     }
 }
 
+/// Every method of the class, the asynchronous ones included (a mutation
+/// in an `async def` is a mutation), overloads excluded as `methods()`
+/// excludes them.
+fn all_methods(c: &ClassDef) -> impl Iterator<Item = &FunctionDef> {
+    c.body.iter().filter_map(|s| match &s.statement {
+        StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
+            let is_overload = f.decorator_list.iter().any(|d| match d {
+                ExprType::Name(n) => n.id == "overload",
+                ExprType::Attribute(a) => a.attr == "overload",
+                _ => false,
+            });
+            if is_overload { None } else { Some(f) }
+        }
+        _ => None,
+    })
+}
+
+/// Whether the class is mutated after construction: its own methods (see
+/// `has_mutating_method`), a field of its own stored from outside, or —
+/// inheritance — the same of any base in the crate.
+fn class_mutates(
+    name: &str,
+    classes: &BTreeMap<String, ClassDef>,
+    external_store_fields: &HashSet<String>,
+    memo: &mut HashMap<String, bool>,
+) -> bool {
+    if let Some(&m) = memo.get(name) {
+        return m;
+    }
+    // A cycle (or an unknown base) is not a mutation.
+    memo.insert(name.to_string(), false);
+    let Some(c) = classes.get(name) else {
+        return false;
+    };
+    let own = has_mutating_method(c)
+        || own_field_names(c).iter().any(|f| external_store_fields.contains(f));
+    let inherited = c.bases.iter().any(|b| match b {
+        ExprType::Name(n) => class_mutates(&n.id, classes, external_store_fields, memo),
+        ExprType::Attribute(a) => class_mutates(&a.attr, classes, external_store_fields, memo),
+        _ => false,
+    });
+    let result = own || inherited;
+    memo.insert(name.to_string(), result);
+    result
+}
+
 /// The field names a class stores through `self` in any of its methods.
 fn own_field_names(c: &ClassDef) -> HashSet<String> {
     let mut out = HashSet::new();
-    for m in c.methods() {
+    for m in all_methods(c) {
         let mut stores = Vec::new();
         self_stores(&m.body, &mut stores, &mut Vec::new());
         out.extend(stores);
@@ -290,7 +321,7 @@ fn own_field_names(c: &ClassDef) -> HashSet<String> {
 fn has_mutating_method(c: &ClassDef) -> bool {
     let mut direct: HashSet<String> = HashSet::new();
     let mut calls: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for m in c.methods() {
+    for m in all_methods(c) {
         if m.name == "__init__" {
             continue;
         }
@@ -361,6 +392,16 @@ fn self_stores(stmts: &[Statement], fields: &mut Vec<String>, self_calls: &mut V
                 if let Some(f) = self_field(&a.target) {
                     fields.push(f);
                     found = true;
+                }
+            }
+            // `del self.items[i]`, `del self.cache`: a mutation of the
+            // field (Devin review on #321).
+            StatementType::Delete(targets) => {
+                for t in targets {
+                    if let Some(f) = self_field(t) {
+                        fields.push(f);
+                        found = true;
+                    }
                 }
             }
             StatementType::Expr(e) => found |= expr_mutates(&e.value, fields, self_calls),

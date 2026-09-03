@@ -5,3 +5,6 @@ alice: 75 (2 moves)
 bob: 50 (1 moves)
 alice: 1 (2 moves)
 51
+True True False False
+True False no
+True 1 yes

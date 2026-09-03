@@ -447,11 +447,6 @@ pub struct PythonOptions {
     /// module of the crate; empty outside module generation.
     pub hierarchy_roots: std::rc::Rc<crate::ast::tree::hierarchy::HierarchyRoots>,
 
-    /// The SHARED classes of the crate (shared.rs): container-stored and
-    /// mutated after construction, so their instances are one object
-    /// behind `stdpython::PyRef<T>` wherever they are held. Computed once
-    /// per module conversion; empty outside module generation.
-    pub shared_classes: std::rc::Rc<std::collections::HashSet<String>>,
 
     /// Names narrowed by `isinstance` from a polymorphic ROOT to a class of
     /// its subtree (if_stmt.rs), mapped to the root: a read of the name in
@@ -660,7 +655,6 @@ impl Default for PythonOptions {
             numpy_backend: None,
             hierarchy_classes: std::rc::Rc::new(std::collections::HashSet::new()),
             hierarchy_roots: std::rc::Rc::new(std::collections::HashMap::new()),
-            shared_classes: Default::default(),
             narrowed_class_origin: std::rc::Rc::new(std::collections::HashMap::new()),
             specialized_fns: std::rc::Rc::new(std::collections::HashMap::new()),
             rendering_specialization: false,

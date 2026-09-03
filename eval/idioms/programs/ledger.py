@@ -50,6 +50,28 @@ class Bank:
         return sum(a.balance for a in self.accounts.values())
 
 
+class Book:
+    def __init__(self):
+        self.entries: list[int] = []
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def add(self, n: int) -> None:
+        self.entries.append(n)
+
+
+class Journal(Book):
+    pass
+
+
+def has_entries(b: Book) -> str:
+    # Truth through the root's sum type: an empty book is False.
+    if bool(b):
+        return "yes"
+    return "no"
+
+
 def main() -> None:
     bank = Bank()
     alice = bank.open("alice", 100)
@@ -64,6 +86,17 @@ def main() -> None:
     first.balance = 1
     print(bank.find("alice").describe())
     print(bank.total())
+    # Identity and the default `==` (identity) on shared objects: the
+    # fetched local IS the stored object; a distinct account is neither.
+    other = Account("alice", 1)
+    print(first is alice, first == alice, first is other, first == other)
+    # Truth: a plain object is True; a book's truth is its length,
+    # inherited by the journal, through the sum type too.
+    shelf: list[Book] = [Book(), Journal()]
+    print(bool(first), bool(shelf[0]), has_entries(shelf[1]))
+    shelf[1].add(3)
+    j = shelf[1]
+    print(bool(j), len(j.entries), has_entries(shelf[1]))
 
 
 if __name__ == "__main__":

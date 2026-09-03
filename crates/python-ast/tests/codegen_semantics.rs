@@ -17377,6 +17377,184 @@ fn a_local_from_a_self_method_call_is_typed_by_its_return() {
     );
 }
 
+/// A derived instance inherits its truth: `__len__` defined on the base
+/// is the subclass's `bool()` too (Devin review on #321).
+#[test]
+fn an_inherited_len_is_the_derived_instances_truth() {
+    let out = compile(
+        concat!(
+            "class Book:\n",
+            "    def __init__(self):\n",
+            "        self.entries: list[int] = []\n",
+            "\n",
+            "    def __len__(self) -> int:\n",
+            "        return len(self.entries)\n",
+            "\n",
+            "class Journal(Book):\n",
+            "    pass\n",
+        ),
+        "inherited_truth.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("implstdpython::PyBoolforJournal{fnpy_bool(self)->bool{self.__len__().expect(\"__len__raised\")!=0}}"),
+        "the inherited __len__ decides the subclass's truth: {}",
+        out
+    );
+}
+
+/// A shared class's `==` is identity by default (`PyRefEq`); one that
+/// defines `__eq__` cannot route `==` through it, so its references panic
+/// on `==` and the conversion warns — never the identity default in
+/// silence. `is` on shared references is `py_is` (Devin review on #321).
+#[test]
+fn a_shared_class_defining_eq_is_loud_on_equality_and_is_stays_identity() {
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "class Tag:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "        self.uses = 0\n",
+            "\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        return isinstance(other, Tag) and other.name == self.name\n",
+            "\n",
+            "    def use(self) -> None:\n",
+            "        self.uses += 1\n",
+            "\n",
+            "class Plain:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.n += 1\n",
+            "\n",
+            "def same(a: Plain, b: Plain) -> bool:\n",
+            "    return a is b\n",
+            "\n",
+            "def main() -> None:\n",
+            "    tags: list[Tag] = [Tag(\"a\")]\n",
+            "    plains: list[Plain] = [Plain()]\n",
+            "    tags[0].use()\n",
+            "    plains[0].bump()\n",
+        ),
+        "shared_eq.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("implstdpython::PyRefEqforTag{fnref_eq(") && flat.contains("panic!("),
+        "== on a shared __eq__ class is a loud panic: {}",
+        out
+    );
+    assert!(
+        flat.contains("implstdpython::PyRefEqforPlain{}"),
+        "a shared class without __eq__ takes the identity default: {}",
+        out
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("defines __eq__ and is shared")),
+        "the conversion names the boundary: {:?}",
+        warnings
+    );
+    assert!(
+        flat.contains("(a).py_is(&b)"),
+        "`is` on shared references is identity: {}",
+        out
+    );
+}
+
+/// Sharing is decided by what the crate STORES and MUTATES through the
+/// typed authorities (Devin review on #321): an inferred container store
+/// (`self.items = [Item(1)]`), a mutator inherited from a base, and a
+/// `del` on a field each make the class shared.
+#[test]
+fn sharing_follows_the_typed_storage_and_inherited_or_del_mutation() {
+    let out = compile(
+        concat!(
+            "class Item:\n",
+            "    def __init__(self, qty: int):\n",
+            "        self.qty = qty\n",
+            "\n",
+            "    def take(self) -> None:\n",
+            "        self.qty -= 1\n",
+            "\n",
+            "class Slot:\n",
+            "    def __init__(self):\n",
+            "        self.tags: list[str] = []\n",
+            "\n",
+            "    def drop_first(self) -> None:\n",
+            "        del self.tags[0]\n",
+            "\n",
+            "class Base:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.n += 1\n",
+            "\n",
+            "class Sub(Base):\n",
+            "    pass\n",
+            "\n",
+            "class Store:\n",
+            "    def __init__(self):\n",
+            "        self.items = [Item(1)]\n",
+            "        self.slots: list[Slot] = []\n",
+            "        self.subs: list[Sub] = []\n",
+        ),
+        "sharing_rules.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("pubitems:Vec<stdpython::PyRef<Item>>"),
+        "an inferred container store shares its element class: {}",
+        out
+    );
+    assert!(
+        flat.contains("Vec<stdpython::PyRef<Slot>>"),
+        "a del on a field is a mutation: {}",
+        out
+    );
+    assert!(
+        flat.contains("Vec<stdpython::PyRef<Sub>>"),
+        "an inherited mutator makes the stored subclass shared: {}",
+        out
+    );
+    assert!(
+        flat.contains("PyRef<Base>") && flat.contains("PyRef<Sub>"),
+        "the family shares as a whole: {}",
+        out
+    );
+}
+
+/// An ALIASED container annotation (`Items = list[Item]`) stores the
+/// class the alias names: the alias-aware annotation authority decides,
+/// not the spelling at the parameter (Devin review on #321).
+#[test]
+fn an_aliased_container_annotation_shares_its_element_class() {
+    let out = compile(
+        concat!(
+            "Items = list[\"Item\"]\n",
+            "\n",
+            "class Item:\n",
+            "    def __init__(self, qty: int):\n",
+            "        self.qty = qty\n",
+            "\n",
+            "    def take(self) -> None:\n",
+            "        self.qty -= 1\n",
+            "\n",
+            "def listed(items: Items) -> int:\n",
+            "    return len(items)\n",
+        ),
+        "sharing_alias.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("fnlisted(items:Vec<stdpython::PyRef<Item>>)"),
+        "the alias's element class is shared: {}",
+        out
+    );
+}
+
 /// A shared class constructs behind `PyRef`, its slot type is `PyRef<C>`,
 /// a loop variable over a container of it borrows for a field read, a
 /// field store through it borrows mutably, and a subscript into the
