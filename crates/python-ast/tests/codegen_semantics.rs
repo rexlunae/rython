@@ -17241,3 +17241,34 @@ fn a_field_read_on_a_type_checking_imported_root_takes_the_accessor_form() {
         out
     );
 }
+
+/// A factory whose declared return is a polymorphic ROOT returns a struct
+/// of the subtree: the return converts into the sum type, as an argument
+/// or a store into the root's slot does (urllib3's connection_from_url,
+/// `-> HTTPConnectionPool`, returning either pool class).
+#[test]
+fn a_return_of_a_subtree_class_converts_into_the_roots_sum_type() {
+    let out = compile(
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "class Circle(Shape):\n",
+            "    def area(self) -> float:\n",
+            "        return 3.0\n",
+            "\n",
+            "def make(kind: str) -> Shape:\n",
+            "    if kind == \"c\":\n",
+            "        return Circle()\n",
+            "    return Shape()\n",
+        ),
+        "factory.py",
+    );
+    assert_eq!(
+        out.matches(") . into ()").count(),
+        2,
+        "both returns convert into the sum type: {}",
+        out
+    );
+}

@@ -2259,6 +2259,20 @@ impl FunctionDef {
                     None
                 };
                 t.filter(|_| !options.fn_return_is_pyvalue && !options.fn_return_is_option)
+            })
+            // A declared return naming a polymorphic ROOT (hierarchy.rs):
+            // the slot is the sum type, and the return site converts a
+            // subtree struct into it.
+            .or_else(|| {
+                self.returns
+                    .as_deref()
+                    .and_then(|ann| crate::resolve_alias_typeinfo(ann, &symbols, &options))
+                    .filter(|t| {
+                        matches!(t, crate::TypeInfo::Class(r)
+                            if crate::ast::tree::hierarchy::is_polymorphic_root(r))
+                            && !options.fn_return_is_pyvalue
+                            && !options.fn_return_is_option
+                    })
             });
 
         // A `-> List[Union[...]]` return whose element resolves to the
