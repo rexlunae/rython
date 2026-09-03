@@ -17738,6 +17738,83 @@ fn identity_on_optional_and_narrowed_shared_references_is_never_equality() {
     );
 }
 
+/// A mutation through a FIELD of a shared instance (`a.items.append(x)`,
+/// `a.center.bump()` where `a = accounts[k]`) renders the chain as a place
+/// through the mutable borrow, never through the read's clone of the
+/// field (Devin review on #321).
+#[test]
+fn a_field_mutated_through_a_shared_receiver_takes_the_mutable_borrow() {
+    let out = compile(
+        concat!(
+            "class Point:\n",
+            "    def __init__(self):\n",
+            "        self.x = 0\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.x += 1\n",
+            "\n",
+            "class Account:\n",
+            "    def __init__(self):\n",
+            "        self.items: list[int] = []\n",
+            "        self.center = Point()\n",
+            "\n",
+            "    def deposit(self, n: int) -> None:\n",
+            "        self.items.append(n)\n",
+            "\n",
+            "class Bank:\n",
+            "    def __init__(self):\n",
+            "        self.accounts: dict[str, Account] = {}\n",
+            "\n",
+            "    def touch(self, k: str) -> int:\n",
+            "        a = self.accounts[k]\n",
+            "        a.items.append(1)\n",
+            "        a.center.bump()\n",
+            "        return len(a.items)\n",
+        ),
+        "shared_field_mutation.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("((a).borrow_mut().items).push("),
+        "the container field mutates through the mutable borrow: {}",
+        out
+    );
+    assert!(
+        flat.contains("((a).borrow_mut().center).bump()"),
+        "the composed field's mutating call goes through the mutable borrow: {}",
+        out
+    );
+}
+
+/// An EXTERNAL container-mutating call on a class's field
+/// (`item.values.append(x)` in a function) is a mutation of the class, so a
+/// container-stored instance of it shares even with no mutator of its own
+/// (Devin review on #321).
+#[test]
+fn an_external_container_mutating_call_shares_the_class() {
+    let out = compile(
+        concat!(
+            "class Bin:\n",
+            "    def __init__(self):\n",
+            "        self.values: list[int] = []\n",
+            "\n",
+            "class Rack:\n",
+            "    def __init__(self):\n",
+            "        self.bins: list[Bin] = [Bin()]\n",
+            "\n",
+            "def fill(b: Bin, v: int) -> None:\n",
+            "    b.values.append(v)\n",
+        ),
+        "external_container_mutation.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("Vec<stdpython::PyRef<Bin>>"),
+        "the class mutated through an external container call shares: {}",
+        out
+    );
+}
+
 /// A shared class constructs behind `PyRef`, its slot type is `PyRef<C>`,
 /// a loop variable over a container of it borrows for a field read, a
 /// field store through it borrows mutably, and a subscript into the

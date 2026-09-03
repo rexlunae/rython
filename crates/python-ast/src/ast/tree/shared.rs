@@ -415,8 +415,31 @@ fn collect_external_store_fields(
         }
         env
     };
+    // A container-mutating call on a FIELD reached through a non-`self`
+    // receiver (`item.values.append(x)`, `item.mapping.update(..)`): the
+    // field's object mutates — the same mutator authority the scope
+    // analysis and the call lowering use (Devin review on #321).
+    fn mutating_calls(e: &ExprType, env: &Env, out: &mut HashSet<ExternalStore>) {
+        if let ExprType::Call(c) = e
+            && let ExprType::Attribute(method) = c.func.as_ref()
+            && crate::ast::tree::scope::mutates_receiver(&method.attr)
+            && let ExprType::Attribute(field) = method.value.as_ref()
+            && !matches!(field.value.as_ref(), ExprType::Name(n) if n.id == "self")
+        {
+            out.insert(ExternalStore {
+                field: field.attr.clone(),
+                receiver_class: env.class_of(&field.value),
+            });
+        }
+        for sub in subexprs(e) {
+            mutating_calls(sub, env, out);
+        }
+    }
     let mut env = env.clone();
     for s in stmts {
+        for e in stmt_exprs(s) {
+            mutating_calls(e, &env, out);
+        }
         match &s.statement {
             StatementType::Assign(a) => {
                 a.targets.iter().for_each(|t| target(t, &env, out));
@@ -548,7 +571,6 @@ fn has_mutating_method(c: &ClassDef) -> bool {
 /// Whether `stmts` mutate `self` (see `has_mutating_method`); collects the
 /// stored field names and the `self.<method>()` callees on the way.
 fn self_stores(stmts: &[Statement], fields: &mut Vec<String>, self_calls: &mut Vec<String>) -> bool {
-    use crate::ast::tree::scope::CONTAINER_MUTATING_METHODS;
     fn is_self(e: &ExprType) -> bool {
         matches!(e, ExprType::Name(n) if n.id == "self")
     }
@@ -569,7 +591,7 @@ fn self_stores(stmts: &[Statement], fields: &mut Vec<String>, self_calls: &mut V
             if is_self(&a.value) {
                 self_calls.push(a.attr.clone());
             } else if let Some(f) = self_field(&a.value)
-                && CONTAINER_MUTATING_METHODS.contains(&a.attr.as_str())
+                && crate::ast::tree::scope::mutates_receiver(&a.attr)
             {
                 fields.push(f);
                 found = true;

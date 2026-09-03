@@ -844,6 +844,30 @@ pub(crate) fn chain_root_is_self(expr: &ExprType) -> bool {
 /// from the sum type's mutable view (`__rython_as_Circle_mut`), never
 /// from the read view's clone — `s.radius = ..`, `s.tags.append(..)`,
 /// `s.center.bump()` alike (Devin review on #319).
+/// Whether `expr` is a FIELD CHAIN rooted at a SHARED instance that is not
+/// a polymorphic root (`a.items` where `a = accounts[k]`, `q.center`):
+/// a mutation through it must render the chain as a place — the field
+/// through the mutable borrow — never through the read's clone of the
+/// field (`a.items.append(x)`, `a.center.bump()`; Devin review on #321).
+pub(crate) fn chain_root_is_shared_instance(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    let ExprType::Attribute(a) = expr else {
+        return false;
+    };
+    let mut root = a.value.as_ref();
+    while let ExprType::Attribute(inner) = root {
+        root = inner.value.as_ref();
+    }
+    if matches!(root, ExprType::Name(n) if n.id == "self") {
+        return false;
+    }
+    shared_receiver(root, ctx, symbols, options)
+}
+
 pub(crate) fn chain_root_is_narrowed_class(expr: &ExprType, options: &PythonOptions) -> bool {
     match expr {
         ExprType::Attribute(a) => chain_root_is_narrowed_class(&a.value, options),

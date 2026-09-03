@@ -99,6 +99,16 @@ def same(a: Tag | None, b: Tag | None) -> str:
     return "one"
 
 
+class Bin:
+    # No mutator of its own: only an external call mutates its field.
+    def __init__(self):
+        self.values: list[int] = []
+
+
+def fill(b: Bin, v: int) -> None:
+    b.values.append(v)
+
+
 class Probe:
     # Truth with a side effect: every bool() counts, on the one object.
     def __init__(self):
@@ -165,6 +175,13 @@ def main() -> None:
     queues: list[Backlog] = [Backlog()]
     q = queues[0]
     print(q.drain(), len(queues[0].items))
+    q.items.append(9)
+    print(len(queues[0].items), queues[0].items[-1])
+    bins: list[Bin] = [Bin()]
+    b = bins[0]
+    fill(b, 7)
+    b.values.append(8)
+    print(bins[0].values)
 
 
 if __name__ == "__main__":
