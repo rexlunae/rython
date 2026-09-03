@@ -2982,7 +2982,27 @@ impl CodeGen for ClassDef {
             .iter()
             .map(|(name, ti)| {
                 let ident = crate::safe_ident(name);
-                let ty = ti.to_rust_type();
+                // A SELF-REFERENTIAL Option field (`left: Optional[Node]`
+                // inside Node) boxes — E0072's indirection, one rule
+                // (round 99): the struct owns its children through Box,
+                // stores wrap in Box::new, and value reads map-deref back
+                // to the plain Option<Class> type every other slot uses.
+                let self_referential = matches!(
+                    ti,
+                    crate::TypeInfo::Option(inner)
+                        if matches!(**inner, crate::TypeInfo::Class(ref c) if c.as_str() == self.name)
+                );
+                let ty = if self_referential {
+                    match ti {
+                        crate::TypeInfo::Option(inner) => {
+                            let inner_ty = inner.to_rust_type();
+                            quote!(Option<Box<#inner_ty>>)
+                        }
+                        _ => unreachable!("checked above"),
+                    }
+                } else {
+                    ti.to_rust_type()
+                };
                 quote!(pub #ident: #ty)
             })
             .collect();

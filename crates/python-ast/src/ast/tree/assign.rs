@@ -493,6 +493,25 @@ impl<'a> CodeGen for Assign {
         // name-store rule above). A value that already yields an Option
         // (another optional field, dict.get, an Optional-returning call)
         // stores through unchanged — wrapping again would nest.
+        let boxed_self_ref_field = |target: &ExprType| -> bool {
+            let ExprType::Attribute(attr) = target else {
+                return false;
+            };
+            let Some(cls) = ctx.enclosing_class_name() else {
+                return false;
+            };
+            let ExprType::Name(recv) = attr.value.as_ref() else {
+                return false;
+            };
+            if recv.id != "self" {
+                return false;
+            }
+            matches!(
+                crate::infer_type(Some(&ctx), target, &options, &symbols),
+                crate::TypeInfo::Option(inner)
+                    if matches!(*inner, crate::TypeInfo::Class(ref c) if c.as_str() == cls)
+            )
+        };
         let attr_field_is_option = |target: &ExprType| -> bool {
             let ExprType::Attribute(attr) = target else {
                 return false;
@@ -1118,8 +1137,17 @@ impl<'a> CodeGen for Assign {
                     // A reused name clones INTO the Some (the field owns
                     // the value and the name is read again later —
                     // charset_normalizer's `_last_printable_char =
-                    // character`).
-                    if stored_name_needs_clone {
+                    // character`). A SELF-REFERENTIAL boxed field owns its
+                    // children through Box (round 99, E0072): the store
+                    // wraps in Box::new so the Option<Box<Class>> slot
+                    // accepts the plain instance.
+                    if boxed_self_ref_field(target) {
+                        if stored_name_needs_clone {
+                            quote!(#target_code = Some(Box::new((#value).clone()));)
+                        } else {
+                            quote!(#target_code = Some(Box::new(#value));)
+                        }
+                    } else if stored_name_needs_clone {
                         quote!(#target_code = Some((#value).clone());)
                     } else {
                         quote!(#target_code = Some(#value);)
