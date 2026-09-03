@@ -14607,41 +14607,6 @@ fn sum_over_a_generator_comprehension_sums_the_collected_list() {
     );
 }
 
-#[test]
-fn mutation_through_a_fetched_copy_is_a_loud_error() {
-    // Issue #137, Directive 4 (decision: loud until borrowed accessors
-    // land): `item = self.find(name)` then `item.qty -= qty` — the local
-    // holds a COPY of the container-stored object, so the mutation would
-    // be lost (CPython's reaches the stored object through the
-    // reference). The conversion names the construct and the rewrite.
-    let err = compile_err(
-        concat!(
-            "class Item:\n",
-            "    def __init__(self) -> None:\n",
-            "        self.qty: int = 0\n",
-            "\n",
-            "class Bag:\n",
-            "    def __init__(self) -> None:\n",
-            "        self.items: dict[str, Item] = {}\n",
-            "    def find(self, name: str) -> Item | None:\n",
-            "        return self.items.get(name)\n",
-            "    def take(self, name: str, qty: int) -> int:\n",
-            "        item = self.find(name)\n",
-            "        if item is None:\n",
-            "            raise KeyError(name)\n",
-            "        item.qty -= qty\n",
-            "        return item.qty\n",
-        ),
-        "aliasmut.py",
-    );
-    assert!(
-        err.contains("mutating `item.qty` is not supported yet")
-            && err.contains("holds a copy of a container-stored object")
-            && err.contains("mutate through the container"),
-        "the aliasing refusal must name the construct and the rewrite: {}",
-        err
-    );
-}
 
 #[test]
 fn an_overriding_derived_argument_into_a_base_slot_is_loud() {
@@ -14704,6 +14669,87 @@ fn sorted_over_class_valued_pairs_sorts_by_key_with_cpython_tie_panic() {
     assert!(
         out.contains("sorted_pairs (&"),
         "the unordered-pair sort must route to sorted_pairs: {}",
+        out
+    );
+}
+
+#[test]
+fn mutation_through_a_fetch_local_writes_back_to_the_container() {
+    // Round 99 (Directive 4's borrowed-accessor increment):
+    // `item = self.items.get(name)` then `item.qty -= qty` — the local is
+    // a VIEW of the container slot in CPython, so the mutation must reach
+    // it: the lowering writes back (mutate a copy, store the slot, rebind
+    // the local) instead of the silent-loss form.
+    let out = compile(
+        concat!(
+            "class Item:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.qty: int = 0\n",
+            "\n",
+            "class Bag:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items: dict[str, Item] = {}\n",
+            "    def take(self, name: str, qty: int) -> int:\n",
+            "        item = self.items.get(name)\n",
+            "        if item is None:\n",
+            "            raise KeyError(name)\n",
+            "        item.qty -= qty\n",
+            "        return item.qty\n",
+        ),
+        "writeback.py",
+    );
+    assert!(
+        out.contains("py_set_index"),
+        "the mutation must write back to the container slot: {}",
+        out
+    );
+    assert!(
+        out.contains("__rython_v . qty = (__rython_v . qty) . py_sub")
+            || out.contains("__rython_v.qty = (__rython_v.qty).py_sub"),
+        "the mutation applies to the copy, then the slot stores it: {}",
+        out
+    );
+    assert!(
+        out.contains("fn take (& mut self") || out.contains("fn take(&mut self"),
+        "the write-back needs &mut self: {}",
+        out
+    );
+}
+
+#[test]
+fn mutation_through_a_one_hop_fetch_method_writes_back() {
+    // The idiom corpus's take: the fetch goes through a METHOD
+    // (`self.find(name)` whose body is a single
+    // `return self.items.get(name)`) — the provenance resolves the hop
+    // and the write-back still fires (the loud aliasing error is gone).
+    let out = compile(
+        concat!(
+            "class Item:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.qty: int = 0\n",
+            "\n",
+            "class Bag:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items: dict[str, Item] = {}\n",
+            "    def find(self, name: str) -> Item | None:\n",
+            "        return self.items.get(name)\n",
+            "    def take(self, name: str, qty: int) -> int:\n",
+            "        item = self.find(name)\n",
+            "        if item is None:\n",
+            "            raise KeyError(name)\n",
+            "        item.qty -= qty\n",
+            "        return item.qty\n",
+        ),
+        "onehop.py",
+    );
+    assert!(
+        out.contains("py_set_index"),
+        "the one-hop fetch resolves to the container slot: {}",
+        out
+    );
+    assert!(
+        !out.contains("the derived class overrides"),
+        "no loud error: {}",
         out
     );
 }

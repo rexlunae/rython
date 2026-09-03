@@ -1193,9 +1193,105 @@ impl ClassDef {
             .or(m.args.args.first())
             .map(|p| p.arg.clone())
             .unwrap_or_else(|| "self".to_string());
-        crate::analyze_scope_with(&m.body, &params, &resolve)
+        if crate::analyze_scope_with(&m.body, &params, &resolve)
             .needs_mut
             .contains(receiver_name.as_str())
+        {
+            return true;
+        }
+        // The fetch-writeback (round 99): a mutation through a local
+        // whose provenance resolves to a `self.<field>` container slot
+        // (`item = self.find(name)`; `item.qty -= qty`) writes the slot —
+        // the method needs `&mut self` even though no python-level store
+        // touches `self` (the generated py_set_index is invisible to the
+        // scope analysis).
+        let ctx = CodeGenContext::Class(self.name.clone());
+        Self::body_has_container_writeback_checked(&m.body, &ctx, symbols, options)
+    }
+
+    /// Whether any statement in `body` mutates a field THROUGH a
+    /// fetch-local whose provenance resolves to a `self.<field>` slot
+    /// (the write-back's &mut-self trigger, round 99).
+    fn body_has_container_writeback_checked(
+        body: &[crate::Statement],
+        ctx: &CodeGenContext,
+        symbols: &SymbolTableScopes,
+        options: &PythonOptions,
+    ) -> bool {
+        fn walk(
+            stmts: &[crate::Statement],
+            ctx: &CodeGenContext,
+            symbols: &SymbolTableScopes,
+            options: &PythonOptions,
+        ) -> bool {
+            for stmt in stmts {
+                let targets: Vec<&ExprType> = match &stmt.statement {
+                    crate::StatementType::AugAssign(a) => vec![&a.target],
+                    crate::StatementType::Assign(a) => a.targets.iter().collect(),
+                    crate::StatementType::If(s) => {
+                        if walk(&s.body, ctx, symbols, options)
+                            || walk(&s.orelse, ctx, symbols, options)
+                        {
+                            return true;
+                        }
+                        continue;
+                    }
+                    crate::StatementType::For(s) => {
+                        if walk(&s.body, ctx, symbols, options)
+                            || walk(&s.orelse, ctx, symbols, options)
+                        {
+                            return true;
+                        }
+                        continue;
+                    }
+                    crate::StatementType::While(s) => {
+                        if walk(&s.body, ctx, symbols, options)
+                            || walk(&s.orelse, ctx, symbols, options)
+                        {
+                            return true;
+                        }
+                        continue;
+                    }
+                    crate::StatementType::Try(s) => {
+                        if walk(&s.body, ctx, symbols, options) {
+                            return true;
+                        }
+                        for h in &s.handlers {
+                            if walk(&h.body, ctx, symbols, options) {
+                                return true;
+                            }
+                        }
+                        if walk(&s.orelse, ctx, symbols, options)
+                            || walk(&s.finalbody, ctx, symbols, options)
+                        {
+                            return true;
+                        }
+                        continue;
+                    }
+                    crate::StatementType::With(s) => {
+                        if walk(&s.body, ctx, symbols, options) {
+                            return true;
+                        }
+                        continue;
+                    }
+                    _ => continue,
+                };
+                for t in targets {
+                    if let ExprType::Attribute(attr) = t
+                        && let ExprType::Name(n) = attr.value.as_ref()
+                        && n.id != "self"
+                        && crate::ast::tree::fetch_provenance::fetch_provenance(
+                            &n.id, ctx, options, symbols,
+                        )
+                        .is_some()
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        walk(body, ctx, symbols, options)
     }
 
     /// Infer the struct field list from the `self.attr = ...` stores in

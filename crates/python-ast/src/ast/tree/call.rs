@@ -9987,12 +9987,17 @@ fn map_call_arguments_inner(
                 let tokens = expr
                     .clone()
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                let inner_ty = crate::ast::tree::type_ctx::coerce_tokens(
+                // An unboxable inner (a class slot — no From<PyValue>) is
+                // NOT coercible: the raw mismatch stays loud (round 99 —
+                // the class-annotation slot widened the slot set, so this
+                // is reachable; a panic here would crash the conversion).
+                let Some(inner_ty) = crate::ast::tree::type_ctx::coerce_tokens(
                     quote!(__rython_v),
                     &crate::TypeInfo::PyValue,
                     inner,
-                )
-                .expect("boxable inner converts from PyValue");
+                ) else {
+                    return Ok(tokens);
+                };
                 return Ok(quote!(Some({
                     let __rython_v = #tokens;
                     #inner_ty

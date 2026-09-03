@@ -1,0 +1,120 @@
+{
+  "rypip_commit": "111cff8",
+  "rypip_path": "/Users/tserica/rython/target/debug/rypip",
+  "elapsed_seconds": 273.1,
+  "packages": {
+    "urllib3": {
+      "package": "urllib3",
+      "requirement": "urllib3==2.0.7",
+      "convert_status": 101,
+      "convert_stderr": "\nthread 'main' (42744896) panicked at crates/python-ast/src/ast/tree/call.rs:9995:18:\nboxable inner converts from PyValue\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+      "total": null
+    },
+    "certifi": {
+      "total": 0,
+      "histogram": {},
+      "e0308_pairs": {},
+      "package": "certifi",
+      "requirement": "certifi==2025.1.31",
+      "convert_status": 0,
+      "build_status": 0
+    },
+    "idna": {
+      "total": 51,
+      "histogram": {
+        "E0308": 30,
+        "E0599": 10,
+        "E0277": 6,
+        "E0382": 4,
+        "E0432": 1
+      },
+      "e0308_pairs": {
+        "Vec<i64> | PyValue": 5,
+        "&PyValue | &&str": 5,
+        "Vec<_> | String": 3,
+        "&[u8] | &PyValue": 2,
+        "&PyValue | &{integer}": 1,
+        "&PyValue | &String": 1,
+        "Vec<_> | PyValue": 1,
+        "&[u8] | Vec<u8>": 1,
+        "String | PyValue": 1,
+        "PyValue | Vec<u8>": 1,
+        "&[Vec<u8>] | &Vec<PyValue>": 1,
+        "PyValue | &str": 1,
+        "i64 | PyValue": 1
+      },
+      "package": "idna",
+      "requirement": "idna==3.10",
+      "convert_status": 0,
+      "build_status": 101
+    },
+    "charset_normalizer": {
+      "total": 163,
+      "histogram": {
+        "E0308": 58,
+        "E0277": 48,
+        "E0599": 28,
+        "E0609": 12,
+        "E0615": 3,
+        "E0061": 3,
+        "E0425": 2,
+        "E0369": 2,
+        "E0596": 2,
+        "E0507": 2,
+        "E0382": 2,
+        "E0618": 1
+      },
+      "e0308_pairs": {
+        "Vec<_> | PyRange": 5,
+        "PyValue | (_, _)": 5,
+        "Vec<_> | String": 4,
+        "PyValue | Option<Vec<CharsetMatch>>": 3,
+        "&[_] | IntoIter<bool>": 3,
+        "String | (String, String)": 3,
+        "String | (String, Vec<f64>)": 3,
+        "HashSet<String> | HashSet<&str>": 3,
+        "String | Vec<String>": 3,
+        "PyValue | Option<_>": 2,
+        "String | Option<String>": 2,
+        "bool | Vec<String>": 2,
+        "PyValue | Vec<PyValue>": 2,
+        "f64 | stdpython::PyValue": 2,
+        "Vec<String> | Option<Vec<String>>": 2,
+        "String | bool": 2,
+        "String | f64": 2,
+        "PyValue | Option<Vec<Option<CharsetMatch>>>": 1,
+        "PyValue | PyFile": 1,
+        "Option<String> | (Option<String>, i64)": 1,
+        "&[String] | &Vec<(Option<String>, i64)>": 1,
+        "&Option<String> | &String": 1,
+        "Option<(String, String)> | Option<String>": 1,
+        "&[(String, f64)] | &Vec<((String, Vec<f64>), f64)>": 1,
+        "PyValue | Vec<Vec<u8>>": 1,
+        "PyValue | Vec<u8>": 1,
+        "Vec<u8> | Option<Vec<u8>>": 1,
+        "&[CharsetMatch] | &PyValue": 1,
+        "IndexMap<String, PyValue> | IndexMap<String, String>": 1,
+        "&PyValue | &&str": 1,
+        "&[u8] | PyValue": 1,
+        "Option<String> | (String, PyValue)": 1,
+        "Vec<u8> | PyValue": 1
+      },
+      "package": "charset_normalizer",
+      "requirement": "charset-normalizer==3.4.1",
+      "convert_status": 0,
+      "build_status": 101
+    },
+    "requests": {
+      "package": "requests",
+      "requirement": "requests==2.32.3",
+      "convert_status": 101,
+      "convert_stderr": "\nthread 'main' (42745915) panicked at crates/python-ast/src/ast/tree/call.rs:9995:18:\nboxable inner converts from PyValue\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+      "total": null
+    }
+  },
+  "idioms": {
+    "passed": 0,
+    "total": 10,
+    "passing": []
+  }
+}

@@ -88,6 +88,62 @@ impl CodeGen for AugAssign {
             && let Some(crate::TypeInfo::Option(inner)) = options.name_types.get(&n.id)
             && matches!(**inner, crate::TypeInfo::Class(_))
         {
+            // The borrowed-accessor increment (Directive 4): a mutation
+            // through a fetch-local whose provenance resolves to a
+            // container slot (`item = self.find(name)` then
+            // `item.qty -= qty`) writes back — mutate a copy, store it
+            // into the slot, and rebind the local. CPython's local holds
+            // a reference to the stored object, so the mutation is
+            // observable through the container (the idiom corpus's take:
+            // total() prints the mutated qty).
+            let aug_method = match self.op {
+                crate::BinOps::Add => "py_add",
+                crate::BinOps::Sub => "py_sub",
+                crate::BinOps::Mult => "py_mul",
+                crate::BinOps::Div => "py_truediv",
+                crate::BinOps::Mod => "py_mod",
+                crate::BinOps::Pow => "py_pow",
+                crate::BinOps::LShift => "py_lshift",
+                crate::BinOps::RShift => "py_rshift",
+                crate::BinOps::BitAnd => "py_and",
+                crate::BinOps::BitOr => "py_or",
+                crate::BinOps::BitXor => "py_xor",
+                crate::BinOps::FloorDiv => "py_floordiv",
+                _ => "",
+            };
+            if !aug_method.is_empty()
+                && let Some(prov) = crate::ast::tree::fetch_provenance::fetch_provenance(
+                    &n.id, &ctx, &options, &symbols,
+                )
+            {
+                let recv_tokens = n.id.clone();
+                let recv_ident = crate::safe_ident(&recv_tokens);
+                let field_ident = crate::safe_ident(&attr.attr);
+                let method_ident = crate::safe_ident(aug_method);
+                let container = prov
+                    .container
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                let key = crate::render_typed_reused(
+                    &prov.key,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                    Some(crate::TypeInfo::String),
+                )?;
+                let value = self.value.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                return Ok(quote!({
+                    let mut __rython_v = (#recv_ident).clone().unwrap_or_else(|| {
+                        panic!(
+                            "AttributeError: 'NoneType' object has no attribute '{}'",
+                            stringify!(#field_ident)
+                        )
+                    });
+                    __rython_v.#field_ident =
+                        (__rython_v.#field_ident).#method_ident(&(#value));
+                    (#container).py_set_index(#key, __rython_v.clone())?;
+                    #recv_ident = Some(__rython_v);
+                }));
+            }
             return Err(format!(
                 "mutating `{}.{}` is not supported yet: `{}` holds a copy of a \
                  container-stored object (fetched with `{} = ...`), so the mutation \

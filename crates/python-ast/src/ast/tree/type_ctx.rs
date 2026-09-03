@@ -510,23 +510,6 @@ fn infer_type_inner(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> TypeInfo {
-    thread_local! { static R99_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
-    let d = R99_DEPTH.with(|c| c.get());
-    if d > 40 {
-        return TypeInfo::PyObject;
-    }
-    R99_DEPTH.with(|c| c.set(d + 1));
-    let r = infer_type_body(ctx, expr, options, symbols);
-    R99_DEPTH.with(|c| c.set(d));
-    r
-}
-
-fn infer_type_body(
-    ctx: Option<&CodeGenContext>,
-    expr: &ExprType,
-    options: &PythonOptions,
-    symbols: &SymbolTableScopes,
-) -> TypeInfo {
     match expr {
         ExprType::Constant(c) => match &c.0 {
             Some(litrs::Literal::Integer(_)) => TypeInfo::Int,
@@ -564,8 +547,16 @@ fn infer_type_body(
                     _ => {}
                 }
             }
-            // 4. The symbol table's recorded assignment.
-            if let Some(SymbolTableNode::Assign { value, .. }) = symbols.get(&n.id) {
+            // 4. The symbol table's recorded assignment. A SELF-
+            // referential binding (`value = "%s" % (name, value)` — the
+            // rebind reads the OLD value, whose type the parameter
+            // annotation already pinned) must not recurse through its own
+            // value — the type comes from the earlier store, not the
+            // value (round 99: the get-then-mutate analysis re-entered
+            // here and overflowed).
+            if let Some(SymbolTableNode::Assign { value, .. }) = symbols.get(&n.id)
+                && !crate::expr_references(value, &n.id)
+            {
                 return infer_type_inner(ctx, value, options, symbols);
             }
             // A CLASS NAME read as a VALUE (`[ChecksumError]`,
@@ -727,7 +718,26 @@ fn infer_type_body(
                     ExprType::Name(n) if crate::is_numpy_alias(&n.id)
                 );
                 match attr.attr.as_str() {
-                    "get" | "pop" | "setdefault" => TypeInfo::PyObject,
+                    // Dict fetch methods: `.get(k)` is Option<V>, the
+                    // receiver's Dict type is the authority (round 99 —
+                    // the fetch-local's type, which the get-then-mutate
+                    // write-back keys off). The 2-ARG get supplies a
+                    // default: plain V.
+                    "get" if call.args.len() == 1 => {
+                        match infer_type_inner(ctx, &attr.value, options, symbols) {
+                            TypeInfo::Dict(_, v) => {
+                                TypeInfo::Option(Box::new((*v).clone()))
+                            }
+                            _ => TypeInfo::PyObject,
+                        }
+                    }
+                    "get" if call.args.len() >= 2 => {
+                        match infer_type_inner(ctx, &attr.value, options, symbols) {
+                            TypeInfo::Dict(_, v) => (*v).clone(),
+                            _ => TypeInfo::PyObject,
+                        }
+                    }
+                    "pop" | "setdefault" => TypeInfo::PyObject,
                     _ if on_numpy => TypeInfo::NdArray,
                     // Dict VIEW methods carry the (key, value) pair type
                     // (`self.items.items()` → Vec<(str, Item)> — the idiom
@@ -2275,6 +2285,24 @@ fn analyze_statement_types(
                     None => match &assign.value {
                         ExprType::Call(c) => {
                             call_return_typeinfo(c, symbols, options)
+                                .or_else(|| {
+                                    // The ctx-aware inferrer: a dict-method
+                                    // fetch (`item = self.items.get(k)` —
+                                    // Option<Item>) resolves through the
+                                    // receiver's field table, which the
+                                    // syntactic path cannot see (round 99).
+                                    let analysis_ctx = self_class
+                                        .map(|cl| CodeGenContext::Class(cl.to_string()));
+                                    match (options, symbols) {
+                                        (Some(options), Some(symbols)) => Some(infer_type(
+                                            analysis_ctx.as_ref(),
+                                            &assign.value,
+                                            options,
+                                            symbols,
+                                        )),
+                                        _ => None,
+                                    }
+                                })
                                 .unwrap_or_else(|| syntactic_type(&assign.value))
                         }
                         // A BINOP value needs the context-aware inferrer:
