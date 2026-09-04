@@ -1357,13 +1357,13 @@ where
 }
 
 /// Python all() function - returns True if all elements are truthy
-pub fn all<T: Truthy>(iterable: &[T]) -> bool {
-    iterable.iter().all(|x| x.is_truthy())
+pub fn all<T: Truthy, I: IntoIterator<Item = T>>(iterable: I) -> bool {
+    iterable.into_iter().all(|x| x.is_truthy())
 }
 
 /// Python any() function - returns True if any element is truthy
-pub fn any<T: Truthy>(iterable: &[T]) -> bool {
-    iterable.iter().any(|x| x.is_truthy())
+pub fn any<T: Truthy, I: IntoIterator<Item = T>>(iterable: I) -> bool {
+    iterable.into_iter().any(|x| x.is_truthy())
 }
 
 /// Python enumerate() function - returns iterator with index and value
