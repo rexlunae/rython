@@ -350,15 +350,44 @@ impl<'a> CodeGen for Attribute {
         // models exceptions as name + message), so the read lowers to
         // the boxed None (the dynamic-attribute divergence). Computed
         // before `self.value`/`symbols` are moved below.
-        let except_binding_receiver: Option<String> = match self.value.as_ref() {
+        let except_binding_receiver: Option<(String, Option<String>)> = match self.value.as_ref() {
             ExprType::Name(receiver) => match symbols.get(&receiver.id) {
-                Some(crate::SymbolTableNode::ExceptBinding) => {
-                    Some(receiver.id.clone())
+                Some(crate::SymbolTableNode::ExceptBinding(cls)) => {
+                    Some((receiver.id.clone(), cls.clone()))
                 }
                 _ => None,
             },
             _ => None,
         };
+        // A MODELED exception field read (`e.needed` on a caught
+        // InsufficientFunds whose __init__ stored self.needed — bank,
+        // round 99): the typed accessor's FULL tokens, computed HERE
+        // before the moves below.
+        let modeled_exc_field: Option<proc_macro2::TokenStream> = except_binding_receiver
+            .as_ref()
+            .and_then(|(_, caught)| {
+                let cls_name = caught.as_ref()?;
+                let cls = match symbols.get(cls_name) {
+                    Some(crate::SymbolTableNode::ClassDef(c)) => c,
+                    _ => return None,
+                };
+                let ty = crate::exception_field_type(cls, &self.attr, &symbols, &options)?;
+                let recv = self
+                    .value
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                    .ok()?;
+                let attr_name = &self.attr;
+                Some(match ty {
+                    crate::TypeInfo::Int => {
+                        quote!((#recv).attr_i64(#attr_name)?)
+                    }
+                    crate::TypeInfo::String => {
+                        quote!((#recv).attr_string(#attr_name)?)
+                    }
+                    _ => quote!(stdpython::PyValue::None_),
+                })
+            });
         // True when the chain's root is a vendored `[python-modules]`
         // dependency — those lower to `crate::<dep>::<attr>` paths (see
         // the emission below). Computed before `self.value` is moved.
@@ -602,7 +631,13 @@ impl<'a> CodeGen for Attribute {
             // fields): the exception object has no static fields (rython
             // models exceptions as name + message), so the read lowers to
             // the boxed None (the dynamic-attribute divergence).
-            if let Some(receiver) = &except_binding_receiver {
+            if let Some((receiver, _caught)) = &except_binding_receiver {
+                // A MODELED exception field (`e.needed` — bank, round
+                // 99): the typed accessor, precomputed above before the
+                // moves.
+                if let Some(tokens) = &modeled_exc_field {
+                    return Ok(tokens.clone());
+                }
                 warnings.borrow_mut().push(format!(
                     "`{}.{}` is dropped: the receiver is an exception object \
                      bound by `except ... as`, and rython models exceptions \

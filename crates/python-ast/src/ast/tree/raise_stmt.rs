@@ -409,6 +409,22 @@ fn exception_value(
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
     match exc {
         ExprType::Call(call) => {
+            // An IN-CRATE exception class with a modeled __init__: render
+            // the class's own message and carry its field stores as attrs
+            // (bank's InsufficientFunds — round 99). Runs FIRST (before
+            // the message builders move ctx/options/symbols below).
+            if let ExprType::Name(name) = call.func.as_ref()
+                && let Some(crate::SymbolTableNode::ClassDef(cls)) = symbols.get(&name.id)
+                && let Some(tokens) = crate::exception_class_raise(
+                    cls,
+                    call,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?
+            {
+                return Ok(tokens);
+            }
             // `raise ssl.SSLError(...)` — the dotted stdlib exception
             // spelling (urllib3's pyopenssl): canonicalize like the bare
             // name, constructing the tagged PyException (the runtime
@@ -485,6 +501,14 @@ fn exception_value(
                     || resolved_is_exception_class(&name.id, &options, &symbols)
                 {
                     let kind = &name.id;
+                    // An IN-CRATE exception class with a modeled __init__
+                    // (`class InsufficientFunds(BankError)` whose __init__
+                    // calls super().__init__(f"need {needed}, have
+                    // {available}") and stores self.needed/self.available
+                    // — bank, round 99): render the __init__'s own message
+                    // (CPython's exact text) and carry the field stores as
+                    // attrs. Falls back to the positional message when the
+                    // class is not resolvable in this module.
                     let msg = match call.args.len() {
                         0 => quote!(String::new()),
                         1 => {
@@ -563,4 +587,213 @@ fn resolved_is_exception_class(
 mod tests {
     // Tests would go here - currently commented out as they need full AST infrastructure
     // create_parse_test!(test_simple_raise, "raise ValueError('error')", "test.py");
+}
+/// The construction of an IN-CRATE exception class with a modeled
+/// __init__ (`raise InsufficientFunds(amount, self.balance)` — bank,
+/// round 99): render the __init__'s OWN message (its super().__init__
+/// argument with the params bound — CPython's exact text, e.g.
+/// "need 100, have 30") and carry the __init__'s `self.<f> = <param>`
+/// stores as the exception's attrs (so `e.needed` resolves later).
+/// Returns None when the class's __init__ does not have the modeled
+/// shape (the positional-message fallback stands).
+pub(crate) fn exception_class_raise(
+    cls: &crate::ClassDef,
+    call: &crate::Call,
+    ctx: crate::CodeGenContext,
+    options: crate::PythonOptions,
+    symbols: crate::SymbolTableScopes,
+) -> Result<Option<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
+    use crate::{ExprType, Statement, StatementType};
+    let Some(init) = cls.init_method() else {
+        return Ok(None);
+    };
+    // The __init__ params AFTER self: [needed, available].
+    let params: Vec<&str> = init
+        .args
+        .args
+        .iter()
+        .skip(1)
+        .map(|a| a.arg.as_str())
+        .collect();
+    if call.args.len() != params.len() || params.is_empty() {
+        return Ok(None);
+    }
+    // Find the super().__init__(<msg>) call in the __init__ body.
+    let mut msg_expr: Option<ExprType> = None;
+    let mut fields: Vec<(String, usize)> = Vec::new(); // (field, param idx)
+    for stmt in &init.body {
+        match &stmt.statement {
+            StatementType::Assign(a) => {
+                // self.<field> = <param>
+                if let [ExprType::Attribute(attr)] = a.targets.as_slice()
+                    && let ExprType::Name(r) = attr.value.as_ref()
+                    && r.id == "self"
+                    && let ExprType::Name(v) = &a.value
+                {
+                    if let Some(idx) = params.iter().position(|p| *p == v.id) {
+                        fields.push((attr.attr.clone(), idx));
+                    }
+                }
+            }
+            StatementType::Expr(e) => {
+                // super().__init__(<msg>) — an expression statement call.
+                if let ExprType::Call(sc) = &e.value {
+                    let is_super_init = match sc.func.as_ref() {
+                        ExprType::Attribute(attr) if attr.attr == "__init__" => {
+                            matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "super")
+                                || matches!(attr.value.as_ref(), ExprType::Call(c2)
+                                    if matches!(c2.func.as_ref(), ExprType::Name(n) if n.id == "super"))
+                        }
+                        _ => false,
+                    };
+                    if is_super_init && !sc.args.is_empty() && msg_expr.is_none() {
+                        msg_expr = Some((sc.args[0]).clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Render the message: substitute the __init__ params with the raise
+    // call's args (positional), then render the substituted expression.
+    let msg = if let Some(mut m) = msg_expr {
+        substitute_params(&mut m, &params, &call.args);
+        let msg_tok = m.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        quote::quote!(format!("{}", #msg_tok))
+    } else {
+        return Ok(None);
+    };
+    // The attrs: each field's value is the corresponding raise arg, boxed.
+    let kind = &cls.name;
+    let attr_pairs: std::result::Result<Vec<_>, Box<dyn std::error::Error>> = fields
+        .iter()
+        .map(|(f, idx)| {
+            let a = call.args[*idx].clone().to_rust(
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )?;
+            Ok(quote::quote!((#f . to_string (), stdpython :: PyValue :: from (#a))))
+        })
+        .collect();
+    let attr_pairs = attr_pairs?;
+    // The class's ancestor chain (BankError, Exception — resolved
+    // through the bases) attaches so `isinstance(v, BankError)` and an
+    // `except BankError:` reach the raised InsufficientFunds.
+    let mut ancestors: Vec<String> = Vec::new();
+    let is_exc = |n: &str| {
+        crate::ast::tree::raise_stmt::is_exception_class_name(n)
+            || match symbols.get(n) {
+                Some(crate::SymbolTableNode::ClassDef(c)) => {
+                    crate::is_exception_class(c)
+                }
+                _ => false,
+            }
+    };
+    let mut cur: Option<&str> = None;
+    if let Some(ExprType::Name(b)) = cls.bases.first() {
+        cur = Some(b.id.as_str());
+    }
+    let mut guard = 0;
+    while let Some(base_name) = cur {
+        guard += 1;
+        if guard > 64 {
+            break;
+        }
+        if is_exc(base_name) {
+            ancestors.push(base_name.to_string());
+        }
+        cur = match symbols.get(base_name) {
+            Some(crate::SymbolTableNode::ClassDef(b)) => {
+                match b.bases.iter().find_map(|bb| match bb {
+                    ExprType::Name(n) if is_exc(&n.id) => Some(n.id.as_str()),
+                    _ => None,
+                }) {
+                    Some(next) => Some(next),
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+    }
+    let ancestor_tokens: Vec<proc_macro2::TokenStream> = ancestors
+        .iter()
+        .map(|a| quote::quote!((#a) . to_string ()))
+        .collect();
+    Ok(Some(quote::quote! {
+        stdpython :: PyException :: new_with_attrs_and_ancestors (
+            #kind , #msg , vec ! [#(#attr_pairs),*] ,
+            vec ! [#(#ancestor_tokens),*]
+        )
+    }))
+}
+
+/// Substitute the __init__ params in a message expression with the raise
+/// call's args (positionally) — an AST rewrite so the f-string renders
+/// against the raise site's scope.
+fn substitute_params(expr: &mut ExprType, params: &[&str], args: &[ExprType]) {
+    use crate::{ExprType, Statement};
+    match expr {
+        ExprType::Name(n) => {
+            if let Some(idx) = params.iter().position(|p| *p == n.id) {
+                *expr = args[idx].clone();
+            }
+        }
+        ExprType::JoinedStr(j) => {
+            for part in &mut j.values {
+                if let ExprType::FormattedValue(f) = part {
+                    substitute_params(&mut f.value, params, args);
+                }
+            }
+        }
+        ExprType::BinOp(b) => {
+            substitute_params(&mut b.left, params, args);
+            substitute_params(&mut b.right, params, args);
+        }
+        ExprType::Call(c) => {
+            substitute_params(&mut c.func, params, args);
+            for a in &mut c.args {
+                substitute_params(a, params, args);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A modeled exception field's type: the exception class's __init__
+/// stores `self.<field> = <param>` where the param's annotation types it
+/// (`self.needed = needed` with `needed: int` → Int — bank's e.needed,
+/// round 99). None for an unmodeled read.
+pub(crate) fn exception_field_type(
+    cls: &crate::ClassDef,
+    field: &str,
+    symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> Option<crate::TypeInfo> {
+    let init = cls.init_method()?;
+    for stmt in &init.body {
+        if let crate::StatementType::Assign(a) = &stmt.statement
+            && let [ExprType::Attribute(attr)] = a.targets.as_slice()
+            && attr.attr == field
+            && let ExprType::Name(r) = attr.value.as_ref()
+            && r.id == "self"
+            && let ExprType::Name(v) = &a.value
+        {
+            // The param's annotation types the field.
+            let param = init
+                .args
+                .args
+                .iter()
+                .find(|p| p.arg == v.id)?;
+            if let Some(ann) = param.annotation.as_ref()
+                && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
+            {
+                return Some(t);
+            }
+            // An unannotated param: fall back to Int for the arithmetic
+            // shapes the corpus exercises; a broader model can widen.
+            return Some(crate::TypeInfo::Int);
+        }
+    }
+    None
 }

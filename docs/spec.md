@@ -2306,7 +2306,7 @@ accepted as permanent spec:
 | Divergence | Status |
 |---|---|
 | True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |
-| Exception message shapes: `KeyError` renders keys with Rust `Debug` quoting; `int()`'s message omits "with base 10"; `open` errors embed Rust `io::Error` text instead of `[Errno N]` | Defect class, same family as issue #82 |
+| Exception message shapes: `int()`'s message omits "with base 10"; `open` errors embed Rust `io::Error` text instead of `[Errno N]` (the `KeyError` key quoting was fixed — single-quoted like CPython, round 99) | Defect class, same family as issue #82 |
 | An uncaught exception on the direct-`main` entry path prints Rust's `Debug` form instead of `Type: message` (exit code 1 either way) | Defect (cosmetic) |
 | The kernel device-manifest sub-mode skips the module-wide floating-point scan | Defect, issue #108 |
 | Generator expressions are materialized eagerly (side-effect timing differs from lazy CPython) | Model limit until generator lowering lands |

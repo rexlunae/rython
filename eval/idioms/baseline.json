@@ -1,8 +1,7 @@
 {
   "programs": {
     "bank": {
-      "status": "build-failed",
-      "errors": 11
+      "status": "pass"
     },
     "clauses": {
       "status": "pass"
@@ -18,7 +17,7 @@
     },
     "pipeline": {
       "status": "build-failed",
-      "errors": 6
+      "errors": 5
     },
     "records": {
       "status": "build-failed",

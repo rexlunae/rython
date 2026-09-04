@@ -2695,20 +2695,42 @@ impl<'a> CodeGen for Call {
                                 ExprType::Call(call)
                                     if let ExprType::Name(f) = call.func.as_ref() =>
                                 {
-                                    let kind = &f.id;
-                                    let msg = match call.args.len() {
-                                        0 => quote!(String::new()),
+                                    // The CLASS-AWARE construction (the
+                                    // __init__ message + the attrs + the
+                                    // ancestor chain) when the class is
+                                    // in-crate; the quoted kind otherwise.
+                                    match symbols.get(&f.id) {
+                                        Some(crate::SymbolTableNode::ClassDef(cls)) => {
+                                            crate::ast::tree::raise_stmt::exception_class_raise(
+                                                cls,
+                                                call,
+                                                ctx.clone(),
+                                                options.clone(),
+                                                symbols.clone(),
+                                            )?
+                                            .unwrap_or_else(|| {
+                                                let kind = &f.id;
+                                                let m = crate::ast::tree::raise_stmt::message_arg(
+                                                    &call.args[0],
+                                                    ctx.clone(),
+                                                    options.clone(),
+                                                    symbols.clone(),
+                                                )
+                                                .unwrap_or_else(|_| quote!(""));
+                                                quote!(PyException::new(#kind, format!("{}", #m)))
+                                            })
+                                        }
                                         _ => {
+                                            let kind = &f.id;
                                             let m = crate::ast::tree::raise_stmt::message_arg(
                                                 &call.args[0],
                                                 ctx.clone(),
                                                 options.clone(),
                                                 symbols.clone(),
                                             )?;
-                                            quote!(format!("{}", #m))
+                                            quote!(PyException::new(#kind, format!("{}", #m)))
                                         }
-                                    };
-                                    quote!(PyException::new(#kind, #msg))
+                                    }
                                 }
                                 _ => self.args[0].clone().to_rust(
                                     ctx.clone(),
