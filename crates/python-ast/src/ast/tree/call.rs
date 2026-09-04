@@ -2230,6 +2230,7 @@ impl<'a> CodeGen for Call {
                     | "filter"
                     | "list"
                     | "isinstance"
+                    | "issubclass"
                     | "hash"
                     | "print"
                     | "open"
@@ -2374,17 +2375,24 @@ impl<'a> CodeGen for Call {
                                 .to_string()
                                 .into());
                         }
-                        let a = &rendered[0];
+                        let mut a = rendered[0].clone();
                         // A GENERATOR EXPRESSION arg (`sorted(w for w in
                         // counts if ...)` — text_stats's starts-with-q,
                         // round 99): the generator lowers to an EAGER
                         // iterator; sorted takes a slice — collect it.
-                        let sorted_arg = if matches!(self.args[0], ExprType::GeneratorExp(_)) {
-                            quote!(#a . collect :: < Vec < _ > > ())
-                        } else {
-                            quote!(#a)
-                        };
-                        let a = &sorted_arg;
+                        if matches!(self.args[0], ExprType::GeneratorExp(_)) {
+                            a = quote!(#a . collect :: < Vec < _ > > ());
+                        }
+                        // A DICT arg (`sorted(self.accounts)` in a finally
+                        // — bank's audit, round 99): CPython sorts the
+                        // dict's KEYS.
+                        if matches!(
+                            crate::infer_type(Some(&ctx), &self.args[0], &options, &symbols),
+                            crate::TypeInfo::Dict(_, _)
+                        ) {
+                            a = quote!(#a . py_keys ());
+                        }
+                        let a = &a;
                         let render = |e: crate::ExprType| {
                             e.to_rust(ctx.clone(), options.clone(), symbols.clone())
                         };
@@ -2539,6 +2547,74 @@ impl<'a> CodeGen for Call {
                     // lowering: it becomes the constant true/false when the
                     // argument's type is known (annotation or literal), and
                     // a loud error when it is not.
+                    // issubclass(C1, C2) over EXCEPTION classes (`issubclass(
+                    // InsufficientFunds, Exception)` — bank's probe, round
+                    // 99): the class names are statically decidable through
+                    // the exception base chain.
+                    "issubclass" => {
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        if self.args.len() != 2 {
+                            return Err("issubclass() takes exactly 2 arguments"
+                                .to_string()
+                                .into());
+                        }
+                        let (ExprType::Name(c1), ExprType::Name(c2)) =
+                            (&self.args[0], &self.args[1])
+                        else {
+                            return Err("issubclass() over non-class values is not supported: \
+                                         classes are not runtime values in rython"
+                                .to_string()
+                                .into());
+                        };
+                        let is_exc = |name: &str| -> bool {
+                            crate::ast::tree::raise_stmt::is_exception_class_name(name)
+                                || match symbols.get(name) {
+                                    Some(SymbolTableNode::ClassDef(cls)) => {
+                                        crate::is_exception_class(cls)
+                                    }
+                                    _ => false,
+                                }
+                        };
+                        if !is_exc(&c1.id) || !is_exc(&c2.id) {
+                            return Err(format!(
+                                "issubclass({}, {}) over non-exception classes is not \
+                                 supported yet (classes are not runtime values); rython \
+                                 refuses to silently ignore it",
+                                c1.id, c2.id
+                            )
+                            .into());
+                        }
+                        // Walk C1's base chain through the symbol table:
+                        // True when C2 is C1 or an ancestor.
+                        let mut base: Option<&str> = Some(&c1.id);
+                        let mut found = false;
+                        let mut guard = 0;
+                        while let Some(cur) = base {
+                            guard += 1;
+                            if guard > 64 {
+                                break;
+                            }
+                            if cur == c2.id {
+                                found = true;
+                                break;
+                            }
+                            base = match symbols.get(cur) {
+                                Some(SymbolTableNode::ClassDef(cls)) => {
+                                    match cls.bases.iter().find_map(|b| match b {
+                                        ExprType::Name(n) if is_exc(&n.id) => Some(n.id.as_str()),
+                                        _ => None,
+                                    }) {
+                                        Some(next) => Some(next),
+                                        None => None,
+                                    }
+                                }
+                                _ => None,
+                            };
+                        }
+                        return Ok(quote!(#found));
+                    }
                     "isinstance" => {
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
@@ -2596,15 +2672,50 @@ impl<'a> CodeGen for Call {
                                     _ => false,
                                 }
                         };
-                        if let ExprType::Name(_n) = &self.args[0]
+                        let first_is_caught_exc = match &self.args[0] {
+                            ExprType::Name(_) => true,
+                            // A CONSTRUCTED exception (`isinstance(
+                            // InsufficientFunds(1, 0), BankError)` —
+                            // bank's probe, round 99): the value's class
+                            // is the callee's — an exception class. The
+                            // construction renders the QUOTED kind (the
+                            // generic class-call path would emit the raw
+                            // class name).
+                            ExprType::Call(call) => matches!(
+                                call.func.as_ref(),
+                                ExprType::Name(f) if is_exc_class(&f.id)
+                            ),
+                            _ => false,
+                        };
+                        if first_is_caught_exc
                             && let ExprType::Name(t) = &self.args[1]
                             && is_exc_class(&t.id)
                         {
-                            let arg = self.args[0].clone().to_rust(
-                                ctx.clone(),
-                                options.clone(),
-                                symbols.clone(),
-                            )?;
+                            let arg = match &self.args[0] {
+                                ExprType::Call(call)
+                                    if let ExprType::Name(f) = call.func.as_ref() =>
+                                {
+                                    let kind = &f.id;
+                                    let msg = match call.args.len() {
+                                        0 => quote!(String::new()),
+                                        _ => {
+                                            let m = crate::ast::tree::raise_stmt::message_arg(
+                                                &call.args[0],
+                                                ctx.clone(),
+                                                options.clone(),
+                                                symbols.clone(),
+                                            )?;
+                                            quote!(format!("{}", #m))
+                                        }
+                                    };
+                                    quote!(PyException::new(#kind, #msg))
+                                }
+                                _ => self.args[0].clone().to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )?,
+                            };
                             let kind = &t.id;
                             return Ok(quote!((#arg).matches(#kind)));
                         }
