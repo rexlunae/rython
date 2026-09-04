@@ -215,6 +215,28 @@ impl CodeGen for Subscript {
                     symbols,
                     Some(crate::TypeInfo::Int),
                 )?;
+                // A RUST TUPLE's index read (`kv[1]` where kv: (String,
+                // i64) — the idiom corpus's sorted-key lambda, round 99)
+                // lowers to the field accessor: the tuple is the VALUE,
+                // not a runtime container. The index must be a constant.
+                if matches!(
+                    crate::infer_type(Some(&ctx), &self.value, &options, &symbols),
+                    crate::TypeInfo::Tuple(_)
+                ) {
+                    let idx_tokens = index.to_string();
+                    let idx: Option<i64> = idx_tokens.trim().parse().ok();
+                    match idx {
+                        Some(n) if n >= 0 => {
+                            return Ok(quote! { #value.#n });
+                        }
+                        _ => {
+                            return Err(format!(
+                                "indexing a Rust tuple with a non-constant index is not                                  supported yet; rython refuses to silently ignore it"
+                            )
+                            .into());
+                        }
+                    }
+                }
                 Ok(quote! { (#value).py_index(#index)? })
             }
             // Slices clamp and never raise.
