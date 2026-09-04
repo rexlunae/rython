@@ -953,6 +953,27 @@ fn infer_type_inner(
                             _ => TypeInfo::PyObject,
                         }
                     }
+                    _ if matches!(attr.value.as_ref(), ExprType::Name(_)) => {
+                        // A CLASS-receiver method call (V.parse("a") — a
+                        // classmethod whose return types the list-comp
+                        // holding it — records's Version.parse, round 99).
+                        let recv = match attr.value.as_ref() {
+                            ExprType::Name(n) => Some(n.id.clone()),
+                            _ => None,
+                        };
+                        match recv.and_then(|id| {
+                            let cls = match symbols.get(&id) {
+                                Some(crate::SymbolTableNode::ClassDef(c)) => c,
+                                _ => return None,
+                            };
+                            let method = cls.method_on_mro(&attr.attr, symbols)?;
+                            let ann = method.returns.as_deref()?;
+                            resolve_alias_typeinfo(ann, symbols, options)
+                        }) {
+                            Some(t) => return t,
+                            None => TypeInfo::PyObject,
+                        }
+                    }
                     _ => TypeInfo::PyObject,
                 }
             }
