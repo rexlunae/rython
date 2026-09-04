@@ -107,6 +107,8 @@ fn write_sample_package(root: &Path) {
     )
     .unwrap();
 }
+
+#[test]
 fn discovers_package_metadata_and_modules() {
     let scratch = Scratch::new("discover");
     write_sample_package(scratch.path());
