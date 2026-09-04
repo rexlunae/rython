@@ -3958,7 +3958,7 @@ impl<T: PyRefEq> PartialEq for PyRef<T> {
 /// PyRef<Version> — round 99). A class without `__lt__` keeps the
 /// default: unordered (None).
 pub trait PyRefOrd: Sized {
-    fn ref_cmp(a: &PyRef<Self>, b: &PyRef<Self>) -> Option<core::cmp::Ordering> {
+    fn ref_cmp(_a: &PyRef<Self>, _b: &PyRef<Self>) -> Option<core::cmp::Ordering> {
         None
     }
 }
