@@ -3814,3 +3814,34 @@ fn list_index_and_count_match_python() {
     assert_eq!(v.count(&"a".to_string()), 2);
     assert_eq!(v.count(&"z".to_string()), 0);
 }
+
+#[test]
+fn exception_attrs_and_key_repr_match_python() {
+    // The exception-attribute model: a constructed exception carries its
+    // __init__ fields (attr_i64) and its ancestor chain (matches on the
+    // base class); KeyError's key repr is single-quoted — verified
+    // against python3.
+    let e = stdpython::PyException::new_with_attrs_and_ancestors(
+        "InsufficientFunds",
+        "need 100, have 30",
+        vec![
+            ("needed".to_string(), stdpython::PyValue::from(100i64)),
+            ("available".to_string(), stdpython::PyValue::from(30i64)),
+        ],
+        vec!["BankError".to_string(), "Exception".to_string()],
+    );
+    assert_eq!(e.attr_i64("needed").unwrap(), 100);
+    assert_eq!(e.attr_i64("available").unwrap(), 30);
+    assert!(e.attr_i64("other").is_err(), "an absent field raises AttributeError");
+    assert!(e.matches("BankError"), "the ancestor chain reaches the base class");
+    assert_eq!(
+        stdpython::key_repr(&"carol".to_string()),
+        "'carol'"
+    );
+    assert_eq!(stdpython::key_repr(&7i64), "7");
+    let k: String = "carol".into();
+    let err = stdpython::PyDict::<String, i64>::new()
+        .py_index(k)
+        .unwrap_err();
+    assert_eq!(err.message, "'carol'", "KeyError quotes a str key like CPython");
+}

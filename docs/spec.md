@@ -2306,7 +2306,7 @@ accepted as permanent spec:
 | Divergence | Status |
 |---|---|
 | True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |
-| Exception message shapes: `KeyError` renders keys with Rust `Debug` quoting; `int()`'s message omits "with base 10"; `open` errors embed Rust `io::Error` text instead of `[Errno N]` | Defect class, same family as issue #82 |
+| Exception message shapes: `int()`'s message omits "with base 10"; `open` errors embed Rust `io::Error` text instead of `[Errno N]` (the `KeyError` key quoting was fixed — single-quoted like CPython, round 99) | Defect class, same family as issue #82 |
 | An uncaught exception on the direct-`main` entry path prints Rust's `Debug` form instead of `Type: message` (exit code 1 either way) | Defect (cosmetic) |
 | The kernel device-manifest sub-mode skips the module-wide floating-point scan | Defect, issue #108 |
 | Generator expressions are materialized eagerly (side-effect timing differs from lazy CPython) | Model limit until generator lowering lands |
@@ -2337,6 +2337,12 @@ accepted as permanent spec:
 | A dict iterated directly (`for w in counts`) yields its KEYS through the typed `py_keys()` view; CPython's dict iteration is also over keys — the typed PyDict's `IntoIterator` (pairs) is never used for the Python `for` lowering | Correct; matches CPython |
 | `swapcase` toggles each cased char's case (the UPPERCASE expansion: `ß`→`SS`, `ǆ`→`Ǆ`, `ﬃ`→`FFI`) | Correct; CPython-verified |
 | An out-of-range CONSTANT index on a statically-known HETEROGENEOUS Rust tuple is a loud conversion error (the runtime cannot express the failing access); on a homogeneous tuple it keeps the runtime's catchable `IndexError`; a non-constant index on a heterogeneous tuple is a loud conversion error naming the location and a rewrite | Correct-or-loud (the review's tuple-index round) |
+| The exception-attribute model (round 99) renders a raised in-crate exception's __init__ fields ONCE per role (the message and each attr re-render the raise ARG tokens) — an argument expression WITH side effects would run multiple times; the corpus's name/field args are single-evaluation | Model limit until argument tokens are bound once |
+| An exception __init__'s other statements (validation, logging, state changes beyond the self-stores and the super().__init__ message) do not run at the construction site | Model limit; the __init__ is modeled as message + field stores only |
+| An exception field of a NON-int/String type (bool, float, bytes, a container) reads as the boxed None with the dynamic-attribute warning — the typed accessors cover int/string | Model limit (loud through -W); extends with the boxed attr_value accessor |
+| A USER exception class derived from a BUILTIN (class MyError(ValueError)) records the builtin ancestor for is/issubclass but an `except ValueError:` HANDLER's matches_builtin fast path does not consult the user ancestor chain — the builtin-discriminant check misses it | Model limit; the handler's discriminant path would need the user-chain fallback |
+| issubclass(C1, C2) with KEYWORD or defaulted exception constructor arguments loses the fields/message | Model limit; positional-only for the modeled shape |
+| An unannotated exception __init__ param's field types as Int | Model limit; inferred typing for exception fields |
 | Old-style `%`-formatting of a DICT as a positional value (`"%s" % {...}`) raises "not enough arguments" instead of CPython's dict repr — the mapping form (`%(name)s`) is exact | Model limit (round 34); positional-vs-mapping mixing follows CPython's rejection |
 
 ---

@@ -157,7 +157,14 @@ impl CodeGen for Try {
             // instead of emitting a field that does not exist.
             let mut acc = acc;
             if let Some(name) = &handler.name {
-                acc.insert(name.clone(), crate::SymbolTableNode::ExceptBinding);
+                // The caught exception CLASS (the except clause's name),
+                // when it is a plain class name — the modeled-field reads
+                // resolve through it (round 99).
+                let caught = match &handler.exception_type {
+                    Some(ExprType::Name(n)) => Some(n.id.clone()),
+                    _ => None,
+                };
+                acc.insert(name.clone(), crate::SymbolTableNode::ExceptBinding(caught));
             }
             let symbols = handler.body.into_iter().fold(acc, |acc, stmt| stmt.find_symbols(acc));
             if let Some(exception_type) = handler.exception_type {
@@ -312,11 +319,26 @@ impl CodeGen for Try {
                 }
                 None => quote!(),
             };
+            // The handler body renders with a PER-HANDLER symbol view:
+            // the merged table's ExceptBinding for the bound name may
+            // carry a LATER handler's class (both bank handlers bind
+            // `as e` — find_symbols keeps the last insertion). Insert
+            // THIS handler's class so the modeled-field reads resolve
+            // (round 99).
+            let mut handler_symbols = symbols.clone();
+            if let Some(name) = &handler.name {
+                let caught = match &handler.exception_type {
+                    Some(ExprType::Name(n)) => Some(n.id.clone()),
+                    _ => None,
+                };
+                handler_symbols
+                    .insert(name.clone(), crate::SymbolTableNode::ExceptBinding(caught));
+            }
             let arm_body = lower_finally_guarded_body(
                 handler.body,
                 handler_ctx.clone(),
                 &options,
-                &symbols,
+                &handler_symbols,
                 has_finally,
                 &finally_tokens,
                 &break_return,

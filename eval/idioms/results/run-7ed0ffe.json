@@ -1,0 +1,101 @@
+{
+  "converter_commit": "7ed0ffe",
+  "repo_head": "7ed0ffe",
+  "rypip_path": "target/debug/rypip",
+  "oracle": "CPython 3.14.1 (pins captured under 3.11)",
+  "passed": 10,
+  "total": 13,
+  "passing": [
+    "bank",
+    "clauses",
+    "inventory",
+    "ledger",
+    "matrix",
+    "shapes",
+    "text_stats",
+    "tokenizer",
+    "tree",
+    "views"
+  ],
+  "programs": {
+    "bank": {
+      "program": "bank",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "clauses": {
+      "program": "clauses",
+      "warnings": 1,
+      "status": "pass"
+    },
+    "inventory": {
+      "program": "inventory",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "ledger": {
+      "program": "ledger",
+      "warnings": 1,
+      "status": "pass"
+    },
+    "matrix": {
+      "program": "matrix",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "pipeline": {
+      "program": "pipeline",
+      "warnings": 13,
+      "status": "build-failed",
+      "errors": 5,
+      "histogram": {
+        "E0277": 3,
+        "E0308": 1,
+        "E0282": 1
+      }
+    },
+    "records": {
+      "program": "records",
+      "warnings": 4,
+      "status": "build-failed",
+      "errors": 16,
+      "histogram": {
+        "E0308": 5,
+        "E0277": 4,
+        "E0599": 3,
+        "E0615": 3,
+        "E0369": 1
+      }
+    },
+    "schedule": {
+      "program": "schedule",
+      "status": "convert-failed",
+      "detail": "t schedule.py:18:1-41:62 [location=schedule.py:18:1-41:62, message=`cal` (a container) is passed to a function that mutates it, and read again afterwards; rython copies containers at the call site, so the mutation would not be visible through `cal`. Python containers are references (issue #79); restructure the code \u2014 mutate through a single name, or pass the container and return the result, help=]"
+    },
+    "shapes": {
+      "program": "shapes",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "text_stats": {
+      "program": "text_stats",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "tokenizer": {
+      "program": "tokenizer",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "tree": {
+      "program": "tree",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "views": {
+      "program": "views",
+      "warnings": 0,
+      "status": "pass"
+    }
+  }
+}

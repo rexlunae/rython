@@ -5245,7 +5245,7 @@ impl<K: Eq + Hash + Debug, V: Clone> PyIndex<K> for PyDict<K, V> {
     fn py_index(&self, key: K) -> Result<V, PyException> {
         self.get(&key)
             .cloned()
-            .ok_or_else(|| PyException::new("KeyError", format!("{:?}", key)))
+            .ok_or_else(|| PyException::new("KeyError", key_repr(&key)))
     }
 }
 
@@ -5265,7 +5265,7 @@ impl<V: Clone> PyIndex<&str> for PyDict<String, V> {
     fn py_index(&self, key: &str) -> Result<V, PyException> {
         self.get(key)
             .cloned()
-            .ok_or_else(|| PyException::new("KeyError", format!("{:?}", key)))
+            .ok_or_else(|| PyException::new("KeyError", key_repr(&key)))
     }
 }
 
@@ -5893,7 +5893,7 @@ impl<K: Eq + Hash + Debug, V: Clone> PyIndex<K> for HashMap<K, V> {
     fn py_index(&self, key: K) -> Result<V, PyException> {
         self.get(&key)
             .cloned()
-            .ok_or_else(|| PyException::new("KeyError", format!("{:?}", key)))
+            .ok_or_else(|| PyException::new("KeyError", key_repr(&key)))
     }
 }
 
@@ -6308,6 +6308,16 @@ pub struct PyException {
     /// instead of a string walk plus MRO table search per clause. User
     /// classes (an open set) have `None` and keep the string `matches`.
     pub discriminant: Option<crate::builtin_exceptions::BuiltinException>,
+    /// The exception instance's ATTRIBUTES (the `self.<field> = <param>`
+    /// stores of the exception class's `__init__` — bank's `e.needed`,
+    /// round 99). The exception model is name + message; these carry the
+    /// typed fields CPython's instance exposes.
+    pub attrs: alloc::vec::Vec<(alloc::string::String, crate::PyValue)>,
+    /// The USER exception class's ancestor chain (BankError, Exception —
+    /// bank's `isinstance(InsufficientFunds(1, 0), BankError)` and the
+    /// `except BankError` reachability, round 99). Builtin exceptions
+    /// keep this empty (their MRO is the interpreter table).
+    pub user_ancestors: alloc::vec::Vec<alloc::string::String>,
 }
 
 impl PyException {
@@ -6317,7 +6327,68 @@ impl PyException {
             message: message.as_ref().to_string(),
             exception_type: exception_type.to_string(),
             discriminant: crate::builtin_exceptions::BuiltinException::from_name(exception_type),
+            attrs: alloc::vec::Vec::new(),
+            user_ancestors: alloc::vec::Vec::new(),
         }
+    }
+
+    /// Construct with the instance's typed attributes (the __init__'s
+    /// field stores, round 99).
+    pub fn new_with_attrs<T: AsRef<str>, M: AsRef<str>>(
+        exception_type: T,
+        message: M,
+        attrs: alloc::vec::Vec<(alloc::string::String, crate::PyValue)>,
+    ) -> Self {
+        Self::new_with_attrs_and_ancestors(exception_type, message, attrs, alloc::vec::Vec::new())
+    }
+
+    pub fn new_with_attrs_and_ancestors<T: AsRef<str>, M: AsRef<str>>(
+        exception_type: T,
+        message: M,
+        attrs: alloc::vec::Vec<(alloc::string::String, crate::PyValue)>,
+        ancestors: alloc::vec::Vec<alloc::string::String>,
+    ) -> Self {
+        let exception_type = exception_type.as_ref();
+        Self {
+            message: message.as_ref().to_string(),
+            exception_type: exception_type.to_string(),
+            discriminant: crate::builtin_exceptions::BuiltinException::from_name(exception_type),
+            attrs,
+            user_ancestors: ancestors,
+        }
+    }
+
+    /// The exception instance's int-typed attribute (`e.needed` on a
+    /// caught `InsufficientFunds` — round 99): the stored value's int,
+    /// or a loud AttributeError when the instance has no such int field.
+    pub fn attr_i64(&self, name: &str) -> Result<i64, PyException> {
+        self.attrs
+            .iter()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, v)| v.as_int())
+            .ok_or_else(|| {
+                PyException::new(
+                    "AttributeError",
+                    format!("'{}' object has no attribute '{}'", self.exception_type, name),
+                )
+            })
+    }
+
+    /// The exception instance's string-typed attribute.
+    pub fn attr_string(&self, name: &str) -> Result<alloc::string::String, PyException> {
+        self.attrs
+            .iter()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, v)| match v {
+                crate::PyValue::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                PyException::new(
+                    "AttributeError",
+                    format!("'{}' object has no attribute '{}'", self.exception_type, name),
+                )
+            })
     }
 
     /// Whether this exception is caught by a BUILTIN exception clause
@@ -6374,10 +6445,14 @@ impl PyException {
             let target = crate::builtin_exceptions::canonical_name(name).unwrap_or(name);
             return mro.contains(&target);
         }
-        // A raised type outside the built-in tree (a user class) keeps
-        // the broad posture: only Exception and BaseException are
-        // treated as catching it (rython does not know user-class
-        // hierarchies — the class-as-value divergence).
+        // A raised type outside the built-in tree (a user class): the
+        // construction attached its ANCESTOR chain (round 99), so an
+        // `except BankError:` / `isinstance(v, BankError)` reaches it;
+        // the broad posture (Exception/BaseException) still applies when
+        // no chain was attached.
+        if self.user_ancestors.iter().any(|a| a == name) {
+            return true;
+        }
         name == "Exception" || name == "BaseException"
     }
 
@@ -6490,6 +6565,19 @@ pub fn index_error<M: AsRef<str>>(message: M) -> PyException {
 /// Python KeyError
 pub fn key_error<M: AsRef<str>>(message: M) -> PyException {
     PyException::new("KeyError", message.as_ref())
+}
+
+/// CPython's KeyError key repr: a str key is SINGLE-quoted
+/// (`KeyError: 'carol'` — bank's no-such-account, round 99), while Rust
+/// Debug double-quotes it. Other keys keep Rust's Debug spelling (ints
+/// are identical either way).
+pub fn key_repr(k: &dyn core::fmt::Debug) -> alloc::string::String {
+    let d = format!("{:?}", k);
+    if d.starts_with('"') && d.ends_with('"') {
+        format!("'{}'", &d[1..d.len() - 1])
+    } else {
+        d
+    }
 }
 
 /// Python AttributeError
