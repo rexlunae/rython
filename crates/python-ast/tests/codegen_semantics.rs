@@ -19164,10 +19164,11 @@ fn issubclass_folds_through_the_interpreters_exception_mro() {
 }
 
 /// `return NotImplemented` is the identity fallback in `__eq__` only;
-/// anywhere else it is a loud refusal rather than a silent `false`.
+/// anywhere else it is a loud rustc error at the site (the rest of the
+/// crate stays measurable) rather than a silent `false`.
 #[test]
 fn return_not_implemented_is_loud_outside_eq() {
-    let err = compile_err(
+    let out = compile(
         concat!(
             "class V:\n",
             "    def __init__(self, n: int):\n",
@@ -19179,7 +19180,22 @@ fn return_not_implemented_is_loud_outside_eq() {
         ),
         "notimpl_lt.py",
     );
-    assert!(err.contains("`return NotImplemented` outside `__eq__`"), "error: {}", err);
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("outside `__eq__`"), "generated: {}", out);
+    // In `__eq__` it is the identity fallback.
+    let out = compile(
+        concat!(
+            "class V:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        if not isinstance(other, V):\n",
+            "            return NotImplemented\n",
+            "        return self.n == other.n\n",
+        ),
+        "notimpl_eq.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
 }
 
 /// A raise argument that contains a call is bound once and read by both
@@ -19211,7 +19227,7 @@ fn a_raise_argument_with_a_call_is_evaluated_once() {
 /// unannotated is refused at the read.
 #[test]
 fn the_exception_model_refuses_what_it_does_not_run_or_type() {
-    let err = compile_err(
+    let out = compile(
         concat!(
             "class Short(Exception):\n",
             "    def __init__(self, needed: int):\n",
@@ -19224,7 +19240,27 @@ fn the_exception_model_refuses_what_it_does_not_run_or_type() {
         ),
         "raise_extra_stmt.py",
     );
-    assert!(err.contains("refuses to silently drop it"), "error: {}", err);
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("refuses to silently drop it"), "generated: {}", out);
+    // A keyword-only parameter with a default is modeled as its default
+    // when the raise passes no keywords, and a message reading a stored
+    // field means the parameter it stores (urllib3's _RequestError).
+    let out = compile(
+        concat!(
+            "class ReqError(Exception):\n",
+            "    def __init__(self, message: str, *, request: str | None = None):\n",
+            "        self.request = request\n",
+            "        self.message = message\n",
+            "        super().__init__(self.message)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise ReqError(\"boom\")\n",
+        ),
+        "raise_kwonly_default.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("(\"request\" . to_string () , stdpython :: PyValue :: None_)"), "generated: {}", out);
+    assert!(out.contains("format ! (\"{}\" , \"boom\")"), "generated: {}", out);
     let err = compile_err(
         concat!(
             "class Short(Exception):\n",

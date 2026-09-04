@@ -613,7 +613,12 @@ pub(crate) fn exception_class_raise(
     let Some(init) = cls.init_method() else {
         return Ok(None);
     };
-    // The __init__ params AFTER self: [needed, available].
+    // The __init__ params AFTER self: [needed, available]. A keyword-only
+    // parameter with a default (`*, request: Request | None = None` —
+    // urllib3's _RequestError) is modeled as its default when the raise
+    // passes no keywords; a raise WITH keywords, or a keyword-only
+    // parameter without a default, is outside the model (the generic
+    // message-only construction, the pre-model behavior, ledgered).
     let params: Vec<&str> = init
         .args
         .args
@@ -621,9 +626,16 @@ pub(crate) fn exception_class_raise(
         .skip(1)
         .map(|a| a.arg.as_str())
         .collect();
-    if call.args.len() != params.len() || params.is_empty() {
+    if call.args.len() != params.len() || params.is_empty() || !call.keywords.is_empty() {
         return Ok(None);
     }
+    let kw_defaults: std::collections::HashMap<&str, &ExprType> = init
+        .args
+        .kwonlyargs
+        .iter()
+        .zip(init.args.kw_defaults.iter())
+        .filter_map(|(p, d)| d.as_deref().map(|d| (p.arg.as_str(), d)))
+        .collect();
     // Find the super().__init__(<msg>) call in the __init__ body. The
     // model is exactly `self.<field> = <param>` stores and the
     // super().__init__ message; any OTHER statement in the __init__
@@ -631,7 +643,13 @@ pub(crate) fn exception_class_raise(
     // construction site, so it is a loud refusal, never silently
     // dropped (the evaluation on issue #137).
     let mut msg_expr: Option<ExprType> = None;
-    let mut fields: Vec<(String, usize)> = Vec::new(); // (field, param idx)
+    // (field, its value: the raise arg at an index, or a keyword-only
+    // parameter's default)
+    enum FieldValue<'a> {
+        Arg(usize),
+        Default(&'a ExprType),
+    }
+    let mut fields: Vec<(String, FieldValue)> = Vec::new();
     for stmt in &init.body {
         let modeled = match &stmt.statement {
             StatementType::Assign(a) => {
@@ -640,10 +658,20 @@ pub(crate) fn exception_class_raise(
                     && let ExprType::Name(r) = attr.value.as_ref()
                     && r.id == "self"
                     && let ExprType::Name(v) = &a.value
-                    && let Some(idx) = params.iter().position(|p| *p == v.id)
                 {
-                    fields.push((attr.attr.clone(), idx));
-                    true
+                    if let Some(idx) = params.iter().position(|p| *p == v.id) {
+                        fields.push((attr.attr.clone(), FieldValue::Arg(idx)));
+                        true
+                    } else if let Some(d) = kw_defaults.get(v.id.as_str()) {
+                        fields.push((attr.attr.clone(), FieldValue::Default(d)));
+                        true
+                    } else if init.args.kwonlyargs.iter().any(|p| p.arg == v.id) {
+                        // A keyword-only parameter without a default: the
+                        // raise would have to pass it — outside the model.
+                        return Ok(None);
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
@@ -673,18 +701,20 @@ pub(crate) fn exception_class_raise(
             _ => false,
         };
         if !modeled {
-            return Err(format!(
-                "`{}.__init__` (line {}) has a statement beyond `self.<field> = <param>` \
-                 stores and the `super().__init__(<message>)` call: rython models an \
-                 exception class's construction as its message and its stored fields, \
+            // Loud at the raise SITE as a rustc error naming the
+            // construct, so the rest of the crate stays measurable.
+            let msg = format!(
+                "rython: `{}.__init__` (line {}) has a statement beyond `self.<field> = \
+                 <param>` stores and the `super().__init__(<message>)` call: rython models \
+                 an exception class's construction as its message and its stored fields, \
                  so that statement would not run at `raise {}(...)`; rython refuses to \
                  silently drop it. Move the logic to the raise site, or store the value \
                  as a field",
                 cls.name,
                 stmt.lineno.unwrap_or(0),
                 cls.name
-            )
-            .into());
+            );
+            return Ok(Some(quote::quote!(compile_error!(#msg))));
         }
     }
     let Some(mut m) = msg_expr else {
@@ -726,6 +756,17 @@ pub(crate) fn exception_class_raise(
     // form the substitution does not descend into) would render against
     // the raise site's scope — a different name, or the wrong one — so
     // it is refused.
+    // A message reading a STORED field (`super().__init__(self.message)`)
+    // means the parameter that field stores: rewrite it before the
+    // parameter substitution.
+    let field_params: Vec<(&str, &str)> = fields
+        .iter()
+        .filter_map(|(f, v)| match v {
+            FieldValue::Arg(idx) => Some((f.as_str(), params[*idx])),
+            FieldValue::Default(_) => None,
+        })
+        .collect();
+    substitute_self_fields(&mut m, &field_params);
     substitute_params(&mut m, &params, &substituted);
     if let Some(left) = params.iter().find(|p| crate::expr_references(&m, p)) {
         return Err(format!(
@@ -744,17 +785,34 @@ pub(crate) fn exception_class_raise(
     let kind = &cls.name;
     let attr_pairs: std::result::Result<Vec<_>, Box<dyn std::error::Error>> = fields
         .iter()
-        .map(|(f, idx)| {
-            let a = if needs_binding {
-                let ident = proc_macro2::Ident::new(
-                    &format!("__rython_exc_arg{idx}"),
-                    proc_macro2::Span::call_site(),
-                );
-                quote::quote!((#ident).clone())
-            } else {
-                call.args[*idx].clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?
+        .map(|(f, value)| {
+            let a = match value {
+                FieldValue::Arg(idx) if needs_binding => {
+                    let ident = proc_macro2::Ident::new(
+                        &format!("__rython_exc_arg{idx}"),
+                        proc_macro2::Span::call_site(),
+                    );
+                    quote::quote!(stdpython :: PyValue :: from ((#ident).clone()))
+                }
+                FieldValue::Arg(idx) => {
+                    let a = call.args[*idx].clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?;
+                    quote::quote!(stdpython :: PyValue :: from (#a))
+                }
+                // The keyword-only parameter's default, boxed (None is the
+                // boxed None).
+                FieldValue::Default(d) if crate::is_none_expr(d) => {
+                    quote::quote!(stdpython :: PyValue :: None_)
+                }
+                FieldValue::Default(d) => {
+                    let a = (*d).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    quote::quote!(stdpython :: PyValue :: from (#a))
+                }
             };
-            Ok(quote::quote!((#f . to_string (), stdpython :: PyValue :: from (#a))))
+            Ok(quote::quote!((#f . to_string (), #a)))
         })
         .collect();
     let attr_pairs = attr_pairs?;
@@ -811,6 +869,38 @@ pub(crate) fn exception_class_raise(
         Ok(Some(construct))
     } else {
         Ok(Some(quote::quote!({ #(#prelude)* #construct })))
+    }
+}
+
+/// Rewrite a `self.<field>` read in the message to the parameter the
+/// field stores (`super().__init__(self.message)` after `self.message =
+/// message`) — the same shapes `substitute_params` descends into.
+fn substitute_self_fields(expr: &mut ExprType, field_params: &[(&str, &str)]) {
+    use crate::ExprType;
+    match expr {
+        ExprType::Attribute(attr) if crate::ast::tree::visit::is_self(&attr.value) => {
+            if let Some((_, param)) = field_params.iter().find(|(f, _)| *f == attr.attr) {
+                *expr = ExprType::Name(crate::ast::tree::name::Name { id: param.to_string() });
+            }
+        }
+        ExprType::JoinedStr(j) => {
+            for part in &mut j.values {
+                if let ExprType::FormattedValue(f) = part {
+                    substitute_self_fields(&mut f.value, field_params);
+                }
+            }
+        }
+        ExprType::BinOp(b) => {
+            substitute_self_fields(&mut b.left, field_params);
+            substitute_self_fields(&mut b.right, field_params);
+        }
+        ExprType::Call(c) => {
+            substitute_self_fields(&mut c.func, field_params);
+            for a in &mut c.args {
+                substitute_self_fields(a, field_params);
+            }
+        }
+        _ => {}
     }
 }
 

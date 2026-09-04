@@ -747,18 +747,20 @@ impl CodeGen for StatementType {
                     // refusal, never a silent `false` (the evaluation on
                     // issue #137).
                     if !options.in_eq_dunder {
-                        return Err(
-                            "`return NotImplemented` outside `__eq__` is not supported yet: \
-                             CPython then tries the reflected operation and falls back to \
-                             the identity default (`__ne__`) or raises TypeError (an \
-                             ordering dunder), which a `false` result would silently \
-                             replace; rython refuses to silently ignore it. Return the \
-                             comparison's value explicitly"
-                                .to_string()
-                                .into(),
-                        );
+                        // Loud at the SITE, as a rustc error naming the
+                        // construct, so the rest of the crate stays
+                        // measurable (urllib3's `__or__` / `__ior__` /
+                        // `__ror__` return it for a non-mapping operand).
+                        let msg = "rython: `return NotImplemented` outside `__eq__` is not \
+                                   supported yet: CPython then tries the reflected operation \
+                                   and falls back to the identity default (`__ne__`) or raises \
+                                   TypeError (an ordering or arithmetic dunder), which a `false` \
+                                   result would silently replace; rython refuses to silently \
+                                   ignore it. Return the operation's value explicitly";
+                        quote!(compile_error!(#msg))
+                    } else {
+                        quote!(false)
                     }
-                    quote!(false)
                 } else if options.fn_return_is_pyvalue {
                     // A PyValue-returning function wraps its other returns
                     // (the identity From passes already-boxed values). A
