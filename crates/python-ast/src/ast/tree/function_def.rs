@@ -2498,7 +2498,26 @@ impl FunctionDef {
             }
         } else {
             match self.resolved_return_type_in(&symbols, &options, ctx.enclosing_class_name()) {
-                Some(ty) => quote!(-> Result<#ty, PyException>),
+                Some(ty) => {
+                    // A SHARED class method returning its OWN class
+                    // (`parse -> "Version"` on the PyRef-shared Version —
+                    // records, round 99): the instance is held behind
+                    // PyRef, so the signature says PyRef<Version>, the
+                    // same wrap the constructor and the field types use.
+                    let enclosing_shared = ctx
+                        .enclosing_class_name()
+                        .is_some_and(|c| crate::ast::tree::shared::is_shared(c));
+                    let ty_s = ty.to_string();
+                    let is_own_class = ty_s == "Self"
+                        || Some(ty_s.replace(' ', "").as_str())
+                            == ctx.enclosing_class_name();
+                    let ty = if enclosing_shared && is_own_class {
+                        quote!(stdpython::PyRef<#ty>)
+                    } else {
+                        ty
+                    };
+                    quote!(-> Result<#ty, PyException>)
+                }
                 // Mixed literal returns (`return 1` / `return None` under
                 // annotated params) box to PyValue; the body statements
                 // were rendered with fn_return_is_pyvalue set above, so
