@@ -2343,6 +2343,11 @@ accepted as permanent spec:
 | A USER exception class derived from a BUILTIN (class MyError(ValueError)) records the builtin ancestor for is/issubclass but an `except ValueError:` HANDLER's matches_builtin fast path does not consult the user ancestor chain — the builtin-discriminant check misses it | Model limit; the handler's discriminant path would need the user-chain fallback |
 | issubclass(C1, C2) with KEYWORD or defaulted exception constructor arguments loses the fields/message | Model limit; positional-only for the modeled shape |
 | An unannotated exception __init__ param's field types as Int | Model limit; inferred typing for exception fields |
+| A SHARED class's `==`/ordering with a REFLECTED comparison (other.__eq__(self)) when the first __eq__/__lt__ returns NotImplemented is not modeled: the NotImplemented return in a comparison dunder lowers to false (the identity fallback for distinct instances), and ref_cmp's Greater case calls the RIGHT operand's __lt__ (a pure total-order __lt__ makes the two calls observationally identical to CPython's sort) | Model limit of the shared-equality round (#329) |
+| The comparison dunders' object-typed parameter on a SHARED class types as the shared PyRef (the comparison compares two shared instances; PyValue has no class member) | Model convention of the shared-equality round |
+| `Truthy` for references is a blanket (`&T` truthiness = `T`'s) | Runtime convention of the all/any round |
+| The shared `__eq__` dispatch and the PyRefOrd ordering are CPython-verified end-to-end by the idiom corpus (records — CI's idioms job diffs records.py's output against python3) | Verified; the corpus is the transcript |
+| NotImplemented skips the reflected comparison and identity fallback in asymmetric equality | Defect, issue #137 shared-equality round follow-up |
 | Old-style `%`-formatting of a DICT as a positional value (`"%s" % {...}`) raises "not enough arguments" instead of CPython's dict repr — the mapping form (`%(name)s`) is exact | Model limit (round 34); positional-vs-mapping mixing follows CPython's rejection |
 
 ---
