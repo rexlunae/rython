@@ -6567,9 +6567,7 @@ let mutating_self_field = boxed_self_ref_receiver
                             .args
                             .first()
                             .map(|a| crate::infer_type(Some(&ctx), a, &options, &symbols));
-                        if attr.attr == "append" && matches!(&recv_ty, crate::TypeInfo::Vec(_)) {
-                            eprintln!("R99APPEND recv={:?} arg={:?}", recv_ty, arg_ty);
-                        }
+
                         if let crate::TypeInfo::Vec(inner) = &recv_ty
                             && matches!(
                                 **inner,

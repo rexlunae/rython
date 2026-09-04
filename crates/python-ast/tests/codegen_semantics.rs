@@ -18979,3 +18979,47 @@ fn a_finally_on_an_abrupt_path_is_what_leaves_the_try() {
     );
     assert!(!out.contains("issue #112"), "generated: {}", out);
 }
+
+#[test]
+fn tuple_constant_index_lowers_to_the_field_accessor() {
+    // A CONSTANT index on a tuple receiver emits the field accessor with
+    // an UNSUFFIXED literal (`kv.1`, not `kv.1i64` — quote's i64
+    // interpolation adds the type suffix, invalid after a dot) and
+    // clones the element out of the read (round 99, text_stats's
+    // sorted-key lambda over the heterogeneous (String, i64) pair).
+    let out = compile(
+        "def top(pairs: list[tuple[str, int]]):
+    return sorted(pairs, key=lambda kv: (-kv[1], kv[0]))
+",
+        "tupleidx1.py",
+    );
+    assert!(
+        out.contains("(kv) . 1 . clone ()") && out.contains("(kv) . 0 . clone ()"),
+        "constant tuple indices must lower to the cloned field accessor: {}",
+        out
+    );
+    assert!(
+        !out.contains("1i64") && !out.contains("0i64"),
+        "the accessor must be unsuffixed: {}",
+        out
+    );
+}
+
+#[test]
+fn tuple_computed_index_on_heterogeneous_tuple_is_loud() {
+    // A COMPUTED index on a HETEROGENEOUS tuple cannot type through the
+    // runtime (its homogeneous (T, T) impl needs equal element types)
+    // and cannot become a field accessor (the index is dynamic) — loud.
+    let err = compile_err(
+        "def pick(pairs: tuple[str, int], i: int) -> str:
+    return pairs[i]
+",
+        "tupleidx2.py",
+    );
+    assert!(
+        err.contains("heterogeneous Rust tuple")
+            && err.contains("computed index"),
+        "must name the construct and the fix: {}",
+        err
+    );
+}

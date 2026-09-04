@@ -4545,16 +4545,16 @@ impl<T: AsRef<str> + ?Sized> PyStrOps for T {
         }
     }
     fn swapcase(&self) -> String {
-        // Python's str.swapcase: each cased char toggles case; the
-        // titlecase-uppercase "ß" expands to "SS" (CPython: "ß".swapcase()
-        // == "SS").
+        // Python's str.swapcase toggles each cased char's CASE — the
+        // UPPERCASE expansion, not titlecase: "ß" -> "SS", "ǆ" -> "Ǆ",
+        // "ﬃ" -> "FFI" (CPython-verified; Devin review on the boxing PR).
         self.as_ref()
             .chars()
             .map(|c| {
                 if c.is_uppercase() {
                     c.to_lowercase().collect::<String>()
                 } else if c.is_lowercase() {
-                    py_to_titlecase(c)
+                    c.to_uppercase().collect::<String>()
                 } else {
                     c.to_string()
                 }
