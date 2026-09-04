@@ -226,8 +226,16 @@ impl CodeGen for Subscript {
                 if tuple_read {
                     // The rendered index carries the cast's i64 suffix —
                     // strip it: the accessor is `kv.1`, not `kv.1i64`.
-                    let idx_tokens = index.to_string().replace("i64", "").trim().to_string();
-                    let idx: Option<i64> = idx_tokens.trim().parse().ok();
+                    let mut idx_tokens = index.to_string().trim().to_string();
+                    // The cast renders the index as `(0i64)` — strip the
+                    // parens and the `i64` suffix before parsing, so
+                    // `pair[0]` yields `pair.0` (round 99, ledger's
+                    // tuple-of-PyRef stores).
+                    idx_tokens = idx_tokens.trim_start_matches('(').trim_end_matches(')').to_string();
+                    let idx: Option<i64> = idx_tokens
+                        .strip_suffix("i64")
+                        .and_then(|t| t.parse().ok())
+                        .or_else(|| idx_tokens.parse::<i64>().ok());
                     match idx {
                         Some(n) if n >= 0 => {
                             return Ok(quote! { #value.#n });
