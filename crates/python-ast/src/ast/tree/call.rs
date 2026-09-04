@@ -2375,6 +2375,16 @@ impl<'a> CodeGen for Call {
                                 .into());
                         }
                         let a = &rendered[0];
+                        // A GENERATOR EXPRESSION arg (`sorted(w for w in
+                        // counts if ...)` — text_stats's starts-with-q,
+                        // round 99): the generator lowers to an EAGER
+                        // iterator; sorted takes a slice — collect it.
+                        let sorted_arg = if matches!(self.args[0], ExprType::GeneratorExp(_)) {
+                            quote!(#a . collect :: < Vec < _ > > ())
+                        } else {
+                            quote!(#a)
+                        };
+                        let a = &sorted_arg;
                         let render = |e: crate::ExprType| {
                             e.to_rust(ctx.clone(), options.clone(), symbols.clone())
                         };
@@ -3468,6 +3478,24 @@ impl<'a> CodeGen for Call {
                             return Ok(quote!(stdpython::PyValue::None_));
                         }
                         let bname = crate::safe_ident(&bname);
+                        // A Vec<String> argument (`set(ws)` — text_stats's
+                        // distinct count) is the set of the ELEMENTS, not
+                        // the str-set-of-characters.
+                        if bname == "set" && self.args.len() == 1
+                            && matches!(
+                                crate::infer_type(
+                                    Some(&ctx),
+                                    &self.args[0],
+                                    &options,
+                                    &symbols
+                                ),
+                                crate::TypeInfo::Vec(ref inner)
+                                    if matches!(**inner, crate::TypeInfo::String)
+                            )
+                        {
+                            let a = &rendered[0];
+                            return Ok(quote!(set_of_strings(&(#a))));
+                        }
                         return Ok(quote!(#bname(#(#rendered),*)));
                     }
                     "frozenset" => {
@@ -6556,6 +6584,31 @@ let mutating_self_field = boxed_self_ref_receiver
                     // list.append(x) pushes one element; Vec::append (inherent)
                     // concatenates another Vec — silently different.
                     ("append", [value]) => {
+                        // A BOXED-element receiver (Vec<PyValue> from the
+                        // empty-literal divergence) boxing a TYPED element
+                        // (`out.append(w)` where w: String — text_stats's
+                        // words(), round 99): the push boxes the element.
+                        // (Only when the ARG is not itself boxed — a
+                        // PyValue arg passes through.)
+                        let recv_ty = crate::infer_type(Some(&ctx), &attr.value, &options, &symbols);
+                        let arg_ty = self
+                            .args
+                            .first()
+                            .map(|a| crate::infer_type(Some(&ctx), a, &options, &symbols));
+                        if let crate::TypeInfo::Vec(inner) = &recv_ty
+                            && matches!(
+                                **inner,
+                                crate::TypeInfo::PyValue | crate::TypeInfo::PyObject
+                            )
+                            && !arg_ty.as_ref().is_some_and(|t| {
+                                matches!(
+                                    t,
+                                    crate::TypeInfo::PyValue | crate::TypeInfo::PyObject
+                                )
+                            })
+                        {
+                            return Ok(quote!((#receiver).push(stdpython::PyValue::from(#value))));
+                        }
                         // A str literal appended to a Vec<String> local
                         // (`lines.append("\r\n")` — urllib3's
                         // render_headers) is a &'static str; the Vec holds

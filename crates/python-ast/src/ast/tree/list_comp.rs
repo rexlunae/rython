@@ -282,12 +282,29 @@ fn build_comprehension_loops(
                 }
                 quote!([#(#elts),*])
             }
-            _ => crate::render_reused(
-                &generator.iter,
-                ctx.clone(),
-                iter_options.clone(),
-                symbols.clone(),
-            )?,
+            _ => {
+                let mut it = crate::render_reused(
+                    &generator.iter,
+                    ctx.clone(),
+                    iter_options.clone(),
+                    symbols.clone(),
+                )?;
+                // A DICT-typed iterable (`for w in counts` in a
+                // comprehension — text_stats's starts-with-q, round 99):
+                // Python iterates the KEYS.
+                if matches!(
+                    crate::infer_type(
+                        Some(ctx),
+                        &generator.iter,
+                        iter_options,
+                        symbols
+                    ),
+                    crate::TypeInfo::Dict(_, _)
+                ) {
+                    it = quote!(#it . py_keys ());
+                }
+                it
+            }
         };
         let conditions: Result<Vec<_>, _> = generator
             .ifs

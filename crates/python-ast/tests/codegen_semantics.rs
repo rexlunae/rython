@@ -18979,3 +18979,81 @@ fn a_finally_on_an_abrupt_path_is_what_leaves_the_try() {
     );
     assert!(!out.contains("issue #112"), "generated: {}", out);
 }
+
+#[test]
+fn tuple_constant_index_lowers_to_the_field_accessor() {
+    // A CONSTANT index on a tuple receiver emits the field accessor with
+    // an UNSUFFIXED literal (`kv.1`, not `kv.1i64` — quote's i64
+    // interpolation adds the type suffix, invalid after a dot) and
+    // clones the element out of the read (round 99, text_stats's
+    // sorted-key lambda over the heterogeneous (String, i64) pair).
+    let out = compile(
+        "def top(pairs: list[tuple[str, int]]):
+    return sorted(pairs, key=lambda kv: (-kv[1], kv[0]))
+",
+        "tupleidx1.py",
+    );
+    assert!(
+        out.contains("(kv) . 1 . clone ()") && out.contains("(kv) . 0 . clone ()"),
+        "constant tuple indices must lower to the cloned field accessor: {}",
+        out
+    );
+    assert!(
+        !out.contains("1i64") && !out.contains("0i64"),
+        "the accessor must be unsuffixed: {}",
+        out
+    );
+}
+
+#[test]
+fn tuple_computed_index_on_heterogeneous_tuple_is_loud() {
+    // A COMPUTED index on a HETEROGENEOUS tuple cannot type through the
+    // runtime (its homogeneous (T, T) impl needs equal element types)
+    // and cannot become a field accessor (the index is dynamic) — loud.
+    let err = compile_err(
+        "def pick(pairs: tuple[str, int], i: int) -> str:
+    return pairs[i]
+",
+        "tupleidx2.py",
+    );
+    assert!(
+        err.contains("heterogeneous Rust tuple")
+            && err.contains("non-constant index"),
+        "must name the construct and the fix: {}",
+        err
+    );
+}
+
+#[test]
+fn tuple_out_of_range_constant_is_loud_with_bounds() {
+    // An OUT-OF-RANGE CONSTANT on a statically-known HETEROGENEOUS tuple
+    // is not misreported as a computed index: the error names the index
+    // and the bounds, and the rewrite (CPython's catchable IndexError is
+    // preserved for the homogeneous runtime path — Devin review on #326).
+    let err = compile_err(
+        "def f(t: tuple[str, int]) -> str:\n    return t[5]\n",
+        "tupleidx3.py",
+    );
+    assert!(
+        err.contains("out of bounds") && err.contains("2-element"),
+        "must name the constant and the bounds: {}",
+        err
+    );
+}
+
+#[test]
+fn empty_container_pins_its_element_from_the_split_chain() {
+    // `out = []` whose element comes from a str-method CHAIN pins
+    // Vec<String> — the split/strip/lower returns are in the typed
+    // table, so the empty container adopts String and the pushes stay
+    // direct (round 99, text_stats's words()).
+    let out = compile(
+        "def words(text: str) -> list[str]:\n    out = []\n    for raw in text.split():\n        w = raw.strip().lower()\n        if w:\n            out.append(w)\n    return out\n",
+        "boxedpush.py",
+    );
+    assert!(
+        out.contains("Vec :: < String > :: new") && out.contains("push (w)"),
+        "the empty container must pin String from the chain: {}",
+        out
+    );
+}

@@ -3780,6 +3780,13 @@ impl Len for str {
     }
 }
 
+impl Len for crate::HashSet<String> {
+    fn len(&self) -> usize {
+        // Python counts members.
+        crate::HashSet::len(self)
+    }
+}
+
 impl<T> Len for Vec<T> {
     fn len(&self) -> usize {
         self.len()
@@ -4439,6 +4446,7 @@ pub trait PyStrOps {
     fn lstrip(&self) -> String;
     fn rstrip(&self) -> String;
     fn capitalize(&self) -> String;
+    fn swapcase(&self) -> String;
     fn startswith(&self, prefix: &str) -> bool;
     fn endswith(&self, suffix: &str) -> bool;
     /// str.find: CHARACTER index of the first match, or -1 (not an Option).
@@ -4542,6 +4550,23 @@ impl<T: AsRef<str> + ?Sized> PyStrOps for T {
             Some(first) => py_to_titlecase(first) + &chars.as_str().to_lowercase(),
             None => String::new(),
         }
+    }
+    fn swapcase(&self) -> String {
+        // Python's str.swapcase toggles each cased char's CASE — the
+        // UPPERCASE expansion, not titlecase: "ß" -> "SS", "ǆ" -> "Ǆ",
+        // "ﬃ" -> "FFI" (CPython-verified; Devin review on the boxing PR).
+        self.as_ref()
+            .chars()
+            .map(|c| {
+                if c.is_uppercase() {
+                    c.to_lowercase().collect::<String>()
+                } else if c.is_lowercase() {
+                    c.to_uppercase().collect::<String>()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect()
     }
     fn startswith(&self, prefix: &str) -> bool {
         self.as_ref().starts_with(prefix)
@@ -7158,6 +7183,13 @@ where
 /// `set("abc") == {'a','b','c'}`.
 pub fn set<S: AsRef<str>>(s: S) -> crate::HashSet<String> {
     s.as_ref().chars().map(|c| c.to_string()).collect()
+}
+
+/// Python's `set(iterable)` for a Vec of Strings (`set(ws)` —
+/// text_stats's distinct count, round 99): the set of the ELEMENTS, not
+/// the str-set-of-characters (CPython: `set(['a', 'b']) == {'a', 'b'}`).
+pub fn set_of_strings<S: AsRef<str>>(iterable: &[S]) -> crate::HashSet<String> {
+    iterable.iter().map(|s| s.as_ref().to_string()).collect()
 }
 
 /// A set of strings boxes as a Tuple of Str members (the list-as-tuple

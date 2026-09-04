@@ -2451,7 +2451,7 @@ fn narrowed_value_type(t: &TypeInfo) -> TypeInfo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StrMethod {
     Upper, Lower, Strip, Lstrip, Rstrip, Title, Capitalize, Casefold, Swapcase,
-    Replace, Zfill, Center, Ljust, Rjust, Expandtabs, Format, Splitlines,
+    Replace, Zfill, Center, Ljust, Rjust, Expandtabs, Format, Splitlines, Split,
 }
 
 impl StrMethod {
@@ -2474,6 +2474,7 @@ impl StrMethod {
             "expandtabs" => Self::Expandtabs,
             "format" => Self::Format,
             "splitlines" => Self::Splitlines,
+            "split" | "split_whitespace" | "rsplit" => Self::Split,
             _ => return None,
         })
     }
@@ -2481,7 +2482,9 @@ impl StrMethod {
     /// The method's result on a str receiver.
     pub(crate) fn result(self) -> TypeInfo {
         match self {
-            Self::Splitlines => TypeInfo::Vec(Box::new(TypeInfo::String)),
+            Self::Splitlines | Self::Split => {
+                TypeInfo::Vec(Box::new(TypeInfo::String))
+            }
             _ => TypeInfo::String,
         }
     }

@@ -444,6 +444,13 @@ fn issue81_string_divergences_match_cpython() {
     assert_eq!("\u{01f3}".title(), "\u{01f2}"); // ǳ -> ǲ
     assert_eq!("3rd".title(), "3Rd");
 
+    // swapcase toggles each cased char's CASE — the UPPERCASE expansion,
+    // not titlecase: ß -> SS, ǆ -> Ǆ, ﬃ -> FFI (verified against python3).
+    assert_eq!("The Quick".swapcase(), "tHE qUICK");
+    assert_eq!("\u{00df}".swapcase(), "SS"); // ß -> SS
+    assert_eq!("\u{01c6}".swapcase(), "\u{01c4}"); // ǆ -> Ǆ
+    assert_eq!("\u{fb03}".swapcase(), "FFI"); // ﬃ -> FFI
+
     // The \x1c-\x1f separators are whitespace for strip/split.
     assert_eq!("hello\u{1f}".strip(), "hello");
     assert_eq!("a\u{1c}b".py_split_whitespace(), vec!["a", "b"]);

@@ -179,6 +179,43 @@ impl CodeGen for Subscript {
         // Computed BEFORE self.value is moved by the to_rust below.
         let value_yields_option =
             crate::expr_yields_option_ctx(&self.value, &ctx, &options, &symbols);
+        // A RUST TUPLE receiver: the runtime PyIndex impl covers only
+        // HOMOGENEOUS tuples (`(T, T)` — ledger's tuple-of-PyRef). A
+        // heterogeneous tuple (`(String, i64)` — text_stats's sorted-key
+        // lambda's kv) needs the codegen's field accessor; a constant
+        // index on ANY tuple emits `(#value).N` directly (clean integer,
+        // no runtime). Computed BEFORE the moves.
+        let tuple_value_type = match crate::infer_type(Some(&ctx), &self.value, &options, &symbols) {
+            crate::TypeInfo::Tuple(inner) => Some(inner),
+            _ => None,
+        };
+        // The tuple's elements are all the SAME display when the runtime
+        // `(T, T)` impl can serve the read (homogeneous).
+        let tuple_homogeneous = tuple_value_type.as_ref().is_some_and(|inner| {
+            inner.len() >= 2
+                && inner.windows(2).all(|w| w[0] == w[1])
+        });
+        // A compile-time CONSTANT index (the AST slice, before the
+        // i64-cast render): normalized 0..len-1. The RAW constant and
+        // its bounds are kept separate so an OUT-OF-RANGE constant is
+        // not misreported as a COMPUTED index (Devin review on #326):
+        // CPython raises a catchable IndexError only when the access
+        // executes.
+        let tuple_len = tuple_value_type
+            .as_ref()
+            .map(|inner| inner.len() as i64);
+        let raw_constant_index = match &self.kind {
+            SubscriptKind::Index(index_expr) => {
+                constant_tuple_index(index_expr.as_ref())
+            }
+            _ => None,
+        };
+        let constant_index = raw_constant_index.and_then(|i| {
+            tuple_len.and_then(|len| {
+                let norm = if i < 0 { i + len } else { i };
+                (norm >= 0 && norm < len).then_some(norm)
+            })
+        });
         let value = self.value.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         let value = if value_yields_option {
             quote!((#value).clone().unwrap_or_else(|| {
@@ -201,6 +238,53 @@ impl CodeGen for Subscript {
                         &options,
                         &symbols,
                     );
+                }
+                // A CONSTANT index on a RUST TUPLE receiver lowers to the
+                // field accessor (`kv[1]` → `(kv).1`, `pair[0]` →
+                // `(pair).0`): the runtime PyIndex impl serves only
+                // homogeneous tuples, and the accessor is valid for any
+                // tuple — the clean integer comes from the AST, never
+                // the cast's suffix. A HOMOGENEOUS tuple with a COMPUTED
+                // index keeps the runtime path (negative wrap,
+                // IndexError).
+                if let Some(n) = constant_index {
+                    // quote's integer interpolation renders the TYPE suffix
+                    // (`1i64` — invalid after `.`); the accessor needs the
+                    // unsuffixed literal. The read CLONES the element —
+                    // the same semantics the runtime's homogeneous-tuple
+                    // py_index applies (`self.0.clone()`): a shared-ref
+                    // receiver (`kv: &(String, i64)` in sorted_key's
+                    // closure) cannot move the String out of the borrow,
+                    // and an owned receiver stays usable after the read.
+                    let accessor = proc_macro2::Literal::i64_unsuffixed(n);
+                    return Ok(quote! { (#value).#accessor.clone() });
+                }
+                // An OUT-OF-RANGE CONSTANT on a STATICALLY-KNOWN tuple: a
+                // homogeneous tuple lowers to the runtime py_index (its
+                // catchable IndexError — CPython's behavior when the
+                // access executes); a HETEROGENEOUS tuple cannot express
+                // the failing access through the runtime (its Output type
+                // depends on the index) — loud, naming the bounds and the
+                // rewrite. A receiver whose tuple-ness is NOT statically
+                // known (an isinstance-narrowed union) keeps the runtime
+                // path below.
+                if tuple_value_type.is_some() && !tuple_homogeneous {
+                    if let Some(raw_i) = raw_constant_index {
+                        return Err(format!(
+                            "index {} is out of bounds for this {} tuple (CPython raises a \
+                             catchable IndexError only when the access executes); use an index \
+                             within the bounds, or make the tuple homogeneous",
+                            raw_i, tuple_len.map(|l| format!("{l}-element")).unwrap_or_default()
+                        )
+                        .into());
+                    }
+                    return Err(format!(
+                        "indexing a heterogeneous Rust tuple with a non-constant index is not \
+                         supported yet (line {}): use a constant index, or make the tuple \
+                         homogeneous; rython refuses to silently ignore it",
+                        self.lineno.map(|l| l.to_string()).unwrap_or_default()
+                    )
+                    .into());
                 }
                 // Context-aware: indices are i64. `len(x)` yields usize and
                 // `xs[len(xs) - 1]` yields i64, so coerce usize → i64 here
@@ -261,3 +345,21 @@ pub fn is_step_one(step: Option<&ExprType>) -> bool {
     }
 }
 
+
+/// A tuple subscript's compile-time CONSTANT index (0, 1, -1 ...): the
+/// AST integer literal (or its unary-minus form), BEFORE the i64-cast
+/// render. Returns None for any computed index.
+fn constant_tuple_index(e: &ExprType) -> Option<i64> {
+    match e {
+        ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::Integer(n)) => n
+                .value::<u128>()
+                .and_then(|v| i64::try_from(v).ok()),
+            _ => None,
+        },
+        ExprType::UnaryOp(u) if matches!(u.op, crate::ast::tree::unary_op::Ops::USub) => {
+            constant_tuple_index(&u.operand).map(|v| -v)
+        }
+        _ => None,
+    }
+}
