@@ -5051,3 +5051,15 @@ mod round81_token_format_tests {
         assert!(s.contains("u8"), "sanity");
     }
 }
+
+/// Whether a method name is a COMPARISON dunder (the shared-class
+/// equality/ordering round, #329): the names whose object-typed
+/// parameters compare two shared instances. ONE authority — the
+/// analysis seeding and the signature rewriting consult it so the six
+/// strings cannot drift.
+pub(crate) fn is_comparison_dunder(name: &str) -> bool {
+    matches!(
+        name,
+        "__eq__" | "__ne__" | "__lt__" | "__le__" | "__gt__" | "__ge__"
+    )
+}

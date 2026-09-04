@@ -1640,10 +1640,8 @@ impl FunctionDef {
                             // Version.__eq__(self, other: object), round
                             // 99).
                             "object" | "Any"
-                                if matches!(
-                                    self.name.as_str(),
-                                    "__eq__" | "__ne__" | "__lt__" | "__le__"
-                                        | "__gt__" | "__ge__"
+                                if crate::ast::tree::type_ctx::is_comparison_dunder(
+                                    &self.name,
                                 ) && ctx.enclosing_class_name().is_some_and(|c| {
                                     crate::ast::tree::shared::is_shared(c)
                                 }) =>
@@ -2723,7 +2721,7 @@ impl FunctionDef {
         // class so the signature says PyRef<Version> (the body's field
         // reads already borrow through the PyRef).
         let mut render_args = render_args;
-        if matches!(self.name.as_str(), "__eq__" | "__ne__" | "__lt__" | "__le__" | "__gt__" | "__ge__")
+        if crate::ast::tree::type_ctx::is_comparison_dunder(&self.name)
             && ctx.enclosing_class_name().is_some_and(|c| crate::ast::tree::shared::is_shared(c))
         {
             let class = ctx.enclosing_class_name().expect("checked").to_string();

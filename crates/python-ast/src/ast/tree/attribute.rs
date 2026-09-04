@@ -429,10 +429,7 @@ impl<'a> CodeGen for Attribute {
                 .is_some_and(|(class, class_symbols)| {
                     class.has_property_getter(&self.attr, &class_symbols, &options)
                 });
-        if self.attr == "x" && matches!(self.value.as_ref(), ExprType::Name(n) if n.id == "v") {
-            let nt = crate::infer_type(Some(&ctx), &self.value, &options, &symbols);
-            eprintln!("R99PROP v type={:?}", nt);
-        }
+
         let warnings = options.definition_warnings.clone();
         // Issue #137's Option-aware access: a READ through an
         // Option-typed receiver (`self.timeout.connect_timeout` where the

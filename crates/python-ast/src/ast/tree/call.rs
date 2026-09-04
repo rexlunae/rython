@@ -1743,16 +1743,7 @@ impl<'a> CodeGen for Call {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        if let ExprType::Attribute(a) = self.func.as_ref() {
-            if matches!(a.attr.as_str(), "insert" | "depth" | "inorder") {
-                let recv_dbg = match a.value.as_ref() {
-                    crate::ExprType::Name(n) => format!("Name({})", n.id),
-                    crate::ExprType::Attribute(x) => format!("Attr(.{})", x.attr),
-                    _ => "other".to_string(),
-                };
-                eprintln!("R99ENTRY {} recv={} ctx={:?}", a.attr, recv_dbg, std::mem::discriminant(&ctx));
-            }
-        }
+        
         // typing-module calls are compile-time-only: TypeVar, Protocol,
         // TypeAlias, runtime_checkable, Literal, ... exist only for
         // the type system (annotations are strings under `from __future__
@@ -5950,7 +5941,6 @@ impl<'a> CodeGen for Call {
                     class.method_on_mro_with_options(&attr.attr, &class_symbols, &options)
                 {
                     if attr.attr == "depth" {
-                        eprintln!("R99DEPTHPROCEED");
                     }
                     if method.name == "__init__" && class.init_method().is_none() {
                         return Err(format!(
@@ -6002,7 +5992,6 @@ impl<'a> CodeGen for Call {
                     // **kwargs)` — botocore's S3EndpointSetter, where the
                     // field is registered externally and never stored in
                     // __init__): the class has no stored field of this
-                        eprintln!("R99SITE5794");
                     // name, so the KEYWORD-style call cannot be the
                     // zero-parameter method — the external field is
                     // unmodeled — the call is dropped (external-field
@@ -6147,9 +6136,6 @@ impl<'a> CodeGen for Call {
                             &options,
                         )
                     {
-                        eprintln!("R99CALLOPTION {}", attr.attr);
-                        eprintln!("R99RESOLVEDOPT {} mutates={}", attr.attr, mutates_receiver);
-                        eprintln!("R99OPTARM {} mutates={}", attr.attr, mutates_receiver);
                         let mname = attr.attr.clone();
                         // A SHARED class mutates through the borrow: the
                         // Option unwrap clones the reference either way.
@@ -6296,7 +6282,6 @@ let mutating_self_field = boxed_self_ref_receiver
             let option_receiver =
                 crate::ast::tree::attribute::receiver_option_inner(&attr.value, &ctx, &symbols, &options);
             if option_receiver.is_some() && matches!(attr.attr.as_str(), "insert" | "depth") {
-                eprintln!("R99GENOPT {}", attr.attr);
             }
                         let receiver = if (matches!(attr.value.as_ref(), ExprType::Subscript(_))
                 || mutating_self_field)
