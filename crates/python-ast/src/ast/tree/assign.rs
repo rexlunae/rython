@@ -1563,6 +1563,17 @@ impl<'a> CodeGen for Assign {
                     symbols.clone(),
                 )?;
                 let setter = crate::safe_ident(&format!("{}_set", attr.attr));
+                // A SHARED receiver's setter borrows MUTABLY (records's
+                // v.patch = -1 where v is a PyRef<Version>, round 99) —
+                // but NOT a method's own `self` (self is the plain
+                // struct; the borrow would double-wrap).
+                let receiver_is_self = matches!(
+                    attr.value.as_ref(),
+                    ExprType::Name(n) if n.id == "self"
+                );
+                if crate::ast::tree::shared::is_shared(&class.name) && !receiver_is_self {
+                    return Ok(quote!((#recv).borrow_mut().#setter(#value)?;));
+                }
                 return Ok(quote!(#recv.#setter(#value)?;));
             }
             match target {

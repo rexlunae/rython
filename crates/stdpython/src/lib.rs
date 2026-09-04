@@ -3823,11 +3823,13 @@ impl Truthy for str {
     }
 }
 
-impl Truthy for &str {
+impl<T: Truthy + ?Sized> Truthy for &T {
     fn is_truthy(&self) -> bool {
-        !self.is_empty()
+        (*self).is_truthy()
     }
 }
+
+
 
 impl<T> Truthy for Vec<T> {
     fn is_truthy(&self) -> bool {
@@ -3948,6 +3950,22 @@ pub trait PyRefEq: Sized {
 impl<T: PyRefEq> PartialEq for PyRef<T> {
     fn eq(&self, other: &Self) -> bool {
         T::ref_eq(self, other)
+    }
+}
+
+/// Ordering of a SHARED class's references, dispatched to the class's
+/// own `__lt__` through the borrows (records's sorted/min/max over
+/// PyRef<Version> — round 99). A class without `__lt__` keeps the
+/// default: unordered (None).
+pub trait PyRefOrd: Sized {
+    fn ref_cmp(a: &PyRef<Self>, b: &PyRef<Self>) -> Option<core::cmp::Ordering> {
+        None
+    }
+}
+
+impl<T: PyRefEq + PyRefOrd> PartialOrd for PyRef<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        T::ref_cmp(self, other)
     }
 }
 

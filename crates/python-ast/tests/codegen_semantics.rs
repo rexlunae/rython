@@ -17408,7 +17408,7 @@ fn an_inherited_len_is_the_derived_instances_truth() {
 /// on `==` and the conversion warns — never the identity default in
 /// silence. `is` on shared references is `py_is` (Devin review on #321).
 #[test]
-fn a_shared_class_defining_eq_is_loud_on_equality_and_is_stays_identity() {
+fn a_shared_class_defining_eq_dispatches_to_its_eq_and_is_stays_identity() {
     let (out, warnings) = compile_with_warnings(
         concat!(
             "class Tag:\n",
@@ -17442,8 +17442,10 @@ fn a_shared_class_defining_eq_is_loud_on_equality_and_is_stays_identity() {
     );
     let flat: String = out.split_whitespace().collect();
     assert!(
-        flat.contains("implstdpython::PyRefEqforTag{fnref_eq(") && flat.contains("panic!("),
-        "== on a shared __eq__ class is a loud panic: {}",
+        flat.contains("implstdpython::PyRefEqforTag{fnref_eq(")
+            && flat.contains(".__eq__(_b.clone())"),
+        "== on a shared __eq__ class dispatches to its own __eq__ through \
+         the borrows (round 99): {}",
         out
     );
     assert!(
@@ -17452,8 +17454,8 @@ fn a_shared_class_defining_eq_is_loud_on_equality_and_is_stays_identity() {
         out
     );
     assert!(
-        warnings.iter().any(|w| w.contains("defines __eq__ and is shared")),
-        "the conversion names the boundary: {:?}",
+        !warnings.iter().any(|w| w.contains("defines __eq__ and is shared")),
+        "the shared __eq__ dispatch is modeled, not a warning: {:?}",
         warnings
     );
     assert!(

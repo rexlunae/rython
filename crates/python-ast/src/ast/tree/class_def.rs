@@ -3363,25 +3363,45 @@ impl CodeGen for ClassDef {
             && crate::ast::tree::shared::is_shared(&self.name)
         {
             if self.method_on_mro("__eq__", &symbols).is_some() {
-                options.definition_warnings.borrow_mut().push(format!(
-                    "class `{}` defines __eq__ and is shared (its instances are held \
-                     by reference, issue #137): `==` on its references cannot call \
-                     __eq__ (whose parameter is the boxed value) and panics at runtime; \
-                     `is` keeps its identity meaning",
-                    self.name
-                ));
-                let msg = format!(
-                    "TypeError: == on shared class `{}`, which defines __eq__, is not supported (issue #137)",
-                    self.name
-                );
+                // The shared class's own __eq__ dispatches through the
+                // borrows: `a == b` on two PyRef<Version> calls Version's
+                // __eq__ (whose other parameter is the PyRef class —
+                // records, round 99). The __eq__ may raise; the loud
+                // panic is the §12.2 posture (a raise inside == has no
+                // Result channel through the bool contract).
                 quote!(impl stdpython::PyRefEq for #class_name {
                     fn ref_eq(_a: &stdpython::PyRef<Self>, _b: &stdpython::PyRef<Self>) -> bool {
-                        panic!(#msg)
+                        _a.borrow()
+                            .__eq__(_b.clone())
+                            .unwrap_or_else(|e| panic!("{}", e))
                     }
                 })
             } else {
                 quote!(impl stdpython::PyRefEq for #class_name {})
             }
+        } else {
+            quote!()
+        };
+
+        // The ORDERING of a shared class's references (`sorted(vs)` over
+        // Vec<PyRef<Version>> — records, round 99): the class's own __lt__
+        // through the borrows decides Less/Greater/Equal.
+        let ref_ord_impl = if options.with_std_python
+            && crate::ast::tree::shared::is_shared(&self.name)
+            && self.method_on_mro("__lt__", &symbols).is_some()
+        {
+            quote!(impl stdpython::PyRefOrd for #class_name {
+                fn ref_cmp(_a: &stdpython::PyRef<Self>, _b: &stdpython::PyRef<Self>) -> Option<core::cmp::Ordering> {
+                    use core::cmp::Ordering;
+                    if _a.borrow().__lt__(_b.clone()).unwrap_or_else(|e| panic!("{}", e)) {
+                        Some(Ordering::Less)
+                    } else if _b.borrow().__lt__(_a.clone()).unwrap_or_else(|e| panic!("{}", e)) {
+                        Some(Ordering::Greater)
+                    } else {
+                        Some(Ordering::Equal)
+                    }
+                }
+            })
         } else {
             quote!()
         };
@@ -3485,6 +3505,7 @@ impl CodeGen for ClassDef {
             // false — same contract the PyInherits tree carries for
             // ancestry bounds.
             #is_none_impl #truth_impl #ref_truth_impl #ref_eq_impl
+            #ref_ord_impl
             // Class-level COMPUTED constants live at module scope under
             // class-mangled names: associated statics are not legal Rust
             // (issue #137).

@@ -662,6 +662,12 @@ impl<'a> CodeGen for Attribute {
             // and unwraps (`self.url()?`). Only when the receiver's class
             // actually defines the getter — a genuine field read is untouched.
             if property_getter && field_access.is_none() {
+                // A SHARED receiver's getter call borrows first (the
+                // PyRef itself has no methods — records's v.patch where v
+                // is a PyRef<Version>, round 99).
+                if shared_recv {
+                    return Ok(quote!((#value_tokens).borrow().#attr()?));
+                }
                 return Ok(quote!(#value_tokens.#attr()?));
             }
             // The fallibility rule (the review's fix 2, round 99): a
