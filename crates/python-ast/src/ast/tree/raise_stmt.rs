@@ -603,7 +603,7 @@ pub(crate) fn exception_class_raise(
     options: crate::PythonOptions,
     symbols: crate::SymbolTableScopes,
 ) -> Result<Option<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
-    use crate::{ExprType, Statement, StatementType};
+    use crate::{ExprType, StatementType};
     let Some(init) = cls.init_method() else {
         return Ok(None);
     };
