@@ -19057,3 +19057,30 @@ fn empty_container_pins_its_element_from_the_split_chain() {
         out
     );
 }
+
+#[test]
+fn list_index_count_and_tuple_append_own_their_arguments() {
+    // list.index(x)/list.count(x) with a str literal argument own it
+    // (the PyListOps slot is &String), and a TUPLE literal pushed into a
+    // Vec<Tuple<String, ...>> owns each String element (tokenizer, round
+    // 99).
+    let out = compile(
+        "def analyze(kinds: list[str], tokens: list[tuple[str, str]]) -> None:\n    kinds.index(\"op\")\n    kinds.count(\"name\")\n    tokens.append((\"num\", \"x\"))\n",
+        "tokops.py",
+    );
+    assert!(
+        out.contains("py_index_of") && out.contains("py_index_of (& (\"op\") . to_string ())"),
+        "index must route to py_index_of with an owned arg: {}",
+        out
+    );
+    assert!(
+        out.contains("count (& (\"name\") . to_string ())"),
+        "count must own the literal: {}",
+        out
+    );
+    assert!(
+        out.contains("(\"num\") . to_string ()") || out.contains("\"num\" . to_string ()"),
+        "the tuple literal's String element must own at the push: {}",
+        out
+    );
+}

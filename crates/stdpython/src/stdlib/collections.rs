@@ -415,7 +415,9 @@ impl<T> crate::PyListOps<T> for deque<T> {
             .position(|e| e == item)
             .map(|i| i as i64)
             .ok_or_else(|| {
-                crate::PyException::new("ValueError", "list.index(x): x not in list")
+                // CPython 3.14: "deque.index(x): x not in deque" (verified
+                // against python3.14.1 — the modern form since 3.10).
+                crate::PyException::new("ValueError", "deque.index(x): x not in deque")
             })
     }
     fn py_insert(&mut self, index: i64, item: T) -> Result<(), crate::PyException> {

@@ -3803,7 +3803,14 @@ fn list_index_and_count_match_python() {
     let v = vec!["a".to_string(), "b".to_string(), "a".to_string()];
     assert_eq!(v.py_index_of(&"b".to_string()).unwrap(), 1);
     assert_eq!(v.py_index_of(&"a".to_string()).unwrap(), 0);
-    assert!(v.py_index_of(&"z".to_string()).is_err(), "absent x raises ValueError");
+    // CPython 3.14's exact messages (verified against python3.14.1 —
+    // the modern 3.10+ form, NOT the pre-3.10 "X is not in list").
+    let err = v.py_index_of(&"z".to_string()).unwrap_err();
+    assert_eq!(err.message, "list.index(x): x not in list");
+    let mut d = stdpython::collections::deque::<String>::new();
+    d.append("a".to_string());
+    let derr = d.py_index_of(&"z".to_string()).unwrap_err();
+    assert_eq!(derr.message, "deque.index(x): x not in deque");
     assert_eq!(v.count(&"a".to_string()), 2);
     assert_eq!(v.count(&"z".to_string()), 0);
 }
