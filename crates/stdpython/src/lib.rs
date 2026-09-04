@@ -1477,6 +1477,20 @@ pub fn list<L: PyListFrom>(x: L) -> Vec<L::Item> {
 }
 
 /// Python zip() function - combines multiple iterables
+/// Python `zip(*iterable)` — the star-args splat: zip over a Vec of
+/// Vecs (all rows the same length as the shortest, CPython's truncating
+/// zip), producing Vec<Vec<T>> — one output Vec per position (round 99,
+/// matrix's `zip(*m)` transpose).
+pub fn zip_many<T: Clone>(iterables: Vec<Vec<T>>) -> Vec<Vec<T>> {
+    if iterables.is_empty() {
+        return Vec::new();
+    }
+    let shortest = iterables.iter().map(|v| v.len()).min().unwrap_or(0);
+    (0..shortest)
+        .map(|i| iterables.iter().map(|v| v[i].clone()).collect())
+        .collect()
+}
+
 pub fn zip<T, U>(iter1: Vec<T>, iter2: Vec<U>) -> Vec<(T, U)> {
     iter1.into_iter().zip(iter2.into_iter()).collect()
 }

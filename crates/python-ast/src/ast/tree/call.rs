@@ -2218,6 +2218,7 @@ impl<'a> CodeGen for Call {
                 bname,
                 "min"
                     | "max"
+                    | "zip"
                     | "sorted"
                     | "enumerate"
                     | "pow"
@@ -2286,7 +2287,17 @@ impl<'a> CodeGen for Call {
                     .into()
                 };
                 match bname {
-                    "min" | "max" => {
+                                    // zip(*x) — the star-args splat: zip over a Vec of
+                    // Vecs (round 99, matrix's `zip(*m)` transpose). The
+                    // runtime's zip_many returns Vec<Vec<T>> — one output
+                    // Vec per position, CPython's truncating zip.
+                    "zip" if self.args.len() == 1
+                        && matches!(self.args.first(), Some(ExprType::Starred(_))) =>
+                    {
+                        let a = &rendered[0];
+                        return Ok(quote!(zip_many(#a)));
+                    }
+    "min" | "max" => {
                         let mut key = None;
                         let mut default = None;
                         for kw in &self.keywords {
@@ -2417,7 +2428,26 @@ impl<'a> CodeGen for Call {
                         if rendered.is_empty() {
                             return Err("enumerate() expected an iterable".to_string().into());
                         }
-                        let a = &rendered[0];
+                        // enumerate consumes its iterable (IntoIterator):
+                        // a name reused later is cloned here (the same
+                        // rule the for-statement's iter render uses —
+                        // round 99, matrix's `for i, row in enumerate(m)`
+                        // with m read again after).
+                        let a_owned = match self.args.first() {
+                            Some(ExprType::Name(n))
+                                if options
+                                    .use_counts
+                                    .get(&n.id)
+                                    .copied()
+                                    .unwrap_or(0)
+                                    > 1 =>
+                            {
+                                let tok = rendered[0].clone();
+                                quote!(Clone::clone(&(#tok)))
+                            }
+                            _ => rendered[0].clone(),
+                        };
+                        let a = &a_owned;
                         return Ok(match start {
                             None => quote!(enumerate(#a)),
                             Some(s) => {
