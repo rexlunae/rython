@@ -180,6 +180,15 @@ impl CodeGen for AugAssign {
         // place. In a generic trait default the LOAD accessor clones
         // (`self.age()`) while the STORE must go through the mutable accessor
         // (`*self.age_mut()`), so the two sides render differently.
+        // A read-modify-write through a SHARED receiver's mutable borrow
+        // (`c.n += 1` on a PyRef): the load's `Ref` temporary would live
+        // to the end of the store statement, so the load and the operand
+        // are bound first and the `borrow_mut` taken after (the same rule
+        // the plain store applies; the evaluation on issue #137).
+        let shared_store = matches!(&self.target, ExprType::Attribute(a)
+            if crate::ast::tree::attribute::shared_receiver(&a.value, &ctx, &symbols, &options));
+        let mut prelude = TokenStream::new();
+        let mut shared_load: Option<TokenStream> = None;
         let (target, target_load) = match &self.target {
             ExprType::Attribute(attr) => {
                 let store = crate::ast::tree::attribute::to_rust_place(
@@ -194,7 +203,12 @@ impl CodeGen for AugAssign {
                     .target
                     .clone()
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                (store, load)
+                if shared_store {
+                    shared_load = Some(load);
+                    (store, quote!(__rython_load))
+                } else {
+                    (store, load)
+                }
             }
             _ => {
                 let t = self.target.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
@@ -208,10 +222,19 @@ impl CodeGen for AugAssign {
             crate::TypeInfo::Option(_)
         );
 
+        // The operand: a name or a constant takes no borrow and renders
+        // in place; anything else may read the same object.
+        let operand_reads = !matches!(self.value, ExprType::Name(_) | ExprType::Constant(_));
         let value = self.value.to_rust(ctx, options, symbols)?;
+        let value = if shared_store && operand_reads {
+            prelude.extend(quote!(let __rython_val = #value;));
+            quote!(__rython_val)
+        } else {
+            value
+        };
 
         // Generate the appropriate augmented assignment operator
-        match self.op {
+        let stmt: Result<TokenStream, Box<dyn std::error::Error>> = match self.op {
             // `+=` mirrors Python's `+` (string concat, list concat,
             // numeric promotion) via PyAdd. An OPTION-typed target
             // (`self._data += data` where the field is `bytes | None` —
@@ -351,7 +374,23 @@ impl CodeGen for AugAssign {
             BinOps::Unknown => {
                 Err(format!("Unknown augmented assignment operator").into())
             },
+        };
+        let stmt = stmt?;
+        // The load is bound only when the operator's lowering read it
+        // (the typed fast paths `x -= v` / `x *= v` store in place and
+        // never do — an unused binding would be a warning in the
+        // generated crate).
+        if shared_store && stmt.to_string().contains("__rython_load") {
+            let load = shared_load.take().expect("the shared store rendered its load");
+            let mut with_load = quote!(let __rython_load = #load;);
+            with_load.extend(prelude);
+            prelude = with_load;
         }
+        Ok(if prelude.is_empty() {
+            stmt
+        } else {
+            quote!({ #prelude #stmt })
+        })
     }
 }
 

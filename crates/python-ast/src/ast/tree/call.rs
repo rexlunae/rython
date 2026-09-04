@@ -5517,18 +5517,9 @@ impl<'a> CodeGen for Call {
                                 }
                             }
                         };
-                        // A SHARED class (shared.rs) constructs behind
-                        // `PyRef`; a shared ROOT's value is its sum type
-                        // holding the reference.
-                        if crate::ast::tree::shared::is_shared(&class.name) {
-                            let shared = quote!(stdpython::PyRef::new(#cname::new(#(#args),*)?));
-                            if crate::ast::tree::hierarchy::is_polymorphic_root(&class.name) {
-                                let any = crate::ast::tree::hierarchy::any_ident(&class.name);
-                                return Ok(quote!({ #prelude #any::from(#shared) }));
-                            }
-                            return Ok(quote!({ #prelude #shared }));
-                        }
-                        return Ok(quote!({ #prelude #cname::new(#(#args),*)? }));
+                        let construct =
+                            shared_construction(&class.name, quote!(#cname::new(#(#args),*)?));
+                        return Ok(quote!({ #prelude #construct }));
                     }
                     None => {
                         // The class has NO own __init__ and its base's
@@ -5560,9 +5551,12 @@ impl<'a> CodeGen for Call {
                                  positionally (documented divergence)",
                                 n.id
                             ));
-                            return Ok(quote!(#cname::new(#(#args),*)?));
+                            return Ok(shared_construction(
+                                &class.name,
+                                quote!(#cname::new(#(#args),*)?),
+                            ));
                         }
-                        return Ok(quote!(#cname::new()?));
+                        return Ok(shared_construction(&class.name, quote!(#cname::new()?)));
                     }
                 }
             }
@@ -11399,4 +11393,21 @@ pub(crate) fn receiver_is_bytes_like(
         }
         _ => false,
     }
+}
+
+/// A SHARED class (shared.rs) constructs behind `PyRef`; a shared ROOT's
+/// value is its sum type holding the reference. One wrap for every
+/// construction path — a class with its own `__init__` and one without
+/// (a root constructed bare in a root-typed list, `Shape()` beside
+/// `Circle(1.0)`, missed the wrap; the evaluation on issue #137).
+fn shared_construction(class_name: &str, construct: TokenStream) -> TokenStream {
+    if !crate::ast::tree::shared::is_shared(class_name) {
+        return construct;
+    }
+    let shared = quote!(stdpython::PyRef::new(#construct));
+    if crate::ast::tree::hierarchy::is_polymorphic_root(class_name) {
+        let any = crate::ast::tree::hierarchy::any_ident(class_name);
+        return quote!(#any::from(#shared));
+    }
+    shared
 }

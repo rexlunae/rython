@@ -84,16 +84,40 @@ pub fn compute_shared(
         register(&module.raw.body, defs, &module_symbols, &module_opts);
     }
     // Mutability is INHERITED: a stored subclass whose only mutator is
-    // its base's is mutated through it (Devin review on #321).
+    // its base's is mutated through it (Devin review on #321). And both
+    // facts are FAMILY facts: a root-typed container (`shapes:
+    // list[Shape]`) stores the subtree's instances, and a subclass's
+    // mutator (`Rect.scale`) mutates them — the store is recorded under
+    // the root and the mutation under the subclass, so each is asked of
+    // the whole family (the evaluation on issue #137: `views`'s Rect,
+    // stored under Shape and mutated through a parameter, stayed a
+    // value, and a mutation through the parameter was silently lost).
+    let roots = options.hierarchy_roots.clone();
+    let family_of = |name: &str| -> Vec<String> {
+        roots
+            .iter()
+            .find(|(root, subtree)| {
+                root.as_str() == name || subtree.iter().any(|v| v.name == name)
+            })
+            .map(|(root, subtree)| {
+                std::iter::once(root.clone())
+                    .chain(subtree.iter().map(|v| v.name.clone()))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![name.to_string()])
+    };
     let mut memo: HashMap<String, bool> = HashMap::new();
     let names: Vec<String> = classes.keys().cloned().collect();
     let mut shared: HashSet<String> = names
         .iter()
         .filter(|name| {
             let c = &classes[*name];
-            let qualifies = stored.contains(*name)
+            let family = family_of(name);
+            let qualifies = family.iter().any(|m| stored.contains(m))
                 && !crate::ast::tree::class_def::is_exception_class(c)
-                && class_mutates(name, &classes, &external_stores, &mut memo);
+                && family
+                    .iter()
+                    .any(|m| class_mutates(m, &classes, &external_stores, &mut memo));
             if qualifies && defined_in.get(*name).copied().unwrap_or(0) > 1 {
                 options.definition_warnings.borrow_mut().push(format!(
                     "class `{}` is defined by more than one module of the crate: its \
@@ -110,7 +134,6 @@ pub fn compute_shared(
         .collect();
     // Family closure: a root's sum type holds its members, so the root
     // and every class of its subtree take the one representation.
-    let roots = options.hierarchy_roots.clone();
     let mut changed = true;
     while changed {
         changed = false;

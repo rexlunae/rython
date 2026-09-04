@@ -6,6 +6,9 @@
     "clauses": {
       "status": "pass"
     },
+    "handoff": {
+      "status": "pass"
+    },
     "inventory": {
       "status": "pass"
     },
