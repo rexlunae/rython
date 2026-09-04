@@ -732,7 +732,7 @@ pub(crate) fn exception_class_raise(
 /// call's args (positionally) — an AST rewrite so the f-string renders
 /// against the raise site's scope.
 fn substitute_params(expr: &mut ExprType, params: &[&str], args: &[ExprType]) {
-    use crate::{ExprType, Statement};
+    use crate::ExprType;
     match expr {
         ExprType::Name(n) => {
             if let Some(idx) = params.iter().position(|p| *p == n.id) {
