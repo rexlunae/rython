@@ -406,6 +406,20 @@ impl<T> crate::PyListOps<T> for deque<T> {
     {
         self.inner.iter().filter(|e| *e == item).count() as i64
     }
+    fn py_index_of(&self, item: &T) -> Result<i64, crate::PyException>
+    where
+        T: PartialEq,
+    {
+        self.inner
+            .iter()
+            .position(|e| e == item)
+            .map(|i| i as i64)
+            .ok_or_else(|| {
+                // CPython 3.14: "deque.index(x): x not in deque" (verified
+                // against python3.14.1 — the modern form since 3.10).
+                crate::PyException::new("ValueError", "deque.index(x): x not in deque")
+            })
+    }
     fn py_insert(&mut self, index: i64, item: T) -> Result<(), crate::PyException> {
         if let Some(max_len) = self.maxlen {
             if self.inner.len() >= max_len {

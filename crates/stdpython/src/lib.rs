@@ -4201,6 +4201,11 @@ pub trait PyListOps<T> {
     fn count(&self, item: &T) -> i64
     where
         T: PartialEq;
+    /// list.index(x): the first index whose element equals x, or a
+    /// catchable ValueError (CPython's behavior when x is absent).
+    fn py_index_of(&self, item: &T) -> Result<i64, PyException>
+    where
+        T: PartialEq;
     /// list.insert(i, x) with Python index rules: negative indices count
     /// from the end, and out-of-range indices clamp (insert past the end
     /// appends, before the start prepends) — never a panic. Result so a
@@ -4214,6 +4219,15 @@ impl<T> PyListOps<T> for Vec<T> {
         T: PartialEq,
     {
         self.iter().filter(|e| *e == item).count() as i64
+    }
+    fn py_index_of(&self, item: &T) -> Result<i64, PyException>
+    where
+        T: PartialEq,
+    {
+        self.iter()
+            .position(|e| e == item)
+            .map(|i| i as i64)
+            .ok_or_else(|| PyException::new("ValueError", "list.index(x): x not in list"))
     }
     fn py_insert(&mut self, index: i64, item: T) -> Result<(), PyException> {
         let len = self.len() as i64;

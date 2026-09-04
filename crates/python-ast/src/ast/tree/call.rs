@@ -6625,6 +6625,44 @@ let mutating_self_field = boxed_self_ref_receiver
                         {
                             return Ok(quote!((#receiver).push((#value).to_string())));
                         }
+                        // A TUPLE literal into a Vec<Tuple<String, ...>>
+                        // slot (`tokens.append(("num", src[i:j]))` —
+                        // tokenizer, round 99): each String-typed element
+                        // that renders as a str literal or slice owns at
+                        // the push.
+                        if let Some(ExprType::Tuple(t)) = self.args.first()
+                            && let crate::TypeInfo::Vec(inner) =
+                                crate::infer_type(Some(&ctx), &attr.value, &options, &symbols)
+                            && let crate::TypeInfo::Tuple(slot_elts) = inner.as_ref()
+                            && slot_elts.len() == t.elts.len()
+                        {
+                            let mut elems = Vec::new();
+                            for (elt, slot) in t.elts.iter().zip(slot_elts.iter()) {
+                                let tok = elt.clone().to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )?;
+                                let elt_ty = crate::infer_type(
+                                    Some(&ctx),
+                                    elt,
+                                    &options,
+                                    &symbols,
+                                );
+                                match (elt_ty, slot) {
+                                    (crate::TypeInfo::StrRef, crate::TypeInfo::String) => {
+                                        elems.push(quote!((#tok).to_string()));
+                                    }
+                                    (crate::TypeInfo::String, crate::TypeInfo::String) => {
+                                        elems.push(quote!((#tok).to_string()));
+                                    }
+                                    _ => {
+                                        elems.push(tok);
+                                    }
+                                }
+                            }
+                            return Ok(quote!((#receiver).push((#(#elems),*))));
+                        }
                         return Ok(quote!((#receiver).push(#value)));
                     }
                     // list.extend(x) with a PyValue/heterogeneous argument
@@ -6673,9 +6711,25 @@ let mutating_self_field = boxed_self_ref_receiver
                             }
                         }
                     }
-                    // list.count(x): the PyListOps method takes a reference.
+                    // list.count(x) / list.index(x): the PyListOps methods
+                    // take a reference. A str literal arg owns (the slot is
+                    // &String — `kinds.count("name")` where kinds:
+                    // Vec<String>, tokenizer, round 99).
                     ("count", [value]) => {
+                        if let ExprType::Constant(c) = self.args.first().unwrap()
+                            && matches!(&c.0, Some(litrs::Literal::String(_)))
+                        {
+                            return Ok(quote!((#receiver).count(&(#value).to_string())));
+                        }
                         return Ok(quote!((#receiver).count(&(#value))));
+                    }
+                    ("index", [value]) => {
+                        if let ExprType::Constant(c) = self.args.first().unwrap()
+                            && matches!(&c.0, Some(litrs::Literal::String(_)))
+                        {
+                            return Ok(quote!((#receiver).py_index_of(&(#value).to_string())?));
+                        }
+                        return Ok(quote!((#receiver).py_index_of(&(#value))?));
                     }
                     // File-object and csv.Writer methods return Result (I/O
                     // can fail; Python raises): thread `?`. The threading
