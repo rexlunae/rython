@@ -179,6 +179,14 @@ impl CodeGen for Subscript {
         // Computed BEFORE self.value is moved by the to_rust below.
         let value_yields_option =
             crate::expr_yields_option_ctx(&self.value, &ctx, &options, &symbols);
+        // A RUST TUPLE's index read (`kv[1]` where kv: (String, i64) —
+        // the sorted-key lambda, round 99) lowers to the field accessor:
+        // the tuple is the VALUE, not a runtime container. Detected before
+        // the moves; the emission happens in the Index arm.
+        let tuple_read = matches!(
+            crate::infer_type(Some(&ctx), &self.value, &options, &symbols),
+            crate::TypeInfo::Tuple(_)
+        );
         let value = self.value.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         let value = if value_yields_option {
             quote!((#value).clone().unwrap_or_else(|| {
@@ -215,15 +223,10 @@ impl CodeGen for Subscript {
                     symbols,
                     Some(crate::TypeInfo::Int),
                 )?;
-                // A RUST TUPLE's index read (`kv[1]` where kv: (String,
-                // i64) — the idiom corpus's sorted-key lambda, round 99)
-                // lowers to the field accessor: the tuple is the VALUE,
-                // not a runtime container. The index must be a constant.
-                if matches!(
-                    crate::infer_type(Some(&ctx), &self.value, &options, &symbols),
-                    crate::TypeInfo::Tuple(_)
-                ) {
-                    let idx_tokens = index.to_string();
+                if tuple_read {
+                    // The rendered index carries the cast's i64 suffix —
+                    // strip it: the accessor is `kv.1`, not `kv.1i64`.
+                    let idx_tokens = index.to_string().replace("i64", "").trim().to_string();
                     let idx: Option<i64> = idx_tokens.trim().parse().ok();
                     match idx {
                         Some(n) if n >= 0 => {
@@ -231,7 +234,8 @@ impl CodeGen for Subscript {
                         }
                         _ => {
                             return Err(format!(
-                                "indexing a Rust tuple with a non-constant index is not                                  supported yet; rython refuses to silently ignore it"
+                                "indexing a Rust tuple with a non-constant index is not \
+                                 supported yet; rython refuses to silently ignore it"
                             )
                             .into());
                         }
