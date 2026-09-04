@@ -217,6 +217,16 @@ impl CodeGen for For {
             options.clone(),
             symbols.clone(),
         )?;
+        // A DICT-typed iterable (`for w in counts` — text_stats's starts-
+        // with-q comprehension, round 99): Python iterates the dict's
+        // KEYS, but the typed PyDict's IntoIterator yields the (K, V)
+        // pairs. Route through the keys view.
+        if matches!(
+            crate::infer_type(Some(&ctx), &self.iter, &options, &symbols),
+            crate::TypeInfo::Dict(_, _)
+        ) {
+            iter = quote!(#iter . py_keys ());
+        }
         // A TUPLE-LITERAL iterable (`for key in ("headers",
         // "_proxy_headers", "_socks_options")` — urllib3's poolmanager):
         // Python iterates the tuple; rython's tuple value is a Rust tuple,

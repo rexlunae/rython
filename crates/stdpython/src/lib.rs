@@ -3780,6 +3780,13 @@ impl Len for str {
     }
 }
 
+impl Len for crate::HashSet<String> {
+    fn len(&self) -> usize {
+        // Python counts members.
+        crate::HashSet::len(self)
+    }
+}
+
 impl<T> Len for Vec<T> {
     fn len(&self) -> usize {
         self.len()
@@ -7176,6 +7183,13 @@ where
 /// `set("abc") == {'a','b','c'}`.
 pub fn set<S: AsRef<str>>(s: S) -> crate::HashSet<String> {
     s.as_ref().chars().map(|c| c.to_string()).collect()
+}
+
+/// Python's `set(iterable)` for a Vec of Strings (`set(ws)` —
+/// text_stats's distinct count, round 99): the set of the ELEMENTS, not
+/// the str-set-of-characters (CPython: `set(['a', 'b']) == {'a', 'b'}`).
+pub fn set_of_strings<S: AsRef<str>>(iterable: &[S]) -> crate::HashSet<String> {
+    iterable.iter().map(|s| s.as_ref().to_string()).collect()
 }
 
 /// A set of strings boxes as a Tuple of Str members (the list-as-tuple

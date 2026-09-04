@@ -196,18 +196,26 @@ impl CodeGen for Subscript {
                 && inner.windows(2).all(|w| w[0] == w[1])
         });
         // A compile-time CONSTANT index (the AST slice, before the
-        // i64-cast render): 0..len-1 or its negative equivalent.
-        let constant_index = match &self.kind {
-            SubscriptKind::Index(index_expr) => constant_tuple_index(index_expr.as_ref())
-                .and_then(|i| {
-                    tuple_value_type.as_ref().and_then(|inner| {
-                        let len = inner.len() as i64;
-                        let norm = if i < 0 { i + len } else { i };
-                        (norm >= 0 && norm < len).then_some(norm)
-                    })
-                }),
+        // i64-cast render): normalized 0..len-1. The RAW constant and
+        // its bounds are kept separate so an OUT-OF-RANGE constant is
+        // not misreported as a COMPUTED index (Devin review on #326):
+        // CPython raises a catchable IndexError only when the access
+        // executes.
+        let tuple_len = tuple_value_type
+            .as_ref()
+            .map(|inner| inner.len() as i64);
+        let raw_constant_index = match &self.kind {
+            SubscriptKind::Index(index_expr) => {
+                constant_tuple_index(index_expr.as_ref())
+            }
             _ => None,
         };
+        let constant_index = raw_constant_index.and_then(|i| {
+            tuple_len.and_then(|len| {
+                let norm = if i < 0 { i + len } else { i };
+                (norm >= 0 && norm < len).then_some(norm)
+            })
+        });
         let value = self.value.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         let value = if value_yields_option {
             quote!((#value).clone().unwrap_or_else(|| {
@@ -251,10 +259,30 @@ impl CodeGen for Subscript {
                     let accessor = proc_macro2::Literal::i64_unsuffixed(n);
                     return Ok(quote! { (#value).#accessor.clone() });
                 }
+                // An OUT-OF-RANGE CONSTANT on a STATICALLY-KNOWN tuple: a
+                // homogeneous tuple lowers to the runtime py_index (its
+                // catchable IndexError — CPython's behavior when the
+                // access executes); a HETEROGENEOUS tuple cannot express
+                // the failing access through the runtime (its Output type
+                // depends on the index) — loud, naming the bounds and the
+                // rewrite. A receiver whose tuple-ness is NOT statically
+                // known (an isinstance-narrowed union) keeps the runtime
+                // path below.
                 if tuple_value_type.is_some() && !tuple_homogeneous {
+                    if let Some(raw_i) = raw_constant_index {
+                        return Err(format!(
+                            "index {} is out of bounds for this {} tuple (CPython raises a \
+                             catchable IndexError only when the access executes); use an index \
+                             within the bounds, or make the tuple homogeneous",
+                            raw_i, tuple_len.map(|l| format!("{l}-element")).unwrap_or_default()
+                        )
+                        .into());
+                    }
                     return Err(format!(
-                        "indexing a heterogeneous Rust tuple with a computed index is not \
-                         supported yet; rython refuses to silently ignore it"
+                        "indexing a heterogeneous Rust tuple with a non-constant index is not \
+                         supported yet (line {}): use a constant index, or make the tuple \
+                         homogeneous; rython refuses to silently ignore it",
+                        self.lineno.map(|l| l.to_string()).unwrap_or_default()
                     )
                     .into());
                 }

@@ -19018,8 +19018,42 @@ fn tuple_computed_index_on_heterogeneous_tuple_is_loud() {
     );
     assert!(
         err.contains("heterogeneous Rust tuple")
-            && err.contains("computed index"),
+            && err.contains("non-constant index"),
         "must name the construct and the fix: {}",
         err
+    );
+}
+
+#[test]
+fn tuple_out_of_range_constant_is_loud_with_bounds() {
+    // An OUT-OF-RANGE CONSTANT on a statically-known HETEROGENEOUS tuple
+    // is not misreported as a computed index: the error names the index
+    // and the bounds, and the rewrite (CPython's catchable IndexError is
+    // preserved for the homogeneous runtime path — Devin review on #326).
+    let err = compile_err(
+        "def f(t: tuple[str, int]) -> str:\n    return t[5]\n",
+        "tupleidx3.py",
+    );
+    assert!(
+        err.contains("out of bounds") && err.contains("2-element"),
+        "must name the constant and the bounds: {}",
+        err
+    );
+}
+
+#[test]
+fn empty_container_pins_its_element_from_the_split_chain() {
+    // `out = []` whose element comes from a str-method CHAIN pins
+    // Vec<String> — the split/strip/lower returns are in the typed
+    // table, so the empty container adopts String and the pushes stay
+    // direct (round 99, text_stats's words()).
+    let out = compile(
+        "def words(text: str) -> list[str]:\n    out = []\n    for raw in text.split():\n        w = raw.strip().lower()\n        if w:\n            out.append(w)\n    return out\n",
+        "boxedpush.py",
+    );
+    assert!(
+        out.contains("Vec :: < String > :: new") && out.contains("push (w)"),
+        "the empty container must pin String from the chain: {}",
+        out
     );
 }
