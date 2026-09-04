@@ -6637,7 +6637,6 @@ let mutating_self_field = boxed_self_ref_receiver
                             && slot_elts.len() == t.elts.len()
                         {
                             let mut elems = Vec::new();
-                            let mut ok = true;
                             for (elt, slot) in t.elts.iter().zip(slot_elts.iter()) {
                                 let tok = elt.clone().to_rust(
                                     ctx.clone(),
@@ -6662,9 +6661,7 @@ let mutating_self_field = boxed_self_ref_receiver
                                     }
                                 }
                             }
-                            if ok {
-                                return Ok(quote!((#receiver).push((#(#elems),*))));
-                            }
+                            return Ok(quote!((#receiver).push((#(#elems),*))));
                         }
                         return Ok(quote!((#receiver).push(#value)));
                     }
