@@ -6556,6 +6556,34 @@ let mutating_self_field = boxed_self_ref_receiver
                     // list.append(x) pushes one element; Vec::append (inherent)
                     // concatenates another Vec — silently different.
                     ("append", [value]) => {
+                        // A BOXED-element receiver (Vec<PyValue> from the
+                        // empty-literal divergence) boxing a TYPED element
+                        // (`out.append(w)` where w: String — text_stats's
+                        // words(), round 99): the push boxes the element.
+                        // (Only when the ARG is not itself boxed — a
+                        // PyValue arg passes through.)
+                        let recv_ty = crate::infer_type(Some(&ctx), &attr.value, &options, &symbols);
+                        let arg_ty = self
+                            .args
+                            .first()
+                            .map(|a| crate::infer_type(Some(&ctx), a, &options, &symbols));
+                        if attr.attr == "append" && matches!(&recv_ty, crate::TypeInfo::Vec(_)) {
+                            eprintln!("R99APPEND recv={:?} arg={:?}", recv_ty, arg_ty);
+                        }
+                        if let crate::TypeInfo::Vec(inner) = &recv_ty
+                            && matches!(
+                                **inner,
+                                crate::TypeInfo::PyValue | crate::TypeInfo::PyObject
+                            )
+                            && !arg_ty.as_ref().is_some_and(|t| {
+                                matches!(
+                                    t,
+                                    crate::TypeInfo::PyValue | crate::TypeInfo::PyObject
+                                )
+                            })
+                        {
+                            return Ok(quote!((#receiver).push(stdpython::PyValue::from(#value))));
+                        }
                         // A str literal appended to a Vec<String> local
                         // (`lines.append("\r\n")` — urllib3's
                         // render_headers) is a &'static str; the Vec holds

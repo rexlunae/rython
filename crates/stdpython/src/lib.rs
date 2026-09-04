@@ -4439,6 +4439,7 @@ pub trait PyStrOps {
     fn lstrip(&self) -> String;
     fn rstrip(&self) -> String;
     fn capitalize(&self) -> String;
+    fn swapcase(&self) -> String;
     fn startswith(&self, prefix: &str) -> bool;
     fn endswith(&self, suffix: &str) -> bool;
     /// str.find: CHARACTER index of the first match, or -1 (not an Option).
@@ -4542,6 +4543,23 @@ impl<T: AsRef<str> + ?Sized> PyStrOps for T {
             Some(first) => py_to_titlecase(first) + &chars.as_str().to_lowercase(),
             None => String::new(),
         }
+    }
+    fn swapcase(&self) -> String {
+        // Python's str.swapcase: each cased char toggles case; the
+        // titlecase-uppercase "ß" expands to "SS" (CPython: "ß".swapcase()
+        // == "SS").
+        self.as_ref()
+            .chars()
+            .map(|c| {
+                if c.is_uppercase() {
+                    c.to_lowercase().collect::<String>()
+                } else if c.is_lowercase() {
+                    py_to_titlecase(c)
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect()
     }
     fn startswith(&self, prefix: &str) -> bool {
         self.as_ref().starts_with(prefix)
