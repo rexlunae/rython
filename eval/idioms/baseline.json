@@ -20,8 +20,7 @@
       "errors": 5
     },
     "records": {
-      "status": "build-failed",
-      "errors": 16
+      "status": "pass"
     },
     "schedule": {
       "status": "convert-failed"

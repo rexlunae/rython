@@ -429,6 +429,7 @@ impl<'a> CodeGen for Attribute {
                 .is_some_and(|(class, class_symbols)| {
                     class.has_property_getter(&self.attr, &class_symbols, &options)
                 });
+
         let warnings = options.definition_warnings.clone();
         // Issue #137's Option-aware access: a READ through an
         // Option-typed receiver (`self.timeout.connect_timeout` where the
@@ -658,6 +659,12 @@ impl<'a> CodeGen for Attribute {
             // and unwraps (`self.url()?`). Only when the receiver's class
             // actually defines the getter — a genuine field read is untouched.
             if property_getter && field_access.is_none() {
+                // A SHARED receiver's getter call borrows first (the
+                // PyRef itself has no methods — records's v.patch where v
+                // is a PyRef<Version>, round 99).
+                if shared_recv {
+                    return Ok(quote!((#value_tokens).borrow().#attr()?));
+                }
                 return Ok(quote!(#value_tokens.#attr()?));
             }
             // The fallibility rule (the review's fix 2, round 99): a

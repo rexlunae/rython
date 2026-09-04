@@ -736,6 +736,12 @@ impl CodeGen for StatementType {
                     quote!(())
                 } else if matches!(e.value, ExprType::NoneType(_)) {
                     quote!(())
+                } else if matches!(&e.value, ExprType::Name(n) if n.id == "NotImplemented") {
+                    // `return NotImplemented` in a comparison dunder: the
+                    // == falls back to identity (False for distinct shared
+                    // instances — records's Version.__eq__, round 99). The
+                    // NotImplemented singleton has no other value shape.
+                    quote!(false)
                 } else if options.fn_return_is_pyvalue {
                     // A PyValue-returning function wraps its other returns
                     // (the identity From passes already-boxed values). A

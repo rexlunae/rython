@@ -1632,7 +1632,24 @@ impl FunctionDef {
                                 info.name_types.insert(p.arg.clone(), crate::TypeInfo::Bytes);
                             }
                             // `object` — a value of unknown type: the boxed
-                            // heterogeneous value.
+                            // heterogeneous value. EXCEPT a comparison
+                            // dunder (__eq__/__lt__/...) of a SHARED class:
+                            // its other parameter compares two shared
+                            // instances — the PyRef class, not the box
+                            // (PyValue has no class member — records's
+                            // Version.__eq__(self, other: object), round
+                            // 99).
+                            "object" | "Any"
+                                if crate::ast::tree::type_ctx::is_comparison_dunder(
+                                    &self.name,
+                                ) && ctx.enclosing_class_name().is_some_and(|c| {
+                                    crate::ast::tree::shared::is_shared(c)
+                                }) =>
+                            {
+                                let class = ctx.enclosing_class_name().expect("checked").to_string();
+                                info.name_types
+                                    .insert(p.arg.clone(), crate::TypeInfo::Class(class));
+                            }
                             "object" | "Any" => {
                                 info.name_types
                                     .insert(p.arg.clone(), crate::TypeInfo::PyValue);
@@ -2498,7 +2515,26 @@ impl FunctionDef {
             }
         } else {
             match self.resolved_return_type_in(&symbols, &options, ctx.enclosing_class_name()) {
-                Some(ty) => quote!(-> Result<#ty, PyException>),
+                Some(ty) => {
+                    // A SHARED class method returning its OWN class
+                    // (`parse -> "Version"` on the PyRef-shared Version —
+                    // records, round 99): the instance is held behind
+                    // PyRef, so the signature says PyRef<Version>, the
+                    // same wrap the constructor and the field types use.
+                    let enclosing_shared = ctx
+                        .enclosing_class_name()
+                        .is_some_and(|c| crate::ast::tree::shared::is_shared(c));
+                    let ty_s = ty.to_string();
+                    let is_own_class = ty_s == "Self"
+                        || Some(ty_s.replace(' ', "").as_str())
+                            == ctx.enclosing_class_name();
+                    let ty = if enclosing_shared && is_own_class {
+                        quote!(stdpython::PyRef<#ty>)
+                    } else {
+                        ty
+                    };
+                    quote!(-> Result<#ty, PyException>)
+                }
                 // Mixed literal returns (`return 1` / `return None` under
                 // annotated params) box to PyValue; the body statements
                 // were rendered with fn_return_is_pyvalue set above, so
@@ -2679,6 +2715,29 @@ impl FunctionDef {
         // Render the parameter list now: the inference pass has populated
         // options.param_type_vars, so unannotated parameters render as
         // their inferred type variables (`a: A`).
+        // A comparison dunder of a SHARED class (`__eq__(self, other:
+        // object)` — records's Version, round 99): the object-typed
+        // parameter compares two shared instances — retype it as the
+        // class so the signature says PyRef<Version> (the body's field
+        // reads already borrow through the PyRef).
+        let mut render_args = render_args;
+        if crate::ast::tree::type_ctx::is_comparison_dunder(&self.name)
+            && ctx.enclosing_class_name().is_some_and(|c| crate::ast::tree::shared::is_shared(c))
+        {
+            let class = ctx.enclosing_class_name().expect("checked").to_string();
+            for p in &mut render_args.args {
+                let is_object_any = matches!(
+                    p.annotation.as_deref(),
+                    Some(ExprType::Name(n))
+                        if matches!(n.id.as_str(), "object" | "Any")
+                );
+                if is_object_any {
+                    p.annotation = Some(Box::new(ExprType::Name(crate::Name {
+                        id: class.clone(),
+                    })));
+                }
+            }
+        }
         let parameters = render_args
             .clone()
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;

@@ -953,6 +953,27 @@ fn infer_type_inner(
                             _ => TypeInfo::PyObject,
                         }
                     }
+                    _ if matches!(attr.value.as_ref(), ExprType::Name(_)) => {
+                        // A CLASS-receiver method call (V.parse("a") — a
+                        // classmethod whose return types the list-comp
+                        // holding it — records's Version.parse, round 99).
+                        let recv = match attr.value.as_ref() {
+                            ExprType::Name(n) => Some(n.id.clone()),
+                            _ => None,
+                        };
+                        match recv.and_then(|id| {
+                            let cls = match symbols.get(&id) {
+                                Some(crate::SymbolTableNode::ClassDef(c)) => c,
+                                _ => return None,
+                            };
+                            let method = cls.method_on_mro(&attr.attr, symbols)?;
+                            let ann = method.returns.as_deref()?;
+                            resolve_alias_typeinfo(ann, symbols, options)
+                        }) {
+                            Some(t) => return t,
+                            None => TypeInfo::PyObject,
+                        }
+                    }
                     _ => TypeInfo::PyObject,
                 }
             }
@@ -5029,4 +5050,16 @@ mod round81_token_format_tests {
         eprintln!("Vec<u8> to_string = [{s}]");
         assert!(s.contains("u8"), "sanity");
     }
+}
+
+/// Whether a method name is a COMPARISON dunder (the shared-class
+/// equality/ordering round, #329): the names whose object-typed
+/// parameters compare two shared instances. ONE authority — the
+/// analysis seeding and the signature rewriting consult it so the six
+/// strings cannot drift.
+pub(crate) fn is_comparison_dunder(name: &str) -> bool {
+    matches!(
+        name,
+        "__eq__" | "__ne__" | "__lt__" | "__le__" | "__gt__" | "__ge__"
+    )
 }
