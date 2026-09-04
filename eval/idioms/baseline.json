@@ -14,8 +14,7 @@
       "status": "pass"
     },
     "matrix": {
-      "status": "build-failed",
-      "errors": 3
+      "status": "pass"
     },
     "pipeline": {
       "status": "build-failed",

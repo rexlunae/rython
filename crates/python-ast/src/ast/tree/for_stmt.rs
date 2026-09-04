@@ -338,10 +338,15 @@ pub(crate) fn lower_loop_target(
                 let v = quote!(#tname);
                 lower_loop_target(elt, v, hoisted, &mut inner, counter);
             }
-            out.push(quote!({
-                let (#(#pats),*) = #value;
-                #(#inner)*
-            }));
+            // The temps are unique (the counter), so the destructure
+            // splices WITHOUT a block: a closing block would end the
+            // fresh bindings' scope before the loop body runs (`for i,
+            // row in enumerate(m): for j, x in enumerate(row): if i ==
+            // j` — the inner body reads `i` outside the block, round 99,
+            // matrix). The temps are part of the same destructure
+            // statement.
+            out.push(quote!(let (#(#pats),*) = #value;));
+            out.extend(inner);
         }
         // Subscript/attribute targets cannot reach here (they collect no
         // names, so `any_hoisted` is false and the direct pattern path
