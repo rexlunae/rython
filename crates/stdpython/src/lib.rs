@@ -6419,9 +6419,17 @@ impl PyException {
     pub fn matches_builtin(&self, target: crate::builtin_exceptions::BuiltinException) -> bool {
         use crate::builtin_exceptions::BuiltinException;
         let Some(raised) = self.discriminant else {
-            // A raised user class: the broad posture, same as matches().
+            // A raised user class: caught by `except Exception:` /
+            // `except BaseException:`, and by any BUILTIN in its
+            // recorded ancestor chain (`class MyError(ValueError)` is
+            // caught by `except ValueError:` — the chain the construction
+            // attached; the evaluation on issue #137).
             return target == BuiltinException::Exception
-                || target == BuiltinException::BaseException;
+                || target == BuiltinException::BaseException
+                || self.user_ancestors.iter().any(|a| {
+                    BuiltinException::from_name(a)
+                        .is_some_and(|b| b == target || b.ancestors().contains(&target))
+                });
         };
         if raised == target {
             return true;

@@ -363,31 +363,46 @@ impl<'a> CodeGen for Attribute {
         // InsufficientFunds whose __init__ stored self.needed — bank,
         // round 99): the typed accessor's FULL tokens, computed HERE
         // before the moves below.
-        let modeled_exc_field: Option<proc_macro2::TokenStream> = except_binding_receiver
-            .as_ref()
-            .and_then(|(_, caught)| {
-                let cls_name = caught.as_ref()?;
-                let cls = match symbols.get(cls_name) {
-                    Some(crate::SymbolTableNode::ClassDef(c)) => c,
-                    _ => return None,
-                };
-                let ty = crate::exception_field_type(cls, &self.attr, &symbols, &options)?;
-                let recv = self
-                    .value
-                    .clone()
-                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
-                    .ok()?;
-                let attr_name = &self.attr;
-                Some(match ty {
-                    crate::TypeInfo::Int => {
-                        quote!((#recv).attr_i64(#attr_name)?)
-                    }
-                    crate::TypeInfo::String => {
-                        quote!((#recv).attr_string(#attr_name)?)
-                    }
-                    _ => return None,
-                })
-            });
+        let modeled_exc_field: Option<proc_macro2::TokenStream> = (|| -> Result<
+            Option<proc_macro2::TokenStream>,
+            Box<dyn std::error::Error>,
+        > {
+            let Some((_, caught)) = except_binding_receiver.as_ref() else {
+                return Ok(None);
+            };
+            let Some(cls_name) = caught.as_ref() else {
+                return Ok(None);
+            };
+            let cls = match symbols.get(cls_name) {
+                Some(crate::SymbolTableNode::ClassDef(c)) => c,
+                _ => return Ok(None),
+            };
+            let Some(ty) = crate::exception_field_type(cls, &self.attr, &symbols, &options) else {
+                return Ok(None);
+            };
+            // A stored field whose __init__ parameter carries no
+            // annotation has no type to read it as: loud, with the fix
+            // (a guessed Int made a str field a false AttributeError).
+            if matches!(ty, crate::TypeInfo::PyObject) {
+                return Err(format!(
+                    "`{}.{}` is read on a caught `{}` whose `__init__` parameter is \
+                     unannotated, so rython cannot type the field; annotate the parameter \
+                     (`int` or `str`) — rython refuses to guess",
+                    cls_name, self.attr, cls_name
+                )
+                .into());
+            }
+            let recv = self
+                .value
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let attr_name = &self.attr;
+            Ok(match ty {
+                crate::TypeInfo::Int => Some(quote!((#recv).attr_i64(#attr_name)?)),
+                crate::TypeInfo::String => Some(quote!((#recv).attr_string(#attr_name)?)),
+                _ => None,
+            })
+        })()?;
         // True when the chain's root is a vendored `[python-modules]`
         // dependency — those lower to `crate::<dep>::<attr>` paths (see
         // the emission below). Computed before `self.value` is moved.

@@ -19086,3 +19086,160 @@ fn list_index_count_and_tuple_append_own_their_arguments() {
         out
     );
 }
+
+/// A plain `zip(a, b)` keeps the ordinary builtin lowering; only the
+/// star-args splat `zip(*rows)` takes the zip_many arm (the guard that
+/// admitted every `zip` sent the plain form to a missing arm — a
+/// converter panic on charset_normalizer in the requests sweep).
+#[test]
+fn a_plain_zip_call_converts_and_the_splat_takes_zip_many() {
+    let out = compile(
+        concat!(
+            "def pairs(xs: list[int], ys: list[str]) -> list[tuple[int, str]]:\n",
+            "    return list(zip(xs, ys))\n",
+        ),
+        "zip_plain.py",
+    );
+    assert!(out.contains("zip ("), "generated: {}", out);
+    assert!(!out.contains("zip_many"), "generated: {}", out);
+    let out = compile(
+        concat!(
+            "def transpose(m: list[list[int]]) -> list[list[int]]:\n",
+            "    return [list(r) for r in zip(*m)]\n",
+        ),
+        "zip_splat.py",
+    );
+    assert!(out.contains("zip_many"), "generated: {}", out);
+}
+
+/// An argument-less construction of an in-crate exception class inside
+/// `isinstance` (no modeled `__init__`) converts instead of indexing a
+/// missing argument.
+#[test]
+fn isinstance_of_an_argumentless_exception_construction_converts() {
+    let out = compile(
+        concat!(
+            "class MyError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "def check() -> bool:\n",
+            "    return isinstance(MyError(), Exception)\n",
+        ),
+        "isinstance_exc.py",
+    );
+    assert!(out.contains("MyError"), "generated: {}", out);
+}
+
+/// `issubclass` on builtin exception names folds through the interpreter's
+/// own MRO — the same authority the runtime table is generated from — so a
+/// pair the old hand-typed parent map did not know folds to the truth
+/// (the evaluation on issue #137).
+#[test]
+fn issubclass_folds_through_the_interpreters_exception_mro() {
+    let out = compile(
+        concat!(
+            "def probe() -> tuple[bool, bool, bool, bool]:\n",
+            "    return (\n",
+            "        issubclass(FileNotFoundError, OSError),\n",
+            "        issubclass(NotImplementedError, RuntimeError),\n",
+            "        issubclass(KeyError, ValueError),\n",
+            "        issubclass(FileNotFoundError, EnvironmentError),\n",
+            "    )\n",
+        ),
+        "issubclass_mro.py",
+    );
+    assert!(out.contains("(true , true , false , true)"), "generated: {}", out);
+    // A user class over a builtin walks the symbol table into the MRO.
+    let out = compile(
+        concat!(
+            "class MyError(ValueError):\n",
+            "    pass\n",
+            "\n",
+            "def probe() -> bool:\n",
+            "    return issubclass(MyError, Exception)\n",
+        ),
+        "issubclass_user.py",
+    );
+    assert!(out.contains("return Ok (true)"), "generated: {}", out);
+}
+
+/// `return NotImplemented` is the identity fallback in `__eq__` only;
+/// anywhere else it is a loud refusal rather than a silent `false`.
+#[test]
+fn return_not_implemented_is_loud_outside_eq() {
+    let err = compile_err(
+        concat!(
+            "class V:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "    def __lt__(self, other: object) -> bool:\n",
+            "        if not isinstance(other, V):\n",
+            "            return NotImplemented\n",
+            "        return self.n < other.n\n",
+        ),
+        "notimpl_lt.py",
+    );
+    assert!(err.contains("`return NotImplemented` outside `__eq__`"), "error: {}", err);
+}
+
+/// A raise argument that contains a call is bound once and read by both
+/// the message and the stored attribute (CPython evaluates a constructor
+/// argument once).
+#[test]
+fn a_raise_argument_with_a_call_is_evaluated_once() {
+    let out = compile(
+        concat!(
+            "class Short(Exception):\n",
+            "    def __init__(self, needed: int):\n",
+            "        super().__init__(f\"need {needed}\")\n",
+            "        self.needed = needed\n",
+            "\n",
+            "def cost() -> int:\n",
+            "    return 3\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Short(cost())\n",
+        ),
+        "raise_once.py",
+    );
+    assert_eq!(out.matches("cost () ?").count(), 1, "generated: {}", out);
+    assert!(out.contains("__rython_exc_arg0"), "generated: {}", out);
+}
+
+/// An exception `__init__` with a statement the construction model does
+/// not run is refused at the raise site; a field read whose parameter is
+/// unannotated is refused at the read.
+#[test]
+fn the_exception_model_refuses_what_it_does_not_run_or_type() {
+    let err = compile_err(
+        concat!(
+            "class Short(Exception):\n",
+            "    def __init__(self, needed: int):\n",
+            "        super().__init__(f\"need {needed}\")\n",
+            "        self.needed = needed\n",
+            "        print(\"constructed\")\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Short(3)\n",
+        ),
+        "raise_extra_stmt.py",
+    );
+    assert!(err.contains("refuses to silently drop it"), "error: {}", err);
+    let err = compile_err(
+        concat!(
+            "class Short(Exception):\n",
+            "    def __init__(self, needed):\n",
+            "        super().__init__(f\"need {needed}\")\n",
+            "        self.needed = needed\n",
+            "\n",
+            "def f() -> int:\n",
+            "    try:\n",
+            "        raise Short(3)\n",
+            "    except Short as e:\n",
+            "        return e.needed\n",
+            "    return 0\n",
+        ),
+        "exc_field_unannotated.py",
+    );
+    assert!(err.contains("rython refuses to guess"), "error: {}", err);
+}

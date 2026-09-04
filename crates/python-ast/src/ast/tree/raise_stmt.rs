@@ -624,25 +624,33 @@ pub(crate) fn exception_class_raise(
     if call.args.len() != params.len() || params.is_empty() {
         return Ok(None);
     }
-    // Find the super().__init__(<msg>) call in the __init__ body.
+    // Find the super().__init__(<msg>) call in the __init__ body. The
+    // model is exactly `self.<field> = <param>` stores and the
+    // super().__init__ message; any OTHER statement in the __init__
+    // (validation, logging, a computed field) would not run at the
+    // construction site, so it is a loud refusal, never silently
+    // dropped (the evaluation on issue #137).
     let mut msg_expr: Option<ExprType> = None;
     let mut fields: Vec<(String, usize)> = Vec::new(); // (field, param idx)
     for stmt in &init.body {
-        match &stmt.statement {
+        let modeled = match &stmt.statement {
             StatementType::Assign(a) => {
                 // self.<field> = <param>
                 if let [ExprType::Attribute(attr)] = a.targets.as_slice()
                     && let ExprType::Name(r) = attr.value.as_ref()
                     && r.id == "self"
                     && let ExprType::Name(v) = &a.value
+                    && let Some(idx) = params.iter().position(|p| *p == v.id)
                 {
-                    if let Some(idx) = params.iter().position(|p| *p == v.id) {
-                        fields.push((attr.attr.clone(), idx));
-                    }
+                    fields.push((attr.attr.clone(), idx));
+                    true
+                } else {
+                    false
                 }
             }
             StatementType::Expr(e) => {
-                // super().__init__(<msg>) — an expression statement call.
+                // super().__init__(<msg>) — an expression statement call;
+                // a docstring is inert.
                 if let ExprType::Call(sc) = &e.value {
                     let is_super_init = match sc.func.as_ref() {
                         ExprType::Attribute(attr) if attr.attr == "__init__" => {
@@ -655,30 +663,97 @@ pub(crate) fn exception_class_raise(
                     if is_super_init && !sc.args.is_empty() && msg_expr.is_none() {
                         msg_expr = Some((sc.args[0]).clone());
                     }
+                    is_super_init
+                } else {
+                    matches!(&e.value, ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::String(_))))
                 }
             }
-            _ => {}
+            StatementType::Pass => true,
+            _ => false,
+        };
+        if !modeled {
+            return Err(format!(
+                "`{}.__init__` (line {}) has a statement beyond `self.<field> = <param>` \
+                 stores and the `super().__init__(<message>)` call: rython models an \
+                 exception class's construction as its message and its stored fields, \
+                 so that statement would not run at `raise {}(...)`; rython refuses to \
+                 silently drop it. Move the logic to the raise site, or store the value \
+                 as a field",
+                cls.name,
+                stmt.lineno.unwrap_or(0),
+                cls.name
+            )
+            .into());
         }
     }
-    // Render the message: substitute the __init__ params with the raise
-    // call's args (positional), then render the substituted expression.
-    let msg = if let Some(mut m) = msg_expr {
-        substitute_params(&mut m, &params, &call.args);
-        let msg_tok = m.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        quote::quote!(format!("{}", #msg_tok))
-    } else {
+    let Some(mut m) = msg_expr else {
         return Ok(None);
     };
+    // The raise ARGUMENTS are evaluated once, in order, exactly as
+    // CPython evaluates a constructor call: an argument that contains a
+    // call is bound to a temporary and both the message and the attrs
+    // read the temporary (an argument with a side effect must not run
+    // once per role — the evaluation on issue #137). A pure argument (a
+    // name, a constant, a field read, arithmetic on those) renders in
+    // place, keeping its inferred type for the message's format spec.
+    let needs_binding = call.args.iter().any(|a| {
+        crate::ast::tree::visit::any_expr(a, |e| matches!(e, ExprType::Call(_)))
+    });
+    let mut prelude: Vec<proc_macro2::TokenStream> = Vec::new();
+    let substituted: Vec<ExprType> = if needs_binding {
+        call.args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let ident = proc_macro2::Ident::new(
+                    &format!("__rython_exc_arg{i}"),
+                    proc_macro2::Span::call_site(),
+                );
+                let tokens = a.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                prelude.push(quote::quote!(let #ident = #tokens;));
+                Ok(ExprType::Name(crate::ast::tree::name::Name {
+                    id: format!("__rython_exc_arg{i}"),
+                }))
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
+    } else {
+        call.args.clone()
+    };
+    // Render the message: substitute the __init__ params with the raise
+    // call's args (positional), then render the substituted expression.
+    // A parameter the rewrite did not reach (the message uses it in a
+    // form the substitution does not descend into) would render against
+    // the raise site's scope — a different name, or the wrong one — so
+    // it is refused.
+    substitute_params(&mut m, &params, &substituted);
+    if let Some(left) = params.iter().find(|p| crate::expr_references(&m, p)) {
+        return Err(format!(
+            "`{}.__init__`'s message uses its parameter `{}` in a form rython's \
+             exception model does not rewrite at the raise site (a name, an \
+             f-string, arithmetic, and a call's arguments are modeled); rython refuses \
+             to render it against the raise site's scope. Simplify the message \
+             expression, or bind it to a field",
+            cls.name, left
+        )
+        .into());
+    }
+    let msg_tok = m.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+    let msg = quote::quote!(format!("{}", #msg_tok));
     // The attrs: each field's value is the corresponding raise arg, boxed.
     let kind = &cls.name;
     let attr_pairs: std::result::Result<Vec<_>, Box<dyn std::error::Error>> = fields
         .iter()
         .map(|(f, idx)| {
-            let a = call.args[*idx].clone().to_rust(
-                ctx.clone(),
-                options.clone(),
-                symbols.clone(),
-            )?;
+            let a = if needs_binding {
+                let ident = proc_macro2::Ident::new(
+                    &format!("__rython_exc_arg{idx}"),
+                    proc_macro2::Span::call_site(),
+                );
+                quote::quote!((#ident).clone())
+            } else {
+                call.args[*idx].clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?
+            };
             Ok(quote::quote!((#f . to_string (), stdpython :: PyValue :: from (#a))))
         })
         .collect();
@@ -726,12 +801,17 @@ pub(crate) fn exception_class_raise(
         .iter()
         .map(|a| quote::quote!((#a) . to_string ()))
         .collect();
-    Ok(Some(quote::quote! {
+    let construct = quote::quote! {
         stdpython :: PyException :: new_with_attrs_and_ancestors (
             #kind , #msg , vec ! [#(#attr_pairs),*] ,
             vec ! [#(#ancestor_tokens),*]
         )
-    }))
+    };
+    if prelude.is_empty() {
+        Ok(Some(construct))
+    } else {
+        Ok(Some(quote::quote!({ #(#prelude)* #construct })))
+    }
 }
 
 /// Substitute the __init__ params in a message expression with the raise
@@ -806,10 +886,10 @@ pub(crate) fn exception_field_type(
                     {
                         return Some(t);
                     }
-                    // An unannotated param: fall back to Int for the
-                    // arithmetic shapes the corpus exercises; a broader
-                    // model can widen.
-                    return Some(crate::TypeInfo::Int);
+                    // An unannotated param: no type — the reader refuses
+                    // loudly rather than guessing (an Int guess made a
+                    // str field's read a false AttributeError).
+                    return Some(crate::TypeInfo::PyObject);
                 }
             }
         }
@@ -825,27 +905,22 @@ pub(crate) fn exception_field_type(
     None
 }
 
-/// The DIRECT parent of a BUILTIN exception name (the canonical
-/// hierarchy): used by the issubclass walk when a name has no symbol —
-/// builtins live in the interpreter, not the module (Devin review on
-/// #328). None for a root (Exception's parent is BaseException, whose
-/// parent is None).
-pub(crate) fn builtin_exception_parent(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "BaseException" => return None,
-        "Exception" => "BaseException",
-        "ArithmeticError" | "AssertionError" | "AttributeError" | "BufferError" | "EOFError"
-        | "ImportError" | "LookupError" | "MemoryError" | "NameError" | "OSError"
-        | "ReferenceError" | "RuntimeError" | "StopIteration" | "SyntaxError"
-        | "SystemError" | "TypeError" | "ValueError" | "Warning" => "Exception",
-        "ZeroDivisionError" | "OverflowError" | "FloatingPointError" => "ArithmeticError",
-        "IndexError" | "KeyError" => "LookupError",
-        "ModuleNotFoundError" => "ImportError",
-        "UnicodeError" => "ValueError",
-        "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError" => {
-            "UnicodeError"
-        }
-        "IndentationError" | "TabError" => "SyntaxError",
-        _ => return None,
-    })
+/// A BUILTIN exception's method resolution order, from the live
+/// interpreter (`exception_tree::dump_builtin_exception_tree` — the same
+/// dump the runtime's `BUILTIN_EXCEPTION_MRO` table is generated from):
+/// `[the class's canonical name, then each ancestor]`, or None for a
+/// name that is no builtin exception. One authority for the hierarchy
+/// the issubclass fold walks — a hand-typed parent map drifted from the
+/// generated table on day one (44 of 84 names missing, so
+/// `issubclass(FileNotFoundError, OSError)` folded to `false`; Devin
+/// review on #328 / the evaluation on issue #137).
+pub(crate) fn builtin_exception_mro(name: &str) -> Option<&'static [String]> {
+    static TREE: std::sync::OnceLock<std::collections::HashMap<String, Vec<String>>> =
+        std::sync::OnceLock::new();
+    let tree = TREE.get_or_init(|| {
+        crate::exception_tree::dump_builtin_exception_tree()
+            .map(|(_, _, entries)| entries.into_iter().collect())
+            .unwrap_or_default()
+    });
+    tree.get(name).map(|v| v.as_slice())
 }

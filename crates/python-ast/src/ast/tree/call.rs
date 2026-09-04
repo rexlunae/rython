@@ -2205,11 +2205,19 @@ impl<'a> CodeGen for Call {
         // TypeError for them.
         if let ExprType::Name(n) = self.func.as_ref() {
             let bname = n.id.as_str();
-            if matches!(
+            // `zip` takes the builtin arm only in its star-args splat form
+            // (`zip(*rows)`); a plain `zip(a, b)` keeps the ordinary
+            // builtin-call path below (the guard admitting every `zip`
+            // sent the plain form to the missing arm — a converter panic
+            // on charset_normalizer, the requests sweep's regression).
+            let zip_splat = bname == "zip"
+                && self.args.len() == 1
+                && matches!(self.args.first(), Some(ExprType::Starred(_)));
+            if (zip_splat
+                || matches!(
                 bname,
                 "min"
                     | "max"
-                    | "zip"
                     | "sorted"
                     | "enumerate"
                     | "pow"
@@ -2239,7 +2247,7 @@ impl<'a> CodeGen for Call {
                     | "tuple"
                     | "next"
                     | "id"
-            ) && (symbols.get(bname).is_none()
+            )) && (symbols.get(bname).is_none()
                 // An import of a BUILTIN-CLASS self-alias (`from .compat
                 // import str` where compat does `str = str` — requests'
                 // py2 shim): the self-alias emits no runtime item, so the
@@ -2578,13 +2586,17 @@ impl<'a> CodeGen for Call {
                             .into());
                         }
                         // Walk C1's base chain through the symbol table
-                        // AND the builtin parent map: True when C2 is C1
-                        // or an ancestor. A BUILTIN name (ValueError) has
-                        // no symbol — its parent comes from the static map
-                        // (Devin review on #328: issubclass(ValueError,
-                        // Exception) must be true).
-                        let builtin_parent: fn(&str) -> Option<&'static str> =
-                            crate::ast::tree::raise_stmt::builtin_exception_parent;
+                        // down to the first BUILTIN name, then ask the
+                        // interpreter's own MRO for that builtin (the one
+                        // authority the runtime table is generated from):
+                        // True when C2 is C1, a user ancestor, or in the
+                        // builtin's MRO. C2's canonical name (an alias —
+                        // `EnvironmentError` IS `OSError`) is its MRO head.
+                        let mro = crate::ast::tree::raise_stmt::builtin_exception_mro;
+                        let target: &str = mro(&c2.id)
+                            .and_then(|m| m.first())
+                            .map(|s| s.as_str())
+                            .unwrap_or(&c2.id);
                         let mut base: Option<&str> = Some(&c1.id);
                         let mut found = false;
                         let mut guard = 0;
@@ -2593,21 +2605,30 @@ impl<'a> CodeGen for Call {
                             if guard > 64 {
                                 break;
                             }
-                            if cur == c2.id {
+                            if cur == c2.id || cur == target {
                                 found = true;
                                 break;
                             }
                             base = match symbols.get(cur) {
                                 Some(SymbolTableNode::ClassDef(cls)) => {
-                                    match cls.bases.iter().find_map(|b| match b {
+                                    cls.bases.iter().find_map(|b| match b {
                                         ExprType::Name(n) if is_exc(&n.id) => Some(n.id.as_str()),
                                         _ => None,
-                                    }) {
-                                        Some(next) => Some(next),
-                                        None => builtin_parent(cur),
-                                    }
+                                    })
                                 }
-                                _ => builtin_parent(cur),
+                                _ => {
+                                    let Some(chain) = mro(cur) else {
+                                        return Err(format!(
+                                            "issubclass({}, {}): `{}` is neither a class this \
+                                             crate defines nor a builtin exception; rython \
+                                             cannot fold the test",
+                                            c1.id, c2.id, cur
+                                        )
+                                        .into());
+                                    };
+                                    found = chain.iter().any(|a| a == target);
+                                    None
+                                }
                             };
                         }
                         return Ok(quote!(#found));
@@ -2705,17 +2726,29 @@ impl<'a> CodeGen for Call {
                                                 options.clone(),
                                                 symbols.clone(),
                                             )?
-                                            .unwrap_or_else(|| {
+                                            .map(Ok)
+                                            .unwrap_or_else(|| -> Result<_, Box<dyn std::error::Error>> {
+                                                // No modeled __init__ (a `pass` body, an
+                                                // unmodeled shape): the quoted kind with
+                                                // the message argument, if any — an
+                                                // argument-less construction has none
+                                                // (`isinstance(MyError(), Exception)`
+                                                // indexed args[0] and panicked).
                                                 let kind = &f.id;
-                                                let m = crate::ast::tree::raise_stmt::message_arg(
-                                                    &call.args[0],
-                                                    ctx.clone(),
-                                                    options.clone(),
-                                                    symbols.clone(),
-                                                )
-                                                .unwrap_or_else(|_| quote!(""));
-                                                quote!(PyException::new(#kind, format!("{}", #m)))
-                                            })
+                                                let m = match call.args.first() {
+                                                    None => quote!(String::new()),
+                                                    Some(first) => {
+                                                        let m = crate::ast::tree::raise_stmt::message_arg(
+                                                            first,
+                                                            ctx.clone(),
+                                                            options.clone(),
+                                                            symbols.clone(),
+                                                        )?;
+                                                        quote!(format!("{}", #m))
+                                                    }
+                                                };
+                                                Ok(quote!(PyException::new(#kind, #m)))
+                                            })?
                                         }
                                         _ => {
                                             let kind = &f.id;
@@ -3913,7 +3946,15 @@ impl<'a> CodeGen for Call {
                             }
                         }
                     }
-                    _ => unreachable!(),
+                    // Every name the guard above admits has an arm; a
+                    // name added to the guard without one is a converter
+                    // defect, reported rather than a panic.
+                    _ => {
+                        return Err(format!(
+                            "internal: builtin `{bname}` is routed to the builtin lowering but has no arm"
+                        )
+                        .into())
+                    }
                 }
             }
         }

@@ -2282,6 +2282,7 @@ impl FunctionDef {
         // returns both `host.lower()` and `host`, a `str | None` path).
         // Round 85 extends this to the INFERRED `T | None` returns.
         options.fn_return_is_option = return_is_option;
+        options.in_eq_dunder = self.name == "__eq__";
 
         // Round 81 (the generics directive): a CONCRETE typed return
         // (`-> Vec<u8>`, `-> i64` ...) whose value arrives as a boxed

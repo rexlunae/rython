@@ -737,10 +737,27 @@ impl CodeGen for StatementType {
                 } else if matches!(e.value, ExprType::NoneType(_)) {
                     quote!(())
                 } else if matches!(&e.value, ExprType::Name(n) if n.id == "NotImplemented") {
-                    // `return NotImplemented` in a comparison dunder: the
-                    // == falls back to identity (False for distinct shared
-                    // instances — records's Version.__eq__, round 99). The
-                    // NotImplemented singleton has no other value shape.
+                    // `return NotImplemented` in `__eq__`: the == falls
+                    // back to identity (False for distinct shared
+                    // instances — records's Version.__eq__, round 99).
+                    // Anywhere else the singleton means something the
+                    // lowering does not model (`__ne__` ends at the
+                    // identity default — True for distinct objects; an
+                    // ordering dunder raises TypeError), so it is a loud
+                    // refusal, never a silent `false` (the evaluation on
+                    // issue #137).
+                    if !options.in_eq_dunder {
+                        return Err(
+                            "`return NotImplemented` outside `__eq__` is not supported yet: \
+                             CPython then tries the reflected operation and falls back to \
+                             the identity default (`__ne__`) or raises TypeError (an \
+                             ordering dunder), which a `false` result would silently \
+                             replace; rython refuses to silently ignore it. Return the \
+                             comparison's value explicitly"
+                                .to_string()
+                                .into(),
+                        );
+                    }
                     quote!(false)
                 } else if options.fn_return_is_pyvalue {
                     // A PyValue-returning function wraps its other returns

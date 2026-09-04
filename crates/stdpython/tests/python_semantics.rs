@@ -3845,3 +3845,26 @@ fn exception_attrs_and_key_repr_match_python() {
         .unwrap_err();
     assert_eq!(err.message, "'carol'", "KeyError quotes a str key like CPython");
 }
+
+/// A raised USER class derived from a builtin (`class MyError(ValueError)`)
+/// is caught by `except ValueError:` — the discriminant fast path consults
+/// the ancestor chain the construction attached (the evaluation on issue
+/// #137). Verified against python3:
+///   class MyError(ValueError): pass
+///   try: raise MyError("x")
+///   except ValueError: print("caught")   -> caught
+#[test]
+fn a_user_exception_over_a_builtin_is_caught_by_the_builtin_handler() {
+    use stdpython::{BuiltinException as B, PyException};
+    let e = PyException::new_with_attrs_and_ancestors(
+        "MyError",
+        "x",
+        vec![],
+        vec!["ValueError".to_string(), "Exception".to_string()],
+    );
+    assert!(e.matches_builtin(B::ValueError));
+    assert!(e.matches_builtin(B::Exception));
+    assert!(e.matches_builtin(B::BaseException));
+    assert!(!e.matches_builtin(B::KeyError), "siblings do not catch");
+    assert!(!e.matches_builtin(B::LookupError));
+}

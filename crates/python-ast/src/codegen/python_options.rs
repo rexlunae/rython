@@ -356,6 +356,10 @@ pub struct PythonOptions {
     /// the possible results (urllib3's `_normalize_host` returns both
     /// `host.lower()` (str) and `host` (str | None) paths).
     pub fn_return_is_option: bool,
+    /// The function being lowered is an `__eq__` (the one place a
+    /// `return NotImplemented` has a modeled meaning: the identity
+    /// fallback).
+    pub in_eq_dunder: bool,
 
     /// The CURRENT function's resolved return type, when it is a CONCRETE
     /// member (Int/Float/Bool/String/Bytes) rather than the boxed PyValue
@@ -643,6 +647,7 @@ impl Default for PythonOptions {
             clone_field_returns: false,
             fn_return_is_pyvalue: false,
             fn_return_is_option: false,
+            in_eq_dunder: false,
             fn_return_typed: None,
             pyvalue_into_params: std::rc::Rc::new(std::collections::HashSet::new()),
             statically_none_names: std::rc::Rc::new(std::collections::HashSet::new()),
