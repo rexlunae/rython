@@ -604,6 +604,12 @@ pub(crate) fn exception_class_raise(
     symbols: crate::SymbolTableScopes,
 ) -> Result<Option<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
     use crate::{ExprType, StatementType};
+    // Only EXCEPTION classes route through the modeled construction (an
+    // ordinary class whose __init__ calls super().__init__ must not
+    // become an exception — Devin review on #328).
+    if !crate::is_exception_class(cls) {
+        return Ok(None);
+    }
     let Some(init) = cls.init_method() else {
         return Ok(None);
     };
@@ -770,30 +776,76 @@ pub(crate) fn exception_field_type(
     symbols: &crate::SymbolTableScopes,
     options: &crate::PythonOptions,
 ) -> Option<crate::TypeInfo> {
-    let init = cls.init_method()?;
-    for stmt in &init.body {
-        if let crate::StatementType::Assign(a) = &stmt.statement
-            && let [ExprType::Attribute(attr)] = a.targets.as_slice()
-            && attr.attr == field
-            && let ExprType::Name(r) = attr.value.as_ref()
-            && r.id == "self"
-            && let ExprType::Name(v) = &a.value
-        {
-            // The param's annotation types the field.
-            let param = init
-                .args
-                .args
-                .iter()
-                .find(|p| p.arg == v.id)?;
-            if let Some(ann) = param.annotation.as_ref()
-                && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
-            {
-                return Some(t);
-            }
-            // An unannotated param: fall back to Int for the arithmetic
-            // shapes the corpus exercises; a broader model can widen.
-            return Some(crate::TypeInfo::Int);
+    // Walk the class AND its bases: the field may be defined on a BASE
+    // (an `except BankError as e` catching an InsufficientFunds whose
+    // __init__ stores the field — Devin review on #328).
+    let mut current: Option<&crate::ClassDef> = Some(cls);
+    let mut guard = 0;
+    while let Some(c) = current {
+        guard += 1;
+        if guard > 32 {
+            break;
         }
+        if let Some(init) = c.init_method() {
+            for stmt in &init.body {
+                if let crate::StatementType::Assign(a) = &stmt.statement
+                    && let [ExprType::Attribute(attr)] = a.targets.as_slice()
+                    && attr.attr == field
+                    && let ExprType::Name(r) = attr.value.as_ref()
+                    && r.id == "self"
+                    && let ExprType::Name(v) = &a.value
+                {
+                    // The param's annotation types the field.
+                    let param = init
+                        .args
+                        .args
+                        .iter()
+                        .find(|p| p.arg == v.id)?;
+                    if let Some(ann) = param.annotation.as_ref()
+                        && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
+                    {
+                        return Some(t);
+                    }
+                    // An unannotated param: fall back to Int for the
+                    // arithmetic shapes the corpus exercises; a broader
+                    // model can widen.
+                    return Some(crate::TypeInfo::Int);
+                }
+            }
+        }
+        // The next base in the chain (resolved through the symbol table).
+        current = c.bases.iter().find_map(|b| match b {
+            ExprType::Name(n) => match symbols.get(&n.id) {
+                Some(crate::SymbolTableNode::ClassDef(base)) => Some(base),
+                _ => None,
+            },
+            _ => None,
+        });
     }
     None
+}
+
+/// The DIRECT parent of a BUILTIN exception name (the canonical
+/// hierarchy): used by the issubclass walk when a name has no symbol —
+/// builtins live in the interpreter, not the module (Devin review on
+/// #328). None for a root (Exception's parent is BaseException, whose
+/// parent is None).
+pub(crate) fn builtin_exception_parent(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "BaseException" => return None,
+        "Exception" => "BaseException",
+        "ArithmeticError" | "AssertionError" | "AttributeError" | "BufferError" | "EOFError"
+        | "ImportError" | "LookupError" | "MemoryError" | "NameError" | "OSError"
+        | "ReferenceError" | "RuntimeError" | "StopIteration" | "SyntaxError"
+        | "SystemError" | "TypeError" | "ValueError" | "Warning" => "Exception",
+        "ZeroDivisionError" | "OverflowError" | "FloatingPointError" => "ArithmeticError",
+        "IndexError" | "KeyError" => "LookupError",
+        "ModuleNotFoundError" => "ImportError",
+        "UnicodeError" => "ValueError",
+        "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError" => {
+            "UnicodeError"
+        }
+        "IndentationError" | "TabError" => "SyntaxError",
+        _ => return None,
+    })
 }

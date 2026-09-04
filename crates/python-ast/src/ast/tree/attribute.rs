@@ -385,7 +385,7 @@ impl<'a> CodeGen for Attribute {
                     crate::TypeInfo::String => {
                         quote!((#recv).attr_string(#attr_name)?)
                     }
-                    _ => quote!(stdpython::PyValue::None_),
+                    _ => return None,
                 })
             });
         // True when the chain's root is a vendored `[python-modules]`

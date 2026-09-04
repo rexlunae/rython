@@ -2586,8 +2586,14 @@ impl<'a> CodeGen for Call {
                             )
                             .into());
                         }
-                        // Walk C1's base chain through the symbol table:
-                        // True when C2 is C1 or an ancestor.
+                        // Walk C1's base chain through the symbol table
+                        // AND the builtin parent map: True when C2 is C1
+                        // or an ancestor. A BUILTIN name (ValueError) has
+                        // no symbol — its parent comes from the static map
+                        // (Devin review on #328: issubclass(ValueError,
+                        // Exception) must be true).
+                        let builtin_parent: fn(&str) -> Option<&'static str> =
+                            crate::ast::tree::raise_stmt::builtin_exception_parent;
                         let mut base: Option<&str> = Some(&c1.id);
                         let mut found = false;
                         let mut guard = 0;
@@ -2607,10 +2613,10 @@ impl<'a> CodeGen for Call {
                                         _ => None,
                                     }) {
                                         Some(next) => Some(next),
-                                        None => None,
+                                        None => builtin_parent(cur),
                                     }
                                 }
-                                _ => None,
+                                _ => builtin_parent(cur),
                             };
                         }
                         return Ok(quote!(#found));
@@ -2722,12 +2728,17 @@ impl<'a> CodeGen for Call {
                                         }
                                         _ => {
                                             let kind = &f.id;
-                                            let m = crate::ast::tree::raise_stmt::message_arg(
-                                                &call.args[0],
-                                                ctx.clone(),
-                                                options.clone(),
-                                                symbols.clone(),
-                                            )?;
+                                            let m = match call.args.len() {
+                                                0 => quote!(String::new()),
+                                                _ => {
+                                                    crate::ast::tree::raise_stmt::message_arg(
+                                                        &call.args[0],
+                                                        ctx.clone(),
+                                                        options.clone(),
+                                                        symbols.clone(),
+                                                    )?
+                                                }
+                                            };
                                             quote!(PyException::new(#kind, format!("{}", #m)))
                                         }
                                     }
