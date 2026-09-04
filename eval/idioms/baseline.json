@@ -31,12 +31,10 @@
       "status": "pass"
     },
     "text_stats": {
-      "status": "build-failed",
-      "errors": 9
+      "status": "pass"
     },
     "tokenizer": {
-      "status": "build-failed",
-      "errors": 6
+      "status": "pass"
     },
     "tree": {
       "status": "pass"
