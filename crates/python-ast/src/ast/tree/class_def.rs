@@ -229,6 +229,12 @@ pub struct ExceptionIndex {
     pub ambiguous_aliases: std::collections::HashSet<(Vec<String>, String)>,
 }
 
+/// The alternative [`module_name_aliases`] records for a name that a
+/// control-flow body the gates could not fold may leave unbound: never a
+/// class, so a name carrying it beside a class target is decided at
+/// runtime (Devin review on #330).
+pub(crate) const UNBOUND_ALTERNATIVE: &str = "<unbound>";
+
 /// A module's bindings of one name to another — `X = Y` and `from m
 /// import Y as X` — the alias spellings a base may use: the module's own
 /// scope through the one statement visitor (a binding under `try:` or
@@ -241,7 +247,13 @@ pub struct ExceptionIndex {
 /// B, as CPython's module init leaves it), while a binding inside a
 /// control-flow body the gates could not fold ADDS an alternative — a
 /// name with two alternatives is decided at runtime (the caller's
-/// ambiguity). Devin review on #330.
+/// ambiguity). A name whose FIRST binding is inside such a body may be
+/// left UNBOUND at runtime (the branch not taken, the loop over nothing,
+/// the `try:` body raising before it): that is an alternative too,
+/// [`UNBOUND_ALTERNATIVE`] — one rule for every body (an `if` without
+/// an `else`, a loop, a `try:` and its handlers, a `with`): the
+/// conversion does not prove a body executes, it refuses to guess. A
+/// later top-level binding replaces it. Devin review on #330.
 pub(crate) fn module_name_aliases(
     body: &[crate::Statement],
     options: &crate::PythonOptions,
@@ -260,6 +272,10 @@ pub(crate) fn module_name_aliases(
                     *alts = vec![target.to_string()];
                 }
             }
+            None if nested => bindings.push((
+                name.to_string(),
+                vec![UNBOUND_ALTERNATIVE.to_string(), target.to_string()],
+            )),
             None => bindings.push((name.to_string(), vec![target.to_string()])),
         }
     }
@@ -367,14 +383,29 @@ pub fn compute_exception_classes(
                 if is_exception(&cur) || crate_classes.contains(cur.as_str()) {
                     return true;
                 }
-                match all.iter().find(|(a, _)| *a == cur) {
+                // Through the name's CLASS alternatives (a copy `S = R`
+                // of a maybe-unbound R is class-ish by R's class).
+                match all.iter().find(|(a, t)| *a == cur && t != UNBOUND_ALTERNATIVE) {
                     Some((_, t)) => cur = t.clone(),
                     None => return false,
                 }
             }
             false
         };
-        aliases.retain(|(_, t)| classish(t));
+        // The "may be unbound" alternative stays beside a class target
+        // — the pair is the runtime decision; alone it is no alias.
+        let names_with_class: std::collections::HashSet<&str> = all
+            .iter()
+            .filter(|(_, t)| t != UNBOUND_ALTERNATIVE && classish(t))
+            .map(|(a, _)| a.as_str())
+            .collect();
+        aliases.retain(|(a, t)| {
+            if t == UNBOUND_ALTERNATIVE {
+                names_with_class.contains(a.as_str())
+            } else {
+                classish(t)
+            }
+        });
     }
     for (path, _, aliases) in per_module.iter_mut() {
         let module: Vec<String> = path.clone().unwrap_or_else(|| options.this_module_path.clone());
@@ -404,12 +435,25 @@ pub fn compute_exception_classes(
         // Warned once, by the module that owns the binding (every module's
         // conversion recomputes the crate-wide index).
         for a in multi.iter().filter(|_| path.is_none()) {
-            options.definition_warnings.borrow_mut().push(format!(
-                "`{a}` is bound to more than one class at module level (a `try:`/`except:` \
-                 or an `if` the conversion cannot fold): which class it names is decided at \
-                 runtime, so rython follows neither — a class deriving from it, a raise, a \
-                 handler, or an issubclass naming it is a loud error; bind it once"
-            ));
+            let may_be_unbound = aliases
+                .iter()
+                .any(|(n, t)| n == a && t == UNBOUND_ALTERNATIVE);
+            options.definition_warnings.borrow_mut().push(if may_be_unbound {
+                format!(
+                    "`{a}` is bound to a class only inside a `try:`, an `if`, a loop, or a \
+                     `with` the conversion cannot fold, so at runtime it may be that class or \
+                     unbound: rython follows neither — a class deriving from it, a raise, a \
+                     handler, or an issubclass naming it is a loud error; bind it once at \
+                     module level"
+                )
+            } else {
+                format!(
+                    "`{a}` is bound to more than one class at module level (a `try:`/`except:` \
+                     or an `if` the conversion cannot fold): which class it names is decided at \
+                     runtime, so rython follows neither — a class deriving from it, a raise, a \
+                     handler, or an issubclass naming it is a loud error; bind it once"
+                )
+            });
         }
         aliases.retain(|(a, _)| !multi.contains(a));
         ambiguous_aliases.extend(multi.into_iter().map(|a| (module.clone(), a)));
@@ -2951,9 +2995,10 @@ impl CodeGen for ClassDef {
         {
             return Err(format!(
                 "class `{}` inherits from `{}`, which is bound to more than one class at \
-                 module level (a `try:`/`except:` or an `if` the conversion cannot fold): \
-                 which class it names is decided at runtime, and rython refuses to follow \
-                 one branch silently; bind the name once",
+                 module level, or to a class only inside a `try:`, an `if`, a loop, or a \
+                 `with` the conversion cannot fold (so it may be unbound): which class it \
+                 names is decided at runtime, and rython refuses to follow one branch \
+                 silently; bind the name once at module level",
                 self.name, base_name,
             )
             .into());

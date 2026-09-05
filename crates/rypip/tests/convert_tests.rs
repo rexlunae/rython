@@ -8446,7 +8446,8 @@ fn the_exception_model_matches_python_at_runtime() {
     // it, a zero-parameter fixed message, a variadic forwarder, the last
     // store of a field (round 4); a base and a handler through an alias,
     // an alias of a builtin, a BaseException subclass outside `except
-    // Exception` (round 6); a raise through an alias is the canonical
+    // Exception` (round 6); a field stored twice from differently typed
+    // parameters reads as the LAST store (round 15); a raise through an alias is the canonical
     // kind, an inherited __init__ runs (round 7); the message reads the
     // fields as they stood at the super call (round 8).
     let scratch = Scratch::new("exc_model");
@@ -8585,6 +8586,13 @@ fn the_exception_model_matches_python_at_runtime() {
             "\n",
             "class Outer(Exception):\n",
             "    pass\n",
+            "\n",
+            "\n",
+            "class Restored(Exception):\n",
+            "    def __init__(self, n: int, s: str) -> None:\n",
+            "        super().__init__(s)\n",
+            "        self.v = n\n",
+            "        self.v = s\n",
             "\n",
             "\n",
             "class Pair2Arg(Exception):\n",
@@ -8734,6 +8742,10 @@ fn the_exception_model_matches_python_at_runtime() {
             "        raise Outer(Inner(5), tag())\n",
             "    except Outer as e:\n",
             "        print(e)\n",
+            "    try:\n",
+            "        raise Restored(3, \"t\")\n",
+            "    except Restored as e:\n",
+            "        print(e.v + \"!\", e)\n",
             "\n",
             "\n",
             "if __name__ == \"__main__\":\n",
@@ -8791,6 +8803,7 @@ fn the_exception_model_matches_python_at_runtime() {
             "('m', 'n')",
             "('t', 3) 3",
             "(Inner(5), 't')",
+            "t! t",
         ],
         "the exception model diverged from CPython"
     );

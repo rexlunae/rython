@@ -19944,10 +19944,13 @@ fn a_message_free_name_must_be_the_binding_the_init_sees() {
 
 #[test]
 fn an_alias_under_a_gate_joins_the_exception_closure() {
-    // `try: R = Root / except NameError: pass` binds R once, in the
-    // module's own scope: `class Leaf(R)` is an exception class. Bound
-    // to TWO classes (`except: R = Exception`), R is decided at runtime:
-    // the base, a raise, a handler, and an issubclass naming it are loud
+    // `R = Exception` at top level, then `try: R = Root / except
+    // NameError: pass`: R is bound before the gate, so at runtime it is
+    // Root or Exception — decided at runtime, loud. Bound ONCE at top
+    // level after the gate (`R = Root` replaces the gated alternatives),
+    // `class Leaf(R)` is an exception class over Root. Bound to TWO
+    // classes (`except: R = Exception`), R is decided at runtime: the
+    // base, a raise, a handler, and an issubclass naming it are loud
     // (Devin review on #330).
     let out = compile(
         concat!(
@@ -19955,9 +19958,11 @@ fn an_alias_under_a_gate_joins_the_exception_closure() {
             "    pass\n",
             "\n",
             "try:\n",
-            "    R = Root\n",
+            "    R = Exception\n",
             "except NameError:\n",
             "    pass\n",
+            "\n",
+            "R = Root\n",
             "\n",
             "class Leaf(R):\n",
             "    pass\n",
@@ -19968,7 +19973,9 @@ fn an_alias_under_a_gate_joins_the_exception_closure() {
         "raise_gated_alias.py",
     );
     assert!(!out.contains("LeafTrait"), "generated: {}", out);
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
     assert!(out.contains("(\"Leaf\" , format ! (\"{}\" , \"x\")"), "generated: {}", out);
+    assert!(out.contains("\"Root\""), "generated: {}", out);
     let err = compile_err(
         concat!(
             "class Root(Exception):\n",
@@ -20198,6 +20205,132 @@ fn a_gated_binding_of_ordinary_values_is_not_an_exception_alias() {
     );
     assert!(!out.contains("compile_error !"), "generated: {}", out);
     assert!(out.contains("print (& ("), "generated: {}", out);
+}
+
+#[test]
+fn an_alias_bound_only_under_a_gate_may_be_unbound_and_is_refused() {
+    // `if runtime_condition(): R = Root` then `class Leaf(R)`: Python
+    // leaves R unbound when the branch is not taken (a NameError at the
+    // class statement), so R is decided at runtime — the base, a raise,
+    // a handler, and an issubclass naming it are loud, never Root
+    // unconditionally. One rule for every body the gates cannot fold: an
+    // `if` without an `else`, a `try:` whose body may raise before the
+    // binding (`except NameError: pass`), a loop that may run zero times
+    // (Devin review on #330).
+    let err = compile_err(
+        concat!(
+            "import os\n",
+            "\n",
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "if os.environ.get(\"STRICT\"):\n",
+            "    R = Root\n",
+            "\n",
+            "class Leaf(R):\n",
+            "    pass\n",
+        ),
+        "raise_maybe_unbound_alias_if.py",
+    );
+    assert!(err.contains("may be unbound"), "error: {}", err);
+    let err = compile_err(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "try:\n",
+            "    R = Root\n",
+            "except NameError:\n",
+            "    pass\n",
+            "\n",
+            "class Leaf(R):\n",
+            "    pass\n",
+        ),
+        "raise_maybe_unbound_alias_try.py",
+    );
+    assert!(err.contains("may be unbound"), "error: {}", err);
+    let err = compile_err(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "for _ in []:\n",
+            "    R = Root\n",
+            "\n",
+            "class Leaf(R):\n",
+            "    pass\n",
+        ),
+        "raise_maybe_unbound_alias_loop.py",
+    );
+    assert!(err.contains("may be unbound"), "error: {}", err);
+    // A raise, a handler, and an issubclass naming it are loud at the
+    // site, and the definition warning names the name and the cause.
+    let out = compile(
+        concat!(
+            "import os\n",
+            "\n",
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "if os.environ.get(\"STRICT\"):\n",
+            "    R = Root\n",
+            "\n",
+            "def f() -> None:\n",
+            "    try:\n",
+            "        raise R(\"x\")\n",
+            "    except R:\n",
+            "        pass\n",
+        ),
+        "raise_maybe_unbound_alias_use.py",
+    );
+    assert!(out.matches("compile_error !").count() >= 2, "generated: {}", out);
+    assert!(out.contains("may be unbound"), "generated: {}", out);
+    let err = compile_err(
+        concat!(
+            "import os\n",
+            "\n",
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "if os.environ.get(\"STRICT\"):\n",
+            "    R = Root\n",
+            "\n",
+            "def f() -> bool:\n",
+            "    return issubclass(R, Root)\n",
+        ),
+        "raise_maybe_unbound_alias_issubclass.py",
+    );
+    assert!(err.contains("may be unbound"), "error: {}", err);
+}
+
+#[test]
+fn an_exception_fields_type_is_its_last_stores_parameter() {
+    // `self.v = n` (an int) then `self.v = s` (a str) in one __init__:
+    // the construction records the LAST store (`classify_exception_init`
+    // is last-store-wins), so the read `e.v` is typed str too — the same
+    // final assignment, not the first one's annotation (Devin review on
+    // #330).
+    let out = compile(
+        concat!(
+            "class E(Exception):\n",
+            "    def __init__(self, n: int, s: str) -> None:\n",
+            "        super().__init__(s)\n",
+            "        self.v = n\n",
+            "        self.v = s\n",
+            "\n",
+            "def f() -> str:\n",
+            "    try:\n",
+            "        raise E(3, \"t\")\n",
+            "    except E as e:\n",
+            "        return e.v\n",
+            "    return \"\"\n",
+        ),
+        "raise_last_store_field_type.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("fn f () -> Result < String"), "generated: {}", out);
+    assert!(out.contains("attr_string (\"v\")"), "generated: {}", out);
+    assert!(!out.contains("attr_int"), "generated: {}", out);
 }
 
 #[test]

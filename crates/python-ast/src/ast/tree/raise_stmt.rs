@@ -1245,14 +1245,16 @@ pub(crate) fn exception_mro(
 }
 
 /// The refusal for an exception name that is a runtime-ambiguous alias
-/// (bound to more than one class at module level), or None.
+/// (bound to more than one class at module level, or to a class only
+/// inside control flow that may leave it unbound), or None.
 pub(crate) fn ambiguous_alias_refusal(name: &str, options: &PythonOptions) -> Option<String> {
     crate::ast::tree::class_def::is_runtime_ambiguous_alias(name, &options.this_module_path).then(|| {
         format!(
-            "rython: `{name}` is bound to more than one class at module level (a \
-             `try:`/`except:` or an `if` the conversion cannot fold), so which exception \
-             class it names is decided at runtime; rython refuses to follow one branch \
-             silently — bind the name once"
+            "rython: `{name}` is bound to more than one class at module level, or to a class \
+             only inside a `try:`, an `if`, a loop, or a `with` the conversion cannot fold \
+             (so it may be unbound), so which exception class it names is decided at \
+             runtime; rython refuses to follow one branch silently — bind the name once at \
+             module level"
         )
     })
 }
@@ -1733,6 +1735,7 @@ pub(crate) fn exception_field_type(
     symbols: &crate::SymbolTableScopes,
     options: &crate::PythonOptions,
 ) -> Result<Option<crate::TypeInfo>, Box<dyn std::error::Error>> {
+    use crate::ast::tree::visit::{Descend, Flow, is_self, walk_stmts};
     // Walk the class's MRO: the field may be defined on a BASE (an
     // `except BankError as e` catching an InsufficientFunds whose
     // __init__ stores the field — Devin review on #328), local or
@@ -1741,40 +1744,46 @@ pub(crate) fn exception_field_type(
     // annotation resolved in its own scope (Devin review on #330).
     for (_, def) in exception_mro(cls, symbols, options)? {
         let Some((c, c_scope)) = def else { continue };
-        if let Some(init) = c.init_method() {
-            for stmt in &init.body {
-                if let crate::StatementType::Assign(a) = &stmt.statement
-                    && let [ExprType::Attribute(attr)] = a.targets.as_slice()
-                    && attr.attr == field
-                    && let ExprType::Name(r) = attr.value.as_ref()
-                    && r.id == "self"
-                    && let ExprType::Name(v) = &a.value
-                {
-                    // The param's annotation types the field — a
-                    // positional-only, positional, or keyword-only
-                    // parameter.
-                    let Some(param) = init
-                        .args
-                        .posonlyargs
-                        .iter()
-                        .chain(init.args.args.iter())
-                        .chain(init.args.kwonlyargs.iter())
-                        .find(|p| p.arg == v.id)
-                    else {
-                        return Ok(None);
-                    };
-                    if let Some(ann) = param.annotation.as_ref()
-                        && let Some(t) = crate::resolve_alias_typeinfo(ann, &c_scope, options)
-                    {
-                        return Ok(Some(t));
-                    }
-                    // An unannotated param: no type — the reader refuses
-                    // loudly rather than guessing (an Int guess made a
-                    // str field's read a false AttributeError).
-                    return Ok(Some(crate::TypeInfo::PyObject));
-                }
+        let Some(init) = c.init_method() else { continue };
+        // The LAST `self.<field> = <param>` store in the initializer is
+        // the one the construction records — the same last-store-wins
+        // `classify_exception_init` models, over the same statements
+        // (nested control flow of the body included), so the read's
+        // type is the stored value's (Devin review on #330).
+        let mut last: Option<&str> = None;
+        walk_stmts(&init.body, Descend::OwnScope, &mut |stmt| {
+            if let crate::StatementType::Assign(a) = &stmt.statement
+                && let [ExprType::Attribute(attr)] = a.targets.as_slice()
+                && attr.attr == field
+                && is_self(&attr.value)
+                && let ExprType::Name(v) = &a.value
+            {
+                last = Some(v.id.as_str());
             }
+            Flow::Continue
+        });
+        let Some(stored) = last else { continue };
+        // The param's annotation types the field — a positional-only,
+        // positional, or keyword-only parameter.
+        let Some(param) = init
+            .args
+            .posonlyargs
+            .iter()
+            .chain(init.args.args.iter())
+            .chain(init.args.kwonlyargs.iter())
+            .find(|p| p.arg == stored)
+        else {
+            return Ok(None);
+        };
+        if let Some(ann) = param.annotation.as_ref()
+            && let Some(t) = crate::resolve_alias_typeinfo(ann, &c_scope, options)
+        {
+            return Ok(Some(t));
         }
+        // An unannotated param: no type — the reader refuses loudly
+        // rather than guessing (an Int guess made a str field's read a
+        // false AttributeError).
+        return Ok(Some(crate::TypeInfo::PyObject));
     }
     Ok(None)
 }
