@@ -644,10 +644,16 @@ mod tests {
 /// one message expression, or its own `*args` (the variadic forwarder).
 pub(crate) enum SuperMessage {
     Empty,
-    /// The arguments as written: one is the message, two or more make
-    /// `str(e)` the args tuple's repr.
-    Args(alloc_vec::Vec<crate::ExprType>),
-    Forwarded,
+    /// The arguments as written, in the initializer's namespace: bound to
+    /// the next initializer of the chain, or — at `BaseException` — one
+    /// is the message, two or more make `str(e)` the args tuple's repr,
+    /// and a keyword is a TypeError.
+    Args {
+        args: alloc_vec::Vec<crate::ExprType>,
+        keywords: alloc_vec::Vec<(String, crate::ExprType)>,
+    },
+    /// `super().__init__(*args)` — with `**kwargs` too when `kwargs`.
+    Forwarded { kwargs: bool },
 }
 mod alloc_vec {
     pub use std::vec::Vec;
@@ -669,6 +675,9 @@ pub(crate) struct InitModel<'a> {
     pub super_init: Option<SuperMessage>,
     pub fields: Vec<(String, &'a str)>,
     pub fields_at_super: Vec<(String, &'a str)>,
+    /// The stores AFTER the super call (they overwrite what a base's
+    /// `__init__` stored — the chain's execution order).
+    pub fields_after_super: Vec<(String, &'a str)>,
 }
 
 pub(crate) fn classify_exception_init<'a>(
@@ -683,6 +692,7 @@ pub(crate) fn classify_exception_init<'a>(
     let mut super_init: Option<SuperMessage> = None;
     let mut fields: Vec<(String, &'a str)> = Vec::new(); // (field, param)
     let mut fields_at_super: Vec<(String, &'a str)> = Vec::new();
+    let mut fields_after_super: Vec<(String, &'a str)> = Vec::new();
     let mut refusal: Option<String> = None;
     walk_stmts(body, Descend::OwnScope, &mut |stmt| {
         let modeled = match &stmt.statement {
@@ -696,6 +706,15 @@ pub(crate) fn classify_exception_init<'a>(
                         existing.1 = param;
                     } else {
                         fields.push((attr.attr.clone(), param));
+                    }
+                    if super_init.is_some() {
+                        if let Some(existing) =
+                            fields_after_super.iter_mut().find(|(f, _)| *f == attr.attr)
+                        {
+                            existing.1 = param;
+                        } else {
+                            fields_after_super.push((attr.attr.clone(), param));
+                        }
                     }
                     true
                 } else {
@@ -738,7 +757,9 @@ pub(crate) fn classify_exception_init<'a>(
                             });
                         fields_at_super = fields.clone();
                         if forwards_own {
-                            super_init = Some(SuperMessage::Forwarded);
+                            super_init = Some(SuperMessage::Forwarded {
+                                kwargs: sc.keywords.iter().any(|k| k.arg.is_none()),
+                            });
                         } else if splats {
                             refusal = Some(format!(
                                 "rython: `{}.__init__` calls `super().__init__` with a starred \
@@ -748,21 +769,21 @@ pub(crate) fn classify_exception_init<'a>(
                                 cls.name
                             ));
                             return Flow::Stop;
-                        } else if !sc.keywords.is_empty() {
-                            // BaseException.__init__ takes no keywords: a
-                            // TypeError in CPython.
-                            refusal = Some(format!(
-                                "rython: `{}.__init__` calls `super().__init__` with a keyword \
-                                 argument, which BaseException.__init__ does not accept (a \
-                                 TypeError in CPython)",
-                                cls.name
-                            ));
-                            return Flow::Stop;
                         } else {
-                            super_init = Some(if sc.args.is_empty() {
+                            // A keyword binds to a user-defined base's
+                            // parameter; BaseException.__init__ takes
+                            // none (a TypeError, loud at the site).
+                            super_init = Some(if sc.args.is_empty() && sc.keywords.is_empty() {
                                 SuperMessage::Empty
                             } else {
-                                SuperMessage::Args(sc.args.clone())
+                                SuperMessage::Args {
+                                    args: sc.args.clone(),
+                                    keywords: sc
+                                        .keywords
+                                        .iter()
+                                        .map(|k| (k.arg.clone().expect("splats refused"), k.value.clone()))
+                                        .collect(),
+                                }
                             });
                         }
                     }
@@ -793,167 +814,8 @@ pub(crate) fn classify_exception_init<'a>(
     });
     match refusal {
         Some(msg) => Err(msg),
-        None => Ok(InitModel { super_init, fields, fields_at_super }),
+        None => Ok(InitModel { super_init, fields, fields_at_super, fields_after_super }),
     }
-}
-
-/// A raise of a class whose `__init__` is variadic (`*args` / `**kwargs`):
-/// nothing binds by name, so the body may only forward to
-/// `super().__init__(*args)` (a docstring and `pass` aside); the message
-/// is then the raise's one positional argument per `BaseException`, or
-/// empty for none; a keyword (BaseException takes none — a TypeError in
-/// CPython) and two or more positionals (the args tuple's repr) are loud.
-fn variadic_exception_raise(
-    cls: &crate::ClassDef,
-    init: &crate::FunctionDef,
-    call: &crate::Call,
-    ctx: crate::CodeGenContext,
-    options: crate::PythonOptions,
-    symbols: crate::SymbolTableScopes,
-    class_symbols: &crate::SymbolTableScopes,
-) -> Result<Option<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
-    let site_error = |msg: String| -> Result<Option<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
-        Ok(Some(quote::quote!(compile_error!(#msg))))
-    };
-    let vararg = init.args.vararg.as_ref().map(|a| a.arg.as_str());
-    let kwarg = init.args.kwarg.as_ref().map(|a| a.arg.as_str());
-    // The NAMED parameters before `*args` (`__init__(self, prefix,
-    // *args)`) take the first arguments; the forwarded slice is the rest
-    // (Devin review on #330). A keyword-only parameter or a field store
-    // of a named one is not modeled here: loud.
-    let named: Vec<&str> = init
-        .args
-        .posonlyargs
-        .iter()
-        .chain(init.args.args.iter())
-        .skip(1)
-        .map(|a| a.arg.as_str())
-        .collect();
-    if !init.args.kwonlyargs.is_empty() {
-        return site_error(format!(
-            "rython: `{}.__init__` mixes `*args` with keyword-only parameters, which the \
-             forwarding model does not bind; name the parameters, or drop `*args`",
-            cls.name
-        ));
-    }
-    let model = match classify_exception_init(cls, &init.body, &named, vararg, kwarg) {
-        Ok(model) => model,
-        Err(msg) => return site_error(msg),
-    };
-    if !model.fields.is_empty() {
-        return site_error(format!(
-            "rython: `{}.__init__` stores a named parameter as a field while forwarding \
-             `*args`, which the forwarding model does not bind; name every parameter, \
-             or drop `*args`",
-            cls.name
-        ));
-    }
-    if let Some(SuperMessage::Args(_) | SuperMessage::Empty) = model.super_init {
-        return site_error(format!(
-            "rython: `{}.__init__` takes `*args` but does not forward them to \
-             `super().__init__(*args)`: the message would not be the raise's argument; \
-             forward the arguments, or name the parameters",
-            cls.name
-        ));
-    }
-    if !call.keywords.is_empty() {
-        return site_error(format!(
-            "rython: `{}()` takes no keyword arguments (BaseException.__init__ accepts \
-             none)",
-            cls.name
-        ));
-    }
-    if call.args.iter().any(|a| matches!(a, crate::ExprType::Starred(_))) {
-        return site_error(format!(
-            "rython: `raise {}(*...)`: a starred argument to an exception constructor \
-             is not modeled; pass the arguments explicitly",
-            cls.name
-        ));
-    }
-    if call.args.len() < named.len() {
-        return site_error(format!(
-            "rython: `{}()` missing a required argument: '{}'",
-            cls.name,
-            named[call.args.len()]
-        ));
-    }
-    // The named parameters' arguments are evaluated once, in order, and
-    // dropped (the body forwards only `*args`).
-    let mut prelude: Vec<proc_macro2::TokenStream> = Vec::new();
-    for a in &call.args[..named.len()] {
-        if matches!(a, crate::ExprType::Constant(_)) {
-            continue;
-        }
-        let tokens = a.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        prelude.push(quote::quote!(let _ = #tokens;));
-    }
-    // The forwarded slice, each argument evaluated once: `str(e)` is the
-    // one argument, empty for none, the tuple's repr for two or more —
-    // the same rule as the generic construction (Devin review on #330).
-    let mut arg_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
-    for (i, a) in call.args[named.len()..].iter().enumerate() {
-        let tokens = a.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        let runs_code = crate::ast::tree::visit::any_expr_for(
-            a,
-            crate::ast::tree::visit::Descend::All,
-            |e| matches!(e, crate::ExprType::Call(_)),
-        );
-        if runs_code {
-            let ident = proc_macro2::Ident::new(
-                &format!("__rython_exc_a{i}"),
-                proc_macro2::Span::call_site(),
-            );
-            prelude.push(quote::quote!(let #ident = #tokens;));
-            arg_tokens.push(quote::quote!(#ident));
-        } else {
-            arg_tokens.push(tokens);
-        }
-    }
-    let forwarded_runs_code = call.args[named.len()..].iter().any(|a| {
-        crate::ast::tree::visit::any_expr_for(a, crate::ast::tree::visit::Descend::All, |e| {
-            matches!(e, crate::ExprType::Call(_))
-        })
-    });
-    let msg = match arg_tokens.as_slice() {
-        [] => quote::quote!(String::new()),
-        [one] if !forwarded_runs_code => {
-            let m = message_arg(&call.args[named.len()], ctx, options.clone(), symbols)?;
-            let _ = one;
-            quote::quote!(format!("{}", #m))
-        }
-        [one] => quote::quote!(format!("{}", stdpython::py_display(&(#one)))),
-        many => {
-            let fmt = format!("({})", vec!["{}"; many.len()].join(", "));
-            quote::quote!(format!(#fmt, #(stdpython::PyRepr::py_repr(&(#many))),*))
-        }
-    };
-    let args_repr = quote::quote!(vec![#(stdpython::PyRepr::py_repr(&(#arg_tokens))),*]);
-    let kind = &cls.name;
-    let ancestor_tokens = exception_ancestor_tokens(cls, class_symbols, &options)?;
-    let construct = quote::quote! {
-        stdpython :: PyException :: new_with_attrs_and_ancestors (
-            #kind , #msg , vec ! [] , vec ! [#(#ancestor_tokens),*]
-        ) . with_args_repr (#args_repr)
-    };
-    Ok(Some(if prelude.is_empty() {
-        construct
-    } else {
-        quote::quote!({ #(#prelude)* #construct })
-    }))
-}
-
-/// The class whose `__init__` a construction of `cls` runs — `cls`
-/// itself or the first base up the chain defining one — with that
-/// class's scope; None when no class of the chain defines one.
-pub(crate) fn exception_init_owner(
-    cls: &crate::ClassDef,
-    scope: &SymbolTableScopes,
-    options: &PythonOptions,
-) -> Result<Option<(crate::ClassDef, SymbolTableScopes)>, Box<dyn std::error::Error>> {
-    Ok(exception_mro(cls, scope, options)?
-        .into_iter()
-        .filter_map(|(_, def)| def)
-        .find(|(c, _)| c.init_method().is_some()))
 }
 
 /// The ONE construction of an in-crate exception class, wherever the
@@ -983,7 +845,8 @@ pub(crate) fn exception_construction(
     )? {
         return Ok(tokens);
     }
-    let kind = &cls.name;
+    // No initializer chain to model: the arguments are `args` — the same
+    // once-evaluation and rendering as a chain's end.
     if !call.keywords.is_empty() {
         let msg = format!(
             "rython: `{}()` takes no keyword arguments (BaseException.__init__ accepts none)",
@@ -991,58 +854,24 @@ pub(crate) fn exception_construction(
         );
         return Ok(quote!(compile_error!(#msg)));
     }
-    // Every argument evaluated once (a temporary when it runs code),
-    // read by `str(e)` and by the recorded `repr(e)` parts.
-    let mut prelude: Vec<TokenStream> = Vec::new();
-    let mut arg_tokens: Vec<TokenStream> = Vec::new();
-    for (i, a) in call.args.iter().enumerate() {
-        let tokens = a.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        let runs_code = crate::ast::tree::visit::any_expr_for(
-            a,
-            crate::ast::tree::visit::Descend::All,
-            |e| matches!(e, ExprType::Call(_)),
+    if call.args.iter().any(|a| matches!(a, ExprType::Starred(_))) {
+        let msg = format!(
+            "rython: `raise {}(*...)`: a starred argument to an exception constructor is \
+             not modeled; pass the arguments explicitly",
+            cls.name
         );
-        if runs_code {
-            let ident = proc_macro2::Ident::new(
-                &format!("__rython_exc_a{i}"),
-                proc_macro2::Span::call_site(),
-            );
-            prelude.push(quote!(let #ident = #tokens;));
-            arg_tokens.push(quote!(#ident));
-        } else {
-            arg_tokens.push(tokens);
-        }
+        return Ok(quote!(compile_error!(#msg)));
     }
-    // `str(e)` is `str(e.args)`: the one argument's str, empty for none,
-    // and for two or more the tuple's repr — each argument's repr,
-    // parenthesized and comma-joined (`(<Pool object>, 'Pool is
-    // closed.')`; the default object repr drops CPython's address, the
-    // documented §12.3 divergence). The old comma-joined display was a
-    // silent divergence (the CI transcript on #330).
-    let msg = match arg_tokens.as_slice() {
-        [] => quote!(String::new()),
-        [one] if prelude.is_empty() => {
-            // Read in place: the display wrapping the message builder
-            // applies (a class instance, an Option, a boxed value).
-            let m = message_arg(&call.args[0], ctx, options.clone(), symbols)?;
-            quote!(format!("{}", #m))
-        }
-        [one] => quote!(format!("{}", stdpython::py_display(&(#one)))),
-        many => {
-            let fmt = format!("({})", vec!["{}"; many.len()].join(", "));
-            quote!(format!(#fmt, #(stdpython::PyRepr::py_repr(&(#many))),*))
-        }
+    let mut st = Construction {
+        ctx,
+        options,
+        symbols,
+        prelude: Vec::new(),
+        call_positional: call.args.clone(),
+        runs_code: false,
     };
-    let args_repr = quote!(vec![#(stdpython::PyRepr::py_repr(&(#arg_tokens))),*]);
-    let ancestors = exception_ancestor_tokens(cls, class_symbols, &options)?;
-    let construct = quote!(PyException::new_with_attrs_and_ancestors(
-        #kind, #msg, vec![], vec![#(#ancestors),*]
-    ).with_args_repr(#args_repr));
-    Ok(if prelude.is_empty() {
-        construct
-    } else {
-        quote!({ #(#prelude)* #construct })
-    })
+    st.runs_code = call.args.iter().any(|a| st.may_run_code(a));
+    finish_construction(st, cls, class_symbols, call.args.clone(), Vec::new())
 }
 
 /// The ancestor chain of an in-crate exception class, base-most last
@@ -1302,46 +1131,227 @@ pub(crate) fn exception_ancestor_tokens(
         .collect())
 }
 
-/// A raise of an in-crate exception class whose `__init__` the model
-/// covers: the class's own message (the `super().__init__(<message>)`
-/// argument, rendered at the raise site with the parameters bound to the
-/// call's arguments) and its field stores as attrs, plus the ancestor
-/// chain. The model is exactly `self.<field> = <param>` stores and the
-/// message; any other statement is a `compile_error!` at the raise site.
-///
-/// Arguments bind the way CPython binds a call: positionals to the
-/// positional parameters in order, keywords by name to a positional or a
-/// keyword-only parameter, a missing parameter to its default. Every
-/// bound argument that is not a bare name or a constant is evaluated
-/// ONCE, in source order, into a typed temporary the message and the
-/// attrs both read (a property read or a call runs once — Devin review
-/// on #330); a default is modeled only when it is a constant (a
-/// definition-time value with an identity or an effect cannot be
-/// re-rendered at each raise). What the model cannot bind is loud at the
-/// site. None when the class has no `__init__` parameters to model (the
-/// generic message-only construction, which still attaches the
-/// ancestors).
-pub(crate) fn exception_class_raise(
-    cls: &crate::ClassDef,
-    call: &crate::Call,
+/// A temporary of the construction (bound once in the prelude).
+fn is_exc_temp(e: &crate::ExprType) -> bool {
+    matches!(e, crate::ExprType::Name(n) if n.id.starts_with("__rython_exc_"))
+}
+
+/// The temporary's name for an evaluated argument (`arg`) or a message
+/// part (`m`) of one level of the initializer chain: the raise's own
+/// level keeps the short names, a base's level is prefixed.
+fn exc_temp(level: usize, kind: &str, k: usize) -> String {
+    if level == 0 {
+        format!("__rython_exc_{kind}{k}")
+    } else {
+        format!("__rython_exc_l{level}_{kind}{k}")
+    }
+}
+
+/// A stored attribute of the construction: (field, its value in the
+/// raise site's namespace, the class and parameter that stored it).
+type Attr = (String, crate::ExprType, String, String);
+
+/// `over` replaces same-named fields of `base` in place, new ones append.
+fn overlay(mut base: Vec<Attr>, over: impl IntoIterator<Item = Attr>) -> Vec<Attr> {
+    for a in over {
+        match base.iter_mut().find(|b| b.0 == a.0) {
+            Some(b) => *b = a,
+            None => base.push(a),
+        }
+    }
+    base
+}
+
+/// A site error is a `compile_error!` at the construction (the inner
+/// Err); the outer Err is a conversion failure.
+type Modeled<T> = Result<Result<T, String>, Box<dyn std::error::Error>>;
+
+/// The state one construction threads through the initializer chain:
+/// the prelude (temporaries bound once, in evaluation order), the
+/// options carrying every temporary's type, the raise's own positional
+/// arguments (what `BaseException.__new__` records when no initializer
+/// of the chain calls `super().__init__`), and whether ANY expression of
+/// the construction runs code (then a bare name is captured before it).
+struct Construction {
     ctx: crate::CodeGenContext,
     options: crate::PythonOptions,
     symbols: crate::SymbolTableScopes,
-    class_symbols: &crate::SymbolTableScopes,
-) -> Result<Option<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
+    prelude: Vec<proc_macro2::TokenStream>,
+    call_positional: Vec<crate::ExprType>,
+    runs_code: bool,
+}
+
+/// Whether an expression MAY run code by its shape alone: a call, an
+/// attribute read (a property getter, unless the receiver is `self` —
+/// the modeled field reads), a subscript (`__getitem__`), a walrus, an
+/// await or a yield, anywhere in it. Constants, names, and the pure
+/// combinators over them (an f-string, an arithmetic or a comparison, a
+/// literal collection) are not code of their own.
+fn may_run_code_by_shape(e: &crate::ExprType) -> bool {
+    use crate::ExprType;
+    crate::ast::tree::visit::any_expr_for(e, crate::ast::tree::visit::Descend::All, |x| {
+        matches!(
+            x,
+            ExprType::Call(_)
+                | ExprType::Subscript(_)
+                | ExprType::NamedExpr(_)
+                | ExprType::Await(_)
+                | ExprType::Yield(_)
+                | ExprType::YieldFrom(_)
+        ) || matches!(x, ExprType::Attribute(a) if !crate::ast::tree::visit::is_self(&a.value))
+    })
+}
+
+impl Construction {
+    /// Whether a site expression may run code: by shape, except that an
+    /// attribute read is a plain field read (no code) when its receiver's
+    /// class is known and declares no property getter of that name — the
+    /// one authority attribute lowering routes property reads by.
+    fn may_run_code(&self, e: &crate::ExprType) -> bool {
+        use crate::ExprType;
+        crate::ast::tree::visit::any_expr_for(e, crate::ast::tree::visit::Descend::All, |x| {
+            match x {
+                ExprType::Call(_)
+                | ExprType::Subscript(_)
+                | ExprType::NamedExpr(_)
+                | ExprType::Await(_)
+                | ExprType::Yield(_)
+                | ExprType::YieldFrom(_) => true,
+                ExprType::Attribute(a) => {
+                    match crate::receiver_class_for_read(&a.value, &self.ctx, &self.symbols, &self.options) {
+                        Some((class, class_symbols)) => {
+                            class.has_property_getter(&a.attr, &class_symbols, &self.options)
+                        }
+                        None => !crate::ast::tree::visit::is_self(&a.value),
+                    }
+                }
+                _ => false,
+            }
+        })
+    }
+
+    /// Bind `expr` to a fresh temporary, its type recorded for the reads.
+    fn bind_temp(
+        &mut self,
+        name: String,
+        expr: &crate::ExprType,
+        clone: bool,
+    ) -> Result<crate::ExprType, Box<dyn std::error::Error>> {
+        let ident = proc_macro2::Ident::new(&name, proc_macro2::Span::call_site());
+        let tokens =
+            expr.clone().to_rust(self.ctx.clone(), self.options.clone(), self.symbols.clone())?;
+        if clone {
+            self.prelude.push(quote::quote!(let #ident = (#tokens).clone();));
+        } else {
+            self.prelude.push(quote::quote!(let #ident = #tokens;));
+        }
+        let ty = crate::infer_type(Some(&self.ctx), expr, &self.options, &self.symbols);
+        if !matches!(ty, crate::TypeInfo::PyObject) {
+            let mut name_types = (*self.options.name_types).clone();
+            name_types.insert(name.clone(), ty);
+            self.options.name_types = std::rc::Rc::new(name_types);
+        }
+        Ok(crate::ExprType::Name(crate::ast::tree::name::Name { id: name }))
+    }
+
+    /// Whether a bare name at position `k` of `exprs` must be captured
+    /// before a later expression could rebind it: a later one of these
+    /// runs code, or any expression of the construction does.
+    fn captures(&self, exprs: &[crate::ExprType], k: usize) -> bool {
+        matches!(&exprs[k], crate::ExprType::Name(n) if n.id != "self")
+            && !is_exc_temp(&exprs[k])
+            && (self.runs_code || exprs[k + 1..].iter().any(|e| self.may_run_code(e)))
+    }
+}
+
+/// Whether a `super().__init__` argument of any initializer up the chain
+/// may run code (by shape — the initializer's namespace has no site
+/// types): a message that calls a function can rebind a global a
+/// bare-name argument reads, so the name is captured first (Devin review
+/// on #330).
+fn construction_runs_code(chain: &[(crate::ClassDef, SymbolTableScopes)]) -> bool {
+    let trivial = |e: &crate::ExprType| !may_run_code_by_shape(e);
+    chain.iter().any(|(c, _)| {
+        let Some(init) = c.init_method() else { return false };
+        let params: Vec<&str> = init
+            .args
+            .posonlyargs
+            .iter()
+            .chain(init.args.args.iter())
+            .skip(1)
+            .chain(init.args.kwonlyargs.iter())
+            .map(|a| a.arg.as_str())
+            .collect();
+        let vararg = init.args.vararg.as_ref().map(|a| a.arg.as_str());
+        let kwarg = init.args.kwarg.as_ref().map(|a| a.arg.as_str());
+        match classify_exception_init(c, &init.body, &params, vararg, kwarg) {
+            Ok(InitModel { super_init: Some(SuperMessage::Args { args, keywords }), .. }) => {
+                args.iter().any(|a| !trivial(a)) || keywords.iter().any(|(_, v)| !trivial(v))
+            }
+            _ => false,
+        }
+    })
+}
+
+/// One level of the initializer chain: the first `__init__` among
+/// `chain` (the MRO from this level on) bound to `args`/`keywords` —
+/// site-namespace expressions — with `attrs_in` the attribute state on
+/// entry (the stores a subclass made before its `super().__init__`).
+/// Returns what `BaseException.__init__` finally receives (`str(e)`'s
+/// arguments, site namespace) and the attribute state on exit. A
+/// user-defined base's `__init__` RUNS here, at the `super().__init__`
+/// call, with the call's arguments bound to its parameters — its
+/// message, its stores, its own super call (Devin review on #330: the
+/// super call was taken for BaseException's, dropping the base's body).
+/// `via` names the class whose super call produced `args`, for the
+/// messages.
+fn model_init_level(
+    st: &mut Construction,
+    cls: &crate::ClassDef,
+    chain: &[(crate::ClassDef, SymbolTableScopes)],
+    args: Vec<crate::ExprType>,
+    keywords: Vec<(Option<String>, crate::ExprType)>,
+    attrs_in: Vec<Attr>,
+    level: usize,
+    via: Option<&str>,
+) -> Modeled<(Vec<crate::ExprType>, Vec<Attr>)> {
     use crate::ExprType;
     use std::collections::HashMap;
-    if !crate::is_exception_class(cls) {
-        return Ok(None);
+    macro_rules! site {
+        ($($arg:tt)*) => { return Ok(Err(format!($($arg)*))) };
     }
-    // The `__init__` that runs is the first one up the chain (Python's
-    // MRO): a `class Child(Base): pass` constructs through Base's — the
-    // kind stays Child and the ancestors are Child's (Devin review on
-    // #330).
-    let Some((owner, owner_scope)) = exception_init_owner(cls, class_symbols, &options)? else {
-        return Ok(None);
+    let Some(pos) = chain.iter().position(|(c, _)| c.init_method().is_some()) else {
+        // BaseException.__init__: `args` is what it receives; it takes
+        // no keyword (a TypeError in CPython).
+        if !keywords.is_empty() {
+            match via {
+                Some(owner) => site!(
+                    "rython: `{owner}.__init__` calls `super().__init__` with a keyword \
+                     argument, which BaseException.__init__ does not accept (a TypeError in \
+                     CPython)"
+                ),
+                None => site!(
+                    "rython: `{}()` takes no keyword arguments (BaseException.__init__ \
+                     accepts none)",
+                    cls.name
+                ),
+            }
+        }
+        if args.iter().any(|a| matches!(a, ExprType::Starred(_))) {
+            site!(
+                "rython: `raise {}(*...)`: a starred argument to an exception constructor \
+                 is not modeled; pass the arguments explicitly",
+                cls.name
+            );
+        }
+        return Ok(Ok((args, attrs_in)));
     };
+    let (owner, owner_scope) = &chain[pos];
+    let rest = &chain[pos + 1..];
     let init = owner.init_method().expect("the owner defines __init__");
+    if init.args.vararg.is_some() || init.args.kwarg.is_some() {
+        return model_variadic_level(st, cls, owner, init, rest, args, keywords, attrs_in, level);
+    }
     // The positional parameters are the positional-only ones followed by
     // the ordinary ones (CPython's `posonlyargs ++ args`); the receiver
     // is the first of that sequence wherever it sits, and a
@@ -1349,32 +1359,16 @@ pub(crate) fn exception_class_raise(
     let combined: Vec<&crate::ast::tree::arguments::Parameter> =
         init.args.posonlyargs.iter().chain(init.args.args.iter()).collect();
     let positional: Vec<&str> = combined.iter().skip(1).map(|a| a.arg.as_str()).collect();
-    let positional_only: Vec<&str> = init
-        .args
-        .posonlyargs
-        .iter()
-        .skip(1)
-        .map(|a| a.arg.as_str())
-        .collect();
+    let positional_only: Vec<&str> =
+        init.args.posonlyargs.iter().skip(1).map(|a| a.arg.as_str()).collect();
     let kwonly: Vec<&str> = init.args.kwonlyargs.iter().map(|a| a.arg.as_str()).collect();
-    let site_error = |msg: String| -> Result<Option<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
-        Ok(Some(quote::quote!(compile_error!(#msg))))
-    };
-    // A VARIADIC `__init__(self, *args, **kwargs)` binds nothing by name:
-    // modeled when its body only forwards to `super().__init__(*args)`
-    // (idna's IDNAError), the message then being the raise's one
-    // positional argument — the BaseException rule below; any other
-    // statement in it is the same refusal as an unmodeled body.
-    if init.args.vararg.is_some() || init.args.kwarg.is_some() {
-        return variadic_exception_raise(cls, init, call, ctx, options, symbols, class_symbols);
-    }
     // Defaults: positional defaults align to the tail of the positional
     // parameters, keyword-only defaults to their parameters.
     let mut defaults: HashMap<&str, &ExprType> = HashMap::new();
     let n_all = combined.len();
     let n_def = init.args.defaults.len();
     if n_def > n_all {
-        return Ok(None);
+        site!("rython: `{}.__init__` has more defaults than parameters", owner.name);
     }
     for (i, d) in init.args.defaults.iter().enumerate() {
         let param = combined[n_all - n_def + i];
@@ -1388,322 +1382,538 @@ pub(crate) fn exception_class_raise(
         }
     }
     // Bind the call: (param → the argument expression), in source order.
-    let mut given: Vec<(&str, &ExprType)> = Vec::new();
-    for (i, a) in call.args.iter().enumerate() {
+    let mut given: Vec<(&str, ExprType)> = Vec::new();
+    let n_positional = args.len();
+    for (i, a) in args.into_iter().enumerate() {
         if matches!(a, ExprType::Starred(_)) {
-            return site_error(format!(
+            site!(
                 "rython: `raise {}(*...)`: a starred argument to an exception constructor \
                  is not modeled; pass the arguments explicitly",
                 cls.name
-            ));
+            );
         }
         let Some(p) = positional.get(i) else {
-            return site_error(format!(
+            site!(
                 "rython: `{}()` takes {} positional argument(s) but {} were given",
-                cls.name,
+                owner.name,
                 positional.len(),
-                call.args.len()
-            ));
+                n_positional
+            );
         };
         given.push((p, a));
     }
-    for kw in &call.keywords {
-        let Some(name) = kw.arg.as_deref() else {
-            return site_error(format!(
+    for (name, value) in keywords {
+        let Some(name) = name else {
+            site!(
                 "rython: `raise {}(**...)`: a keyword splat to an exception constructor is \
                  not modeled; pass the arguments explicitly",
                 cls.name
-            ));
+            );
         };
-        if positional_only.contains(&name) {
-            return site_error(format!(
+        if positional_only.iter().any(|p| *p == name) {
+            site!(
                 "rython: `{}()` got some positional-only arguments passed as keyword \
                  arguments: '{}'",
-                cls.name, name
-            ));
+                owner.name,
+                name
+            );
         }
-        if !positional.contains(&name) && !kwonly.contains(&name) {
-            return site_error(format!(
-                "rython: `{}()` got an unexpected keyword argument '{}'",
-                cls.name, name
-            ));
-        }
+        let Some(param) = positional.iter().chain(kwonly.iter()).find(|p| **p == name) else {
+            site!("rython: `{}()` got an unexpected keyword argument '{}'", owner.name, name);
+        };
         if given.iter().any(|(p, _)| *p == name) {
-            return site_error(format!(
-                "rython: `{}()` got multiple values for argument '{}'",
-                cls.name, name
-            ));
+            site!("rython: `{}()` got multiple values for argument '{}'", owner.name, name);
         }
-        given.push((name, &kw.value));
+        given.push((param, value));
     }
-    // Every parameter's substitution at the raise site: a temporary for
-    // an evaluated argument, the expression itself for a bare name or a
-    // constant, the constant default otherwise.
-    let mut prelude: Vec<proc_macro2::TokenStream> = Vec::new();
-    let mut msg_options = options.clone();
-    let mut name_types = (*msg_options.name_types).clone();
+    // Every parameter's substitution at the site: a temporary for an
+    // evaluated argument (bound once, in source order — a property read,
+    // a call, a walrus, an f-string run once), the expression itself for
+    // a constant or a bare name — unless a LATER expression of the
+    // construction runs code, which could rebind the name before the
+    // message and the attrs read it (`E(counter, bump())`, or a message
+    // that calls `bump()`): then the name is captured in source order
+    // too, a clone (Devin review on #330).
+    let exprs: Vec<ExprType> = given.iter().map(|(_, a)| a.clone()).collect();
     let mut substitution: HashMap<&str, ExprType> = HashMap::new();
-    let evaluated = |a: &ExprType| !matches!(a, ExprType::Name(_) | ExprType::Constant(_));
     for (k, (param, arg)) in given.iter().enumerate() {
-        // A bare name is read in place — unless a LATER argument runs
-        // code, which could rebind it before the message and the attrs
-        // read it (`E(counter, bump())`): then it is captured in source
-        // order too, a clone (the raise site may read it again — an
-        // `isinstance(E(x, f()), ...)` construction; Devin review on
-        // #330).
-        let captured_name = matches!(arg, ExprType::Name(_))
-            && given[k + 1..].iter().any(|(_, later)| evaluated(later));
-        if !evaluated(arg) && !captured_name {
-            substitution.insert(param, (*arg).clone());
+        let captured = st.captures(&exprs, k);
+        // Bound once: an expression that may run code (a call, a property
+        // read, a subscript, a walrus), or a bare name captured; a
+        // constant, a name, or a pure combinator over them (an f-string,
+        // an arithmetic) is read in place.
+        if !captured && !st.may_run_code(arg) {
+            substitution.insert(param, arg.clone());
             continue;
         }
-        let temp = format!("__rython_exc_arg{k}");
-        let ident = proc_macro2::Ident::new(&temp, proc_macro2::Span::call_site());
-        let tokens = (*arg).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        if captured_name {
-            prelude.push(quote::quote!(let #ident = (#tokens).clone();));
-        } else {
-            prelude.push(quote::quote!(let #ident = #tokens;));
-        }
-        let ty = crate::infer_type(Some(&ctx), arg, &options, &symbols);
-        if !matches!(ty, crate::TypeInfo::PyObject) {
-            name_types.insert(temp.clone(), ty);
-        }
-        substitution.insert(param, ExprType::Name(crate::ast::tree::name::Name { id: temp }));
+        let temp = st.bind_temp(exc_temp(level, "arg", k), arg, captured)?;
+        substitution.insert(param, temp);
+    }
+    if level == 0 {
+        // What `BaseException.__new__` records as `args` when no
+        // initializer calls super: the raise's positional arguments, as
+        // bound here (a temporary stands for an evaluated one).
+        st.call_positional = given[..n_positional].iter().map(|(p, _)| substitution[p].clone()).collect();
     }
     for param in positional.iter().chain(kwonly.iter()) {
         if substitution.contains_key(param) {
             continue;
         }
         let Some(d) = defaults.get(param) else {
-            return site_error(format!(
-                "rython: `{}()` missing a required argument: '{}'",
-                cls.name, param
-            ));
+            site!("rython: `{}()` missing a required argument: '{}'", owner.name, param);
         };
         let constant = matches!(d, ExprType::Constant(_) | ExprType::NoneType(_))
             || matches!(d, ExprType::UnaryOp(u) if matches!(u.operand.as_ref(), ExprType::Constant(_)));
         if !constant {
-            return site_error(format!(
+            site!(
                 "rython: `{}.__init__`'s default for '{}' is not a constant: CPython \
                  evaluates a default once at definition time, which re-rendering it at \
                  each raise cannot reproduce; pass the argument explicitly, or make the \
                  default a constant",
-                cls.name, param
-            ));
+                owner.name,
+                param
+            );
         }
         substitution.insert(param, (*d).clone());
     }
-    msg_options.name_types = std::rc::Rc::new(name_types);
     // The __init__ body — `self.<field> = <param>` stores and the
-    // `super().__init__(<message>)` call; a docstring and `pass` are
-    // inert; anything else would not run at the raise site — classified
-    // through the one statement visitor (a compound statement is
-    // unmodeled at its head, so its bodies are never entered).
+    // `super().__init__(...)` call; a docstring and `pass` are inert;
+    // anything else would not run at the site — classified through the
+    // one statement visitor.
     let params: Vec<&str> = positional.iter().chain(kwonly.iter()).copied().collect();
-    let InitModel { super_init, fields, fields_at_super } =
-        match classify_exception_init(cls, &init.body, &params, None, None) {
+    let InitModel { super_init, fields, fields_at_super, fields_after_super } =
+        match classify_exception_init(owner, &init.body, &params, None, None) {
             Ok(model) => model,
-            Err(msg) => return site_error(msg),
+            Err(msg) => return Ok(Err(msg)),
         };
-    // The message, as CPython sets `str(e)`: the `super().__init__`
-    // argument; the empty string for the zero-argument call (a class
-    // that stores fields and calls `super().__init__()` keeps its fields
-    // — Devin review on #330); with no super call at all,
-    // `BaseException.__new__` still records the call's positional
-    // arguments as `args`, so `str(e)` is the one positional argument,
-    // or empty for none — more than one is the tuple's repr, refused.
-    let msg_exprs: Vec<ExprType> = match super_init {
-        Some(SuperMessage::Empty) => Vec::new(),
-        Some(SuperMessage::Args(args)) => args,
-        // `super().__init__(*args)` cannot appear here: the variadic
-        // initializer took the branch above, and a non-variadic body
-        // naming `*args` is refused by the classifier.
-        Some(SuperMessage::Forwarded) => unreachable!("forwarding needs a vararg"),
-        None => match call.args.len() {
-            0 => Vec::new(),
-            1 => vec![ExprType::Name(crate::ast::tree::name::Name {
-                id: positional[0].to_string(),
-            })],
-            _ => {
-                return site_error(format!(
-                    "rython: `{}.__init__` never calls `super().__init__`, so `str(e)` is \
-                     the repr of the {} positional arguments as a tuple, which rython's \
-                     one-message exception model does not reproduce; call \
-                     `super().__init__(<message>)`",
-                    cls.name,
-                    call.args.len()
-                ));
-            }
-        },
-    };
-    // Every argument is evaluated, in source order, whether or not the
-    // model reads it: a bare name bound to a parameter the message and
-    // the fields ignore is still read once (`raise E(undefined_name)`
-    // is a NameError before the construction in CPython, an unresolved
-    // name in rustc here — Devin review on #330).
+    // Every argument is evaluated, whether or not the model reads it: a
+    // bare name bound to a parameter the message and the fields ignore
+    // is still read once (`raise E(undefined_name)` is a NameError in
+    // CPython, an unresolved name in rustc here — Devin review on #330).
     let mut read_by_model: Vec<&str> = fields.iter().map(|(_, p)| *p).collect();
-    for m0 in &msg_exprs {
-        crate::ast::tree::visit::walk_expr(m0, &mut |e| {
-            if let ExprType::Name(n) = e
-                && let Some(p) = params.iter().find(|p| **p == n.id)
-            {
-                read_by_model.push(p);
-            }
-            if let ExprType::Attribute(attr) = e
-                && crate::ast::tree::visit::is_self(&attr.value)
-                && let Some((_, p)) = fields_at_super.iter().find(|(f, _)| *f == attr.attr)
-            {
-                read_by_model.push(p);
-            }
-        });
+    if let Some(SuperMessage::Args { args, keywords }) = &super_init {
+        for m0 in args.iter().chain(keywords.iter().map(|(_, v)| v)) {
+            crate::ast::tree::visit::walk_expr(m0, &mut |e| {
+                if let ExprType::Name(n) = e
+                    && let Some(p) = params.iter().find(|p| **p == n.id)
+                {
+                    read_by_model.push(p);
+                }
+                if let ExprType::Attribute(attr) = e
+                    && crate::ast::tree::visit::is_self(&attr.value)
+                    && let Some((_, p)) = fields_at_super.iter().find(|(f, _)| *f == attr.attr)
+                {
+                    read_by_model.push(p);
+                }
+            });
+        }
     }
     for (param, arg) in &given {
         if let ExprType::Name(n) = arg
+            && !is_exc_temp(arg)
             && !read_by_model.contains(param)
             && matches!(substitution.get(param), Some(ExprType::Name(s)) if s.id == n.id)
         {
             let ident = crate::safe_ident(&n.id);
-            prelude.push(quote::quote!(let _ = &#ident;));
+            st.prelude.push(quote::quote!(let _ = &#ident;));
         }
     }
-    // Each message argument rewritten to the raise site, evaluated once:
-    // a lambda or a comprehension is refused (bindings of its own the
-    // rewrite cannot model); `self.<field>` means the parameter the
-    // field stored at the super call; every parameter means its
-    // substitution — one pre-order pass through the mutable visitor (a
-    // replaced node is a leaf, never rewritten again, so a caller name
-    // that matches another parameter binds ONCE — Devin review on #330);
-    // every name the rewritten expression still reads must be bound at
-    // the site as the `__init__` sees it. An argument that runs code
-    // binds to a temporary, read by the message and by the args repr.
-    let mut arg_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
-    for (i, m0) in msg_exprs.iter().enumerate() {
-        let mut m = m0.clone();
-        if crate::ast::tree::visit::any_expr_for(&m, crate::ast::tree::visit::Descend::All, |e| {
-            matches!(
-                e,
-                ExprType::Lambda(_)
-                    | ExprType::ListComp(_)
-                    | ExprType::SetComp(_)
-                    | ExprType::DictComp(_)
-                    | ExprType::GeneratorExp(_)
-            )
-        }) {
-            return site_error(format!(
-                "rython: `{}.__init__`'s message holds a lambda or a comprehension, \
-                 whose own bindings the raise-site rewrite cannot model; compute the \
-                 message in a local first",
-                cls.name
-            ));
-        }
-        crate::ast::tree::visit::walk_expr_mut(&mut m, &mut |e| {
-            if let ExprType::Attribute(attr) = e
-                && crate::ast::tree::visit::is_self(&attr.value)
-                && let Some((_, param)) = fields_at_super.iter().find(|(f, _)| *f == attr.attr)
-            {
-                *e = ExprType::Name(crate::ast::tree::name::Name { id: param.to_string() });
+    let stored = |list: &[(String, &str)]| -> Vec<Attr> {
+        list.iter()
+            .map(|(f, p)| (f.clone(), substitution[p].clone(), owner.name.clone(), p.to_string()))
+            .collect()
+    };
+    let Some(super_init) = super_init else {
+        // No super call at all: `BaseException.__new__` still records
+        // the raise's positional arguments as `args`, so `str(e)` is the
+        // one positional argument, or empty for none — more than one is
+        // the tuple's repr, refused; the chain's remaining initializers
+        // never run.
+        let msg = match st.call_positional.len() {
+            0 => Vec::new(),
+            1 => vec![st.call_positional[0].clone()],
+            n => site!(
+                "rython: `{}.__init__` never calls `super().__init__`, so `str(e)` is the \
+                 repr of the {} positional arguments as a tuple, which rython's \
+                 one-message exception model does not reproduce; call \
+                 `super().__init__(<message>)`",
+                owner.name,
+                n
+            ),
+        };
+        return Ok(Ok((msg, overlay(attrs_in, stored(&fields)))));
+    };
+    // The attribute state at the super call: what a `self.<field>` read
+    // in the message means (a later store does not rewrite it).
+    let attrs_at_super = overlay(attrs_in, stored(&fields_at_super));
+    let (next_args, next_keywords): (Vec<ExprType>, Vec<(Option<String>, ExprType)>) =
+        match super_init {
+            SuperMessage::Empty => (Vec::new(), Vec::new()),
+            SuperMessage::Args { args, keywords } => {
+                let mut next_args = Vec::new();
+                for m0 in &args {
+                    match rewrite_super_arg(st, owner, owner_scope, m0, &params, &substitution, &attrs_at_super)? {
+                        Ok(m) => next_args.push(m),
+                        Err(msg) => return Ok(Err(msg)),
+                    }
+                }
+                let mut next_keywords = Vec::new();
+                for (name, v0) in &keywords {
+                    match rewrite_super_arg(st, owner, owner_scope, v0, &params, &substitution, &attrs_at_super)? {
+                        Ok(v) => next_keywords.push((Some(name.clone()), v)),
+                        Err(msg) => return Ok(Err(msg)),
+                    }
+                }
+                (next_args, next_keywords)
             }
-            if let ExprType::Name(n) = e
-                && let Some(sub) = substitution.get(n.id.as_str())
-            {
-                *e = sub.clone();
-            }
-        });
-        let site_names: Vec<&str> = substitution
-            .values()
-            .filter_map(|v| match v {
-                ExprType::Name(n) => Some(n.id.as_str()),
-                _ => None,
-            })
-            .collect();
-        let mut free: Vec<String> = Vec::new();
-        crate::ast::tree::visit::walk_expr(&m, &mut |e| {
-            if let ExprType::Name(n) = e
-                && !n.id.starts_with("__rython_exc_arg")
-                && !site_names.contains(&n.id.as_str())
-                && !free.contains(&n.id)
-            {
-                free.push(n.id.clone());
-            }
-        });
-        for name in free {
-            let at_def = format!("{:?}", owner_scope.module_get(&name));
-            let at_site = format!("{:?}", symbols.get(&name));
-            let local = options.name_types.contains_key(&name)
-                && owner_scope.module_get(&name).is_some();
-            if at_def != at_site || local {
-                return site_error(format!(
-                    "rython: `{}.__init__`'s message reads `{}`, which at this raise \
-                     site is not the binding the `__init__` sees (a local, or another \
-                     module's global of the same name): rython renders the message at \
-                     the raise site and refuses to silently read the wrong one; pass \
-                     the value as an argument, or store it as a field",
-                    cls.name, name
-                ));
-            }
-        }
-        let runs_code = crate::ast::tree::visit::any_expr_for(
-            &m,
-            crate::ast::tree::visit::Descend::All,
-            |e| matches!(e, ExprType::Call(_)),
+            // `super().__init__(*args)` names a `*args` this initializer
+            // does not have: refused by the classifier.
+            SuperMessage::Forwarded { .. } => unreachable!("forwarding needs a vararg"),
+        };
+    let (msg, attrs_after_super) = match model_init_level(
+        st,
+        cls,
+        rest,
+        next_args,
+        next_keywords,
+        attrs_at_super,
+        level + 1,
+        Some(&owner.name),
+    )? {
+        Ok(out) => out,
+        Err(msg) => return Ok(Err(msg)),
+    };
+    // The stores after the super call overwrite what the base stored.
+    Ok(Ok((msg, overlay(attrs_after_super, stored(&fields_after_super)))))
+}
+
+/// A `super().__init__` argument rewritten from the initializer's
+/// namespace to the site's, evaluated once: a lambda or a comprehension
+/// is refused (bindings of its own the rewrite cannot model);
+/// `self.<field>` means the value the field held at the super call (a
+/// store of this initializer before the call, or of a subclass before
+/// its own); every parameter means its substitution — one pre-order pass
+/// through the mutable visitor (a replaced node is a leaf, never
+/// rewritten again, so a caller name that matches another parameter
+/// binds ONCE — Devin review on #330); every other name the argument
+/// reads must be bound at the site as the `__init__` sees it.
+fn rewrite_super_arg(
+    st: &Construction,
+    owner: &crate::ClassDef,
+    owner_scope: &SymbolTableScopes,
+    m0: &crate::ExprType,
+    params: &[&str],
+    substitution: &std::collections::HashMap<&str, crate::ExprType>,
+    attrs_at_super: &[Attr],
+) -> Modeled<crate::ExprType> {
+    use crate::ExprType;
+    use crate::ast::tree::visit::{Descend, any_expr_for, is_self, walk_expr, walk_expr_mut};
+    macro_rules! site {
+        ($($arg:tt)*) => { return Ok(Err(format!($($arg)*))) };
+    }
+    if any_expr_for(m0, Descend::All, |e| {
+        matches!(
+            e,
+            ExprType::Lambda(_)
+                | ExprType::ListComp(_)
+                | ExprType::SetComp(_)
+                | ExprType::DictComp(_)
+                | ExprType::GeneratorExp(_)
+        )
+    }) {
+        site!(
+            "rython: `{}.__init__`'s message holds a lambda or a comprehension, whose own \
+             bindings the raise-site rewrite cannot model; compute the message in a local \
+             first",
+            owner.name
         );
-        let tokens = m.to_rust(ctx.clone(), msg_options.clone(), symbols.clone())?;
-        if runs_code {
-            let ident = proc_macro2::Ident::new(
-                &format!("__rython_exc_m{i}"),
-                proc_macro2::Span::call_site(),
+    }
+    // The names the argument reads from the initializer's own scope —
+    // neither a parameter nor a modeled `self.<field>` read; a bare
+    // `self` (the exception under construction) or a field no store
+    // before the super call set is refused.
+    let mut free: Vec<String> = Vec::new();
+    let mut self_attr_reads = 0usize;
+    let mut self_reads = 0usize;
+    let mut bad_field: Option<String> = None;
+    walk_expr(m0, &mut |e| match e {
+        ExprType::Attribute(attr) if is_self(&attr.value) => {
+            self_attr_reads += 1;
+            if !attrs_at_super.iter().any(|(f, ..)| *f == attr.attr) && bad_field.is_none() {
+                bad_field = Some(attr.attr.clone());
+            }
+        }
+        ExprType::Name(n) if n.id == "self" => self_reads += 1,
+        ExprType::Name(n) if !params.contains(&n.id.as_str()) && !free.contains(&n.id) => {
+            free.push(n.id.clone());
+        }
+        _ => {}
+    });
+    if let Some(f) = bad_field {
+        site!(
+            "rython: `{}.__init__`'s message reads `self.{f}`, which no `self.{f} = <param>` \
+             store before the `super().__init__` call sets: rython models the message from \
+             the stored fields and refuses to guess the value; store the field first, or \
+             pass the value as an argument",
+            owner.name
+        );
+    }
+    if self_reads > self_attr_reads {
+        site!(
+            "rython: `{}.__init__`'s message reads `self` (the exception under \
+             construction), which the raise-site rewrite cannot model; pass the value as \
+             an argument",
+            owner.name
+        );
+    }
+    for name in free {
+        let at_def = format!("{:?}", owner_scope.module_get(&name));
+        let at_site = format!("{:?}", st.symbols.get(&name));
+        let local = st.options.name_types.contains_key(&name)
+            && owner_scope.module_get(&name).is_some();
+        if at_def != at_site || local {
+            site!(
+                "rython: `{}.__init__`'s message reads `{}`, which at this raise site is not \
+                 the binding the `__init__` sees (a local, or another module's global of \
+                 the same name): rython renders the message at the raise site and refuses \
+                 to silently read the wrong one; pass the value as an argument, or store it \
+                 as a field",
+                owner.name,
+                name
             );
-            prelude.push(quote::quote!(let #ident = #tokens;));
-            arg_tokens.push(quote::quote!(#ident));
-        } else {
-            arg_tokens.push(tokens);
         }
     }
-    // `str(e)`: the one argument, empty for none, the args tuple's repr
-    // for two or more; `repr(e)` records every argument's repr.
-    let msg = match arg_tokens.as_slice() {
+    let mut m = m0.clone();
+    walk_expr_mut(&mut m, &mut |e| {
+        if let ExprType::Attribute(attr) = e
+            && is_self(&attr.value)
+            && let Some((_, value, ..)) = attrs_at_super.iter().find(|(f, ..)| *f == attr.attr)
+        {
+            *e = value.clone();
+        } else if let ExprType::Name(n) = e
+            && let Some(sub) = substitution.get(n.id.as_str())
+        {
+            *e = sub.clone();
+        }
+    });
+    Ok(Ok(m))
+}
+
+/// A level whose `__init__` is variadic (`*args` / `**kwargs`): nothing
+/// binds by name, so the body may only forward to
+/// `super().__init__(*args)` (a docstring and `pass` aside) — the named
+/// parameters before `*args` take the first arguments (evaluated once,
+/// dropped), the forwarded slice is the rest, handed to the next
+/// initializer of the chain; a keyword is forwarded with `**kwargs`,
+/// swallowed by a `**kwargs` the call does not forward, and a TypeError
+/// (loud) without one.
+#[allow(clippy::too_many_arguments)]
+fn model_variadic_level(
+    st: &mut Construction,
+    cls: &crate::ClassDef,
+    owner: &crate::ClassDef,
+    init: &crate::FunctionDef,
+    rest: &[(crate::ClassDef, SymbolTableScopes)],
+    args: Vec<crate::ExprType>,
+    keywords: Vec<(Option<String>, crate::ExprType)>,
+    attrs_in: Vec<Attr>,
+    level: usize,
+) -> Modeled<(Vec<crate::ExprType>, Vec<Attr>)> {
+    use crate::ExprType;
+    macro_rules! site {
+        ($($arg:tt)*) => { return Ok(Err(format!($($arg)*))) };
+    }
+    let vararg = init.args.vararg.as_ref().map(|a| a.arg.as_str());
+    let kwarg = init.args.kwarg.as_ref().map(|a| a.arg.as_str());
+    let named: Vec<&str> = init
+        .args
+        .posonlyargs
+        .iter()
+        .chain(init.args.args.iter())
+        .skip(1)
+        .map(|a| a.arg.as_str())
+        .collect();
+    if !init.args.kwonlyargs.is_empty() {
+        site!(
+            "rython: `{}.__init__` mixes `*args` with keyword-only parameters, which the \
+             forwarding model does not bind; name the parameters, or drop `*args`",
+            owner.name
+        );
+    }
+    let model = match classify_exception_init(owner, &init.body, &named, vararg, kwarg) {
+        Ok(model) => model,
+        Err(msg) => return Ok(Err(msg)),
+    };
+    if !model.fields.is_empty() {
+        site!(
+            "rython: `{}.__init__` stores a named parameter as a field while forwarding \
+             `*args`, which the forwarding model does not bind; name every parameter, or \
+             drop `*args`",
+            owner.name
+        );
+    }
+    if let Some(SuperMessage::Args { .. } | SuperMessage::Empty) = model.super_init {
+        site!(
+            "rython: `{}.__init__` takes `*args` but does not forward them to \
+             `super().__init__(*args)`: the message would not be the raise's argument; \
+             forward the arguments, or name the parameters",
+            owner.name
+        );
+    }
+    if kwarg.is_none() && !keywords.is_empty() {
+        site!(
+            "rython: `{}()` takes no keyword arguments (BaseException.__init__ accepts none)",
+            cls.name
+        );
+    }
+    if args.iter().any(|a| matches!(a, ExprType::Starred(_))) {
+        site!(
+            "rython: `raise {}(*...)`: a starred argument to an exception constructor is \
+             not modeled; pass the arguments explicitly",
+            cls.name
+        );
+    }
+    if args.len() < named.len() {
+        site!(
+            "rython: `{}()` missing a required argument: '{}'",
+            owner.name,
+            named[args.len()]
+        );
+    }
+    if level == 0 {
+        st.call_positional = args.clone();
+    }
+    if model.super_init.is_none() {
+        // No super call: `BaseException.__new__` records the raise's
+        // positional arguments (the named ones included) as `args`; a
+        // base's forwarded arguments are evaluated once and dropped.
+        let msg = match st.call_positional.len() {
+            0 => Vec::new(),
+            1 => vec![st.call_positional[0].clone()],
+            n => site!(
+                "rython: `{}.__init__` never calls `super().__init__`, so `str(e)` is the \
+                 repr of the {} positional arguments as a tuple, which rython's \
+                 one-message exception model does not reproduce; call \
+                 `super().__init__(<message>)`",
+                owner.name,
+                n
+            ),
+        };
+        if level > 0 {
+            for a in args.iter().chain(keywords.iter().map(|(_, v)| v)) {
+                if st.may_run_code(a) {
+                    let tokens =
+                        a.clone().to_rust(st.ctx.clone(), st.options.clone(), st.symbols.clone())?;
+                    st.prelude.push(quote::quote!(let _ = #tokens;));
+                }
+            }
+        }
+        return Ok(Ok((msg, attrs_in)));
+    }
+    // The named parameters' arguments are evaluated once, in order, and
+    // dropped (the body forwards only `*args`).
+    for a in &args[..named.len()] {
+        if matches!(a, ExprType::Constant(_)) {
+            continue;
+        }
+        let tokens = a.clone().to_rust(st.ctx.clone(), st.options.clone(), st.symbols.clone())?;
+        st.prelude.push(quote::quote!(let _ = #tokens;));
+    }
+    let forwarded: Vec<ExprType> = args[named.len()..].to_vec();
+    let forwards_kwargs = matches!(model.super_init, Some(SuperMessage::Forwarded { kwargs: true }));
+    let mut next_keywords = Vec::new();
+    for (name, value) in keywords {
+        if name.is_none() {
+            site!(
+                "rython: `raise {}(**...)`: a keyword splat to an exception constructor is \
+                 not modeled; pass the arguments explicitly",
+                cls.name
+            );
+        }
+        if forwards_kwargs {
+            next_keywords.push((name, value));
+        } else if !matches!(value, ExprType::Constant(_)) {
+            // Swallowed by `**kwargs`: evaluated once, dropped.
+            let tokens =
+                value.to_rust(st.ctx.clone(), st.options.clone(), st.symbols.clone())?;
+            st.prelude.push(quote::quote!(let _ = #tokens;));
+        }
+    }
+    model_init_level(st, cls, rest, forwarded, next_keywords, attrs_in, level + 1, Some(&owner.name))
+}
+
+/// The construction's tokens from what `BaseException.__init__` receives
+/// and the stored attrs: each message part evaluated once (a temporary
+/// unless it is a constant or a name — a bare name captured when a later
+/// part runs code), `str(e)` as CPython sets it (the one argument, empty
+/// for none, the args tuple's repr for two or more), `repr(e)` recording
+/// every part's repr, the attrs boxed, the ancestor chain attached.
+fn finish_construction(
+    mut st: Construction,
+    cls: &crate::ClassDef,
+    class_symbols: &SymbolTableScopes,
+    msg_exprs: Vec<crate::ExprType>,
+    attrs: Vec<Attr>,
+) -> Result<proc_macro2::TokenStream, Box<dyn std::error::Error>> {
+    use crate::ExprType;
+    let mut parts: Vec<ExprType> = Vec::new();
+    for (i, m) in msg_exprs.iter().enumerate() {
+        let captured = st.captures(&msg_exprs, i);
+        if !captured && !st.may_run_code(m) {
+            parts.push(m.clone());
+        } else {
+            parts.push(st.bind_temp(exc_temp(0, "m", i), m, captured)?);
+        }
+    }
+    let mut part_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
+    for p in &parts {
+        part_tokens.push(p.clone().to_rust(st.ctx.clone(), st.options.clone(), st.symbols.clone())?);
+    }
+    let msg = match parts.as_slice() {
         [] => quote::quote!(String::new()),
-        [one] => quote::quote!(format!("{}", #one)),
+        [one] => {
+            // The display wrapping the message builder applies (a class
+            // instance, an Option, a boxed value — a temporary's type is
+            // recorded in the options).
+            let m = message_arg(one, st.ctx.clone(), st.options.clone(), st.symbols.clone())?;
+            quote::quote!(format!("{}", #m))
+        }
         many => {
             let fmt = format!("({})", vec!["{}"; many.len()].join(", "));
-            quote::quote!(format!(#fmt, #(stdpython::PyRepr::py_repr(&(#many))),*))
+            quote::quote!(format!(#fmt, #(stdpython::PyRepr::py_repr(&(#part_tokens))),*))
         }
     };
-    let args_repr = quote::quote!(vec![#(stdpython::PyRepr::py_repr(&(#arg_tokens))),*]);
-    // The attrs: each field's substitution, boxed.
+    let args_repr = quote::quote!(vec![#(stdpython::PyRepr::py_repr(&(#part_tokens))),*]);
     let kind = &cls.name;
     let mut attr_pairs: Vec<proc_macro2::TokenStream> = Vec::new();
-    for (f, param) in &fields {
-        let value = &substitution[param];
+    for (f, value, owner, param) in &attrs {
         // The attrs are BOXED values: a class instance (`raise
         // EmptyPoolError(self, ...)` storing `self.pool = pool` —
         // urllib3's connectionpool) has no box, and dropping the field
         // would make `e.pool` a silent AttributeError; refused at the
-        // site instead.
-        // A temporary's type lives in msg_options (the raise-site
-        // binding), so an evaluated construction or a captured name is
-        // seen too (Devin review on #330).
+        // site instead. A temporary's type lives in the options (the
+        // site binding), so an evaluated construction or a captured name
+        // is seen too (Devin review on #330).
         let instance = crate::ast::tree::visit::is_self(value)
             || matches!(
-                crate::infer_type(Some(&ctx), value, &msg_options, &symbols),
+                crate::infer_type(Some(&st.ctx), value, &st.options, &st.symbols),
                 crate::TypeInfo::Class(_)
             );
         if instance {
-            return site_error(format!(
-                "rython: `{}.__init__` stores its parameter `{}` as `self.{}`, and the \
-                 argument here is a class instance, which an exception's boxed attrs \
+            let msg = format!(
+                "rython: `{owner}.__init__` stores its parameter `{param}` as `self.{f}`, and \
+                 the argument here is a class instance, which an exception's boxed attrs \
                  cannot hold; rython refuses to silently drop the field. Store a plain \
-                 value (a name, an id) instead",
-                cls.name, param, f
-            ));
+                 value (a name, an id) instead"
+            );
+            return Ok(quote::quote!(compile_error!(#msg)));
         }
         let boxed = if crate::is_none_expr(value) {
             quote::quote!(stdpython :: PyValue :: None_)
         } else {
-            let a = value.clone().to_rust(ctx.clone(), msg_options.clone(), symbols.clone())?;
+            let a = value.clone().to_rust(st.ctx.clone(), st.options.clone(), st.symbols.clone())?;
             // A temporary is read by the message too: clone it into the box.
-            if matches!(value, ExprType::Name(n) if n.id.starts_with("__rython_exc_arg")) {
+            if is_exc_temp(value) {
                 quote::quote!(stdpython :: PyValue :: from ((#a).clone()))
             } else {
                 quote::quote!(stdpython :: PyValue :: from (#a))
@@ -1711,18 +1921,75 @@ pub(crate) fn exception_class_raise(
         };
         attr_pairs.push(quote::quote!((#f . to_string (), #boxed)));
     }
-    let ancestor_tokens = exception_ancestor_tokens(cls, class_symbols, &options)?;
+    let ancestor_tokens = exception_ancestor_tokens(cls, class_symbols, &st.options)?;
     let construct = quote::quote! {
         stdpython :: PyException :: new_with_attrs_and_ancestors (
             #kind , #msg , vec ! [#(#attr_pairs),*] ,
             vec ! [#(#ancestor_tokens),*]
         ) . with_args_repr (#args_repr)
     };
-    if prelude.is_empty() {
-        Ok(Some(construct))
+    Ok(if st.prelude.is_empty() {
+        construct
     } else {
-        Ok(Some(quote::quote!({ #(#prelude)* #construct })))
+        let prelude = st.prelude;
+        quote::quote!({ #(#prelude)* #construct })
+    })
+}
+
+/// A construction of an in-crate exception class through its
+/// initializer CHAIN: the first `__init__` up the MRO runs with the
+/// call's arguments bound the way CPython binds a call (positionals in
+/// order, keywords by name, a missing parameter to its constant
+/// default); its `super().__init__(...)` runs the NEXT `__init__` of the
+/// chain the same way, down to `BaseException.__init__`, whose arguments
+/// are `str(e)` and `repr(e)`; the `self.<field> = <param>` stores of
+/// every level, in execution order, are the attrs. The model is exactly
+/// those stores and super calls; any other statement is a
+/// `compile_error!` at the site. Every evaluated expression is bound
+/// once, in evaluation order (a bare name captured before a later
+/// expression that runs code). None when `cls` is not an exception class
+/// of the crate.
+pub(crate) fn exception_class_raise(
+    cls: &crate::ClassDef,
+    call: &crate::Call,
+    ctx: crate::CodeGenContext,
+    options: crate::PythonOptions,
+    symbols: crate::SymbolTableScopes,
+    class_symbols: &crate::SymbolTableScopes,
+) -> Result<Option<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
+    if !crate::is_exception_class(cls) {
+        return Ok(None);
     }
+    // The chain: the MRO's crate classes, `cls` first (Python's MRO: a
+    // `class Child(Base): pass` constructs through Base's `__init__` —
+    // the kind stays Child and the ancestors are Child's; Devin review
+    // on #330).
+    let chain: Vec<(crate::ClassDef, SymbolTableScopes)> = exception_mro(cls, class_symbols, &options)?
+        .into_iter()
+        .filter_map(|(_, def)| def)
+        .collect();
+    let mut st = Construction {
+        ctx,
+        options,
+        symbols,
+        prelude: Vec::new(),
+        call_positional: call.args.clone(),
+        runs_code: false,
+    };
+    st.runs_code = call.args.iter().any(|a| st.may_run_code(a))
+        || call.keywords.iter().any(|k| st.may_run_code(&k.value))
+        || construction_runs_code(&chain);
+    let keywords: Vec<(Option<String>, crate::ExprType)> =
+        call.keywords.iter().map(|k| (k.arg.clone(), k.value.clone())).collect();
+    let (msg_exprs, attrs) =
+        match model_init_level(&mut st, cls, &chain, call.args.clone(), keywords, Vec::new(), 0, None)? {
+            Ok(out) => out,
+            Err(msg) => return Ok(Some(quote::quote!(compile_error!(#msg)))),
+        };
+    // What `BaseException.__new__` records as `args` when no initializer
+    // calls super is the raise's own arguments — as bound at the site
+    // (a level-0 temporary stands for an evaluated one).
+    Ok(Some(finish_construction(st, cls, class_symbols, msg_exprs, attrs)?))
 }
 
 /// A modeled exception field's type: the exception class's __init__
@@ -1735,57 +2002,103 @@ pub(crate) fn exception_field_type(
     symbols: &crate::SymbolTableScopes,
     options: &crate::PythonOptions,
 ) -> Result<Option<crate::TypeInfo>, Box<dyn std::error::Error>> {
-    use crate::ast::tree::visit::{Descend, Flow, is_self, walk_stmts};
     // Walk the class's MRO: the field may be defined on a BASE (an
     // `except BankError as e` catching an InsufficientFunds whose
     // __init__ stores the field — Devin review on #328), local or
     // imported, named directly or through an alias, on any branch of a
     // multiple inheritance — the one linearization, each hop's
     // annotation resolved in its own scope (Devin review on #330).
-    for (_, def) in exception_mro(cls, symbols, options)? {
-        let Some((c, c_scope)) = def else { continue };
-        let Some(init) = c.init_method() else { continue };
-        // The LAST `self.<field> = <param>` store in the initializer is
-        // the one the construction records — the same last-store-wins
-        // `classify_exception_init` models, over the same statements
-        // (nested control flow of the body included), so the read's
-        // type is the stored value's (Devin review on #330).
-        let mut last: Option<&str> = None;
-        walk_stmts(&init.body, Descend::OwnScope, &mut |stmt| {
-            if let crate::StatementType::Assign(a) = &stmt.statement
-                && let [ExprType::Attribute(attr)] = a.targets.as_slice()
-                && attr.attr == field
-                && is_self(&attr.value)
-                && let ExprType::Name(v) = &a.value
-            {
-                last = Some(v.id.as_str());
-            }
-            Flow::Continue
-        });
-        let Some(stored) = last else { continue };
-        // The param's annotation types the field — a positional-only,
-        // positional, or keyword-only parameter.
-        let Some(param) = init
-            .args
-            .posonlyargs
-            .iter()
-            .chain(init.args.args.iter())
-            .chain(init.args.kwonlyargs.iter())
-            .find(|p| p.arg == stored)
-        else {
-            return Ok(None);
-        };
-        if let Some(ann) = param.annotation.as_ref()
-            && let Some(t) = crate::resolve_alias_typeinfo(ann, &c_scope, options)
-        {
-            return Ok(Some(t));
-        }
-        // An unannotated param: no type — the reader refuses loudly
-        // rather than guessing (an Int guess made a str field's read a
-        // false AttributeError).
-        return Ok(Some(crate::TypeInfo::PyObject));
+    let chain: Vec<(crate::ClassDef, SymbolTableScopes)> = exception_mro(cls, symbols, options)?
+        .into_iter()
+        .filter_map(|(_, def)| def)
+        .collect();
+    let Some((param, init, c_scope)) = chain_field_store(&chain, field) else {
+        return Ok(None);
+    };
+    // The param's annotation types the field — a positional-only,
+    // positional, or keyword-only parameter.
+    let Some(param) = init
+        .args
+        .posonlyargs
+        .iter()
+        .chain(init.args.args.iter())
+        .chain(init.args.kwonlyargs.iter())
+        .find(|p| p.arg == param)
+    else {
+        return Ok(None);
+    };
+    if let Some(ann) = param.annotation.as_ref()
+        && let Some(t) = crate::resolve_alias_typeinfo(ann, c_scope, options)
+    {
+        return Ok(Some(t));
     }
-    Ok(None)
+    // An unannotated param: no type — the reader refuses loudly rather
+    // than guessing (an Int guess made a str field's read a false
+    // AttributeError).
+    Ok(Some(crate::TypeInfo::PyObject))
+}
+
+/// The store that gives `field` its final value over the initializer
+/// chain, in the chain's EXECUTION order — the order the construction
+/// records the attrs in (`model_init_level`): the first `__init__` up
+/// the MRO runs; its stores AFTER its `super().__init__` win, else the
+/// base's `__init__` (which ran at that call) decides the same way, else
+/// this initializer's stores before the call; with no super call the
+/// chain ends here. `(the parameter stored, the initializer, its scope)`
+/// (Devin review on #330: the first store's annotation typed a field the
+/// last store, or the base's, had set to another type).
+fn chain_field_store<'a>(
+    chain: &'a [(crate::ClassDef, SymbolTableScopes)],
+    field: &str,
+) -> Option<(&'a str, &'a crate::FunctionDef, &'a SymbolTableScopes)> {
+    let pos = chain.iter().position(|(c, _)| c.init_method().is_some())?;
+    let (c, c_scope) = &chain[pos];
+    let init = c.init_method()?;
+    let params: Vec<&str> = init
+        .args
+        .posonlyargs
+        .iter()
+        .chain(init.args.args.iter())
+        .skip(1)
+        .chain(init.args.kwonlyargs.iter())
+        .map(|a| a.arg.as_str())
+        .collect();
+    let vararg = init.args.vararg.as_ref().map(|a| a.arg.as_str());
+    let kwarg = init.args.kwarg.as_ref().map(|a| a.arg.as_str());
+    let find = |list: &[(String, &'a str)]| list.iter().find(|(f, _)| f == field).map(|(_, p)| *p);
+    match classify_exception_init(c, &init.body, &params, vararg, kwarg) {
+        Ok(model) => {
+            if let Some(p) = find(&model.fields_after_super) {
+                return Some((p, init, c_scope));
+            }
+            if model.super_init.is_some() {
+                if let Some(found) = chain_field_store(&chain[pos + 1..], field) {
+                    return Some(found);
+                }
+                find(&model.fields_at_super).map(|p| (p, init, c_scope))
+            } else {
+                find(&model.fields).map(|p| (p, init, c_scope))
+            }
+        }
+        // An unmodeled body (the construction is refused at every site):
+        // the last store of the field, for the read's type.
+        Err(_) => {
+            use crate::ast::tree::visit::{Descend, Flow, is_self, walk_stmts};
+            let mut last: Option<&'a str> = None;
+            walk_stmts(&init.body, Descend::OwnScope, &mut |stmt| {
+                if let crate::StatementType::Assign(a) = &stmt.statement
+                    && let [ExprType::Attribute(attr)] = a.targets.as_slice()
+                    && attr.attr == field
+                    && is_self(&attr.value)
+                    && let ExprType::Name(v) = &a.value
+                {
+                    last = Some(v.id.as_str());
+                }
+                Flow::Continue
+            });
+            last.map(|p| (p, init, c_scope))
+        }
+    }
 }
 
 /// A BUILTIN exception's method resolution order, from the live

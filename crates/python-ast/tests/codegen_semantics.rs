@@ -15311,17 +15311,17 @@ fn exception_message_args_wrap_class_instances_in_py_display() {
     // The construction runs code, so it is evaluated once into a
     // temporary the message (py_display) and the recorded repr read.
     assert!(
-        out.contains("let __rython_exc_a0 = { Pool :: new (\"x\") ? } ;"),
+        out.contains("let __rython_exc_m0 = { Pool :: new (\"x\") ? } ;"),
         "the argument is evaluated once: {}",
         out
     );
     assert!(
-        out.contains("py_display (& (__rython_exc_a0))"),
+        out.contains("py_display (& (__rython_exc_m0))"),
         "the message arg must wrap the class instance: {}",
         out
     );
     assert!(
-        out.contains("format ! (\"({}, {})\" , stdpython :: PyRepr :: py_repr (& (__rython_exc_a0)) , stdpython :: PyRepr :: py_repr (& (\"closed.\")))"),
+        out.contains("format ! (\"({}, {})\" , stdpython :: PyRepr :: py_repr (& (__rython_exc_m0)) , stdpython :: PyRepr :: py_repr (& (\"closed.\")))"),
         "generated: {}",
         out
     );
@@ -20331,6 +20331,215 @@ fn an_exception_fields_type_is_its_last_stores_parameter() {
     assert!(out.contains("fn f () -> Result < String"), "generated: {}", out);
     assert!(out.contains("attr_string (\"v\")"), "generated: {}", out);
     assert!(!out.contains("attr_int"), "generated: {}", out);
+}
+
+#[test]
+fn a_user_defined_base_initializer_runs_at_the_super_call() {
+    // `Child.__init__` calls `super().__init__(code + 1, text.upper())`
+    // and `Base.__init__` (user-defined) stores `self.code` and formats
+    // the message: the base's initializer RUNS at the super call with
+    // those arguments bound to its parameters — its message is `str(e)`,
+    // its store overwrites the child's earlier `self.code`, the child's
+    // `self.text` survives; a keyword through super binds to the base's
+    // parameter; a class without its own `__init__` constructs through
+    // the chain. Every evaluated argument of every level binds once
+    // (`text.upper()` → the level-1 temporary) (Devin review on #330:
+    // the super call was taken for BaseException's, dropping the body).
+    let out = compile(
+        concat!(
+            "class Base(Exception):\n",
+            "    def __init__(self, code: int, text: str) -> None:\n",
+            "        self.code = code\n",
+            "        super().__init__(f\"[{code}] {text}\")\n",
+            "\n",
+            "class Child(Base):\n",
+            "    def __init__(self, text: str, code: int) -> None:\n",
+            "        self.code = code\n",
+            "        self.text = text\n",
+            "        super().__init__(code + 1, text.upper())\n",
+            "\n",
+            "class Leaf(Child):\n",
+            "    pass\n",
+            "\n",
+            "class Named(Base):\n",
+            "    def __init__(self, text: str) -> None:\n",
+            "        super().__init__(text=text, code=3)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Child(\"boom\", 6)\n",
+            "\n",
+            "def g() -> None:\n",
+            "    raise Leaf(\"leaf\", 1)\n",
+            "\n",
+            "def h() -> None:\n",
+            "    raise Named(\"kw\")\n",
+        ),
+        "raise_chain.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("let __rython_exc_l1_arg1 = \"boom\" . upper ()"), "generated: {}", out);
+    assert!(
+        out.contains("format ! (\"[{}] {}\" , py_display (& (((6) as i64) . py_add (& ((1) as i64)))) , py_display (& (__rython_exc_l1_arg1)))"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("(\"code\" . to_string () , stdpython :: PyValue :: from (((6) as i64) . py_add (& ((1) as i64)))) , (\"text\" . to_string () , stdpython :: PyValue :: from (\"boom\"))"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("(\"Leaf\" , format ! (\"{}\" , format ! (\"[{}] {}\""), "generated: {}", out);
+    assert!(
+        out.contains("(\"Named\" , format ! (\"{}\" , format ! (\"[{}] {}\" , py_display (& (3)) , py_display (& (\"kw\")))) , vec ! [(\"code\" . to_string () , stdpython :: PyValue :: from (3))]"),
+        "generated: {}",
+        out
+    );
+    // A keyword the chain hands to BaseException.__init__ is still loud.
+    let out = compile(
+        concat!(
+            "class E(Exception):\n",
+            "    def __init__(self, text: str) -> None:\n",
+            "        super().__init__(text=text)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise E(\"x\")\n",
+        ),
+        "raise_chain_kw_base.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("BaseException.__init__ does not accept"), "generated: {}", out);
+    // A base initializer the model does not cover is loud at the site.
+    let out = compile(
+        concat!(
+            "class Base(Exception):\n",
+            "    def __init__(self, code: int) -> None:\n",
+            "        print(code)\n",
+            "        super().__init__(code)\n",
+            "\n",
+            "class Child(Base):\n",
+            "    def __init__(self, code: int) -> None:\n",
+            "        super().__init__(code + 1)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Child(1)\n",
+        ),
+        "raise_chain_unmodeled_base.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("`Base.__init__` (line 3) has a statement beyond"), "generated: {}", out);
+}
+
+#[test]
+fn a_bare_name_is_captured_before_an_initializer_message_that_runs_code() {
+    // `raise Ticket(counter)` where `Ticket.__init__`'s message calls
+    // `bump()`, which rebinds the global: `n` is bound at the call, so
+    // the field records the value BEFORE the bump — the bare name is
+    // captured first, in source order (Devin review on #330).
+    let out = compile(
+        concat!(
+            "counter = 0\n",
+            "\n",
+            "def bump() -> int:\n",
+            "    global counter\n",
+            "    counter += 1\n",
+            "    return counter\n",
+            "\n",
+            "class Ticket(Exception):\n",
+            "    def __init__(self, n: int) -> None:\n",
+            "        super().__init__(f\"t{bump()}\")\n",
+            "        self.n = n\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Ticket(counter)\n",
+        ),
+        "raise_capture_before_message.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("let __rython_exc_arg0 = (stdpython :: py_global_read (& counter)) . clone () ; let __rython_exc_m0 = format ! (\"t{}\" , py_display (& (bump () ?)))"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("(\"n\" . to_string () , stdpython :: PyValue :: from ((__rython_exc_arg0) . clone ()))"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn an_effectful_exception_argument_binds_once_in_the_generic_construction() {
+    // A class with no `__init__` to model: a property read (a getter
+    // call), a subscript, and a walrus argument each bind ONCE, read by
+    // `str(e)` and by the recorded repr — not rendered twice (Devin
+    // review on #330: only a call bound once, so a property getter ran
+    // twice). A plain field read and an f-string of pure parts stay in
+    // place.
+    let out = compile(
+        concat!(
+            "class Meter:\n",
+            "    def __init__(self, base: int) -> None:\n",
+            "        self.base = base\n",
+            "    @property\n",
+            "    def value(self) -> int:\n",
+            "        return self.base + 1\n",
+            "\n",
+            "class Plain(Exception):\n",
+            "    pass\n",
+            "\n",
+            "def f(m: Meter, xs: list[int]) -> None:\n",
+            "    raise Plain(m.value, xs[0], (w := 5), m.base, f\"{m.base}!\")\n",
+        ),
+        "raise_generic_once.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("let __rython_exc_m0 = m . value () ?"), "generated: {}", out);
+    assert!(out.contains("let __rython_exc_m1 = "), "generated: {}", out);
+    assert!(out.contains("let __rython_exc_m2 = "), "generated: {}", out);
+    assert!(!out.contains("__rython_exc_m3"), "generated: {}", out);
+    assert_eq!(out.matches("m . value ()").count(), 1, "generated: {}", out);
+    assert_eq!(out.matches("w = 5").count(), 1, "generated: {}", out);
+}
+
+#[test]
+fn an_exception_fields_type_follows_the_chains_execution_order() {
+    // `Typed.__init__` stores `self.v = n` (int) before its super call
+    // and `Base.__init__` stores `self.v = s` (str): the base's store
+    // runs later, so the read is a str; a store AFTER the child's super
+    // call wins over the base's (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Base(Exception):\n",
+            "    def __init__(self, s: str) -> None:\n",
+            "        self.v = s\n",
+            "        self.w = s\n",
+            "        super().__init__(s)\n",
+            "\n",
+            "class Typed(Base):\n",
+            "    def __init__(self, n: int, s: str) -> None:\n",
+            "        self.v = n\n",
+            "        super().__init__(s)\n",
+            "        self.w = n\n",
+            "\n",
+            "def f() -> str:\n",
+            "    try:\n",
+            "        raise Typed(3, \"t\")\n",
+            "    except Typed as e:\n",
+            "        return e.v\n",
+            "    return \"\"\n",
+            "\n",
+            "def g() -> int:\n",
+            "    try:\n",
+            "        raise Typed(3, \"t\")\n",
+            "    except Typed as e:\n",
+            "        return e.w\n",
+            "    return 0\n",
+        ),
+        "raise_chain_field_type.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("attr_string (\"v\")"), "generated: {}", out);
+    assert!(out.contains("attr_i64 (\"w\")"), "generated: {}", out);
 }
 
 #[test]
