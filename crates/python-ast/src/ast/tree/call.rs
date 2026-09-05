@@ -2567,14 +2567,16 @@ impl<'a> CodeGen for Call {
                                 .to_string()
                                 .into());
                         };
+                        // A class resolves locally or through its
+                        // import, with its defining module's scope (the
+                        // one construction-class resolver — Devin review
+                        // on #330).
+                        let resolve = |name: &str| {
+                            resolve_construction_class(name, &symbols, &options)
+                        };
                         let is_exc = |name: &str| -> bool {
                             crate::ast::tree::raise_stmt::is_exception_class_name(name)
-                                || match symbols.get(name) {
-                                    Some(SymbolTableNode::ClassDef(cls)) => {
-                                        crate::is_exception_class(cls)
-                                    }
-                                    _ => false,
-                                }
+                                || resolve(name).is_some_and(|(c, _)| crate::is_exception_class(&c))
                         };
                         if !is_exc(&c1.id) || !is_exc(&c2.id) {
                             return Err(format!(
@@ -2585,51 +2587,52 @@ impl<'a> CodeGen for Call {
                             )
                             .into());
                         }
-                        // Walk C1's base chain through the symbol table
-                        // down to the first BUILTIN name, then ask the
-                        // interpreter's own MRO for that builtin (the one
-                        // authority the runtime table is generated from):
-                        // True when C2 is C1, a user ancestor, or in the
-                        // builtin's MRO. C2's canonical name (an alias —
+                        // C1's chain is C1 then its ancestors — the one
+                        // ancestor walk the raise attaches (every user
+                        // base, then the first builtin); the builtin's
+                        // own MRO comes from the interpreter (the one
+                        // authority the runtime table is generated from).
+                        // True when C2 is in the chain or in that MRO.
+                        // C2's canonical name (an alias —
                         // `EnvironmentError` IS `OSError`) is its MRO head.
                         let mro = crate::ast::tree::raise_stmt::builtin_exception_mro;
                         let target: &str = mro(&c2.id)?
                             .and_then(|m| m.first())
                             .map(|s| s.as_str())
                             .unwrap_or(&c2.id);
-                        let mut base: Option<&str> = Some(&c1.id);
-                        let mut found = false;
-                        let mut guard = 0;
-                        while let Some(cur) = base {
-                            guard += 1;
-                            if guard > 64 {
-                                break;
-                            }
-                            if cur == c2.id || cur == target {
-                                found = true;
-                                break;
-                            }
-                            base = match symbols.get(cur) {
-                                Some(SymbolTableNode::ClassDef(cls)) => {
-                                    cls.bases.iter().find_map(|b| match b {
-                                        ExprType::Name(n) if is_exc(&n.id) => Some(n.id.as_str()),
-                                        _ => None,
-                                    })
+                        let mut chain: Vec<String> = vec![c1.id.clone()];
+                        if let Some((cls, scope)) = resolve(&c1.id) {
+                            chain.extend(crate::ast::tree::raise_stmt::exception_ancestors(
+                                &cls, &scope, &options,
+                            ));
+                        }
+                        let mut found = chain.iter().any(|n| *n == c2.id || n == target);
+                        if !found {
+                            let last = chain.last().expect("c1 itself");
+                            match mro(last)? {
+                                Some(m) => found = m.iter().any(|a| a == target),
+                                None if resolve(last).is_some() => {
+                                    // A user chain that leaves the crate
+                                    // (a base the model does not follow):
+                                    // the builtin tail is unknown.
+                                    return Err(format!(
+                                        "issubclass({}, {}): `{}`'s base chain leaves the \
+                                         crate before a builtin exception; rython cannot \
+                                         fold the test",
+                                        c1.id, c2.id, last
+                                    )
+                                    .into());
                                 }
-                                _ => {
-                                    let Some(chain) = mro(cur)? else {
-                                        return Err(format!(
-                                            "issubclass({}, {}): `{}` is neither a class this \
-                                             crate defines nor a builtin exception; rython \
-                                             cannot fold the test",
-                                            c1.id, c2.id, cur
-                                        )
-                                        .into());
-                                    };
-                                    found = chain.iter().any(|a| a == target);
-                                    None
+                                None => {
+                                    return Err(format!(
+                                        "issubclass({}, {}): `{}` is neither a class this \
+                                         crate defines nor a builtin exception; rython \
+                                         cannot fold the test",
+                                        c1.id, c2.id, last
+                                    )
+                                    .into());
                                 }
-                            };
+                            }
                         }
                         return Ok(quote!(#found));
                     }

@@ -2284,8 +2284,34 @@ impl FunctionDef {
         options.fn_return_is_option = return_is_option;
         // `__eq__` is the dunder only as a METHOD: a free function of
         // that name is an ordinary function, whose `return NotImplemented`
-        // stays the loud refusal (Devin review on #330).
-        options.in_eq_dunder = self.name == "__eq__" && ctx.enclosing_class_name().is_some();
+        // stays the loud refusal. In the method it is CPython's identity
+        // fallback, decided by the other parameter's lowering: a shared
+        // class's `object`/own-class other is the PyRef class (the two
+        // borrows' address is `is`); a boxed other is never the same
+        // object; a value class's own kind has no identity to ask (Devin
+        // review on #330).
+        options.eq_not_implemented = if self.name == "__eq__"
+            && let Some(class) = ctx.enclosing_class_name()
+        {
+            let other = self.args.posonlyargs.iter().chain(self.args.args.iter()).nth(1);
+            let annotated = |p: &crate::ast::tree::arguments::Parameter, names: &[&str]| {
+                matches!(p.annotation.as_deref(), Some(ExprType::Name(n)) if names.contains(&n.id.as_str()))
+                    || matches!(p.annotation.as_deref(), Some(ExprType::Constant(c))
+                        if matches!(&c.0, Some(litrs::Literal::String(lit)) if names.contains(&lit.value())))
+            };
+            Some(match other {
+                Some(p)
+                    if crate::ast::tree::shared::is_shared(class)
+                        && annotated(p, &["object", "Any", class]) =>
+                {
+                    crate::EqFallback::SharedIdentity(p.arg.clone())
+                }
+                Some(p) if annotated(p, &["object", "Any"]) => crate::EqFallback::NeverSame,
+                _ => crate::EqFallback::Unmodeled(class.to_string()),
+            })
+        } else {
+            None
+        };
 
         // Round 81 (the generics directive): a CONCRETE typed return
         // (`-> Vec<u8>`, `-> i64` ...) whose value arrives as a boxed

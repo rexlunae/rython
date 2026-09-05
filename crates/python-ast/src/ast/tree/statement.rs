@@ -746,20 +746,38 @@ impl CodeGen for StatementType {
                     // ordering dunder raises TypeError), so it is a loud
                     // refusal, never a silent `false` (the evaluation on
                     // issue #137).
-                    if !options.in_eq_dunder {
-                        // Loud at the SITE, as a rustc error naming the
-                        // construct, so the rest of the crate stays
-                        // measurable (urllib3's `__or__` / `__ior__` /
-                        // `__ror__` return it for a non-mapping operand).
-                        let msg = "rython: `return NotImplemented` outside `__eq__` is not \
-                                   supported yet: CPython then tries the reflected operation \
-                                   and falls back to the identity default (`__ne__`) or raises \
-                                   TypeError (an ordering or arithmetic dunder), which a `false` \
-                                   result would silently replace; rython refuses to silently \
-                                   ignore it. Return the operation's value explicitly";
-                        quote!(compile_error!(#msg))
-                    } else {
-                        quote!(false)
+                    match &options.eq_not_implemented {
+                        None => {
+                            // Loud at the SITE, as a rustc error naming the
+                            // construct, so the rest of the crate stays
+                            // measurable (urllib3's `__or__` / `__ior__` /
+                            // `__ror__` return it for a non-mapping operand).
+                            let msg = "rython: `return NotImplemented` outside `__eq__` is not \
+                                       supported yet: CPython then tries the reflected operation \
+                                       and falls back to the identity default (`__ne__`) or raises \
+                                       TypeError (an ordering or arithmetic dunder), which a `false` \
+                                       result would silently replace; rython refuses to silently \
+                                       ignore it. Return the operation's value explicitly";
+                            quote!(compile_error!(#msg))
+                        }
+                        // The identity fallback: `a == a` is True, two
+                        // instances are not (Devin review on #330).
+                        Some(crate::EqFallback::SharedIdentity(other)) => {
+                            let other = crate::safe_ident(other);
+                            quote!(core::ptr::eq(self as *const Self, &*#other.borrow() as *const Self))
+                        }
+                        Some(crate::EqFallback::NeverSame) => quote!(false),
+                        Some(crate::EqFallback::Unmodeled(class)) => {
+                            let msg = format!(
+                                "rython: `return NotImplemented` in `{class}.__eq__`: CPython \
+                                 tries the reflected `__eq__` and then falls back to identity, \
+                                 which the instances of a value class (one not shared behind a \
+                                 reference) cannot answer; rython refuses to guess. Annotate the \
+                                 other parameter `object` (a boxed value is never the same \
+                                 object), or return the comparison explicitly"
+                            );
+                            quote!(compile_error!(#msg))
+                        }
                     }
                 } else if options.fn_return_is_pyvalue {
                     // A PyValue-returning function wraps its other returns

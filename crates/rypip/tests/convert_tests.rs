@@ -8635,7 +8635,8 @@ fn imported_exception_classes_match_python_at_runtime() {
     // An exception class defined in one module and raised in another
     // (Devin review on #330): the ancestor chain and the modeled
     // constructor (positional-only parameter, a defaulted one, a keyword)
-    // resolve through the defining module.
+    // resolve through the defining module; so does the issubclass fold,
+    // through a neutral-named intermediate.
     let scratch = Scratch::new("errpkg");
     fs::write(
         scratch.path().join("pyproject.toml"),
@@ -8657,6 +8658,14 @@ fn imported_exception_classes_match_python_at_runtime() {
             "        super().__init__(f\"need {needed} {unit}\")\n",
             "        self.needed = needed\n",
             "        self.unit = unit\n",
+            "\n",
+            "\n",
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Mid(Root):\n",
+            "    pass\n",
         ),
     )
     .unwrap();
@@ -8665,6 +8674,8 @@ fn imported_exception_classes_match_python_at_runtime() {
         concat!(
             "from errors import MyError\n",
             "from errors import Short\n",
+            "from errors import Root\n",
+            "from errors import Mid\n",
             "\n",
             "\n",
             "def run() -> None:\n",
@@ -8680,6 +8691,7 @@ fn imported_exception_classes_match_python_at_runtime() {
             "        raise Short(5, unit=\"coins\")\n",
             "    except Exception as e:\n",
             "        print(e)\n",
+            "    print(issubclass(MyError, Exception), issubclass(Mid, Root), issubclass(Mid, ValueError))\n",
             "\n",
             "\n",
             "if __name__ == \"__main__\":\n",
@@ -8702,7 +8714,12 @@ fn imported_exception_classes_match_python_at_runtime() {
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .collect::<Vec<_>>(),
-        vec!["caught ValueError: imported", "need 2 credits 2 credits", "need 5 coins"],
+        vec![
+            "caught ValueError: imported",
+            "need 2 credits 2 credits",
+            "need 5 coins",
+            "True True False",
+        ],
         "the imported exception model diverged from CPython"
     );
 }
@@ -8782,5 +8799,56 @@ fn a_class_name_two_modules_define_is_never_erased_by_the_exception_closure() {
         String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
         vec!["node:a"],
         "the ordinary Node lost its implementation"
+    );
+}
+
+#[test]
+fn not_implemented_in_a_shared_eq_is_identity_at_runtime() {
+    // A shared class's `__eq__` that returns NotImplemented: `t == t` is
+    // True (the same object), a second instance is not (Devin review on
+    // #330).
+    let scratch = Scratch::new("eq_identity");
+    let file = scratch.path().join("eq_identity.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Tag:\n",
+            "    def __init__(self, s: str):\n",
+            "        self.s = s\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.s += \"!\"\n",
+            "\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        return NotImplemented\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    tags = [Tag(\"x\")]\n",
+            "    t = tags[0]\n",
+            "    t.bump()\n",
+            "    print(t == t, t == tags[0], t == Tag(\"x\"), t.s)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/eq_identity"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["True True False x!"],
+        "the identity fallback diverged from CPython"
     );
 }

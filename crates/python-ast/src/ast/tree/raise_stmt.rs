@@ -643,6 +643,8 @@ pub(crate) fn classify_exception_init<'a>(
     cls: &crate::ClassDef,
     body: &'a [crate::Statement],
     params: &[&'a str],
+    vararg: Option<&str>,
+    kwarg: Option<&str>,
 ) -> Result<(Option<SuperMessage>, Vec<(String, &'a str)>), String> {
     use crate::ast::tree::visit::{Descend, Flow, is_self, walk_stmts};
     use crate::{ExprType, StatementType};
@@ -690,15 +692,29 @@ pub(crate) fn classify_exception_init<'a>(
                             return Flow::Stop;
                         }
                         // The forwarder: `super().__init__(*args)` or
-                        // `(*args, **kwargs)`, its own variadics only.
-                        let forwards = matches!(sc.args.as_slice(), [ExprType::Starred(_)])
-                            && sc.keywords.iter().all(|k| k.arg.is_none());
-                        if forwards {
+                        // `(*args, **kwargs)` — the initializer's OWN
+                        // variadics by name; `*other` is not the raise's
+                        // arguments (Devin review on #330).
+                        let splats = sc.args.iter().any(|a| matches!(a, ExprType::Starred(_)))
+                            || sc.keywords.iter().any(|k| k.arg.is_none());
+                        let forwards_own = matches!(sc.args.as_slice(), [ExprType::Starred(st)]
+                                if matches!(st.value.as_ref(), ExprType::Name(n) if Some(n.id.as_str()) == vararg))
+                            && sc.keywords.iter().all(|k| {
+                                k.arg.is_none()
+                                    && matches!(&k.value, ExprType::Name(n) if Some(n.id.as_str()) == kwarg)
+                            });
+                        if forwards_own {
                             super_init = Some(SuperMessage::Forwarded);
-                        } else if sc.args.len() > 1
-                            || !sc.keywords.is_empty()
-                            || matches!(sc.args.first(), Some(ExprType::Starred(_)))
-                        {
+                        } else if splats {
+                            refusal = Some(format!(
+                                "rython: `{}.__init__` calls `super().__init__` with a starred \
+                                 argument that is not its own `*args`/`**kwargs`: the message \
+                                 would not be the raise's argument, and rython does not model \
+                                 the unpacking; pass one message expression",
+                                cls.name
+                            ));
+                            return Flow::Stop;
+                        } else if sc.args.len() > 1 || !sc.keywords.is_empty() {
                             // `BaseException.__init__(a, b)` sets `args`
                             // to the tuple and `str(e)` to ITS repr
                             // (`('a', 'b')`), which the one-message model
@@ -767,7 +783,9 @@ fn variadic_exception_raise(
     let site_error = |msg: String| -> Result<Option<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
         Ok(Some(quote::quote!(compile_error!(#msg))))
     };
-    let (super_init, fields) = match classify_exception_init(cls, &init.body, &[]) {
+    let vararg = init.args.vararg.as_ref().map(|a| a.arg.as_str());
+    let kwarg = init.args.kwarg.as_ref().map(|a| a.arg.as_str());
+    let (super_init, fields) = match classify_exception_init(cls, &init.body, &[], vararg, kwarg) {
         Ok(model) => model,
         Err(msg) => return site_error(msg),
     };
@@ -1076,7 +1094,7 @@ pub(crate) fn exception_class_raise(
     // through the one statement visitor (a compound statement is
     // unmodeled at its head, so its bodies are never entered).
     let params: Vec<&str> = positional.iter().chain(kwonly.iter()).copied().collect();
-    let (super_init, fields) = match classify_exception_init(cls, &init.body, &params) {
+    let (super_init, fields) = match classify_exception_init(cls, &init.body, &params, None, None) {
         Ok(model) => model,
         Err(msg) => return site_error(msg),
     };

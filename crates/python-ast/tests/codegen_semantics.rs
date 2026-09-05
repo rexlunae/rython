@@ -19655,3 +19655,103 @@ fn a_variadic_exception_init_forwards_or_is_loud() {
     assert!(out.contains("compile_error !"), "generated: {}", out);
     assert!(out.contains("refuses to silently drop it"), "generated: {}", out);
 }
+
+#[test]
+fn not_implemented_in_eq_is_the_identity_fallback_the_other_parameter_allows() {
+    // A shared class's `__eq__` returning NotImplemented ends at `is`:
+    // the two borrows' address. A boxed other is never the same object.
+    // A value class compared with its own kind has no identity to ask:
+    // loud (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Tag:\n",
+            "    def __init__(self, s: str):\n",
+            "        self.s = s\n",
+            "    def bump(self) -> None:\n",
+            "        self.s += \"!\"\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        return NotImplemented\n",
+            "\n",
+            "def f() -> None:\n",
+            "    tags = [Tag(\"x\")]\n",
+            "    tags[0].bump()\n",
+        ),
+        "notimpl_shared.py",
+    );
+    assert!(
+        out.contains("core :: ptr :: eq (self as * const Self , & * other . borrow () as * const Self)"),
+        "generated: {}",
+        out
+    );
+    let out = compile(
+        concat!(
+            "class V:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        if not isinstance(other, V):\n",
+            "            return NotImplemented\n",
+            "        return self.n == other.n\n",
+        ),
+        "notimpl_boxed_other.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    let out = compile(
+        concat!(
+            "class V:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "    def __eq__(self, other: \"V\") -> bool:\n",
+            "        return NotImplemented\n",
+        ),
+        "notimpl_value_other.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("cannot answer"), "generated: {}", out);
+}
+
+#[test]
+fn issubclass_folds_through_a_neutral_named_user_chain() {
+    // `issubclass(LeafError, Root)` over Root(Exception), Mid(Root),
+    // LeafError(Mid): the fold walks the same ancestor chain the raise
+    // attaches, so the neutral-named Mid is a step, not a dead end
+    // (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class Mid(Root):\n",
+            "    pass\n",
+            "\n",
+            "class LeafError(Mid):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    print(issubclass(LeafError, Root), issubclass(Mid, Exception), issubclass(Mid, ValueError))\n",
+        ),
+        "issubclass_neutral.py",
+    );
+    assert!(out.contains("(& (true)) , py_display (& (true)) , py_display (& (false))"), "generated: {}", out);
+}
+
+#[test]
+fn a_variadic_exception_init_forwarding_something_else_is_loud() {
+    // `super().__init__(*other)` is not the raise's arguments (Devin
+    // review on #330).
+    let out = compile(
+        concat!(
+            "OTHER = [\"fixed\"]\n",
+            "\n",
+            "class Odd(Exception):\n",
+            "    def __init__(self, *args):\n",
+            "        super().__init__(*OTHER)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Odd(\"v\")\n",
+        ),
+        "raise_variadic_other.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("not its own `*args`"), "generated: {}", out);
+}
