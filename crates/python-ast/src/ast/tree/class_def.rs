@@ -257,6 +257,28 @@ pub struct ExceptionIndex {
 /// class, so a name carrying it beside a class target is decided at
 /// runtime (Devin review on #330).
 pub(crate) const UNBOUND_ALTERNATIVE: &str = "<unbound>";
+/// The alternative for a name an EXTERNAL import binds (`from
+/// somewhere_else import Root`, `import x`): that external object, never
+/// the crate's same-named class — an exception only by its own name.
+pub(crate) const EXTERNAL_ALTERNATIVE: &str = "<external>";
+/// The alternative for a name the module DEFINES as a class: a class.
+pub(crate) const CLASS_ALTERNATIVE: &str = "<class>";
+/// The alternative for a name the module defines as a function, or
+/// imports from a crate module under its own name: the module's own
+/// binding — a class only when the crate emits a class by that name.
+pub(crate) const LOCAL_ALTERNATIVE: &str = "<local>";
+/// The alternative for a name bound to an ordinary value (`X = make()`):
+/// never a class.
+pub(crate) const VALUE_ALTERNATIVE: &str = "<value>";
+/// Whether an alternative is one of the sentinels above (never an alias
+/// target to follow).
+pub(crate) fn is_sentinel_alternative(t: &str) -> bool {
+    t == UNBOUND_ALTERNATIVE
+        || t == EXTERNAL_ALTERNATIVE
+        || t == CLASS_ALTERNATIVE
+        || t == LOCAL_ALTERNATIVE
+        || t == VALUE_ALTERNATIVE
+}
 
 /// A module's bindings of one name to another — `X = Y` and `from m
 /// import Y as X` — the alias spellings a base may use: the module's own
@@ -277,6 +299,16 @@ pub(crate) const UNBOUND_ALTERNATIVE: &str = "<unbound>";
 /// an `else`, a loop, a `try:` and its handlers, a `with`): the
 /// conversion does not prove a body executes, it refuses to guess. A
 /// later top-level binding replaces it. Devin review on #330.
+///
+/// EVERY module-level binding of a name takes part in that flow, the
+/// same way: an external import ([`EXTERNAL_ALTERNATIVE`]), a class or
+/// function definition or a crate import under the name's own spelling
+/// ([`LOCAL_ALTERNATIVE`]), an assignment of an ordinary value
+/// ([`VALUE_ALTERNATIVE`]) — so a local `class Root(Exception)` after
+/// `from somewhere_else import Root` REPLACES the external binding at the
+/// top level, and under a gate is one more alternative (runtime-decided,
+/// loud). Returns the alternatives (sentinels included) and the names
+/// whose alternatives include the external one.
 pub(crate) fn module_name_aliases(
     body: &[crate::Statement],
     options: &crate::PythonOptions,
@@ -284,11 +316,6 @@ pub(crate) fn module_name_aliases(
     use crate::ast::tree::visit::{Descend, stmt_bodies_for};
     // name → its current alternatives, in first-seen order
     let mut bindings: Vec<(String, Vec<String>)> = Vec::new();
-    // The names an EXTERNAL import binds (`from somewhere_else import
-    // Root`, `import x`): in this module such a name is that external
-    // object, never the crate's same-named class nor a builtin exception
-    // (the closure is keyed by bare name — Devin review on #330).
-    let mut externals: std::collections::HashSet<String> = std::collections::HashSet::new();
     fn bind(bindings: &mut Vec<(String, Vec<String>)>, name: &str, target: &str, nested: bool) {
         match bindings.iter_mut().find(|(n, _)| n == name) {
             Some((_, alts)) => {
@@ -311,7 +338,6 @@ pub(crate) fn module_name_aliases(
         stmts: &[crate::Statement],
         nested: bool,
         bindings: &mut Vec<(String, Vec<String>)>,
-        externals: &mut std::collections::HashSet<String>,
         options: &crate::PythonOptions,
     ) {
         for s in stmts {
@@ -320,20 +346,31 @@ pub(crate) fn module_name_aliases(
                     if !options.module_defs.contains_key(&i.resolved_module_path(options)) =>
                 {
                     for a in &i.names {
-                        externals.insert(a.asname.clone().unwrap_or_else(|| a.name.clone()));
+                        let name = a.asname.clone().unwrap_or_else(|| a.name.clone());
+                        bind(bindings, &name, EXTERNAL_ALTERNATIVE, nested);
                     }
                 }
                 crate::StatementType::Import(i) => {
                     for a in &i.names {
-                        externals.insert(a.asname.clone().unwrap_or_else(|| {
+                        let name = a.asname.clone().unwrap_or_else(|| {
                             a.name.split('.').next().unwrap_or(&a.name).to_string()
-                        }));
+                        });
+                        bind(bindings, &name, EXTERNAL_ALTERNATIVE, nested);
                     }
                 }
                 crate::StatementType::Assign(a) => {
-                    if let ([ExprType::Name(t)], ExprType::Name(v)) = (a.targets.as_slice(), &a.value) {
-                        bind(bindings, &t.id, &v.id, nested);
+                    if let [ExprType::Name(t)] = a.targets.as_slice() {
+                        match &a.value {
+                            ExprType::Name(v) => bind(bindings, &t.id, &v.id, nested),
+                            _ => bind(bindings, &t.id, VALUE_ALTERNATIVE, nested),
+                        }
                     }
+                }
+                crate::StatementType::ClassDef(c) => {
+                    bind(bindings, &c.name, CLASS_ALTERNATIVE, nested);
+                }
+                crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
+                    bind(bindings, &f.name, LOCAL_ALTERNATIVE, nested);
                 }
                 // An import alias names a class of a CRATE module only:
                 // an external package's `Root as R` is not the crate's
@@ -343,21 +380,27 @@ pub(crate) fn module_name_aliases(
                     if options.module_defs.contains_key(&i.resolved_module_path(options)) =>
                 {
                     for a in &i.names {
-                        if let Some(asname) = &a.asname
-                            && asname != &a.name
-                        {
-                            bind(bindings, asname, &a.name, nested);
+                        match &a.asname {
+                            Some(asname) if asname != &a.name => {
+                                bind(bindings, asname, &a.name, nested);
+                            }
+                            _ => bind(bindings, &a.name, LOCAL_ALTERNATIVE, nested),
                         }
                     }
                 }
                 _ => {}
             }
             for body in stmt_bodies_for(s, Descend::SkipDefs) {
-                collect(body, true, bindings, externals, options);
+                collect(body, true, bindings, options);
             }
         }
     }
-    collect(body, false, &mut bindings, &mut externals, options);
+    collect(body, false, &mut bindings, options);
+    let externals: std::collections::HashSet<String> = bindings
+        .iter()
+        .filter(|(_, alts)| alts.iter().any(|t| t == EXTERNAL_ALTERNATIVE))
+        .map(|(n, _)| n.clone())
+        .collect();
     (
         bindings
             .into_iter()
@@ -439,25 +482,44 @@ pub fn compute_exception_classes(
                 }
                 // Through the name's CLASS alternatives (a copy `S = R`
                 // of a maybe-unbound R is class-ish by R's class).
-                match all.iter().find(|(a, t)| *a == cur && t != UNBOUND_ALTERNATIVE) {
+                match all.iter().find(|(a, t)| *a == cur && !is_sentinel_alternative(t)) {
                     Some((_, t)) => cur = t.clone(),
                     None => return false,
                 }
             }
             false
         };
-        // The "may be unbound" alternative stays beside a class target
+        // Whether one alternative of `name` is a class: an alias target
+        // by its chain; the module's own definition when the module
+        // emits a class by that name (or the name is an exception by
+        // convention); an external binding only by its own name; an
+        // ordinary value and "unbound" never.
+        let classish_alt = |name: &str, t: &str| -> bool {
+            if t == CLASS_ALTERNATIVE {
+                true
+            } else if t == LOCAL_ALTERNATIVE {
+                crate_classes.contains(name) || is_exception(name)
+            } else if t == EXTERNAL_ALTERNATIVE {
+                is_exception(name)
+            } else if t == UNBOUND_ALTERNATIVE || t == VALUE_ALTERNATIVE {
+                false
+            } else {
+                classish(t)
+            }
+        };
+        // A NON-class alternative ("may be unbound", an external object,
+        // an ordinary value, a function) stays beside a class alternative
         // — the pair is the runtime decision; alone it is no alias.
         let names_with_class: std::collections::HashSet<&str> = all
             .iter()
-            .filter(|(_, t)| t != UNBOUND_ALTERNATIVE && classish(t))
+            .filter(|(a, t)| classish_alt(a, t))
             .map(|(a, _)| a.as_str())
             .collect();
         aliases.retain(|(a, t)| {
-            if t == UNBOUND_ALTERNATIVE {
+            if is_sentinel_alternative(t) && !classish_alt(a, t) {
                 names_with_class.contains(a.as_str())
             } else {
-                classish(t)
+                classish_alt(a, t)
             }
         });
     }
@@ -492,6 +554,13 @@ pub fn compute_exception_classes(
             let may_be_unbound = aliases
                 .iter()
                 .any(|(n, t)| n == a && t == UNBOUND_ALTERNATIVE);
+            let rebound = aliases.iter().any(|(n, t)| {
+                n == a
+                    && (t == EXTERNAL_ALTERNATIVE
+                        || t == LOCAL_ALTERNATIVE
+                        || t == CLASS_ALTERNATIVE
+                        || t == VALUE_ALTERNATIVE)
+            });
             options.definition_warnings.borrow_mut().push(if may_be_unbound {
                 format!(
                     "`{a}` is bound to a class only inside a `try:`, an `if`, a loop, or a \
@@ -499,6 +568,14 @@ pub fn compute_exception_classes(
                      unbound: rython follows neither — a class deriving from it, a raise, a \
                      handler, or an issubclass naming it is a loud error; bind it once at \
                      module level"
+                )
+            } else if rebound {
+                format!(
+                    "`{a}` is bound more than one way at module level — an import, a class \
+                     definition, an assignment — across a `try:`/`except:` or an `if` the \
+                     conversion cannot fold: which class it names is decided at runtime, so \
+                     rython follows neither — a class deriving from it, a raise, a handler, \
+                     or an issubclass naming it is a loud error; bind it once"
                 )
             } else {
                 format!(
@@ -509,15 +586,15 @@ pub fn compute_exception_classes(
                 )
             });
         }
-        aliases.retain(|(a, _)| !multi.contains(a));
+        // The sentinels served the decision; only real alias targets
+        // remain to be followed.
+        aliases.retain(|(a, t)| !multi.contains(a) && !is_sentinel_alternative(t));
         ambiguous_aliases.extend(multi.into_iter().map(|a| (module.clone(), a)));
     }
     // (class, its module's alias bindings and external names)
     type Bindings = (Vec<(String, String)>, std::collections::HashSet<String>);
     let mut all: Vec<(&ClassDef, std::rc::Rc<Bindings>)> = Vec::new();
-    let mut alias_names: Vec<(String, String)> = Vec::new();
     for (_, defs, aliases, externals) in &per_module {
-        alias_names.extend(aliases.iter().cloned());
         let bindings = std::rc::Rc::new((aliases.clone(), externals.clone()));
         for c in defs {
             all.push((c, bindings.clone()));
@@ -583,14 +660,19 @@ pub fn compute_exception_classes(
         }
     }
     // The alias names whose target is an exception: what `is_exception_class`
-    // sees in a base position.
-    for (alias, _) in &alias_names {
-        if !unambiguous(alias) {
-            continue;
-        }
-        let target = canonical(alias, &alias_names);
-        if is_exception(&target) || (unambiguous(&target) && set.contains(&target)) {
-            set.insert(alias.clone());
+    // sees in a base position — each alias resolved through ITS module's
+    // bindings only (module A's `X = Y` over A's ordinary `Y` never
+    // follows module B's `Y = ValueError` — Devin review on #330); the
+    // bare-name ambiguity checks stay crate-wide.
+    for (_, _, aliases, _) in &per_module {
+        for (alias, _) in aliases {
+            if !unambiguous(alias) {
+                continue;
+            }
+            let target = canonical(alias, aliases);
+            if is_exception(&target) || (unambiguous(&target) && set.contains(&target)) {
+                set.insert(alias.clone());
+            }
         }
     }
     for (c, bindings) in &all {
@@ -4504,13 +4586,19 @@ pub(crate) fn strip_self(args: &mut crate::ParameterList) {
 /// Whether an expression is a CLASS REFERENCE (`HTTPConnectionPool` — a
 /// Name resolving to a class, or an imported class name): class values have
 /// no rython runtime equivalent (the classes-as-values divergence).
-pub(crate) fn is_class_value_expr(value: &ExprType, symbols: &SymbolTableScopes) -> bool {    match value {
+pub(crate) fn is_class_value_expr(value: &ExprType, symbols: &SymbolTableScopes) -> bool {
+    match value {
         ExprType::Name(n) => match symbols.get(&n.id) {
             Some(SymbolTableNode::ClassDef(_)) => true,
             Some(SymbolTableNode::Alias(canonical)) => {
                 matches!(symbols.get(canonical), Some(SymbolTableNode::ClassDef(_)))
             }
             Some(SymbolTableNode::ImportFrom(_)) => true,
+            // A builtin exception class (`Y = ValueError`): a compile-time
+            // alias the hoist skips too (module.rs) — the store emits
+            // nothing, or the name is an unresolved assignment in rustc
+            // (Devin review on #330).
+            None => crate::ast::tree::raise_stmt::is_builtin_exception_name(&n.id),
             _ => false,
         },
         _ => false,

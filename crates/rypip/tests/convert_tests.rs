@@ -9098,6 +9098,96 @@ fn a_class_name_two_modules_define_is_never_erased_by_the_exception_closure() {
 }
 
 #[test]
+fn an_alias_resolves_in_its_own_module_never_through_another_modules_binding() {
+    // shapes.py: an ordinary `Y`, `X = Y`, `Z(Y)`, and `X()` constructed
+    // through the alias; errs.py independently binds `Y = ValueError`.
+    // The exception closure resolves shapes' `X` through shapes' own
+    // bindings — never through errs' `Y` — so `X` and `Y` stay ordinary
+    // (`make()` labels, `Z` keeps its method); errs' alias of a builtin
+    // is a compile-time binding, its store emits nothing (Devin review
+    // on #330).
+    let scratch = Scratch::new("leakpkg");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"leakpkg\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("leakpkg");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("shapes.py"),
+        concat!(
+            "class Y:\n",
+            "    def label(self) -> str:\n",
+            "        return \"y\"\n",
+            "\n",
+            "\n",
+            "X = Y\n",
+            "\n",
+            "\n",
+            "class Z(Y):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def make() -> str:\n",
+            "    return X().label()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("errs.py"),
+        concat!(
+            "Y = ValueError\n",
+            "\n",
+            "\n",
+            "def boom() -> None:\n",
+            "    raise ValueError(\"bad\")\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("cli.py"),
+        concat!(
+            "from shapes import Z, make\n",
+            "from errs import boom\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(Z().label(), make())\n",
+            "    try:\n",
+            "        boom()\n",
+            "    except ValueError as e:\n",
+            "        print(\"caught\", e)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let shapes = fs::read_to_string(krate.root.join("src/shapes.rs")).unwrap();
+    assert!(!shapes.contains("pub struct Y;"), "Y lowered as an exception marker: {}", shapes);
+    assert!(!shapes.contains("pub struct Z;"), "Z lowered as an exception marker: {}", shapes);
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/leakpkg"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["y y", "caught bad"],
+        "the alias leaked across modules"
+    );
+}
+
+#[test]
 fn a_message_reading_another_modules_global_is_refused_at_a_foreign_raise_site() {
     // errors.PREFIX in the message, cli.PREFIX at the raise site: the
     // message would silently read the caller's global — a loud

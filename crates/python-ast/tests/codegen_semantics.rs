@@ -20593,6 +20593,74 @@ fn an_exception_fields_type_follows_the_chains_execution_order() {
 }
 
 #[test]
+fn a_local_class_replaces_an_external_import_of_its_name() {
+    // `from somewhere_else import Root` then a top-level `class
+    // Root(Exception)`: the module's binding of `Root` is the local class
+    // (CPython's module init leaves it so), so `class Leaf(Root)` is an
+    // exception class over it — the external binding is REPLACED, not a
+    // permanent mark on the name. The same class under a gate the
+    // conversion cannot fold is one more alternative: runtime-decided,
+    // loud (Devin review on #330).
+    let out = compile(
+        concat!(
+            "from somewhere_else import Root\n",
+            "\n",
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class Leaf(Root):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Leaf(\"x\")\n",
+        ),
+        "raise_local_replaces_external.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(!out.contains("LeafTrait"), "generated: {}", out);
+    assert!(
+        out.contains("(\"Leaf\" , format ! (\"{}\" , \"x\") , vec ! [] , vec ! [(\"Root\") . to_string () , (\"Exception\") . to_string ()])"),
+        "generated: {}",
+        out
+    );
+    let err = compile_err(
+        concat!(
+            "import os\n",
+            "from somewhere_else import Root\n",
+            "\n",
+            "if os.environ.get(\"LOCAL\"):\n",
+            "    class Root(Exception):\n",
+            "        pass\n",
+            "\n",
+            "class Leaf(Root):\n",
+            "    pass\n",
+        ),
+        "raise_gated_local_over_external.py",
+    );
+    assert!(err.contains("decided at runtime"), "error: {}", err);
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "import os\n",
+            "from somewhere_else import Root\n",
+            "\n",
+            "if os.environ.get(\"LOCAL\"):\n",
+            "    class Root(Exception):\n",
+            "        pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Root(\"x\")\n",
+        ),
+        "raise_gated_local_over_external_use.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        warnings.iter().any(|w| w.contains("`Root` is bound more than one way")),
+        "warnings: {:?}",
+        warnings
+    );
+}
+
+#[test]
 fn a_parameter_or_local_named_not_implemented_is_a_value() {
     // A parameter or a local named `NotImplemented` shadows the singleton
     // in `__eq__`: the return is that value — no decline, no identity
