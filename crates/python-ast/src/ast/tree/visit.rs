@@ -225,6 +225,10 @@ pub fn reserved_prefix_binding(body: &[Statement]) -> Option<(String, usize)> {
             ),
             StatementType::Try(t) => names.extend(t.handlers.iter().filter_map(|h| h.name.clone())),
             StatementType::Global(ns) | StatementType::Nonlocal(ns) => names.extend(ns.iter().cloned()),
+            // A bare annotated declaration (`__rython_base: int` — a
+            // dataclass field, a class-level declaration) binds the name
+            // for the class's fields (Devin review on #331).
+            StatementType::AnnotatedName { name, .. } => names.push(name.clone()),
             _ => {}
         }
         // Expression-local bindings: a walrus, a comprehension's targets,

@@ -20871,6 +20871,8 @@ fn a_binding_under_the_reserved_temporary_prefix_is_refused() {
         ("def k(xs: list[int]) -> dict[int, int]:\n    return {__rython_k: 1 for __rython_k in xs}\n", "`__rython_k`", "dict"),
         ("def k(xs: list[int]) -> int:\n    return sum(__rython_g for __rython_g in xs)\n", "`__rython_g`", "gen"),
         ("def k(xs: list[int]) -> list[int]:\n    return list(map(lambda __rython_p: __rython_p + 1, xs))\n", "`__rython_p`", "lambda"),
+        ("from dataclasses import dataclass\n\n@dataclass\nclass D:\n    __rython_base: int\n", "`__rython_base`", "annotated"),
+        ("class E:\n    __rython_kind: str = \"e\"\n", "`__rython_kind`", "annotated_assign"),
     ] {
         let err = compile_err(src, &format!("reserved_{tag}.py"));
         assert!(err.contains(name), "{tag}: {}", err);
