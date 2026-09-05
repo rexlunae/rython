@@ -380,7 +380,8 @@ impl CodeGen for Module {
             crate::ast::tree::class_def::install_exception_classes(
                 &exceptions.classes,
                 &exceptions.ambiguous_aliases,
-                &exceptions.this_externals,
+                &exceptions.this_bindings,
+                &exceptions.class_bindings,
             );
             let roots =
                 crate::ast::tree::hierarchy::compute_roots(&self.raw.body, &items, &options);
@@ -4693,6 +4694,88 @@ pub fn resolve_imported_class(
     resolve_imported_class_with_path(options, path, name, depth).map(|(c, s, _)| (c, s))
 }
 
+/// The options in which the imports of the crate module at `path`
+/// resolve: its relative imports are relative to ITS package. A module's
+/// path includes the module name (["urllib3", "connection"]) while
+/// `resolved_module_path` expects the package path (["urllib3"]); an
+/// `__init__` module IS its own package, so its package path is the full
+/// module path (["urllib3", "util"] for urllib3/util/__init__.py — the
+/// re-export chain `from urllib3.util import Timeout` follows through
+/// it), detected by a longer module key under the path.
+pub(crate) fn defining_module_context(
+    options: &PythonOptions,
+    path: &[String],
+) -> PythonOptions {
+    let mut ctx = options.clone();
+    let is_package = options
+        .module_defs
+        .keys()
+        .any(|k| k.len() > path.len() && k[..path.len()] == path[..]);
+    ctx.module_path = if is_package {
+        path.to_vec()
+    } else {
+        path[..path.len().saturating_sub(1)].to_vec()
+    };
+    ctx
+}
+
+/// Whether the crate module at `path` binds `name` by an EXTERNAL import
+/// (`from json import JSONDecodeError` in requests' compat.py), judged by
+/// that module's own binding flow ([`module_name_aliases`]) — so a
+/// sibling's `from .compat import JSONDecodeError as CompatJSONDecodeError`
+/// is the external class there, never the crate's same-named class (the
+/// sweep on issue #137). `depth` bounds the import chain.
+pub(crate) fn module_binds_externally(
+    options: &PythonOptions,
+    path: &[String],
+    name: &str,
+    depth: usize,
+) -> bool {
+    if depth > 6 {
+        return false;
+    }
+    if let Some(known) = MODULE_EXTERNALS_MEMO.with(|m| {
+        m.borrow().as_ref().and_then(|memo| memo.get(path).map(|e| e.contains(name)))
+    }) {
+        return known;
+    }
+    let Some(module) = options.module_defs.get(path) else {
+        return false;
+    };
+    let module: &crate::Module = module;
+    let ctx = defining_module_context(options, path);
+    let (_, bindings) = crate::ast::tree::class_def::module_name_aliases_depth(
+        &splice_gated_branches(module.raw.body.clone(), &ctx),
+        &ctx,
+        depth + 1,
+    );
+    let external = bindings.externals.contains(name);
+    MODULE_EXTERNALS_MEMO.with(|m| {
+        if let Some(memo) = m.borrow_mut().as_mut() {
+            memo.insert(path.to_vec(), bindings.externals);
+        }
+    });
+    external
+}
+
+thread_local! {
+    /// Each crate module's external-import names, memoized for the span of
+    /// one [`with_module_externals_memo`] (one crate-wide class walk): the
+    /// source-module question above is asked once per module, not once per
+    /// imported name down every import chain.
+    static MODULE_EXTERNALS_MEMO: std::cell::RefCell<
+        Option<std::collections::HashMap<Vec<String>, std::collections::HashSet<String>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with the module-externals memo open (cleared after).
+pub(crate) fn with_module_externals_memo<T>(f: impl FnOnce() -> T) -> T {
+    MODULE_EXTERNALS_MEMO.with(|m| *m.borrow_mut() = Some(std::collections::HashMap::new()));
+    let out = f();
+    MODULE_EXTERNALS_MEMO.with(|m| *m.borrow_mut() = None);
+    out
+}
+
 /// [`resolve_imported_class`], also returning the DEFINING module's path
 /// (the module the chain terminated in) — the scope its relative imports
 /// and annotations resolve in.
@@ -4722,24 +4805,7 @@ pub fn resolve_imported_class_with_path(
             // Resolve the relative import in the DEFINING module's
             // context (`from .timeout import Timeout` in util/__init__.py
             // is relative to ["urllib3", "util"], not the caller).
-            let mut ctx = options.clone();
-            // The relative import resolves in the DEFINING module's PACKAGE
-            // context: module_class_def's path includes the module name
-            // (["urllib3", "connection"]), but resolved_module_path expects
-            // the package path (["urllib3"]). An __init__ module IS its own
-            // package: its package path is the full module path
-            // (["urllib3", "util"] for urllib3/util/__init__.py — the
-            // re-export chain `from urllib3.util import Timeout` follows
-            // through it). Detect by a longer module key under the path.
-            let is_package = options
-                .module_defs
-                .keys()
-                .any(|k| k.len() > path.len() && k[..path.len()] == path[..]);
-            ctx.module_path = if is_package {
-                path.to_vec()
-            } else {
-                path[..path.len().saturating_sub(1)].to_vec()
-            };
+            let ctx = defining_module_context(options, path);
             let path2 = i.resolved_module_path(&ctx);
             resolve_imported_class_with_path(options, &path2, &defining, depth + 1)
         }

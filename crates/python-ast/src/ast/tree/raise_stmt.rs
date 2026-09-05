@@ -962,7 +962,7 @@ pub(crate) fn exception_mro(
         for b in &cls.bases {
             match b {
                 crate::ExprType::Name(n) if n.id == "object" => {}
-                crate::ExprType::Name(n) => match canonical_exception_class(&n.id, &scope, options) {
+                crate::ExprType::Name(n) => match canonical_exception_base(&cls, &n.id, &scope, options) {
                     Some((base, Some(def))) => bases.push((base, Some(def))),
                     Some((base, None)) => {
                         let head = builtin_exception_mro(&base)?
@@ -1093,10 +1093,79 @@ pub(crate) fn canonical_exception_class(
     scope: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<(String, Option<(crate::ClassDef, SymbolTableScopes)>)> {
+    canonical_exception_class_bound(
+        name,
+        scope,
+        options,
+        crate::ast::tree::class_def::is_this_module_external(name),
+        crate::ast::tree::class_def::this_module_crate_import(name),
+    )
+}
+
+/// [`canonical_exception_class`] for a BASE of the crate class `cls`:
+/// `name` is judged external by the module DEFINING `cls`, whichever
+/// module the linearization runs from (urllib3's `response.py` raising
+/// `exceptions.IncompleteRead(HTTPError, httplib_IncompleteRead)` — the
+/// sweep on issue #137).
+pub(crate) fn canonical_exception_base(
+    cls: &crate::ClassDef,
+    name: &str,
+    scope: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<(String, Option<(crate::ClassDef, SymbolTableScopes)>)> {
+    canonical_exception_class_bound(
+        name,
+        scope,
+        options,
+        crate::ast::tree::class_def::is_external_in_defining_module(&cls.name, name),
+        crate::ast::tree::class_def::crate_import_in_defining_module(&cls.name, name),
+    )
+}
+
+/// `external`: the module binds `name` by an external import;
+/// `crate_import`: the module binds `name` by `from <crate module>
+/// import <defining> as name`, with that module's path and the name
+/// there.
+fn canonical_exception_class_bound(
+    name: &str,
+    scope: &SymbolTableScopes,
+    options: &PythonOptions,
+    external: bool,
+    crate_import: Option<(Vec<String>, String)>,
+) -> Option<(String, Option<(crate::ClassDef, SymbolTableScopes)>)> {
     if crate::ast::tree::class_def::is_runtime_ambiguous_alias(name, &options.this_module_path) {
         return None;
     }
-    // A name this module binds by an EXTERNAL import whose bare name a
+    // A CRATE import's `as` name whose bare name the importing module
+    // binds to a class of its own (`from urllib3.exceptions import
+    // HTTPError as BaseHTTPError` in requests' exceptions.py, which
+    // defines `HTTPError` — the requests sweep on issue #137): the alias
+    // names the SOURCE module's class, never the local one; following
+    // the bare name read a false MRO conflict. Two crate classes share
+    // that bare name, which the name-keyed runtime cannot tell apart, so
+    // the source class takes its place in this chain under the alias
+    // spelling — `except BaseHTTPError:` matches it, the local
+    // `except HTTPError:` does not, as in Python — with its own ancestors,
+    // and a definition warning says so.
+    if let Some((source, defining)) = crate_import
+        && let Some(SymbolTableNode::Alias(canonical)) = scope.get(name)
+        && matches!(scope.get(canonical), Some(SymbolTableNode::ClassDef(_)))
+    {
+        if let Some((cls, cls_scope)) =
+            crate::ast::tree::module::resolve_imported_class(options, &source, &defining, 0)
+        {
+            options.definition_warnings.borrow_mut().push(format!(
+                "`{name}` imports `{defining}` of `{}` beside the crate's own class `{canonical}` \
+                 of the same name: the imported class takes its place in the hierarchy under \
+                 the name `{name}` (the runtime matches exception classes by bare name, so the \
+                 two `{canonical}` classes are told apart by this spelling)",
+                source.join(".")
+            ));
+            return Some((name.to_string(), Some((cls, cls_scope))));
+        }
+        return None;
+    }
+    // A name the module binds by an EXTERNAL import whose bare name a
     // LOCAL class shadows (`from http.client import IncompleteRead as
     // httplib_IncompleteRead` beside the crate's own `IncompleteRead` —
     // urllib3): the binding is the external class, never the local one
@@ -1105,7 +1174,7 @@ pub(crate) fn canonical_exception_class(
     // the alias spelling (matched by that name at runtime), its own
     // ancestors unknown, and said so — the external-module divergence
     // (the sweep on issue #137).
-    if crate::ast::tree::class_def::is_this_module_external(name)
+    if external
         && let Some(SymbolTableNode::Alias(canonical)) = scope.get(name)
         && matches!(scope.get(canonical), Some(SymbolTableNode::ClassDef(_)))
     {

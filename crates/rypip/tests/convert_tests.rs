@@ -9549,6 +9549,217 @@ fn an_external_import_alias_never_resolves_to_an_unrelated_crate_class() {
 }
 
 #[test]
+fn an_external_alias_base_is_judged_by_the_defining_module_from_any_raise_site() {
+    // errors.py binds `from http.client import IncompleteRead as
+    // httplib_IncompleteRead` beside its own `IncompleteRead(HTTPError,
+    // httplib_IncompleteRead)`; reader.py imports the crate's class and
+    // raises it. The base is external by errors.py's bindings, whichever
+    // module linearizes the class: judging it by the RAISING module's
+    // bindings read a cycle through the crate's own `IncompleteRead`
+    // (urllib3's response.py; the sweep on issue #137).
+    let scratch = Scratch::new("extbase");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"extbase\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("extbase");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("errors.py"),
+        concat!(
+            "from http.client import IncompleteRead as httplib_IncompleteRead\n",
+            "\n",
+            "\n",
+            "class HTTPError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class IncompleteRead(HTTPError, httplib_IncompleteRead):\n",
+            "    def __init__(self, partial: int, expected: int) -> None:\n",
+            "        self.partial = partial\n",
+            "        self.expected = expected\n",
+            "        super().__init__(partial, expected)\n",
+        ),
+    )
+    .unwrap();
+    // The same through a CRATE module that itself binds the name by an
+    // external import, under an import fallback (requests' compat.py:
+    // `from json import JSONDecodeError`), re-imported under an alias
+    // beside a local class of the bare name (requests' exceptions.py).
+    fs::write(
+        pkg.join("compat.py"),
+        concat!(
+            "try:\n",
+            "    from simplejson import JSONDecodeError\n",
+            "except ImportError:\n",
+            "    from json import JSONDecodeError\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("decode.py"),
+        concat!(
+            "from .compat import JSONDecodeError as CompatJSONDecodeError\n",
+            "from .errors import HTTPError\n",
+            "\n",
+            "\n",
+            "class JSONDecodeError(HTTPError, CompatJSONDecodeError):\n",
+            "    def __init__(self, msg: str) -> None:\n",
+            "        super().__init__(msg)\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("reader.py"),
+        concat!(
+            "from .errors import IncompleteRead\n",
+            "from .decode import JSONDecodeError\n",
+            "\n",
+            "\n",
+            "def read(n: int) -> int:\n",
+            "    if n < 3:\n",
+            "        raise IncompleteRead(n, 3)\n",
+            "    if n > 9:\n",
+            "        raise JSONDecodeError(\"bad\")\n",
+            "    return n\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect("the external alias base must not read as a cycle");
+    let reader = fs::read_to_string(krate.root.join("src/reader.rs")).unwrap();
+    assert!(!reader.contains("compile_error !"), "generated: {}", reader);
+    // Each name found after the previous one, from the raise site on.
+    let in_order = |names: &[&str]| {
+        let mut from = 0;
+        for a in names {
+            let at = reader[from..]
+                .find(a)
+                .unwrap_or_else(|| panic!("{a} is not an ancestor after {from}: {reader}"));
+            from += at + a.len();
+        }
+        true
+    };
+    assert!(
+        in_order(&["\"HTTPError\"", "\"Exception\"", "\"httplib_IncompleteRead\""]),
+        "the external branch must end the chain under its alias name: {}",
+        reader
+    );
+    assert!(
+        in_order(&["\"JSONDecodeError\"", "\"HTTPError\"", "\"Exception\"", "\"CompatJSONDecodeError\""]),
+        "the crate-module re-import of an external name must end the chain under its alias: {}",
+        reader
+    );
+    for expected in [
+        "`httplib_IncompleteRead` is an external import bound beside the crate's own class `IncompleteRead`",
+        "`CompatJSONDecodeError` is an external import bound beside the crate's own class `JSONDecodeError`",
+    ] {
+        assert!(
+            krate.warnings.iter().any(|w| w.contains(expected)),
+            "missing {expected:?} in warnings: {:?}",
+            krate.warnings
+        );
+    }
+}
+
+#[test]
+fn a_crate_import_alias_beside_a_local_class_of_its_name_is_the_source_modules_class() {
+    // base.py defines `HTTPError(Exception)`; errors.py imports it `as
+    // BaseHTTPError`, defines its OWN `HTTPError(RequestException)`, and
+    // derives `ContentDecodingError(RequestException, BaseHTTPError)`
+    // (requests' exceptions.py over urllib3's). The alias names base.py's
+    // class: following the bare name into the local `HTTPError` read a
+    // false MRO conflict (the sweep on issue #137). The imported class
+    // takes its place under the alias spelling, with its own ancestors,
+    // so `except BaseHTTPError:` catches it and the local `except
+    // HTTPError:` does not. Verified against python3: the program prints
+    // `base dec`.
+    let scratch = Scratch::new("twin");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"twin\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("twin");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(pkg.join("base.py"), concat!("class HTTPError(Exception):\n", "    pass\n")).unwrap();
+    fs::write(
+        pkg.join("errors.py"),
+        concat!(
+            "from .base import HTTPError as BaseHTTPError\n",
+            "\n",
+            "\n",
+            "class RequestException(IOError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class HTTPError(RequestException):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class ContentDecodingError(RequestException, BaseHTTPError):\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("main.py"),
+        concat!(
+            "from .errors import ContentDecodingError, HTTPError\n",
+            "from .base import HTTPError as BaseHTTPError\n",
+            "\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise ContentDecodingError(\"dec\")\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    try:\n",
+            "        f()\n",
+            "    except HTTPError:\n",
+            "        print(\"local\")\n",
+            "    except BaseHTTPError as e:\n",
+            "        print(\"base\", e)\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect("the alias must name the source module's class, never a false MRO conflict");
+    let main = fs::read_to_string(krate.root.join("src/main.rs")).unwrap();
+    assert!(!main.contains("compile_error !"), "generated: {}", main);
+    // The raise records the chain: RequestException, its builtin, then
+    // the imported class under the alias spelling with ITS ancestor.
+    let mut from = 0;
+    for a in ["\"ContentDecodingError\"", "\"RequestException\"", "\"BaseHTTPError\"", "\"Exception\""] {
+        let at = main[from..]
+            .find(a)
+            .unwrap_or_else(|| panic!("{a} is not in the chain after {from}: {main}"));
+        from += at + a.len();
+    }
+    assert!(
+        !main.contains("(\"HTTPError\") . to_string ()") && !main.contains("(\"HTTPError\").to_string()"),
+        "the local HTTPError must not be an ancestor: {}",
+        main
+    );
+    assert!(
+        krate.warnings.iter().any(|w| w.contains(
+            "`BaseHTTPError` imports `HTTPError` of `base` beside the crate's own class `HTTPError` of the same name"
+        )),
+        "warnings: {:?}",
+        krate.warnings
+    );
+}
+
+#[test]
 fn shared_read_modify_write_matches_python_at_runtime() {
     // A read-modify-write through a container-held (shared) object: the
     // target is read ONCE before the operand runs (an operand that

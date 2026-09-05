@@ -170,7 +170,7 @@ pub type ModuleClasses = (
     Option<Vec<String>>,
     Vec<ClassDef>,
     Vec<(String, String)>,
-    std::collections::HashSet<String>,
+    crate::ast::tree::class_def::ModuleBindings,
 );
 
 pub fn crate_emitted_classes(
@@ -178,12 +178,22 @@ pub fn crate_emitted_classes(
     this_classes: &[ClassDef],
     options: &PythonOptions,
 ) -> Vec<ModuleClasses> {
+    crate::ast::tree::module::with_module_externals_memo(|| {
+        crate_emitted_classes_walk(this_body, this_classes, options)
+    })
+}
+
+fn crate_emitted_classes_walk(
+    this_body: &[crate::Statement],
+    this_classes: &[ClassDef],
+    options: &PythonOptions,
+) -> Vec<ModuleClasses> {
     let mut per_module: Vec<ModuleClasses> = Vec::new();
-    let (this_aliases, this_externals) = crate::ast::tree::class_def::module_name_aliases(
+    let (this_aliases, this_bindings) = crate::ast::tree::class_def::module_name_aliases(
         &crate::ast::tree::module::splice_gated_branches(this_body.to_vec(), options),
         options,
     );
-    per_module.push((None, this_classes.to_vec(), this_aliases, this_externals));
+    per_module.push((None, this_classes.to_vec(), this_aliases, this_bindings));
     for (path, module) in options.module_defs.iter() {
         if path[..] == options.this_module_path[..] {
             continue;
@@ -204,11 +214,11 @@ pub fn crate_emitted_classes(
         };
         module_opts.this_module_path = path.clone();
         let defs = crate::ast::tree::module::emitted_class_defs(module, &module_opts);
-        let (aliases, externals) = crate::ast::tree::class_def::module_name_aliases(
+        let (aliases, bindings) = crate::ast::tree::class_def::module_name_aliases(
             &crate::ast::tree::module::splice_gated_branches(module.raw.body.clone(), &module_opts),
             &module_opts,
         );
-        per_module.push((Some(path.clone()), defs, aliases, externals));
+        per_module.push((Some(path.clone()), defs, aliases, bindings));
     }
     per_module
 }
