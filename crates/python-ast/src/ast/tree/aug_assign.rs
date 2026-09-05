@@ -170,6 +170,38 @@ impl CodeGen for AugAssign {
             });
         }
 
+        // A COMPUTED shared receiver (`pick().n += 5`, `picks[nxt()].x +=
+        // 7`) is evaluated ONCE — Python evaluates the target's receiver
+        // once, reads the attribute, evaluates the operand, then stores.
+        // The receiver's PyRef is bound first and the statement lowered
+        // again on that name (typed as the receiver's class), so the load
+        // and the store address the same object (Devin review on #331). A
+        // value-class receiver stores in place and is not rebound (a copy
+        // would lose the store).
+        if let ExprType::Attribute(attr) = &self.target
+            && !matches!(attr.value.as_ref(), ExprType::Name(_))
+            && crate::ast::tree::attribute::shared_receiver(&attr.value, &ctx, &symbols, &options)
+            && let Some((class, _)) =
+                crate::receiver_class_for_read(&attr.value, &ctx, &symbols, &options)
+        {
+            let recv = attr.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let mut inner_options = options.clone();
+            let mut name_types = (*inner_options.name_types).clone();
+            name_types.insert("__rython_recv".to_string(), crate::TypeInfo::Class(class.name.clone()));
+            inner_options.name_types = std::rc::Rc::new(name_types);
+            let mut rebound = self.clone();
+            rebound.target = ExprType::Attribute(crate::ast::tree::attribute::Attribute {
+                value: Box::new(ExprType::Name(crate::ast::tree::name::Name {
+                    id: "__rython_recv".to_string(),
+                })),
+                attr: attr.attr.clone(),
+                ctx: attr.ctx.clone(),
+            });
+            let inner = rebound.to_rust(ctx, inner_options, symbols)?;
+            // The trailing `;` ends the store's `RefMut` temporary before
+            // the bound receiver goes out of scope.
+            return Ok(quote!({ let __rython_recv = #recv; #inner; }));
+        }
         // A PROPERTY target (`d.x += v` where `x` is `@property` with a
         // setter): the read goes through the getter and the store through
         // the setter call, the current value bound first, then the

@@ -9455,6 +9455,103 @@ fn an_external_import_alias_never_resolves_to_an_unrelated_crate_class() {
 }
 
 #[test]
+fn shared_read_modify_write_matches_python_at_runtime() {
+    // A read-modify-write through a container-held (shared) object: the
+    // target is read ONCE before the operand runs (an operand that
+    // mutates the same object never changes what the operation reads),
+    // for the plain store, every augmented operator, and a property with
+    // a setter; a COMPUTED receiver (`pick().n += 5`, `picks[nxt()].x +=
+    // 7`) is evaluated once, so the load and the store address the same
+    // object, and a plain store evaluates its value before its target's
+    // receiver (Devin review on #331).
+    let scratch = Scratch::new("rmw_rt");
+    let file = scratch.path().join("rmw_rt.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self):\n",
+            "        self.n = 10\n",
+            "        self._x = 1\n",
+            "\n",
+            "    @property\n",
+            "    def x(self) -> int:\n",
+            "        return self._x\n",
+            "\n",
+            "    @x.setter\n",
+            "    def x(self, v: int) -> None:\n",
+            "        self._x = v\n",
+            "\n",
+            "\n",
+            "calls = 0\n",
+            "\n",
+            "\n",
+            "def nxt() -> int:\n",
+            "    global calls\n",
+            "    calls += 1\n",
+            "    return calls % 2\n",
+            "\n",
+            "\n",
+            "class Picker:\n",
+            "    def __init__(self):\n",
+            "        self.items = [Counter(), Counter()]\n",
+            "\n",
+            "    def pick(self) -> Counter:\n",
+            "        return self.items[nxt()]\n",
+            "\n",
+            "\n",
+            "def take(c: Counter) -> int:\n",
+            "    c.n = c.n + 100\n",
+            "    return 3\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    counters = [Counter(), Counter()]\n",
+            "    c = counters[0]\n",
+            "    c.n -= take(c)\n",
+            "    print(c.n, counters[0].n)\n",
+            "    c.n *= take(c)\n",
+            "    print(c.n)\n",
+            "    c.n += take(c)\n",
+            "    print(c.n)\n",
+            "    c.n &= take(c)\n",
+            "    print(c.n)\n",
+            "    d = counters[1]\n",
+            "    d.x = d.x + 1\n",
+            "    d.x += d.x\n",
+            "    print(d.x, counters[1].x)\n",
+            "    p = Picker()\n",
+            "    p.pick().n += 5\n",
+            "    p.pick().x += 7\n",
+            "    p.items[nxt()].n -= 1\n",
+            "    p.items[nxt()].x = p.items[nxt()].x + 100\n",
+            "    print(p.items[0].n, p.items[1].n, p.items[0].x, p.items[1].x, calls)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/rmw_rt"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["7 7", "21", "24", "0", "4 4", "10 14 8 108 5"],
+        "the shared read-modify-write diverged from CPython"
+    );
+}
+
+#[test]
 fn not_implemented_in_a_shared_eq_is_identity_at_runtime() {
     // A shared class's `__eq__` that returns NotImplemented: `t == t` is
     // True (the same object), a second instance is not; when the left

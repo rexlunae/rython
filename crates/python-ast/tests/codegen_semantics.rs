@@ -20776,7 +20776,9 @@ fn a_shared_read_modify_write_reads_the_target_once_before_the_operand() {
     // a setter goes through the getter and the setter in the same order
     // (Devin review on #331: the compound Rust operators read the field
     // after the operand ran; the setter held the mutable borrow while the
-    // getter read).
+    // getter read). Verified against python3: the `rmw` corpus program
+    // (eval/idioms/programs/rmw.expected) and the runtime transcript
+    // `shared_read_modify_write_matches_python_at_runtime`.
     let out = compile(
         concat!(
             "class Counter:\n",
