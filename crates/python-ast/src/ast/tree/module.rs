@@ -3667,7 +3667,7 @@ pub(crate) fn module_def_exception_alias(
     path: &[String],
     name: &str,
 ) -> Option<&'static str> {
-    let module = options.module_defs.get(path)?;
+    let module = options.module_defs.get(module_defs_key(options, path)?)?;
     let module: &crate::Module = module;
     // A module-scope alias (`Error = socket.error`), under any control
     // flow — the try/except import fallback included.

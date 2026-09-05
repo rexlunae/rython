@@ -1655,10 +1655,11 @@ fn resolve_construction_class_depth(
             resolve_construction_class_depth(&v.id, symbols, options, depth + 1)
         }
         Some(SymbolTableNode::ImportFrom(i)) => {
+            // By the module-defs KEY: a root-qualified import inside the
+            // package (`from pkg.errors import HTTPError`) resolves to the
+            // stripped key (Devin review on #331).
             let path = i.resolved_module_path(options);
-            if options.module_defs.contains_key(&path) {
-                if name == "RLResolver" {
-                }
+            if let Some(key) = crate::ast::tree::module::module_defs_key(options, &path) {
                 // The DEFINING module's name for the class: an alias
                 // (`from urllib3.util import Timeout as TimeoutSauce`)
                 // binds the ORIGINAL name there.
@@ -1668,7 +1669,7 @@ fn resolve_construction_class_depth(
                     .find(|a| a.asname.as_deref() == Some(name))
                     .map(|a| a.name.clone())
                     .unwrap_or_else(|| name.to_string());
-                crate::resolve_imported_class(options, &path, &defining, 0)
+                crate::resolve_imported_class(options, key, &defining, 0)
             } else {
                 None
             }

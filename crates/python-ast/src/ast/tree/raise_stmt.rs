@@ -1174,17 +1174,24 @@ fn canonical_exception_class_bound(
     // the alias spelling (matched by that name at runtime), its own
     // ancestors unknown, and said so — the external-module divergence
     // (the sweep on issue #137).
-    if external
-        && let Some(SymbolTableNode::Alias(canonical)) = scope.get(name)
-        && matches!(scope.get(canonical), Some(SymbolTableNode::ClassDef(_)))
-    {
+    // The same for an `as` binding whose bare name is not a local class
+    // (a crate re-export of an external name, `from pkg.compat import
+    // JSONDecodeError as CompatJSONDecodeError`): the bare name would
+    // otherwise read as a builtin by its spelling alone (Devin review on
+    // #331).
+    if external && let Some(SymbolTableNode::Alias(canonical)) = scope.get(name) {
         if let Some(builtin) = imported_exception_alias(name, scope, Some(options)) {
             return Some((builtin.to_string(), None));
         }
+        let beside = if matches!(scope.get(canonical), Some(SymbolTableNode::ClassDef(_))) {
+            format!("bound beside the crate's own class `{canonical}`")
+        } else {
+            format!("of `{canonical}`")
+        };
         options.definition_warnings.borrow_mut().push(format!(
-            "`{name}` is an external import bound beside the crate's own class `{canonical}`: \
-             as a base or a handler it is matched by the name `{name}` at runtime and its \
-             own ancestors are unknown (the external-module divergence)"
+            "`{name}` is an external import {beside}: as a base or a handler it is matched \
+             by the name `{name}` at runtime and its own ancestors are unknown (the \
+             external-module divergence)"
         ));
         return Some((name.to_string(), None));
     }

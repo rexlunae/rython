@@ -467,6 +467,10 @@ pub(crate) fn module_name_aliases_depth(
                         &i.resolved_module_path(options),
                     ) =>
                 {
+                    // The module-defs KEY (a root-qualified `from pkg.compat
+                    // import ...` inside the package resolves to the
+                    // stripped key), for the source lookup and the record
+                    // alike (Devin review on #331).
                     let source = i.resolved_module_path(options);
                     let source_key = crate::ast::tree::module::module_defs_key(options, &source)
                         .map(<[String]>::to_vec)
@@ -474,7 +478,7 @@ pub(crate) fn module_name_aliases_depth(
                     for a in &i.names {
                         let local = a.asname.as_deref().unwrap_or(&a.name);
                         if crate::ast::tree::module::module_binds_externally(
-                            options, &source, &a.name, depth,
+                            options, &source_key, &a.name, depth,
                         ) {
                             bind(bindings, local, EXTERNAL_ALTERNATIVE, nested);
                         } else if local != a.name {

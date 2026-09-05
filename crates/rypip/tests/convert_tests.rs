@@ -9611,11 +9611,29 @@ fn an_external_alias_base_is_judged_by_the_defining_module_from_any_raise_site()
         ),
     )
     .unwrap();
+    // The same re-import spelled ROOT-QUALIFIED (`from extbase.compat
+    // import ...` inside the package): the source is looked up by its
+    // module-defs key, so the external identity survives (Devin review
+    // on #331).
+    fs::write(
+        pkg.join("decode2.py"),
+        concat!(
+            "from extbase.compat import JSONDecodeError as CompatJSONDecodeError\n",
+            "from extbase.errors import HTTPError\n",
+            "\n",
+            "\n",
+            "class JSONDecodeError2(HTTPError, CompatJSONDecodeError):\n",
+            "    def __init__(self, msg: str) -> None:\n",
+            "        super().__init__(msg)\n",
+        ),
+    )
+    .unwrap();
     fs::write(
         pkg.join("reader.py"),
         concat!(
             "from .errors import IncompleteRead\n",
             "from .decode import JSONDecodeError\n",
+            "from .decode2 import JSONDecodeError2\n",
             "\n",
             "\n",
             "def read(n: int) -> int:\n",
@@ -9623,6 +9641,8 @@ fn an_external_alias_base_is_judged_by_the_defining_module_from_any_raise_site()
             "        raise IncompleteRead(n, 3)\n",
             "    if n > 9:\n",
             "        raise JSONDecodeError(\"bad\")\n",
+            "    if n == 7:\n",
+            "        raise JSONDecodeError2(\"bad7\")\n",
             "    return n\n",
         ),
     )
@@ -9653,6 +9673,11 @@ fn an_external_alias_base_is_judged_by_the_defining_module_from_any_raise_site()
     assert!(
         in_order(&["\"JSONDecodeError\"", "\"HTTPError\"", "\"Exception\"", "\"CompatJSONDecodeError\""]),
         "the crate-module re-import of an external name must end the chain under its alias: {}",
+        reader
+    );
+    assert!(
+        in_order(&["\"JSONDecodeError2\"", "\"HTTPError\"", "\"Exception\"", "\"CompatJSONDecodeError\""]),
+        "the root-qualified re-import must end the chain under its alias too: {}",
         reader
     );
     for expected in [
