@@ -20261,3 +20261,96 @@ fn builtin_bases_take_their_full_mro_into_the_merge() {
         out
     );
 }
+
+#[test]
+fn a_copy_of_a_runtime_ambiguous_alias_is_ambiguous_too() {
+    // `try: R = A / except: R = B`, then `S = R`: S is decided at runtime
+    // as R is — a base, a raise, a handler, and an issubclass naming S
+    // are loud (Devin review on #330).
+    let err = compile_err(
+        concat!(
+            "class A(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class B(Exception):\n",
+            "    pass\n",
+            "\n",
+            "try:\n",
+            "    R = A\n",
+            "except NameError:\n",
+            "    R = B\n",
+            "S = R\n",
+            "\n",
+            "class Leaf(S):\n",
+            "    pass\n",
+        ),
+        "alias_copy_base.py",
+    );
+    assert!(err.contains("bound to more than one class"), "error: {}", err);
+    let out = compile(
+        concat!(
+            "class A(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class B(Exception):\n",
+            "    pass\n",
+            "\n",
+            "try:\n",
+            "    R = A\n",
+            "except NameError:\n",
+            "    R = B\n",
+            "S = R\n",
+            "\n",
+            "def f() -> None:\n",
+            "    try:\n",
+            "        raise S(\"x\")\n",
+            "    except S:\n",
+            "        pass\n",
+        ),
+        "alias_copy_use.py",
+    );
+    assert!(out.matches("compile_error !").count() >= 2, "generated: {}", out);
+    assert!(out.contains("`S` is bound to more than one class"), "generated: {}", out);
+    let err = compile_err(
+        concat!(
+            "class A(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class B(Exception):\n",
+            "    pass\n",
+            "\n",
+            "try:\n",
+            "    R = A\n",
+            "except NameError:\n",
+            "    R = B\n",
+            "S = R\n",
+            "\n",
+            "def f() -> bool:\n",
+            "    return issubclass(S, A)\n",
+        ),
+        "alias_copy_issubclass.py",
+    );
+    assert!(err.contains("bound to more than one class"), "error: {}", err);
+}
+
+#[test]
+fn a_cyclic_exception_chain_is_refused() {
+    // `class A(Exception)` then `class A(A)`: the name-keyed model has
+    // one `A`, whose base is itself — a cycle, refused at the
+    // definition, never a partial MRO (Devin review on #330; the MRO
+    // walk carries the active chain and refuses re-entry too).
+    let err = compile_err(
+        concat!(
+            "class A(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class A(A):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise A(\"x\")\n",
+        ),
+        "raise_cyclic_bases.py",
+    );
+    assert!(err.contains("cyclic inheritance"), "error: {}", err);
+}

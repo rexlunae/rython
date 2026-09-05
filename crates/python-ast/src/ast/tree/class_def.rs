@@ -383,11 +383,24 @@ pub fn compute_exception_classes(
         for (a, t) in aliases.iter() {
             targets.entry(a.as_str()).or_default().insert(t.as_str());
         }
-        let multi: std::collections::HashSet<String> = targets
+        let mut multi: std::collections::HashSet<String> = targets
             .iter()
             .filter(|(_, t)| t.len() > 1)
             .map(|(a, _)| a.to_string())
             .collect();
+        // Transitively: a copy of a runtime-ambiguous alias (`S = R`) is
+        // decided at runtime too (Devin review on #330).
+        loop {
+            let before = multi.len();
+            for (a, t) in aliases.iter() {
+                if multi.contains(t) {
+                    multi.insert(a.clone());
+                }
+            }
+            if multi.len() == before {
+                break;
+            }
+        }
         // Warned once, by the module that owns the binding (every module's
         // conversion recomputes the crate-wide index).
         for a in multi.iter().filter(|_| path.is_none()) {
@@ -2929,6 +2942,21 @@ impl CodeGen for ClassDef {
             // mixins' methods are NOT inherited (the documented divergence,
             // issue #122-family). Single-inheritance classes are unchanged.
             let _ = real_bases; // first base used below; extras dropped
+        }
+        // A base bound to more than one class at runtime (`try: R = A /
+        // except: R = B`, or a copy `S = R` of it): the ambiguity is the
+        // error, before any binding is followed (Devin review on #330).
+        if let Some(base_name) = real_bases.first()
+            && is_runtime_ambiguous_alias(base_name, &options.this_module_path)
+        {
+            return Err(format!(
+                "class `{}` inherits from `{}`, which is bound to more than one class at \
+                 module level (a `try:`/`except:` or an `if` the conversion cannot fold): \
+                 which class it names is decided at runtime, and rython refuses to follow \
+                 one branch silently; bind the name once",
+                self.name, base_name,
+            )
+            .into());
         }
         let base: Option<ClassDef> = match real_bases.first() {
             None => None,

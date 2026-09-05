@@ -1094,15 +1094,34 @@ pub(crate) fn exception_mro(
         name: String,
         def: Option<(crate::ClassDef, crate::SymbolTableScopes)>,
         options: &crate::PythonOptions,
-        depth: usize,
+        active: &mut Vec<String>,
         direct_builtins: &mut std::collections::HashSet<String>,
     ) -> Result<Vec<Entry>, Box<dyn std::error::Error>> {
         let Some((cls, scope)) = def else {
             return builtin_seq(&name);
         };
-        if depth > 32 {
-            return Ok(vec![(name, Some((cls, scope)))]);
+        // A base that re-enters the chain being linearized is a cycle
+        // (`class B(A)` then `A = B`: the name-keyed resolution turns
+        // back on itself): loud, never a partial MRO (Devin review on
+        // #330).
+        if active.contains(&name) {
+            return Err(format!(
+                "class `{}`: cyclic inheritance through {} — a base re-enters the chain \
+                 being linearized, so no MRO exists; rython refuses to invent one",
+                name,
+                active.join(" -> ")
+            )
+            .into());
         }
+        if active.len() > 64 {
+            return Err(format!(
+                "class `{}`: the base chain is deeper than 64 classes; rython refuses to \
+                 linearize it",
+                name
+            )
+            .into());
+        }
+        active.push(name.clone());
         // Each base by its canonical name, with its definition: a crate
         // class; a builtin (its canonical MRO head, recorded as a direct
         // builtin base); a stdlib-module spelling (`ssl.SSLError`); an
@@ -1163,10 +1182,11 @@ pub(crate) fn exception_mro(
                 }
             }
         }
-        let mut seqs: Vec<Vec<Entry>> = bases
-            .iter()
-            .map(|(n, d)| linearize(n.clone(), d.clone(), options, depth + 1, direct_builtins))
-            .collect::<Result<_, _>>()?;
+        let mut seqs: Vec<Vec<Entry>> = Vec::new();
+        for (n, d) in &bases {
+            seqs.push(linearize(n.clone(), d.clone(), options, active, direct_builtins)?);
+        }
+        active.pop();
         seqs.push(bases.clone());
         let mut out: Vec<Entry> = vec![(name, Some((cls, scope)))];
         // C3 merge: take the first head that is in no other sequence's
@@ -1206,11 +1226,12 @@ pub(crate) fn exception_mro(
         Ok(out)
     }
     let mut direct_builtins: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut active: Vec<String> = Vec::new();
     let full = linearize(
         cls.name.clone(),
         Some((cls.clone(), scope.clone())),
         options,
-        0,
+        &mut active,
         &mut direct_builtins,
     )?;
     // The recorded chain: the crate's classes and the builtins they
