@@ -2326,6 +2326,16 @@ impl<'a> CodeGen for Call {
                         let a = &rendered[0];
                         return Ok(quote!(zip_many(#a)));
                     }
+                    // A PLAIN zip(a, b) (charset_normalizer's zipped
+                    // pair-loops — round 99): the runtime zip over two
+                    // Vecs; the one-arg star form above is the splat. The
+                    // guarded arm must not let the plain call fall to the
+                    // builtin match's unreachable.
+                    "zip" if self.args.len() == 2 => {
+                        let a = &rendered[0];
+                        let b = &rendered[1];
+                        return Ok(quote!(zip(#a, #b)));
+                    }
     "min" | "max" => {
                         let mut key = None;
                         let mut default = None;
@@ -3445,6 +3455,24 @@ impl<'a> CodeGen for Call {
                         return Ok(match rendered.as_slice() {
                             [p] => quote!(open(&(#p), None::<&str>)?),
                             [p, m] => quote!(open(&(#p), Some(#m))?),
+                            // open(path, mode, buffering, encoding, errors)
+                            // — Python's full signature (charset_normalizer's
+                            // CLI opens with a bufsize, an encoding, and an
+                            // errors policy): rython's text mode is always
+                            // UTF-8 with the default buffer, so the extra
+                            // knobs are runtime-behavior choices that cannot
+                            // vary — the call proceeds with the mode, and
+                            // the drop is reported through -W (the
+                            // documented encoding/buffering divergence).
+                            [p, m, ..] => {
+                                options.definition_warnings.borrow_mut().push(format!(
+                                    "open({}, ...) passes only the path and mode: rython's \
+                                     text mode is always UTF-8 with the default buffer \
+                                     (the encoding/buffering divergence)",
+                                    bname
+                                ));
+                                quote!(open(&(#p), Some(#m))?)
+                            }
                             _ => {
                                 return Err("open() takes 1 or 2 arguments (path and mode)"
                                     .to_string()
