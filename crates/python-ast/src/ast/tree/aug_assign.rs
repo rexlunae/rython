@@ -170,6 +170,34 @@ impl CodeGen for AugAssign {
             });
         }
 
+        // A PROPERTY target (`d.x += v` where `x` is `@property` with a
+        // setter): the read goes through the getter and the store through
+        // the setter call, the current value bound first, then the
+        // operand, then the setter's (mutable) borrow — the same order as
+        // a field (Devin review on #331).
+        if let ExprType::Attribute(attr) = &self.target
+            && let Some((class, _)) = crate::receiver_class(&attr.value, &ctx, &symbols, &options)
+            && class.is_property_setter(&attr.attr)
+        {
+            let recv = attr.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let load = self.target.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let value = self.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let setter = crate::safe_ident(&format!("{}_set", attr.attr));
+            let combined = combine_op(&self.op, &quote!(__rython_load), &quote!(__rython_val))?;
+            let receiver_is_self = matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "self");
+            if crate::ast::tree::shared::is_shared(&class.name) && !receiver_is_self {
+                return Ok(quote! {{
+                    let __rython_load = #load;
+                    let __rython_val = #value;
+                    (#recv).borrow_mut().#setter(#combined)?;
+                }});
+            }
+            return Ok(quote! {{
+                let __rython_load = #load;
+                let __rython_val = #value;
+                #recv.#setter(#combined)?;
+            }});
+        }
         // The `self.<field>` target's Rust type, captured before the moves
         // below: an Option or boxed field changes the aug-op (the inner
         // arithmetic).
@@ -222,8 +250,18 @@ impl CodeGen for AugAssign {
             crate::TypeInfo::Option(_)
         );
 
-        // The operand: a name or a constant takes no borrow and renders
-        // in place; anything else may read the same object.
+        // A shared store binds the target's CURRENT value first — Python
+        // evaluates the target once, then the operand, then stores — so
+        // an operand that mutates the same object (`c.n -= take(c)`)
+        // never changes what the operation reads, whatever the operator
+        // (Devin review on #331: the typed fast paths `-=`/`*=` read the
+        // field after the operand ran). Then the operand: a name or a
+        // constant takes no borrow and renders in place; anything else
+        // may read the same object and is bound too.
+        if shared_store {
+            let load = shared_load.take().expect("the shared store rendered its load");
+            prelude.extend(quote!(let __rython_load = #load;));
+        }
         let operand_reads = !matches!(self.value, ExprType::Name(_) | ExprType::Constant(_));
         let value = self.value.to_rust(ctx, options, symbols)?;
         let value = if shared_store && operand_reads {
@@ -231,6 +269,17 @@ impl CodeGen for AugAssign {
             quote!(__rython_val)
         } else {
             value
+        };
+        // A compound Rust operator (`-=`, `*=`, `&=`, ...) reads the place
+        // at store time: through a shared receiver the store reads the
+        // bound load instead, one rule for every operator.
+        let compound = |op: &BinOps, in_place: TokenStream| -> Result<TokenStream, Box<dyn std::error::Error>> {
+            if shared_store {
+                let combined = combine_op(op, &target_load, &value)?;
+                Ok(quote!(#target = #combined))
+            } else {
+                Ok(in_place)
+            }
         };
 
         // Generate the appropriate augmented assignment operator
@@ -324,10 +373,10 @@ impl CodeGen for AugAssign {
                     Some(crate::TypeInfo::PyValue) => {
                         Ok(quote!(#target = (#target_load).py_sub(&(#value))))
                     }
-                    _ => Ok(quote!(#target -= #value)),
+                    _ => compound(&BinOps::Sub, quote!(#target -= #value)),
                 }
             }
-            BinOps::Mult => Ok(quote!(#target *= #value)),
+            BinOps::Mult => compound(&BinOps::Mult, quote!(#target *= #value)),
             // Python's `/` is TRUE division: `x /= 2` on an int yields a
             // float. Route through py_div (numeric → f64, numpy arrays →
             // elementwise) instead of Rust's truncating `/=` or an `as f64`
@@ -341,7 +390,7 @@ impl CodeGen for AugAssign {
             // ZeroDivisionError (issue #75).
             BinOps::FloorDiv => Ok(quote!(#target = py_floordiv(#target_load, #value)?)),
             BinOps::Mod => Ok(quote!(#target = py_mod(#target_load, #value)?)),
-            BinOps::BitAnd => Ok(quote!(#target &= #value)),
+            BinOps::BitAnd => compound(&BinOps::BitAnd, quote!(#target &= #value)),
             BinOps::BitOr => {
                 // An Option-typed target (`ssl_options |= X` where the
                 // local is `int | None` — urllib3's ssl_): OR the inner
@@ -356,12 +405,12 @@ impl CodeGen for AugAssign {
                             ),
                         }
                     }),
-                    _ => Ok(quote!(#target |= #value)),
+                    _ => compound(&BinOps::BitOr, quote!(#target |= #value)),
                 }
             }
-            BinOps::BitXor => Ok(quote!(#target ^= #value)),
-            BinOps::LShift => Ok(quote!(#target <<= #value)),
-            BinOps::RShift => Ok(quote!(#target >>= #value)),
+            BinOps::BitXor => compound(&BinOps::BitXor, quote!(#target ^= #value)),
+            BinOps::LShift => compound(&BinOps::LShift, quote!(#target <<= #value)),
+            BinOps::RShift => compound(&BinOps::RShift, quote!(#target >>= #value)),
             BinOps::Pow => {
                 // Rust doesn't have **= operator, so we need to expand it
                 Ok(quote!(#target = py_pow(#target_load, #value)))
@@ -376,16 +425,6 @@ impl CodeGen for AugAssign {
             },
         };
         let stmt = stmt?;
-        // The load is bound only when the operator's lowering read it
-        // (the typed fast paths `x -= v` / `x *= v` store in place and
-        // never do — an unused binding would be a warning in the
-        // generated crate).
-        if shared_store && stmt.to_string().contains("__rython_load") {
-            let load = shared_load.take().expect("the shared store rendered its load");
-            let mut with_load = quote!(let __rython_load = #load;);
-            with_load.extend(prelude);
-            prelude = with_load;
-        }
         Ok(if prelude.is_empty() {
             stmt
         } else {

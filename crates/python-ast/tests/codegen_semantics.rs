@@ -14732,8 +14732,12 @@ fn a_container_stored_mutated_class_is_shared_and_a_fetch_local_mutates_the_one_
         "the container holds references to the shared class: {}",
         out
     );
+    // The read-modify-write binds the current value first, then stores
+    // through the mutable borrow (one rule for every operator).
     assert!(
-        flat.contains(").borrow_mut().qty-=qty") && flat.contains(").borrow().qty.clone()"),
+        flat.contains("let__rython_load=")
+            && flat.contains(").borrow().qty.clone()")
+            && flat.contains(").borrow_mut().qty=__rython_load-qty"),
         "the mutation borrows the one object mutably, reading through a shared borrow: {}",
         out
     );
@@ -20760,6 +20764,67 @@ fn an_explicit_eq_call_on_a_declining_shared_class_is_loud() {
     );
     assert!(out.contains("compile_error !"), "generated: {}", out);
     assert!(out.contains("explicit `Tag.__eq__(...)` call"), "generated: {}", out);
+}
+
+#[test]
+fn a_shared_read_modify_write_reads_the_target_once_before_the_operand() {
+    // `c.n -= take(c)` where `take` mutates `c.n`: Python reads the
+    // target ONCE, then runs the operand, then stores — for every
+    // operator, the typed fast paths included (`-=`, `*=`, `&=`), the
+    // current value is bound first, the operand next, and the store
+    // reads the bound value through the mutable borrow. A property with
+    // a setter goes through the getter and the setter in the same order
+    // (Devin review on #331: the compound Rust operators read the field
+    // after the operand ran; the setter held the mutable borrow while the
+    // getter read).
+    let out = compile(
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self):\n",
+            "        self.n = 10\n",
+            "        self._x = 1\n",
+            "    @property\n",
+            "    def x(self) -> int:\n",
+            "        return self._x\n",
+            "    @x.setter\n",
+            "    def x(self, v: int) -> None:\n",
+            "        self._x = v\n",
+            "\n",
+            "def take(c: Counter) -> int:\n",
+            "    c.n = c.n + 100\n",
+            "    return 3\n",
+            "\n",
+            "def main() -> None:\n",
+            "    counters = [Counter(), Counter()]\n",
+            "    c = counters[0]\n",
+            "    c.n -= take(c)\n",
+            "    c.n *= take(c)\n",
+            "    c.n &= take(c)\n",
+            "    d = counters[1]\n",
+            "    d.x = d.x + 1\n",
+            "    d.x += d.x\n",
+        ),
+        "shared_rmw.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        flat.contains("let__rython_load=(c).borrow().n.clone();let__rython_val=take(Clone::clone(&(c)))?;(c).borrow_mut().n=__rython_load-__rython_val"),
+        "generated: {}",
+        out
+    );
+    assert!(flat.contains("(c).borrow_mut().n=__rython_load*__rython_val"), "generated: {}", out);
+    assert!(flat.contains("(c).borrow_mut().n=__rython_load&__rython_val"), "generated: {}", out);
+    assert!(
+        flat.contains("let__rython_val=((d).borrow().x()?).py_add(&((1)asi64));(d).borrow_mut().x_set(__rython_val)?;"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        flat.contains("let__rython_load=(d).borrow().x()?;let__rython_val=(d).borrow().x()?;(d).borrow_mut().x_set((__rython_load).py_add(&(__rython_val)))?;"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]

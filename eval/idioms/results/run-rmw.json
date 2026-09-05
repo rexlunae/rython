@@ -1,0 +1,106 @@
+{
+  "converter_commit": "fbccc0a",
+  "repo_head": "fbccc0a",
+  "rypip_path": "target/release/rypip",
+  "oracle": "CPython 3.11.15",
+  "passed": 13,
+  "total": 15,
+  "passing": [
+    "bank",
+    "clauses",
+    "handoff",
+    "inventory",
+    "ledger",
+    "matrix",
+    "records",
+    "rmw",
+    "shapes",
+    "text_stats",
+    "tokenizer",
+    "tree",
+    "views"
+  ],
+  "programs": {
+    "bank": {
+      "program": "bank",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "clauses": {
+      "program": "clauses",
+      "warnings": 1,
+      "status": "pass"
+    },
+    "handoff": {
+      "program": "handoff",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "inventory": {
+      "program": "inventory",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "ledger": {
+      "program": "ledger",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "matrix": {
+      "program": "matrix",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "pipeline": {
+      "program": "pipeline",
+      "warnings": 13,
+      "status": "build-failed",
+      "errors": 5,
+      "histogram": {
+        "E0277": 3,
+        "E0308": 1,
+        "E0282": 1
+      }
+    },
+    "records": {
+      "program": "records",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "rmw": {
+      "program": "rmw",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "schedule": {
+      "program": "schedule",
+      "status": "convert-failed",
+      "detail": ") -> core::result::Result<(), anyhow::Error>, core::result::Result<(), anyhow::Error>>\n   5: std::rt::lang_start::<core::result::Result<(), anyhow::Error>>::{closure#0}\n   6: std::rt::lang_start_internal\n   7: main\n   8: __libc_start_call_main\n             at ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16\n   9: __libc_start_main_impl\n             at ./csu/../csu/libc-start.c:360:3\n  10: _start"
+    },
+    "shapes": {
+      "program": "shapes",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "text_stats": {
+      "program": "text_stats",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "tokenizer": {
+      "program": "tokenizer",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "tree": {
+      "program": "tree",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "views": {
+      "program": "views",
+      "warnings": 0,
+      "status": "pass"
+    }
+  }
+}

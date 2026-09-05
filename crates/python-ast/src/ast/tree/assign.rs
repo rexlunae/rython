@@ -1594,6 +1594,16 @@ impl<'a> CodeGen for Assign {
                     ExprType::Name(n) if n.id == "self"
                 );
                 if crate::ast::tree::shared::is_shared(&class.name) && !receiver_is_self {
+                    // The value is bound BEFORE the setter's mutable
+                    // borrow: `c.x = c.x + 1` reads the same object
+                    // through the getter (the same rule as a field store
+                    // — Devin review on #331).
+                    if !matches!(value_expr, ExprType::Name(_) | ExprType::Constant(_)) {
+                        return Ok(quote!({
+                            let __rython_val = #value;
+                            (#recv).borrow_mut().#setter(__rython_val)?;
+                        }));
+                    }
                     return Ok(quote!((#recv).borrow_mut().#setter(#value)?;));
                 }
                 return Ok(quote!(#recv.#setter(#value)?;));

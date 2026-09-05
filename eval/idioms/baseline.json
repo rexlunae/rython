@@ -25,6 +25,9 @@
     "records": {
       "status": "pass"
     },
+    "rmw": {
+      "status": "pass"
+    },
     "schedule": {
       "status": "convert-failed"
     },

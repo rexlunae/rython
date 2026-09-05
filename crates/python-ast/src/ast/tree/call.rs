@@ -5461,7 +5461,9 @@ impl<'a> CodeGen for Call {
                             symbols.clone(),
                         )?);
                     }
-                    return Ok(quote!(#cname::new(#(#args),*)?));
+                    // The one wrap for a shared class, on this path too
+                    // (Devin review on #331).
+                    return Ok(shared_construction(&class.name, quote!(#cname::new(#(#args),*)?)));
                 }
                 match class.method_on_mro_with_options("__init__", &class_symbols, &options) {
                     Some(init) => {
@@ -5686,10 +5688,18 @@ impl<'a> CodeGen for Call {
                         symbols.clone(),
                     )?);
                 }
+                // A module-qualified construction of a shared class wraps
+                // like the bare-name spelling (Devin review on #331).
                 if args.is_empty() {
-                    return Ok(quote!(crate::#(#path_parts)::*::#cname::new()?));
+                    return Ok(shared_construction(
+                        &attr.attr,
+                        quote!(crate::#(#path_parts)::*::#cname::new()?),
+                    ));
                 }
-                return Ok(quote!(crate::#(#path_parts)::*::#cname::new(#(#args),*)?));
+                return Ok(shared_construction(
+                    &attr.attr,
+                    quote!(crate::#(#path_parts)::*::#cname::new(#(#args),*)?),
+                ));
             }
         }
 
