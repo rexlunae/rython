@@ -14732,8 +14732,12 @@ fn a_container_stored_mutated_class_is_shared_and_a_fetch_local_mutates_the_one_
         "the container holds references to the shared class: {}",
         out
     );
+    // The read-modify-write binds the current value first, then stores
+    // through the mutable borrow (one rule for every operator).
     assert!(
-        flat.contains(").borrow_mut().qty-=qty") && flat.contains(").borrow().qty.clone()"),
+        flat.contains("let__rython_load=")
+            && flat.contains(").borrow().qty.clone()")
+            && flat.contains(").borrow_mut().qty=__rython_load-qty"),
         "the mutation borrows the one object mutably, reading through a shared borrow: {}",
         out
     );
@@ -20760,6 +20764,160 @@ fn an_explicit_eq_call_on_a_declining_shared_class_is_loud() {
     );
     assert!(out.contains("compile_error !"), "generated: {}", out);
     assert!(out.contains("explicit `Tag.__eq__(...)` call"), "generated: {}", out);
+}
+
+#[test]
+fn a_shared_read_modify_write_reads_the_target_once_before_the_operand() {
+    // `c.n -= take(c)` where `take` mutates `c.n`: Python reads the
+    // target ONCE, then runs the operand, then stores — for every
+    // operator, the typed fast paths included (`-=`, `*=`, `&=`), the
+    // current value is bound first, the operand next, and the store
+    // reads the bound value through the mutable borrow. A property with
+    // a setter goes through the getter and the setter in the same order
+    // (Devin review on #331: the compound Rust operators read the field
+    // after the operand ran; the setter held the mutable borrow while the
+    // getter read). Verified against python3: the `rmw` corpus program
+    // (eval/idioms/programs/rmw.expected) and the runtime transcript
+    // `shared_read_modify_write_matches_python_at_runtime`.
+    let out = compile(
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self):\n",
+            "        self.n = 10\n",
+            "        self._x = 1\n",
+            "    @property\n",
+            "    def x(self) -> int:\n",
+            "        return self._x\n",
+            "    @x.setter\n",
+            "    def x(self, v: int) -> None:\n",
+            "        self._x = v\n",
+            "\n",
+            "def take(c: Counter) -> int:\n",
+            "    c.n = c.n + 100\n",
+            "    return 3\n",
+            "\n",
+            "def main() -> None:\n",
+            "    counters = [Counter(), Counter()]\n",
+            "    c = counters[0]\n",
+            "    c.n -= take(c)\n",
+            "    c.n *= take(c)\n",
+            "    c.n &= take(c)\n",
+            "    d = counters[1]\n",
+            "    d.x = d.x + 1\n",
+            "    d.x += d.x\n",
+        ),
+        "shared_rmw.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        flat.contains("let__rython_load=(c).borrow().n.clone();let__rython_val=take(Clone::clone(&(c)))?;(c).borrow_mut().n=__rython_load-__rython_val"),
+        "generated: {}",
+        out
+    );
+    assert!(flat.contains("(c).borrow_mut().n=__rython_load*__rython_val"), "generated: {}", out);
+    assert!(flat.contains("(c).borrow_mut().n=__rython_load&__rython_val"), "generated: {}", out);
+    assert!(
+        flat.contains("let__rython_val=((d).borrow().x()?).py_add(&((1)asi64));(d).borrow_mut().x_set(__rython_val)?;"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        flat.contains("let__rython_load=(d).borrow().x()?;let__rython_val=(d).borrow().x()?;(d).borrow_mut().x_set((__rython_load).py_add(&(__rython_val)))?;"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn a_binding_under_the_reserved_temporary_prefix_is_refused() {
+    // `__rython_recv`, `__rython_load`, ... are the conversion's own
+    // temporaries in the generated crate: a program binding such a name
+    // (a local, a parameter, a def, a loop target, a walrus) would be
+    // shadowed by them, or shadow them, silently — refused at the
+    // module, naming the binding and its line (Devin review on #331).
+    let err = compile_err(
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "def pick(cs: list[Counter]) -> Counter:\n",
+            "    return cs[0]\n",
+            "\n",
+            "def f() -> None:\n",
+            "    cs = [Counter()]\n",
+            "    __rython_recv = 5\n",
+            "    pick(cs).n += __rython_recv\n",
+        ),
+        "reserved_local.py",
+    );
+    assert!(err.contains("`__rython_recv` (line 10)") && err.contains("reserves"), "error: {}", err);
+    let err = compile_err(
+        concat!("def g(__rython_load: int) -> int:\n", "    return __rython_load\n"),
+        "reserved_param.py",
+    );
+    assert!(err.contains("`__rython_load` (line 1)"), "error: {}", err);
+    let err = compile_err(
+        concat!("def h(xs: list[int]) -> int:\n", "    return sum((__rython_val := x) for x in xs)\n"),
+        "reserved_walrus.py",
+    );
+    assert!(err.contains("`__rython_val`"), "error: {}", err);
+    // Expression-local bindings too: a comprehension target (list, set,
+    // dict, generator) and a lambda parameter (Devin review on #331).
+    for (src, name, tag) in [
+        ("def k(xs: list[int]) -> list[int]:\n    return [__rython_idx * 2 for __rython_idx in xs]\n", "`__rython_idx`", "list"),
+        ("def k(xs: list[int]) -> set[int]:\n    return {__rython_s for __rython_s in xs}\n", "`__rython_s`", "set"),
+        ("def k(xs: list[int]) -> dict[int, int]:\n    return {__rython_k: 1 for __rython_k in xs}\n", "`__rython_k`", "dict"),
+        ("def k(xs: list[int]) -> int:\n    return sum(__rython_g for __rython_g in xs)\n", "`__rython_g`", "gen"),
+        ("def k(xs: list[int]) -> list[int]:\n    return list(map(lambda __rython_p: __rython_p + 1, xs))\n", "`__rython_p`", "lambda"),
+        ("from dataclasses import dataclass\n\n@dataclass\nclass D:\n    __rython_base: int\n", "`__rython_base`", "annotated"),
+        ("class E:\n    __rython_kind: str = \"e\"\n", "`__rython_kind`", "annotated_assign"),
+    ] {
+        let err = compile_err(src, &format!("reserved_{tag}.py"));
+        assert!(err.contains(name), "{tag}: {}", err);
+    }
+}
+
+#[test]
+fn an_aliased_external_import_shadowed_by_a_local_class_is_an_external_base() {
+    // `from http.client import IncompleteRead as httplib_IncompleteRead`
+    // beside the crate's own `IncompleteRead(HTTPError,
+    // httplib_IncompleteRead)` (urllib3): the alias names the EXTERNAL
+    // class, never the local one of the same bare name — following it
+    // into the local class read a cycle where Python has an external
+    // base. The external branch is recorded under the alias spelling,
+    // with a definition warning; the class stays an exception through
+    // HTTPError (the sweep on issue #137).
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "from http.client import IncompleteRead as httplib_IncompleteRead\n",
+            "\n",
+            "class HTTPError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class IncompleteRead(HTTPError, httplib_IncompleteRead):\n",
+            "    def __init__(self, partial: int, expected: int) -> None:\n",
+            "        self.partial = partial\n",
+            "        self.expected = expected\n",
+            "        super().__init__(partial, expected)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise IncompleteRead(3, 7)\n",
+        ),
+        "raise_external_shadowed_base.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("vec ! [(\"HTTPError\") . to_string () , (\"Exception\") . to_string () , (\"httplib_IncompleteRead\") . to_string ()]"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("`httplib_IncompleteRead` is an external import bound beside the crate's own class `IncompleteRead`")),
+        "warnings: {:?}",
+        warnings
+    );
 }
 
 #[test]

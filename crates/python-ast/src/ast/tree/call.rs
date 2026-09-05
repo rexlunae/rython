@@ -1655,10 +1655,11 @@ fn resolve_construction_class_depth(
             resolve_construction_class_depth(&v.id, symbols, options, depth + 1)
         }
         Some(SymbolTableNode::ImportFrom(i)) => {
+            // By the module-defs KEY: a root-qualified import inside the
+            // package (`from pkg.errors import HTTPError`) resolves to the
+            // stripped key (Devin review on #331).
             let path = i.resolved_module_path(options);
-            if options.module_defs.contains_key(&path) {
-                if name == "RLResolver" {
-                }
+            if let Some(key) = crate::ast::tree::module::module_defs_key(options, &path) {
                 // The DEFINING module's name for the class: an alias
                 // (`from urllib3.util import Timeout as TimeoutSauce`)
                 // binds the ORIGINAL name there.
@@ -1668,7 +1669,7 @@ fn resolve_construction_class_depth(
                     .find(|a| a.asname.as_deref() == Some(name))
                     .map(|a| a.name.clone())
                     .unwrap_or_else(|| name.to_string());
-                crate::resolve_imported_class(options, &path, &defining, 0)
+                crate::resolve_imported_class(options, key, &defining, 0)
             } else {
                 None
             }
@@ -5461,7 +5462,9 @@ impl<'a> CodeGen for Call {
                             symbols.clone(),
                         )?);
                     }
-                    return Ok(quote!(#cname::new(#(#args),*)?));
+                    // The one wrap for a shared class, on this path too
+                    // (Devin review on #331).
+                    return Ok(shared_construction(&class.name, quote!(#cname::new(#(#args),*)?)));
                 }
                 match class.method_on_mro_with_options("__init__", &class_symbols, &options) {
                     Some(init) => {
@@ -5517,18 +5520,9 @@ impl<'a> CodeGen for Call {
                                 }
                             }
                         };
-                        // A SHARED class (shared.rs) constructs behind
-                        // `PyRef`; a shared ROOT's value is its sum type
-                        // holding the reference.
-                        if crate::ast::tree::shared::is_shared(&class.name) {
-                            let shared = quote!(stdpython::PyRef::new(#cname::new(#(#args),*)?));
-                            if crate::ast::tree::hierarchy::is_polymorphic_root(&class.name) {
-                                let any = crate::ast::tree::hierarchy::any_ident(&class.name);
-                                return Ok(quote!({ #prelude #any::from(#shared) }));
-                            }
-                            return Ok(quote!({ #prelude #shared }));
-                        }
-                        return Ok(quote!({ #prelude #cname::new(#(#args),*)? }));
+                        let construct =
+                            shared_construction(&class.name, quote!(#cname::new(#(#args),*)?));
+                        return Ok(quote!({ #prelude #construct }));
                     }
                     None => {
                         // The class has NO own __init__ and its base's
@@ -5560,9 +5554,12 @@ impl<'a> CodeGen for Call {
                                  positionally (documented divergence)",
                                 n.id
                             ));
-                            return Ok(quote!(#cname::new(#(#args),*)?));
+                            return Ok(shared_construction(
+                                &class.name,
+                                quote!(#cname::new(#(#args),*)?),
+                            ));
                         }
-                        return Ok(quote!(#cname::new()?));
+                        return Ok(shared_construction(&class.name, quote!(#cname::new()?)));
                     }
                 }
             }
@@ -5692,10 +5689,18 @@ impl<'a> CodeGen for Call {
                         symbols.clone(),
                     )?);
                 }
+                // A module-qualified construction of a shared class wraps
+                // like the bare-name spelling (Devin review on #331).
                 if args.is_empty() {
-                    return Ok(quote!(crate::#(#path_parts)::*::#cname::new()?));
+                    return Ok(shared_construction(
+                        &attr.attr,
+                        quote!(crate::#(#path_parts)::*::#cname::new()?),
+                    ));
                 }
-                return Ok(quote!(crate::#(#path_parts)::*::#cname::new(#(#args),*)?));
+                return Ok(shared_construction(
+                    &attr.attr,
+                    quote!(crate::#(#path_parts)::*::#cname::new(#(#args),*)?),
+                ));
             }
         }
 
@@ -11399,4 +11404,21 @@ pub(crate) fn receiver_is_bytes_like(
         }
         _ => false,
     }
+}
+
+/// A SHARED class (shared.rs) constructs behind `PyRef`; a shared ROOT's
+/// value is its sum type holding the reference. One wrap for every
+/// construction path — a class with its own `__init__` and one without
+/// (a root constructed bare in a root-typed list, `Shape()` beside
+/// `Circle(1.0)`, missed the wrap; the evaluation on issue #137).
+fn shared_construction(class_name: &str, construct: TokenStream) -> TokenStream {
+    if !crate::ast::tree::shared::is_shared(class_name) {
+        return construct;
+    }
+    let shared = quote!(stdpython::PyRef::new(#construct));
+    if crate::ast::tree::hierarchy::is_polymorphic_root(class_name) {
+        let any = crate::ast::tree::hierarchy::any_ident(class_name);
+        return quote!(#any::from(#shared));
+    }
+    shared
 }

@@ -198,7 +198,8 @@ pub fn is_exception_class(class: &ClassDef) -> bool {
     class.bases.iter().any(|b| match b {
         ExprType::Name(n) => {
             is_exception(&n.id)
-                || (is_registered_exception_class(&n.id) && !is_this_module_external(&n.id))
+                || (is_registered_exception_class(&n.id)
+                    && !is_external_in_defining_module(&class.name, &n.id))
         }
         _ => false,
     }) || is_registered_exception_class(&class.name)
@@ -213,6 +214,52 @@ pub fn is_this_module_external(name: &str) -> bool {
     THIS_EXTERNALS.with(|r| r.borrow().contains(name))
 }
 
+/// Whether the module DEFINING the crate class `class` binds `name` by an
+/// external import: the answer for a base of that class, wherever the
+/// class is being linearized from. `httplib_IncompleteRead` in urllib3's
+/// `exceptions.py` is the external class there even when `response.py`
+/// raises `IncompleteRead` (the converting module's own bindings say
+/// nothing about it — the sweep on issue #137). A class the registry
+/// does not know (outside module generation, or a name two modules
+/// define) is judged by the converting module's bindings.
+pub fn is_external_in_defining_module(class: &str, name: &str) -> bool {
+    CLASS_BINDINGS.with(|r| match r.borrow().get(class) {
+        Some(bindings) => bindings.externals.contains(name),
+        None => is_this_module_external(name),
+    })
+}
+
+/// The crate module and defining name an `as` import binds `name` to in
+/// the module being converted (`from urllib3.exceptions import HTTPError
+/// as BaseHTTPError` → (["urllib3", "exceptions"], "HTTPError")), when
+/// that module is part of the crate.
+pub fn this_module_crate_import(name: &str) -> Option<(Vec<String>, String)> {
+    THIS_BINDINGS.with(|r| r.borrow().crate_imports.get(name).cloned())
+}
+
+/// [`this_module_crate_import`] for the module DEFINING the crate class
+/// `class`; a class the registry does not know is judged by the
+/// converting module's bindings.
+pub fn crate_import_in_defining_module(class: &str, name: &str) -> Option<(Vec<String>, String)> {
+    CLASS_BINDINGS.with(|r| match r.borrow().get(class) {
+        Some(bindings) => bindings.crate_imports.get(name).cloned(),
+        None => this_module_crate_import(name),
+    })
+}
+
+/// What a module's import statements say about its names, beside the
+/// alias flow of [`module_name_aliases`]: the names bound by an EXTERNAL
+/// import, and the `as` bindings of CRATE imports with their source
+/// module and defining name — an `as` name is that source's class even
+/// when the importing module binds the bare name to a class of its own
+/// (`HTTPError as BaseHTTPError` in requests' exceptions.py, which
+/// defines `HTTPError` too; the sweep on issue #137).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModuleBindings {
+    pub externals: std::collections::HashSet<String>,
+    pub crate_imports: std::collections::HashMap<String, (Vec<String>, String)>,
+}
+
 thread_local! {
     /// The exception classes of the conversion in progress, by bare
     /// name: the transitive closure over the crate's emitted classes.
@@ -224,6 +271,14 @@ thread_local! {
     /// The names the module being converted binds by an external import.
     static THIS_EXTERNALS: std::cell::RefCell<std::rc::Rc<std::collections::HashSet<String>>> =
         std::cell::RefCell::new(std::rc::Rc::new(std::collections::HashSet::new()));
+    /// The import bindings of the module being converted.
+    static THIS_BINDINGS: std::cell::RefCell<std::rc::Rc<ModuleBindings>> =
+        std::cell::RefCell::new(std::rc::Rc::new(ModuleBindings::default()));
+    /// For each crate class (by unambiguous bare name), the import
+    /// bindings of its DEFINING module.
+    static CLASS_BINDINGS: std::cell::RefCell<
+        std::rc::Rc<std::collections::HashMap<String, ModuleBindings>>,
+    > = std::cell::RefCell::new(std::rc::Rc::new(std::collections::HashMap::new()));
     /// The alias names a module binds to MORE than one target at runtime
     /// (`try: R = Root / except: R = Exception` — which one the program
     /// takes is not static): out of the closure, and loud wherever an
@@ -248,8 +303,11 @@ pub fn is_runtime_ambiguous_alias(name: &str, module: &[String]) -> bool {
 pub struct ExceptionIndex {
     pub classes: std::collections::HashSet<String>,
     pub ambiguous_aliases: std::collections::HashSet<(Vec<String>, String)>,
-    /// The names the converting module binds by an external import.
-    pub this_externals: std::collections::HashSet<String>,
+    /// The import bindings of the converting module.
+    pub this_bindings: ModuleBindings,
+    /// For each crate class by unambiguous bare name, the import
+    /// bindings of its defining module.
+    pub class_bindings: std::collections::HashMap<String, ModuleBindings>,
 }
 
 /// The alternative [`module_name_aliases`] records for a name that a
@@ -312,10 +370,23 @@ pub(crate) fn is_sentinel_alternative(t: &str) -> bool {
 pub(crate) fn module_name_aliases(
     body: &[crate::Statement],
     options: &crate::PythonOptions,
-) -> (Vec<(String, String)>, std::collections::HashSet<String>) {
+) -> (Vec<(String, String)>, ModuleBindings) {
+    module_name_aliases_depth(body, options, 0)
+}
+
+/// [`module_name_aliases`] at `depth` along an import chain: a crate
+/// import's binding is judged by the SOURCE module's own flow (an
+/// external import there is external here), and the chain is bounded.
+pub(crate) fn module_name_aliases_depth(
+    body: &[crate::Statement],
+    options: &crate::PythonOptions,
+    depth: usize,
+) -> (Vec<(String, String)>, ModuleBindings) {
     use crate::ast::tree::visit::{Descend, stmt_bodies_for};
     // name → its current alternatives, in first-seen order
     let mut bindings: Vec<(String, Vec<String>)> = Vec::new();
+    let mut crate_imports: std::collections::HashMap<String, (Vec<String>, String)> =
+        std::collections::HashMap::new();
     fn bind(bindings: &mut Vec<(String, Vec<String>)>, name: &str, target: &str, nested: bool) {
         match bindings.iter_mut().find(|(n, _)| n == name) {
             Some((_, alts)) => {
@@ -338,7 +409,9 @@ pub(crate) fn module_name_aliases(
         stmts: &[crate::Statement],
         nested: bool,
         bindings: &mut Vec<(String, Vec<String>)>,
+        crate_imports: &mut std::collections::HashMap<String, (Vec<String>, String)>,
         options: &crate::PythonOptions,
+        depth: usize,
     ) {
         for s in stmts {
             match &s.statement {
@@ -381,30 +454,50 @@ pub(crate) fn module_name_aliases(
                 // An import alias names a class of a CRATE module only:
                 // an external package's `Root as R` is not the crate's
                 // `Root` (the index is keyed by bare name — Devin review
-                // on #330); such a base is loud downstream.
+                // on #330); such a base is loud downstream. A name the
+                // SOURCE module itself binds by an external import
+                // (`from .compat import JSONDecodeError as
+                // CompatJSONDecodeError` over compat.py's `from json
+                // import JSONDecodeError` — requests) is external here
+                // too, never the crate's same-named class (the sweep on
+                // issue #137).
                 crate::StatementType::ImportFrom(i)
                     if crate::ast::tree::module::module_defs_contains(
                         options,
                         &i.resolved_module_path(options),
                     ) =>
                 {
+                    // The module-defs KEY (a root-qualified `from pkg.compat
+                    // import ...` inside the package resolves to the
+                    // stripped key), for the source lookup and the record
+                    // alike (Devin review on #331).
+                    let source = i.resolved_module_path(options);
+                    let source_key = crate::ast::tree::module::module_defs_key(options, &source)
+                        .map(<[String]>::to_vec)
+                        .unwrap_or(source.clone());
                     for a in &i.names {
-                        match &a.asname {
-                            Some(asname) if asname != &a.name => {
-                                bind(bindings, asname, &a.name, nested);
-                            }
-                            _ => bind(bindings, &a.name, LOCAL_ALTERNATIVE, nested),
+                        let local = a.asname.as_deref().unwrap_or(&a.name);
+                        if crate::ast::tree::module::module_binds_externally(
+                            options, &source_key, &a.name, depth,
+                        ) {
+                            bind(bindings, local, EXTERNAL_ALTERNATIVE, nested);
+                        } else if local != a.name {
+                            bind(bindings, local, &a.name, nested);
+                            crate_imports
+                                .insert(local.to_string(), (source_key.clone(), a.name.clone()));
+                        } else {
+                            bind(bindings, local, LOCAL_ALTERNATIVE, nested);
                         }
                     }
                 }
                 _ => {}
             }
             for body in stmt_bodies_for(s, Descend::SkipDefs) {
-                collect(body, true, bindings, options);
+                collect(body, true, bindings, crate_imports, options, depth);
             }
         }
     }
-    collect(body, false, &mut bindings, options);
+    collect(body, false, &mut bindings, &mut crate_imports, options, depth);
     let externals: std::collections::HashSet<String> = bindings
         .iter()
         .filter(|(_, alts)| alts.iter().any(|t| t == EXTERNAL_ALTERNATIVE))
@@ -415,7 +508,7 @@ pub(crate) fn module_name_aliases(
             .into_iter()
             .flat_map(|(n, alts)| alts.into_iter().map(move |t| (n.clone(), t)))
             .collect(),
-        externals,
+        ModuleBindings { externals, crate_imports },
     )
 }
 
@@ -429,11 +522,14 @@ pub fn is_registered_exception_class(name: &str) -> bool {
 pub fn install_exception_classes(
     classes: &std::collections::HashSet<String>,
     ambiguous: &std::collections::HashSet<(Vec<String>, String)>,
-    this_externals: &std::collections::HashSet<String>,
+    this_bindings: &ModuleBindings,
+    class_bindings: &std::collections::HashMap<String, ModuleBindings>,
 ) {
     EXCEPTION_CLASSES.with(|r| *r.borrow_mut() = std::rc::Rc::new(classes.clone()));
     AMBIGUOUS_ALIASES.with(|r| *r.borrow_mut() = std::rc::Rc::new(ambiguous.clone()));
-    THIS_EXTERNALS.with(|r| *r.borrow_mut() = std::rc::Rc::new(this_externals.clone()));
+    THIS_EXTERNALS.with(|r| *r.borrow_mut() = std::rc::Rc::new(this_bindings.externals.clone()));
+    THIS_BINDINGS.with(|r| *r.borrow_mut() = std::rc::Rc::new(this_bindings.clone()));
+    CLASS_BINDINGS.with(|r| *r.borrow_mut() = std::rc::Rc::new(class_bindings.clone()));
 }
 
 /// The transitive closure of exception-ness over every emitted class of
@@ -475,7 +571,8 @@ pub fn compute_exception_classes(
         .flat_map(|(_, defs, _, _)| defs.iter().map(|c| c.name.clone()))
         .collect();
     let is_exception = crate::ast::tree::raise_stmt::is_exception_class_name;
-    for (_, _, aliases, externals) in per_module.iter_mut() {
+    for (_, _, aliases, module_bindings) in per_module.iter_mut() {
+        let externals = &module_bindings.externals;
         let all: Vec<(String, String)> = aliases.clone();
         let classish = |target: &str| -> bool {
             let mut cur = target.to_string();
@@ -603,8 +700,8 @@ pub fn compute_exception_classes(
     // (class, its module's alias bindings and external names)
     type Bindings = (Vec<(String, String)>, std::collections::HashSet<String>);
     let mut all: Vec<(&ClassDef, std::rc::Rc<Bindings>)> = Vec::new();
-    for (_, defs, aliases, externals) in &per_module {
-        let bindings = std::rc::Rc::new((aliases.clone(), externals.clone()));
+    for (_, defs, aliases, module_bindings) in &per_module {
+        let bindings = std::rc::Rc::new((aliases.clone(), module_bindings.externals.clone()));
         for c in defs {
             all.push((c, bindings.clone()));
         }
@@ -695,12 +792,20 @@ pub fn compute_exception_classes(
             ));
         }
     }
-    let this_externals = per_module
+    let this_bindings = per_module
         .iter()
         .find(|(path, ..)| path.is_none())
-        .map(|(_, _, _, e)| e.clone())
+        .map(|(_, _, _, b)| b.clone())
         .unwrap_or_default();
-    ExceptionIndex { classes: set, ambiguous_aliases, this_externals }
+    let class_bindings = per_module
+        .iter()
+        .flat_map(|(_, defs, _, bindings)| {
+            defs.iter()
+                .filter(|c| unambiguous(&c.name))
+                .map(|c| (c.name.clone(), bindings.clone()))
+        })
+        .collect();
+    ExceptionIndex { classes: set, ambiguous_aliases, this_bindings, class_bindings }
 }
 
 impl ClassDef {

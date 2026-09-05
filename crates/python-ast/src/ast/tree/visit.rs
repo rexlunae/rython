@@ -150,6 +150,119 @@ pub fn stmt_targets(s: &Statement) -> Vec<&ExprType> {
     }
 }
 
+/// The names a binding target binds: a name, every element of a tuple or
+/// list pattern, a starred element's name.
+pub fn target_names(target: &ExprType) -> Vec<&str> {
+    match target {
+        ExprType::Name(n) => vec![n.id.as_str()],
+        ExprType::Tuple(t) => t.elts.iter().flat_map(target_names).collect(),
+        ExprType::List(items) => items.iter().flat_map(target_names).collect(),
+        ExprType::Starred(st) => target_names(&st.value),
+        _ => Vec::new(),
+    }
+}
+
+/// The prefix of every temporary the conversion emits into the generated
+/// crate (`__rython_load`, `__rython_recv`, `__rython_exc_arg0`, ...).
+pub const RESERVED_PREFIX: &str = "__rython_";
+
+/// The first binding in `body` (nested definitions included) of a name
+/// under [`RESERVED_PREFIX`], with its line: a store target, a loop or
+/// `with ... as` target, a walrus, a function or class name, a parameter,
+/// an import, an `except ... as`, a `global`/`nonlocal` declaration. Such
+/// a name would be shadowed by, or shadow, the conversion's own
+/// temporaries silently (Devin review on #331), so the module refuses it
+/// loudly.
+pub fn reserved_prefix_binding(body: &[Statement]) -> Option<(String, usize)> {
+    let mut found: Option<(String, usize)> = None;
+    let reserved = |n: &str| n.starts_with(RESERVED_PREFIX);
+    walk_stmts(body, Descend::All, &mut |s| {
+        let line = s.lineno.unwrap_or(0);
+        let mut names: Vec<String> = Vec::new();
+        let params = |a: &crate::ParameterList| -> Vec<String> {
+            a.posonlyargs
+                .iter()
+                .chain(a.args.iter())
+                .chain(a.kwonlyargs.iter())
+                .chain(a.vararg.iter())
+                .chain(a.kwarg.iter())
+                .map(|p| p.arg.clone())
+                .collect()
+        };
+        for t in stmt_targets(s) {
+            names.extend(target_names(t).into_iter().map(str::to_string));
+        }
+        match &s.statement {
+            StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
+                names.push(f.name.clone());
+                let a = &f.args;
+                names.extend(
+                    a.posonlyargs
+                        .iter()
+                        .chain(a.args.iter())
+                        .chain(a.kwonlyargs.iter())
+                        .chain(a.vararg.iter())
+                        .chain(a.kwarg.iter())
+                        .map(|p| p.arg.clone()),
+                );
+                // A default value or an annotation is an expression of
+                // the enclosing scope: its walrus or lambda binds there.
+                for e in def_header_exprs(f) {
+                    walk_expr(e, &mut |x| {
+                        if let ExprType::Lambda(l) = x {
+                            names.extend(params(&l.args));
+                        }
+                    });
+                }
+            }
+            StatementType::ClassDef(c) => names.push(c.name.clone()),
+            StatementType::Import(im) => names.extend(im.names.iter().map(|a| match &a.asname {
+                Some(asname) => asname.clone(),
+                None => a.name.split('.').next().unwrap_or(&a.name).to_string(),
+            })),
+            StatementType::ImportFrom(im) => names.extend(
+                im.names.iter().map(|a| a.asname.clone().unwrap_or_else(|| a.name.clone())),
+            ),
+            StatementType::Try(t) => names.extend(t.handlers.iter().filter_map(|h| h.name.clone())),
+            StatementType::Global(ns) | StatementType::Nonlocal(ns) => names.extend(ns.iter().cloned()),
+            // A bare annotated declaration (`__rython_base: int` — a
+            // dataclass field, a class-level declaration) binds the name
+            // for the class's fields (Devin review on #331).
+            StatementType::AnnotatedName { name, .. } => names.push(name.clone()),
+            _ => {}
+        }
+        // Expression-local bindings: a walrus, a comprehension's targets,
+        // a lambda's parameters.
+        for e in stmt_exprs(s) {
+            walk_expr(e, &mut |x| match x {
+                ExprType::NamedExpr(ne) => {
+                    names.extend(target_names(&ne.left).into_iter().map(str::to_string));
+                }
+                ExprType::ListComp(c) => names.extend(
+                    c.generators.iter().flat_map(|g| target_names(&g.target)).map(str::to_string),
+                ),
+                ExprType::SetComp(c) => names.extend(
+                    c.generators.iter().flat_map(|g| target_names(&g.target)).map(str::to_string),
+                ),
+                ExprType::DictComp(c) => names.extend(
+                    c.generators.iter().flat_map(|g| target_names(&g.target)).map(str::to_string),
+                ),
+                ExprType::GeneratorExp(c) => names.extend(
+                    c.generators.iter().flat_map(|g| target_names(&g.target)).map(str::to_string),
+                ),
+                ExprType::Lambda(l) => names.extend(params(&l.args)),
+                _ => {}
+            });
+        }
+        if let Some(n) = names.into_iter().find(|n| reserved(n)) {
+            found = Some((n, line));
+            return Flow::Stop;
+        }
+        Flow::Continue
+    });
+    found
+}
+
 /// Whether a binding target (a store's target, a `for` target, a `with
 /// ... as`) binds `name`: a bare name, or one inside a tuple / list /
 /// starred pattern. An attribute or subscript target mutates an object

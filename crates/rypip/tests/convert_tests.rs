@@ -9240,6 +9240,100 @@ fn an_alias_resolves_in_its_own_module_never_through_another_modules_binding() {
 }
 
 #[test]
+fn a_family_with_a_duplicate_named_member_stays_values_loudly() {
+    // shapes.py: `Shape` with `Rect(Shape)` whose `scale` mutates; cli.py
+    // stores the family root-typed (`list[Shape]`) — the family facts
+    // are split between the root (stored) and the subclass (mutated).
+    // other.py defines an unrelated `Rect`: the bare name is ambiguous,
+    // so the member cannot take the shared representation, and a family
+    // holds ONE representation — the whole family stays values, with a
+    // definition warning naming the root and the duplicate, never the
+    // family closure re-admitting the ambiguous name (Devin review on
+    // #331). An ambiguous name is also outside the hierarchy index, so
+    // the root-typed store of a `Rect` is the pre-existing loud build
+    // failure of that exclusion (E0308 at the call), never a silent value
+    // copy: the conversion's warning is the assertion here.
+    let scratch = Scratch::new("duppkg");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"duppkg\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("duppkg");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("shapes.py"),
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "\n",
+            "class Rect(Shape):\n",
+            "    def __init__(self, w: float, h: float):\n",
+            "        self.w = w\n",
+            "        self.h = h\n",
+            "\n",
+            "    def area(self) -> float:\n",
+            "        return self.w * self.h\n",
+            "\n",
+            "    def scale(self, k: float) -> None:\n",
+            "        self.w *= k\n",
+            "        self.h *= k\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("other.py"),
+        concat!(
+            "class Rect:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "    def label(self) -> str:\n",
+            "        return self.name\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("cli.py"),
+        concat!(
+            "from shapes import Shape, Rect\n",
+            "\n",
+            "\n",
+            "def grow(s: Shape) -> None:\n",
+            "    if isinstance(s, Rect):\n",
+            "        s.scale(2.0)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    shapes: list[Shape] = [Rect(2.0, 3.0)]\n",
+            "    for s in shapes:\n",
+            "        grow(s)\n",
+            "    print(f\"{shapes[0].area():.1f}\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    assert!(
+        krate.warnings.iter().any(|w| w.contains("class `Rect` is defined by more than one module")
+            && w.contains("`Shape` and its hierarchy stay values")),
+        "warnings: {:?}",
+        krate.warnings
+    );
+    let shapes = fs::read_to_string(krate.root.join("src/shapes.rs")).unwrap();
+    assert!(!shapes.contains("PyRef<"), "the family took the shared representation: {}", shapes);
+}
+
+#[test]
 fn a_message_reading_another_modules_global_is_refused_at_a_foreign_raise_site() {
     // errors.PREFIX in the message, cli.PREFIX at the raise site: the
     // message would silently read the caller's global — a loud
@@ -9451,6 +9545,339 @@ fn an_external_import_alias_never_resolves_to_an_unrelated_crate_class() {
         krate.warnings.iter().any(|w| w.contains("somewhere_else")),
         "warnings: {:?}",
         krate.warnings
+    );
+}
+
+#[test]
+fn an_external_alias_base_is_judged_by_the_defining_module_from_any_raise_site() {
+    // errors.py binds `from http.client import IncompleteRead as
+    // httplib_IncompleteRead` beside its own `IncompleteRead(HTTPError,
+    // httplib_IncompleteRead)`; reader.py imports the crate's class and
+    // raises it. The base is external by errors.py's bindings, whichever
+    // module linearizes the class: judging it by the RAISING module's
+    // bindings read a cycle through the crate's own `IncompleteRead`
+    // (urllib3's response.py; the sweep on issue #137).
+    let scratch = Scratch::new("extbase");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"extbase\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("extbase");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("errors.py"),
+        concat!(
+            "from http.client import IncompleteRead as httplib_IncompleteRead\n",
+            "\n",
+            "\n",
+            "class HTTPError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class IncompleteRead(HTTPError, httplib_IncompleteRead):\n",
+            "    def __init__(self, partial: int, expected: int) -> None:\n",
+            "        self.partial = partial\n",
+            "        self.expected = expected\n",
+            "        super().__init__(partial, expected)\n",
+        ),
+    )
+    .unwrap();
+    // The same through a CRATE module that itself binds the name by an
+    // external import, under an import fallback (requests' compat.py:
+    // `from json import JSONDecodeError`), re-imported under an alias
+    // beside a local class of the bare name (requests' exceptions.py).
+    fs::write(
+        pkg.join("compat.py"),
+        concat!(
+            "try:\n",
+            "    from simplejson import JSONDecodeError\n",
+            "except ImportError:\n",
+            "    from json import JSONDecodeError\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("decode.py"),
+        concat!(
+            "from .compat import JSONDecodeError as CompatJSONDecodeError\n",
+            "from .errors import HTTPError\n",
+            "\n",
+            "\n",
+            "class JSONDecodeError(HTTPError, CompatJSONDecodeError):\n",
+            "    def __init__(self, msg: str) -> None:\n",
+            "        super().__init__(msg)\n",
+        ),
+    )
+    .unwrap();
+    // The same re-import spelled ROOT-QUALIFIED (`from extbase.compat
+    // import ...` inside the package): the source is looked up by its
+    // module-defs key, so the external identity survives (Devin review
+    // on #331).
+    fs::write(
+        pkg.join("decode2.py"),
+        concat!(
+            "from extbase.compat import JSONDecodeError as CompatJSONDecodeError\n",
+            "from extbase.errors import HTTPError\n",
+            "\n",
+            "\n",
+            "class JSONDecodeError2(HTTPError, CompatJSONDecodeError):\n",
+            "    def __init__(self, msg: str) -> None:\n",
+            "        super().__init__(msg)\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("reader.py"),
+        concat!(
+            "from .errors import IncompleteRead\n",
+            "from .decode import JSONDecodeError\n",
+            "from .decode2 import JSONDecodeError2\n",
+            "\n",
+            "\n",
+            "def read(n: int) -> int:\n",
+            "    if n < 3:\n",
+            "        raise IncompleteRead(n, 3)\n",
+            "    if n > 9:\n",
+            "        raise JSONDecodeError(\"bad\")\n",
+            "    if n == 7:\n",
+            "        raise JSONDecodeError2(\"bad7\")\n",
+            "    return n\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect("the external alias base must not read as a cycle");
+    let reader = fs::read_to_string(krate.root.join("src/reader.rs")).unwrap();
+    assert!(!reader.contains("compile_error !"), "generated: {}", reader);
+    // Each name found after the previous one, from the raise site on.
+    let in_order = |names: &[&str]| {
+        let mut from = 0;
+        for a in names {
+            let at = reader[from..]
+                .find(a)
+                .unwrap_or_else(|| panic!("{a} is not an ancestor after {from}: {reader}"));
+            from += at + a.len();
+        }
+        true
+    };
+    assert!(
+        in_order(&["\"HTTPError\"", "\"Exception\"", "\"httplib_IncompleteRead\""]),
+        "the external branch must end the chain under its alias name: {}",
+        reader
+    );
+    assert!(
+        in_order(&["\"JSONDecodeError\"", "\"HTTPError\"", "\"Exception\"", "\"CompatJSONDecodeError\""]),
+        "the crate-module re-import of an external name must end the chain under its alias: {}",
+        reader
+    );
+    assert!(
+        in_order(&["\"JSONDecodeError2\"", "\"HTTPError\"", "\"Exception\"", "\"CompatJSONDecodeError\""]),
+        "the root-qualified re-import must end the chain under its alias too: {}",
+        reader
+    );
+    for expected in [
+        "`httplib_IncompleteRead` is an external import bound beside the crate's own class `IncompleteRead`",
+        "`CompatJSONDecodeError` is an external import bound beside the crate's own class `JSONDecodeError`",
+    ] {
+        assert!(
+            krate.warnings.iter().any(|w| w.contains(expected)),
+            "missing {expected:?} in warnings: {:?}",
+            krate.warnings
+        );
+    }
+}
+
+#[test]
+fn a_crate_import_alias_beside_a_local_class_of_its_name_is_the_source_modules_class() {
+    // base.py defines `HTTPError(Exception)`; errors.py imports it `as
+    // BaseHTTPError`, defines its OWN `HTTPError(RequestException)`, and
+    // derives `ContentDecodingError(RequestException, BaseHTTPError)`
+    // (requests' exceptions.py over urllib3's). The alias names base.py's
+    // class: following the bare name into the local `HTTPError` read a
+    // false MRO conflict (the sweep on issue #137). The imported class
+    // takes its place under the alias spelling, with its own ancestors,
+    // so `except BaseHTTPError:` catches it and the local `except
+    // HTTPError:` does not. Verified against python3: the program prints
+    // `base dec`.
+    let scratch = Scratch::new("twin");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"twin\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("twin");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(pkg.join("base.py"), concat!("class HTTPError(Exception):\n", "    pass\n")).unwrap();
+    fs::write(
+        pkg.join("errors.py"),
+        concat!(
+            "from .base import HTTPError as BaseHTTPError\n",
+            "\n",
+            "\n",
+            "class RequestException(IOError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class HTTPError(RequestException):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class ContentDecodingError(RequestException, BaseHTTPError):\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("main.py"),
+        concat!(
+            "from .errors import ContentDecodingError, HTTPError\n",
+            "from .base import HTTPError as BaseHTTPError\n",
+            "\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise ContentDecodingError(\"dec\")\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    try:\n",
+            "        f()\n",
+            "    except HTTPError:\n",
+            "        print(\"local\")\n",
+            "    except BaseHTTPError as e:\n",
+            "        print(\"base\", e)\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect("the alias must name the source module's class, never a false MRO conflict");
+    let main = fs::read_to_string(krate.root.join("src/main.rs")).unwrap();
+    assert!(!main.contains("compile_error !"), "generated: {}", main);
+    // The raise records the chain: RequestException, its builtin, then
+    // the imported class under the alias spelling with ITS ancestor.
+    let mut from = 0;
+    for a in ["\"ContentDecodingError\"", "\"RequestException\"", "\"BaseHTTPError\"", "\"Exception\""] {
+        let at = main[from..]
+            .find(a)
+            .unwrap_or_else(|| panic!("{a} is not in the chain after {from}: {main}"));
+        from += at + a.len();
+    }
+    assert!(
+        !main.contains("(\"HTTPError\") . to_string ()") && !main.contains("(\"HTTPError\").to_string()"),
+        "the local HTTPError must not be an ancestor: {}",
+        main
+    );
+    assert!(
+        krate.warnings.iter().any(|w| w.contains(
+            "`BaseHTTPError` imports `HTTPError` of `base` beside the crate's own class `HTTPError` of the same name"
+        )),
+        "warnings: {:?}",
+        krate.warnings
+    );
+}
+
+#[test]
+fn shared_read_modify_write_matches_python_at_runtime() {
+    // A read-modify-write through a container-held (shared) object: the
+    // target is read ONCE before the operand runs (an operand that
+    // mutates the same object never changes what the operation reads),
+    // for the plain store, every augmented operator, and a property with
+    // a setter; a COMPUTED receiver (`pick().n += 5`, `picks[nxt()].x +=
+    // 7`) is evaluated once, so the load and the store address the same
+    // object, and a plain store evaluates its value before its target's
+    // receiver (Devin review on #331).
+    let scratch = Scratch::new("rmw_rt");
+    let file = scratch.path().join("rmw_rt.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self):\n",
+            "        self.n = 10\n",
+            "        self._x = 1\n",
+            "\n",
+            "    @property\n",
+            "    def x(self) -> int:\n",
+            "        return self._x\n",
+            "\n",
+            "    @x.setter\n",
+            "    def x(self, v: int) -> None:\n",
+            "        self._x = v\n",
+            "\n",
+            "\n",
+            "calls = 0\n",
+            "\n",
+            "\n",
+            "def nxt() -> int:\n",
+            "    global calls\n",
+            "    calls += 1\n",
+            "    return calls % 2\n",
+            "\n",
+            "\n",
+            "class Picker:\n",
+            "    def __init__(self):\n",
+            "        self.items = [Counter(), Counter()]\n",
+            "\n",
+            "    def pick(self) -> Counter:\n",
+            "        return self.items[nxt()]\n",
+            "\n",
+            "\n",
+            "def take(c: Counter) -> int:\n",
+            "    c.n = c.n + 100\n",
+            "    return 3\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    counters = [Counter(), Counter()]\n",
+            "    c = counters[0]\n",
+            "    c.n -= take(c)\n",
+            "    print(c.n, counters[0].n)\n",
+            "    c.n *= take(c)\n",
+            "    print(c.n)\n",
+            "    c.n += take(c)\n",
+            "    print(c.n)\n",
+            "    c.n &= take(c)\n",
+            "    print(c.n)\n",
+            "    d = counters[1]\n",
+            "    d.x = d.x + 1\n",
+            "    d.x += d.x\n",
+            "    print(d.x, counters[1].x)\n",
+            "    p = Picker()\n",
+            "    p.pick().n += 5\n",
+            "    p.pick().x += 7\n",
+            "    p.items[nxt()].n -= 1\n",
+            "    p.items[nxt()].x = p.items[nxt()].x + 100\n",
+            "    print(p.items[0].n, p.items[1].n, p.items[0].x, p.items[1].x, calls)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/rmw_rt"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["7 7", "21", "24", "0", "4 4", "10 14 8 108 5"],
+        "the shared read-modify-write diverged from CPython"
     );
 }
 

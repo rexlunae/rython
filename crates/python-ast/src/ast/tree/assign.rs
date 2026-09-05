@@ -682,8 +682,8 @@ impl<'a> CodeGen for Assign {
                 Some(quote!(vec![#(#owned),*]))
             }
         };
-        let render_one = |target: &ExprType,
-                          value: &TokenStream|
+        let render_one_inner = |target: &ExprType,
+                                value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
             // Issue #115: a store to a `global`-declared name whose module
             // binding is a MUTABLE static writes THROUGH the static —
@@ -1502,6 +1502,28 @@ impl<'a> CodeGen for Assign {
             }
         };
 
+        // A store through a SHARED receiver's mutable borrow (`c.n = c.n
+        // + 1`, `s.r = s.r + 1.0` on a PyRef, narrowed or not): the
+        // value's temporaries — the `Ref` a read of the SAME object
+        // takes — live to the end of the statement, so the value is
+        // bound first and the `borrow_mut` taken after; otherwise the
+        // loud aliasing-under-mutation boundary fires on an ordinary
+        // read-modify-write (the evaluation on issue #137).
+        let render_one = |target: &ExprType,
+                          value: &TokenStream|
+         -> Result<TokenStream, Box<dyn std::error::Error>> {
+            // A name or a constant takes no borrow, so it stores in
+            // place; anything else (a field read, a call, an index) may
+            // read the same object and is bound first.
+            let shared_store = matches!(target, ExprType::Attribute(a)
+                if crate::ast::tree::attribute::shared_receiver(&a.value, &ctx, &symbols, &options))
+                && !matches!(value_expr, ExprType::Name(_) | ExprType::Constant(_));
+            if shared_store {
+                let stmt = render_one_inner(target, &quote!(__rython_val))?;
+                return Ok(quote!({ let __rython_val = #value; #stmt }));
+            }
+            render_one_inner(target, value)
+        };
         let render = |target: &ExprType,
                       value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
@@ -1572,6 +1594,16 @@ impl<'a> CodeGen for Assign {
                     ExprType::Name(n) if n.id == "self"
                 );
                 if crate::ast::tree::shared::is_shared(&class.name) && !receiver_is_self {
+                    // The value is bound BEFORE the setter's mutable
+                    // borrow: `c.x = c.x + 1` reads the same object
+                    // through the getter (the same rule as a field store
+                    // — Devin review on #331).
+                    if !matches!(value_expr, ExprType::Name(_) | ExprType::Constant(_)) {
+                        return Ok(quote!({
+                            let __rython_val = #value;
+                            (#recv).borrow_mut().#setter(__rython_val)?;
+                        }));
+                    }
                     return Ok(quote!((#recv).borrow_mut().#setter(#value)?;));
                 }
                 return Ok(quote!(#recv.#setter(#value)?;));

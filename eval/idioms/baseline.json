@@ -6,6 +6,9 @@
     "clauses": {
       "status": "pass"
     },
+    "handoff": {
+      "status": "pass"
+    },
     "inventory": {
       "status": "pass"
     },
@@ -20,6 +23,9 @@
       "errors": 5
     },
     "records": {
+      "status": "pass"
+    },
+    "rmw": {
       "status": "pass"
     },
     "schedule": {
