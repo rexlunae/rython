@@ -6476,7 +6476,19 @@ impl PyException {
         // `except BankError:` / `isinstance(v, BankError)` reaches it;
         // the broad posture (Exception/BaseException) still applies when
         // no chain was attached.
-        if self.user_ancestors.iter().any(|a| a == name) {
+        // A user ancestor matches by name, by canonical name (`except
+        // EnvironmentError:` on a subclass of OSError — the alias IS the
+        // class), and through the builtin ancestor's own MRO (a subclass
+        // of FileNotFoundError is caught by `except OSError:`).
+        let target = crate::builtin_exceptions::canonical_name(name).unwrap_or(name);
+        if self.user_ancestors.iter().any(|a| {
+            a == name
+                || crate::builtin_exceptions::canonical_name(a).unwrap_or(a) == target
+                || BUILTIN_EXCEPTION_MRO
+                    .iter()
+                    .find(|(n, _)| n == a)
+                    .is_some_and(|(_, mro)| mro.contains(&target))
+        }) {
             return true;
         }
         name == "Exception" || name == "BaseException"

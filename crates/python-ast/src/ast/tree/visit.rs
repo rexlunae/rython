@@ -369,6 +369,170 @@ pub fn each_subexpr<'a>(
     true
 }
 
+/// The MUTABLE twin of `each_subexpr` — the same enumeration, arm for
+/// arm (kept adjacent so a new expression form is added to both), for
+/// the rewrites that replace nodes in place (the exception model's
+/// parameter substitution). Lambda bodies are entered per `descend`.
+pub fn each_subexpr_mut<'a>(
+    e: &'a mut ExprType,
+    descend: Descend,
+    f: &mut impl FnMut(&'a mut ExprType) -> bool,
+) -> bool {
+    macro_rules! visit {
+        ($x:expr) => {{
+            let sub: &'a mut ExprType = &mut $x;
+            if !f(sub) {
+                return false;
+            }
+        }};
+    }
+    match e {
+        ExprType::BoolOp(b) => {
+            for v in &mut b.values {
+                visit!(*v);
+            }
+        }
+        ExprType::NamedExpr(n) => {
+            visit!(n.left);
+            visit!(n.right);
+        }
+        ExprType::BinOp(b) => {
+            visit!(b.left);
+            visit!(b.right);
+        }
+        ExprType::UnaryOp(u) => visit!(u.operand),
+        ExprType::Lambda(l) => {
+            if descend != Descend::OwnScope {
+                visit!(l.body);
+            }
+        }
+        ExprType::IfExp(i) => {
+            visit!(i.test);
+            visit!(i.body);
+            visit!(i.orelse);
+        }
+        ExprType::Dict(d) => {
+            for k in d.keys.iter_mut().flatten() {
+                visit!(*k);
+            }
+            for v in &mut d.values {
+                visit!(*v);
+            }
+        }
+        ExprType::Set(s) => {
+            for x in &mut s.elts {
+                visit!(*x);
+            }
+        }
+        ExprType::ListComp(c) => {
+            visit!(c.elt);
+            for g in &mut c.generators {
+                visit!(g.iter);
+                for i in &mut g.ifs {
+                    visit!(*i);
+                }
+            }
+        }
+        ExprType::SetComp(c) => {
+            visit!(c.elt);
+            for g in &mut c.generators {
+                visit!(g.iter);
+                for i in &mut g.ifs {
+                    visit!(*i);
+                }
+            }
+        }
+        ExprType::GeneratorExp(c) => {
+            visit!(c.elt);
+            for g in &mut c.generators {
+                visit!(g.iter);
+                for i in &mut g.ifs {
+                    visit!(*i);
+                }
+            }
+        }
+        ExprType::DictComp(c) => {
+            visit!(c.key);
+            visit!(c.value);
+            for g in &mut c.generators {
+                visit!(g.iter);
+                for i in &mut g.ifs {
+                    visit!(*i);
+                }
+            }
+        }
+        ExprType::Await(a) => visit!(a.value),
+        ExprType::Yield(y) => {
+            if let Some(v) = &mut y.value {
+                visit!(**v);
+            }
+        }
+        ExprType::YieldFrom(y) => visit!(y.value),
+        ExprType::Compare(c) => {
+            visit!(c.left);
+            for x in &mut c.comparators {
+                visit!(*x);
+            }
+        }
+        ExprType::Call(c) => {
+            visit!(c.func);
+            for a in &mut c.args {
+                visit!(*a);
+            }
+            for k in &mut c.keywords {
+                visit!(k.value);
+            }
+        }
+        ExprType::FormattedValue(fv) => {
+            visit!(fv.value);
+            if let Some(spec) = &mut fv.format_spec {
+                visit!(**spec);
+            }
+        }
+        ExprType::JoinedStr(j) => {
+            for v in &mut j.values {
+                visit!(*v);
+            }
+        }
+        ExprType::Attribute(a) => visit!(a.value),
+        ExprType::Subscript(sub) => {
+            visit!(sub.value);
+            match &mut sub.kind {
+                crate::SubscriptKind::Index(i) => visit!(*i),
+                crate::SubscriptKind::Slice { lower, upper, step } => {
+                    for b in lower.iter_mut().chain(upper.iter_mut()).chain(step.iter_mut()) {
+                        visit!(**b);
+                    }
+                }
+            }
+        }
+        ExprType::Starred(st) => visit!(st.value),
+        ExprType::List(l) => {
+            for x in l.iter_mut() {
+                visit!(*x);
+            }
+        }
+        ExprType::Tuple(t) => {
+            for x in &mut t.elts {
+                visit!(*x);
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+/// Rewrite an expression in place, pre-order: `f` sees each node (and
+/// may replace it), then the walk descends into the node's — possibly
+/// new — subexpressions. Lambda bodies are entered (`Descend::All`).
+pub fn walk_expr_mut(e: &mut ExprType, f: &mut impl FnMut(&mut ExprType)) {
+    f(e);
+    each_subexpr_mut(e, Descend::All, &mut |sub| {
+        walk_expr_mut(sub, f);
+        true
+    });
+}
+
 /// The direct subexpressions of an expression, collected (lambda bodies
 /// included: `Descend::All`).
 pub fn subexprs(e: &ExprType) -> Vec<&ExprType> {

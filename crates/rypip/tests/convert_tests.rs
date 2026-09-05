@@ -8428,3 +8428,97 @@ fn an_unreachable_vendored_module_does_not_add_a_surface() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.trim(), "CAT", "stdout: {}", stdout);
 }
+
+#[test]
+fn the_exception_model_matches_python_at_runtime() {
+    // The exception model end to end (Devin review on #330): a user
+    // class over a builtin caught by the builtin's handler and by the
+    // builtin's alias; a modeled constructor bound positionally, by
+    // keyword, and by keyword-only default; a property argument evaluated
+    // once; issubclass through the interpreter's own MRO.
+    let scratch = Scratch::new("exc_model");
+    let file = scratch.path().join("exc_model.py");
+    fs::write(
+        &file,
+        concat!(
+            "class MyError(ValueError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class DiskError(OSError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Short(Exception):\n",
+            "    def __init__(self, needed: int, *, unit: str = \"credits\"):\n",
+            "        super().__init__(f\"need {needed} {unit}\")\n",
+            "        self.needed = needed\n",
+            "        self.unit = unit\n",
+            "\n",
+            "\n",
+            "class Meter:\n",
+            "    def __init__(self):\n",
+            "        self.reads = 0\n",
+            "\n",
+            "    @property\n",
+            "    def level(self) -> int:\n",
+            "        self.reads += 1\n",
+            "        return 7\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    try:\n",
+            "        raise MyError(\"bad\")\n",
+            "    except ValueError as e:\n",
+            "        print(\"caught ValueError:\", e)\n",
+            "    try:\n",
+            "        raise DiskError(\"full\")\n",
+            "    except EnvironmentError as e:\n",
+            "        print(\"caught EnvironmentError:\", e)\n",
+            "    try:\n",
+            "        raise Short(3, unit=\"coins\")\n",
+            "    except Short as e:\n",
+            "        print(e, e.needed, e.unit)\n",
+            "    try:\n",
+            "        raise Short(unit=\"marks\", needed=4)\n",
+            "    except Short as e:\n",
+            "        print(e, e.needed, e.unit)\n",
+            "    m = Meter()\n",
+            "    try:\n",
+            "        raise Short(m.level)\n",
+            "    except Short as e:\n",
+            "        print(e, e.needed, m.reads)\n",
+            "    print(issubclass(FileNotFoundError, OSError), issubclass(MyError, Exception), issubclass(KeyError, ValueError))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/exc_model"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "caught ValueError: bad",
+            "caught EnvironmentError: full",
+            "need 3 coins 3 coins",
+            "need 4 marks 4 marks",
+            "need 7 credits 7 1",
+            "True True False",
+        ],
+        "the exception model diverged from CPython"
+    );
+}

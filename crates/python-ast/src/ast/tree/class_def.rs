@@ -1174,13 +1174,23 @@ impl ClassDef {
         // visited set through recursive method resolution (RefCell because
         // the resolver is a shared Fn).
         let visited = std::cell::RefCell::new(visited);
-        let resolve = |call: &crate::Call| -> Option<bool> {
-            let ExprType::Attribute(attr) = call.func.as_ref() else {
-                return None;
+        let resolve = |access: crate::ast::tree::scope::Access<'_>| -> Option<bool> {
+            use crate::ast::tree::scope::Access;
+            let attr = match access {
+                Access::Call(call) => match call.func.as_ref() {
+                    ExprType::Attribute(attr) => attr,
+                    _ => return None,
+                },
+                Access::Property(attr) => attr,
             };
             let (class, class_symbols) =
                 crate::receiver_class(&attr.value, &ctx, symbols, options)?;
             if class.method_on_mro(&attr.attr, &class_symbols).is_none() {
+                return None;
+            }
+            if matches!(access, Access::Property(_))
+                && !class.has_property_getter(&attr.attr, &class_symbols, options)
+            {
                 return None;
             }
             Some(class.method_mut_inner(

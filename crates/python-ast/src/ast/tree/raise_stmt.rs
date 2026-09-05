@@ -501,6 +501,16 @@ fn exception_value(
                     || resolved_is_exception_class(&name.id, &options, &symbols)
                 {
                     let kind = &name.id;
+                    // An in-crate class's ancestor chain is class
+                    // metadata: attached whether or not its __init__ is
+                    // modeled (`class MyError(ValueError): pass` is
+                    // caught by `except ValueError:`).
+                    let ancestors = match symbols.get(&name.id) {
+                        Some(crate::SymbolTableNode::ClassDef(cls)) => {
+                            Some(exception_ancestor_tokens(cls, &symbols))
+                        }
+                        _ => None,
+                    };
                     // An IN-CRATE exception class with a modeled __init__
                     // (`class InsufficientFunds(BankError)` whose __init__
                     // calls super().__init__(f"need {needed}, have
@@ -533,7 +543,12 @@ fn exception_value(
                             quote!(format!(#fmt, #(#args),*))
                         }
                     };
-                    return Ok(quote!(PyException::new(#kind, #msg)));
+                    return Ok(match ancestors {
+                        Some(ancestors) => quote!(PyException::new_with_attrs_and_ancestors(
+                            #kind, #msg, vec![], vec![#(#ancestors),*]
+                        )),
+                        None => quote!(PyException::new(#kind, #msg)),
+                    });
                 }
             }
             let tokens = exc.clone().to_rust(ctx, options, symbols)?;
@@ -544,6 +559,21 @@ fn exception_value(
         {
             let kind = imported_exception_alias(&name.id, &symbols, Some(&options)).unwrap();
             Ok(quote!(PyException::new(#kind, String::new())))
+        }
+        // `raise MyError` (the class, no call) for an in-crate class: the
+        // ancestor chain attaches here too.
+        ExprType::Name(name)
+            if matches!(symbols.get(&name.id), Some(crate::SymbolTableNode::ClassDef(c))
+                if crate::is_exception_class(c)) =>
+        {
+            let kind = &name.id;
+            let ancestors = match symbols.get(&name.id) {
+                Some(crate::SymbolTableNode::ClassDef(cls)) => exception_ancestor_tokens(cls, &symbols),
+                _ => Vec::new(),
+            };
+            Ok(quote!(PyException::new_with_attrs_and_ancestors(
+                #kind, String::new(), vec![], vec![#(#ancestors),*]
+            )))
         }
         ExprType::Name(name)
             if is_exception_class_name(&name.id)
@@ -588,14 +618,79 @@ mod tests {
     // Tests would go here - currently commented out as they need full AST infrastructure
     // create_parse_test!(test_simple_raise, "raise ValueError('error')", "test.py");
 }
-/// The construction of an IN-CRATE exception class with a modeled
-/// __init__ (`raise InsufficientFunds(amount, self.balance)` — bank,
-/// round 99): render the __init__'s OWN message (its super().__init__
-/// argument with the params bound — CPython's exact text, e.g.
-/// "need 100, have 30") and carry the __init__'s `self.<f> = <param>`
-/// stores as the exception's attrs (so `e.needed` resolves later).
-/// Returns None when the class's __init__ does not have the modeled
-/// shape (the positional-message fallback stands).
+/// The ancestor chain of an in-crate exception class, base-most last
+/// (`InsufficientFunds` → `["BankError", "Exception"]`): the bases
+/// resolved through the symbol table, ending at the first builtin. Class
+/// metadata, attached to EVERY construction of the class — a modeled
+/// `__init__` or none (`class MyError(ValueError): pass` must be caught
+/// by `except ValueError:`; Devin review on #330).
+pub(crate) fn exception_ancestors(
+    cls: &crate::ClassDef,
+    symbols: &crate::SymbolTableScopes,
+) -> Vec<String> {
+    use crate::ExprType;
+    let is_exc = |n: &str| {
+        is_exception_class_name(n)
+            || match symbols.get(n) {
+                Some(crate::SymbolTableNode::ClassDef(c)) => crate::is_exception_class(c),
+                _ => false,
+            }
+    };
+    let mut ancestors: Vec<String> = Vec::new();
+    let mut cur: Option<&str> = match cls.bases.first() {
+        Some(ExprType::Name(b)) => Some(b.id.as_str()),
+        _ => None,
+    };
+    let mut guard = 0;
+    while let Some(base_name) = cur {
+        guard += 1;
+        if guard > 64 {
+            break;
+        }
+        if is_exc(base_name) {
+            ancestors.push(base_name.to_string());
+        }
+        cur = match symbols.get(base_name) {
+            Some(crate::SymbolTableNode::ClassDef(b)) => b.bases.iter().find_map(|bb| match bb {
+                ExprType::Name(n) if is_exc(&n.id) => Some(n.id.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        };
+    }
+    ancestors
+}
+
+/// The ancestor chain as tokens for `new_with_attrs_and_ancestors`.
+pub(crate) fn exception_ancestor_tokens(
+    cls: &crate::ClassDef,
+    symbols: &crate::SymbolTableScopes,
+) -> Vec<proc_macro2::TokenStream> {
+    exception_ancestors(cls, symbols)
+        .iter()
+        .map(|a| quote::quote!((#a) . to_string ()))
+        .collect()
+}
+
+/// A raise of an in-crate exception class whose `__init__` the model
+/// covers: the class's own message (the `super().__init__(<message>)`
+/// argument, rendered at the raise site with the parameters bound to the
+/// call's arguments) and its field stores as attrs, plus the ancestor
+/// chain. The model is exactly `self.<field> = <param>` stores and the
+/// message; any other statement is a `compile_error!` at the raise site.
+///
+/// Arguments bind the way CPython binds a call: positionals to the
+/// positional parameters in order, keywords by name to a positional or a
+/// keyword-only parameter, a missing parameter to its default. Every
+/// bound argument that is not a bare name or a constant is evaluated
+/// ONCE, in source order, into a typed temporary the message and the
+/// attrs both read (a property read or a call runs once — Devin review
+/// on #330); a default is modeled only when it is a constant (a
+/// definition-time value with an identity or an effect cannot be
+/// re-rendered at each raise). What the model cannot bind is loud at the
+/// site. None when the class has no `__init__` parameters to model (the
+/// generic message-only construction, which still attaches the
+/// ancestors).
 pub(crate) fn exception_class_raise(
     cls: &crate::ClassDef,
     call: &crate::Call,
@@ -604,81 +699,145 @@ pub(crate) fn exception_class_raise(
     symbols: crate::SymbolTableScopes,
 ) -> Result<Option<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
     use crate::{ExprType, StatementType};
-    // Only EXCEPTION classes route through the modeled construction (an
-    // ordinary class whose __init__ calls super().__init__ must not
-    // become an exception — Devin review on #328).
+    use std::collections::HashMap;
     if !crate::is_exception_class(cls) {
         return Ok(None);
     }
     let Some(init) = cls.init_method() else {
         return Ok(None);
     };
-    // The __init__ params AFTER self: [needed, available]. A keyword-only
-    // parameter with a default (`*, request: Request | None = None` —
-    // urllib3's _RequestError) is modeled as its default when the raise
-    // passes no keywords; a raise WITH keywords, or a keyword-only
-    // parameter without a default, is outside the model (the generic
-    // message-only construction, the pre-model behavior, ledgered).
-    let params: Vec<&str> = init
-        .args
-        .args
-        .iter()
-        .skip(1)
-        .map(|a| a.arg.as_str())
-        .collect();
-    if call.args.len() != params.len() || params.is_empty() || !call.keywords.is_empty() {
+    let positional: Vec<&str> = init.args.args.iter().skip(1).map(|a| a.arg.as_str()).collect();
+    let kwonly: Vec<&str> = init.args.kwonlyargs.iter().map(|a| a.arg.as_str()).collect();
+    if positional.is_empty() && kwonly.is_empty() {
         return Ok(None);
     }
-    let kw_defaults: std::collections::HashMap<&str, &ExprType> = init
-        .args
-        .kwonlyargs
-        .iter()
-        .zip(init.args.kw_defaults.iter())
-        .filter_map(|(p, d)| d.as_deref().map(|d| (p.arg.as_str(), d)))
-        .collect();
-    // Find the super().__init__(<msg>) call in the __init__ body. The
-    // model is exactly `self.<field> = <param>` stores and the
-    // super().__init__ message; any OTHER statement in the __init__
-    // (validation, logging, a computed field) would not run at the
-    // construction site, so it is a loud refusal, never silently
-    // dropped (the evaluation on issue #137).
-    let mut msg_expr: Option<ExprType> = None;
-    // (field, its value: the raise arg at an index, or a keyword-only
-    // parameter's default)
-    enum FieldValue<'a> {
-        Arg(usize),
-        Default(&'a ExprType),
+    let site_error = |msg: String| -> Result<Option<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
+        Ok(Some(quote::quote!(compile_error!(#msg))))
+    };
+    // Defaults: positional defaults align to the tail of the positional
+    // parameters, keyword-only defaults to their parameters.
+    let mut defaults: HashMap<&str, &ExprType> = HashMap::new();
+    let n_all = init.args.args.len();
+    let n_def = init.args.defaults.len();
+    for (i, d) in init.args.defaults.iter().enumerate() {
+        let param = &init.args.args[n_all - n_def + i];
+        if param.arg != "self" {
+            defaults.insert(param.arg.as_str(), d.as_ref());
+        }
     }
-    let mut fields: Vec<(String, FieldValue)> = Vec::new();
+    for (param, d) in init.args.kwonlyargs.iter().zip(init.args.kw_defaults.iter()) {
+        if let Some(d) = d.as_deref() {
+            defaults.insert(param.arg.as_str(), d);
+        }
+    }
+    // Bind the call: (param → the argument expression), in source order.
+    let mut given: Vec<(&str, &ExprType)> = Vec::new();
+    for (i, a) in call.args.iter().enumerate() {
+        if matches!(a, ExprType::Starred(_)) {
+            return site_error(format!(
+                "rython: `raise {}(*...)`: a starred argument to an exception constructor \
+                 is not modeled; pass the arguments explicitly",
+                cls.name
+            ));
+        }
+        let Some(p) = positional.get(i) else {
+            return site_error(format!(
+                "rython: `{}()` takes {} positional argument(s) but {} were given",
+                cls.name,
+                positional.len(),
+                call.args.len()
+            ));
+        };
+        given.push((p, a));
+    }
+    for kw in &call.keywords {
+        let Some(name) = kw.arg.as_deref() else {
+            return site_error(format!(
+                "rython: `raise {}(**...)`: a keyword splat to an exception constructor is \
+                 not modeled; pass the arguments explicitly",
+                cls.name
+            ));
+        };
+        if !positional.contains(&name) && !kwonly.contains(&name) {
+            return site_error(format!(
+                "rython: `{}()` got an unexpected keyword argument '{}'",
+                cls.name, name
+            ));
+        }
+        if given.iter().any(|(p, _)| *p == name) {
+            return site_error(format!(
+                "rython: `{}()` got multiple values for argument '{}'",
+                cls.name, name
+            ));
+        }
+        given.push((name, &kw.value));
+    }
+    // Every parameter's substitution at the raise site: a temporary for
+    // an evaluated argument, the expression itself for a bare name or a
+    // constant, the constant default otherwise.
+    let mut prelude: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut msg_options = options.clone();
+    let mut name_types = (*msg_options.name_types).clone();
+    let mut substitution: HashMap<&str, ExprType> = HashMap::new();
+    for (k, (param, arg)) in given.iter().enumerate() {
+        if matches!(arg, ExprType::Name(_) | ExprType::Constant(_)) {
+            substitution.insert(param, (*arg).clone());
+            continue;
+        }
+        let temp = format!("__rython_exc_arg{k}");
+        let ident = proc_macro2::Ident::new(&temp, proc_macro2::Span::call_site());
+        let tokens = (*arg).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        prelude.push(quote::quote!(let #ident = #tokens;));
+        let ty = crate::infer_type(Some(&ctx), arg, &options, &symbols);
+        if !matches!(ty, crate::TypeInfo::PyObject) {
+            name_types.insert(temp.clone(), ty);
+        }
+        substitution.insert(param, ExprType::Name(crate::ast::tree::name::Name { id: temp }));
+    }
+    for param in positional.iter().chain(kwonly.iter()) {
+        if substitution.contains_key(param) {
+            continue;
+        }
+        let Some(d) = defaults.get(param) else {
+            return site_error(format!(
+                "rython: `{}()` missing a required argument: '{}'",
+                cls.name, param
+            ));
+        };
+        let constant = matches!(d, ExprType::Constant(_) | ExprType::NoneType(_))
+            || matches!(d, ExprType::UnaryOp(u) if matches!(u.operand.as_ref(), ExprType::Constant(_)));
+        if !constant {
+            return site_error(format!(
+                "rython: `{}.__init__`'s default for '{}' is not a constant: CPython \
+                 evaluates a default once at definition time, which re-rendering it at \
+                 each raise cannot reproduce; pass the argument explicitly, or make the \
+                 default a constant",
+                cls.name, param
+            ));
+        }
+        substitution.insert(param, (*d).clone());
+    }
+    msg_options.name_types = std::rc::Rc::new(name_types);
+    // The __init__ body: `self.<field> = <param>` stores and the
+    // `super().__init__(<message>)` call; a docstring and `pass` are
+    // inert; anything else would not run at the raise site.
+    let mut msg_expr: Option<ExprType> = None;
+    let mut fields: Vec<(String, &str)> = Vec::new(); // (field, param)
     for stmt in &init.body {
         let modeled = match &stmt.statement {
             StatementType::Assign(a) => {
-                // self.<field> = <param>
                 if let [ExprType::Attribute(attr)] = a.targets.as_slice()
-                    && let ExprType::Name(r) = attr.value.as_ref()
-                    && r.id == "self"
+                    && crate::ast::tree::visit::is_self(&attr.value)
                     && let ExprType::Name(v) = &a.value
+                    && let Some(param) = positional.iter().chain(kwonly.iter()).find(|p| **p == v.id)
                 {
-                    if let Some(idx) = params.iter().position(|p| *p == v.id) {
-                        fields.push((attr.attr.clone(), FieldValue::Arg(idx)));
-                        true
-                    } else if let Some(d) = kw_defaults.get(v.id.as_str()) {
-                        fields.push((attr.attr.clone(), FieldValue::Default(d)));
-                        true
-                    } else if init.args.kwonlyargs.iter().any(|p| p.arg == v.id) {
-                        // A keyword-only parameter without a default: the
-                        // raise would have to pass it — outside the model.
-                        return Ok(None);
-                    } else {
-                        false
-                    }
+                    fields.push((attr.attr.clone(), param));
+                    true
                 } else {
                     false
                 }
             }
             StatementType::Expr(e) => {
-                // super().__init__(<msg>) — an expression statement call;
-                // a docstring is inert.
                 if let ExprType::Call(sc) = &e.value {
                     let is_super_init = match sc.func.as_ref() {
                         ExprType::Attribute(attr) if attr.attr == "__init__" => {
@@ -701,9 +860,7 @@ pub(crate) fn exception_class_raise(
             _ => false,
         };
         if !modeled {
-            // Loud at the raise SITE as a rustc error naming the
-            // construct, so the rest of the crate stays measurable.
-            let msg = format!(
+            return site_error(format!(
                 "rython: `{}.__init__` (line {}) has a statement beyond `self.<field> = \
                  <param>` stores and the `super().__init__(<message>)` call: rython models \
                  an exception class's construction as its message and its stored fields, \
@@ -713,152 +870,61 @@ pub(crate) fn exception_class_raise(
                 cls.name,
                 stmt.lineno.unwrap_or(0),
                 cls.name
-            );
-            return Ok(Some(quote::quote!(compile_error!(#msg))));
+            ));
         }
     }
     let Some(mut m) = msg_expr else {
         return Ok(None);
     };
-    // The raise ARGUMENTS are evaluated once, in order, exactly as
-    // CPython evaluates a constructor call: an argument that contains a
-    // call is bound to a temporary and both the message and the attrs
-    // read the temporary (an argument with a side effect must not run
-    // once per role — the evaluation on issue #137). A pure argument (a
-    // name, a constant, a field read, arithmetic on those) renders in
-    // place, keeping its inferred type for the message's format spec.
-    let needs_binding = call.args.iter().any(|a| {
-        crate::ast::tree::visit::any_expr(a, |e| matches!(e, ExprType::Call(_)))
+    // The message at the raise site: a `self.<field>` read means the
+    // parameter the field stores, and each parameter means its
+    // substitution — one rewrite through the mutable visitor.
+    crate::ast::tree::visit::walk_expr_mut(&mut m, &mut |e| {
+        if let ExprType::Attribute(attr) = e
+            && crate::ast::tree::visit::is_self(&attr.value)
+            && let Some((_, param)) = fields.iter().find(|(f, _)| *f == attr.attr)
+        {
+            *e = ExprType::Name(crate::ast::tree::name::Name { id: param.to_string() });
+        }
+        if let ExprType::Name(n) = e
+            && let Some(sub) = substitution.get(n.id.as_str())
+        {
+            *e = sub.clone();
+        }
     });
-    let mut prelude: Vec<proc_macro2::TokenStream> = Vec::new();
-    let substituted: Vec<ExprType> = if needs_binding {
-        call.args
-            .iter()
-            .enumerate()
-            .map(|(i, a)| {
-                let ident = proc_macro2::Ident::new(
-                    &format!("__rython_exc_arg{i}"),
-                    proc_macro2::Span::call_site(),
-                );
-                let tokens = a.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                prelude.push(quote::quote!(let #ident = #tokens;));
-                Ok(ExprType::Name(crate::ast::tree::name::Name {
-                    id: format!("__rython_exc_arg{i}"),
-                }))
-            })
-            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
-    } else {
-        call.args.clone()
-    };
-    // Render the message: substitute the __init__ params with the raise
-    // call's args (positional), then render the substituted expression.
-    // A parameter the rewrite did not reach (the message uses it in a
-    // form the substitution does not descend into) would render against
-    // the raise site's scope — a different name, or the wrong one — so
-    // it is refused.
-    // A message reading a STORED field (`super().__init__(self.message)`)
-    // means the parameter that field stores: rewrite it before the
-    // parameter substitution.
-    let field_params: Vec<(&str, &str)> = fields
+    if let Some(left) = positional
         .iter()
-        .filter_map(|(f, v)| match v {
-            FieldValue::Arg(idx) => Some((f.as_str(), params[*idx])),
-            FieldValue::Default(_) => None,
-        })
-        .collect();
-    substitute_self_fields(&mut m, &field_params);
-    substitute_params(&mut m, &params, &substituted);
-    if let Some(left) = params.iter().find(|p| crate::expr_references(&m, p)) {
-        return Err(format!(
-            "`{}.__init__`'s message uses its parameter `{}` in a form rython's \
-             exception model does not rewrite at the raise site (a name, an \
-             f-string, arithmetic, and a call's arguments are modeled); rython refuses \
-             to render it against the raise site's scope. Simplify the message \
-             expression, or bind it to a field",
+        .chain(kwonly.iter())
+        .find(|p| crate::expr_references(&m, p))
+    {
+        return site_error(format!(
+            "rython: `{}.__init__`'s message still reads its parameter `{}` after the \
+             raise-site rewrite; simplify the message expression, or store the value as a \
+             field",
             cls.name, left
-        )
-        .into());
+        ));
     }
-    let msg_tok = m.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+    let msg_tok = m.to_rust(ctx.clone(), msg_options.clone(), symbols.clone())?;
     let msg = quote::quote!(format!("{}", #msg_tok));
-    // The attrs: each field's value is the corresponding raise arg, boxed.
+    // The attrs: each field's substitution, boxed.
     let kind = &cls.name;
-    let attr_pairs: std::result::Result<Vec<_>, Box<dyn std::error::Error>> = fields
-        .iter()
-        .map(|(f, value)| {
-            let a = match value {
-                FieldValue::Arg(idx) if needs_binding => {
-                    let ident = proc_macro2::Ident::new(
-                        &format!("__rython_exc_arg{idx}"),
-                        proc_macro2::Span::call_site(),
-                    );
-                    quote::quote!(stdpython :: PyValue :: from ((#ident).clone()))
-                }
-                FieldValue::Arg(idx) => {
-                    let a = call.args[*idx].clone().to_rust(
-                        ctx.clone(),
-                        options.clone(),
-                        symbols.clone(),
-                    )?;
-                    quote::quote!(stdpython :: PyValue :: from (#a))
-                }
-                // The keyword-only parameter's default, boxed (None is the
-                // boxed None).
-                FieldValue::Default(d) if crate::is_none_expr(d) => {
-                    quote::quote!(stdpython :: PyValue :: None_)
-                }
-                FieldValue::Default(d) => {
-                    let a = (*d).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    quote::quote!(stdpython :: PyValue :: from (#a))
-                }
-            };
-            Ok(quote::quote!((#f . to_string (), #a)))
-        })
-        .collect();
-    let attr_pairs = attr_pairs?;
-    // The class's ancestor chain (BankError, Exception — resolved
-    // through the bases) attaches so `isinstance(v, BankError)` and an
-    // `except BankError:` reach the raised InsufficientFunds.
-    let mut ancestors: Vec<String> = Vec::new();
-    let is_exc = |n: &str| {
-        crate::ast::tree::raise_stmt::is_exception_class_name(n)
-            || match symbols.get(n) {
-                Some(crate::SymbolTableNode::ClassDef(c)) => {
-                    crate::is_exception_class(c)
-                }
-                _ => false,
+    let mut attr_pairs: Vec<proc_macro2::TokenStream> = Vec::new();
+    for (f, param) in &fields {
+        let value = &substitution[param];
+        let boxed = if crate::is_none_expr(value) {
+            quote::quote!(stdpython :: PyValue :: None_)
+        } else {
+            let a = value.clone().to_rust(ctx.clone(), msg_options.clone(), symbols.clone())?;
+            // A temporary is read by the message too: clone it into the box.
+            if matches!(value, ExprType::Name(n) if n.id.starts_with("__rython_exc_arg")) {
+                quote::quote!(stdpython :: PyValue :: from ((#a).clone()))
+            } else {
+                quote::quote!(stdpython :: PyValue :: from (#a))
             }
-    };
-    let mut cur: Option<&str> = None;
-    if let Some(ExprType::Name(b)) = cls.bases.first() {
-        cur = Some(b.id.as_str());
-    }
-    let mut guard = 0;
-    while let Some(base_name) = cur {
-        guard += 1;
-        if guard > 64 {
-            break;
-        }
-        if is_exc(base_name) {
-            ancestors.push(base_name.to_string());
-        }
-        cur = match symbols.get(base_name) {
-            Some(crate::SymbolTableNode::ClassDef(b)) => {
-                match b.bases.iter().find_map(|bb| match bb {
-                    ExprType::Name(n) if is_exc(&n.id) => Some(n.id.as_str()),
-                    _ => None,
-                }) {
-                    Some(next) => Some(next),
-                    None => None,
-                }
-            }
-            _ => None,
         };
+        attr_pairs.push(quote::quote!((#f . to_string (), #boxed)));
     }
-    let ancestor_tokens: Vec<proc_macro2::TokenStream> = ancestors
-        .iter()
-        .map(|a| quote::quote!((#a) . to_string ()))
-        .collect();
+    let ancestor_tokens = exception_ancestor_tokens(cls, &symbols);
     let construct = quote::quote! {
         stdpython :: PyException :: new_with_attrs_and_ancestors (
             #kind , #msg , vec ! [#(#attr_pairs),*] ,
@@ -869,70 +935,6 @@ pub(crate) fn exception_class_raise(
         Ok(Some(construct))
     } else {
         Ok(Some(quote::quote!({ #(#prelude)* #construct })))
-    }
-}
-
-/// Rewrite a `self.<field>` read in the message to the parameter the
-/// field stores (`super().__init__(self.message)` after `self.message =
-/// message`) — the same shapes `substitute_params` descends into.
-fn substitute_self_fields(expr: &mut ExprType, field_params: &[(&str, &str)]) {
-    use crate::ExprType;
-    match expr {
-        ExprType::Attribute(attr) if crate::ast::tree::visit::is_self(&attr.value) => {
-            if let Some((_, param)) = field_params.iter().find(|(f, _)| *f == attr.attr) {
-                *expr = ExprType::Name(crate::ast::tree::name::Name { id: param.to_string() });
-            }
-        }
-        ExprType::JoinedStr(j) => {
-            for part in &mut j.values {
-                if let ExprType::FormattedValue(f) = part {
-                    substitute_self_fields(&mut f.value, field_params);
-                }
-            }
-        }
-        ExprType::BinOp(b) => {
-            substitute_self_fields(&mut b.left, field_params);
-            substitute_self_fields(&mut b.right, field_params);
-        }
-        ExprType::Call(c) => {
-            substitute_self_fields(&mut c.func, field_params);
-            for a in &mut c.args {
-                substitute_self_fields(a, field_params);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Substitute the __init__ params in a message expression with the raise
-/// call's args (positionally) — an AST rewrite so the f-string renders
-/// against the raise site's scope.
-fn substitute_params(expr: &mut ExprType, params: &[&str], args: &[ExprType]) {
-    use crate::ExprType;
-    match expr {
-        ExprType::Name(n) => {
-            if let Some(idx) = params.iter().position(|p| *p == n.id) {
-                *expr = args[idx].clone();
-            }
-        }
-        ExprType::JoinedStr(j) => {
-            for part in &mut j.values {
-                if let ExprType::FormattedValue(f) = part {
-                    substitute_params(&mut f.value, params, args);
-                }
-            }
-        }
-        ExprType::BinOp(b) => {
-            substitute_params(&mut b.left, params, args);
-            substitute_params(&mut b.right, params, args);
-        }
-        ExprType::Call(c) => {
-            substitute_params(&mut c.func, params, args);
-            for a in &mut c.args {
-                substitute_params(a, params, args);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -965,11 +967,13 @@ pub(crate) fn exception_field_type(
                     && r.id == "self"
                     && let ExprType::Name(v) = &a.value
                 {
-                    // The param's annotation types the field.
+                    // The param's annotation types the field — a
+                    // positional or a keyword-only parameter.
                     let param = init
                         .args
                         .args
                         .iter()
+                        .chain(init.args.kwonlyargs.iter())
                         .find(|p| p.arg == v.id)?;
                     if let Some(ann) = param.annotation.as_ref()
                         && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)

@@ -2747,7 +2747,15 @@ impl<'a> CodeGen for Call {
                                                         quote!(format!("{}", #m))
                                                     }
                                                 };
-                                                Ok(quote!(PyException::new(#kind, #m)))
+                                                // The ancestor chain is class metadata,
+                                                // attached with or without a modeled __init__.
+                                                let ancestors =
+                                                    crate::ast::tree::raise_stmt::exception_ancestor_tokens(
+                                                        cls, &symbols,
+                                                    );
+                                                Ok(quote!(PyException::new_with_attrs_and_ancestors(
+                                                    #kind, #m, vec![], vec![#(#ancestors),*]
+                                                )))
                                             })?
                                         }
                                         _ => {
