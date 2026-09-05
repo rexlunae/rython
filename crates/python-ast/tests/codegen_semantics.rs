@@ -20880,6 +20880,47 @@ fn a_binding_under_the_reserved_temporary_prefix_is_refused() {
 }
 
 #[test]
+fn an_aliased_external_import_shadowed_by_a_local_class_is_an_external_base() {
+    // `from http.client import IncompleteRead as httplib_IncompleteRead`
+    // beside the crate's own `IncompleteRead(HTTPError,
+    // httplib_IncompleteRead)` (urllib3): the alias names the EXTERNAL
+    // class, never the local one of the same bare name — following it
+    // into the local class read a cycle where Python has an external
+    // base. The external branch is recorded under the alias spelling,
+    // with a definition warning; the class stays an exception through
+    // HTTPError (the sweep on issue #137).
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "from http.client import IncompleteRead as httplib_IncompleteRead\n",
+            "\n",
+            "class HTTPError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class IncompleteRead(HTTPError, httplib_IncompleteRead):\n",
+            "    def __init__(self, partial: int, expected: int) -> None:\n",
+            "        self.partial = partial\n",
+            "        self.expected = expected\n",
+            "        super().__init__(partial, expected)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise IncompleteRead(3, 7)\n",
+        ),
+        "raise_external_shadowed_base.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("vec ! [(\"HTTPError\") . to_string () , (\"Exception\") . to_string () , (\"httplib_IncompleteRead\") . to_string ()]"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("`httplib_IncompleteRead` is an external import bound beside the crate's own class `IncompleteRead`")),
+        "warnings: {:?}",
+        warnings
+    );
+}
+
+#[test]
 fn a_parameter_or_local_named_not_implemented_is_a_value() {
     // A parameter or a local named `NotImplemented` shadows the singleton
     // in `__eq__`: the return is that value — no decline, no identity

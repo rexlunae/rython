@@ -1096,6 +1096,29 @@ pub(crate) fn canonical_exception_class(
     if crate::ast::tree::class_def::is_runtime_ambiguous_alias(name, &options.this_module_path) {
         return None;
     }
+    // A name this module binds by an EXTERNAL import whose bare name a
+    // LOCAL class shadows (`from http.client import IncompleteRead as
+    // httplib_IncompleteRead` beside the crate's own `IncompleteRead` —
+    // urllib3): the binding is the external class, never the local one
+    // (following the alias into it read a cycle where Python has an
+    // external base). A branch the model cannot see into: recorded under
+    // the alias spelling (matched by that name at runtime), its own
+    // ancestors unknown, and said so — the external-module divergence
+    // (the sweep on issue #137).
+    if crate::ast::tree::class_def::is_this_module_external(name)
+        && let Some(SymbolTableNode::Alias(canonical)) = scope.get(name)
+        && matches!(scope.get(canonical), Some(SymbolTableNode::ClassDef(_)))
+    {
+        if let Some(builtin) = imported_exception_alias(name, scope, Some(options)) {
+            return Some((builtin.to_string(), None));
+        }
+        options.definition_warnings.borrow_mut().push(format!(
+            "`{name}` is an external import bound beside the crate's own class `{canonical}`: \
+             as a base or a handler it is matched by the name `{name}` at runtime and its \
+             own ancestors are unknown (the external-module divergence)"
+        ));
+        return Some((name.to_string(), None));
+    }
     if let Some((cls, cls_scope)) =
         crate::ast::tree::call::resolve_construction_class(name, scope, options)
     {
