@@ -15289,7 +15289,7 @@ fn exception_message_args_wrap_class_instances_in_py_display() {
     // boxed value in py_display (Python's str) — a raw format! would
     // fail to compile (no Rust Display on a class struct). Two arguments
     // to a class without a modeled __init__ make `str(e)` the args
-    // tuple's repr, which the one-message model refuses (the old
+    // tuple's repr — each argument's repr, parenthesized (the old
     // comma-joined message was a silent divergence; Devin review on #330).
     let out = compile(
         concat!(
@@ -15314,7 +15314,11 @@ fn exception_message_args_wrap_class_instances_in_py_display() {
         "the message arg must wrap the class instance: {}",
         out
     );
-    assert!(out.contains("repr of the args tuple"), "generated: {}", out);
+    assert!(
+        out.contains("format ! (\"({}, {})\" , stdpython :: PyRepr :: py_repr (& ({ Pool :: new (\"x\") ? })) , stdpython :: PyRepr :: py_repr (& (\"closed.\")))"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]

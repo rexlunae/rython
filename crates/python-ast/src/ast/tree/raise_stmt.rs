@@ -969,14 +969,19 @@ pub(crate) fn exception_construction(
             quote!(format!("{}", #m))
         }
         many => {
-            let msg = format!(
-                "rython: `{}({} arguments)`: `str(e)` is then the repr of the args tuple, \
-                 which rython's one-message exception model does not reproduce; pass one \
-                 message",
-                cls.name,
-                many.len()
-            );
-            return Ok(quote!(compile_error!(#msg)));
+            // `str(e)` is `str(e.args)`: the tuple's repr — each
+            // argument's repr, parenthesized and comma-joined
+            // (`(<Pool object>, 'Pool is closed.')`; the default object
+            // repr drops CPython's address, the documented §12.3
+            // divergence). The old comma-joined display was a silent
+            // divergence (the CI transcript on #330).
+            let mut parts: Vec<TokenStream> = Vec::new();
+            for a in many {
+                let tokens = a.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                parts.push(quote!(stdpython::PyRepr::py_repr(&(#tokens))));
+            }
+            let fmt = format!("({})", vec!["{}"; parts.len()].join(", "));
+            quote!(format!(#fmt, #(#parts),*))
         }
     };
     let ancestors = exception_ancestor_tokens(cls, class_symbols, &options);

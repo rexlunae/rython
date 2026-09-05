@@ -8131,7 +8131,10 @@ fn class_instance_display_matches_cpython() {
     // (documented §12.3 divergence; CPython's own output varies run to
     // run) and the module prefix for the crate root. Output verified
     // against CPython: Pool(host='x') / <... object> / fstring=Pool(...)
-    // / a message containing str(pool).
+    // / the two-argument exception's `str(e)` — the args tuple's repr,
+    // `(<Pool object>, 'Pool is closed.')` (CPython: `(<__main__.Pool
+    // object at 0x...>, 'Pool is closed.')` — the address and module
+    // prefix are the §12.3 divergence; #330).
     let scratch = Scratch::new("classdisp");
     let pkg = scratch.path().join("probe");
     fs::create_dir_all(&pkg).unwrap();
@@ -8191,9 +8194,10 @@ fn class_instance_display_matches_cpython() {
         stdout
     );
     assert_eq!(lines[2], "fstring=Pool(host='y')", "stdout: {}", stdout);
-    assert!(
-        lines[3].contains("Pool(host='example.com')"),
-        "the __str__ must be honored inside the message: {}",
+    assert_eq!(
+        lines[3],
+        "(<Pool object>, 'Pool is closed.')",
+        "the two-argument message is the args tuple's repr: {}",
         stdout
     );
 }
