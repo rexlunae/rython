@@ -20734,6 +20734,35 @@ fn a_global_declaration_of_not_implemented_alone_is_still_the_singleton() {
 }
 
 #[test]
+fn an_explicit_eq_call_on_a_declining_shared_class_is_loud() {
+    // `t.__eq__(other)` spelled out on a shared class whose `__eq__` can
+    // return NotImplemented: the decline lives in the `==` adapter as the
+    // Option's None, and the singleton has no runtime value to hand the
+    // caller — a `compile_error!` at the call, never a silent None; `==`
+    // stays the supported spelling (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Tag:\n",
+            "    def __init__(self, s: str):\n",
+            "        self.s = s\n",
+            "    def bump(self) -> None:\n",
+            "        self.s += \"!\"\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        return NotImplemented\n",
+            "\n",
+            "def f() -> bool:\n",
+            "    tags = [Tag(\"x\")]\n",
+            "    tags[0].bump()\n",
+            "    t = tags[0]\n",
+            "    return t.__eq__(Tag(\"y\"))\n",
+        ),
+        "notimpl_explicit_eq.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("explicit `Tag.__eq__(...)` call"), "generated: {}", out);
+}
+
+#[test]
 fn a_parameter_or_local_named_not_implemented_is_a_value() {
     // A parameter or a local named `NotImplemented` shadows the singleton
     // in `__eq__`: the return is that value — no decline, no identity

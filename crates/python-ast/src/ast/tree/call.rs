@@ -1784,6 +1784,29 @@ impl<'a> CodeGen for Call {
         {
             return self.args[1].clone().to_rust(ctx, options, symbols);
         }
+        // An EXPLICIT `obj.__eq__(other)` on a shared class whose `__eq__`
+        // can decline (`return NotImplemented`): the decline is the
+        // `Option<bool>`'s None inside the `==` adapter (PyRefEq), and the
+        // NotImplemented singleton has no runtime value to hand a caller
+        // — loud at the site rather than a silent None (Devin review on
+        // #330). `==` is the supported spelling.
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && attr.attr == "__eq__"
+            && let Some((class, class_symbols)) =
+                receiver_class_for_read(&attr.value, &ctx, &symbols, &options)
+            && crate::ast::tree::shared::is_shared(&class.name)
+            && let Some(eq) = class.method_on_mro("__eq__", &class_symbols)
+            && crate::ast::tree::function_def::body_returns_not_implemented(&eq, &class_symbols)
+        {
+            let msg = format!(
+                "rython: an explicit `{}.__eq__(...)` call on a shared class whose `__eq__` \
+                 can return NotImplemented: the singleton has no runtime value to return, \
+                 so the call would yield None silently; compare with `==` (the reflected \
+                 `__eq__` and identity then apply as in CPython)",
+                class.name
+            );
+            return Ok(quote!(compile_error!(#msg)));
+        }
         // A compat builtin ALIAS used as a callee (`builtin_str = str` —
         // requests/compat, called as `builtin_str(x)` in models.py): the
         // alias resolves through its defining module to the builtin name,
