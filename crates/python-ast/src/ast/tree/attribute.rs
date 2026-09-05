@@ -373,11 +373,15 @@ impl<'a> CodeGen for Attribute {
             let Some(cls_name) = caught.as_ref() else {
                 return Ok(None);
             };
-            let cls = match symbols.get(cls_name) {
-                Some(crate::SymbolTableNode::ClassDef(c)) => c,
-                _ => return Ok(None),
+            // The caught class resolves locally or through its import;
+            // its field types come from the defining module's scope.
+            let Some((cls, class_symbols)) =
+                crate::ast::tree::call::resolve_construction_class(cls_name, &symbols, &options)
+            else {
+                return Ok(None);
             };
-            let Some(ty) = crate::exception_field_type(cls, &self.attr, &symbols, &options) else {
+            let Some(ty) = crate::exception_field_type(&cls, &self.attr, &class_symbols, &options)
+            else {
                 return Ok(None);
             };
             // A stored field whose __init__ parameter carries no

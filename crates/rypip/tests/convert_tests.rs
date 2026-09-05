@@ -8522,3 +8522,80 @@ fn the_exception_model_matches_python_at_runtime() {
         "the exception model diverged from CPython"
     );
 }
+
+#[test]
+fn imported_exception_classes_match_python_at_runtime() {
+    // An exception class defined in one module and raised in another
+    // (Devin review on #330): the ancestor chain and the modeled
+    // constructor (positional-only parameter, a defaulted one, a keyword)
+    // resolve through the defining module.
+    let scratch = Scratch::new("errpkg");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"errpkg\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("errpkg");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("errors.py"),
+        concat!(
+            "class MyError(ValueError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Short(Exception):\n",
+            "    def __init__(self, needed: int, /, unit: str = \"credits\"):\n",
+            "        super().__init__(f\"need {needed} {unit}\")\n",
+            "        self.needed = needed\n",
+            "        self.unit = unit\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("cli.py"),
+        concat!(
+            "from errors import MyError\n",
+            "from errors import Short\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    try:\n",
+            "        raise MyError(\"imported\")\n",
+            "    except ValueError as e:\n",
+            "        print(\"caught ValueError:\", e)\n",
+            "    try:\n",
+            "        raise Short(2)\n",
+            "    except Short as e:\n",
+            "        print(e, e.needed, e.unit)\n",
+            "    try:\n",
+            "        raise Short(5, unit=\"coins\")\n",
+            "    except Exception as e:\n",
+            "        print(e)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/errpkg"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["caught ValueError: imported", "need 2 credits 2 credits", "need 5 coins"],
+        "the imported exception model diverged from CPython"
+    );
+}

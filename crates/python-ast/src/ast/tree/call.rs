@@ -2717,14 +2717,16 @@ impl<'a> CodeGen for Call {
                                     // __init__ message + the attrs + the
                                     // ancestor chain) when the class is
                                     // in-crate; the quoted kind otherwise.
-                                    match symbols.get(&f.id) {
-                                        Some(crate::SymbolTableNode::ClassDef(cls)) => {
+                                    match resolve_construction_class(&f.id, &symbols, &options) {
+                                        Some((cls, class_symbols)) => {
+                                            let cls = &cls;
                                             crate::ast::tree::raise_stmt::exception_class_raise(
                                                 cls,
                                                 call,
                                                 ctx.clone(),
                                                 options.clone(),
                                                 symbols.clone(),
+                                                &class_symbols,
                                             )?
                                             .map(Ok)
                                             .unwrap_or_else(|| -> Result<_, Box<dyn std::error::Error>> {
@@ -2751,7 +2753,7 @@ impl<'a> CodeGen for Call {
                                                 // attached with or without a modeled __init__.
                                                 let ancestors =
                                                     crate::ast::tree::raise_stmt::exception_ancestor_tokens(
-                                                        cls, &symbols,
+                                                        cls, &class_symbols, &options,
                                                     );
                                                 Ok(quote!(PyException::new_with_attrs_and_ancestors(
                                                     #kind, #m, vec![], vec![#(#ancestors),*]

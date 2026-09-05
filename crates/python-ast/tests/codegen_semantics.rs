@@ -19279,3 +19279,61 @@ fn the_exception_model_refuses_what_it_does_not_run_or_type() {
     );
     assert!(err.contains("rython refuses to guess"), "error: {}", err);
 }
+
+/// Positional-only `__init__` parameters bind like CPython's combined
+/// `posonlyargs ++ args` sequence, defaults aligned to its tail; passing
+/// one by keyword is loud (Devin review on #330).
+#[test]
+fn positional_only_exception_parameters_bind_and_default() {
+    let out = compile(
+        concat!(
+            "class Short(Exception):\n",
+            "    def __init__(self, needed: int, /, unit: str = \"credits\"):\n",
+            "        super().__init__(f\"need {needed} {unit}\")\n",
+            "        self.needed = needed\n",
+            "        self.unit = unit\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Short(2)\n",
+            "\n",
+            "def g() -> None:\n",
+            "    raise Short(needed=2)\n",
+        ),
+        "raise_posonly.py",
+    );
+    assert!(
+        out.contains("(\"unit\" . to_string () , stdpython :: PyValue :: from (\"credits\"))"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("positional-only arguments passed as keyword"), "generated: {}", out);
+}
+
+/// The mutable enumeration visits exactly the nodes the immutable one
+/// does — the two twins are pinned against each other over an expression
+/// that exercises every form (Devin review on #330).
+#[test]
+fn the_mutable_visitor_twin_agrees_with_the_immutable_one() {
+    use python_ast::ast::tree::visit::{walk_expr, walk_expr_mut};
+    let module = parse(
+        concat!(
+            "x = [a + b for a in xs if a] + {k: v for k, v in d.items()} + {s for s in t} + ",
+            "list(g(1, k=lambda q: q * 2)) + (f\"{n:>{w}}\" if p and not r else u[1:2:3]) + ",
+            "(await w) + (yield z) + (yield from zs) + (m := n) + o.attr + [*rest] + (1, 2) + ",
+            "{1, 2} + q[i] + (a < b < c) + (-e)\n",
+        ),
+        "twins.py",
+    )
+    .unwrap_or_else(|e| panic!("parse failed: {}", e));
+    let stmt = module.raw.body.into_iter().next().expect("one statement");
+    let python_ast::StatementType::Assign(assign) = stmt.statement else {
+        panic!("an assignment");
+    };
+    let mut seen_ro: Vec<String> = Vec::new();
+    walk_expr(&assign.value, &mut |e| seen_ro.push(format!("{:?}", std::mem::discriminant(e))));
+    let mut value = assign.value.clone();
+    let mut seen_mut: Vec<String> = Vec::new();
+    walk_expr_mut(&mut value, &mut |e| seen_mut.push(format!("{:?}", std::mem::discriminant(e))));
+    assert!(seen_ro.len() > 40, "the expression exercises the forms: {}", seen_ro.len());
+    assert_eq!(seen_ro, seen_mut, "the two enumerations diverged");
+}

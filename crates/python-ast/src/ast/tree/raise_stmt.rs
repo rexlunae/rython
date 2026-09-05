@@ -413,14 +413,19 @@ fn exception_value(
             // the class's own message and carry its field stores as attrs
             // (bank's InsufficientFunds — round 99). Runs FIRST (before
             // the message builders move ctx/options/symbols below).
+            // The class resolves locally or through its import (`from
+            // .errors import MyError`): the defining module's ClassDef
+            // and symbols drive the model and the ancestor chain.
             if let ExprType::Name(name) = call.func.as_ref()
-                && let Some(crate::SymbolTableNode::ClassDef(cls)) = symbols.get(&name.id)
+                && let Some((cls, class_symbols)) =
+                    crate::ast::tree::call::resolve_construction_class(&name.id, &symbols, &options)
                 && let Some(tokens) = crate::exception_class_raise(
-                    cls,
+                    &cls,
                     call,
                     ctx.clone(),
                     options.clone(),
                     symbols.clone(),
+                    &class_symbols,
                 )?
             {
                 return Ok(tokens);
@@ -505,12 +510,12 @@ fn exception_value(
                     // metadata: attached whether or not its __init__ is
                     // modeled (`class MyError(ValueError): pass` is
                     // caught by `except ValueError:`).
-                    let ancestors = match symbols.get(&name.id) {
-                        Some(crate::SymbolTableNode::ClassDef(cls)) => {
-                            Some(exception_ancestor_tokens(cls, &symbols))
-                        }
-                        _ => None,
-                    };
+                    let ancestors = crate::ast::tree::call::resolve_construction_class(
+                        &name.id, &symbols, &options,
+                    )
+                    .map(|(cls, class_symbols)| {
+                        exception_ancestor_tokens(&cls, &class_symbols, &options)
+                    });
                     // An IN-CRATE exception class with a modeled __init__
                     // (`class InsufficientFunds(BankError)` whose __init__
                     // calls super().__init__(f"need {needed}, have
@@ -563,14 +568,15 @@ fn exception_value(
         // `raise MyError` (the class, no call) for an in-crate class: the
         // ancestor chain attaches here too.
         ExprType::Name(name)
-            if matches!(symbols.get(&name.id), Some(crate::SymbolTableNode::ClassDef(c))
-                if crate::is_exception_class(c)) =>
+            if crate::ast::tree::call::resolve_construction_class(&name.id, &symbols, &options)
+                .is_some_and(|(c, _)| crate::is_exception_class(&c)) =>
         {
             let kind = &name.id;
-            let ancestors = match symbols.get(&name.id) {
-                Some(crate::SymbolTableNode::ClassDef(cls)) => exception_ancestor_tokens(cls, &symbols),
-                _ => Vec::new(),
-            };
+            let ancestors = crate::ast::tree::call::resolve_construction_class(
+                &name.id, &symbols, &options,
+            )
+            .map(|(cls, class_symbols)| exception_ancestor_tokens(&cls, &class_symbols, &options))
+            .unwrap_or_default();
             Ok(quote!(PyException::new_with_attrs_and_ancestors(
                 #kind, String::new(), vec![], vec![#(#ancestors),*]
             )))
@@ -627,36 +633,32 @@ mod tests {
 pub(crate) fn exception_ancestors(
     cls: &crate::ClassDef,
     symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
 ) -> Vec<String> {
     use crate::ExprType;
-    let is_exc = |n: &str| {
-        is_exception_class_name(n)
-            || match symbols.get(n) {
-                Some(crate::SymbolTableNode::ClassDef(c)) => crate::is_exception_class(c),
-                _ => false,
-            }
-    };
+    // Each base resolves in the scope its class was defined in — a
+    // class imported from another module (`from .errors import MyError`)
+    // names ITS bases in that module (Devin review on #330); the one
+    // construction-class resolver follows the import.
     let mut ancestors: Vec<String> = Vec::new();
-    let mut cur: Option<&str> = match cls.bases.first() {
-        Some(ExprType::Name(b)) => Some(b.id.as_str()),
-        _ => None,
-    };
+    let mut cur: Option<(crate::ClassDef, crate::SymbolTableScopes)> =
+        Some((cls.clone(), symbols.clone()));
     let mut guard = 0;
-    while let Some(base_name) = cur {
+    while let Some((c, scope)) = cur.take() {
         guard += 1;
         if guard > 64 {
             break;
         }
-        if is_exc(base_name) {
-            ancestors.push(base_name.to_string());
-        }
-        cur = match symbols.get(base_name) {
-            Some(crate::SymbolTableNode::ClassDef(b)) => b.bases.iter().find_map(|bb| match bb {
-                ExprType::Name(n) if is_exc(&n.id) => Some(n.id.as_str()),
-                _ => None,
-            }),
-            _ => None,
+        let Some(ExprType::Name(base)) = c.bases.first() else {
+            break;
         };
+        let resolved = crate::ast::tree::call::resolve_construction_class(&base.id, &scope, options);
+        let is_exc = is_exception_class_name(&base.id)
+            || resolved.as_ref().is_some_and(|(b, _)| crate::is_exception_class(b));
+        if is_exc {
+            ancestors.push(base.id.clone());
+        }
+        cur = resolved;
     }
     ancestors
 }
@@ -665,8 +667,9 @@ pub(crate) fn exception_ancestors(
 pub(crate) fn exception_ancestor_tokens(
     cls: &crate::ClassDef,
     symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
 ) -> Vec<proc_macro2::TokenStream> {
-    exception_ancestors(cls, symbols)
+    exception_ancestors(cls, symbols, options)
         .iter()
         .map(|a| quote::quote!((#a) . to_string ()))
         .collect()
@@ -697,6 +700,7 @@ pub(crate) fn exception_class_raise(
     ctx: crate::CodeGenContext,
     options: crate::PythonOptions,
     symbols: crate::SymbolTableScopes,
+    class_symbols: &crate::SymbolTableScopes,
 ) -> Result<Option<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
     use crate::{ExprType, StatementType};
     use std::collections::HashMap;
@@ -706,7 +710,20 @@ pub(crate) fn exception_class_raise(
     let Some(init) = cls.init_method() else {
         return Ok(None);
     };
-    let positional: Vec<&str> = init.args.args.iter().skip(1).map(|a| a.arg.as_str()).collect();
+    // The positional parameters are the positional-only ones followed by
+    // the ordinary ones (CPython's `posonlyargs ++ args`); the receiver
+    // is the first of that sequence wherever it sits, and a
+    // positional-only parameter cannot be passed by keyword.
+    let combined: Vec<&crate::ast::tree::arguments::Parameter> =
+        init.args.posonlyargs.iter().chain(init.args.args.iter()).collect();
+    let positional: Vec<&str> = combined.iter().skip(1).map(|a| a.arg.as_str()).collect();
+    let positional_only: Vec<&str> = init
+        .args
+        .posonlyargs
+        .iter()
+        .skip(1)
+        .map(|a| a.arg.as_str())
+        .collect();
     let kwonly: Vec<&str> = init.args.kwonlyargs.iter().map(|a| a.arg.as_str()).collect();
     if positional.is_empty() && kwonly.is_empty() {
         return Ok(None);
@@ -717,11 +734,14 @@ pub(crate) fn exception_class_raise(
     // Defaults: positional defaults align to the tail of the positional
     // parameters, keyword-only defaults to their parameters.
     let mut defaults: HashMap<&str, &ExprType> = HashMap::new();
-    let n_all = init.args.args.len();
+    let n_all = combined.len();
     let n_def = init.args.defaults.len();
+    if n_def > n_all {
+        return Ok(None);
+    }
     for (i, d) in init.args.defaults.iter().enumerate() {
-        let param = &init.args.args[n_all - n_def + i];
-        if param.arg != "self" {
+        let param = combined[n_all - n_def + i];
+        if i + (n_all - n_def) > 0 {
             defaults.insert(param.arg.as_str(), d.as_ref());
         }
     }
@@ -758,6 +778,13 @@ pub(crate) fn exception_class_raise(
                 cls.name
             ));
         };
+        if positional_only.contains(&name) {
+            return site_error(format!(
+                "rython: `{}()` got some positional-only arguments passed as keyword \
+                 arguments: '{}'",
+                cls.name, name
+            ));
+        }
         if !positional.contains(&name) && !kwonly.contains(&name) {
             return site_error(format!(
                 "rython: `{}()` got an unexpected keyword argument '{}'",
@@ -924,7 +951,7 @@ pub(crate) fn exception_class_raise(
         };
         attr_pairs.push(quote::quote!((#f . to_string (), #boxed)));
     }
-    let ancestor_tokens = exception_ancestor_tokens(cls, &symbols);
+    let ancestor_tokens = exception_ancestor_tokens(cls, class_symbols, &options);
     let construct = quote::quote! {
         stdpython :: PyException :: new_with_attrs_and_ancestors (
             #kind , #msg , vec ! [#(#attr_pairs),*] ,
@@ -968,11 +995,13 @@ pub(crate) fn exception_field_type(
                     && let ExprType::Name(v) = &a.value
                 {
                     // The param's annotation types the field — a
-                    // positional or a keyword-only parameter.
+                    // positional-only, positional, or keyword-only
+                    // parameter.
                     let param = init
                         .args
-                        .args
+                        .posonlyargs
                         .iter()
+                        .chain(init.args.args.iter())
                         .chain(init.args.kwonlyargs.iter())
                         .find(|p| p.arg == v.id)?;
                     if let Some(ann) = param.annotation.as_ref()
