@@ -20230,3 +20230,34 @@ fn a_parameter_or_local_named_not_implemented_is_a_value() {
     assert!(!out.contains("Option < bool >"), "generated: {}", out);
     assert_eq!(out.matches("return Ok (NotImplemented)").count(), 2, "generated: {}", out);
 }
+
+#[test]
+fn builtin_bases_take_their_full_mro_into_the_merge() {
+    // `class C(Exception, ValueError)` has no consistent MRO in CPython
+    // (ValueError precedes Exception in its own); `class D(ValueError,
+    // Exception)` does, and its recorded chain is its direct builtins in
+    // MRO order (Devin review on #330).
+    let err = compile_err(
+        concat!(
+            "class C(Exception, ValueError):\n",
+            "    pass\n",
+        ),
+        "raise_builtin_order_bad.py",
+    );
+    assert!(err.contains("consistent method resolution order"), "error: {}", err);
+    let out = compile(
+        concat!(
+            "class D(ValueError, Exception):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise D(\"d\")\n",
+        ),
+        "raise_builtin_order_ok.py",
+    );
+    assert!(
+        out.contains("(\"D\" , format ! (\"{}\" , \"d\") , vec ! [] , vec ! [(\"ValueError\") . to_string () , (\"Exception\") . to_string ()])"),
+        "generated: {}",
+        out
+    );
+}

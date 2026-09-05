@@ -9122,6 +9122,53 @@ fn an_alias_ambiguity_is_scoped_to_its_module() {
 }
 
 #[test]
+fn an_external_import_alias_never_resolves_to_an_unrelated_crate_class() {
+    // errors.py defines an exception `Root`; other.py imports an
+    // EXTERNAL `Root as R` and derives from R: that class is not the
+    // crate's Root — it lowers as the ordinary class it is (the external
+    // base is the documented external-module divergence, warned), never
+    // as a marker over the unrelated exception (Devin review on #330).
+    let scratch = Scratch::new("extalias");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"extalias\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("extalias");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("errors.py"),
+        concat!("class Root(Exception):\n", "    pass\n"),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("other.py"),
+        concat!(
+            "from somewhere_else import Root as R\n",
+            "\n",
+            "\n",
+            "class Node(R):\n",
+            "    def label(self) -> str:\n",
+            "        return \"node\"\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let other = fs::read_to_string(krate.root.join("src/other.rs")).unwrap();
+    assert!(other.contains("fn label"), "the ordinary class lost its method: {}", other);
+    assert!(!other.contains("pub struct Node;"), "lowered as an exception marker: {}", other);
+    assert!(
+        krate.warnings.iter().any(|w| w.contains("somewhere_else")),
+        "warnings: {:?}",
+        krate.warnings
+    );
+}
+
+#[test]
 fn not_implemented_in_a_shared_eq_is_identity_at_runtime() {
     // A shared class's `__eq__` that returns NotImplemented: `t == t` is
     // True (the same object), a second instance is not; when the left

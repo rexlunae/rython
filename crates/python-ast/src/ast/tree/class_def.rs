@@ -242,7 +242,10 @@ pub struct ExceptionIndex {
 /// control-flow body the gates could not fold ADDS an alternative — a
 /// name with two alternatives is decided at runtime (the caller's
 /// ambiguity). Devin review on #330.
-pub(crate) fn module_name_aliases(body: &[crate::Statement]) -> Vec<(String, String)> {
+pub(crate) fn module_name_aliases(
+    body: &[crate::Statement],
+    options: &crate::PythonOptions,
+) -> Vec<(String, String)> {
     use crate::ast::tree::visit::{Descend, stmt_bodies_for};
     // name → its current alternatives, in first-seen order
     let mut bindings: Vec<(String, Vec<String>)> = Vec::new();
@@ -264,6 +267,7 @@ pub(crate) fn module_name_aliases(body: &[crate::Statement]) -> Vec<(String, Str
         stmts: &[crate::Statement],
         nested: bool,
         bindings: &mut Vec<(String, Vec<String>)>,
+        options: &crate::PythonOptions,
     ) {
         for s in stmts {
             match &s.statement {
@@ -272,7 +276,13 @@ pub(crate) fn module_name_aliases(body: &[crate::Statement]) -> Vec<(String, Str
                         bind(bindings, &t.id, &v.id, nested);
                     }
                 }
-                crate::StatementType::ImportFrom(i) => {
+                // An import alias names a class of a CRATE module only:
+                // an external package's `Root as R` is not the crate's
+                // `Root` (the index is keyed by bare name — Devin review
+                // on #330); such a base is loud downstream.
+                crate::StatementType::ImportFrom(i)
+                    if options.module_defs.contains_key(&i.resolved_module_path(options)) =>
+                {
                     for a in &i.names {
                         if let Some(asname) = &a.asname
                             && asname != &a.name
@@ -284,11 +294,11 @@ pub(crate) fn module_name_aliases(body: &[crate::Statement]) -> Vec<(String, Str
                 _ => {}
             }
             for body in stmt_bodies_for(s, Descend::SkipDefs) {
-                collect(body, true, bindings);
+                collect(body, true, bindings, options);
             }
         }
     }
-    collect(body, false, &mut bindings);
+    collect(body, false, &mut bindings, options);
     bindings
         .into_iter()
         .flat_map(|(n, alts)| alts.into_iter().map(move |t| (n.clone(), t)))

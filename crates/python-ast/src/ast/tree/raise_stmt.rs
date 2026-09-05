@@ -1080,30 +1080,92 @@ pub(crate) fn exception_mro(
     options: &crate::PythonOptions,
 ) -> Result<Vec<(String, Option<(crate::ClassDef, crate::SymbolTableScopes)>)>, Box<dyn std::error::Error>> {
     type Entry = (String, Option<(crate::ClassDef, crate::SymbolTableScopes)>);
+    /// A builtin base's own linearization from the interpreter table
+    /// (`ValueError, Exception, BaseException, object`), so the merge
+    /// sees the constraints CPython sees (`class C(Exception,
+    /// ValueError)` has no consistent MRO — Devin review on #330).
+    fn builtin_seq(name: &str) -> Result<Vec<Entry>, Box<dyn std::error::Error>> {
+        Ok(match builtin_exception_mro(name)? {
+            Some(mro) => mro.iter().map(|n| (n.clone(), None)).collect(),
+            None => vec![(name.to_string(), None)],
+        })
+    }
     fn linearize(
         name: String,
         def: Option<(crate::ClassDef, crate::SymbolTableScopes)>,
         options: &crate::PythonOptions,
         depth: usize,
+        direct_builtins: &mut std::collections::HashSet<String>,
     ) -> Result<Vec<Entry>, Box<dyn std::error::Error>> {
         let Some((cls, scope)) = def else {
-            return Ok(vec![(name, None)]);
+            return builtin_seq(&name);
         };
         if depth > 32 {
             return Ok(vec![(name, Some((cls, scope)))]);
         }
-        // Each base by its canonical name, with its definition.
-        let bases: Vec<Entry> = cls
-            .bases
-            .iter()
-            .filter_map(|b| match b {
-                crate::ExprType::Name(n) => canonical_exception_class(&n.id, &scope, options),
-                _ => None,
-            })
-            .collect();
+        // Each base by its canonical name, with its definition: a crate
+        // class; a builtin (its canonical MRO head, recorded as a direct
+        // builtin base); a stdlib-module spelling (`ssl.SSLError`); an
+        // exception-named base the crate does not define (an external
+        // package's — the branch ends there, matched by name at runtime);
+        // `object` adds nothing. Any other base cannot take a place in
+        // the MRO: loud, never dropped.
+        let mut bases: Vec<Entry> = Vec::new();
+        for b in &cls.bases {
+            match b {
+                crate::ExprType::Name(n) if n.id == "object" => {}
+                crate::ExprType::Name(n) => match canonical_exception_class(&n.id, &scope, options) {
+                    Some((base, Some(def))) => bases.push((base, Some(def))),
+                    Some((base, None)) => {
+                        let head = builtin_exception_mro(&base)?
+                            .and_then(|m| m.first().cloned())
+                            .unwrap_or(base);
+                        direct_builtins.insert(head.clone());
+                        bases.push((head, None));
+                    }
+                    None => {
+                        return Err(format!(
+                            "class `{}` inherits from `{}`, which is not an exception class \
+                             the model can place in its MRO (an ordinary class, an unresolved \
+                             import, or a name bound to more than one class at runtime)",
+                            cls.name, n.id
+                        )
+                        .into());
+                    }
+                },
+                crate::ExprType::Attribute(a) => {
+                    let base = match a.value.as_ref() {
+                        crate::ExprType::Name(m) => stdlib_exception_canonical(&m.id, &a.attr)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| a.attr.clone()),
+                        _ => a.attr.clone(),
+                    };
+                    if !is_exception_class_name(&base) {
+                        return Err(format!(
+                            "class `{}` inherits from a dotted base `{}` that is no exception \
+                             class the model knows; rython cannot place it in the MRO",
+                            cls.name, base
+                        )
+                        .into());
+                    }
+                    let head = builtin_exception_mro(&base)?
+                        .and_then(|m| m.first().cloned())
+                        .unwrap_or(base);
+                    direct_builtins.insert(head.clone());
+                    bases.push((head, None));
+                }
+                _ => {
+                    return Err(format!(
+                        "class `{}` has a base expression rython cannot place in its MRO",
+                        cls.name
+                    )
+                    .into());
+                }
+            }
+        }
         let mut seqs: Vec<Vec<Entry>> = bases
             .iter()
-            .map(|(n, d)| linearize(n.clone(), d.clone(), options, depth + 1))
+            .map(|(n, d)| linearize(n.clone(), d.clone(), options, depth + 1, direct_builtins))
             .collect::<Result<_, _>>()?;
         seqs.push(bases.clone());
         let mut out: Vec<Entry> = vec![(name, Some((cls, scope)))];
@@ -1143,7 +1205,22 @@ pub(crate) fn exception_mro(
         }
         Ok(out)
     }
-    linearize(cls.name.clone(), Some((cls.clone(), scope.clone())), options, 0)
+    let mut direct_builtins: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let full = linearize(
+        cls.name.clone(),
+        Some((cls.clone(), scope.clone())),
+        options,
+        0,
+        &mut direct_builtins,
+    )?;
+    // The recorded chain: the crate's classes and the builtins they
+    // derive from DIRECTLY — the runtime expands each builtin's own MRO
+    // from the interpreter table, so the tail (`Exception, BaseException,
+    // object`) is not repeated here.
+    Ok(full
+        .into_iter()
+        .filter(|(name, def)| def.is_some() || direct_builtins.contains(name))
+        .collect())
 }
 
 /// The refusal for an exception name that is a runtime-ambiguous alias

@@ -171,6 +171,7 @@ pub fn crate_emitted_classes(
         Vec::new();
     let this_aliases = crate::ast::tree::class_def::module_name_aliases(
         &crate::ast::tree::module::splice_gated_branches(this_body.to_vec(), options),
+        options,
     );
     per_module.push((None, this_classes.to_vec(), this_aliases));
     for (path, module) in options.module_defs.iter() {
@@ -195,6 +196,7 @@ pub fn crate_emitted_classes(
         let defs = crate::ast::tree::module::emitted_class_defs(module, &module_opts);
         let aliases = crate::ast::tree::class_def::module_name_aliases(
             &crate::ast::tree::module::splice_gated_branches(module.raw.body.clone(), &module_opts),
+            &module_opts,
         );
         per_module.push((Some(path.clone()), defs, aliases));
     }
