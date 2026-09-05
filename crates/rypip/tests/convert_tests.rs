@@ -8131,7 +8131,10 @@ fn class_instance_display_matches_cpython() {
     // (documented §12.3 divergence; CPython's own output varies run to
     // run) and the module prefix for the crate root. Output verified
     // against CPython: Pool(host='x') / <... object> / fstring=Pool(...)
-    // / a message containing str(pool).
+    // / the two-argument exception's `str(e)` — the args tuple's repr,
+    // `(<Pool object>, 'Pool is closed.')` (CPython: `(<__main__.Pool
+    // object at 0x...>, 'Pool is closed.')` — the address and module
+    // prefix are the §12.3 divergence; #330).
     let scratch = Scratch::new("classdisp");
     let pkg = scratch.path().join("probe");
     fs::create_dir_all(&pkg).unwrap();
@@ -8191,9 +8194,10 @@ fn class_instance_display_matches_cpython() {
         stdout
     );
     assert_eq!(lines[2], "fstring=Pool(host='y')", "stdout: {}", stdout);
-    assert!(
-        lines[3].contains("Pool(host='example.com')"),
-        "the __str__ must be honored inside the message: {}",
+    assert_eq!(
+        lines[3],
+        "(<Pool object>, 'Pool is closed.')",
+        "the two-argument message is the args tuple's repr: {}",
         stdout
     );
 }
@@ -8427,4 +8431,1115 @@ fn an_unreachable_vendored_module_does_not_add_a_surface() {
         .expect("running generated binary");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.trim(), "CAT", "stdout: {}", stdout);
+}
+
+#[test]
+fn the_exception_model_matches_python_at_runtime() {
+    // The exception model end to end (Devin review on #330): a user
+    // class over a builtin caught by the builtin's handler and by the
+    // builtin's alias; a modeled constructor bound positionally, by
+    // keyword, and by keyword-only default; a property argument evaluated
+    // once; issubclass through the interpreter's own MRO; a caller name
+    // that matches another parameter; a neutral-named intermediate class
+    // caught by its own handler; a zero-argument super call and no super
+    // call (round 3); a global captured before a later argument rebinds
+    // it, a zero-parameter fixed message, a variadic forwarder, the last
+    // store of a field (round 4); a base and a handler through an alias,
+    // an alias of a builtin, a BaseException subclass outside `except
+    // Exception` (round 6); a field stored twice from differently typed
+    // parameters reads as the LAST store (round 15); a user-defined
+    // base's `__init__` runs at the super call (its message, its stores,
+    // a keyword through super, a chain through a class without its own
+    // `__init__`), a bare name captured before a message that runs code,
+    // a property-read argument bound once, a composite argument captured
+    // before the message (round 16); an issubclass over a multiple
+    // inheritance walks every builtin branch's MRO (round 17); an argument
+    // the initializer ignores still runs, in source order (round 19); a
+    // variadic initializer's arguments run in call order, a swallowed
+    // keyword after the forwarded positionals (round 20); a raise through an alias is the canonical
+    // kind, an inherited __init__ runs (round 7); the message reads the
+    // fields as they stood at the super call (round 8).
+    let scratch = Scratch::new("exc_model");
+    let file = scratch.path().join("exc_model.py");
+    fs::write(
+        &file,
+        concat!(
+            "class MyError(ValueError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class DiskError(OSError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Short(Exception):\n",
+            "    def __init__(self, needed: int, *, unit: str = \"credits\"):\n",
+            "        super().__init__(f\"need {needed} {unit}\")\n",
+            "        self.needed = needed\n",
+            "        self.unit = unit\n",
+            "\n",
+            "\n",
+            "class Meter:\n",
+            "    def __init__(self):\n",
+            "        self.reads = 0\n",
+            "\n",
+            "    @property\n",
+            "    def level(self) -> int:\n",
+            "        self.reads += 1\n",
+            "        return 7\n",
+            "\n",
+            "\n",
+            "class Pair(Exception):\n",
+            "    def __init__(self, a: str, b: str):\n",
+            "        super().__init__(f\"{a}\")\n",
+            "        self.a = a\n",
+            "        self.b = b\n",
+            "\n",
+            "\n",
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Mid(Root):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class LeafError(Mid):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Bare(Exception):\n",
+            "    def __init__(self, code: int):\n",
+            "        super().__init__()\n",
+            "        self.code = code\n",
+            "\n",
+            "\n",
+            "class Silent(Exception):\n",
+            "    def __init__(self, code: int):\n",
+            "        self.code = code\n",
+            "\n",
+            "\n",
+            "counter = 0\n",
+            "\n",
+            "\n",
+            "def bump() -> int:\n",
+            "    global counter\n",
+            "    counter += 1\n",
+            "    return counter\n",
+            "\n",
+            "\n",
+            "class Pair2(Exception):\n",
+            "    def __init__(self, first: int, second: int):\n",
+            "        super().__init__(f\"{first} {second}\")\n",
+            "\n",
+            "\n",
+            "class Fixed(Exception):\n",
+            "    def __init__(self):\n",
+            "        super().__init__(\"fixed message\")\n",
+            "\n",
+            "\n",
+            "class Var(Exception):\n",
+            "    def __init__(self, *args):\n",
+            "        super().__init__(*args)\n",
+            "\n",
+            "\n",
+            "class Twice(Exception):\n",
+            "    def __init__(self, a: int, b: int):\n",
+            "        super().__init__(\"t\")\n",
+            "        self.v = a\n",
+            "        self.v = b\n",
+            "\n",
+            "\n",
+            "class Twice2(Exception):\n",
+            "    def __init__(self, first: str, second: str):\n",
+            "        self.value = first\n",
+            "        super().__init__(self.value)\n",
+            "        self.value = second\n",
+            "\n",
+            "\n",
+            "class Coded(Exception):\n",
+            "    def __init__(self, code: int):\n",
+            "        super().__init__(f\"code {code}\")\n",
+            "        self.code = code\n",
+            "\n",
+            "\n",
+            "class Child(Coded):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Prefixed(Exception):\n",
+            "    def __init__(self, prefix, *args):\n",
+            "        super().__init__(*args)\n",
+            "\n",
+            "\n",
+            "class Ignores(Exception):\n",
+            "    def __init__(self, unused: int):\n",
+            "        super().__init__(\"ignored\")\n",
+            "\n",
+            "\n",
+            "class A(ValueError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class B(IndexError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Both(A, B):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Arith(ZeroDivisionError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Look(LookupError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Branches(Arith, Look):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Inner(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Outer(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Restored(Exception):\n",
+            "    def __init__(self, n: int, s: str) -> None:\n",
+            "        super().__init__(s)\n",
+            "        self.v = n\n",
+            "        self.v = s\n",
+            "\n",
+            "\n",
+            "class ChainBase(Exception):\n",
+            "    def __init__(self, code: int, text: str) -> None:\n",
+            "        self.code = code\n",
+            "        super().__init__(f\"[{code}] {text}\")\n",
+            "\n",
+            "\n",
+            "class ChainChild(ChainBase):\n",
+            "    def __init__(self, text: str, code: int) -> None:\n",
+            "        self.code = code\n",
+            "        self.text = text\n",
+            "        super().__init__(code + 1, text.upper())\n",
+            "\n",
+            "\n",
+            "class ChainLeaf(ChainChild):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class ChainNamed(ChainBase):\n",
+            "    def __init__(self, text: str) -> None:\n",
+            "        super().__init__(text=text, code=3)\n",
+            "\n",
+            "\n",
+            "class ChainTyped(ChainBase):\n",
+            "    def __init__(self, n: int, s: str) -> None:\n",
+            "        self.v = n\n",
+            "        super().__init__(n, s)\n",
+            "        self.code = n\n",
+            "\n",
+            "\n",
+            "class Ticket(Exception):\n",
+            "    def __init__(self, n: int) -> None:\n",
+            "        super().__init__(f\"t{bump()}\")\n",
+            "        self.n = n\n",
+            "\n",
+            "\n",
+            "class Gauge:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.base = 10\n",
+            "\n",
+            "    @property\n",
+            "    def value(self) -> int:\n",
+            "        return self.base + bump()\n",
+            "\n",
+            "\n",
+            "class Plain(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Ignore(Exception):\n",
+            "    def __init__(self, n: int, tag: str = \"t\") -> None:\n",
+            "        super().__init__(\"ignored\")\n",
+            "\n",
+            "\n",
+            "class Variadic(Exception):\n",
+            "    def __init__(self, *args, **kwargs):\n",
+            "        super().__init__(*args)\n",
+            "\n",
+            "\n",
+            "def tick(s: str) -> str:\n",
+            "    print(\"tick\", s)\n",
+            "    return s\n",
+            "\n",
+            "\n",
+            "class Pair2Arg(Exception):\n",
+            "    def __init__(self, a: str, b: int):\n",
+            "        super().__init__(a, b)\n",
+            "        self.b = b\n",
+            "\n",
+            "\n",
+            "def tag() -> str:\n",
+            "    return \"t\"\n",
+            "\n",
+            "\n",
+            "R = Exception\n",
+            "R = Root\n",
+            "\n",
+            "\n",
+            "class ViaAlias(R):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "Base = ValueError\n",
+            "\n",
+            "\n",
+            "class Bad(Base):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Exit(BaseException):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    try:\n",
+            "        raise MyError(\"bad\")\n",
+            "    except ValueError as e:\n",
+            "        print(\"caught ValueError:\", e)\n",
+            "    try:\n",
+            "        raise DiskError(\"full\")\n",
+            "    except EnvironmentError as e:\n",
+            "        print(\"caught EnvironmentError:\", e)\n",
+            "    try:\n",
+            "        raise Short(3, unit=\"coins\")\n",
+            "    except Short as e:\n",
+            "        print(e, e.needed, e.unit)\n",
+            "    try:\n",
+            "        raise Short(unit=\"marks\", needed=4)\n",
+            "    except Short as e:\n",
+            "        print(e, e.needed, e.unit)\n",
+            "    m = Meter()\n",
+            "    try:\n",
+            "        raise Short(m.level)\n",
+            "    except Short as e:\n",
+            "        print(e, e.needed, m.reads)\n",
+            "    print(issubclass(FileNotFoundError, OSError), issubclass(MyError, Exception), issubclass(KeyError, ValueError))\n",
+            "    b = \"first\"\n",
+            "    try:\n",
+            "        raise Pair(b, \"second\")\n",
+            "    except Pair as e:\n",
+            "        print(e, e.a, e.b)\n",
+            "    try:\n",
+            "        raise LeafError(\"leaf\")\n",
+            "    except Mid as e:\n",
+            "        print(\"caught Mid:\", e)\n",
+            "    try:\n",
+            "        raise Bare(9)\n",
+            "    except Bare as e:\n",
+            "        print(\"[\" + str(e) + \"]\", e.code)\n",
+            "    try:\n",
+            "        raise Silent(5)\n",
+            "    except Silent as e:\n",
+            "        print(\"[\" + str(e) + \"]\", e.code)\n",
+            "    try:\n",
+            "        raise Pair2(counter, bump())\n",
+            "    except Pair2 as e:\n",
+            "        print(e)\n",
+            "    try:\n",
+            "        raise Fixed()\n",
+            "    except Fixed as e:\n",
+            "        print(e)\n",
+            "    try:\n",
+            "        raise Var(\"v\")\n",
+            "    except Var as e:\n",
+            "        print(e)\n",
+            "    try:\n",
+            "        raise Twice(1, 2)\n",
+            "    except Twice as e:\n",
+            "        print(e, e.v)\n",
+            "    try:\n",
+            "        raise ViaAlias(\"via\")\n",
+            "    except Root as e:\n",
+            "        print(\"Root:\", e)\n",
+            "    try:\n",
+            "        raise ViaAlias(\"via2\")\n",
+            "    except R as e:\n",
+            "        print(\"R:\", e)\n",
+            "    try:\n",
+            "        raise Bad(\"bad\")\n",
+            "    except ValueError as e:\n",
+            "        print(\"ValueError:\", e)\n",
+            "    try:\n",
+            "        raise Exit(\"bye\")\n",
+            "    except Exception:\n",
+            "        print(\"wrong\")\n",
+            "    except BaseException as e:\n",
+            "        print(\"base:\", e)\n",
+            "    print(issubclass(ViaAlias, R), issubclass(Bad, Exception), issubclass(Exit, Exception))\n",
+            "    try:\n",
+            "        raise R\n",
+            "    except R:\n",
+            "        print(\"R bare caught\")\n",
+            "    try:\n",
+            "        raise R(\"x\")\n",
+            "    except Root as e:\n",
+            "        print(\"Root:\", e)\n",
+            "    print(isinstance(R(\"z\"), Root), isinstance(R(\"z\"), R))\n",
+            "    try:\n",
+            "        raise Child(7)\n",
+            "    except Child as e:\n",
+            "        print(e, e.code)\n",
+            "    try:\n",
+            "        raise Twice2(\"a\", \"b\")\n",
+            "    except Twice2 as e:\n",
+            "        print(e, e.value)\n",
+            "    print(\"[\" + str(Prefixed(\"p\")) + \"]\", Prefixed(\"p\", \"m\"))\n",
+            "    n = 3\n",
+            "    try:\n",
+            "        raise Ignores(n)\n",
+            "    except Ignores as e:\n",
+            "        print(e)\n",
+            "    try:\n",
+            "        raise Both(\"x\")\n",
+            "    except B as e:\n",
+            "        print(\"B:\", e)\n",
+            "    try:\n",
+            "        raise Both(\"y\")\n",
+            "    except LookupError as e:\n",
+            "        print(\"LookupError:\", e)\n",
+            "    print(issubclass(Both, IndexError), issubclass(Both, ValueError), issubclass(Both, OSError))\n",
+            "    print(issubclass(Branches, ArithmeticError), issubclass(Branches, LookupError), issubclass(Branches, KeyError), issubclass(Branches, Exception))\n",
+            "    print(str(Outer(Inner(\"a\", \"b\"), \"x\")))\n",
+            "    print(str(Outer(Inner(\"a\"), 2)))\n",
+            "    print(str(Prefixed(\"p\", \"m\", \"n\")))\n",
+            "    try:\n",
+            "        raise Pair2Arg(tag(), 3)\n",
+            "    except Pair2Arg as e:\n",
+            "        print(e, e.b)\n",
+            "    try:\n",
+            "        raise Outer(Inner(5), tag())\n",
+            "    except Outer as e:\n",
+            "        print(e)\n",
+            "    try:\n",
+            "        raise Restored(3, \"t\")\n",
+            "    except Restored as e:\n",
+            "        print(e.v + \"!\", e)\n",
+            "    try:\n",
+            "        raise ChainChild(\"boom\", 6)\n",
+            "    except ChainChild as e:\n",
+            "        print(e, e.code, e.text)\n",
+            "    try:\n",
+            "        raise ChainLeaf(\"leaf\", 1)\n",
+            "    except ChainChild as e:\n",
+            "        print(e, e.code, e.text)\n",
+            "    try:\n",
+            "        raise ChainNamed(\"kw\")\n",
+            "    except ChainBase as e:\n",
+            "        print(e, e.code)\n",
+            "    try:\n",
+            "        raise ChainTyped(4, \"s\")\n",
+            "    except ChainBase as e:\n",
+            "        print(e, e.code)\n",
+            "    try:\n",
+            "        raise Ticket(counter)\n",
+            "    except Ticket as e:\n",
+            "        print(e, e.n, counter)\n",
+            "    gauge = Gauge()\n",
+            "    try:\n",
+            "        raise Plain(gauge.value, \"x\")\n",
+            "    except Plain as e:\n",
+            "        print(e, counter)\n",
+            "    try:\n",
+            "        raise Ticket(counter * 10)\n",
+            "    except Ticket as e:\n",
+            "        print(e, e.n, counter)\n",
+            "    try:\n",
+            "        raise Ignore(1 // 0)\n",
+            "    except ZeroDivisionError as e:\n",
+            "        print(\"zde\", e)\n",
+            "    k = 3\n",
+            "    try:\n",
+            "        raise Ignore(7, tag=\"x\" * (k // 0))\n",
+            "    except ZeroDivisionError as e:\n",
+            "        print(\"zde2\", e)\n",
+            "    try:\n",
+            "        raise Ignore(7, tag=str(10 % (k - 3)))\n",
+            "    except ZeroDivisionError as e:\n",
+            "        print(\"zde3\", e)\n",
+            "    try:\n",
+            "        raise Ignore(k + 2)\n",
+            "    except Ignore as e:\n",
+            "        print(\"ignored\", e)\n",
+            "    try:\n",
+            "        raise Variadic(tick(\"a\"), ignored=tick(\"b\"))\n",
+            "    except Variadic as e:\n",
+            "        print(\"V:\", e)\n",
+            "    try:\n",
+            "        raise Variadic(tick(\"x\"), 1 // 0, ignored=tick(\"y\"))\n",
+            "    except ZeroDivisionError as e:\n",
+            "        print(\"zde4\", e)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/exc_model"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "caught ValueError: bad",
+            "caught EnvironmentError: full",
+            "need 3 coins 3 coins",
+            "need 4 marks 4 marks",
+            "need 7 credits 7 1",
+            "True True False",
+            "first first second",
+            "caught Mid: leaf",
+            "[] 9",
+            "[5] 5",
+            "0 1",
+            "fixed message",
+            "v",
+            "t 2",
+            "Root: via",
+            "R: via2",
+            "ValueError: bad",
+            "base: bye",
+            "True True False",
+            "R bare caught",
+            "Root: x",
+            "True True",
+            "code 7 7",
+            "a b",
+            "[] m",
+            "ignored",
+            "B: x",
+            "LookupError: y",
+            "True True False",
+            "True True False True",
+            "(Inner('a', 'b'), 'x')",
+            "(Inner('a'), 2)",
+            "('m', 'n')",
+            "('t', 3) 3",
+            "(Inner(5), 't')",
+            "t! t",
+            "[7] BOOM 7 boom",
+            "[2] LEAF 2 leaf",
+            "[3] kw 3",
+            "[4] s 4",
+            "t2 1 2",
+            "(13, 'x') 3",
+            "t4 30 4",
+            "zde integer division or modulo by zero",
+            "zde2 integer division or modulo by zero",
+            "zde3 integer modulo by zero",
+            "ignored ignored",
+            "tick a",
+            "tick b",
+            "V: a",
+            "tick x",
+            "zde4 integer division or modulo by zero",
+        ],
+        "the exception model diverged from CPython"
+    );
+}
+
+#[test]
+fn imported_exception_classes_match_python_at_runtime() {
+    // An exception class defined in one module and raised in another
+    // (Devin review on #330): the ancestor chain and the modeled
+    // constructor (positional-only parameter, a defaulted one, a keyword)
+    // resolve through the defining module; so does the issubclass fold,
+    // through a neutral-named intermediate.
+    let scratch = Scratch::new("errpkg");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"errpkg\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("errpkg");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("errors.py"),
+        concat!(
+            "class MyError(ValueError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Short(Exception):\n",
+            "    def __init__(self, needed: int, /, unit: str = \"credits\"):\n",
+            "        super().__init__(f\"need {needed} {unit}\")\n",
+            "        self.needed = needed\n",
+            "        self.unit = unit\n",
+            "\n",
+            "\n",
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Mid(Root):\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("cli.py"),
+        concat!(
+            "from errors import MyError\n",
+            "from errors import Short\n",
+            "from errors import Root\n",
+            "from errors import Mid\n",
+            "from errors import Root as R2\n",
+            "\n",
+            "\n",
+            "class Deep(R2):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    try:\n",
+            "        raise MyError(\"imported\")\n",
+            "    except ValueError as e:\n",
+            "        print(\"caught ValueError:\", e)\n",
+            "    try:\n",
+            "        raise Short(2)\n",
+            "    except Short as e:\n",
+            "        print(e, e.needed, e.unit)\n",
+            "    try:\n",
+            "        raise Short(5, unit=\"coins\")\n",
+            "    except Exception as e:\n",
+            "        print(e)\n",
+            "    print(issubclass(MyError, Exception), issubclass(Mid, Root), issubclass(Mid, ValueError))\n",
+            "    try:\n",
+            "        raise Deep(\"deep\")\n",
+            "    except Root as e:\n",
+            "        print(\"Root:\", e)\n",
+            "    print(isinstance(Deep(\"d\"), R2))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/errpkg"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "caught ValueError: imported",
+            "need 2 credits 2 credits",
+            "need 5 coins",
+            "True True False",
+            "Root: deep",
+            "True",
+        ],
+        "the imported exception model diverged from CPython"
+    );
+}
+
+#[test]
+fn a_class_name_two_modules_define_is_never_erased_by_the_exception_closure() {
+    // `Node(Root)` (an exception through the chain) in one module and an
+    // ordinary `Node` in another: the crate-wide closure is keyed by bare
+    // name, so the ambiguous name stays out of it — the ordinary Node
+    // keeps its implementation, and the exclusion is a definition
+    // warning (Devin review on #330).
+    let scratch = Scratch::new("nodepkg");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"nodepkg\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("nodepkg");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("errors.py"),
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Node(Root):\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("tree.py"),
+        concat!(
+            "class Node:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "    def label(self) -> str:\n",
+            "        return \"node:\" + self.name\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("cli.py"),
+        concat!(
+            "from tree import Node\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    print(Node(\"a\").label())\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    assert!(
+        krate.warnings.iter().any(|w| w.contains("`Node` is defined by more than one module")),
+        "warnings: {:?}",
+        krate.warnings
+    );
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/nodepkg"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["node:a"],
+        "the ordinary Node lost its implementation"
+    );
+}
+
+#[test]
+fn an_alias_resolves_in_its_own_module_never_through_another_modules_binding() {
+    // shapes.py: an ordinary `Y`, `X = Y`, `Z(Y)`, and `X()` constructed
+    // through the alias; errs.py independently binds `Y = ValueError`.
+    // The exception closure resolves shapes' `X` through shapes' own
+    // bindings — never through errs' `Y` — so `X` and `Y` stay ordinary
+    // (`make()` labels, `Z` keeps its method); errs' alias of a builtin
+    // is a compile-time binding, its store emits nothing (Devin review
+    // on #330).
+    let scratch = Scratch::new("leakpkg");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"leakpkg\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("leakpkg");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("shapes.py"),
+        concat!(
+            "class Y:\n",
+            "    def label(self) -> str:\n",
+            "        return \"y\"\n",
+            "\n",
+            "\n",
+            "X = Y\n",
+            "\n",
+            "\n",
+            "class Z(Y):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def make() -> str:\n",
+            "    return X().label()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("errs.py"),
+        concat!(
+            "Y = ValueError\n",
+            "\n",
+            "\n",
+            "def boom() -> None:\n",
+            "    raise ValueError(\"bad\")\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("cli.py"),
+        concat!(
+            "from shapes import Z, make\n",
+            "from errs import boom\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(Z().label(), make())\n",
+            "    try:\n",
+            "        boom()\n",
+            "    except ValueError as e:\n",
+            "        print(\"caught\", e)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let shapes = fs::read_to_string(krate.root.join("src/shapes.rs")).unwrap();
+    assert!(!shapes.contains("pub struct Y;"), "Y lowered as an exception marker: {}", shapes);
+    assert!(!shapes.contains("pub struct Z;"), "Z lowered as an exception marker: {}", shapes);
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/leakpkg"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["y y", "caught bad"],
+        "the alias leaked across modules"
+    );
+}
+
+#[test]
+fn a_message_reading_another_modules_global_is_refused_at_a_foreign_raise_site() {
+    // errors.PREFIX in the message, cli.PREFIX at the raise site: the
+    // message would silently read the caller's global — a loud
+    // `compile_error!` at the site instead (Devin review on #330).
+    let scratch = Scratch::new("prefixpkg");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"prefixpkg\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("prefixpkg");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("errors.py"),
+        concat!(
+            "PREFIX = \"E\"\n",
+            "\n",
+            "\n",
+            "class Tagged(Exception):\n",
+            "    def __init__(self, n: int):\n",
+            "        super().__init__(f\"{PREFIX}{n}\")\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("cli.py"),
+        concat!(
+            "from errors import Tagged\n",
+            "\n",
+            "PREFIX = \"C\"\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    raise Tagged(1)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let cli = fs::read_to_string(krate.root.join("src/cli.rs")).unwrap();
+    assert!(cli.contains("compile_error !"), "generated: {}", cli);
+    assert!(cli.contains("message reads `PREFIX`"), "generated: {}", cli);
+}
+
+#[test]
+fn an_alias_ambiguity_is_scoped_to_its_module() {
+    // other.py binds `R` two ways at runtime; errors.py binds its own `R`
+    // once: errors' `class Leaf(R)` is an exception over Root, unaffected
+    // by the unrelated module (Devin review on #330).
+    let scratch = Scratch::new("aliaspkg");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"aliaspkg\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("aliaspkg");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("errors.py"),
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "R = Root\n",
+            "\n",
+            "\n",
+            "class Leaf(R):\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("other.py"),
+        concat!(
+            "class A(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class B(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "try:\n",
+            "    R = A\n",
+            "except NameError:\n",
+            "    R = B\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("cli.py"),
+        concat!(
+            "from errors import Leaf\n",
+            "from errors import Root\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    try:\n",
+            "        raise Leaf(\"leaf\")\n",
+            "    except Root as e:\n",
+            "        print(\"Root:\", e)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    assert!(
+        krate.warnings.iter().any(|w| w.contains("`R` is bound to a class only inside a `try:`")),
+        "warnings: {:?}",
+        krate.warnings
+    );
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/aliaspkg"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["Root: leaf"],
+        "the module-scoped alias diverged from CPython"
+    );
+}
+
+#[test]
+fn an_external_import_alias_never_resolves_to_an_unrelated_crate_class() {
+    // errors.py defines an exception `Root`; other.py imports an
+    // EXTERNAL `Root as R` and derives from R: that class is not the
+    // crate's Root — it lowers as the ordinary class it is (the external
+    // base is the documented external-module divergence, warned), never
+    // as a marker over the unrelated exception (Devin review on #330).
+    let scratch = Scratch::new("extalias");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"extalias\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("extalias");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("errors.py"),
+        concat!("class Root(Exception):\n", "    pass\n"),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("other.py"),
+        concat!(
+            "from somewhere_else import Root as R\n",
+            "\n",
+            "\n",
+            "class Node(R):\n",
+            "    def label(self) -> str:\n",
+            "        return \"node\"\n",
+        ),
+    )
+    .unwrap();
+    // The same through an ASSIGNMENT after an external import of the bare
+    // name (`from somewhere_else import Root` / `R = Root`), and a base
+    // naming the external `Root` directly: the module's external binding
+    // is that object, never the crate's `Root` (Devin review on #330).
+    fs::write(
+        pkg.join("third.py"),
+        concat!(
+            "from somewhere_else import Root\n",
+            "\n",
+            "R = Root\n",
+            "\n",
+            "\n",
+            "class Node2(R):\n",
+            "    def label(self) -> str:\n",
+            "        return \"node2\"\n",
+            "\n",
+            "\n",
+            "class Node3(Root):\n",
+            "    def label(self) -> str:\n",
+            "        return \"node3\"\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let other = fs::read_to_string(krate.root.join("src/other.rs")).unwrap();
+    assert!(other.contains("fn label"), "the ordinary class lost its method: {}", other);
+    assert!(!other.contains("pub struct Node;"), "lowered as an exception marker: {}", other);
+    let third = fs::read_to_string(krate.root.join("src/third.rs")).unwrap();
+    assert!(third.matches("fn label").count() >= 2, "an ordinary class lost its method: {}", third);
+    assert!(!third.contains("pub struct Node2;"), "lowered as an exception marker: {}", third);
+    assert!(!third.contains("pub struct Node3;"), "lowered as an exception marker: {}", third);
+    assert!(
+        krate.warnings.iter().any(|w| w.contains("somewhere_else")),
+        "warnings: {:?}",
+        krate.warnings
+    );
+}
+
+#[test]
+fn not_implemented_in_a_shared_eq_is_identity_at_runtime() {
+    // A shared class's `__eq__` that returns NotImplemented: `t == t` is
+    // True (the same object), a second instance is not; when the left
+    // operand declines, the right one's reflected `__eq__` decides
+    // (`a == b` with a strict and b lenient is True), and identity only
+    // when both decline (Devin review on #330).
+    let scratch = Scratch::new("eq_identity");
+    let file = scratch.path().join("eq_identity.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Tag:\n",
+            "    def __init__(self, s: str):\n",
+            "        self.s = s\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.s += \"!\"\n",
+            "\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        return NotImplemented\n",
+            "\n",
+            "\n",
+            "class Strict:\n",
+            "    def __init__(self, v: int, strict: bool):\n",
+            "        self.v = v\n",
+            "        self.strict = strict\n",
+            "\n",
+            "    def loosen(self) -> None:\n",
+            "        self.strict = False\n",
+            "\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        if self.strict:\n",
+            "            return NotImplemented\n",
+            "        return self.v == other.v\n",
+            "\n",
+            "\n",
+            "class Declared:\n",
+            "    def __init__(self, s: str):\n",
+            "        self.s = s\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.s += \"?\"\n",
+            "\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        global NotImplemented\n",
+            "        return NotImplemented\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    tags = [Tag(\"x\")]\n",
+            "    t = tags[0]\n",
+            "    t.bump()\n",
+            "    print(t == t, t == tags[0], t == Tag(\"x\"), t.s)\n",
+            "    items = [Strict(1, True)]\n",
+            "    a = items[0]\n",
+            "    b = Strict(1, False)\n",
+            "    c = Strict(2, True)\n",
+            "    print(a == b, b == a, a == a, a == c)\n",
+            "    items[0].loosen()\n",
+            "    print(a == c)\n",
+            "    ds = [Declared(\"d\")]\n",
+            "    d = ds[0]\n",
+            "    d.bump()\n",
+            "    print(d == d, d == ds[0], d == Declared(\"d\"), d.s)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/eq_identity"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["True True False x!", "True True True False", "False", "True True False d?"],
+        "the equality dispatch diverged from CPython"
+    );
 }

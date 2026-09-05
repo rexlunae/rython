@@ -123,11 +123,24 @@ impl CodeGen for Name {
             // classes as values lower to their NAME STRINGS (round 33
             // design — the exception model is string-tagged). The raw
             // Python spelling, matching what the raise side emits.
+            // A BUILTIN exception class read as a value (`Base =
+            // ValueError`, the module-level alias a base or a handler
+            // then spells) is its name string too, unless a binding
+            // shadows the name (Devin review on #330). A runtime-ambiguous
+            // alias (bound to two classes under a gate) names no one
+            // class: loud.
+            if let Some(msg) =
+                crate::ast::tree::raise_stmt::ambiguous_alias_refusal(&self.id, &options)
+            {
+                return Ok(quote!(compile_error!(#msg)));
+            }
             if matches!(symbols.get(&self.id), Some(crate::SymbolTableNode::ClassDef(_)))
                 || matches!(symbols.get(&self.id), Some(crate::SymbolTableNode::Alias(c))
                     if matches!(symbols.get(c), Some(crate::SymbolTableNode::ClassDef(_))))
                 || (matches!(symbols.get(&self.id), Some(crate::SymbolTableNode::ImportFrom(_)))
                     && crate::resolve_class_referenced(&self.id, &symbols, &options).is_some())
+                || (symbols.get(&self.id).is_none()
+                    && crate::ast::tree::raise_stmt::is_builtin_exception_name(&self.id))
             {
                 let name = self.id.clone();
                 return Ok(quote!(#name.to_string()));
@@ -314,7 +327,13 @@ impl CodeGen for Name {
             // collections): the comparison sentinel — a boxed None
             // (rython's comparisons return bool; the sentinel has no
             // analogue — documented divergence).
-            if self.id == "NotImplemented" && symbols.get("NotImplemented").is_none() {
+            // A parameter or a local named `NotImplemented` shadows the
+            // singleton (Devin review on #330): an ordinary name.
+            if self.id == "NotImplemented"
+                && symbols.get("NotImplemented").is_none()
+                && !options.local_types.contains_key("NotImplemented")
+                && !options.name_types.contains_key("NotImplemented")
+            {
                 return Ok(quote!(stdpython::PyValue::None_));
             }
             // A name imported from an EXTERNAL module (`from ssl import

@@ -736,12 +736,55 @@ impl CodeGen for StatementType {
                     quote!(())
                 } else if matches!(e.value, ExprType::NoneType(_)) {
                     quote!(())
-                } else if matches!(&e.value, ExprType::Name(n) if n.id == "NotImplemented") {
-                    // `return NotImplemented` in a comparison dunder: the
-                    // == falls back to identity (False for distinct shared
-                    // instances — records's Version.__eq__, round 99). The
-                    // NotImplemented singleton has no other value shape.
-                    quote!(false)
+                } else if matches!(&e.value, ExprType::Name(n) if n.id == "NotImplemented")
+                    // A parameter or a local named `NotImplemented` shadows
+                    // the singleton: an ordinary value (Devin review on
+                    // #330).
+                    && !options.local_types.contains_key("NotImplemented")
+                    && !options.name_types.contains_key("NotImplemented")
+                {
+                    // `return NotImplemented` in `__eq__`: the == falls
+                    // back to identity (False for distinct shared
+                    // instances — records's Version.__eq__, round 99).
+                    // Anywhere else the singleton means something the
+                    // lowering does not model (`__ne__` ends at the
+                    // identity default — True for distinct objects; an
+                    // ordering dunder raises TypeError), so it is a loud
+                    // refusal, never a silent `false` (the evaluation on
+                    // issue #137).
+                    match &options.eq_not_implemented {
+                        None => {
+                            // Loud at the SITE, as a rustc error naming the
+                            // construct, so the rest of the crate stays
+                            // measurable (urllib3's `__or__` / `__ior__` /
+                            // `__ror__` return it for a non-mapping operand).
+                            let msg = "rython: `return NotImplemented` outside `__eq__` is not \
+                                       supported yet: CPython then tries the reflected operation \
+                                       and falls back to the identity default (`__ne__`) or raises \
+                                       TypeError (an ordering or arithmetic dunder), which a `false` \
+                                       result would silently replace; rython refuses to silently \
+                                       ignore it. Return the operation's value explicitly";
+                            quote!(compile_error!(#msg))
+                        }
+                        // The declined result: the None of the method's
+                        // `Option<bool>` (function_def.rs rewrote the
+                        // return annotation); the `==` boundary tries the
+                        // reflected `__eq__`, then identity (Devin review
+                        // on #330).
+                        Some(crate::EqFallback::SharedDeclined) => quote!(None),
+                        Some(crate::EqFallback::NeverSame) => quote!(false),
+                        Some(crate::EqFallback::Unmodeled(class)) => {
+                            let msg = format!(
+                                "rython: `return NotImplemented` in `{class}.__eq__`: CPython \
+                                 tries the reflected `__eq__` and then falls back to identity, \
+                                 which the instances of a value class (one not shared behind a \
+                                 reference) cannot answer; rython refuses to guess. Annotate the \
+                                 other parameter `object` (a boxed value is never the same \
+                                 object), or return the comparison explicitly"
+                            );
+                            quote!(compile_error!(#msg))
+                        }
+                    }
                 } else if options.fn_return_is_pyvalue {
                     // A PyValue-returning function wraps its other returns
                     // (the identity From passes already-boxed values). A
@@ -883,6 +926,12 @@ impl CodeGen for StatementType {
                 let value = if options.fn_return_is_option
                     && !ctx.in_try_block()
                     && !crate::is_none_expr(&e.value)
+                    // The declined `__eq__` result is already the None
+                    // member.
+                    && !(matches!(&e.value, ExprType::Name(n) if n.id == "NotImplemented")
+                        && !options.local_types.contains_key("NotImplemented")
+                        && !options.name_types.contains_key("NotImplemented")
+                        && matches!(options.eq_not_implemented, Some(crate::EqFallback::SharedDeclined)))
                 {
                     // Wrap unless the value is itself the Option (an
                     // Option-typed name, a `.get(key, None)` call, a

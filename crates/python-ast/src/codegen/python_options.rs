@@ -80,6 +80,23 @@ pub fn sys_path() -> PyResult<Vec<String>> {
 
 /// State of the one-time cross-module trait-mut table cache (see
 /// `PythonOptions::cross_module_mut_self`).
+/// The identity fallback a class's `__eq__` reaches with `return
+/// NotImplemented` — CPython tries the reflected `__eq__`, then `is`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EqFallback {
+    /// A SHARED class whose other parameter is the PyRef class: the
+    /// method's result is `Option<bool>` and NotImplemented is its None —
+    /// the `==` boundary (`PyRefEq::ref_eq`) then tries the reflected
+    /// `__eq__` and ends at identity, as CPython does.
+    SharedDeclined,
+    /// The other parameter is the boxed value, which no class instance
+    /// can be: never the same object.
+    NeverSame,
+    /// A value class compared with its own kind: instances have no
+    /// identity the lowering can ask, so the fallback is loud.
+    Unmodeled(String),
+}
+
 #[derive(Clone, Debug)]
 pub enum CrossModuleMutSelf {
     /// No module has hit the cross-module fallback yet.
@@ -356,6 +373,11 @@ pub struct PythonOptions {
     /// the possible results (urllib3's `_normalize_host` returns both
     /// `host.lower()` (str) and `host` (str | None) paths).
     pub fn_return_is_option: bool,
+    /// What a `return NotImplemented` means in the function being
+    /// lowered: None outside a class's `__eq__` (a loud refusal), else
+    /// the identity fallback CPython ends at once the reflected `__eq__`
+    /// has declined too (Devin review on #330).
+    pub eq_not_implemented: Option<EqFallback>,
 
     /// The CURRENT function's resolved return type, when it is a CONCRETE
     /// member (Int/Float/Bool/String/Bytes) rather than the boxed PyValue
@@ -643,6 +665,7 @@ impl Default for PythonOptions {
             clone_field_returns: false,
             fn_return_is_pyvalue: false,
             fn_return_is_option: false,
+            eq_not_implemented: None,
             fn_return_typed: None,
             pyvalue_into_params: std::rc::Rc::new(std::collections::HashSet::new()),
             statically_none_names: std::rc::Rc::new(std::collections::HashSet::new()),

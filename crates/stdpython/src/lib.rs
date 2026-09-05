@@ -814,10 +814,9 @@ impl PyMod<i64> for i64 {
     type Output = i64;
     fn py_mod(&self, rhs: &i64) -> Result<i64, PyException> {
         if *rhs == 0 {
-            return Err(PyException::new(
-                "ZeroDivisionError",
-                "integer division or modulo by zero",
-            ));
+            // CPython 3.11: `10 % 0` is "integer modulo by zero" (the
+            // floor division keeps "integer division or modulo by zero").
+            return Err(PyException::new("ZeroDivisionError", "integer modulo by zero"));
         }
         let r = *self % *rhs;
         if r != 0 && (r < 0) != (*rhs < 0) {
@@ -6336,6 +6335,13 @@ pub struct PyException {
     /// `except BankError` reachability, round 99). Builtin exceptions
     /// keep this empty (their MRO is the interpreter table).
     pub user_ancestors: alloc::vec::Vec<alloc::string::String>,
+    /// The constructor arguments' reprs, when the construction recorded
+    /// them: `repr(e)` is `Kind(repr(a), repr(b))` — an exception passed
+    /// as an argument to another keeps its structure (`(Inner('a', 'b'),
+    /// 'x')`), never a quoted flattened message (Devin review on #330).
+    /// None for a construction that did not record them (the runtime's
+    /// own raises): `repr` then quotes the message.
+    pub args_repr: Option<alloc::vec::Vec<alloc::string::String>>,
 }
 
 impl PyException {
@@ -6347,6 +6353,7 @@ impl PyException {
             discriminant: crate::builtin_exceptions::BuiltinException::from_name(exception_type),
             attrs: alloc::vec::Vec::new(),
             user_ancestors: alloc::vec::Vec::new(),
+            args_repr: None,
         }
     }
 
@@ -6373,7 +6380,14 @@ impl PyException {
             discriminant: crate::builtin_exceptions::BuiltinException::from_name(exception_type),
             attrs,
             user_ancestors: ancestors,
+            args_repr: None,
         }
+    }
+
+    /// Record the constructor arguments' reprs (see `args_repr`).
+    pub fn with_args_repr(mut self, reprs: alloc::vec::Vec<alloc::string::String>) -> Self {
+        self.args_repr = Some(reprs);
+        self
     }
 
     /// The exception instance's int-typed attribute (`e.needed` on a
@@ -6419,9 +6433,27 @@ impl PyException {
     pub fn matches_builtin(&self, target: crate::builtin_exceptions::BuiltinException) -> bool {
         use crate::builtin_exceptions::BuiltinException;
         let Some(raised) = self.discriminant else {
-            // A raised user class: the broad posture, same as matches().
-            return target == BuiltinException::Exception
-                || target == BuiltinException::BaseException;
+            // A raised user class: caught by any BUILTIN in its recorded
+            // ancestor chain and that builtin's ancestors (`class
+            // MyError(ValueError)` is caught by `except ValueError:` and
+            // `except Exception:`; `class Exit(BaseException)` by `except
+            // BaseException:` and NOT by `except Exception:` — the chain
+            // the construction attached decides; Devin review on #330).
+            // Only a chain with no builtin in it (none attached, or one
+            // that leaves the crate) keeps the broad posture:
+            // Exception/BaseException catch it.
+            let builtins: alloc::vec::Vec<BuiltinException> = self
+                .user_ancestors
+                .iter()
+                .filter_map(|a| BuiltinException::from_name(a))
+                .collect();
+            if builtins.is_empty() {
+                return target == BuiltinException::Exception
+                    || target == BuiltinException::BaseException;
+            }
+            return builtins
+                .iter()
+                .any(|b| *b == target || b.ancestors().contains(&target));
         };
         if raised == target {
             return true;
@@ -6468,10 +6500,30 @@ impl PyException {
         // `except BankError:` / `isinstance(v, BankError)` reaches it;
         // the broad posture (Exception/BaseException) still applies when
         // no chain was attached.
-        if self.user_ancestors.iter().any(|a| a == name) {
+        // A user ancestor matches by name, by canonical name (`except
+        // EnvironmentError:` on a subclass of OSError — the alias IS the
+        // class), and through the builtin ancestor's own MRO (a subclass
+        // of FileNotFoundError is caught by `except OSError:`).
+        let target = crate::builtin_exceptions::canonical_name(name).unwrap_or(name);
+        if self.user_ancestors.iter().any(|a| {
+            a == name
+                || crate::builtin_exceptions::canonical_name(a).unwrap_or(a) == target
+                || BUILTIN_EXCEPTION_MRO
+                    .iter()
+                    .find(|(n, _)| n == a)
+                    .is_some_and(|(_, mro)| mro.contains(&target))
+        }) {
             return true;
         }
-        name == "Exception" || name == "BaseException"
+        // The broad posture only for a chain with no builtin in it (none
+        // attached, or one that leaves the crate): a chain that reaches a
+        // builtin decided above — `class Exit(BaseException)` is not an
+        // Exception (Devin review on #330).
+        let chain_has_builtin = self.user_ancestors.iter().any(|a| {
+            crate::builtin_exceptions::canonical_name(a).is_some()
+                || BUILTIN_EXCEPTION_MRO.iter().any(|(n, _)| n == a)
+        });
+        !chain_has_builtin && (name == "Exception" || name == "BaseException")
     }
 
     /// Whether an `except <value>:` clause with a BOXED runtime value
@@ -6556,8 +6608,14 @@ impl PyDisplay for PyException {
 
 /// Python's `repr(exception)` is `ValueError('boom')`.
 impl PyRepr for PyException {
+    /// CPython's `BaseException.__repr__`: the class name and the args
+    /// tuple's contents — `Inner('a', 'b')`, `Inner(5)`, `Inner()`.
     fn py_repr(&self) -> String {
-        format!("{}({})", self.exception_type, py_str_repr(&self.message))
+        match &self.args_repr {
+            Some(parts) => format!("{}({})", self.exception_type, parts.join(", ")),
+            None if self.message.is_empty() => format!("{}()", self.exception_type),
+            None => format!("{}({})", self.exception_type, py_str_repr(&self.message)),
+        }
     }
 }
 

@@ -1649,6 +1649,11 @@ fn resolve_construction_class_depth(
         Some(SymbolTableNode::Alias(canonical)) => {
             resolve_construction_class_depth(canonical, symbols, options, depth + 1)
         }
+        // A module-level rebinding of a class (`R = Root`): the class
+        // (Devin review on #330).
+        Some(SymbolTableNode::Assign { value: ExprType::Name(v), .. }) => {
+            resolve_construction_class_depth(&v.id, symbols, options, depth + 1)
+        }
         Some(SymbolTableNode::ImportFrom(i)) => {
             let path = i.resolved_module_path(options);
             if options.module_defs.contains_key(&path) {
@@ -1778,6 +1783,29 @@ impl<'a> CodeGen for Call {
             && matches!(attr.value.as_ref(), ExprType::Name(m) if crate::is_typing(&m.id))
         {
             return self.args[1].clone().to_rust(ctx, options, symbols);
+        }
+        // An EXPLICIT `obj.__eq__(other)` on a shared class whose `__eq__`
+        // can decline (`return NotImplemented`): the decline is the
+        // `Option<bool>`'s None inside the `==` adapter (PyRefEq), and the
+        // NotImplemented singleton has no runtime value to hand a caller
+        // — loud at the site rather than a silent None (Devin review on
+        // #330). `==` is the supported spelling.
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && attr.attr == "__eq__"
+            && let Some((class, class_symbols)) =
+                receiver_class_for_read(&attr.value, &ctx, &symbols, &options)
+            && crate::ast::tree::shared::is_shared(&class.name)
+            && let Some(eq) = class.method_on_mro("__eq__", &class_symbols)
+            && crate::ast::tree::function_def::body_returns_not_implemented(&eq, &class_symbols)
+        {
+            let msg = format!(
+                "rython: an explicit `{}.__eq__(...)` call on a shared class whose `__eq__` \
+                 can return NotImplemented: the singleton has no runtime value to return, \
+                 so the call would yield None silently; compare with `==` (the reflected \
+                 `__eq__` and identity then apply as in CPython)",
+                class.name
+            );
+            return Ok(quote!(compile_error!(#msg)));
         }
         // A compat builtin ALIAS used as a callee (`builtin_str = str` —
         // requests/compat, called as `builtin_str(x)` in models.py): the
@@ -2205,11 +2233,19 @@ impl<'a> CodeGen for Call {
         // TypeError for them.
         if let ExprType::Name(n) = self.func.as_ref() {
             let bname = n.id.as_str();
-            if matches!(
+            // `zip` takes the builtin arm only in its star-args splat form
+            // (`zip(*rows)`); a plain `zip(a, b)` keeps the ordinary
+            // builtin-call path below (the guard admitting every `zip`
+            // sent the plain form to the missing arm — a converter panic
+            // on charset_normalizer, the requests sweep's regression).
+            let zip_splat = bname == "zip"
+                && self.args.len() == 1
+                && matches!(self.args.first(), Some(ExprType::Starred(_)));
+            if (zip_splat
+                || matches!(
                 bname,
                 "min"
                     | "max"
-                    | "zip"
                     | "sorted"
                     | "enumerate"
                     | "pow"
@@ -2239,7 +2275,7 @@ impl<'a> CodeGen for Call {
                     | "tuple"
                     | "next"
                     | "id"
-            ) && (symbols.get(bname).is_none()
+            )) && (symbols.get(bname).is_none()
                 // An import of a BUILTIN-CLASS self-alias (`from .compat
                 // import str` where compat does `str = str` — requests'
                 // py2 shim): the self-alias emits no runtime item, so the
@@ -2559,14 +2595,16 @@ impl<'a> CodeGen for Call {
                                 .to_string()
                                 .into());
                         };
+                        // A class resolves locally or through its
+                        // import, with its defining module's scope (the
+                        // one construction-class resolver — Devin review
+                        // on #330).
+                        let resolve = |name: &str| {
+                            resolve_construction_class(name, &symbols, &options)
+                        };
                         let is_exc = |name: &str| -> bool {
                             crate::ast::tree::raise_stmt::is_exception_class_name(name)
-                                || match symbols.get(name) {
-                                    Some(SymbolTableNode::ClassDef(cls)) => {
-                                        crate::is_exception_class(cls)
-                                    }
-                                    _ => false,
-                                }
+                                || resolve(name).is_some_and(|(c, _)| crate::is_exception_class(&c))
                         };
                         if !is_exc(&c1.id) || !is_exc(&c2.id) {
                             return Err(format!(
@@ -2577,38 +2615,83 @@ impl<'a> CodeGen for Call {
                             )
                             .into());
                         }
-                        // Walk C1's base chain through the symbol table
-                        // AND the builtin parent map: True when C2 is C1
-                        // or an ancestor. A BUILTIN name (ValueError) has
-                        // no symbol — its parent comes from the static map
-                        // (Devin review on #328: issubclass(ValueError,
-                        // Exception) must be true).
-                        let builtin_parent: fn(&str) -> Option<&'static str> =
-                            crate::ast::tree::raise_stmt::builtin_exception_parent;
-                        let mut base: Option<&str> = Some(&c1.id);
-                        let mut found = false;
-                        let mut guard = 0;
-                        while let Some(cur) = base {
-                            guard += 1;
-                            if guard > 64 {
-                                break;
+                        // C1's chain is C1 then its ancestors — the one
+                        // ancestor walk the raise attaches (every user
+                        // base, then the first builtin); the builtin's
+                        // own MRO comes from the interpreter (the one
+                        // authority the runtime table is generated from).
+                        // True when C2 is in the chain or in that MRO.
+                        // C2's canonical name (an alias —
+                        // `EnvironmentError` IS `OSError`) is its MRO head.
+                        // Both operands by their canonical names (an
+                        // alias `R = Root` is Root — Devin review on #330).
+                        let canon = |name: &str| {
+                            crate::ast::tree::raise_stmt::canonical_exception_class(
+                                name, &symbols, &options,
+                            )
+                            .unwrap_or((name.to_string(), None))
+                        };
+                        for n in [&c1.id, &c2.id] {
+                            if let Some(msg) = crate::ast::tree::raise_stmt::ambiguous_alias_refusal(n, &options) {
+                                return Err(msg.into());
                             }
-                            if cur == c2.id {
-                                found = true;
-                                break;
-                            }
-                            base = match symbols.get(cur) {
-                                Some(SymbolTableNode::ClassDef(cls)) => {
-                                    match cls.bases.iter().find_map(|b| match b {
-                                        ExprType::Name(n) if is_exc(&n.id) => Some(n.id.as_str()),
-                                        _ => None,
-                                    }) {
-                                        Some(next) => Some(next),
-                                        None => builtin_parent(cur),
+                        }
+                        let (c2_name, _) = canon(&c2.id);
+                        let mro = crate::ast::tree::raise_stmt::builtin_exception_mro;
+                        let target: &str = mro(&c2_name)?
+                            .and_then(|m| m.first())
+                            .map(|s| s.as_str())
+                            .unwrap_or(&c2_name);
+                        let (c1_name, c1_class) = canon(&c1.id);
+                        let mut chain: Vec<String> = vec![c1_name];
+                        if let Some((cls, scope)) = c1_class {
+                            chain.extend(crate::ast::tree::raise_stmt::exception_ancestors(
+                                &cls, &scope, &options,
+                            )?);
+                        }
+                        let mut found = chain.iter().any(|n| *n == c2_name || n == target);
+                        // EVERY builtin of the chain takes its full MRO
+                        // into the test (`C(A, B)` over ZeroDivisionError
+                        // and LookupError: ArithmeticError is A's branch,
+                        // not the last one's — Devin review on #330).
+                        let mut any_builtin = false;
+                        if !found {
+                            for n in &chain {
+                                if let Some(m) = mro(n)? {
+                                    any_builtin = true;
+                                    if m.iter().any(|a| a == target) {
+                                        found = true;
+                                        break;
                                     }
                                 }
-                                _ => builtin_parent(cur),
-                            };
+                            }
+                        }
+                        if !found && !any_builtin {
+                            let last = chain.last().expect("c1 itself");
+                            match mro(last)? {
+                                Some(_) => unreachable!("a builtin in the chain was walked above"),
+                                None if resolve(last).is_some() => {
+                                    // A user chain that leaves the crate
+                                    // (a base the model does not follow):
+                                    // the builtin tail is unknown.
+                                    return Err(format!(
+                                        "issubclass({}, {}): `{}`'s base chain leaves the \
+                                         crate before a builtin exception; rython cannot \
+                                         fold the test",
+                                        c1.id, c2.id, last
+                                    )
+                                    .into());
+                                }
+                                None => {
+                                    return Err(format!(
+                                        "issubclass({}, {}): `{}` is neither a class this \
+                                         crate defines nor a builtin exception; rython \
+                                         cannot fold the test",
+                                        c1.id, c2.id, last
+                                    )
+                                    .into());
+                                }
+                            }
                         }
                         return Ok(quote!(#found));
                     }
@@ -2660,14 +2743,12 @@ impl<'a> CodeGen for Call {
                         // except handlers use (charset_normalizer's codec
                         // fallback). The target may be an exception class
                         // NAME even though classes aren't values.
+                        // The one construction-class resolver (an alias
+                        // `R = Root` is Root — Devin review on #330).
                         let is_exc_class = |name: &str| -> bool {
                             crate::ast::tree::raise_stmt::is_exception_class_name(name)
-                                || match symbols.get(name) {
-                                    Some(SymbolTableNode::ClassDef(c)) => {
-                                        crate::is_exception_class(c)
-                                    }
-                                    _ => false,
-                                }
+                                || resolve_construction_class(name, &symbols, &options)
+                                    .is_some_and(|(c, _)| crate::is_exception_class(&c))
                         };
                         let first_is_caught_exc = match &self.args[0] {
                             ExprType::Name(_) => true,
@@ -2696,29 +2777,23 @@ impl<'a> CodeGen for Call {
                                     // __init__ message + the attrs + the
                                     // ancestor chain) when the class is
                                     // in-crate; the quoted kind otherwise.
-                                    match symbols.get(&f.id) {
-                                        Some(crate::SymbolTableNode::ClassDef(cls)) => {
-                                            crate::ast::tree::raise_stmt::exception_class_raise(
-                                                cls,
+                                    match resolve_construction_class(&f.id, &symbols, &options) {
+                                        Some((cls, class_symbols)) => {
+                                            crate::ast::tree::raise_stmt::exception_construction(
+                                                &cls,
+                                                &class_symbols,
                                                 call,
                                                 ctx.clone(),
                                                 options.clone(),
                                                 symbols.clone(),
                                             )?
-                                            .unwrap_or_else(|| {
-                                                let kind = &f.id;
-                                                let m = crate::ast::tree::raise_stmt::message_arg(
-                                                    &call.args[0],
-                                                    ctx.clone(),
-                                                    options.clone(),
-                                                    symbols.clone(),
-                                                )
-                                                .unwrap_or_else(|_| quote!(""));
-                                                quote!(PyException::new(#kind, format!("{}", #m)))
-                                            })
                                         }
                                         _ => {
-                                            let kind = &f.id;
+                                            let kind = crate::ast::tree::raise_stmt::canonical_exception_class(
+                                                &f.id, &symbols, &options,
+                                            )
+                                            .map(|(n, _)| n)
+                                            .unwrap_or_else(|| f.id.clone());
                                             let m = match call.args.len() {
                                                 0 => quote!(String::new()),
                                                 _ => {
@@ -2740,7 +2815,16 @@ impl<'a> CodeGen for Call {
                                     symbols.clone(),
                                 )?,
                             };
-                            let kind = &t.id;
+                            // The target by its canonical name (`R = Root`
+                            // — Devin review on #330).
+                            if let Some(msg) = crate::ast::tree::raise_stmt::ambiguous_alias_refusal(&t.id, &options) {
+                                return Ok(quote!(compile_error!(#msg)));
+                            }
+                            let kind = crate::ast::tree::raise_stmt::canonical_exception_class(
+                                &t.id, &symbols, &options,
+                            )
+                            .map(|(n, _)| n)
+                            .unwrap_or_else(|| t.id.clone());
                             return Ok(quote!((#arg).matches(#kind)));
                         }
                         // `isinstance(v, type(x))`: `type(...)` of a
@@ -3913,7 +3997,15 @@ impl<'a> CodeGen for Call {
                             }
                         }
                     }
-                    _ => unreachable!(),
+                    // Every name the guard above admits has an arm; a
+                    // name added to the guard without one is a converter
+                    // defect, reported rather than a panic.
+                    _ => {
+                        return Err(format!(
+                            "internal: builtin `{bname}` is routed to the builtin lowering but has no arm"
+                        )
+                        .into())
+                    }
                 }
             }
         }
@@ -5340,34 +5432,17 @@ impl<'a> CodeGen for Call {
                 // the formatted message — so the value flows into `raise
                 // new_e` and `except` matches by name.
                 if crate::is_exception_class(&class) {
-                    let msg = match self.args.len() {
-                        0 => quote!(String::new()),
-                        1 => {
-                            let arg = self.args[0].clone().to_rust(
-                                ctx.clone(),
-                                options.clone(),
-                                symbols.clone(),
-                            )?;
-                            quote!(format!("{}", #arg))
-                        }
-                        _ => {
-                            let args: Result<Vec<TokenStream>, Box<dyn std::error::Error>> =
-                                self.args
-                                    .iter()
-                                    .map(|a| {
-                                        a.clone().to_rust(
-                                            ctx.clone(),
-                                            options.clone(),
-                                            symbols.clone(),
-                                        )
-                                    })
-                                    .collect();
-                            let args = args?;
-                            let fmt = vec!["{}"; args.len()].join(", ");
-                            quote!(format!(#fmt, #(#args),*))
-                        }
-                    };
-                    return Ok(quote!(PyException::new(#cname, #msg)));
+                    // The one construction (raise_stmt.rs): the modeled
+                    // __init__, else the generic message with the
+                    // ancestors — never a bare identifier kind.
+                    return crate::ast::tree::raise_stmt::exception_construction(
+                        &class,
+                        &class_symbols,
+                        &self,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    );
                 }
                 // A starred argument (`HTTPBasicAuth(*auth)` — requests)
                 // spreads a tuple; the signature mapping cannot know the

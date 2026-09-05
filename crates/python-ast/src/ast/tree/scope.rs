@@ -120,7 +120,7 @@ struct Analysis<'r> {
     /// question authoritatively (a user method shadowing a builtin mutator
     /// name may be read-only); None means unknown, falling back to the
     /// syntactic MUTATING_METHODS list.
-    resolve_call: &'r dyn Fn(&crate::Call) -> Option<bool>,
+    resolve: &'r dyn Fn(Access<'_>) -> Option<bool>,
 }
 
 impl Analysis<'_> {
@@ -201,14 +201,24 @@ pub fn analyze_scope(body: &[Statement], initialized: &[String]) -> ScopeBinding
     analyze_scope_with(body, initialized, &|_| None)
 }
 
-/// analyze_scope with a call resolver: when the resolver classifies a
-/// method call (receiver class statically known), its answer is
-/// authoritative for whether the call mutates the receiver chain's base
-/// binding; unresolved calls fall back to the syntactic method-name list.
+/// An access the resolver classifies for the mutability analysis: a
+/// method call, or a property READ (`m.level` — a getter that takes
+/// `&mut self` mutates the receiver exactly as a call would; Devin
+/// review on #330).
+pub(crate) enum Access<'a> {
+    Call(&'a crate::Call),
+    Property(&'a crate::ast::tree::attribute::Attribute),
+}
+
+/// analyze_scope with an access resolver: when the resolver classifies a
+/// method call or a property read (receiver class statically known), its
+/// answer is authoritative for whether the access mutates the receiver
+/// chain's base binding; an unresolved call falls back to the syntactic
+/// method-name list, an unresolved attribute read is a read.
 pub(crate) fn analyze_scope_with(
     body: &[Statement],
     initialized: &[String],
-    resolve_call: &dyn Fn(&crate::Call) -> Option<bool>,
+    resolve: &dyn Fn(Access<'_>) -> Option<bool>,
 ) -> ScopeBindings {
     // First pass: collect every name the body assigns, so the closure
     // boundaries in the analysis pass know the full name set (a name first
@@ -216,7 +226,7 @@ pub(crate) fn analyze_scope_with(
     // boundary runs). The collector uses a no-op resolver: only the
     // `assigned` list is read back, and consulting the real resolver here
     // would poison its cycle-guard `visited` set for the analysis pass.
-    let noop_resolve = |_: &crate::Call| -> Option<bool> { None };
+    let noop_resolve = |_: Access<'_>| -> Option<bool> { None };
     let mut collector = Analysis {
         assigned: Vec::new(),
         seq_assigned: Vec::new(),
@@ -225,7 +235,7 @@ pub(crate) fn analyze_scope_with(
         closure_captured_uninit: HashSet::new(),
         leaked_loop_targets: HashSet::new(),
         state: HashMap::new(),
-        resolve_call: &noop_resolve,
+        resolve: &noop_resolve,
     };
     walk_stmts(body, &mut collector, false);
 
@@ -240,7 +250,7 @@ pub(crate) fn analyze_scope_with(
             .iter()
             .map(|n| (n.clone(), Init::Yes))
             .collect(),
-        resolve_call,
+        resolve,
     };
     walk_stmts(body, &mut a, false);
     // Parameters are tracked for needs_mut but are not hoisted declarations.
@@ -458,13 +468,25 @@ pub(crate) fn class_call_resolver<'a>(
     ctx: &'a crate::CodeGenContext,
     symbols: &'a crate::SymbolTableScopes,
     options: &'a crate::PythonOptions,
-) -> impl Fn(&crate::Call) -> Option<bool> + 'a {
-    move |call| {
-        let ExprType::Attribute(attr) = call.func.as_ref() else {
-            return None;
+) -> impl Fn(Access<'_>) -> Option<bool> + 'a {
+    move |access| {
+        let attr = match access {
+            Access::Call(call) => match call.func.as_ref() {
+                ExprType::Attribute(attr) => attr,
+                _ => return None,
+            },
+            Access::Property(attr) => attr,
         };
         let (class, class_symbols) = crate::receiver_class(&attr.value, ctx, symbols, options)?;
         if class.method_on_mro(&attr.attr, &class_symbols).is_none() {
+            return None;
+        }
+        // A bare attribute read is a property access only when the class
+        // defines the getter; a method name read without a call is no
+        // access at all.
+        if matches!(access, Access::Property(_))
+            && !class.has_property_getter(&attr.attr, &class_symbols, options)
+        {
             return None;
         }
         Some(class.method_needs_mut_self(&attr.attr, &class_symbols, options))
@@ -658,7 +680,7 @@ fn walk_call(call: &crate::Call, a: &mut Analysis<'_>) {
         // the resolver's verdict is authoritative — a user method may
         // shadow a builtin mutator name yet be read-only, or mutate under
         // a name the syntactic list doesn't know.
-        let mutates = match (a.resolve_call)(call) {
+        let mutates = match (a.resolve)(Access::Call(call)) {
             Some(verdict) => verdict,
             None => mutates_receiver(&attr.attr),
         };
@@ -769,7 +791,17 @@ fn walk_expr(expr: &ExprType, a: &mut Analysis<'_>) {
                 walk_expr(e, a);
             }
         }
-        ExprType::Attribute(attr) => walk_expr(&attr.value, a),
+        ExprType::Attribute(attr) => {
+            // A property read whose getter takes `&mut self` mutates the
+            // chain's base binding (`x = m.level` where `level` bumps a
+            // counter), exactly as a mutating method call does.
+            if (a.resolve)(Access::Property(attr)) == Some(true)
+                && let Some(name) = chain_base_name(&attr.value)
+            {
+                a.record_mutation(name);
+            }
+            walk_expr(&attr.value, a)
+        }
         ExprType::Subscript(sub) => {
             walk_expr(&sub.value, a);
             walk_subscript_kind(&sub.kind, a);

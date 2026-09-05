@@ -15285,9 +15285,12 @@ fn hierarchy_trait_carries_py_display_bound() {
 
 #[test]
 fn exception_message_args_wrap_class_instances_in_py_display() {
-    // The raise-site message flattening wraps class instances, Options,
-    // and boxed values in py_display (Python's str) — a raw format! would
-    // fail to compile (no Rust Display on a class struct).
+    // The raise-site message wraps a class instance, an Option, or a
+    // boxed value in py_display (Python's str) — a raw format! would
+    // fail to compile (no Rust Display on a class struct). Two arguments
+    // to a class without a modeled __init__ make `str(e)` the args
+    // tuple's repr — each argument's repr, parenthesized (the old
+    // comma-joined message was a silent divergence; Devin review on #330).
     let out = compile(
         concat!(
             "class PoolError(Exception):\n",
@@ -15298,14 +15301,28 @@ fn exception_message_args_wrap_class_instances_in_py_display() {
             "        self._host = host\n",
             "\n",
             "def boom():\n",
+            "    raise PoolError(Pool(\"x\"))\n",
+            "\n",
+            "def boom2():\n",
             "    raise PoolError(Pool(\"x\"), \"closed.\")\n",
         ),
         "disp.py",
     );
+    // The construction runs code, so it is evaluated once into a
+    // temporary the message (py_display) and the recorded repr read.
     assert!(
-        out.contains("py_display (& ({ Pool :: new")
-            || out.contains("py_display(&({ Pool::new"),
+        out.contains("let __rython_exc_m0 = { Pool :: new (\"x\") ? } ;"),
+        "the argument is evaluated once: {}",
+        out
+    );
+    assert!(
+        out.contains("py_display (& (__rython_exc_m0))"),
         "the message arg must wrap the class instance: {}",
+        out
+    );
+    assert!(
+        out.contains("format ! (\"({}, {})\" , stdpython :: PyRepr :: py_repr (& (__rython_exc_m0)) , stdpython :: PyRepr :: py_repr (& (\"closed.\")))"),
+        "generated: {}",
         out
     );
 }
@@ -19085,4 +19102,1817 @@ fn list_index_count_and_tuple_append_own_their_arguments() {
         "the tuple literal's String element must own at the push: {}",
         out
     );
+}
+
+/// A plain `zip(a, b)` keeps the ordinary builtin lowering; only the
+/// star-args splat `zip(*rows)` takes the zip_many arm (the guard that
+/// admitted every `zip` sent the plain form to a missing arm — a
+/// converter panic on charset_normalizer in the requests sweep).
+#[test]
+fn a_plain_zip_call_converts_and_the_splat_takes_zip_many() {
+    let out = compile(
+        concat!(
+            "def pairs(xs: list[int], ys: list[str]) -> list[tuple[int, str]]:\n",
+            "    return list(zip(xs, ys))\n",
+        ),
+        "zip_plain.py",
+    );
+    assert!(out.contains("zip ("), "generated: {}", out);
+    assert!(!out.contains("zip_many"), "generated: {}", out);
+    let out = compile(
+        concat!(
+            "def transpose(m: list[list[int]]) -> list[list[int]]:\n",
+            "    return [list(r) for r in zip(*m)]\n",
+        ),
+        "zip_splat.py",
+    );
+    assert!(out.contains("zip_many"), "generated: {}", out);
+}
+
+/// An argument-less construction of an in-crate exception class inside
+/// `isinstance` (no modeled `__init__`) converts instead of indexing a
+/// missing argument.
+#[test]
+fn isinstance_of_an_argumentless_exception_construction_converts() {
+    let out = compile(
+        concat!(
+            "class MyError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "def check() -> bool:\n",
+            "    return isinstance(MyError(), Exception)\n",
+        ),
+        "isinstance_exc.py",
+    );
+    assert!(out.contains("MyError"), "generated: {}", out);
+}
+
+/// `issubclass` on builtin exception names folds through the interpreter's
+/// own MRO — the same authority the runtime table is generated from — so a
+/// pair the old hand-typed parent map did not know folds to the truth
+/// (the evaluation on issue #137).
+#[test]
+fn issubclass_folds_through_the_interpreters_exception_mro() {
+    let out = compile(
+        concat!(
+            "def probe() -> tuple[bool, bool, bool, bool]:\n",
+            "    return (\n",
+            "        issubclass(FileNotFoundError, OSError),\n",
+            "        issubclass(NotImplementedError, RuntimeError),\n",
+            "        issubclass(KeyError, ValueError),\n",
+            "        issubclass(FileNotFoundError, EnvironmentError),\n",
+            "    )\n",
+        ),
+        "issubclass_mro.py",
+    );
+    assert!(out.contains("(true , true , false , true)"), "generated: {}", out);
+    // A user class over a builtin walks the symbol table into the MRO.
+    let out = compile(
+        concat!(
+            "class MyError(ValueError):\n",
+            "    pass\n",
+            "\n",
+            "def probe() -> bool:\n",
+            "    return issubclass(MyError, Exception)\n",
+        ),
+        "issubclass_user.py",
+    );
+    assert!(out.contains("return Ok (true)"), "generated: {}", out);
+}
+
+/// `return NotImplemented` is the identity fallback in `__eq__` only;
+/// anywhere else it is a loud rustc error at the site (the rest of the
+/// crate stays measurable) rather than a silent `false`.
+#[test]
+fn return_not_implemented_is_loud_outside_eq() {
+    let out = compile(
+        concat!(
+            "class V:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "    def __lt__(self, other: object) -> bool:\n",
+            "        if not isinstance(other, V):\n",
+            "            return NotImplemented\n",
+            "        return self.n < other.n\n",
+        ),
+        "notimpl_lt.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("outside `__eq__`"), "generated: {}", out);
+    // In `__eq__` it is the identity fallback.
+    let out = compile(
+        concat!(
+            "class V:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        if not isinstance(other, V):\n",
+            "            return NotImplemented\n",
+            "        return self.n == other.n\n",
+        ),
+        "notimpl_eq.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+}
+
+/// A raise argument that contains a call is bound once and read by both
+/// the message and the stored attribute (CPython evaluates a constructor
+/// argument once).
+#[test]
+fn a_raise_argument_with_a_call_is_evaluated_once() {
+    let out = compile(
+        concat!(
+            "class Short(Exception):\n",
+            "    def __init__(self, needed: int):\n",
+            "        super().__init__(f\"need {needed}\")\n",
+            "        self.needed = needed\n",
+            "\n",
+            "def cost() -> int:\n",
+            "    return 3\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Short(cost())\n",
+        ),
+        "raise_once.py",
+    );
+    assert_eq!(out.matches("cost () ?").count(), 1, "generated: {}", out);
+    assert!(out.contains("__rython_exc_arg0"), "generated: {}", out);
+}
+
+/// An exception `__init__` with a statement the construction model does
+/// not run is refused at the raise site; a field read whose parameter is
+/// unannotated is refused at the read.
+#[test]
+fn the_exception_model_refuses_what_it_does_not_run_or_type() {
+    let out = compile(
+        concat!(
+            "class Short(Exception):\n",
+            "    def __init__(self, needed: int):\n",
+            "        super().__init__(f\"need {needed}\")\n",
+            "        self.needed = needed\n",
+            "        print(\"constructed\")\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Short(3)\n",
+        ),
+        "raise_extra_stmt.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("refuses to silently drop it"), "generated: {}", out);
+    // A keyword-only parameter with a default is modeled as its default
+    // when the raise passes no keywords, and a message reading a stored
+    // field means the parameter it stores (urllib3's _RequestError).
+    let out = compile(
+        concat!(
+            "class ReqError(Exception):\n",
+            "    def __init__(self, message: str, *, request: str | None = None):\n",
+            "        self.request = request\n",
+            "        self.message = message\n",
+            "        super().__init__(self.message)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise ReqError(\"boom\")\n",
+        ),
+        "raise_kwonly_default.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("(\"request\" . to_string () , stdpython :: PyValue :: None_)"), "generated: {}", out);
+    assert!(out.contains("format ! (\"{}\" , \"boom\")"), "generated: {}", out);
+    let err = compile_err(
+        concat!(
+            "class Short(Exception):\n",
+            "    def __init__(self, needed):\n",
+            "        super().__init__(f\"need {needed}\")\n",
+            "        self.needed = needed\n",
+            "\n",
+            "def f() -> int:\n",
+            "    try:\n",
+            "        raise Short(3)\n",
+            "    except Short as e:\n",
+            "        return e.needed\n",
+            "    return 0\n",
+        ),
+        "exc_field_unannotated.py",
+    );
+    assert!(err.contains("rython refuses to guess"), "error: {}", err);
+}
+
+/// Positional-only `__init__` parameters bind like CPython's combined
+/// `posonlyargs ++ args` sequence, defaults aligned to its tail; passing
+/// one by keyword is loud (Devin review on #330).
+#[test]
+fn positional_only_exception_parameters_bind_and_default() {
+    let out = compile(
+        concat!(
+            "class Short(Exception):\n",
+            "    def __init__(self, needed: int, /, unit: str = \"credits\"):\n",
+            "        super().__init__(f\"need {needed} {unit}\")\n",
+            "        self.needed = needed\n",
+            "        self.unit = unit\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Short(2)\n",
+            "\n",
+            "def g() -> None:\n",
+            "    raise Short(needed=2)\n",
+        ),
+        "raise_posonly.py",
+    );
+    assert!(
+        out.contains("(\"unit\" . to_string () , stdpython :: PyValue :: from (\"credits\"))"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("positional-only arguments passed as keyword"), "generated: {}", out);
+}
+
+/// The mutable enumeration visits exactly the nodes the immutable one
+/// does — the two twins are pinned against each other over an expression
+/// that exercises every form (Devin review on #330).
+#[test]
+fn the_mutable_visitor_twin_agrees_with_the_immutable_one() {
+    use python_ast::ast::tree::visit::{walk_expr, walk_expr_mut};
+    let module = parse(
+        concat!(
+            "x = [a + b for a in xs if a] + {k: v for k, v in d.items()} + {s for s in t} + ",
+            "list(g(1, k=lambda q: q * 2)) + (f\"{n:>{w}}\" if p and not r else u[1:2:3]) + ",
+            "(await w) + (yield z) + (yield from zs) + (m := n) + o.attr + [*rest] + (1, 2) + ",
+            "{1, 2} + q[i] + (a < b < c) + (-e)\n",
+        ),
+        "twins.py",
+    )
+    .unwrap_or_else(|e| panic!("parse failed: {}", e));
+    let stmt = module.raw.body.into_iter().next().expect("one statement");
+    let python_ast::StatementType::Assign(assign) = stmt.statement else {
+        panic!("an assignment");
+    };
+    let mut seen_ro: Vec<String> = Vec::new();
+    walk_expr(&assign.value, &mut |e| seen_ro.push(format!("{:?}", std::mem::discriminant(e))));
+    let mut value = assign.value.clone();
+    let mut seen_mut: Vec<String> = Vec::new();
+    walk_expr_mut(&mut value, &mut |e| seen_mut.push(format!("{:?}", std::mem::discriminant(e))));
+    assert!(seen_ro.len() > 40, "the expression exercises the forms: {}", seen_ro.len());
+    assert_eq!(seen_ro, seen_mut, "the two enumerations diverged");
+}
+
+#[test]
+fn exception_arguments_bind_once_even_when_a_caller_name_matches_a_parameter() {
+    // `E(b, "second")` for `__init__(self, a, b)`: the message's `a`
+    // means the caller's `b`, bound once — the raise-site rewrite never
+    // re-substitutes a replacement, and no leftover check mistakes the
+    // caller's name for the parameter (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Pair(Exception):\n",
+            "    def __init__(self, a: str, b: str):\n",
+            "        super().__init__(f\"{a}\")\n",
+            "        self.a = a\n",
+            "        self.b = b\n",
+            "\n",
+            "def f(b: str) -> None:\n",
+            "    raise Pair(b, \"second\")\n",
+        ),
+        "raise_collide.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("(\"a\" . to_string () , stdpython :: PyValue :: from (b))"), "generated: {}", out);
+    assert!(out.contains("(\"b\" . to_string () , stdpython :: PyValue :: from (\"second\"))"), "generated: {}", out);
+    // A lambda or a comprehension in the message binds names of its own
+    // the rewrite cannot model: refused at the site.
+    let out = compile(
+        concat!(
+            "class Listing(Exception):\n",
+            "    def __init__(self, items: list[str]):\n",
+            "        super().__init__(\", \".join(i for i in items))\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Listing([\"x\"])\n",
+        ),
+        "raise_comprehension_msg.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("lambda or a comprehension"), "generated: {}", out);
+}
+
+#[test]
+fn exception_ness_and_the_ancestor_chain_are_transitive() {
+    // `Root(Exception)`, `Mid(Root)`, `LeafError(Mid)`: Mid IS an
+    // exception class (a marker, no trait machinery) and LeafError's
+    // ancestors record Mid, so `except Mid:` catches it (Devin review on
+    // #330).
+    let out = compile(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class Mid(Root):\n",
+            "    pass\n",
+            "\n",
+            "class LeafError(Mid):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise LeafError(\"leaf\")\n",
+        ),
+        "raise_neutral_mid.py",
+    );
+    assert!(!out.contains("MidTrait"), "generated: {}", out);
+    assert!(
+        out.contains("vec ! [(\"Mid\") . to_string () , (\"Root\") . to_string () , (\"Exception\") . to_string ()]"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn a_zero_argument_super_init_keeps_the_fields_and_no_super_call_keeps_the_argument() {
+    // `super().__init__()` is the empty message with the fields kept;
+    // no super call at all leaves `str(e)` to BaseException.__new__: the
+    // one positional argument, or empty; two would be the tuple's repr,
+    // refused; so is a two-argument super call (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Bare(Exception):\n",
+            "    def __init__(self, code: int):\n",
+            "        super().__init__()\n",
+            "        self.code = code\n",
+            "\n",
+            "class Silent(Exception):\n",
+            "    def __init__(self, code: int):\n",
+            "        self.code = code\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Bare(9)\n",
+            "\n",
+            "def g() -> None:\n",
+            "    raise Silent(5)\n",
+        ),
+        "raise_zero_arg_super.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("(\"Bare\" , String :: new () , vec ! [(\"code\" . to_string () , stdpython :: PyValue :: from (9))]"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("(\"Silent\" , format ! (\"{}\" , 5) , vec ! [(\"code\" . to_string () , stdpython :: PyValue :: from (5))]"),
+        "generated: {}",
+        out
+    );
+    let out = compile(
+        concat!(
+            "class Two(Exception):\n",
+            "    def __init__(self, a: int, b: int):\n",
+            "        super().__init__(a, b)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Two(1, 2)\n",
+        ),
+        "raise_two_arg_super.py",
+    );
+    // `super().__init__(a, b)` is the args tuple's repr, as CPython's
+    // `str(e)` is.
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("format ! (\"({}, {})\" , stdpython :: PyRepr :: py_repr (& (1)) , stdpython :: PyRepr :: py_repr (& (2)))"),
+        "generated: {}",
+        out
+    );
+    let out = compile(
+        concat!(
+            "class Silent2(Exception):\n",
+            "    def __init__(self, a: int, b: int):\n",
+            "        self.a = a\n",
+            "        self.b = b\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Silent2(1, 2)\n",
+        ),
+        "raise_two_arg_no_super.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("never calls `super().__init__`"), "generated: {}", out);
+}
+
+#[test]
+fn not_implemented_is_the_identity_fallback_only_in_a_method_named_eq() {
+    // A FREE function named `__eq__` is an ordinary function: its
+    // `return NotImplemented` stays the loud refusal (Devin review on
+    // #330).
+    let out = compile(
+        concat!(
+            "def __eq__(a: int, b: int) -> bool:\n",
+            "    if a < 0:\n",
+            "        return NotImplemented\n",
+            "    return a == b\n",
+        ),
+        "notimpl_free_eq.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("outside `__eq__`"), "generated: {}", out);
+}
+
+#[test]
+fn a_zero_parameter_exception_init_is_modeled_like_any_other() {
+    // `__init__(self)` runs the body analysis too: a fixed message is the
+    // message, an argument at the raise is the arity error, an unmodeled
+    // statement is the refusal (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Fixed(Exception):\n",
+            "    def __init__(self):\n",
+            "        super().__init__(\"fixed message\")\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Fixed()\n",
+            "\n",
+            "def g() -> None:\n",
+            "    raise Fixed(1)\n",
+        ),
+        "raise_zero_param.py",
+    );
+    assert!(out.contains("(\"Fixed\" , format ! (\"{}\" , \"fixed message\") , vec ! []"), "generated: {}", out);
+    assert!(out.contains("takes 0 positional argument(s) but 1 were given"), "generated: {}", out);
+    let out = compile(
+        concat!(
+            "class Noisy(Exception):\n",
+            "    def __init__(self):\n",
+            "        print(\"constructed\")\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Noisy()\n",
+        ),
+        "raise_zero_param_stmt.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("refuses to silently drop it"), "generated: {}", out);
+}
+
+#[test]
+fn an_exception_init_models_the_last_store_and_refuses_a_second_super_call() {
+    // The last `self.v = ...` wins, as in Python; a second
+    // `super().__init__` (which would replace the args) is refused
+    // (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Twice(Exception):\n",
+            "    def __init__(self, a: int, b: int):\n",
+            "        super().__init__(\"t\")\n",
+            "        self.v = a\n",
+            "        self.v = b\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Twice(1, 2)\n",
+        ),
+        "raise_last_store.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("vec ! [(\"v\" . to_string () , stdpython :: PyValue :: from (2))]"), "generated: {}", out);
+    let out = compile(
+        concat!(
+            "class Again(Exception):\n",
+            "    def __init__(self, a: str):\n",
+            "        super().__init__(\"first\")\n",
+            "        super().__init__(a)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Again(\"x\")\n",
+        ),
+        "raise_second_super.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("a second time"), "generated: {}", out);
+    // A compound statement is refused at its head — the walk never
+    // enters its body.
+    let out = compile(
+        concat!(
+            "class Cond(Exception):\n",
+            "    def __init__(self, a: str):\n",
+            "        if a:\n",
+            "            super().__init__(a)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Cond(\"x\")\n",
+        ),
+        "raise_compound_init.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("(line 3) has a statement beyond"), "generated: {}", out);
+}
+
+#[test]
+fn a_bare_name_argument_is_captured_before_a_later_argument_runs() {
+    // `E(counter, bump())`: bump may rebind counter, so counter is
+    // captured (a clone) in source order before bump runs; with no later
+    // evaluated argument the name is read in place (Devin review on
+    // #330).
+    let out = compile(
+        concat!(
+            "counter = 0\n",
+            "\n",
+            "def bump() -> int:\n",
+            "    global counter\n",
+            "    counter += 1\n",
+            "    return counter\n",
+            "\n",
+            "class Pair2(Exception):\n",
+            "    def __init__(self, first: int, second: int):\n",
+            "        super().__init__(f\"{first} {second}\")\n",
+            "\n",
+            "def f(x: int) -> None:\n",
+            "    raise Pair2(counter, bump())\n",
+            "\n",
+            "def g(x: int) -> None:\n",
+            "    raise Pair2(x, 2)\n",
+        ),
+        "raise_capture_name.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("let __rython_exc_arg0 = (stdpython :: py_global_read (& counter)) . clone () ; let __rython_exc_arg1 = bump () ?"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("format ! (\"{} {}\" , py_display (& (x)) , py_display (& (2)))"), "generated: {}", out);
+}
+
+#[test]
+fn a_variadic_exception_init_forwards_or_is_loud() {
+    // `__init__(self, *args)` forwarding to `super().__init__(*args)`
+    // (idna's IDNAError): the message is the raise's one argument; a
+    // body doing more, a keyword, or two arguments are loud (Devin
+    // review on #330).
+    let out = compile(
+        concat!(
+            "class Var(Exception):\n",
+            "    def __init__(self, *args):\n",
+            "        super().__init__(*args)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Var(\"v\")\n",
+            "\n",
+            "def g() -> None:\n",
+            "    raise Var()\n",
+            "\n",
+            "def h() -> None:\n",
+            "    raise Var(\"a\", \"b\")\n",
+        ),
+        "raise_variadic.py",
+    );
+    assert!(out.contains("(\"Var\" , format ! (\"{}\" , \"v\") , vec ! []"), "generated: {}", out);
+    assert!(out.contains("(\"Var\" , String :: new () , vec ! []"), "generated: {}", out);
+    // Two forwarded arguments: the args tuple's repr, as the generic
+    // construction renders it.
+    assert!(
+        out.contains("format ! (\"({}, {})\" , stdpython :: PyRepr :: py_repr (& (\"a\")) , stdpython :: PyRepr :: py_repr (& (\"b\")))"),
+        "generated: {}",
+        out
+    );
+    let out = compile(
+        concat!(
+            "class Req(Exception):\n",
+            "    def __init__(self, *args, **kwargs):\n",
+            "        self.response = kwargs.pop(\"response\", None)\n",
+            "        super().__init__(*args, **kwargs)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Req(\"boom\")\n",
+        ),
+        "raise_variadic_stmt.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("refuses to silently drop it"), "generated: {}", out);
+}
+
+#[test]
+fn not_implemented_in_eq_is_the_identity_fallback_the_other_parameter_allows() {
+    // A shared class's `__eq__` returning NotImplemented declines: the
+    // `==` boundary tries the reflected `__eq__`, then `is` (the same
+    // reference). A boxed other is never the same object.
+    // A value class compared with its own kind has no identity to ask:
+    // loud (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Tag:\n",
+            "    def __init__(self, s: str):\n",
+            "        self.s = s\n",
+            "    def bump(self) -> None:\n",
+            "        self.s += \"!\"\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        return NotImplemented\n",
+            "\n",
+            "def f() -> None:\n",
+            "    tags = [Tag(\"x\")]\n",
+            "    tags[0].bump()\n",
+        ),
+        "notimpl_shared.py",
+    );
+    // The declining `__eq__` returns Option<bool> (NotImplemented is its
+    // None) and the `==` boundary dispatches: left, right reflected,
+    // then identity.
+    assert!(
+        out.contains("-> Result < Option < bool > , PyException > { return Ok (None) ; }"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("None => _a . py_is (_b)"), "generated: {}", out);
+    assert!(out.contains("_b . borrow () . __eq__ (_a . clone ())"), "generated: {}", out);
+    let out = compile(
+        concat!(
+            "class V:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        if not isinstance(other, V):\n",
+            "            return NotImplemented\n",
+            "        return self.n == other.n\n",
+        ),
+        "notimpl_boxed_other.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    let out = compile(
+        concat!(
+            "class V:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "    def __eq__(self, other: \"V\") -> bool:\n",
+            "        return NotImplemented\n",
+        ),
+        "notimpl_value_other.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("cannot answer"), "generated: {}", out);
+}
+
+#[test]
+fn issubclass_folds_through_a_neutral_named_user_chain() {
+    // `issubclass(LeafError, Root)` over Root(Exception), Mid(Root),
+    // LeafError(Mid): the fold walks the same ancestor chain the raise
+    // attaches, so the neutral-named Mid is a step, not a dead end
+    // (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class Mid(Root):\n",
+            "    pass\n",
+            "\n",
+            "class LeafError(Mid):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    print(issubclass(LeafError, Root), issubclass(Mid, Exception), issubclass(Mid, ValueError))\n",
+        ),
+        "issubclass_neutral.py",
+    );
+    assert!(out.contains("(& (true)) , py_display (& (true)) , py_display (& (false))"), "generated: {}", out);
+}
+
+#[test]
+fn a_variadic_exception_init_forwarding_something_else_is_loud() {
+    // `super().__init__(*other)` is not the raise's arguments (Devin
+    // review on #330).
+    let out = compile(
+        concat!(
+            "OTHER = [\"fixed\"]\n",
+            "\n",
+            "class Odd(Exception):\n",
+            "    def __init__(self, *args):\n",
+            "        super().__init__(*OTHER)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Odd(\"v\")\n",
+        ),
+        "raise_variadic_other.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("not its own `*args`"), "generated: {}", out);
+}
+
+#[test]
+fn an_aliased_base_is_recorded_by_its_canonical_name_everywhere() {
+    // `R = Root`, `class LeafError(R)`: the ancestor chain records Root,
+    // `except R:` matches "Root", `issubclass(LeafError, R)` folds, and
+    // a module-level alias of a builtin (`Base = ValueError`) makes
+    // `class Bad(Base)` an exception class over ValueError (Devin review
+    // on #330).
+    let out = compile(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "R = Root\n",
+            "\n",
+            "class LeafError(R):\n",
+            "    pass\n",
+            "\n",
+            "Base = ValueError\n",
+            "\n",
+            "class Bad(Base):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    try:\n",
+            "        raise LeafError(\"leaf\")\n",
+            "    except R as e:\n",
+            "        print(e)\n",
+            "    raise Bad(\"bad\")\n",
+            "\n",
+            "def g() -> None:\n",
+            "    print(issubclass(LeafError, R), issubclass(Bad, Exception))\n",
+        ),
+        "raise_alias_base.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("(\"LeafError\" , format ! (\"{}\" , \"leaf\") , vec ! [] , vec ! [(\"Root\") . to_string () , (\"Exception\") . to_string ()])"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("__rython_exc . matches (\"Root\")"), "generated: {}", out);
+    assert!(!out.contains("matches (\"R\")"), "generated: {}", out);
+    assert!(
+        out.contains("(\"Bad\" , format ! (\"{}\" , \"bad\") , vec ! [] , vec ! [(\"ValueError\") . to_string ()])"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("(& (true)) , py_display (& (true))"), "generated: {}", out);
+    assert!(out.contains("PyValue :: from (\"ValueError\" . to_string ())"), "generated: {}", out);
+}
+
+#[test]
+fn an_aliased_raise_is_the_canonical_kind_and_an_inherited_init_runs() {
+    // `raise R` / `raise R(...)` under `R = Root` construct a "Root";
+    // `isinstance(R(...), Root)` sees one; `class Child(Base): pass`
+    // constructs through Base's `__init__` with the kind Child and
+    // Child's ancestors (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Base(Exception):\n",
+            "    def __init__(self, code: int):\n",
+            "        super().__init__(f\"code {code}\")\n",
+            "        self.code = code\n",
+            "\n",
+            "class Child(Base):\n",
+            "    pass\n",
+            "\n",
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "R = Root\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise R\n",
+            "\n",
+            "def g() -> None:\n",
+            "    raise R(\"x\")\n",
+            "\n",
+            "def h() -> bool:\n",
+            "    return isinstance(R(\"z\"), Root)\n",
+            "\n",
+            "def k() -> None:\n",
+            "    raise Child(7)\n",
+        ),
+        "raise_alias_kind.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(!out.contains("(\"R\""), "generated: {}", out);
+    assert!(out.contains("(\"Root\" , String :: new () , vec ! [] , vec ! [(\"Exception\") . to_string ()])"), "generated: {}", out);
+    assert!(out.contains("(\"Root\" , format ! (\"{}\" , \"x\") , vec ! [] , vec ! [(\"Exception\") . to_string ()])"), "generated: {}", out);
+    assert!(out.contains(". matches (\"Root\")"), "generated: {}", out);
+    assert!(
+        out.contains("(\"Child\" , format ! (\"{}\" , format ! (\"code {}\" , py_display (& (7)))) , vec ! [(\"code\" . to_string () , stdpython :: PyValue :: from (7))] , vec ! [(\"Base\") . to_string () , (\"Exception\") . to_string ()])"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn a_message_reads_the_fields_as_they_stood_at_the_super_call() {
+    // `self.value = first; super().__init__(self.value); self.value =
+    // second`: the message is first, the attr second (Devin review on
+    // #330).
+    let out = compile(
+        concat!(
+            "class Twice2(Exception):\n",
+            "    def __init__(self, first: str, second: str):\n",
+            "        self.value = first\n",
+            "        super().__init__(self.value)\n",
+            "        self.value = second\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Twice2(\"a\", \"b\")\n",
+        ),
+        "raise_store_then_message.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("(\"Twice2\" , format ! (\"{}\" , \"a\") , vec ! [(\"value\" . to_string () , stdpython :: PyValue :: from (\"b\"))]"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn a_message_free_name_must_be_the_binding_the_init_sees() {
+    // A message reading a module global renders at the raise site: fine
+    // where the site sees the same binding, refused where a local
+    // shadows it (Devin review on #330).
+    let out = compile(
+        concat!(
+            "PREFIX = \"P\"\n",
+            "\n",
+            "class Tagged(Exception):\n",
+            "    def __init__(self, n: int):\n",
+            "        super().__init__(f\"{PREFIX}{n}\")\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Tagged(3)\n",
+            "\n",
+            "def g() -> None:\n",
+            "    PREFIX = \"L\"\n",
+            "    raise Tagged(4)\n",
+        ),
+        "raise_free_name.py",
+    );
+    assert!(out.contains("format ! (\"{}{}\" , py_display (& (PREFIX)) , py_display (& (3)))"), "generated: {}", out);
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("message reads `PREFIX`"), "generated: {}", out);
+}
+
+#[test]
+fn an_alias_under_a_gate_joins_the_exception_closure() {
+    // `R = Exception` at top level, then `try: R = Root / except
+    // NameError: pass`: R is bound before the gate, so at runtime it is
+    // Root or Exception — decided at runtime, loud. Bound ONCE at top
+    // level after the gate (`R = Root` replaces the gated alternatives),
+    // `class Leaf(R)` is an exception class over Root. Bound to TWO
+    // classes (`except: R = Exception`), R is decided at runtime: the
+    // base, a raise, a handler, and an issubclass naming it are loud
+    // (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "try:\n",
+            "    R = Exception\n",
+            "except NameError:\n",
+            "    pass\n",
+            "\n",
+            "R = Root\n",
+            "\n",
+            "class Leaf(R):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Leaf(\"x\")\n",
+        ),
+        "raise_gated_alias.py",
+    );
+    assert!(!out.contains("LeafTrait"), "generated: {}", out);
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("(\"Leaf\" , format ! (\"{}\" , \"x\")"), "generated: {}", out);
+    assert!(out.contains("\"Root\""), "generated: {}", out);
+    let err = compile_err(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "try:\n",
+            "    R = Root\n",
+            "except NameError:\n",
+            "    R = Exception\n",
+            "\n",
+            "class Leaf(R):\n",
+            "    pass\n",
+        ),
+        "raise_two_way_alias.py",
+    );
+    assert!(err.contains("bound to more than one class"), "error: {}", err);
+    let out = compile(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "try:\n",
+            "    R = Root\n",
+            "except NameError:\n",
+            "    R = Exception\n",
+            "\n",
+            "def f() -> None:\n",
+            "    try:\n",
+            "        raise R(\"x\")\n",
+            "    except R:\n",
+            "        pass\n",
+        ),
+        "raise_two_way_alias_use.py",
+    );
+    assert!(out.matches("compile_error !").count() >= 2, "generated: {}", out);
+    assert!(out.contains("bound to more than one class"), "generated: {}", out);
+}
+
+#[test]
+fn an_exception_field_holding_a_class_instance_is_loud() {
+    // `raise PoolError(self, "empty")` whose __init__ stores `self.pool =
+    // pool`: a class instance has no box, so the field cannot be kept —
+    // a loud refusal, never a dropped field (urllib3's EmptyPoolError;
+    // the sweep after the inherited-init model on #330).
+    let out = compile(
+        concat!(
+            "class PoolError(Exception):\n",
+            "    def __init__(self, pool, message: str):\n",
+            "        self.pool = pool\n",
+            "        super().__init__(f\"{message}\")\n",
+            "\n",
+            "class EmptyPoolError(PoolError):\n",
+            "    pass\n",
+            "\n",
+            "class Pool:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "    def take(self) -> int:\n",
+            "        if self.n == 0:\n",
+            "            raise EmptyPoolError(self, \"empty\")\n",
+            "        return self.n\n",
+        ),
+        "raise_instance_field.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("is a class instance"), "generated: {}", out);
+    // An evaluated construction (a temporary) and a captured name are
+    // class instances too — the temporary's type is the raise-site
+    // binding's (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class PoolError(Exception):\n",
+            "    def __init__(self, pool, message: str):\n",
+            "        self.pool = pool\n",
+            "        super().__init__(f\"{message}\")\n",
+            "\n",
+            "class Pool:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise PoolError(Pool(1), \"empty\")\n",
+            "\n",
+            "def tag() -> str:\n",
+            "    return \"t\"\n",
+            "\n",
+            "def g() -> None:\n",
+            "    p = Pool(2)\n",
+            "    raise PoolError(p, tag())\n",
+        ),
+        "raise_instance_field_temp.py",
+    );
+    assert_eq!(out.matches("is a class instance").count(), 2, "generated: {}", out);
+}
+
+#[test]
+fn every_exception_argument_is_evaluated_and_an_isinstance_target_is_canonical() {
+    // `raise Ignores(n)` whose __init__ ignores its parameter still reads
+    // `n` once (an undefined name is loud in rustc, as CPython's
+    // NameError is); `isinstance(R("z"), R)` under `R = Root` matches
+    // "Root"; `__init__(self, prefix, *args)` forwards the slice after
+    // the named parameter (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "R = Root\n",
+            "\n",
+            "class Ignores(Exception):\n",
+            "    def __init__(self, unused: int):\n",
+            "        super().__init__(\"ignored\")\n",
+            "\n",
+            "class Prefixed(Exception):\n",
+            "    def __init__(self, prefix, *args):\n",
+            "        super().__init__(*args)\n",
+            "\n",
+            "def f(n: int) -> bool:\n",
+            "    if n > 0:\n",
+            "        raise Ignores(n)\n",
+            "    return isinstance(R(\"z\"), R)\n",
+            "\n",
+            "def g() -> None:\n",
+            "    raise Prefixed(\"p\")\n",
+            "\n",
+            "def h(p: str) -> None:\n",
+            "    raise Prefixed(p, \"m\")\n",
+        ),
+        "raise_eval_every_arg.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("let _ = & n ;"), "generated: {}", out);
+    assert!(out.contains(". matches (\"Root\")"), "generated: {}", out);
+    assert!(out.contains("(\"Prefixed\" , String :: new () , vec ! []"), "generated: {}", out);
+    assert!(out.contains("let _ = & p ;"), "generated: {}", out);
+    assert!(out.contains("(\"Prefixed\" , format ! (\"{}\" , \"m\") , vec ! []"), "generated: {}", out);
+}
+
+#[test]
+fn a_multiple_inheritance_exception_records_every_branch_in_mro_order() {
+    // `class Both(A, B)` over A(ValueError), B(IndexError): the ancestor
+    // chain is Python's C3 order — A, ValueError, B, IndexError — so
+    // `except B:` and `except LookupError:` catch it and the issubclass
+    // fold sees both branches; a straight-line rebinding (`R = Exception`
+    // then `R = Root`) is the final binding, not an ambiguity (Devin
+    // review on #330).
+    let out = compile(
+        concat!(
+            "class A(ValueError):\n",
+            "    pass\n",
+            "\n",
+            "class B(IndexError):\n",
+            "    pass\n",
+            "\n",
+            "class Both(A, B):\n",
+            "    pass\n",
+            "\n",
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "R = Exception\n",
+            "R = Root\n",
+            "\n",
+            "class Leaf(R):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Both(\"x\")\n",
+            "\n",
+            "def g() -> None:\n",
+            "    print(issubclass(Both, IndexError), issubclass(Both, ValueError), issubclass(Both, OSError))\n",
+            "    raise Leaf(\"leaf\")\n",
+        ),
+        "raise_multiple_bases.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("vec ! [(\"A\") . to_string () , (\"ValueError\") . to_string () , (\"B\") . to_string () , (\"IndexError\") . to_string ()]"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("(& (true)) , py_display (& (true)) , py_display (& (false))"), "generated: {}", out);
+    assert!(out.contains("(\"Leaf\" , format ! (\"{}\" , \"leaf\") , vec ! [] , vec ! [(\"Root\") . to_string () , (\"Exception\") . to_string ()])"), "generated: {}", out);
+}
+
+#[test]
+fn an_inconsistent_exception_hierarchy_is_refused_at_the_definition() {
+    // `A(Exception)`, `B(A)`, `C(A, B)`: no consistent MRO — CPython's
+    // TypeError at class creation; the class never exists, so the
+    // conversion refuses it rather than inventing an ancestry (Devin
+    // review on #330).
+    let err = compile_err(
+        concat!(
+            "class A(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class B(A):\n",
+            "    pass\n",
+            "\n",
+            "class C(A, B):\n",
+            "    pass\n",
+        ),
+        "raise_inconsistent_mro.py",
+    );
+    assert!(err.contains("consistent method resolution order"), "error: {}", err);
+}
+
+#[test]
+fn a_gated_binding_of_ordinary_values_is_not_an_exception_alias() {
+    // `A = 1; B = 2; try: R = A / except: R = B`: R is a plain runtime
+    // variable, never an exception alias ambiguity — `print(R)` converts
+    // (Devin review on #330).
+    let out = compile(
+        concat!(
+            "A = 1\n",
+            "B = 2\n",
+            "\n",
+            "try:\n",
+            "    R = A\n",
+            "except NameError:\n",
+            "    R = B\n",
+            "\n",
+            "def f() -> None:\n",
+            "    print(R)\n",
+        ),
+        "gated_plain_alias.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("print (& ("), "generated: {}", out);
+}
+
+#[test]
+fn an_alias_bound_only_under_a_gate_may_be_unbound_and_is_refused() {
+    // `if runtime_condition(): R = Root` then `class Leaf(R)`: Python
+    // leaves R unbound when the branch is not taken (a NameError at the
+    // class statement), so R is decided at runtime — the base, a raise,
+    // a handler, and an issubclass naming it are loud, never Root
+    // unconditionally. One rule for every body the gates cannot fold: an
+    // `if` without an `else`, a `try:` whose body may raise before the
+    // binding (`except NameError: pass`), a loop that may run zero times
+    // (Devin review on #330).
+    let err = compile_err(
+        concat!(
+            "import os\n",
+            "\n",
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "if os.environ.get(\"STRICT\"):\n",
+            "    R = Root\n",
+            "\n",
+            "class Leaf(R):\n",
+            "    pass\n",
+        ),
+        "raise_maybe_unbound_alias_if.py",
+    );
+    assert!(err.contains("may be unbound"), "error: {}", err);
+    let err = compile_err(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "try:\n",
+            "    R = Root\n",
+            "except NameError:\n",
+            "    pass\n",
+            "\n",
+            "class Leaf(R):\n",
+            "    pass\n",
+        ),
+        "raise_maybe_unbound_alias_try.py",
+    );
+    assert!(err.contains("may be unbound"), "error: {}", err);
+    let err = compile_err(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "for _ in []:\n",
+            "    R = Root\n",
+            "\n",
+            "class Leaf(R):\n",
+            "    pass\n",
+        ),
+        "raise_maybe_unbound_alias_loop.py",
+    );
+    assert!(err.contains("may be unbound"), "error: {}", err);
+    // A raise, a handler, and an issubclass naming it are loud at the
+    // site, and the definition warning names the name and the cause.
+    let out = compile(
+        concat!(
+            "import os\n",
+            "\n",
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "if os.environ.get(\"STRICT\"):\n",
+            "    R = Root\n",
+            "\n",
+            "def f() -> None:\n",
+            "    try:\n",
+            "        raise R(\"x\")\n",
+            "    except R:\n",
+            "        pass\n",
+        ),
+        "raise_maybe_unbound_alias_use.py",
+    );
+    assert!(out.matches("compile_error !").count() >= 2, "generated: {}", out);
+    assert!(out.contains("may be unbound"), "generated: {}", out);
+    let err = compile_err(
+        concat!(
+            "import os\n",
+            "\n",
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "if os.environ.get(\"STRICT\"):\n",
+            "    R = Root\n",
+            "\n",
+            "def f() -> bool:\n",
+            "    return issubclass(R, Root)\n",
+        ),
+        "raise_maybe_unbound_alias_issubclass.py",
+    );
+    assert!(err.contains("may be unbound"), "error: {}", err);
+}
+
+#[test]
+fn an_exception_fields_type_is_its_last_stores_parameter() {
+    // `self.v = n` (an int) then `self.v = s` (a str) in one __init__:
+    // the construction records the LAST store (`classify_exception_init`
+    // is last-store-wins), so the read `e.v` is typed str too — the same
+    // final assignment, not the first one's annotation (Devin review on
+    // #330).
+    let out = compile(
+        concat!(
+            "class E(Exception):\n",
+            "    def __init__(self, n: int, s: str) -> None:\n",
+            "        super().__init__(s)\n",
+            "        self.v = n\n",
+            "        self.v = s\n",
+            "\n",
+            "def f() -> str:\n",
+            "    try:\n",
+            "        raise E(3, \"t\")\n",
+            "    except E as e:\n",
+            "        return e.v\n",
+            "    return \"\"\n",
+        ),
+        "raise_last_store_field_type.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("fn f () -> Result < String"), "generated: {}", out);
+    assert!(out.contains("attr_string (\"v\")"), "generated: {}", out);
+    assert!(!out.contains("attr_int"), "generated: {}", out);
+}
+
+#[test]
+fn a_user_defined_base_initializer_runs_at_the_super_call() {
+    // `Child.__init__` calls `super().__init__(code + 1, text.upper())`
+    // and `Base.__init__` (user-defined) stores `self.code` and formats
+    // the message: the base's initializer RUNS at the super call with
+    // those arguments bound to its parameters — its message is `str(e)`,
+    // its store overwrites the child's earlier `self.code`, the child's
+    // `self.text` survives; a keyword through super binds to the base's
+    // parameter; a class without its own `__init__` constructs through
+    // the chain. Every evaluated argument of every level binds once
+    // (`text.upper()` → the level-1 temporary) (Devin review on #330:
+    // the super call was taken for BaseException's, dropping the body).
+    let out = compile(
+        concat!(
+            "class Base(Exception):\n",
+            "    def __init__(self, code: int, text: str) -> None:\n",
+            "        self.code = code\n",
+            "        super().__init__(f\"[{code}] {text}\")\n",
+            "\n",
+            "class Child(Base):\n",
+            "    def __init__(self, text: str, code: int) -> None:\n",
+            "        self.code = code\n",
+            "        self.text = text\n",
+            "        super().__init__(code + 1, text.upper())\n",
+            "\n",
+            "class Leaf(Child):\n",
+            "    pass\n",
+            "\n",
+            "class Named(Base):\n",
+            "    def __init__(self, text: str) -> None:\n",
+            "        super().__init__(text=text, code=3)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Child(\"boom\", 6)\n",
+            "\n",
+            "def g() -> None:\n",
+            "    raise Leaf(\"leaf\", 1)\n",
+            "\n",
+            "def h() -> None:\n",
+            "    raise Named(\"kw\")\n",
+        ),
+        "raise_chain.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    // `code + 1` precedes `text.upper()`, which runs code: bound first
+    // (it could raise), then the call, then the base's message.
+    assert!(
+        out.contains("let __rython_exc_l1_arg0 = ((6) as i64) . py_add (& ((1) as i64)) ; let __rython_exc_l1_arg1 = \"boom\" . upper ()"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("format ! (\"[{}] {}\" , py_display (& (__rython_exc_l1_arg0)) , py_display (& (__rython_exc_l1_arg1)))"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("(\"code\" . to_string () , stdpython :: PyValue :: from ((__rython_exc_l1_arg0) . clone ())) , (\"text\" . to_string () , stdpython :: PyValue :: from (\"boom\"))"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("(\"Leaf\" , format ! (\"{}\" , format ! (\"[{}] {}\""), "generated: {}", out);
+    assert!(
+        out.contains("(\"Named\" , format ! (\"{}\" , format ! (\"[{}] {}\" , py_display (& (3)) , py_display (& (\"kw\")))) , vec ! [(\"code\" . to_string () , stdpython :: PyValue :: from (3))]"),
+        "generated: {}",
+        out
+    );
+    // A keyword the chain hands to BaseException.__init__ is still loud.
+    let out = compile(
+        concat!(
+            "class E(Exception):\n",
+            "    def __init__(self, text: str) -> None:\n",
+            "        super().__init__(text=text)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise E(\"x\")\n",
+        ),
+        "raise_chain_kw_base.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("BaseException.__init__ does not accept"), "generated: {}", out);
+    // A base initializer the model does not cover is loud at the site.
+    let out = compile(
+        concat!(
+            "class Base(Exception):\n",
+            "    def __init__(self, code: int) -> None:\n",
+            "        print(code)\n",
+            "        super().__init__(code)\n",
+            "\n",
+            "class Child(Base):\n",
+            "    def __init__(self, code: int) -> None:\n",
+            "        super().__init__(code + 1)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Child(1)\n",
+        ),
+        "raise_chain_unmodeled_base.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("`Base.__init__` (line 3) has a statement beyond"), "generated: {}", out);
+}
+
+#[test]
+fn a_bare_name_is_captured_before_an_initializer_message_that_runs_code() {
+    // `raise Ticket(counter)` where `Ticket.__init__`'s message calls
+    // `bump()`, which rebinds the global: `n` is bound at the call, so
+    // the field records the value BEFORE the bump — the bare name is
+    // captured first, in source order (Devin review on #330).
+    let out = compile(
+        concat!(
+            "counter = 0\n",
+            "\n",
+            "def bump() -> int:\n",
+            "    global counter\n",
+            "    counter += 1\n",
+            "    return counter\n",
+            "\n",
+            "class Ticket(Exception):\n",
+            "    def __init__(self, n: int) -> None:\n",
+            "        super().__init__(f\"t{bump()}\")\n",
+            "        self.n = n\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Ticket(counter)\n",
+        ),
+        "raise_capture_before_message.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("let __rython_exc_arg0 = (stdpython :: py_global_read (& counter)) . clone () ; let __rython_exc_m0 = format ! (\"t{}\" , py_display (& (bump () ?)))"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("(\"n\" . to_string () , stdpython :: PyValue :: from ((__rython_exc_arg0) . clone ()))"),
+        "generated: {}",
+        out
+    );
+    // A COMPOSITE argument reading the name (`counter * 10`) is captured
+    // the same way — evaluated before the message runs (Devin review on
+    // #330).
+    let out = compile(
+        concat!(
+            "counter = 0\n",
+            "\n",
+            "def bump() -> int:\n",
+            "    global counter\n",
+            "    counter += 1\n",
+            "    return counter\n",
+            "\n",
+            "class Ticket(Exception):\n",
+            "    def __init__(self, n: int) -> None:\n",
+            "        super().__init__(f\"t{bump()}\")\n",
+            "        self.n = n\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Ticket(counter * 10)\n",
+            "\n",
+            "def g() -> None:\n",
+            "    raise Ticket(counter * 10 + bump())\n",
+        ),
+        "raise_capture_composite.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("let __rython_exc_arg0 = (stdpython :: py_global_read (& counter)) . py_mul (& ((10) as i64)) ; let __rython_exc_m0 = format ! (\"t{}\" , py_display (& (bump () ?)))"),
+        "generated: {}",
+        out
+    );
+    assert_eq!(out.matches("let __rython_exc_arg0 = ").count(), 2, "generated: {}", out);
+}
+
+#[test]
+fn an_effectful_exception_argument_binds_once_in_the_generic_construction() {
+    // A class with no `__init__` to model: a property read (a getter
+    // call), a subscript, and a walrus argument each bind ONCE, read by
+    // `str(e)` and by the recorded repr — not rendered twice (Devin
+    // review on #330: only a call bound once, so a property getter ran
+    // twice). A plain field read and an f-string of pure parts AFTER the
+    // last expression that runs code stay in place (nothing later could
+    // disturb them); before one, they would be bound first.
+    let out = compile(
+        concat!(
+            "class Meter:\n",
+            "    def __init__(self, base: int) -> None:\n",
+            "        self.base = base\n",
+            "    @property\n",
+            "    def value(self) -> int:\n",
+            "        return self.base + 1\n",
+            "\n",
+            "class Plain(Exception):\n",
+            "    pass\n",
+            "\n",
+            "def f(m: Meter, xs: list[int]) -> None:\n",
+            "    raise Plain(m.value, xs[0], (w := 5), m.base, f\"{m.base}!\")\n",
+        ),
+        "raise_generic_once.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("let __rython_exc_m0 = m . value () ?"), "generated: {}", out);
+    assert!(out.contains("let __rython_exc_m1 = "), "generated: {}", out);
+    assert!(out.contains("let __rython_exc_m2 = "), "generated: {}", out);
+    assert!(!out.contains("__rython_exc_m3"), "generated: {}", out);
+    assert!(out.contains("py_repr (& (m . base))"), "generated: {}", out);
+    assert_eq!(out.matches("m . value ()").count(), 1, "generated: {}", out);
+    assert_eq!(out.matches("w = 5").count(), 1, "generated: {}", out);
+    let out = compile(
+        concat!(
+            "class Meter:\n",
+            "    def __init__(self, base: int) -> None:\n",
+            "        self.base = base\n",
+            "\n",
+            "class Plain(Exception):\n",
+            "    pass\n",
+            "\n",
+            "def f(m: Meter) -> None:\n",
+            "    raise Plain(m.base, f\"{m.base}!\")\n",
+        ),
+        "raise_generic_pure.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(!out.contains("__rython_exc_"), "generated: {}", out);
+}
+
+#[test]
+fn an_exception_fields_type_follows_the_chains_execution_order() {
+    // `Typed.__init__` stores `self.v = n` (int) before its super call
+    // and `Base.__init__` stores `self.v = s` (str): the base's store
+    // runs later, so the read is a str; a store AFTER the child's super
+    // call wins over the base's (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Base(Exception):\n",
+            "    def __init__(self, s: str) -> None:\n",
+            "        self.v = s\n",
+            "        self.w = s\n",
+            "        super().__init__(s)\n",
+            "\n",
+            "class Typed(Base):\n",
+            "    def __init__(self, n: int, s: str) -> None:\n",
+            "        self.v = n\n",
+            "        super().__init__(s)\n",
+            "        self.w = n\n",
+            "\n",
+            "def f() -> str:\n",
+            "    try:\n",
+            "        raise Typed(3, \"t\")\n",
+            "    except Typed as e:\n",
+            "        return e.v\n",
+            "    return \"\"\n",
+            "\n",
+            "def g() -> int:\n",
+            "    try:\n",
+            "        raise Typed(3, \"t\")\n",
+            "    except Typed as e:\n",
+            "        return e.w\n",
+            "    return 0\n",
+        ),
+        "raise_chain_field_type.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("attr_string (\"v\")"), "generated: {}", out);
+    assert!(out.contains("attr_i64 (\"w\")"), "generated: {}", out);
+}
+
+#[test]
+fn a_local_class_replaces_an_external_import_of_its_name() {
+    // `from somewhere_else import Root` then a top-level `class
+    // Root(Exception)`: the module's binding of `Root` is the local class
+    // (CPython's module init leaves it so), so `class Leaf(Root)` is an
+    // exception class over it — the external binding is REPLACED, not a
+    // permanent mark on the name. The same class under a gate the
+    // conversion cannot fold is one more alternative: runtime-decided,
+    // loud (Devin review on #330).
+    let out = compile(
+        concat!(
+            "from somewhere_else import Root\n",
+            "\n",
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class Leaf(Root):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Leaf(\"x\")\n",
+        ),
+        "raise_local_replaces_external.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(!out.contains("LeafTrait"), "generated: {}", out);
+    assert!(
+        out.contains("(\"Leaf\" , format ! (\"{}\" , \"x\") , vec ! [] , vec ! [(\"Root\") . to_string () , (\"Exception\") . to_string ()])"),
+        "generated: {}",
+        out
+    );
+    let err = compile_err(
+        concat!(
+            "import os\n",
+            "from somewhere_else import Root\n",
+            "\n",
+            "if os.environ.get(\"LOCAL\"):\n",
+            "    class Root(Exception):\n",
+            "        pass\n",
+            "\n",
+            "class Leaf(Root):\n",
+            "    pass\n",
+        ),
+        "raise_gated_local_over_external.py",
+    );
+    assert!(err.contains("decided at runtime"), "error: {}", err);
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "import os\n",
+            "from somewhere_else import Root\n",
+            "\n",
+            "if os.environ.get(\"LOCAL\"):\n",
+            "    class Root(Exception):\n",
+            "        pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Root(\"x\")\n",
+        ),
+        "raise_gated_local_over_external_use.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        warnings.iter().any(|w| w.contains("`Root` is bound more than one way")),
+        "warnings: {:?}",
+        warnings
+    );
+}
+
+#[test]
+fn an_ignored_exception_argument_is_still_evaluated_in_source_order() {
+    // `Ignore.__init__` never reads `n` or `tag`: `raise Ignore(1 // 0)`
+    // is CPython's ZeroDivisionError, not an Ignore — an ignored pure
+    // combinator (a positional one, a keyword one) runs once, in source
+    // order, like an ignored bare name is read once; a constant needs
+    // nothing (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Ignore(Exception):\n",
+            "    def __init__(self, n: int, tag: str = \"t\") -> None:\n",
+            "        super().__init__(\"ignored\")\n",
+            "\n",
+            "def f(k: int) -> None:\n",
+            "    raise Ignore(1 // 0)\n",
+            "\n",
+            "def g(k: int) -> None:\n",
+            "    raise Ignore(7, tag=\"x\" * (k // 0))\n",
+            "\n",
+            "def h(k: int) -> None:\n",
+            "    raise Ignore(k, tag=\"t\")\n",
+        ),
+        "raise_ignored_argument.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("let _ = py_floordiv (1 , 0) ? ;"), "generated: {}", out);
+    assert!(
+        out.contains("let _ = multiply_string (\"x\" , (py_floordiv ((k) . clone () , 0) ?) as i64) ;"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("let _ = & k ;"), "generated: {}", out);
+    assert_eq!(out.matches("let _ = ").count(), 3, "generated: {}", out);
+}
+
+#[test]
+fn a_global_declaration_of_not_implemented_alone_is_still_the_singleton() {
+    // `global NotImplemented` in a shared class's `__eq__`, with no module
+    // binding of the name, redirects the lookup to the module scope where
+    // the builtin still answers: the method declines (Option<bool>, None)
+    // as without the declaration (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Tag:\n",
+            "    def __init__(self, s: str):\n",
+            "        self.s = s\n",
+            "    def bump(self) -> None:\n",
+            "        self.s += \"!\"\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        global NotImplemented\n",
+            "        return NotImplemented\n",
+            "\n",
+            "def f() -> None:\n",
+            "    tags = [Tag(\"x\")]\n",
+            "    tags[0].bump()\n",
+        ),
+        "notimpl_global_decl.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("fn __eq__ (& self , other : stdpython :: PyRef < Tag >) -> Result < Option < bool > , PyException >"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("return Ok (None) ;"), "generated: {}", out);
+}
+
+#[test]
+fn an_explicit_eq_call_on_a_declining_shared_class_is_loud() {
+    // `t.__eq__(other)` spelled out on a shared class whose `__eq__` can
+    // return NotImplemented: the decline lives in the `==` adapter as the
+    // Option's None, and the singleton has no runtime value to hand the
+    // caller — a `compile_error!` at the call, never a silent None; `==`
+    // stays the supported spelling (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Tag:\n",
+            "    def __init__(self, s: str):\n",
+            "        self.s = s\n",
+            "    def bump(self) -> None:\n",
+            "        self.s += \"!\"\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        return NotImplemented\n",
+            "\n",
+            "def f() -> bool:\n",
+            "    tags = [Tag(\"x\")]\n",
+            "    tags[0].bump()\n",
+            "    t = tags[0]\n",
+            "    return t.__eq__(Tag(\"y\"))\n",
+        ),
+        "notimpl_explicit_eq.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("explicit `Tag.__eq__(...)` call"), "generated: {}", out);
+}
+
+#[test]
+fn a_parameter_or_local_named_not_implemented_is_a_value() {
+    // A parameter or a local named `NotImplemented` shadows the singleton
+    // in `__eq__`: the return is that value — no decline, no identity
+    // fallback, no refusal (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class V:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "    def __eq__(self, NotImplemented: bool) -> bool:\n",
+            "        return NotImplemented\n",
+            "\n",
+            "class W:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        NotImplemented = True\n",
+            "        return NotImplemented\n",
+            "\n",
+            "def f() -> None:\n",
+            "    ws = [W(1)]\n",
+            "    ws[0].n = 2\n",
+        ),
+        "notimpl_shadowed.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(!out.contains("Option < bool >"), "generated: {}", out);
+    assert_eq!(out.matches("return Ok (NotImplemented)").count(), 2, "generated: {}", out);
+}
+
+#[test]
+fn builtin_bases_take_their_full_mro_into_the_merge() {
+    // `class C(Exception, ValueError)` has no consistent MRO in CPython
+    // (ValueError precedes Exception in its own); `class D(ValueError,
+    // Exception)` does, and its recorded chain is its direct builtins in
+    // MRO order (Devin review on #330).
+    let err = compile_err(
+        concat!(
+            "class C(Exception, ValueError):\n",
+            "    pass\n",
+        ),
+        "raise_builtin_order_bad.py",
+    );
+    assert!(err.contains("consistent method resolution order"), "error: {}", err);
+    let out = compile(
+        concat!(
+            "class D(ValueError, Exception):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise D(\"d\")\n",
+        ),
+        "raise_builtin_order_ok.py",
+    );
+    assert!(
+        out.contains("(\"D\" , format ! (\"{}\" , \"d\") , vec ! [] , vec ! [(\"ValueError\") . to_string () , (\"Exception\") . to_string ()])"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn a_copy_of_a_runtime_ambiguous_alias_is_ambiguous_too() {
+    // `try: R = A / except: R = B`, then `S = R`: S is decided at runtime
+    // as R is — a base, a raise, a handler, and an issubclass naming S
+    // are loud (Devin review on #330).
+    let err = compile_err(
+        concat!(
+            "class A(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class B(Exception):\n",
+            "    pass\n",
+            "\n",
+            "try:\n",
+            "    R = A\n",
+            "except NameError:\n",
+            "    R = B\n",
+            "S = R\n",
+            "\n",
+            "class Leaf(S):\n",
+            "    pass\n",
+        ),
+        "alias_copy_base.py",
+    );
+    assert!(err.contains("bound to more than one class"), "error: {}", err);
+    let out = compile(
+        concat!(
+            "class A(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class B(Exception):\n",
+            "    pass\n",
+            "\n",
+            "try:\n",
+            "    R = A\n",
+            "except NameError:\n",
+            "    R = B\n",
+            "S = R\n",
+            "\n",
+            "def f() -> None:\n",
+            "    try:\n",
+            "        raise S(\"x\")\n",
+            "    except S:\n",
+            "        pass\n",
+        ),
+        "alias_copy_use.py",
+    );
+    assert!(out.matches("compile_error !").count() >= 2, "generated: {}", out);
+    assert!(out.contains("`S` is bound to more than one class"), "generated: {}", out);
+    let err = compile_err(
+        concat!(
+            "class A(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class B(Exception):\n",
+            "    pass\n",
+            "\n",
+            "try:\n",
+            "    R = A\n",
+            "except NameError:\n",
+            "    R = B\n",
+            "S = R\n",
+            "\n",
+            "def f() -> bool:\n",
+            "    return issubclass(S, A)\n",
+        ),
+        "alias_copy_issubclass.py",
+    );
+    assert!(err.contains("bound to more than one class"), "error: {}", err);
+}
+
+#[test]
+fn a_cyclic_exception_chain_is_refused() {
+    // `class A(Exception)` then `class A(A)`: the name-keyed model has
+    // one `A`, whose base is itself — a cycle, refused at the
+    // definition, never a partial MRO (Devin review on #330; the MRO
+    // walk carries the active chain and refuses re-entry too).
+    let err = compile_err(
+        concat!(
+            "class A(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class A(A):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise A(\"x\")\n",
+        ),
+        "raise_cyclic_bases.py",
+    );
+    assert!(err.contains("cyclic inheritance"), "error: {}", err);
 }

@@ -557,20 +557,49 @@ impl CodeGen for FunctionDef {
         // A module function registered for isinstance specialization
         // (specialize.rs) renders as its variants + residual instead of
         // one generic definition. Methods and nested defs never register.
+        // A SHARED class's `__eq__` that can decline (`return
+        // NotImplemented`) returns `bool | None`: NotImplemented is the
+        // None, and the `==` boundary (`PyRefEq::ref_eq`) tries the
+        // reflected `__eq__` before identity, as CPython does (Devin
+        // review on #330). The annotation is rewritten here so the one
+        // return-type authority and the Some-wrapping return sites see
+        // an Option like any `-> T | None` function.
+        let this = if self.declines_equality(&ctx, &symbols) {
+            let mut f = self.clone();
+            f.returns = Some(Box::new(ExprType::BinOp(crate::ast::tree::bin_ops::BinOp {
+                op: crate::ast::tree::bin_ops::BinOps::BitOr,
+                left: Box::new(ExprType::Name(crate::Name { id: "bool".to_string() })),
+                right: Box::new(ExprType::NoneType(crate::ast::tree::constant::Constant(None))),
+            })));
+            f
+        } else {
+            self
+        };
         let result = if !options.rendering_specialization
             && matches!(ctx, CodeGenContext::Module(_))
-            && options.specialized_fns.contains_key(&self.name)
+            && options.specialized_fns.contains_key(&this.name)
         {
-            let spec = options.specialized_fns.get(&self.name).unwrap().clone();
-            self.render_specializations(spec, ctx, options, symbols)
+            let spec = options.specialized_fns.get(&this.name).unwrap().clone();
+            this.render_specializations(spec, ctx, options, symbols)
         } else {
-            self.to_rust_inner(ctx, options, symbols)
+            this.to_rust_inner(ctx, options, symbols)
         };
         return result;
     }
 }
 
 impl FunctionDef {
+    /// Whether this is a SHARED class's `__eq__` with a `return
+    /// NotImplemented` in its own body: the declining shape whose result
+    /// is `Option<bool>` (see `to_rust`).
+    pub fn declines_equality(&self, ctx: &CodeGenContext, symbols: &SymbolTableScopes) -> bool {
+        self.name == "__eq__"
+            && ctx
+                .enclosing_class_name()
+                .is_some_and(|c| crate::ast::tree::shared::is_shared(c))
+            && body_returns_not_implemented(self, symbols)
+    }
+
     /// Emit the monomorphized variants of an isinstance-dispatched
     /// function (specialize.rs): one definition per tested type with the
     /// axis parameter ANNOTATED as that type — the isinstance checks fold
@@ -2282,6 +2311,36 @@ impl FunctionDef {
         // returns both `host.lower()` and `host`, a `str | None` path).
         // Round 85 extends this to the INFERRED `T | None` returns.
         options.fn_return_is_option = return_is_option;
+        // `__eq__` is the dunder only as a METHOD: a free function of
+        // that name is an ordinary function, whose `return NotImplemented`
+        // stays the loud refusal. In the method it is CPython's identity
+        // fallback, decided by the other parameter's lowering: a shared
+        // class's `object`/own-class other is the PyRef class (the two
+        // borrows' address is `is`); a boxed other is never the same
+        // object; a value class's own kind has no identity to ask (Devin
+        // review on #330).
+        options.eq_not_implemented = if self.name == "__eq__"
+            && let Some(class) = ctx.enclosing_class_name()
+        {
+            let other = self.args.posonlyargs.iter().chain(self.args.args.iter()).nth(1);
+            let annotated = |p: &crate::ast::tree::arguments::Parameter, names: &[&str]| {
+                matches!(p.annotation.as_deref(), Some(ExprType::Name(n)) if names.contains(&n.id.as_str()))
+                    || matches!(p.annotation.as_deref(), Some(ExprType::Constant(c))
+                        if matches!(&c.0, Some(litrs::Literal::String(lit)) if names.contains(&lit.value())))
+            };
+            Some(match other {
+                Some(p)
+                    if crate::ast::tree::shared::is_shared(class)
+                        && annotated(p, &["object", "Any", class]) =>
+                {
+                    crate::EqFallback::SharedDeclined
+                }
+                Some(p) if annotated(p, &["object", "Any"]) => crate::EqFallback::NeverSame,
+                _ => crate::EqFallback::Unmodeled(class.to_string()),
+            })
+        } else {
+            None
+        };
 
         // Round 81 (the generics directive): a CONCRETE typed return
         // (`-> Vec<u8>`, `-> i64` ...) whose value arrives as a boxed
@@ -5106,3 +5165,32 @@ impl FunctionDef {
 }
 
 impl Object for FunctionDef {}
+
+/// Whether a function's body (its own scope: control-flow bodies, not
+/// nested defs) has a `return NotImplemented` naming the SINGLETON — a
+/// parameter or a local named `NotImplemented` shadows it, and then the
+/// return is that value (Devin review on #330).
+pub fn body_returns_not_implemented(f: &FunctionDef, symbols: &SymbolTableScopes) -> bool {
+    use crate::ast::tree::visit::{Descend, any_stmt, def_owns_name, stmt_targets, target_binds};
+    // A `global NotImplemented` DECLARATION alone redirects the lookup to
+    // the module scope, where an absent binding still falls through to
+    // the builtin: the singleton, unless the module (or this body, through
+    // the declaration) binds the name (Devin review on #330).
+    let declares_global = any_stmt(&f.body, Descend::SkipDefs, |s| {
+        matches!(&s.statement, crate::StatementType::Global(names)
+            if names.iter().any(|n| n == "NotImplemented"))
+    });
+    let shadowed = if declares_global {
+        symbols.module_get("NotImplemented").is_some()
+            || any_stmt(&f.body, Descend::SkipDefs, |s| {
+                stmt_targets(s).into_iter().any(|t| target_binds(t, "NotImplemented"))
+            })
+    } else {
+        def_owns_name(f, "NotImplemented")
+    };
+    !shadowed
+        && any_stmt(&f.body, Descend::OwnScope, |s| {
+            matches!(&s.statement, crate::StatementType::Return(Some(e))
+                if matches!(&e.value, ExprType::Name(n) if n.id == "NotImplemented"))
+        })
+}

@@ -3845,3 +3845,69 @@ fn exception_attrs_and_key_repr_match_python() {
         .unwrap_err();
     assert_eq!(err.message, "'carol'", "KeyError quotes a str key like CPython");
 }
+
+/// A raised USER class derived from a builtin (`class MyError(ValueError)`)
+/// is caught by `except ValueError:` — the discriminant fast path consults
+/// the ancestor chain the construction attached (the evaluation on issue
+/// #137). Verified against python3:
+///   class MyError(ValueError): pass
+///   try: raise MyError("x")
+///   except ValueError: print("caught")   -> caught
+#[test]
+fn a_user_exception_over_a_builtin_is_caught_by_the_builtin_handler() {
+    use stdpython::{BuiltinException as B, PyException};
+    let e = PyException::new_with_attrs_and_ancestors(
+        "MyError",
+        "x",
+        vec![],
+        vec!["ValueError".to_string(), "Exception".to_string()],
+    );
+    assert!(e.matches_builtin(B::ValueError));
+    assert!(e.matches_builtin(B::Exception));
+    assert!(e.matches_builtin(B::BaseException));
+    assert!(!e.matches_builtin(B::KeyError), "siblings do not catch");
+    assert!(!e.matches_builtin(B::LookupError));
+}
+
+#[test]
+fn a_user_exception_over_base_exception_is_not_an_exception() {
+    // `class Exit(BaseException)`: the recorded chain decides — caught by
+    // `except BaseException:`, not by `except Exception:` (Devin review
+    // on #330). A chain with no builtin in it keeps the broad posture.
+    use stdpython::{BuiltinException as B, PyException};
+    let e = PyException::new_with_attrs_and_ancestors(
+        "Exit",
+        "bye",
+        vec![],
+        vec!["BaseException".to_string()],
+    );
+    assert!(e.matches_builtin(B::BaseException));
+    assert!(!e.matches_builtin(B::Exception));
+    assert!(e.matches("BaseException"));
+    assert!(!e.matches("Exception"));
+    let unknown = PyException::new_with_attrs_and_ancestors(
+        "Odd",
+        "x",
+        vec![],
+        vec!["SomeImportedError".to_string()],
+    );
+    assert!(unknown.matches_builtin(B::Exception));
+    assert!(unknown.matches("Exception"));
+    assert!(!unknown.matches_builtin(B::ValueError));
+}
+
+#[test]
+fn an_exceptions_repr_is_its_class_and_its_args() {
+    // CPython's BaseException.__repr__: the class name and the args
+    // tuple's contents, from the recorded reprs; a construction that
+    // recorded none quotes its message, or is `Kind()` when empty (Devin
+    // review on #330).
+    use stdpython::{PyException, PyRepr};
+    let e = PyException::new_with_attrs_and_ancestors("Inner", "('a', 'b')", vec![], vec![])
+        .with_args_repr(vec!["'a'".to_string(), "'b'".to_string()]);
+    assert_eq!(e.py_repr(), "Inner('a', 'b')");
+    let one = PyException::new("Inner", "x");
+    assert_eq!(one.py_repr(), "Inner('x')");
+    let none = PyException::new("Inner", "");
+    assert_eq!(none.py_repr(), "Inner()");
+}

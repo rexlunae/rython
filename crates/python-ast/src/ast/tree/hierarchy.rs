@@ -157,18 +157,33 @@ fn base_names(c: &ClassDef) -> Vec<String> {
 
 /// Compute the index over the module being converted (`this_classes`, in
 /// scope bare) and every other module of the crate (`options.module_defs`).
-pub fn compute_roots(this_classes: &[ClassDef], options: &PythonOptions) -> HierarchyRoots {
-    // name → (its direct bases, the module defining it)
-    let mut classes: BTreeMap<String, (Vec<String>, Option<Vec<String>>)> = BTreeMap::new();
-    // The index is keyed by BARE class name — the identity the type side
-    // carries (`TypeInfo::Class(name)`) — so a name two modules both
-    // define (`Timeout` in urllib3's util.timeout and in requests'
-    // exceptions) is ambiguous: it is excluded, as a class and as a base,
-    // and its classes lower as before the index existed (concrete
-    // structs) rather than joining the wrong subtree.
-    let mut defined_in: BTreeMap<String, usize> = BTreeMap::new();
-    let mut per_module: Vec<(Option<Vec<String>>, Vec<ClassDef>)> = Vec::new();
-    per_module.push((None, this_classes.to_vec()));
+/// The emitted classes of every module of the crate, per module: the
+/// module being converted first (path None — its scope is bare), then
+/// each other module of `options.module_defs`, its classes as its own
+/// emission sees them. One enumeration for every crate-wide index (the
+/// hierarchy roots, the exception closure).
+/// One module of the crate: its path (None for the module being
+/// converted), its emitted classes, its name aliases (`X = Y`, `from m
+/// import Y as X` of a crate module), and the names its EXTERNAL imports
+/// bind.
+pub type ModuleClasses = (
+    Option<Vec<String>>,
+    Vec<ClassDef>,
+    Vec<(String, String)>,
+    std::collections::HashSet<String>,
+);
+
+pub fn crate_emitted_classes(
+    this_body: &[crate::Statement],
+    this_classes: &[ClassDef],
+    options: &PythonOptions,
+) -> Vec<ModuleClasses> {
+    let mut per_module: Vec<ModuleClasses> = Vec::new();
+    let (this_aliases, this_externals) = crate::ast::tree::class_def::module_name_aliases(
+        &crate::ast::tree::module::splice_gated_branches(this_body.to_vec(), options),
+        options,
+    );
+    per_module.push((None, this_classes.to_vec(), this_aliases, this_externals));
     for (path, module) in options.module_defs.iter() {
         if path[..] == options.this_module_path[..] {
             continue;
@@ -189,15 +204,37 @@ pub fn compute_roots(this_classes: &[ClassDef], options: &PythonOptions) -> Hier
         };
         module_opts.this_module_path = path.clone();
         let defs = crate::ast::tree::module::emitted_class_defs(module, &module_opts);
-        per_module.push((Some(path.clone()), defs));
+        let (aliases, externals) = crate::ast::tree::class_def::module_name_aliases(
+            &crate::ast::tree::module::splice_gated_branches(module.raw.body.clone(), &module_opts),
+            &module_opts,
+        );
+        per_module.push((Some(path.clone()), defs, aliases, externals));
     }
-    for (_, defs) in &per_module {
+    per_module
+}
+
+pub fn compute_roots(
+    this_body: &[crate::Statement],
+    this_classes: &[ClassDef],
+    options: &PythonOptions,
+) -> HierarchyRoots {
+    // name → (its direct bases, the module defining it)
+    let mut classes: BTreeMap<String, (Vec<String>, Option<Vec<String>>)> = BTreeMap::new();
+    // The index is keyed by BARE class name — the identity the type side
+    // carries (`TypeInfo::Class(name)`) — so a name two modules both
+    // define (`Timeout` in urllib3's util.timeout and in requests'
+    // exceptions) is ambiguous: it is excluded, as a class and as a base,
+    // and its classes lower as before the index existed (concrete
+    // structs) rather than joining the wrong subtree.
+    let mut defined_in: BTreeMap<String, usize> = BTreeMap::new();
+    let per_module = crate_emitted_classes(this_body, this_classes, options);
+    for (_, defs, _, _) in &per_module {
         for c in defs {
             *defined_in.entry(c.name.clone()).or_insert(0) += 1;
         }
     }
     let unambiguous = |name: &str| defined_in.get(name).copied().unwrap_or(0) == 1;
-    for (path, defs) in &per_module {
+    for (path, defs, _, _) in &per_module {
         for c in defs {
             if participates(c) && unambiguous(&c.name) {
                 classes.insert(
