@@ -20863,6 +20863,18 @@ fn a_binding_under_the_reserved_temporary_prefix_is_refused() {
         "reserved_walrus.py",
     );
     assert!(err.contains("`__rython_val`"), "error: {}", err);
+    // Expression-local bindings too: a comprehension target (list, set,
+    // dict, generator) and a lambda parameter (Devin review on #331).
+    for (src, name, tag) in [
+        ("def k(xs: list[int]) -> list[int]:\n    return [__rython_idx * 2 for __rython_idx in xs]\n", "`__rython_idx`", "list"),
+        ("def k(xs: list[int]) -> set[int]:\n    return {__rython_s for __rython_s in xs}\n", "`__rython_s`", "set"),
+        ("def k(xs: list[int]) -> dict[int, int]:\n    return {__rython_k: 1 for __rython_k in xs}\n", "`__rython_k`", "dict"),
+        ("def k(xs: list[int]) -> int:\n    return sum(__rython_g for __rython_g in xs)\n", "`__rython_g`", "gen"),
+        ("def k(xs: list[int]) -> list[int]:\n    return list(map(lambda __rython_p: __rython_p + 1, xs))\n", "`__rython_p`", "lambda"),
+    ] {
+        let err = compile_err(src, &format!("reserved_{tag}.py"));
+        assert!(err.contains(name), "{tag}: {}", err);
+    }
 }
 
 #[test]

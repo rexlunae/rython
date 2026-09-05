@@ -9240,6 +9240,100 @@ fn an_alias_resolves_in_its_own_module_never_through_another_modules_binding() {
 }
 
 #[test]
+fn a_family_with_a_duplicate_named_member_stays_values_loudly() {
+    // shapes.py: `Shape` with `Rect(Shape)` whose `scale` mutates; cli.py
+    // stores the family root-typed (`list[Shape]`) — the family facts
+    // are split between the root (stored) and the subclass (mutated).
+    // other.py defines an unrelated `Rect`: the bare name is ambiguous,
+    // so the member cannot take the shared representation, and a family
+    // holds ONE representation — the whole family stays values, with a
+    // definition warning naming the root and the duplicate, never the
+    // family closure re-admitting the ambiguous name (Devin review on
+    // #331). An ambiguous name is also outside the hierarchy index, so
+    // the root-typed store of a `Rect` is the pre-existing loud build
+    // failure of that exclusion (E0308 at the call), never a silent value
+    // copy: the conversion's warning is the assertion here.
+    let scratch = Scratch::new("duppkg");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"duppkg\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("duppkg");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("shapes.py"),
+        concat!(
+            "class Shape:\n",
+            "    def area(self) -> float:\n",
+            "        return 0.0\n",
+            "\n",
+            "\n",
+            "class Rect(Shape):\n",
+            "    def __init__(self, w: float, h: float):\n",
+            "        self.w = w\n",
+            "        self.h = h\n",
+            "\n",
+            "    def area(self) -> float:\n",
+            "        return self.w * self.h\n",
+            "\n",
+            "    def scale(self, k: float) -> None:\n",
+            "        self.w *= k\n",
+            "        self.h *= k\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("other.py"),
+        concat!(
+            "class Rect:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "    def label(self) -> str:\n",
+            "        return self.name\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("cli.py"),
+        concat!(
+            "from shapes import Shape, Rect\n",
+            "\n",
+            "\n",
+            "def grow(s: Shape) -> None:\n",
+            "    if isinstance(s, Rect):\n",
+            "        s.scale(2.0)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    shapes: list[Shape] = [Rect(2.0, 3.0)]\n",
+            "    for s in shapes:\n",
+            "        grow(s)\n",
+            "    print(f\"{shapes[0].area():.1f}\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    assert!(
+        krate.warnings.iter().any(|w| w.contains("class `Rect` is defined by more than one module")
+            && w.contains("`Shape` and its hierarchy stay values")),
+        "warnings: {:?}",
+        krate.warnings
+    );
+    let shapes = fs::read_to_string(krate.root.join("src/shapes.rs")).unwrap();
+    assert!(!shapes.contains("PyRef<"), "the family took the shared representation: {}", shapes);
+}
+
+#[test]
 fn a_message_reading_another_modules_global_is_refused_at_a_foreign_raise_site() {
     // errors.PREFIX in the message, cli.PREFIX at the raise site: the
     // message would silently read the caller's global — a loud

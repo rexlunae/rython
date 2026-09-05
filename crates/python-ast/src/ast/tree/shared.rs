@@ -132,6 +132,53 @@ pub fn compute_shared(
         })
         .cloned()
         .collect();
+    // An AMBIGUOUS class (a bare name two modules define) is absent from
+    // the hierarchy index, so its family above never saw it: `Rect(Shape)`
+    // with `Rect.scale` mutating, stored root-typed as `list[Shape]`,
+    // would have shared the family — the mutation the family fact was
+    // meant to catch. The name cannot take the shared representation,
+    // and a family holds ONE representation (its root's sum type carries
+    // every member), so the family it derives from stays values too —
+    // loudly, naming the root and the duplicate (Devin review on #331).
+    let ambiguous: Vec<String> = names
+        .iter()
+        .filter(|n| defined_in.get(*n).copied().unwrap_or(0) > 1)
+        .cloned()
+        .collect();
+    for name in &ambiguous {
+        let c = &classes[name];
+        let base_family: Vec<String> = c
+            .bases
+            .iter()
+            .filter_map(|b| match b {
+                crate::ExprType::Name(n) => Some(n.id.as_str()),
+                _ => None,
+            })
+            .flat_map(family_of)
+            .collect();
+        if base_family.is_empty() {
+            continue;
+        }
+        let stored_family = stored.contains(name) || base_family.iter().any(|m| stored.contains(m));
+        let mutates = class_mutates(name, &classes, &external_stores, &mut memo)
+            || base_family
+                .iter()
+                .any(|m| class_mutates(m, &classes, &external_stores, &mut memo));
+        if stored_family && mutates {
+            let root = base_family.first().cloned().unwrap_or_default();
+            options.definition_warnings.borrow_mut().push(format!(
+                "class `{name}` is defined by more than one module of the crate, and it \
+                 derives from `{root}`, whose hierarchy is stored in a container and \
+                 mutated: sharing is keyed by the class name and a hierarchy takes one \
+                 representation, so `{root}` and its hierarchy stay values — a mutation \
+                 through a container-fetched alias of any member does not reach the \
+                 stored object (issue #137); rename the duplicate class"
+            ));
+            for m in &base_family {
+                shared.remove(m);
+            }
+        }
+    }
     // Family closure: a root's sum type holds its members, so the root
     // and every class of its subtree take the one representation.
     let mut changed = true;

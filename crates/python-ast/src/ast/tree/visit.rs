@@ -179,6 +179,16 @@ pub fn reserved_prefix_binding(body: &[Statement]) -> Option<(String, usize)> {
     walk_stmts(body, Descend::All, &mut |s| {
         let line = s.lineno.unwrap_or(0);
         let mut names: Vec<String> = Vec::new();
+        let params = |a: &crate::ParameterList| -> Vec<String> {
+            a.posonlyargs
+                .iter()
+                .chain(a.args.iter())
+                .chain(a.kwonlyargs.iter())
+                .chain(a.vararg.iter())
+                .chain(a.kwarg.iter())
+                .map(|p| p.arg.clone())
+                .collect()
+        };
         for t in stmt_targets(s) {
             names.extend(target_names(t).into_iter().map(str::to_string));
         }
@@ -195,6 +205,15 @@ pub fn reserved_prefix_binding(body: &[Statement]) -> Option<(String, usize)> {
                         .chain(a.kwarg.iter())
                         .map(|p| p.arg.clone()),
                 );
+                // A default value or an annotation is an expression of
+                // the enclosing scope: its walrus or lambda binds there.
+                for e in def_header_exprs(f) {
+                    walk_expr(e, &mut |x| {
+                        if let ExprType::Lambda(l) = x {
+                            names.extend(params(&l.args));
+                        }
+                    });
+                }
             }
             StatementType::ClassDef(c) => names.push(c.name.clone()),
             StatementType::Import(im) => names.extend(im.names.iter().map(|a| match &a.asname {
@@ -208,11 +227,27 @@ pub fn reserved_prefix_binding(body: &[Statement]) -> Option<(String, usize)> {
             StatementType::Global(ns) | StatementType::Nonlocal(ns) => names.extend(ns.iter().cloned()),
             _ => {}
         }
+        // Expression-local bindings: a walrus, a comprehension's targets,
+        // a lambda's parameters.
         for e in stmt_exprs(s) {
-            walk_expr(e, &mut |x| {
-                if let ExprType::NamedExpr(ne) = x {
+            walk_expr(e, &mut |x| match x {
+                ExprType::NamedExpr(ne) => {
                     names.extend(target_names(&ne.left).into_iter().map(str::to_string));
                 }
+                ExprType::ListComp(c) => names.extend(
+                    c.generators.iter().flat_map(|g| target_names(&g.target)).map(str::to_string),
+                ),
+                ExprType::SetComp(c) => names.extend(
+                    c.generators.iter().flat_map(|g| target_names(&g.target)).map(str::to_string),
+                ),
+                ExprType::DictComp(c) => names.extend(
+                    c.generators.iter().flat_map(|g| target_names(&g.target)).map(str::to_string),
+                ),
+                ExprType::GeneratorExp(c) => names.extend(
+                    c.generators.iter().flat_map(|g| target_names(&g.target)).map(str::to_string),
+                ),
+                ExprType::Lambda(l) => names.extend(params(&l.args)),
+                _ => {}
             });
         }
         if let Some(n) = names.into_iter().find(|n| reserved(n)) {
