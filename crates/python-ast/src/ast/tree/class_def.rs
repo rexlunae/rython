@@ -203,6 +203,24 @@ thread_local! {
     /// and the direct bases alone decide).
     static EXCEPTION_CLASSES: std::cell::RefCell<std::rc::Rc<std::collections::HashSet<String>>> =
         std::cell::RefCell::new(std::rc::Rc::new(std::collections::HashSet::new()));
+    /// The alias names a module binds to MORE than one target at runtime
+    /// (`try: R = Root / except: R = Exception` — which one the program
+    /// takes is not static): out of the closure, and loud wherever an
+    /// exception name resolves (Devin review on #330).
+    static AMBIGUOUS_ALIASES: std::cell::RefCell<std::rc::Rc<std::collections::HashSet<String>>> =
+        std::cell::RefCell::new(std::rc::Rc::new(std::collections::HashSet::new()));
+}
+
+/// Whether `name` is an alias the conversion in progress binds to more
+/// than one target at runtime.
+pub fn is_runtime_ambiguous_alias(name: &str) -> bool {
+    AMBIGUOUS_ALIASES.with(|r| r.borrow().contains(name))
+}
+
+/// The exception closure with the runtime-ambiguous alias names.
+pub struct ExceptionIndex {
+    pub classes: std::collections::HashSet<String>,
+    pub ambiguous_aliases: std::collections::HashSet<String>,
 }
 
 /// A module's bindings of one name to another — `X = Y` and `from m
@@ -242,9 +260,14 @@ pub fn is_registered_exception_class(name: &str) -> bool {
     EXCEPTION_CLASSES.with(|r| r.borrow().contains(name))
 }
 
-/// Mirror the computed closure into the registry.
-pub fn install_exception_classes(classes: &std::collections::HashSet<String>) {
+/// Mirror the computed closure and the ambiguous alias names into the
+/// registries.
+pub fn install_exception_classes(
+    classes: &std::collections::HashSet<String>,
+    ambiguous: &std::collections::HashSet<String>,
+) {
     EXCEPTION_CLASSES.with(|r| *r.borrow_mut() = std::rc::Rc::new(classes.clone()));
+    AMBIGUOUS_ALIASES.with(|r| *r.borrow_mut() = std::rc::Rc::new(ambiguous.clone()));
 }
 
 /// The transitive closure of exception-ness over every emitted class of
@@ -267,9 +290,37 @@ pub fn compute_exception_classes(
     this_body: &[crate::Statement],
     this_classes: &[ClassDef],
     options: &crate::PythonOptions,
-) -> std::collections::HashSet<String> {
-    let per_module =
+) -> ExceptionIndex {
+    let mut per_module =
         crate::ast::tree::hierarchy::crate_emitted_classes(this_body, this_classes, options);
+    // An alias a module binds to more than one target after the static
+    // gates folded (`try: R = Root / except: R = Exception`) is decided
+    // at RUNTIME: never followed (the first target is not "the" one —
+    // Devin review on #330), out of the closure, and registered so a
+    // base, a raise, a handler, or an issubclass naming it is loud.
+    let mut ambiguous_aliases: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_, _, aliases) in per_module.iter_mut() {
+        let mut targets: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
+            std::collections::HashMap::new();
+        for (a, t) in aliases.iter() {
+            targets.entry(a.as_str()).or_default().insert(t.as_str());
+        }
+        let multi: std::collections::HashSet<String> = targets
+            .iter()
+            .filter(|(_, t)| t.len() > 1)
+            .map(|(a, _)| a.to_string())
+            .collect();
+        for a in &multi {
+            options.definition_warnings.borrow_mut().push(format!(
+                "`{a}` is bound to more than one class at module level (a `try:`/`except:` \
+                 or an `if` the conversion cannot fold): which class it names is decided at \
+                 runtime, so rython follows neither — a class deriving from it, a raise, a \
+                 handler, or an issubclass naming it is a loud error; bind it once"
+            ));
+        }
+        aliases.retain(|(a, _)| !multi.contains(a));
+        ambiguous_aliases.extend(multi);
+    }
     // (class, its module's alias bindings)
     let mut all: Vec<(&ClassDef, std::rc::Rc<Vec<(String, String)>>)> = Vec::new();
     let mut alias_names: Vec<(String, String)> = Vec::new();
@@ -354,7 +405,7 @@ pub fn compute_exception_classes(
             ));
         }
     }
-    set
+    ExceptionIndex { classes: set, ambiguous_aliases }
 }
 
 impl ClassDef {
@@ -2874,6 +2925,20 @@ impl CodeGen for ClassDef {
                                 if crate::is_typing(&n.id))) =>
                 {
                     None
+                }
+                // A base bound to more than one class at runtime (`try: R
+                // = Root / except: R = Exception`): the ambiguity is the
+                // error, not a missing definition (Devin review on #330).
+                _ if is_runtime_ambiguous_alias(base_name) => {
+                    return Err(format!(
+                        "class `{}` inherits from `{}`, which is bound to more than one \
+                         class at module level (a `try:`/`except:` or an `if` the \
+                         conversion cannot fold): which class it names is decided at \
+                         runtime, and rython refuses to follow one branch silently; bind \
+                         the name once",
+                        self.name, base_name,
+                    )
+                    .into());
                 }
                 _ => {
                     return Err(format!(

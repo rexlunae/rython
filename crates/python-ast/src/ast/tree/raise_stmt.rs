@@ -407,6 +407,19 @@ fn exception_value(
     options: PythonOptions,
     symbols: SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    // A runtime-ambiguous alias (`try: R = Root / except: R = Exception`)
+    // names no one class: loud (Devin review on #330).
+    let alias_name = match exc {
+        ExprType::Call(call) => match call.func.as_ref() {
+            ExprType::Name(n) => Some(n.id.as_str()),
+            _ => None,
+        },
+        ExprType::Name(n) => Some(n.id.as_str()),
+        _ => None,
+    };
+    if let Some(msg) = alias_name.and_then(ambiguous_alias_refusal) {
+        return Ok(quote!(compile_error!(#msg)));
+    }
     match exc {
         ExprType::Call(call) => {
             // An IN-CRATE exception class with a modeled __init__: render
@@ -419,16 +432,16 @@ fn exception_value(
             if let ExprType::Name(name) = call.func.as_ref()
                 && let Some((cls, class_symbols)) =
                     crate::ast::tree::call::resolve_construction_class(&name.id, &symbols, &options)
-                && let Some(tokens) = crate::exception_class_raise(
-                    &cls,
-                    call,
-                    ctx.clone(),
-                    options.clone(),
-                    symbols.clone(),
-                    &class_symbols,
-                )?
+                && crate::is_exception_class(&cls)
             {
-                return Ok(tokens);
+                return exception_construction(
+                    &cls,
+                    &class_symbols,
+                    call,
+                    ctx,
+                    options,
+                    symbols,
+                );
             }
             // `raise ssl.SSLError(...)` — the dotted stdlib exception
             // spelling (urllib3's pyopenssl): canonicalize like the bare
@@ -800,11 +813,37 @@ fn variadic_exception_raise(
     };
     let vararg = init.args.vararg.as_ref().map(|a| a.arg.as_str());
     let kwarg = init.args.kwarg.as_ref().map(|a| a.arg.as_str());
-    let model = match classify_exception_init(cls, &init.body, &[], vararg, kwarg) {
+    // The NAMED parameters before `*args` (`__init__(self, prefix,
+    // *args)`) take the first arguments; the forwarded slice is the rest
+    // (Devin review on #330). A keyword-only parameter or a field store
+    // of a named one is not modeled here: loud.
+    let named: Vec<&str> = init
+        .args
+        .posonlyargs
+        .iter()
+        .chain(init.args.args.iter())
+        .skip(1)
+        .map(|a| a.arg.as_str())
+        .collect();
+    if !init.args.kwonlyargs.is_empty() {
+        return site_error(format!(
+            "rython: `{}.__init__` mixes `*args` with keyword-only parameters, which the \
+             forwarding model does not bind; name the parameters, or drop `*args`",
+            cls.name
+        ));
+    }
+    let model = match classify_exception_init(cls, &init.body, &named, vararg, kwarg) {
         Ok(model) => model,
         Err(msg) => return site_error(msg),
     };
-    debug_assert!(model.fields.is_empty(), "no parameter to store");
+    if !model.fields.is_empty() {
+        return site_error(format!(
+            "rython: `{}.__init__` stores a named parameter as a field while forwarding \
+             `*args`, which the forwarding model does not bind; name every parameter, \
+             or drop `*args`",
+            cls.name
+        ));
+    }
     if let Some(SuperMessage::Expr(_) | SuperMessage::Empty) = model.super_init {
         return site_error(format!(
             "rython: `{}.__init__` takes `*args` but does not forward them to \
@@ -820,15 +859,32 @@ fn variadic_exception_raise(
             cls.name
         ));
     }
-    let msg = match call.args.as_slice() {
-        [] => quote::quote!(String::new()),
-        [crate::ExprType::Starred(_)] => {
-            return site_error(format!(
-                "rython: `raise {}(*...)`: a starred argument to an exception constructor \
-                 is not modeled; pass the arguments explicitly",
-                cls.name
-            ));
+    if call.args.iter().any(|a| matches!(a, crate::ExprType::Starred(_))) {
+        return site_error(format!(
+            "rython: `raise {}(*...)`: a starred argument to an exception constructor \
+             is not modeled; pass the arguments explicitly",
+            cls.name
+        ));
+    }
+    if call.args.len() < named.len() {
+        return site_error(format!(
+            "rython: `{}()` missing a required argument: '{}'",
+            cls.name,
+            named[call.args.len()]
+        ));
+    }
+    // The named parameters' arguments are evaluated once, in order, and
+    // dropped (the body forwards only `*args`).
+    let mut prelude: Vec<proc_macro2::TokenStream> = Vec::new();
+    for a in &call.args[..named.len()] {
+        if matches!(a, crate::ExprType::Constant(_)) {
+            continue;
         }
+        let tokens = a.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        prelude.push(quote::quote!(let _ = #tokens;));
+    }
+    let msg = match &call.args[named.len()..] {
+        [] => quote::quote!(String::new()),
         [one] => {
             let m = message_arg(one, ctx, options.clone(), symbols)?;
             quote::quote!(format!("{}", #m))
@@ -845,10 +901,15 @@ fn variadic_exception_raise(
     };
     let kind = &cls.name;
     let ancestor_tokens = exception_ancestor_tokens(cls, class_symbols, &options);
-    Ok(Some(quote::quote! {
+    let construct = quote::quote! {
         stdpython :: PyException :: new_with_attrs_and_ancestors (
             #kind , #msg , vec ! [] , vec ! [#(#ancestor_tokens),*]
         )
+    };
+    Ok(Some(if prelude.is_empty() {
+        construct
+    } else {
+        quote::quote!({ #(#prelude)* #construct })
     }))
 }
 
@@ -879,6 +940,64 @@ pub(crate) fn exception_init_owner(
         };
     }
     None
+}
+
+/// The ONE construction of an in-crate exception class, wherever the
+/// call sits — a `raise`, an `isinstance` probe, a value position
+/// (`err = MyError("x")`, `str(MyError("x"))`): the modeled `__init__`
+/// (`exception_class_raise`) when the class has one to model, else the
+/// generic construction — the kind is the class's own name, the message
+/// the one positional argument or empty (two or more would be the args
+/// tuple's repr: refused), the ancestor chain attached (Devin review on
+/// #330: the value position built `PyException::new(<ident>, ...)`,
+/// which never compiled).
+pub(crate) fn exception_construction(
+    cls: &crate::ClassDef,
+    class_symbols: &SymbolTableScopes,
+    call: &crate::Call,
+    ctx: CodeGenContext,
+    options: PythonOptions,
+    symbols: SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    if let Some(tokens) = exception_class_raise(
+        cls,
+        call,
+        ctx.clone(),
+        options.clone(),
+        symbols.clone(),
+        class_symbols,
+    )? {
+        return Ok(tokens);
+    }
+    let kind = &cls.name;
+    if !call.keywords.is_empty() {
+        let msg = format!(
+            "rython: `{}()` takes no keyword arguments (BaseException.__init__ accepts none)",
+            cls.name
+        );
+        return Ok(quote!(compile_error!(#msg)));
+    }
+    let msg = match call.args.as_slice() {
+        [] => quote!(String::new()),
+        [one] => {
+            let m = message_arg(one, ctx, options.clone(), symbols)?;
+            quote!(format!("{}", #m))
+        }
+        many => {
+            let msg = format!(
+                "rython: `{}({} arguments)`: `str(e)` is then the repr of the args tuple, \
+                 which rython's one-message exception model does not reproduce; pass one \
+                 message",
+                cls.name,
+                many.len()
+            );
+            return Ok(quote!(compile_error!(#msg)));
+        }
+    };
+    let ancestors = exception_ancestor_tokens(cls, class_symbols, &options);
+    Ok(quote!(PyException::new_with_attrs_and_ancestors(
+        #kind, #msg, vec![], vec![#(#ancestors),*]
+    )))
 }
 
 /// The ancestor chain of an in-crate exception class, base-most last
@@ -942,11 +1061,27 @@ pub(crate) fn exception_ancestors(
 /// alias of a builtin (`Base = ValueError`) is the builtin; a bare
 /// exception-named binding the model does not follow is itself. None
 /// for a name that is no exception class.
+/// The refusal for an exception name that is a runtime-ambiguous alias
+/// (bound to more than one class at module level), or None.
+pub(crate) fn ambiguous_alias_refusal(name: &str) -> Option<String> {
+    crate::ast::tree::class_def::is_runtime_ambiguous_alias(name).then(|| {
+        format!(
+            "rython: `{name}` is bound to more than one class at module level (a \
+             `try:`/`except:` or an `if` the conversion cannot fold), so which exception \
+             class it names is decided at runtime; rython refuses to follow one branch \
+             silently — bind the name once"
+        )
+    })
+}
+
 pub(crate) fn canonical_exception_class(
     name: &str,
     scope: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<(String, Option<(crate::ClassDef, SymbolTableScopes)>)> {
+    if crate::ast::tree::class_def::is_runtime_ambiguous_alias(name) {
+        return None;
+    }
     if let Some((cls, cls_scope)) =
         crate::ast::tree::call::resolve_construction_class(name, scope, options)
     {
@@ -1217,6 +1352,36 @@ pub(crate) fn exception_class_raise(
             }
         },
     };
+    // Every argument is evaluated, in source order, whether or not the
+    // model reads it: a bare name bound to a parameter the message and
+    // the fields ignore is still read once (`raise E(undefined_name)`
+    // is a NameError before the construction in CPython, an unresolved
+    // name in rustc here — Devin review on #330).
+    let mut read_by_model: Vec<&str> = fields.iter().map(|(_, p)| *p).collect();
+    if let Some(m0) = &msg_expr {
+        crate::ast::tree::visit::walk_expr(m0, &mut |e| {
+            if let ExprType::Name(n) = e
+                && let Some(p) = params.iter().find(|p| **p == n.id)
+            {
+                read_by_model.push(p);
+            }
+            if let ExprType::Attribute(attr) = e
+                && crate::ast::tree::visit::is_self(&attr.value)
+                && let Some((_, p)) = fields_at_super.iter().find(|(f, _)| *f == attr.attr)
+            {
+                read_by_model.push(p);
+            }
+        });
+    }
+    for (param, arg) in &given {
+        if let ExprType::Name(n) = arg
+            && !read_by_model.contains(param)
+            && matches!(substitution.get(param), Some(ExprType::Name(s)) if s.id == n.id)
+        {
+            let ident = crate::safe_ident(&n.id);
+            prelude.push(quote::quote!(let _ = &#ident;));
+        }
+    }
     let msg = match msg_expr {
         None => quote::quote!(String::new()),
         Some(mut m) => {

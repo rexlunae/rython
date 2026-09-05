@@ -15285,9 +15285,12 @@ fn hierarchy_trait_carries_py_display_bound() {
 
 #[test]
 fn exception_message_args_wrap_class_instances_in_py_display() {
-    // The raise-site message flattening wraps class instances, Options,
-    // and boxed values in py_display (Python's str) — a raw format! would
-    // fail to compile (no Rust Display on a class struct).
+    // The raise-site message wraps a class instance, an Option, or a
+    // boxed value in py_display (Python's str) — a raw format! would
+    // fail to compile (no Rust Display on a class struct). Two arguments
+    // to a class without a modeled __init__ make `str(e)` the args
+    // tuple's repr, which the one-message model refuses (the old
+    // comma-joined message was a silent divergence; Devin review on #330).
     let out = compile(
         concat!(
             "class PoolError(Exception):\n",
@@ -15298,6 +15301,9 @@ fn exception_message_args_wrap_class_instances_in_py_display() {
             "        self._host = host\n",
             "\n",
             "def boom():\n",
+            "    raise PoolError(Pool(\"x\"))\n",
+            "\n",
+            "def boom2():\n",
             "    raise PoolError(Pool(\"x\"), \"closed.\")\n",
         ),
         "disp.py",
@@ -15308,6 +15314,7 @@ fn exception_message_args_wrap_class_instances_in_py_display() {
         "the message arg must wrap the class instance: {}",
         out
     );
+    assert!(out.contains("repr of the args tuple"), "generated: {}", out);
 }
 
 #[test]
@@ -19915,9 +19922,11 @@ fn a_message_free_name_must_be_the_binding_the_init_sees() {
 
 #[test]
 fn an_alias_under_a_gate_joins_the_exception_closure() {
-    // `try: R = Root / except: R = Exception` binds R in the module's own
-    // scope: `class Leaf(R)` is an exception class (Devin review on
-    // #330).
+    // `try: R = Root / except NameError: pass` binds R once, in the
+    // module's own scope: `class Leaf(R)` is an exception class. Bound
+    // to TWO classes (`except: R = Exception`), R is decided at runtime:
+    // the base, a raise, a handler, and an issubclass naming it are loud
+    // (Devin review on #330).
     let out = compile(
         concat!(
             "class Root(Exception):\n",
@@ -19926,7 +19935,7 @@ fn an_alias_under_a_gate_joins_the_exception_closure() {
             "try:\n",
             "    R = Root\n",
             "except NameError:\n",
-            "    R = Exception\n",
+            "    pass\n",
             "\n",
             "class Leaf(R):\n",
             "    pass\n",
@@ -19938,6 +19947,42 @@ fn an_alias_under_a_gate_joins_the_exception_closure() {
     );
     assert!(!out.contains("LeafTrait"), "generated: {}", out);
     assert!(out.contains("(\"Leaf\" , format ! (\"{}\" , \"x\")"), "generated: {}", out);
+    let err = compile_err(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "try:\n",
+            "    R = Root\n",
+            "except NameError:\n",
+            "    R = Exception\n",
+            "\n",
+            "class Leaf(R):\n",
+            "    pass\n",
+        ),
+        "raise_two_way_alias.py",
+    );
+    assert!(err.contains("bound to more than one class"), "error: {}", err);
+    let out = compile(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "try:\n",
+            "    R = Root\n",
+            "except NameError:\n",
+            "    R = Exception\n",
+            "\n",
+            "def f() -> None:\n",
+            "    try:\n",
+            "        raise R(\"x\")\n",
+            "    except R:\n",
+            "        pass\n",
+        ),
+        "raise_two_way_alias_use.py",
+    );
+    assert!(out.matches("compile_error !").count() >= 2, "generated: {}", out);
+    assert!(out.contains("bound to more than one class"), "generated: {}", out);
 }
 
 #[test]
@@ -19968,4 +20013,47 @@ fn an_exception_field_holding_a_class_instance_is_loud() {
     );
     assert!(out.contains("compile_error !"), "generated: {}", out);
     assert!(out.contains("is a class instance"), "generated: {}", out);
+}
+
+#[test]
+fn every_exception_argument_is_evaluated_and_an_isinstance_target_is_canonical() {
+    // `raise Ignores(n)` whose __init__ ignores its parameter still reads
+    // `n` once (an undefined name is loud in rustc, as CPython's
+    // NameError is); `isinstance(R("z"), R)` under `R = Root` matches
+    // "Root"; `__init__(self, prefix, *args)` forwards the slice after
+    // the named parameter (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "R = Root\n",
+            "\n",
+            "class Ignores(Exception):\n",
+            "    def __init__(self, unused: int):\n",
+            "        super().__init__(\"ignored\")\n",
+            "\n",
+            "class Prefixed(Exception):\n",
+            "    def __init__(self, prefix, *args):\n",
+            "        super().__init__(*args)\n",
+            "\n",
+            "def f(n: int) -> bool:\n",
+            "    if n > 0:\n",
+            "        raise Ignores(n)\n",
+            "    return isinstance(R(\"z\"), R)\n",
+            "\n",
+            "def g() -> None:\n",
+            "    raise Prefixed(\"p\")\n",
+            "\n",
+            "def h(p: str) -> None:\n",
+            "    raise Prefixed(p, \"m\")\n",
+        ),
+        "raise_eval_every_arg.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("let _ = & n ;"), "generated: {}", out);
+    assert!(out.contains(". matches (\"Root\")"), "generated: {}", out);
+    assert!(out.contains("(\"Prefixed\" , String :: new () , vec ! []"), "generated: {}", out);
+    assert!(out.contains("let _ = p ;"), "generated: {}", out);
+    assert!(out.contains("(\"Prefixed\" , format ! (\"{}\" , \"m\") , vec ! []"), "generated: {}", out);
 }

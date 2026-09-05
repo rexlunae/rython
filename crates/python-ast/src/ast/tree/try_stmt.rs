@@ -717,6 +717,9 @@ fn exception_match_guard(
             // `R = Root`, `import Root as R`) is its definition's name —
             // the name the raise's ancestor chain records (Devin review
             // on #330). One canonicalizer for both.
+            if let Some(msg) = crate::ast::tree::raise_stmt::ambiguous_alias_refusal(&name.id) {
+                return Ok(Some(quote!(compile_error!(#msg))));
+            }
             let n = crate::ast::tree::raise_stmt::canonical_exception_class(
                 &name.id, symbols, options,
             )

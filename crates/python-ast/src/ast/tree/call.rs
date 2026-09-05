@@ -2608,6 +2608,11 @@ impl<'a> CodeGen for Call {
                             )
                             .unwrap_or((name.to_string(), None))
                         };
+                        for n in [&c1.id, &c2.id] {
+                            if let Some(msg) = crate::ast::tree::raise_stmt::ambiguous_alias_refusal(n) {
+                                return Err(msg.into());
+                            }
+                        }
                         let (c2_name, _) = canon(&c2.id);
                         let mro = crate::ast::tree::raise_stmt::builtin_exception_mro;
                         let target: &str = mro(&c2_name)?
@@ -2735,48 +2740,14 @@ impl<'a> CodeGen for Call {
                                     // in-crate; the quoted kind otherwise.
                                     match resolve_construction_class(&f.id, &symbols, &options) {
                                         Some((cls, class_symbols)) => {
-                                            let cls = &cls;
-                                            crate::ast::tree::raise_stmt::exception_class_raise(
-                                                cls,
+                                            crate::ast::tree::raise_stmt::exception_construction(
+                                                &cls,
+                                                &class_symbols,
                                                 call,
                                                 ctx.clone(),
                                                 options.clone(),
                                                 symbols.clone(),
-                                                &class_symbols,
                                             )?
-                                            .map(Ok)
-                                            .unwrap_or_else(|| -> Result<_, Box<dyn std::error::Error>> {
-                                                // No modeled __init__ (a `pass` body, an
-                                                // unmodeled shape): the quoted kind with
-                                                // the message argument, if any — an
-                                                // argument-less construction has none
-                                                // (`isinstance(MyError(), Exception)`
-                                                // indexed args[0] and panicked).
-                                                // The class's own name (`R(...)`
-                                                // under `R = Root` is a Root).
-                                                let kind = &cls.name;
-                                                let m = match call.args.first() {
-                                                    None => quote!(String::new()),
-                                                    Some(first) => {
-                                                        let m = crate::ast::tree::raise_stmt::message_arg(
-                                                            first,
-                                                            ctx.clone(),
-                                                            options.clone(),
-                                                            symbols.clone(),
-                                                        )?;
-                                                        quote!(format!("{}", #m))
-                                                    }
-                                                };
-                                                // The ancestor chain is class metadata,
-                                                // attached with or without a modeled __init__.
-                                                let ancestors =
-                                                    crate::ast::tree::raise_stmt::exception_ancestor_tokens(
-                                                        cls, &class_symbols, &options,
-                                                    );
-                                                Ok(quote!(PyException::new_with_attrs_and_ancestors(
-                                                    #kind, #m, vec![], vec![#(#ancestors),*]
-                                                )))
-                                            })?
                                         }
                                         _ => {
                                             let kind = crate::ast::tree::raise_stmt::canonical_exception_class(
@@ -2805,7 +2776,16 @@ impl<'a> CodeGen for Call {
                                     symbols.clone(),
                                 )?,
                             };
-                            let kind = &t.id;
+                            // The target by its canonical name (`R = Root`
+                            // — Devin review on #330).
+                            if let Some(msg) = crate::ast::tree::raise_stmt::ambiguous_alias_refusal(&t.id) {
+                                return Ok(quote!(compile_error!(#msg)));
+                            }
+                            let kind = crate::ast::tree::raise_stmt::canonical_exception_class(
+                                &t.id, &symbols, &options,
+                            )
+                            .map(|(n, _)| n)
+                            .unwrap_or_else(|| t.id.clone());
                             return Ok(quote!((#arg).matches(#kind)));
                         }
                         // `isinstance(v, type(x))`: `type(...)` of a
@@ -5413,34 +5393,17 @@ impl<'a> CodeGen for Call {
                 // the formatted message — so the value flows into `raise
                 // new_e` and `except` matches by name.
                 if crate::is_exception_class(&class) {
-                    let msg = match self.args.len() {
-                        0 => quote!(String::new()),
-                        1 => {
-                            let arg = self.args[0].clone().to_rust(
-                                ctx.clone(),
-                                options.clone(),
-                                symbols.clone(),
-                            )?;
-                            quote!(format!("{}", #arg))
-                        }
-                        _ => {
-                            let args: Result<Vec<TokenStream>, Box<dyn std::error::Error>> =
-                                self.args
-                                    .iter()
-                                    .map(|a| {
-                                        a.clone().to_rust(
-                                            ctx.clone(),
-                                            options.clone(),
-                                            symbols.clone(),
-                                        )
-                                    })
-                                    .collect();
-                            let args = args?;
-                            let fmt = vec!["{}"; args.len()].join(", ");
-                            quote!(format!(#fmt, #(#args),*))
-                        }
-                    };
-                    return Ok(quote!(PyException::new(#cname, #msg)));
+                    // The one construction (raise_stmt.rs): the modeled
+                    // __init__, else the generic message with the
+                    // ancestors — never a bare identifier kind.
+                    return crate::ast::tree::raise_stmt::exception_construction(
+                        &class,
+                        &class_symbols,
+                        &self,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    );
                 }
                 // A starred argument (`HTTPBasicAuth(*auth)` — requests)
                 // spreads a tuple; the signature mapping cannot know the
