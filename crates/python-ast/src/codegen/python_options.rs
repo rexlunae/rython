@@ -84,9 +84,11 @@ pub fn sys_path() -> PyResult<Vec<String>> {
 /// NotImplemented` — CPython tries the reflected `__eq__`, then `is`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum EqFallback {
-    /// A SHARED class whose other parameter is the PyRef class: `is` is
-    /// the two borrows' address (`a == a` is True, two instances False).
-    SharedIdentity(String),
+    /// A SHARED class whose other parameter is the PyRef class: the
+    /// method's result is `Option<bool>` and NotImplemented is its None —
+    /// the `==` boundary (`PyRefEq::ref_eq`) then tries the reflected
+    /// `__eq__` and ends at identity, as CPython does.
+    SharedDeclined,
     /// The other parameter is the boxed value, which no class instance
     /// can be: never the same object.
     NeverSame,

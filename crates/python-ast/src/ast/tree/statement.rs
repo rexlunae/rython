@@ -760,12 +760,12 @@ impl CodeGen for StatementType {
                                        ignore it. Return the operation's value explicitly";
                             quote!(compile_error!(#msg))
                         }
-                        // The identity fallback: `a == a` is True, two
-                        // instances are not (Devin review on #330).
-                        Some(crate::EqFallback::SharedIdentity(other)) => {
-                            let other = crate::safe_ident(other);
-                            quote!(core::ptr::eq(self as *const Self, &*#other.borrow() as *const Self))
-                        }
+                        // The declined result: the None of the method's
+                        // `Option<bool>` (function_def.rs rewrote the
+                        // return annotation); the `==` boundary tries the
+                        // reflected `__eq__`, then identity (Devin review
+                        // on #330).
+                        Some(crate::EqFallback::SharedDeclined) => quote!(None),
                         Some(crate::EqFallback::NeverSame) => quote!(false),
                         Some(crate::EqFallback::Unmodeled(class)) => {
                             let msg = format!(
@@ -920,6 +920,10 @@ impl CodeGen for StatementType {
                 let value = if options.fn_return_is_option
                     && !ctx.in_try_block()
                     && !crate::is_none_expr(&e.value)
+                    // The declined `__eq__` result is already the None
+                    // member.
+                    && !(matches!(&e.value, ExprType::Name(n) if n.id == "NotImplemented")
+                        && matches!(options.eq_not_implemented, Some(crate::EqFallback::SharedDeclined)))
                 {
                     // Wrap unless the value is itself the Option (an
                     // Option-typed name, a `.get(key, None)` call, a

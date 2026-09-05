@@ -19658,8 +19658,9 @@ fn a_variadic_exception_init_forwards_or_is_loud() {
 
 #[test]
 fn not_implemented_in_eq_is_the_identity_fallback_the_other_parameter_allows() {
-    // A shared class's `__eq__` returning NotImplemented ends at `is`:
-    // the two borrows' address. A boxed other is never the same object.
+    // A shared class's `__eq__` returning NotImplemented declines: the
+    // `==` boundary tries the reflected `__eq__`, then `is` (the same
+    // reference). A boxed other is never the same object.
     // A value class compared with its own kind has no identity to ask:
     // loud (Devin review on #330).
     let out = compile(
@@ -19678,11 +19679,16 @@ fn not_implemented_in_eq_is_the_identity_fallback_the_other_parameter_allows() {
         ),
         "notimpl_shared.py",
     );
+    // The declining `__eq__` returns Option<bool> (NotImplemented is its
+    // None) and the `==` boundary dispatches: left, right reflected,
+    // then identity.
     assert!(
-        out.contains("core :: ptr :: eq (self as * const Self , & * other . borrow () as * const Self)"),
+        out.contains("-> Result < Option < bool > , PyException > { return Ok (None) ; }"),
         "generated: {}",
         out
     );
+    assert!(out.contains("None => _a . py_is (_b)"), "generated: {}", out);
+    assert!(out.contains("_b . borrow () . __eq__ (_a . clone ())"), "generated: {}", out);
     let out = compile(
         concat!(
             "class V:\n",
@@ -19852,4 +19858,84 @@ fn an_aliased_raise_is_the_canonical_kind_and_an_inherited_init_runs() {
         "generated: {}",
         out
     );
+}
+
+#[test]
+fn a_message_reads_the_fields_as_they_stood_at_the_super_call() {
+    // `self.value = first; super().__init__(self.value); self.value =
+    // second`: the message is first, the attr second (Devin review on
+    // #330).
+    let out = compile(
+        concat!(
+            "class Twice2(Exception):\n",
+            "    def __init__(self, first: str, second: str):\n",
+            "        self.value = first\n",
+            "        super().__init__(self.value)\n",
+            "        self.value = second\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Twice2(\"a\", \"b\")\n",
+        ),
+        "raise_store_then_message.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("(\"Twice2\" , format ! (\"{}\" , \"a\") , vec ! [(\"value\" . to_string () , stdpython :: PyValue :: from (\"b\"))]"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn a_message_free_name_must_be_the_binding_the_init_sees() {
+    // A message reading a module global renders at the raise site: fine
+    // where the site sees the same binding, refused where a local
+    // shadows it (Devin review on #330).
+    let out = compile(
+        concat!(
+            "PREFIX = \"P\"\n",
+            "\n",
+            "class Tagged(Exception):\n",
+            "    def __init__(self, n: int):\n",
+            "        super().__init__(f\"{PREFIX}{n}\")\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Tagged(3)\n",
+            "\n",
+            "def g() -> None:\n",
+            "    PREFIX = \"L\"\n",
+            "    raise Tagged(4)\n",
+        ),
+        "raise_free_name.py",
+    );
+    assert!(out.contains("format ! (\"{}{}\" , py_display (& (PREFIX)) , py_display (& (3)))"), "generated: {}", out);
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("message reads `PREFIX`"), "generated: {}", out);
+}
+
+#[test]
+fn an_alias_under_a_gate_joins_the_exception_closure() {
+    // `try: R = Root / except: R = Exception` binds R in the module's own
+    // scope: `class Leaf(R)` is an exception class (Devin review on
+    // #330).
+    let out = compile(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "try:\n",
+            "    R = Root\n",
+            "except NameError:\n",
+            "    R = Exception\n",
+            "\n",
+            "class Leaf(R):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Leaf(\"x\")\n",
+        ),
+        "raise_gated_alias.py",
+    );
+    assert!(!out.contains("LeafTrait"), "generated: {}", out);
+    assert!(out.contains("(\"Leaf\" , format ! (\"{}\" , \"x\")"), "generated: {}", out);
 }

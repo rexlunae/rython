@@ -641,17 +641,29 @@ pub(crate) enum SuperMessage {
 /// for the first statement the model does not run. Walks the body
 /// through the one statement visitor; a modeled statement has no
 /// bodies, and an unmodeled one stops the walk at its head.
+/// The model of an exception `__init__` body: the `super().__init__`
+/// call, the field stores as they stand at the END of the body (the
+/// attrs), and as they stood AT the super call (what a `self.<field>`
+/// read in the message means — a later store does not rewrite the
+/// message; Devin review on #330).
+pub(crate) struct InitModel<'a> {
+    pub super_init: Option<SuperMessage>,
+    pub fields: Vec<(String, &'a str)>,
+    pub fields_at_super: Vec<(String, &'a str)>,
+}
+
 pub(crate) fn classify_exception_init<'a>(
     cls: &crate::ClassDef,
     body: &'a [crate::Statement],
     params: &[&'a str],
     vararg: Option<&str>,
     kwarg: Option<&str>,
-) -> Result<(Option<SuperMessage>, Vec<(String, &'a str)>), String> {
+) -> Result<InitModel<'a>, String> {
     use crate::ast::tree::visit::{Descend, Flow, is_self, walk_stmts};
     use crate::{ExprType, StatementType};
     let mut super_init: Option<SuperMessage> = None;
     let mut fields: Vec<(String, &'a str)> = Vec::new(); // (field, param)
+    let mut fields_at_super: Vec<(String, &'a str)> = Vec::new();
     let mut refusal: Option<String> = None;
     walk_stmts(body, Descend::OwnScope, &mut |stmt| {
         let modeled = match &stmt.statement {
@@ -705,6 +717,7 @@ pub(crate) fn classify_exception_init<'a>(
                                 k.arg.is_none()
                                     && matches!(&k.value, ExprType::Name(n) if Some(n.id.as_str()) == kwarg)
                             });
+                        fields_at_super = fields.clone();
                         if forwards_own {
                             super_init = Some(SuperMessage::Forwarded);
                         } else if splats {
@@ -763,7 +776,7 @@ pub(crate) fn classify_exception_init<'a>(
     });
     match refusal {
         Some(msg) => Err(msg),
-        None => Ok((super_init, fields)),
+        None => Ok(InitModel { super_init, fields, fields_at_super }),
     }
 }
 
@@ -787,12 +800,12 @@ fn variadic_exception_raise(
     };
     let vararg = init.args.vararg.as_ref().map(|a| a.arg.as_str());
     let kwarg = init.args.kwarg.as_ref().map(|a| a.arg.as_str());
-    let (super_init, fields) = match classify_exception_init(cls, &init.body, &[], vararg, kwarg) {
+    let model = match classify_exception_init(cls, &init.body, &[], vararg, kwarg) {
         Ok(model) => model,
         Err(msg) => return site_error(msg),
     };
-    debug_assert!(fields.is_empty(), "no parameter to store");
-    if let Some(SuperMessage::Expr(_) | SuperMessage::Empty) = super_init {
+    debug_assert!(model.fields.is_empty(), "no parameter to store");
+    if let Some(SuperMessage::Expr(_) | SuperMessage::Empty) = model.super_init {
         return site_error(format!(
             "rython: `{}.__init__` takes `*args` but does not forward them to \
              `super().__init__(*args)`: the message would not be the raise's argument; \
@@ -1005,7 +1018,7 @@ pub(crate) fn exception_class_raise(
     // MRO): a `class Child(Base): pass` constructs through Base's — the
     // kind stays Child and the ancestors are Child's (Devin review on
     // #330).
-    let Some((owner, _owner_scope)) = exception_init_owner(cls, class_symbols, &options) else {
+    let Some((owner, owner_scope)) = exception_init_owner(cls, class_symbols, &options) else {
         return Ok(None);
     };
     let init = owner.init_method().expect("the owner defines __init__");
@@ -1168,10 +1181,11 @@ pub(crate) fn exception_class_raise(
     // through the one statement visitor (a compound statement is
     // unmodeled at its head, so its bodies are never entered).
     let params: Vec<&str> = positional.iter().chain(kwonly.iter()).copied().collect();
-    let (super_init, fields) = match classify_exception_init(cls, &init.body, &params, None, None) {
-        Ok(model) => model,
-        Err(msg) => return site_error(msg),
-    };
+    let InitModel { super_init, fields, fields_at_super } =
+        match classify_exception_init(cls, &init.body, &params, None, None) {
+            Ok(model) => model,
+            Err(msg) => return site_error(msg),
+        };
     // The message, as CPython sets `str(e)`: the `super().__init__`
     // argument; the empty string for the zero-argument call (a class
     // that stores fields and calls `super().__init__()` keeps its fields
@@ -1238,7 +1252,7 @@ pub(crate) fn exception_class_raise(
             crate::ast::tree::visit::walk_expr_mut(&mut m, &mut |e| {
                 if let ExprType::Attribute(attr) = e
                     && crate::ast::tree::visit::is_self(&attr.value)
-                    && let Some((_, param)) = fields.iter().find(|(f, _)| *f == attr.attr)
+                    && let Some((_, param)) = fields_at_super.iter().find(|(f, _)| *f == attr.attr)
                 {
                     *e = ExprType::Name(crate::ast::tree::name::Name { id: param.to_string() });
                 }
@@ -1248,6 +1262,49 @@ pub(crate) fn exception_class_raise(
                     *e = sub.clone();
                 }
             });
+            // The message renders at the raise site, so every name it
+            // still reads — a module global of the defining module, a
+            // builtin — must be bound there exactly as the `__init__`
+            // sees it; a caller local or a same-named global of another
+            // module would silently change the message (Devin review on
+            // #330). Refused otherwise.
+            // A bare-name ARGUMENT inlined for a parameter is the raise
+            // site's own name, read there by design.
+            let site_names: Vec<&str> = substitution
+                .values()
+                .filter_map(|v| match v {
+                    ExprType::Name(n) => Some(n.id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let mut free: Vec<String> = Vec::new();
+            crate::ast::tree::visit::walk_expr(&m, &mut |e| {
+                if let ExprType::Name(n) = e
+                    && !n.id.starts_with("__rython_exc_arg")
+                    && !site_names.contains(&n.id.as_str())
+                    && !free.contains(&n.id)
+                {
+                    free.push(n.id.clone());
+                }
+            });
+            for name in free {
+                let at_def = format!("{:?}", owner_scope.module_get(&name));
+                let at_site = format!("{:?}", symbols.get(&name));
+                // A raise-site LOCAL of the name (a parameter or a local
+                // store — the function's typed names) shadows the global.
+                let local = options.name_types.contains_key(&name)
+                    && owner_scope.module_get(&name).is_some();
+                if at_def != at_site || local {
+                    return site_error(format!(
+                        "rython: `{}.__init__`'s message reads `{}`, which at this raise \
+                         site is not the binding the `__init__` sees (a local, or another \
+                         module's global of the same name): rython renders the message at \
+                         the raise site and refuses to silently read the wrong one; pass \
+                         the value as an argument, or store it as a field",
+                        cls.name, name
+                    ));
+                }
+            }
             let msg_tok = m.to_rust(ctx.clone(), msg_options.clone(), symbols.clone())?;
             quote::quote!(format!("{}", #msg_tok))
         }

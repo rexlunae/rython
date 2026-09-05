@@ -205,11 +205,16 @@ thread_local! {
         std::cell::RefCell::new(std::rc::Rc::new(std::collections::HashSet::new()));
 }
 
-/// A module's top-level bindings of one name to another — `X = Y` and
-/// `from m import Y as X` — the alias spellings a base may use.
-fn top_level_name_aliases(body: &[crate::Statement]) -> Vec<(String, String)> {
+/// A module's bindings of one name to another — `X = Y` and `from m
+/// import Y as X` — the alias spellings a base may use: the module's own
+/// scope through the one statement visitor (a binding under `try:` or
+/// an `if` the emission cannot fold is one too; nested definitions are
+/// not), over the body with its static gates already folded, as the
+/// emitted classes are (Devin review on #330).
+pub(crate) fn module_name_aliases(body: &[crate::Statement]) -> Vec<(String, String)> {
+    use crate::ast::tree::visit::{Descend, Flow, walk_stmts};
     let mut out = Vec::new();
-    for s in body {
+    walk_stmts(body, Descend::SkipDefs, &mut |s| {
         match &s.statement {
             crate::StatementType::Assign(a) => {
                 if let ([ExprType::Name(t)], ExprType::Name(v)) = (a.targets.as_slice(), &a.value) {
@@ -227,7 +232,8 @@ fn top_level_name_aliases(body: &[crate::Statement]) -> Vec<(String, String)> {
             }
             _ => {}
         }
-    }
+        Flow::Continue
+    });
     out
 }
 
@@ -262,21 +268,14 @@ pub fn compute_exception_classes(
     this_classes: &[ClassDef],
     options: &crate::PythonOptions,
 ) -> std::collections::HashSet<String> {
-    let per_module = crate::ast::tree::hierarchy::crate_emitted_classes(this_classes, options);
-    // (class, its module's top-level `X = Y` aliases)
+    let per_module =
+        crate::ast::tree::hierarchy::crate_emitted_classes(this_body, this_classes, options);
+    // (class, its module's alias bindings)
     let mut all: Vec<(&ClassDef, std::rc::Rc<Vec<(String, String)>>)> = Vec::new();
     let mut alias_names: Vec<(String, String)> = Vec::new();
-    for (path, defs) in &per_module {
-        let aliases: Vec<(String, String)> = match path {
-            None => top_level_name_aliases(this_body),
-            Some(p) => options
-                .module_defs
-                .get(p)
-                .map(|m| top_level_name_aliases(&m.raw.body))
-                .unwrap_or_default(),
-        };
+    for (_, defs, aliases) in &per_module {
         alias_names.extend(aliases.iter().cloned());
-        let aliases = std::rc::Rc::new(aliases);
+        let aliases = std::rc::Rc::new(aliases.clone());
         for c in defs {
             all.push((c, aliases.clone()));
         }
@@ -285,8 +284,15 @@ pub fn compute_exception_classes(
     for (c, _) in &all {
         *defined_in.entry(c.name.as_str()).or_insert(0) += 1;
     }
-    for (a, _) in &alias_names {
-        *defined_in.entry(a.as_str()).or_insert(0) += 1;
+    // An alias name counts once per module (`R = Root` under `try:` and
+    // `R = Exception` under its `except:` are one binding).
+    for (_, _, aliases) in &per_module {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (a, _) in aliases {
+            if seen.insert(a.as_str()) {
+                *defined_in.entry(a.as_str()).or_insert(0) += 1;
+            }
+        }
     }
     let unambiguous = |name: &str| defined_in.get(name).copied().unwrap_or(0) == 1;
     let is_exception = crate::ast::tree::raise_stmt::is_exception_class_name;
@@ -3538,20 +3544,42 @@ impl CodeGen for ClassDef {
         let ref_eq_impl = if options.with_std_python
             && crate::ast::tree::shared::is_shared(&self.name)
         {
-            if self.method_on_mro("__eq__", &symbols).is_some() {
+            if let Some(eq) = self.method_on_mro("__eq__", &symbols) {
                 // The shared class's own __eq__ dispatches through the
                 // borrows: `a == b` on two PyRef<Version> calls Version's
                 // __eq__ (whose other parameter is the PyRef class —
                 // records, round 99). The __eq__ may raise; the loud
                 // panic is the §12.2 posture (a raise inside == has no
                 // Result channel through the bool contract).
-                quote!(impl stdpython::PyRefEq for #class_name {
-                    fn ref_eq(_a: &stdpython::PyRef<Self>, _b: &stdpython::PyRef<Self>) -> bool {
-                        _a.borrow()
-                            .__eq__(_b.clone())
-                            .unwrap_or_else(|e| panic!("{}", e))
-                    }
-                })
+                // A DECLINING __eq__ (`return NotImplemented`) returns
+                // `Option<bool>`: CPython's dispatch runs here — the left
+                // operand, then the right one reflected, then identity
+                // (Devin review on #330).
+                if crate::ast::tree::function_def::body_returns_not_implemented(&eq.body) {
+                    quote!(impl stdpython::PyRefEq for #class_name {
+                        fn ref_eq(_a: &stdpython::PyRef<Self>, _b: &stdpython::PyRef<Self>) -> bool {
+                            let left = _a.borrow().__eq__(_b.clone()).unwrap_or_else(|e| panic!("{}", e));
+                            match left {
+                                Some(r) => r,
+                                None => {
+                                    let right = _b.borrow().__eq__(_a.clone()).unwrap_or_else(|e| panic!("{}", e));
+                                    match right {
+                                        Some(r) => r,
+                                        None => _a.py_is(_b),
+                                    }
+                                }
+                            }
+                        }
+                    })
+                } else {
+                    quote!(impl stdpython::PyRefEq for #class_name {
+                        fn ref_eq(_a: &stdpython::PyRef<Self>, _b: &stdpython::PyRef<Self>) -> bool {
+                            _a.borrow()
+                                .__eq__(_b.clone())
+                                .unwrap_or_else(|e| panic!("{}", e))
+                        }
+                    })
+                }
             } else {
                 quote!(impl stdpython::PyRefEq for #class_name {})
             }

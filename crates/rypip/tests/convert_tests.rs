@@ -8442,7 +8442,9 @@ fn the_exception_model_matches_python_at_runtime() {
     // it, a zero-parameter fixed message, a variadic forwarder, the last
     // store of a field (round 4); a base and a handler through an alias,
     // an alias of a builtin, a BaseException subclass outside `except
-    // Exception` (round 6).
+    // Exception` (round 6); a raise through an alias is the canonical
+    // kind, an inherited __init__ runs (round 7); the message reads the
+    // fields as they stood at the super call (round 8).
     let scratch = Scratch::new("exc_model");
     let file = scratch.path().join("exc_model.py");
     fs::write(
@@ -8532,6 +8534,23 @@ fn the_exception_model_matches_python_at_runtime() {
             "        super().__init__(\"t\")\n",
             "        self.v = a\n",
             "        self.v = b\n",
+            "\n",
+            "\n",
+            "class Twice2(Exception):\n",
+            "    def __init__(self, first: str, second: str):\n",
+            "        self.value = first\n",
+            "        super().__init__(self.value)\n",
+            "        self.value = second\n",
+            "\n",
+            "\n",
+            "class Coded(Exception):\n",
+            "    def __init__(self, code: int):\n",
+            "        super().__init__(f\"code {code}\")\n",
+            "        self.code = code\n",
+            "\n",
+            "\n",
+            "class Child(Coded):\n",
+            "    pass\n",
             "\n",
             "\n",
             "R = Root\n",
@@ -8627,6 +8646,23 @@ fn the_exception_model_matches_python_at_runtime() {
             "    except BaseException as e:\n",
             "        print(\"base:\", e)\n",
             "    print(issubclass(ViaAlias, R), issubclass(Bad, Exception), issubclass(Exit, Exception))\n",
+            "    try:\n",
+            "        raise R\n",
+            "    except R:\n",
+            "        print(\"R bare caught\")\n",
+            "    try:\n",
+            "        raise R(\"x\")\n",
+            "    except Root as e:\n",
+            "        print(\"Root:\", e)\n",
+            "    print(isinstance(R(\"z\"), Root))\n",
+            "    try:\n",
+            "        raise Child(7)\n",
+            "    except Child as e:\n",
+            "        print(e, e.code)\n",
+            "    try:\n",
+            "        raise Twice2(\"a\", \"b\")\n",
+            "    except Twice2 as e:\n",
+            "        print(e, e.value)\n",
             "\n",
             "\n",
             "if __name__ == \"__main__\":\n",
@@ -8669,6 +8705,11 @@ fn the_exception_model_matches_python_at_runtime() {
             "ValueError: bad",
             "base: bye",
             "True True False",
+            "R bare caught",
+            "Root: x",
+            "True",
+            "code 7 7",
+            "a b",
         ],
         "the exception model diverged from CPython"
     );
@@ -8857,10 +8898,64 @@ fn a_class_name_two_modules_define_is_never_erased_by_the_exception_closure() {
 }
 
 #[test]
+fn a_message_reading_another_modules_global_is_refused_at_a_foreign_raise_site() {
+    // errors.PREFIX in the message, cli.PREFIX at the raise site: the
+    // message would silently read the caller's global — a loud
+    // `compile_error!` at the site instead (Devin review on #330).
+    let scratch = Scratch::new("prefixpkg");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"prefixpkg\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("prefixpkg");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("errors.py"),
+        concat!(
+            "PREFIX = \"E\"\n",
+            "\n",
+            "\n",
+            "class Tagged(Exception):\n",
+            "    def __init__(self, n: int):\n",
+            "        super().__init__(f\"{PREFIX}{n}\")\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("cli.py"),
+        concat!(
+            "from errors import Tagged\n",
+            "\n",
+            "PREFIX = \"C\"\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    raise Tagged(1)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let cli = fs::read_to_string(krate.root.join("src/cli.rs")).unwrap();
+    assert!(cli.contains("compile_error !"), "generated: {}", cli);
+    assert!(cli.contains("message reads `PREFIX`"), "generated: {}", cli);
+}
+
+#[test]
 fn not_implemented_in_a_shared_eq_is_identity_at_runtime() {
     // A shared class's `__eq__` that returns NotImplemented: `t == t` is
-    // True (the same object), a second instance is not (Devin review on
-    // #330).
+    // True (the same object), a second instance is not; when the left
+    // operand declines, the right one's reflected `__eq__` decides
+    // (`a == b` with a strict and b lenient is True), and identity only
+    // when both decline (Devin review on #330).
     let scratch = Scratch::new("eq_identity");
     let file = scratch.path().join("eq_identity.py");
     fs::write(
@@ -8877,11 +8972,32 @@ fn not_implemented_in_a_shared_eq_is_identity_at_runtime() {
             "        return NotImplemented\n",
             "\n",
             "\n",
+            "class Strict:\n",
+            "    def __init__(self, v: int, strict: bool):\n",
+            "        self.v = v\n",
+            "        self.strict = strict\n",
+            "\n",
+            "    def loosen(self) -> None:\n",
+            "        self.strict = False\n",
+            "\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        if self.strict:\n",
+            "            return NotImplemented\n",
+            "        return self.v == other.v\n",
+            "\n",
+            "\n",
             "def main() -> None:\n",
             "    tags = [Tag(\"x\")]\n",
             "    t = tags[0]\n",
             "    t.bump()\n",
             "    print(t == t, t == tags[0], t == Tag(\"x\"), t.s)\n",
+            "    items = [Strict(1, True)]\n",
+            "    a = items[0]\n",
+            "    b = Strict(1, False)\n",
+            "    c = Strict(2, True)\n",
+            "    print(a == b, b == a, a == a, a == c)\n",
+            "    items[0].loosen()\n",
+            "    print(a == c)\n",
             "\n",
             "\n",
             "if __name__ == \"__main__\":\n",
@@ -8902,7 +9018,7 @@ fn not_implemented_in_a_shared_eq_is_identity_at_runtime() {
     // Verified against python3.
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
-        vec!["True True False x!"],
-        "the identity fallback diverged from CPython"
+        vec!["True True False x!", "True True True False", "False"],
+        "the equality dispatch diverged from CPython"
     );
 }

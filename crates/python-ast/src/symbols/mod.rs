@@ -48,6 +48,13 @@ impl SymbolTableScopes {
         None
     }
 
+    /// The MODULE-level binding of `key` (the outermost scope only): what
+    /// a class body or a module-level definition sees, never a function
+    /// local of the innermost scope.
+    pub fn module_get(&self, key: &str) -> Option<&SymbolTableNode> {
+        self.0.back().and_then(|table| table.get(key))
+    }
+
     /// All module-level class definitions visible in this scope (the first
     /// binding of each name wins, mirroring `get`). Used by the parameter
     /// inference's duck-typing pass (issue #109, M3) to index user classes

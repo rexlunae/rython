@@ -557,20 +557,49 @@ impl CodeGen for FunctionDef {
         // A module function registered for isinstance specialization
         // (specialize.rs) renders as its variants + residual instead of
         // one generic definition. Methods and nested defs never register.
+        // A SHARED class's `__eq__` that can decline (`return
+        // NotImplemented`) returns `bool | None`: NotImplemented is the
+        // None, and the `==` boundary (`PyRefEq::ref_eq`) tries the
+        // reflected `__eq__` before identity, as CPython does (Devin
+        // review on #330). The annotation is rewritten here so the one
+        // return-type authority and the Some-wrapping return sites see
+        // an Option like any `-> T | None` function.
+        let this = if self.declines_equality(&ctx) {
+            let mut f = self.clone();
+            f.returns = Some(Box::new(ExprType::BinOp(crate::ast::tree::bin_ops::BinOp {
+                op: crate::ast::tree::bin_ops::BinOps::BitOr,
+                left: Box::new(ExprType::Name(crate::Name { id: "bool".to_string() })),
+                right: Box::new(ExprType::NoneType(crate::ast::tree::constant::Constant(None))),
+            })));
+            f
+        } else {
+            self
+        };
         let result = if !options.rendering_specialization
             && matches!(ctx, CodeGenContext::Module(_))
-            && options.specialized_fns.contains_key(&self.name)
+            && options.specialized_fns.contains_key(&this.name)
         {
-            let spec = options.specialized_fns.get(&self.name).unwrap().clone();
-            self.render_specializations(spec, ctx, options, symbols)
+            let spec = options.specialized_fns.get(&this.name).unwrap().clone();
+            this.render_specializations(spec, ctx, options, symbols)
         } else {
-            self.to_rust_inner(ctx, options, symbols)
+            this.to_rust_inner(ctx, options, symbols)
         };
         return result;
     }
 }
 
 impl FunctionDef {
+    /// Whether this is a SHARED class's `__eq__` with a `return
+    /// NotImplemented` in its own body: the declining shape whose result
+    /// is `Option<bool>` (see `to_rust`).
+    pub fn declines_equality(&self, ctx: &CodeGenContext) -> bool {
+        self.name == "__eq__"
+            && ctx
+                .enclosing_class_name()
+                .is_some_and(|c| crate::ast::tree::shared::is_shared(c))
+            && body_returns_not_implemented(&self.body)
+    }
+
     /// Emit the monomorphized variants of an isinstance-dispatched
     /// function (specialize.rs): one definition per tested type with the
     /// axis parameter ANNOTATED as that type — the isinstance checks fold
@@ -2304,7 +2333,7 @@ impl FunctionDef {
                     if crate::ast::tree::shared::is_shared(class)
                         && annotated(p, &["object", "Any", class]) =>
                 {
-                    crate::EqFallback::SharedIdentity(p.arg.clone())
+                    crate::EqFallback::SharedDeclined
                 }
                 Some(p) if annotated(p, &["object", "Any"]) => crate::EqFallback::NeverSame,
                 _ => crate::EqFallback::Unmodeled(class.to_string()),
@@ -5136,3 +5165,12 @@ impl FunctionDef {
 }
 
 impl Object for FunctionDef {}
+
+/// Whether a body (its own scope: control-flow bodies, not nested defs)
+/// has a `return NotImplemented`.
+pub fn body_returns_not_implemented(body: &[crate::Statement]) -> bool {
+    crate::ast::tree::visit::any_stmt(body, crate::ast::tree::visit::Descend::OwnScope, |s| {
+        matches!(&s.statement, crate::StatementType::Return(Some(e))
+            if matches!(&e.value, ExprType::Name(n) if n.id == "NotImplemented"))
+    })
+}

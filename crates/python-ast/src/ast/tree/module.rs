@@ -363,7 +363,8 @@ impl CodeGen for Module {
                 &options,
             );
             crate::ast::tree::class_def::install_exception_classes(&exceptions);
-            let roots = crate::ast::tree::hierarchy::compute_roots(&items, &options);
+            let roots =
+                crate::ast::tree::hierarchy::compute_roots(&self.raw.body, &items, &options);
             crate::ast::tree::hierarchy::install_roots(&roots);
             options.hierarchy_roots = std::rc::Rc::new(roots);
             // The shared classes (shared.rs): container-stored and mutated
@@ -2893,7 +2894,7 @@ pub(crate) fn static_gate_names(
 /// (`sys.version_info` gates and single-store-name gates) with the taken
 /// branch's statements, recursively. Defs and class bodies inside the
 /// taken branch then lower as ordinary module items.
-fn splice_gated_branches(
+pub(crate) fn splice_gated_branches(
     body: Vec<crate::Statement>,
     options: &PythonOptions,
 ) -> Vec<crate::Statement> {

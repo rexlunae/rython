@@ -163,11 +163,16 @@ fn base_names(c: &ClassDef) -> Vec<String> {
 /// emission sees them. One enumeration for every crate-wide index (the
 /// hierarchy roots, the exception closure).
 pub fn crate_emitted_classes(
+    this_body: &[crate::Statement],
     this_classes: &[ClassDef],
     options: &PythonOptions,
-) -> Vec<(Option<Vec<String>>, Vec<ClassDef>)> {
-    let mut per_module: Vec<(Option<Vec<String>>, Vec<ClassDef>)> = Vec::new();
-    per_module.push((None, this_classes.to_vec()));
+) -> Vec<(Option<Vec<String>>, Vec<ClassDef>, Vec<(String, String)>)> {
+    let mut per_module: Vec<(Option<Vec<String>>, Vec<ClassDef>, Vec<(String, String)>)> =
+        Vec::new();
+    let this_aliases = crate::ast::tree::class_def::module_name_aliases(
+        &crate::ast::tree::module::splice_gated_branches(this_body.to_vec(), options),
+    );
+    per_module.push((None, this_classes.to_vec(), this_aliases));
     for (path, module) in options.module_defs.iter() {
         if path[..] == options.this_module_path[..] {
             continue;
@@ -188,12 +193,19 @@ pub fn crate_emitted_classes(
         };
         module_opts.this_module_path = path.clone();
         let defs = crate::ast::tree::module::emitted_class_defs(module, &module_opts);
-        per_module.push((Some(path.clone()), defs));
+        let aliases = crate::ast::tree::class_def::module_name_aliases(
+            &crate::ast::tree::module::splice_gated_branches(module.raw.body.clone(), &module_opts),
+        );
+        per_module.push((Some(path.clone()), defs, aliases));
     }
     per_module
 }
 
-pub fn compute_roots(this_classes: &[ClassDef], options: &PythonOptions) -> HierarchyRoots {
+pub fn compute_roots(
+    this_body: &[crate::Statement],
+    this_classes: &[ClassDef],
+    options: &PythonOptions,
+) -> HierarchyRoots {
     // name → (its direct bases, the module defining it)
     let mut classes: BTreeMap<String, (Vec<String>, Option<Vec<String>>)> = BTreeMap::new();
     // The index is keyed by BARE class name — the identity the type side
@@ -203,14 +215,14 @@ pub fn compute_roots(this_classes: &[ClassDef], options: &PythonOptions) -> Hier
     // and its classes lower as before the index existed (concrete
     // structs) rather than joining the wrong subtree.
     let mut defined_in: BTreeMap<String, usize> = BTreeMap::new();
-    let per_module = crate_emitted_classes(this_classes, options);
-    for (_, defs) in &per_module {
+    let per_module = crate_emitted_classes(this_body, this_classes, options);
+    for (_, defs, _) in &per_module {
         for c in defs {
             *defined_in.entry(c.name.clone()).or_insert(0) += 1;
         }
     }
     let unambiguous = |name: &str| defined_in.get(name).copied().unwrap_or(0) == 1;
-    for (path, defs) in &per_module {
+    for (path, defs, _) in &per_module {
         for c in defs {
             if participates(c) && unambiguous(&c.name) {
                 classes.insert(
