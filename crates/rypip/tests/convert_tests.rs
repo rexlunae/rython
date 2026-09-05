@@ -8454,7 +8454,9 @@ fn the_exception_model_matches_python_at_runtime() {
     // a property-read argument bound once, a composite argument captured
     // before the message (round 16); an issubclass over a multiple
     // inheritance walks every builtin branch's MRO (round 17); an argument
-    // the initializer ignores still runs, in source order (round 19); a raise through an alias is the canonical
+    // the initializer ignores still runs, in source order (round 19); a
+    // variadic initializer's arguments run in call order, a swallowed
+    // keyword after the forwarded positionals (round 20); a raise through an alias is the canonical
     // kind, an inherited __init__ runs (round 7); the message reads the
     // fields as they stood at the super call (round 8).
     let scratch = Scratch::new("exc_model");
@@ -8667,6 +8669,16 @@ fn the_exception_model_matches_python_at_runtime() {
             "        super().__init__(\"ignored\")\n",
             "\n",
             "\n",
+            "class Variadic(Exception):\n",
+            "    def __init__(self, *args, **kwargs):\n",
+            "        super().__init__(*args)\n",
+            "\n",
+            "\n",
+            "def tick(s: str) -> str:\n",
+            "    print(\"tick\", s)\n",
+            "    return s\n",
+            "\n",
+            "\n",
             "class Pair2Arg(Exception):\n",
             "    def __init__(self, a: str, b: int):\n",
             "        super().__init__(a, b)\n",
@@ -8865,6 +8877,14 @@ fn the_exception_model_matches_python_at_runtime() {
             "        raise Ignore(k + 2)\n",
             "    except Ignore as e:\n",
             "        print(\"ignored\", e)\n",
+            "    try:\n",
+            "        raise Variadic(tick(\"a\"), ignored=tick(\"b\"))\n",
+            "    except Variadic as e:\n",
+            "        print(\"V:\", e)\n",
+            "    try:\n",
+            "        raise Variadic(tick(\"x\"), 1 // 0, ignored=tick(\"y\"))\n",
+            "    except ZeroDivisionError as e:\n",
+            "        print(\"zde4\", e)\n",
             "\n",
             "\n",
             "if __name__ == \"__main__\":\n",
@@ -8935,6 +8955,11 @@ fn the_exception_model_matches_python_at_runtime() {
             "zde2 integer division or modulo by zero",
             "zde3 integer modulo by zero",
             "ignored ignored",
+            "tick a",
+            "tick b",
+            "V: a",
+            "tick x",
+            "zde4 integer division or modulo by zero",
         ],
         "the exception model diverged from CPython"
     );

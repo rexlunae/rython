@@ -1240,6 +1240,11 @@ impl Construction {
         let ident = proc_macro2::Ident::new(&name, proc_macro2::Span::call_site());
         let tokens =
             expr.clone().to_rust(self.ctx.clone(), self.options.clone(), self.symbols.clone())?;
+        // A captured PLACE — a bare name, a field read — is cloned (the
+        // site may read it again; a field cannot be moved out); a
+        // captured combinator is an owned value already.
+        let clone = clone
+            && matches!(expr, crate::ExprType::Name(_) | crate::ExprType::Attribute(_));
         if clone {
             self.prelude.push(quote::quote!(let #ident = (#tokens).clone();));
         } else {
@@ -1256,20 +1261,23 @@ impl Construction {
 
     /// Whether the expression at position `k` of `exprs` must be captured
     /// (evaluated into its temporary) before a later expression could
-    /// rebind a name it reads: it reads a name — bare, or inside a pure
-    /// combinator (`counter + 1`, an f-string) — and a later one of these
-    /// runs code, or any expression of the construction does (Devin
-    /// review on #330: a composite argument observed a later mutation).
-    fn captures(&self, exprs: &[crate::ExprType], k: usize) -> bool {
+    /// rebind a name it reads or run effects it should precede: a later
+    /// one of these runs code, or (`chain_after`: the expressions are a
+    /// level's arguments, with the chain's messages still to run) any
+    /// expression of the construction does (Devin review on #330: a
+    /// composite argument observed a later mutation).
+    fn captures(&self, exprs: &[crate::ExprType], k: usize, chain_after: bool) -> bool {
         let e = &exprs[k];
         // An expression that runs code is bound once anyway (an owned
-        // value, no clone); a capture is for the pure reads.
+        // value, no clone); a capture is for the pure ones — a name that
+        // a later expression could rebind, a combinator that could raise
+        // (`1 // 0`) before a later expression's effects (Devin review on
+        // #330). A constant, `None`, `self`, and a temporary need none.
         !is_exc_temp(e)
             && !self.may_run_code(e)
-            && crate::ast::tree::visit::any_expr_for(e, crate::ast::tree::visit::Descend::All, |x| {
-                matches!(x, crate::ExprType::Name(n) if n.id != "self" && !n.id.starts_with("__rython_exc_"))
-            })
-            && (self.runs_code || exprs[k + 1..].iter().any(|e| self.may_run_code(e)))
+            && !matches!(e, crate::ExprType::Constant(_) | crate::ExprType::NoneType(_))
+            && !matches!(e, crate::ExprType::Name(n) if n.id == "self")
+            && ((chain_after && self.runs_code) || exprs[k + 1..].iter().any(|e| self.may_run_code(e)))
     }
 }
 
@@ -1476,7 +1484,7 @@ fn model_init_level(
     let exprs: Vec<ExprType> = given.iter().map(|(_, a)| a.clone()).collect();
     let mut substitution: HashMap<&str, ExprType> = HashMap::new();
     for (k, (param, arg)) in given.iter().enumerate() {
-        let captured = st.captures(&exprs, k);
+        let captured = st.captures(&exprs, k, true);
         // Bound once: an expression that may run code (a call, a property
         // read, a subscript, a walrus), or one captured before a later
         // expression that may; a constant, a name, or a pure combinator
@@ -1802,8 +1810,55 @@ fn model_variadic_level(
             named[args.len()]
         );
     }
+    if keywords.iter().any(|(name, _)| name.is_none()) {
+        site!(
+            "rython: `raise {}(**...)`: a keyword splat to an exception constructor is \
+             not modeled; pass the arguments explicitly",
+            cls.name
+        );
+    }
+    // EVERY incoming expression — the named parameters' arguments, the
+    // forwarded slice, the keywords — is bound once in CALL order before
+    // any is forwarded or dropped: `E(f(), ignored=g())` runs f() then
+    // g() (Devin review on #330: a swallowed keyword ran before a
+    // forwarded positional). An expression that may run code, or one a
+    // later expression's effects could disturb, is its temporary; a
+    // constant or a name stays in place.
+    let exprs: Vec<ExprType> =
+        args.iter().cloned().chain(keywords.iter().map(|(_, v)| v.clone())).collect();
+    let mut bound: Vec<ExprType> = Vec::with_capacity(exprs.len());
+    for (k, e) in exprs.iter().enumerate() {
+        let captured = st.captures(&exprs, k, true);
+        if captured || st.may_run_code(e) {
+            bound.push(st.bind_temp(exc_temp(level, "arg", k), e, captured)?);
+        } else {
+            bound.push(e.clone());
+        }
+    }
+    // A bound expression the chain never reads is still evaluated once
+    // (a temporary already was; a bare name is read; a pure combinator
+    // runs — it may raise; a constant needs nothing).
+    let drop = |st: &mut Construction, e: &ExprType| -> Result<(), Box<dyn std::error::Error>> {
+        match e {
+            ExprType::Constant(_) | ExprType::NoneType(_) => {}
+            ExprType::Name(n) if is_exc_temp(e) => {
+                let _ = n;
+            }
+            ExprType::Name(n) => {
+                let ident = crate::safe_ident(&n.id);
+                st.prelude.push(quote::quote!(let _ = &#ident;));
+            }
+            other => {
+                let tokens =
+                    other.clone().to_rust(st.ctx.clone(), st.options.clone(), st.symbols.clone())?;
+                st.prelude.push(quote::quote!(let _ = #tokens;));
+            }
+        }
+        Ok(())
+    };
+    let n_args = args.len();
     if level == 0 {
-        st.call_positional = args.clone();
+        st.call_positional = bound[..n_args].to_vec();
     }
     if model.super_init.is_none() {
         // No super call: `BaseException.__new__` records the raise's
@@ -1821,44 +1876,27 @@ fn model_variadic_level(
                 n
             ),
         };
-        if level > 0 {
-            for a in args.iter().chain(keywords.iter().map(|(_, v)| v)) {
-                if st.may_run_code(a) {
-                    let tokens =
-                        a.clone().to_rust(st.ctx.clone(), st.options.clone(), st.symbols.clone())?;
-                    st.prelude.push(quote::quote!(let _ = #tokens;));
-                }
+        let read_by_msg = |e: &ExprType| msg.iter().any(|m| m == e);
+        for e in &bound {
+            if !read_by_msg(e) {
+                drop(st, e)?;
             }
         }
         return Ok(Ok((msg, attrs_in)));
     }
-    // The named parameters' arguments are evaluated once, in order, and
-    // dropped (the body forwards only `*args`).
-    for a in &args[..named.len()] {
-        if matches!(a, ExprType::Constant(_)) {
-            continue;
-        }
-        let tokens = a.clone().to_rust(st.ctx.clone(), st.options.clone(), st.symbols.clone())?;
-        st.prelude.push(quote::quote!(let _ = #tokens;));
+    // The named parameters' arguments are dropped (the body forwards only
+    // `*args`); so is a keyword `**kwargs` swallows.
+    for e in &bound[..named.len()] {
+        drop(st, e)?;
     }
-    let forwarded: Vec<ExprType> = args[named.len()..].to_vec();
+    let forwarded: Vec<ExprType> = bound[named.len()..n_args].to_vec();
     let forwards_kwargs = matches!(model.super_init, Some(SuperMessage::Forwarded { kwargs: true }));
     let mut next_keywords = Vec::new();
-    for (name, value) in keywords {
-        if name.is_none() {
-            site!(
-                "rython: `raise {}(**...)`: a keyword splat to an exception constructor is \
-                 not modeled; pass the arguments explicitly",
-                cls.name
-            );
-        }
+    for ((name, _), value) in keywords.iter().zip(bound[n_args..].iter()) {
         if forwards_kwargs {
-            next_keywords.push((name, value));
-        } else if !matches!(value, ExprType::Constant(_)) {
-            // Swallowed by `**kwargs`: evaluated once, dropped.
-            let tokens =
-                value.to_rust(st.ctx.clone(), st.options.clone(), st.symbols.clone())?;
-            st.prelude.push(quote::quote!(let _ = #tokens;));
+            next_keywords.push((name.clone(), value.clone()));
+        } else {
+            drop(st, value)?;
         }
     }
     model_init_level(st, cls, rest, forwarded, next_keywords, attrs_in, level + 1, Some(&owner.name))
@@ -1880,7 +1918,7 @@ fn finish_construction(
     use crate::ExprType;
     let mut parts: Vec<ExprType> = Vec::new();
     for (i, m) in msg_exprs.iter().enumerate() {
-        let captured = st.captures(&msg_exprs, i);
+        let captured = st.captures(&msg_exprs, i, false);
         if !captured && !st.may_run_code(m) {
             parts.push(m.clone());
         } else {

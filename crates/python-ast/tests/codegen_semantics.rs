@@ -20110,7 +20110,7 @@ fn every_exception_argument_is_evaluated_and_an_isinstance_target_is_canonical()
     assert!(out.contains("let _ = & n ;"), "generated: {}", out);
     assert!(out.contains(". matches (\"Root\")"), "generated: {}", out);
     assert!(out.contains("(\"Prefixed\" , String :: new () , vec ! []"), "generated: {}", out);
-    assert!(out.contains("let _ = p ;"), "generated: {}", out);
+    assert!(out.contains("let _ = & p ;"), "generated: {}", out);
     assert!(out.contains("(\"Prefixed\" , format ! (\"{}\" , \"m\") , vec ! []"), "generated: {}", out);
 }
 
@@ -20377,14 +20377,20 @@ fn a_user_defined_base_initializer_runs_at_the_super_call() {
         "raise_chain.py",
     );
     assert!(!out.contains("compile_error !"), "generated: {}", out);
-    assert!(out.contains("let __rython_exc_l1_arg1 = \"boom\" . upper ()"), "generated: {}", out);
+    // `code + 1` precedes `text.upper()`, which runs code: bound first
+    // (it could raise), then the call, then the base's message.
     assert!(
-        out.contains("format ! (\"[{}] {}\" , py_display (& (((6) as i64) . py_add (& ((1) as i64)))) , py_display (& (__rython_exc_l1_arg1)))"),
+        out.contains("let __rython_exc_l1_arg0 = ((6) as i64) . py_add (& ((1) as i64)) ; let __rython_exc_l1_arg1 = \"boom\" . upper ()"),
         "generated: {}",
         out
     );
     assert!(
-        out.contains("(\"code\" . to_string () , stdpython :: PyValue :: from (((6) as i64) . py_add (& ((1) as i64)))) , (\"text\" . to_string () , stdpython :: PyValue :: from (\"boom\"))"),
+        out.contains("format ! (\"[{}] {}\" , py_display (& (__rython_exc_l1_arg0)) , py_display (& (__rython_exc_l1_arg1)))"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("(\"code\" . to_string () , stdpython :: PyValue :: from ((__rython_exc_l1_arg0) . clone ())) , (\"text\" . to_string () , stdpython :: PyValue :: from (\"boom\"))"),
         "generated: {}",
         out
     );
@@ -20492,7 +20498,7 @@ fn a_bare_name_is_captured_before_an_initializer_message_that_runs_code() {
     );
     assert!(!out.contains("compile_error !"), "generated: {}", out);
     assert!(
-        out.contains("let __rython_exc_arg0 = ((stdpython :: py_global_read (& counter)) . py_mul (& ((10) as i64))) . clone () ; let __rython_exc_m0 = format ! (\"t{}\" , py_display (& (bump () ?)))"),
+        out.contains("let __rython_exc_arg0 = (stdpython :: py_global_read (& counter)) . py_mul (& ((10) as i64)) ; let __rython_exc_m0 = format ! (\"t{}\" , py_display (& (bump () ?)))"),
         "generated: {}",
         out
     );
@@ -20505,9 +20511,9 @@ fn an_effectful_exception_argument_binds_once_in_the_generic_construction() {
     // call), a subscript, and a walrus argument each bind ONCE, read by
     // `str(e)` and by the recorded repr — not rendered twice (Devin
     // review on #330: only a call bound once, so a property getter ran
-    // twice). A plain field read and an f-string of pure parts are
-    // captured (cloned) beside them — the construction runs code — and
-    // stay in place when nothing in the construction does.
+    // twice). A plain field read and an f-string of pure parts AFTER the
+    // last expression that runs code stay in place (nothing later could
+    // disturb them); before one, they would be bound first.
     let out = compile(
         concat!(
             "class Meter:\n",
@@ -20529,8 +20535,8 @@ fn an_effectful_exception_argument_binds_once_in_the_generic_construction() {
     assert!(out.contains("let __rython_exc_m0 = m . value () ?"), "generated: {}", out);
     assert!(out.contains("let __rython_exc_m1 = "), "generated: {}", out);
     assert!(out.contains("let __rython_exc_m2 = "), "generated: {}", out);
-    assert!(out.contains("let __rython_exc_m3 = (m . base) . clone ()"), "generated: {}", out);
-    assert!(out.contains("let __rython_exc_m4 = (format ! (\"{}!\" , py_display (& (m . base)))) . clone ()"), "generated: {}", out);
+    assert!(!out.contains("__rython_exc_m3"), "generated: {}", out);
+    assert!(out.contains("py_repr (& (m . base))"), "generated: {}", out);
     assert_eq!(out.matches("m . value ()").count(), 1, "generated: {}", out);
     assert_eq!(out.matches("w = 5").count(), 1, "generated: {}", out);
     let out = compile(
