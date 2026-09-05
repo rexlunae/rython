@@ -340,6 +340,32 @@ pub fn compute_exception_classes(
     // base, a raise, a handler, or an issubclass naming it is loud.
     let mut ambiguous_aliases: std::collections::HashSet<(Vec<String>, String)> =
         std::collections::HashSet::new();
+    // Only a binding to a CLASS is an alias here: a crate class, a
+    // builtin exception, or an alias of one — an ordinary value bound two
+    // ways under a gate (`R = A` / `R = B` over ints) is a plain runtime
+    // variable, never an exception ambiguity (Devin review on #330).
+    let crate_classes: std::collections::HashSet<String> = per_module
+        .iter()
+        .flat_map(|(_, defs, _)| defs.iter().map(|c| c.name.clone()))
+        .collect();
+    let is_exception = crate::ast::tree::raise_stmt::is_exception_class_name;
+    for (_, _, aliases) in per_module.iter_mut() {
+        let all: Vec<(String, String)> = aliases.clone();
+        let classish = |target: &str| -> bool {
+            let mut cur = target.to_string();
+            for _ in 0..8 {
+                if is_exception(&cur) || crate_classes.contains(cur.as_str()) {
+                    return true;
+                }
+                match all.iter().find(|(a, _)| *a == cur) {
+                    Some((_, t)) => cur = t.clone(),
+                    None => return false,
+                }
+            }
+            false
+        };
+        aliases.retain(|(_, t)| classish(t));
+    }
     for (path, _, aliases) in per_module.iter_mut() {
         let module: Vec<String> = path.clone().unwrap_or_else(|| options.this_module_path.clone());
         let mut targets: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
@@ -390,7 +416,6 @@ pub fn compute_exception_classes(
         }
     }
     let unambiguous = |name: &str| defined_in.get(name).copied().unwrap_or(0) == 1;
-    let is_exception = crate::ast::tree::raise_stmt::is_exception_class_name;
     // A base name through its module's alias chain.
     let canonical = |name: &str, aliases: &[(String, String)]| -> String {
         let mut cur = name.to_string();
@@ -2622,6 +2647,10 @@ impl CodeGen for ClassDef {
         // Exception classes with *args/**kwargs __init__ (idna) lower
         // through here without tripping the variadic-parameter guard.
         if is_exception_class(&self) {
+            // The class exists only with a consistent MRO (CPython's
+            // TypeError at class creation otherwise): loud here, at the
+            // definition (Devin review on #330).
+            crate::ast::tree::raise_stmt::exception_mro(&self, &symbols, &options)?;
             // A real doc ATTRIBUTE: interpolating a String into quote!
             // yields a string-literal token — `""` in item position, a
             // parse error in the generated crate.
@@ -3664,7 +3693,7 @@ impl CodeGen for ClassDef {
                 // `Option<bool>`: CPython's dispatch runs here — the left
                 // operand, then the right one reflected, then identity
                 // (Devin review on #330).
-                if crate::ast::tree::function_def::body_returns_not_implemented(&eq.body) {
+                if crate::ast::tree::function_def::body_returns_not_implemented(&eq) {
                     quote!(impl stdpython::PyRefEq for #class_name {
                         fn ref_eq(_a: &stdpython::PyRef<Self>, _b: &stdpython::PyRef<Self>) -> bool {
                             let left = _a.borrow().__eq__(_b.clone()).unwrap_or_else(|e| panic!("{}", e));

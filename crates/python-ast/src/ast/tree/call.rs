@@ -2624,7 +2624,7 @@ impl<'a> CodeGen for Call {
                         if let Some((cls, scope)) = c1_class {
                             chain.extend(crate::ast::tree::raise_stmt::exception_ancestors(
                                 &cls, &scope, &options,
-                            ));
+                            )?);
                         }
                         let mut found = chain.iter().any(|n| *n == c2_name || n == target);
                         if !found {

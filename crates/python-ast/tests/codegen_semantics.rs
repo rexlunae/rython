@@ -20135,3 +20135,80 @@ fn a_multiple_inheritance_exception_records_every_branch_in_mro_order() {
     assert!(out.contains("(& (true)) , py_display (& (true)) , py_display (& (false))"), "generated: {}", out);
     assert!(out.contains("(\"Leaf\" , format ! (\"{}\" , \"leaf\") , vec ! [] , vec ! [(\"Root\") . to_string () , (\"Exception\") . to_string ()])"), "generated: {}", out);
 }
+
+#[test]
+fn an_inconsistent_exception_hierarchy_is_refused_at_the_definition() {
+    // `A(Exception)`, `B(A)`, `C(A, B)`: no consistent MRO — CPython's
+    // TypeError at class creation; the class never exists, so the
+    // conversion refuses it rather than inventing an ancestry (Devin
+    // review on #330).
+    let err = compile_err(
+        concat!(
+            "class A(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class B(A):\n",
+            "    pass\n",
+            "\n",
+            "class C(A, B):\n",
+            "    pass\n",
+        ),
+        "raise_inconsistent_mro.py",
+    );
+    assert!(err.contains("consistent method resolution order"), "error: {}", err);
+}
+
+#[test]
+fn a_gated_binding_of_ordinary_values_is_not_an_exception_alias() {
+    // `A = 1; B = 2; try: R = A / except: R = B`: R is a plain runtime
+    // variable, never an exception alias ambiguity — `print(R)` converts
+    // (Devin review on #330).
+    let out = compile(
+        concat!(
+            "A = 1\n",
+            "B = 2\n",
+            "\n",
+            "try:\n",
+            "    R = A\n",
+            "except NameError:\n",
+            "    R = B\n",
+            "\n",
+            "def f() -> None:\n",
+            "    print(R)\n",
+        ),
+        "gated_plain_alias.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("print (& ("), "generated: {}", out);
+}
+
+#[test]
+fn a_parameter_or_local_named_not_implemented_is_a_value() {
+    // A parameter or a local named `NotImplemented` shadows the singleton
+    // in `__eq__`: the return is that value — no decline, no identity
+    // fallback, no refusal (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class V:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "    def __eq__(self, NotImplemented: bool) -> bool:\n",
+            "        return NotImplemented\n",
+            "\n",
+            "class W:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        NotImplemented = True\n",
+            "        return NotImplemented\n",
+            "\n",
+            "def f() -> None:\n",
+            "    ws = [W(1)]\n",
+            "    ws[0].n = 2\n",
+        ),
+        "notimpl_shadowed.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(!out.contains("Option < bool >"), "generated: {}", out);
+    assert_eq!(out.matches("return Ok (NotImplemented)").count(), 2, "generated: {}", out);
+}

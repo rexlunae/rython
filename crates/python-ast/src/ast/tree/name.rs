@@ -327,7 +327,13 @@ impl CodeGen for Name {
             // collections): the comparison sentinel — a boxed None
             // (rython's comparisons return bool; the sentinel has no
             // analogue — documented divergence).
-            if self.id == "NotImplemented" && symbols.get("NotImplemented").is_none() {
+            // A parameter or a local named `NotImplemented` shadows the
+            // singleton (Devin review on #330): an ordinary name.
+            if self.id == "NotImplemented"
+                && symbols.get("NotImplemented").is_none()
+                && !options.local_types.contains_key("NotImplemented")
+                && !options.name_types.contains_key("NotImplemented")
+            {
                 return Ok(quote!(stdpython::PyValue::None_));
             }
             // A name imported from an EXTERNAL module (`from ssl import

@@ -736,7 +736,13 @@ impl CodeGen for StatementType {
                     quote!(())
                 } else if matches!(e.value, ExprType::NoneType(_)) {
                     quote!(())
-                } else if matches!(&e.value, ExprType::Name(n) if n.id == "NotImplemented") {
+                } else if matches!(&e.value, ExprType::Name(n) if n.id == "NotImplemented")
+                    // A parameter or a local named `NotImplemented` shadows
+                    // the singleton: an ordinary value (Devin review on
+                    // #330).
+                    && !options.local_types.contains_key("NotImplemented")
+                    && !options.name_types.contains_key("NotImplemented")
+                {
                     // `return NotImplemented` in `__eq__`: the == falls
                     // back to identity (False for distinct shared
                     // instances — records's Version.__eq__, round 99).
@@ -923,6 +929,8 @@ impl CodeGen for StatementType {
                     // The declined `__eq__` result is already the None
                     // member.
                     && !(matches!(&e.value, ExprType::Name(n) if n.id == "NotImplemented")
+                        && !options.local_types.contains_key("NotImplemented")
+                        && !options.name_types.contains_key("NotImplemented")
                         && matches!(options.eq_not_implemented, Some(crate::EqFallback::SharedDeclined)))
                 {
                     // Wrap unless the value is itself the Option (an

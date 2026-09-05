@@ -380,7 +380,7 @@ impl<'a> CodeGen for Attribute {
             else {
                 return Ok(None);
             };
-            let Some(ty) = crate::exception_field_type(&cls, &self.attr, &class_symbols, &options)
+            let Some(ty) = crate::exception_field_type(&cls, &self.attr, &class_symbols, &options)?
             else {
                 return Ok(None);
             };

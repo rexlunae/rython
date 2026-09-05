@@ -533,7 +533,8 @@ fn exception_value(
                     )
                     .map(|(cls, class_symbols)| {
                         exception_ancestor_tokens(&cls, &class_symbols, &options)
-                    });
+                    })
+                    .transpose()?;
                     // An IN-CRATE exception class with a modeled __init__
                     // (`class InsufficientFunds(BankError)` whose __init__
                     // calls super().__init__(f"need {needed}, have
@@ -596,7 +597,7 @@ fn exception_value(
             // The class's own name (`raise R` under `R = Root` raises a
             // Root — Devin review on #330).
             let kind = &cls.name;
-            let ancestors = exception_ancestor_tokens(&cls, &class_symbols, &options);
+            let ancestors = exception_ancestor_tokens(&cls, &class_symbols, &options)?;
             Ok(quote!(PyException::new_with_attrs_and_ancestors(
                 #kind, String::new(), vec![], vec![#(#ancestors),*]
             )))
@@ -900,7 +901,7 @@ fn variadic_exception_raise(
         }
     };
     let kind = &cls.name;
-    let ancestor_tokens = exception_ancestor_tokens(cls, class_symbols, &options);
+    let ancestor_tokens = exception_ancestor_tokens(cls, class_symbols, &options)?;
     let construct = quote::quote! {
         stdpython :: PyException :: new_with_attrs_and_ancestors (
             #kind , #msg , vec ! [] , vec ! [#(#ancestor_tokens),*]
@@ -920,11 +921,11 @@ pub(crate) fn exception_init_owner(
     cls: &crate::ClassDef,
     scope: &SymbolTableScopes,
     options: &PythonOptions,
-) -> Option<(crate::ClassDef, SymbolTableScopes)> {
-    exception_mro(cls, scope, options)
+) -> Result<Option<(crate::ClassDef, SymbolTableScopes)>, Box<dyn std::error::Error>> {
+    Ok(exception_mro(cls, scope, options)?
         .into_iter()
         .filter_map(|(_, def)| def)
-        .find(|(c, _)| c.init_method().is_some())
+        .find(|(c, _)| c.init_method().is_some()))
 }
 
 /// The ONE construction of an in-crate exception class, wherever the
@@ -984,7 +985,7 @@ pub(crate) fn exception_construction(
             quote!(format!(#fmt, #(#parts),*))
         }
     };
-    let ancestors = exception_ancestor_tokens(cls, class_symbols, &options);
+    let ancestors = exception_ancestor_tokens(cls, class_symbols, &options)?;
     Ok(quote!(PyException::new_with_attrs_and_ancestors(
         #kind, #msg, vec![], vec![#(#ancestors),*]
     )))
@@ -1000,12 +1001,12 @@ pub(crate) fn exception_ancestors(
     cls: &crate::ClassDef,
     symbols: &crate::SymbolTableScopes,
     options: &crate::PythonOptions,
-) -> Vec<String> {
-    exception_mro(cls, symbols, options)
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    Ok(exception_mro(cls, symbols, options)?
         .into_iter()
         .skip(1)
         .map(|(name, _)| name)
-        .collect()
+        .collect())
 }
 
 /// A class's method resolution order as Python computes it (C3
@@ -1016,25 +1017,26 @@ pub(crate) fn exception_ancestors(
 /// crate defines it. A builtin base is a leaf (the runtime expands its
 /// own MRO from the interpreter table); a base the crate does not define
 /// and that is not a builtin ends its branch. An inconsistent hierarchy
-/// (a TypeError at class creation in CPython) falls back to the
-/// left-to-right depth-first order.
+/// (`A(Exception)`, `B(A)`, `C(A, B)` — a TypeError at class creation in
+/// CPython) is an error: the class does not exist there, so nothing here
+/// may pretend it does (Devin review on #330).
 pub(crate) fn exception_mro(
     cls: &crate::ClassDef,
     scope: &crate::SymbolTableScopes,
     options: &crate::PythonOptions,
-) -> Vec<(String, Option<(crate::ClassDef, crate::SymbolTableScopes)>)> {
+) -> Result<Vec<(String, Option<(crate::ClassDef, crate::SymbolTableScopes)>)>, Box<dyn std::error::Error>> {
     type Entry = (String, Option<(crate::ClassDef, crate::SymbolTableScopes)>);
     fn linearize(
         name: String,
         def: Option<(crate::ClassDef, crate::SymbolTableScopes)>,
         options: &crate::PythonOptions,
         depth: usize,
-    ) -> Vec<Entry> {
+    ) -> Result<Vec<Entry>, Box<dyn std::error::Error>> {
         let Some((cls, scope)) = def else {
-            return vec![(name, None)];
+            return Ok(vec![(name, None)]);
         };
         if depth > 32 {
-            return vec![(name, Some((cls, scope)))];
+            return Ok(vec![(name, Some((cls, scope)))]);
         }
         // Each base by its canonical name, with its definition.
         let bases: Vec<Entry> = cls
@@ -1048,7 +1050,7 @@ pub(crate) fn exception_mro(
         let mut seqs: Vec<Vec<Entry>> = bases
             .iter()
             .map(|(n, d)| linearize(n.clone(), d.clone(), options, depth + 1))
-            .collect();
+            .collect::<Result<_, _>>()?;
         seqs.push(bases.clone());
         let mut out: Vec<Entry> = vec![(name, Some((cls, scope)))];
         // C3 merge: take the first head that is in no other sequence's
@@ -1073,19 +1075,19 @@ pub(crate) fn exception_mro(
                     out.push(entry);
                 }
                 None => {
-                    // Inconsistent: depth-first, left to right, deduped.
-                    for s in seqs.iter() {
-                        for e in s {
-                            if !out.iter().any(|(n, _)| *n == e.0) {
-                                out.push(e.clone());
-                            }
-                        }
-                    }
-                    break;
+                    let bases: Vec<&str> = bases.iter().map(|(n, _)| n.as_str()).collect();
+                    return Err(format!(
+                        "class `{}`: cannot create a consistent method resolution order (MRO) \
+                         for bases {} — CPython raises TypeError at class creation, so the \
+                         class never exists; reorder or drop the bases",
+                        out[0].0,
+                        bases.join(", ")
+                    )
+                    .into());
                 }
             }
         }
-        out
+        Ok(out)
     }
     linearize(cls.name.clone(), Some((cls.clone(), scope.clone())), options, 0)
 }
@@ -1139,11 +1141,11 @@ pub(crate) fn exception_ancestor_tokens(
     cls: &crate::ClassDef,
     symbols: &crate::SymbolTableScopes,
     options: &crate::PythonOptions,
-) -> Vec<proc_macro2::TokenStream> {
-    exception_ancestors(cls, symbols, options)
+) -> Result<Vec<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
+    Ok(exception_ancestors(cls, symbols, options)?
         .iter()
         .map(|a| quote::quote!((#a) . to_string ()))
-        .collect()
+        .collect())
 }
 
 /// A raise of an in-crate exception class whose `__init__` the model
@@ -1182,7 +1184,7 @@ pub(crate) fn exception_class_raise(
     // MRO): a `class Child(Base): pass` constructs through Base's — the
     // kind stays Child and the ancestors are Child's (Devin review on
     // #330).
-    let Some((owner, owner_scope)) = exception_init_owner(cls, class_symbols, &options) else {
+    let Some((owner, owner_scope)) = exception_init_owner(cls, class_symbols, &options)? else {
         return Ok(None);
     };
     let init = owner.init_method().expect("the owner defines __init__");
@@ -1543,7 +1545,7 @@ pub(crate) fn exception_class_raise(
         };
         attr_pairs.push(quote::quote!((#f . to_string (), #boxed)));
     }
-    let ancestor_tokens = exception_ancestor_tokens(cls, class_symbols, &options);
+    let ancestor_tokens = exception_ancestor_tokens(cls, class_symbols, &options)?;
     let construct = quote::quote! {
         stdpython :: PyException :: new_with_attrs_and_ancestors (
             #kind , #msg , vec ! [#(#attr_pairs),*] ,
@@ -1566,14 +1568,14 @@ pub(crate) fn exception_field_type(
     field: &str,
     symbols: &crate::SymbolTableScopes,
     options: &crate::PythonOptions,
-) -> Option<crate::TypeInfo> {
+) -> Result<Option<crate::TypeInfo>, Box<dyn std::error::Error>> {
     // Walk the class's MRO: the field may be defined on a BASE (an
     // `except BankError as e` catching an InsufficientFunds whose
     // __init__ stores the field — Devin review on #328), local or
     // imported, named directly or through an alias, on any branch of a
     // multiple inheritance — the one linearization, each hop's
     // annotation resolved in its own scope (Devin review on #330).
-    for (_, def) in exception_mro(cls, symbols, options) {
+    for (_, def) in exception_mro(cls, symbols, options)? {
         let Some((c, c_scope)) = def else { continue };
         if let Some(init) = c.init_method() {
             for stmt in &init.body {
@@ -1587,27 +1589,30 @@ pub(crate) fn exception_field_type(
                     // The param's annotation types the field — a
                     // positional-only, positional, or keyword-only
                     // parameter.
-                    let param = init
+                    let Some(param) = init
                         .args
                         .posonlyargs
                         .iter()
                         .chain(init.args.args.iter())
                         .chain(init.args.kwonlyargs.iter())
-                        .find(|p| p.arg == v.id)?;
+                        .find(|p| p.arg == v.id)
+                    else {
+                        return Ok(None);
+                    };
                     if let Some(ann) = param.annotation.as_ref()
                         && let Some(t) = crate::resolve_alias_typeinfo(ann, &c_scope, options)
                     {
-                        return Some(t);
+                        return Ok(Some(t));
                     }
                     // An unannotated param: no type — the reader refuses
                     // loudly rather than guessing (an Int guess made a
                     // str field's read a false AttributeError).
-                    return Some(crate::TypeInfo::PyObject);
+                    return Ok(Some(crate::TypeInfo::PyObject));
                 }
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// A BUILTIN exception's method resolution order, from the live

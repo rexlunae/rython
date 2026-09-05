@@ -597,7 +597,7 @@ impl FunctionDef {
             && ctx
                 .enclosing_class_name()
                 .is_some_and(|c| crate::ast::tree::shared::is_shared(c))
-            && body_returns_not_implemented(&self.body)
+            && body_returns_not_implemented(self)
     }
 
     /// Emit the monomorphized variants of an isinstance-dispatched
@@ -5166,11 +5166,14 @@ impl FunctionDef {
 
 impl Object for FunctionDef {}
 
-/// Whether a body (its own scope: control-flow bodies, not nested defs)
-/// has a `return NotImplemented`.
-pub fn body_returns_not_implemented(body: &[crate::Statement]) -> bool {
-    crate::ast::tree::visit::any_stmt(body, crate::ast::tree::visit::Descend::OwnScope, |s| {
-        matches!(&s.statement, crate::StatementType::Return(Some(e))
-            if matches!(&e.value, ExprType::Name(n) if n.id == "NotImplemented"))
-    })
+/// Whether a function's body (its own scope: control-flow bodies, not
+/// nested defs) has a `return NotImplemented` naming the SINGLETON — a
+/// parameter or a local named `NotImplemented` shadows it, and then the
+/// return is that value (Devin review on #330).
+pub fn body_returns_not_implemented(f: &FunctionDef) -> bool {
+    !crate::ast::tree::visit::def_owns_name(f, "NotImplemented")
+        && crate::ast::tree::visit::any_stmt(&f.body, crate::ast::tree::visit::Descend::OwnScope, |s| {
+            matches!(&s.statement, crate::StatementType::Return(Some(e))
+                if matches!(&e.value, ExprType::Name(n) if n.id == "NotImplemented"))
+        })
 }
