@@ -20465,6 +20465,38 @@ fn a_bare_name_is_captured_before_an_initializer_message_that_runs_code() {
         "generated: {}",
         out
     );
+    // A COMPOSITE argument reading the name (`counter * 10`) is captured
+    // the same way — evaluated before the message runs (Devin review on
+    // #330).
+    let out = compile(
+        concat!(
+            "counter = 0\n",
+            "\n",
+            "def bump() -> int:\n",
+            "    global counter\n",
+            "    counter += 1\n",
+            "    return counter\n",
+            "\n",
+            "class Ticket(Exception):\n",
+            "    def __init__(self, n: int) -> None:\n",
+            "        super().__init__(f\"t{bump()}\")\n",
+            "        self.n = n\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Ticket(counter * 10)\n",
+            "\n",
+            "def g() -> None:\n",
+            "    raise Ticket(counter * 10 + bump())\n",
+        ),
+        "raise_capture_composite.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("let __rython_exc_arg0 = ((stdpython :: py_global_read (& counter)) . py_mul (& ((10) as i64))) . clone () ; let __rython_exc_m0 = format ! (\"t{}\" , py_display (& (bump () ?)))"),
+        "generated: {}",
+        out
+    );
+    assert_eq!(out.matches("let __rython_exc_arg0 = ").count(), 2, "generated: {}", out);
 }
 
 #[test]
@@ -20473,8 +20505,9 @@ fn an_effectful_exception_argument_binds_once_in_the_generic_construction() {
     // call), a subscript, and a walrus argument each bind ONCE, read by
     // `str(e)` and by the recorded repr — not rendered twice (Devin
     // review on #330: only a call bound once, so a property getter ran
-    // twice). A plain field read and an f-string of pure parts stay in
-    // place.
+    // twice). A plain field read and an f-string of pure parts are
+    // captured (cloned) beside them — the construction runs code — and
+    // stay in place when nothing in the construction does.
     let out = compile(
         concat!(
             "class Meter:\n",
@@ -20496,9 +20529,26 @@ fn an_effectful_exception_argument_binds_once_in_the_generic_construction() {
     assert!(out.contains("let __rython_exc_m0 = m . value () ?"), "generated: {}", out);
     assert!(out.contains("let __rython_exc_m1 = "), "generated: {}", out);
     assert!(out.contains("let __rython_exc_m2 = "), "generated: {}", out);
-    assert!(!out.contains("__rython_exc_m3"), "generated: {}", out);
+    assert!(out.contains("let __rython_exc_m3 = (m . base) . clone ()"), "generated: {}", out);
+    assert!(out.contains("let __rython_exc_m4 = (format ! (\"{}!\" , py_display (& (m . base)))) . clone ()"), "generated: {}", out);
     assert_eq!(out.matches("m . value ()").count(), 1, "generated: {}", out);
     assert_eq!(out.matches("w = 5").count(), 1, "generated: {}", out);
+    let out = compile(
+        concat!(
+            "class Meter:\n",
+            "    def __init__(self, base: int) -> None:\n",
+            "        self.base = base\n",
+            "\n",
+            "class Plain(Exception):\n",
+            "    pass\n",
+            "\n",
+            "def f(m: Meter) -> None:\n",
+            "    raise Plain(m.base, f\"{m.base}!\")\n",
+        ),
+        "raise_generic_pure.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(!out.contains("__rython_exc_"), "generated: {}", out);
 }
 
 #[test]

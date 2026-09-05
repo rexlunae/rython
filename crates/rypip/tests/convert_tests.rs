@@ -8451,7 +8451,8 @@ fn the_exception_model_matches_python_at_runtime() {
     // base's `__init__` runs at the super call (its message, its stores,
     // a keyword through super, a chain through a class without its own
     // `__init__`), a bare name captured before a message that runs code,
-    // a property-read argument bound once (round 16); a raise through an alias is the canonical
+    // a property-read argument bound once, a composite argument captured
+    // before the message (round 16); a raise through an alias is the canonical
     // kind, an inherited __init__ runs (round 7); the message reads the
     // fields as they stood at the super call (round 8).
     let scratch = Scratch::new("exc_model");
@@ -8823,6 +8824,10 @@ fn the_exception_model_matches_python_at_runtime() {
             "        raise Plain(gauge.value, \"x\")\n",
             "    except Plain as e:\n",
             "        print(e, counter)\n",
+            "    try:\n",
+            "        raise Ticket(counter * 10)\n",
+            "    except Ticket as e:\n",
+            "        print(e, e.n, counter)\n",
             "\n",
             "\n",
             "if __name__ == \"__main__\":\n",
@@ -8887,6 +8892,7 @@ fn the_exception_model_matches_python_at_runtime() {
             "[4] s 4",
             "t2 1 2",
             "(13, 'x') 3",
+            "t4 30 4",
         ],
         "the exception model diverged from CPython"
     );

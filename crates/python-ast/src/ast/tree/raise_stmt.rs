@@ -1254,12 +1254,21 @@ impl Construction {
         Ok(crate::ExprType::Name(crate::ast::tree::name::Name { id: name }))
     }
 
-    /// Whether a bare name at position `k` of `exprs` must be captured
-    /// before a later expression could rebind it: a later one of these
-    /// runs code, or any expression of the construction does.
+    /// Whether the expression at position `k` of `exprs` must be captured
+    /// (evaluated into its temporary) before a later expression could
+    /// rebind a name it reads: it reads a name — bare, or inside a pure
+    /// combinator (`counter + 1`, an f-string) — and a later one of these
+    /// runs code, or any expression of the construction does (Devin
+    /// review on #330: a composite argument observed a later mutation).
     fn captures(&self, exprs: &[crate::ExprType], k: usize) -> bool {
-        matches!(&exprs[k], crate::ExprType::Name(n) if n.id != "self")
-            && !is_exc_temp(&exprs[k])
+        let e = &exprs[k];
+        // An expression that runs code is bound once anyway (an owned
+        // value, no clone); a capture is for the pure reads.
+        !is_exc_temp(e)
+            && !self.may_run_code(e)
+            && crate::ast::tree::visit::any_expr_for(e, crate::ast::tree::visit::Descend::All, |x| {
+                matches!(x, crate::ExprType::Name(n) if n.id != "self" && !n.id.starts_with("__rython_exc_"))
+            })
             && (self.runs_code || exprs[k + 1..].iter().any(|e| self.may_run_code(e)))
     }
 }
@@ -1439,9 +1448,10 @@ fn model_init_level(
     for (k, (param, arg)) in given.iter().enumerate() {
         let captured = st.captures(&exprs, k);
         // Bound once: an expression that may run code (a call, a property
-        // read, a subscript, a walrus), or a bare name captured; a
-        // constant, a name, or a pure combinator over them (an f-string,
-        // an arithmetic) is read in place.
+        // read, a subscript, a walrus), or one captured before a later
+        // expression that may; a constant, a name, or a pure combinator
+        // over them (an f-string, an arithmetic) is otherwise read in
+        // place.
         if !captured && !st.may_run_code(arg) {
             substitution.insert(param, arg.clone());
             continue;
