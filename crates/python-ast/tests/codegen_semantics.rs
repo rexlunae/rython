@@ -20661,6 +20661,73 @@ fn a_local_class_replaces_an_external_import_of_its_name() {
 }
 
 #[test]
+fn an_ignored_exception_argument_is_still_evaluated_in_source_order() {
+    // `Ignore.__init__` never reads `n` or `tag`: `raise Ignore(1 // 0)`
+    // is CPython's ZeroDivisionError, not an Ignore — an ignored pure
+    // combinator (a positional one, a keyword one) runs once, in source
+    // order, like an ignored bare name is read once; a constant needs
+    // nothing (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Ignore(Exception):\n",
+            "    def __init__(self, n: int, tag: str = \"t\") -> None:\n",
+            "        super().__init__(\"ignored\")\n",
+            "\n",
+            "def f(k: int) -> None:\n",
+            "    raise Ignore(1 // 0)\n",
+            "\n",
+            "def g(k: int) -> None:\n",
+            "    raise Ignore(7, tag=\"x\" * (k // 0))\n",
+            "\n",
+            "def h(k: int) -> None:\n",
+            "    raise Ignore(k, tag=\"t\")\n",
+        ),
+        "raise_ignored_argument.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("let _ = py_floordiv (1 , 0) ? ;"), "generated: {}", out);
+    assert!(
+        out.contains("let _ = multiply_string (\"x\" , (py_floordiv ((k) . clone () , 0) ?) as i64) ;"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("let _ = & k ;"), "generated: {}", out);
+    assert_eq!(out.matches("let _ = ").count(), 3, "generated: {}", out);
+}
+
+#[test]
+fn a_global_declaration_of_not_implemented_alone_is_still_the_singleton() {
+    // `global NotImplemented` in a shared class's `__eq__`, with no module
+    // binding of the name, redirects the lookup to the module scope where
+    // the builtin still answers: the method declines (Option<bool>, None)
+    // as without the declaration (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Tag:\n",
+            "    def __init__(self, s: str):\n",
+            "        self.s = s\n",
+            "    def bump(self) -> None:\n",
+            "        self.s += \"!\"\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        global NotImplemented\n",
+            "        return NotImplemented\n",
+            "\n",
+            "def f() -> None:\n",
+            "    tags = [Tag(\"x\")]\n",
+            "    tags[0].bump()\n",
+        ),
+        "notimpl_global_decl.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("fn __eq__ (& self , other : stdpython :: PyRef < Tag >) -> Result < Option < bool > , PyException >"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("return Ok (None) ;"), "generated: {}", out);
+}
+
+#[test]
 fn a_parameter_or_local_named_not_implemented_is_a_value() {
     // A parameter or a local named `NotImplemented` shadows the singleton
     // in `__eq__`: the return is that value — no decline, no identity

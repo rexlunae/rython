@@ -814,10 +814,9 @@ impl PyMod<i64> for i64 {
     type Output = i64;
     fn py_mod(&self, rhs: &i64) -> Result<i64, PyException> {
         if *rhs == 0 {
-            return Err(PyException::new(
-                "ZeroDivisionError",
-                "integer division or modulo by zero",
-            ));
+            // CPython 3.11: `10 % 0` is "integer modulo by zero" (the
+            // floor division keeps "integer division or modulo by zero").
+            return Err(PyException::new("ZeroDivisionError", "integer modulo by zero"));
         }
         let r = *self % *rhs;
         if r != 0 && (r < 0) != (*rhs < 0) {

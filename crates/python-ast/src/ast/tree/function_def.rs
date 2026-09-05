@@ -564,7 +564,7 @@ impl CodeGen for FunctionDef {
         // review on #330). The annotation is rewritten here so the one
         // return-type authority and the Some-wrapping return sites see
         // an Option like any `-> T | None` function.
-        let this = if self.declines_equality(&ctx) {
+        let this = if self.declines_equality(&ctx, &symbols) {
             let mut f = self.clone();
             f.returns = Some(Box::new(ExprType::BinOp(crate::ast::tree::bin_ops::BinOp {
                 op: crate::ast::tree::bin_ops::BinOps::BitOr,
@@ -592,12 +592,12 @@ impl FunctionDef {
     /// Whether this is a SHARED class's `__eq__` with a `return
     /// NotImplemented` in its own body: the declining shape whose result
     /// is `Option<bool>` (see `to_rust`).
-    pub fn declines_equality(&self, ctx: &CodeGenContext) -> bool {
+    pub fn declines_equality(&self, ctx: &CodeGenContext, symbols: &SymbolTableScopes) -> bool {
         self.name == "__eq__"
             && ctx
                 .enclosing_class_name()
                 .is_some_and(|c| crate::ast::tree::shared::is_shared(c))
-            && body_returns_not_implemented(self)
+            && body_returns_not_implemented(self, symbols)
     }
 
     /// Emit the monomorphized variants of an isinstance-dispatched
@@ -5170,9 +5170,26 @@ impl Object for FunctionDef {}
 /// nested defs) has a `return NotImplemented` naming the SINGLETON — a
 /// parameter or a local named `NotImplemented` shadows it, and then the
 /// return is that value (Devin review on #330).
-pub fn body_returns_not_implemented(f: &FunctionDef) -> bool {
-    !crate::ast::tree::visit::def_owns_name(f, "NotImplemented")
-        && crate::ast::tree::visit::any_stmt(&f.body, crate::ast::tree::visit::Descend::OwnScope, |s| {
+pub fn body_returns_not_implemented(f: &FunctionDef, symbols: &SymbolTableScopes) -> bool {
+    use crate::ast::tree::visit::{Descend, any_stmt, def_owns_name, stmt_targets, target_binds};
+    // A `global NotImplemented` DECLARATION alone redirects the lookup to
+    // the module scope, where an absent binding still falls through to
+    // the builtin: the singleton, unless the module (or this body, through
+    // the declaration) binds the name (Devin review on #330).
+    let declares_global = any_stmt(&f.body, Descend::SkipDefs, |s| {
+        matches!(&s.statement, crate::StatementType::Global(names)
+            if names.iter().any(|n| n == "NotImplemented"))
+    });
+    let shadowed = if declares_global {
+        symbols.module_get("NotImplemented").is_some()
+            || any_stmt(&f.body, Descend::SkipDefs, |s| {
+                stmt_targets(s).into_iter().any(|t| target_binds(t, "NotImplemented"))
+            })
+    } else {
+        def_owns_name(f, "NotImplemented")
+    };
+    !shadowed
+        && any_stmt(&f.body, Descend::OwnScope, |s| {
             matches!(&s.statement, crate::StatementType::Return(Some(e))
                 if matches!(&e.value, ExprType::Name(n) if n.id == "NotImplemented"))
         })

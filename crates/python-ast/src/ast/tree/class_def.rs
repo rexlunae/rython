@@ -342,8 +342,14 @@ pub(crate) fn module_name_aliases(
     ) {
         for s in stmts {
             match &s.statement {
+                // A crate module by the one lookup that admits a
+                // package-qualified path (`from pkg.errors import Root`
+                // inside the package — Devin review on #330).
                 crate::StatementType::ImportFrom(i)
-                    if !options.module_defs.contains_key(&i.resolved_module_path(options)) =>
+                    if !crate::ast::tree::module::module_defs_contains(
+                        options,
+                        &i.resolved_module_path(options),
+                    ) =>
                 {
                     for a in &i.names {
                         let name = a.asname.clone().unwrap_or_else(|| a.name.clone());
@@ -377,7 +383,10 @@ pub(crate) fn module_name_aliases(
                 // `Root` (the index is keyed by bare name — Devin review
                 // on #330); such a base is loud downstream.
                 crate::StatementType::ImportFrom(i)
-                    if options.module_defs.contains_key(&i.resolved_module_path(options)) =>
+                    if crate::ast::tree::module::module_defs_contains(
+                        options,
+                        &i.resolved_module_path(options),
+                    ) =>
                 {
                     for a in &i.names {
                         match &a.asname {
@@ -3926,7 +3935,7 @@ impl CodeGen for ClassDef {
                 // `Option<bool>`: CPython's dispatch runs here — the left
                 // operand, then the right one reflected, then identity
                 // (Devin review on #330).
-                if crate::ast::tree::function_def::body_returns_not_implemented(&eq) {
+                if crate::ast::tree::function_def::body_returns_not_implemented(&eq, &symbols) {
                     quote!(impl stdpython::PyRefEq for #class_name {
                         fn ref_eq(_a: &stdpython::PyRef<Self>, _b: &stdpython::PyRef<Self>) -> bool {
                             let left = _a.borrow().__eq__(_b.clone()).unwrap_or_else(|e| panic!("{}", e));

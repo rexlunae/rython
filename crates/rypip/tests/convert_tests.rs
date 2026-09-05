@@ -8453,7 +8453,8 @@ fn the_exception_model_matches_python_at_runtime() {
     // `__init__`), a bare name captured before a message that runs code,
     // a property-read argument bound once, a composite argument captured
     // before the message (round 16); an issubclass over a multiple
-    // inheritance walks every builtin branch's MRO (round 17); a raise through an alias is the canonical
+    // inheritance walks every builtin branch's MRO (round 17); an argument
+    // the initializer ignores still runs, in source order (round 19); a raise through an alias is the canonical
     // kind, an inherited __init__ runs (round 7); the message reads the
     // fields as they stood at the super call (round 8).
     let scratch = Scratch::new("exc_model");
@@ -8661,6 +8662,11 @@ fn the_exception_model_matches_python_at_runtime() {
             "    pass\n",
             "\n",
             "\n",
+            "class Ignore(Exception):\n",
+            "    def __init__(self, n: int, tag: str = \"t\") -> None:\n",
+            "        super().__init__(\"ignored\")\n",
+            "\n",
+            "\n",
             "class Pair2Arg(Exception):\n",
             "    def __init__(self, a: str, b: int):\n",
             "        super().__init__(a, b)\n",
@@ -8842,6 +8848,23 @@ fn the_exception_model_matches_python_at_runtime() {
             "        raise Ticket(counter * 10)\n",
             "    except Ticket as e:\n",
             "        print(e, e.n, counter)\n",
+            "    try:\n",
+            "        raise Ignore(1 // 0)\n",
+            "    except ZeroDivisionError as e:\n",
+            "        print(\"zde\", e)\n",
+            "    k = 3\n",
+            "    try:\n",
+            "        raise Ignore(7, tag=\"x\" * (k // 0))\n",
+            "    except ZeroDivisionError as e:\n",
+            "        print(\"zde2\", e)\n",
+            "    try:\n",
+            "        raise Ignore(7, tag=str(10 % (k - 3)))\n",
+            "    except ZeroDivisionError as e:\n",
+            "        print(\"zde3\", e)\n",
+            "    try:\n",
+            "        raise Ignore(k + 2)\n",
+            "    except Ignore as e:\n",
+            "        print(\"ignored\", e)\n",
             "\n",
             "\n",
             "if __name__ == \"__main__\":\n",
@@ -8908,6 +8931,10 @@ fn the_exception_model_matches_python_at_runtime() {
             "t2 1 2",
             "(13, 'x') 3",
             "t4 30 4",
+            "zde integer division or modulo by zero",
+            "zde2 integer division or modulo by zero",
+            "zde3 integer modulo by zero",
+            "ignored ignored",
         ],
         "the exception model diverged from CPython"
     );
@@ -9439,6 +9466,18 @@ fn not_implemented_in_a_shared_eq_is_identity_at_runtime() {
             "        return self.v == other.v\n",
             "\n",
             "\n",
+            "class Declared:\n",
+            "    def __init__(self, s: str):\n",
+            "        self.s = s\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.s += \"?\"\n",
+            "\n",
+            "    def __eq__(self, other: object) -> bool:\n",
+            "        global NotImplemented\n",
+            "        return NotImplemented\n",
+            "\n",
+            "\n",
             "def main() -> None:\n",
             "    tags = [Tag(\"x\")]\n",
             "    t = tags[0]\n",
@@ -9451,6 +9490,10 @@ fn not_implemented_in_a_shared_eq_is_identity_at_runtime() {
             "    print(a == b, b == a, a == a, a == c)\n",
             "    items[0].loosen()\n",
             "    print(a == c)\n",
+            "    ds = [Declared(\"d\")]\n",
+            "    d = ds[0]\n",
+            "    d.bump()\n",
+            "    print(d == d, d == ds[0], d == Declared(\"d\"), d.s)\n",
             "\n",
             "\n",
             "if __name__ == \"__main__\":\n",
@@ -9471,7 +9514,7 @@ fn not_implemented_in_a_shared_eq_is_identity_at_runtime() {
     // Verified against python3.
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
-        vec!["True True False x!", "True True True False", "False"],
+        vec!["True True False x!", "True True True False", "False", "True True False d?"],
         "the equality dispatch diverged from CPython"
     );
 }

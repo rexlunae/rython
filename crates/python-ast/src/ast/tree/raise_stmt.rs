@@ -1443,6 +1443,36 @@ fn model_init_level(
     // message and the attrs read it (`E(counter, bump())`, or a message
     // that calls `bump()`): then the name is captured in source order
     // too, a clone (Devin review on #330).
+    // The __init__ body — `self.<field> = <param>` stores and the
+    // `super().__init__(...)` call; a docstring and `pass` are inert;
+    // anything else would not run at the site — classified through the
+    // one statement visitor.
+    let params: Vec<&str> = positional.iter().chain(kwonly.iter()).copied().collect();
+    let InitModel { super_init, fields, fields_at_super, fields_after_super } =
+        match classify_exception_init(owner, &init.body, &params, None, None) {
+            Ok(model) => model,
+            Err(msg) => return Ok(Err(msg)),
+        };
+    // The parameters the model reads: a field store, a name in the super
+    // call's arguments, a `self.<field>` read there.
+    let mut read_by_model: Vec<&str> = fields.iter().map(|(_, p)| *p).collect();
+    if let Some(SuperMessage::Args { args, keywords }) = &super_init {
+        for m0 in args.iter().chain(keywords.iter().map(|(_, v)| v)) {
+            crate::ast::tree::visit::walk_expr(m0, &mut |e| {
+                if let ExprType::Name(n) = e
+                    && let Some(p) = params.iter().find(|p| **p == n.id)
+                {
+                    read_by_model.push(p);
+                }
+                if let ExprType::Attribute(attr) = e
+                    && crate::ast::tree::visit::is_self(&attr.value)
+                    && let Some((_, p)) = fields_at_super.iter().find(|(f, _)| *f == attr.attr)
+                {
+                    read_by_model.push(p);
+                }
+            });
+        }
+    }
     let exprs: Vec<ExprType> = given.iter().map(|(_, a)| a.clone()).collect();
     let mut substitution: HashMap<&str, ExprType> = HashMap::new();
     for (k, (param, arg)) in given.iter().enumerate() {
@@ -1453,6 +1483,30 @@ fn model_init_level(
         // over them (an f-string, an arithmetic) is otherwise read in
         // place.
         if !captured && !st.may_run_code(arg) {
+            // Every argument is evaluated, in source order, whether or
+            // not the model reads it: a bare name the message and the
+            // fields ignore is still read once (`raise E(undefined_name)`
+            // is a NameError in CPython, an unresolved name in rustc
+            // here), and an ignored pure combinator still runs (`raise
+            // E(1 // 0)` is the ZeroDivisionError, not E — Devin review
+            // on #330).
+            if !read_by_model.contains(param) && !is_exc_temp(arg) {
+                match arg {
+                    ExprType::Constant(_) | ExprType::NoneType(_) => {}
+                    ExprType::Name(n) => {
+                        let ident = crate::safe_ident(&n.id);
+                        st.prelude.push(quote::quote!(let _ = &#ident;));
+                    }
+                    other => {
+                        let tokens = other.clone().to_rust(
+                            st.ctx.clone(),
+                            st.options.clone(),
+                            st.symbols.clone(),
+                        )?;
+                        st.prelude.push(quote::quote!(let _ = #tokens;));
+                    }
+                }
+            }
             substitution.insert(param, arg.clone());
             continue;
         }
@@ -1485,48 +1539,6 @@ fn model_init_level(
             );
         }
         substitution.insert(param, (*d).clone());
-    }
-    // The __init__ body — `self.<field> = <param>` stores and the
-    // `super().__init__(...)` call; a docstring and `pass` are inert;
-    // anything else would not run at the site — classified through the
-    // one statement visitor.
-    let params: Vec<&str> = positional.iter().chain(kwonly.iter()).copied().collect();
-    let InitModel { super_init, fields, fields_at_super, fields_after_super } =
-        match classify_exception_init(owner, &init.body, &params, None, None) {
-            Ok(model) => model,
-            Err(msg) => return Ok(Err(msg)),
-        };
-    // Every argument is evaluated, whether or not the model reads it: a
-    // bare name bound to a parameter the message and the fields ignore
-    // is still read once (`raise E(undefined_name)` is a NameError in
-    // CPython, an unresolved name in rustc here — Devin review on #330).
-    let mut read_by_model: Vec<&str> = fields.iter().map(|(_, p)| *p).collect();
-    if let Some(SuperMessage::Args { args, keywords }) = &super_init {
-        for m0 in args.iter().chain(keywords.iter().map(|(_, v)| v)) {
-            crate::ast::tree::visit::walk_expr(m0, &mut |e| {
-                if let ExprType::Name(n) = e
-                    && let Some(p) = params.iter().find(|p| **p == n.id)
-                {
-                    read_by_model.push(p);
-                }
-                if let ExprType::Attribute(attr) = e
-                    && crate::ast::tree::visit::is_self(&attr.value)
-                    && let Some((_, p)) = fields_at_super.iter().find(|(f, _)| *f == attr.attr)
-                {
-                    read_by_model.push(p);
-                }
-            });
-        }
-    }
-    for (param, arg) in &given {
-        if let ExprType::Name(n) = arg
-            && !is_exc_temp(arg)
-            && !read_by_model.contains(param)
-            && matches!(substitution.get(param), Some(ExprType::Name(s)) if s.id == n.id)
-        {
-            let ident = crate::safe_ident(&n.id);
-            st.prelude.push(quote::quote!(let _ = &#ident;));
-        }
     }
     let stored = |list: &[(String, &str)]| -> Vec<Attr> {
         list.iter()
