@@ -19806,3 +19806,50 @@ fn an_aliased_base_is_recorded_by_its_canonical_name_everywhere() {
     assert!(out.contains("(& (true)) , py_display (& (true))"), "generated: {}", out);
     assert!(out.contains("PyValue :: from (\"ValueError\" . to_string ())"), "generated: {}", out);
 }
+
+#[test]
+fn an_aliased_raise_is_the_canonical_kind_and_an_inherited_init_runs() {
+    // `raise R` / `raise R(...)` under `R = Root` construct a "Root";
+    // `isinstance(R(...), Root)` sees one; `class Child(Base): pass`
+    // constructs through Base's `__init__` with the kind Child and
+    // Child's ancestors (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Base(Exception):\n",
+            "    def __init__(self, code: int):\n",
+            "        super().__init__(f\"code {code}\")\n",
+            "        self.code = code\n",
+            "\n",
+            "class Child(Base):\n",
+            "    pass\n",
+            "\n",
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "R = Root\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise R\n",
+            "\n",
+            "def g() -> None:\n",
+            "    raise R(\"x\")\n",
+            "\n",
+            "def h() -> bool:\n",
+            "    return isinstance(R(\"z\"), Root)\n",
+            "\n",
+            "def k() -> None:\n",
+            "    raise Child(7)\n",
+        ),
+        "raise_alias_kind.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(!out.contains("(\"R\""), "generated: {}", out);
+    assert!(out.contains("(\"Root\" , String :: new () , vec ! [] , vec ! [(\"Exception\") . to_string ()])"), "generated: {}", out);
+    assert!(out.contains("(\"Root\" , format ! (\"{}\" , \"x\") , vec ! [] , vec ! [(\"Exception\") . to_string ()])"), "generated: {}", out);
+    assert!(out.contains(". matches (\"Root\")"), "generated: {}", out);
+    assert!(
+        out.contains("(\"Child\" , format ! (\"{}\" , format ! (\"code {}\" , py_display (& (7)))) , vec ! [(\"code\" . to_string () , stdpython :: PyValue :: from (7))] , vec ! [(\"Base\") . to_string () , (\"Exception\") . to_string ()])"),
+        "generated: {}",
+        out
+    );
+}

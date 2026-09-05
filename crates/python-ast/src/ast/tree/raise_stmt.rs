@@ -505,7 +505,12 @@ fn exception_value(
                 if is_exception_class_name(&name.id)
                     || resolved_is_exception_class(&name.id, &options, &symbols)
                 {
-                    let kind = &name.id;
+                    // The kind is the class's canonical name: `raise
+                    // R(...)` under `R = Root` raises a Root (Devin
+                    // review on #330).
+                    let kind = canonical_exception_class(&name.id, &symbols, &options)
+                        .map(|(n, _)| n)
+                        .unwrap_or_else(|| name.id.clone());
                     // An in-crate class's ancestor chain is class
                     // metadata: attached whether or not its __init__ is
                     // modeled (`class MyError(ValueError): pass` is
@@ -571,12 +576,14 @@ fn exception_value(
             if crate::ast::tree::call::resolve_construction_class(&name.id, &symbols, &options)
                 .is_some_and(|(c, _)| crate::is_exception_class(&c)) =>
         {
-            let kind = &name.id;
-            let ancestors = crate::ast::tree::call::resolve_construction_class(
+            let (cls, class_symbols) = crate::ast::tree::call::resolve_construction_class(
                 &name.id, &symbols, &options,
             )
-            .map(|(cls, class_symbols)| exception_ancestor_tokens(&cls, &class_symbols, &options))
-            .unwrap_or_default();
+            .expect("checked by the guard");
+            // The class's own name (`raise R` under `R = Root` raises a
+            // Root — Devin review on #330).
+            let kind = &cls.name;
+            let ancestors = exception_ancestor_tokens(&cls, &class_symbols, &options);
             Ok(quote!(PyException::new_with_attrs_and_ancestors(
                 #kind, String::new(), vec![], vec![#(#ancestors),*]
             )))
@@ -585,7 +592,10 @@ fn exception_value(
             if is_exception_class_name(&name.id)
                 || resolved_is_exception_class(&name.id, &options, &symbols) =>
         {
-            let kind = &name.id;
+            // `raise Base` under `Base = ValueError` raises a ValueError.
+            let kind = canonical_exception_class(&name.id, &symbols, &options)
+                .map(|(n, _)| n)
+                .unwrap_or_else(|| name.id.clone());
             Ok(quote!(PyException::new(#kind, String::new())))
         }
         other => {
@@ -604,19 +614,11 @@ fn resolved_is_exception_class(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> bool {
-    match symbols.get(name) {
-        Some(SymbolTableNode::ClassDef(c)) => crate::is_exception_class(c),
-        Some(SymbolTableNode::ImportFrom(i)) => {
-            let path = i.resolved_module_path(options);
-            let Some(key) = crate::module_defs_key(options, &path) else {
-                return false;
-            };
-            crate::module_class_def(&options, key, name).is_some_and(|(c, _)| {
-                crate::is_exception_class(&c)
-            })
-        }
-        _ => false,
-    }
+    // The one construction-class resolver: a local class, an import, an
+    // alias, or a module-level rebinding (`R = Root` — Devin review on
+    // #330).
+    crate::ast::tree::call::resolve_construction_class(name, symbols, options)
+        .is_some_and(|(c, _)| crate::is_exception_class(&c))
 }
 
 #[cfg(test)]
@@ -837,6 +839,35 @@ fn variadic_exception_raise(
     }))
 }
 
+/// The class whose `__init__` a construction of `cls` runs — `cls`
+/// itself or the first base up the chain defining one — with that
+/// class's scope; None when no class of the chain defines one.
+pub(crate) fn exception_init_owner(
+    cls: &crate::ClassDef,
+    scope: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<(crate::ClassDef, SymbolTableScopes)> {
+    let mut cur: Option<(crate::ClassDef, SymbolTableScopes)> = Some((cls.clone(), scope.clone()));
+    let mut guard = 0;
+    while let Some((c, c_scope)) = cur.take() {
+        guard += 1;
+        if guard > 64 {
+            break;
+        }
+        if c.init_method().is_some() {
+            return Some((c, c_scope));
+        }
+        let Some(ExprType::Name(base)) = c.bases.first() else {
+            break;
+        };
+        cur = match canonical_exception_class(&base.id, &c_scope, options) {
+            Some((_, Some(next))) => Some(next),
+            _ => None,
+        };
+    }
+    None
+}
+
 /// The ancestor chain of an in-crate exception class, base-most last
 /// (`InsufficientFunds` → `["BankError", "Exception"]`): the bases
 /// resolved through the symbol table, ending at the first builtin. Class
@@ -970,9 +1001,14 @@ pub(crate) fn exception_class_raise(
     if !crate::is_exception_class(cls) {
         return Ok(None);
     }
-    let Some(init) = cls.init_method() else {
+    // The `__init__` that runs is the first one up the chain (Python's
+    // MRO): a `class Child(Base): pass` constructs through Base's — the
+    // kind stays Child and the ancestors are Child's (Devin review on
+    // #330).
+    let Some((owner, _owner_scope)) = exception_init_owner(cls, class_symbols, &options) else {
         return Ok(None);
     };
+    let init = owner.init_method().expect("the owner defines __init__");
     // The positional parameters are the positional-only ones followed by
     // the ordinary ones (CPython's `posonlyargs ++ args`); the receiver
     // is the first of that sequence wherever it sits, and a
@@ -1260,10 +1296,14 @@ pub(crate) fn exception_field_type(
 ) -> Option<crate::TypeInfo> {
     // Walk the class AND its bases: the field may be defined on a BASE
     // (an `except BankError as e` catching an InsufficientFunds whose
-    // __init__ stores the field — Devin review on #328).
-    let mut current: Option<&crate::ClassDef> = Some(cls);
+    // __init__ stores the field — Devin review on #328), local or
+    // imported, named directly or through an alias — the one canonical
+    // chain, each hop's annotation resolved in its own scope (Devin
+    // review on #330).
+    let mut cur: Option<(crate::ClassDef, crate::SymbolTableScopes)> =
+        Some((cls.clone(), symbols.clone()));
     let mut guard = 0;
-    while let Some(c) = current {
+    while let Some((c, c_scope)) = cur.take() {
         guard += 1;
         if guard > 32 {
             break;
@@ -1288,7 +1328,7 @@ pub(crate) fn exception_field_type(
                         .chain(init.args.kwonlyargs.iter())
                         .find(|p| p.arg == v.id)?;
                     if let Some(ann) = param.annotation.as_ref()
-                        && let Some(t) = crate::resolve_alias_typeinfo(ann, symbols, options)
+                        && let Some(t) = crate::resolve_alias_typeinfo(ann, &c_scope, options)
                     {
                         return Some(t);
                     }
@@ -1299,14 +1339,13 @@ pub(crate) fn exception_field_type(
                 }
             }
         }
-        // The next base in the chain (resolved through the symbol table).
-        current = c.bases.iter().find_map(|b| match b {
-            ExprType::Name(n) => match symbols.get(&n.id) {
-                Some(crate::SymbolTableNode::ClassDef(base)) => Some(base),
-                _ => None,
-            },
+        let Some(ExprType::Name(base)) = c.bases.first() else {
+            break;
+        };
+        cur = match canonical_exception_class(&base.id, &c_scope, options) {
+            Some((_, Some(next))) => Some(next),
             _ => None,
-        });
+        };
     }
     None
 }

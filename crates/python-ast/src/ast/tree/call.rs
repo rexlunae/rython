@@ -2699,14 +2699,12 @@ impl<'a> CodeGen for Call {
                         // except handlers use (charset_normalizer's codec
                         // fallback). The target may be an exception class
                         // NAME even though classes aren't values.
+                        // The one construction-class resolver (an alias
+                        // `R = Root` is Root — Devin review on #330).
                         let is_exc_class = |name: &str| -> bool {
                             crate::ast::tree::raise_stmt::is_exception_class_name(name)
-                                || match symbols.get(name) {
-                                    Some(SymbolTableNode::ClassDef(c)) => {
-                                        crate::is_exception_class(c)
-                                    }
-                                    _ => false,
-                                }
+                                || resolve_construction_class(name, &symbols, &options)
+                                    .is_some_and(|(c, _)| crate::is_exception_class(&c))
                         };
                         let first_is_caught_exc = match &self.args[0] {
                             ExprType::Name(_) => true,
@@ -2754,7 +2752,9 @@ impl<'a> CodeGen for Call {
                                                 // argument-less construction has none
                                                 // (`isinstance(MyError(), Exception)`
                                                 // indexed args[0] and panicked).
-                                                let kind = &f.id;
+                                                // The class's own name (`R(...)`
+                                                // under `R = Root` is a Root).
+                                                let kind = &cls.name;
                                                 let m = match call.args.first() {
                                                     None => quote!(String::new()),
                                                     Some(first) => {
@@ -2779,7 +2779,11 @@ impl<'a> CodeGen for Call {
                                             })?
                                         }
                                         _ => {
-                                            let kind = &f.id;
+                                            let kind = crate::ast::tree::raise_stmt::canonical_exception_class(
+                                                &f.id, &symbols, &options,
+                                            )
+                                            .map(|(n, _)| n)
+                                            .unwrap_or_else(|| f.id.clone());
                                             let m = match call.args.len() {
                                                 0 => quote!(String::new()),
                                                 _ => {
