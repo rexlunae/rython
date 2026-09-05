@@ -1314,6 +1314,25 @@ pub(crate) fn exception_class_raise(
     let mut attr_pairs: Vec<proc_macro2::TokenStream> = Vec::new();
     for (f, param) in &fields {
         let value = &substitution[param];
+        // The attrs are BOXED values: a class instance (`raise
+        // EmptyPoolError(self, ...)` storing `self.pool = pool` —
+        // urllib3's connectionpool) has no box, and dropping the field
+        // would make `e.pool` a silent AttributeError; refused at the
+        // site instead.
+        let instance = crate::ast::tree::visit::is_self(value)
+            || matches!(
+                crate::infer_type(Some(&ctx), value, &options, &symbols),
+                crate::TypeInfo::Class(_)
+            );
+        if instance {
+            return site_error(format!(
+                "rython: `{}.__init__` stores its parameter `{}` as `self.{}`, and the \
+                 argument here is a class instance, which an exception's boxed attrs \
+                 cannot hold; rython refuses to silently drop the field. Store a plain \
+                 value (a name, an id) instead",
+                cls.name, param, f
+            ));
+        }
         let boxed = if crate::is_none_expr(value) {
             quote::quote!(stdpython :: PyValue :: None_)
         } else {

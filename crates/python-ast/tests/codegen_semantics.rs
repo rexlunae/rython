@@ -19939,3 +19939,33 @@ fn an_alias_under_a_gate_joins_the_exception_closure() {
     assert!(!out.contains("LeafTrait"), "generated: {}", out);
     assert!(out.contains("(\"Leaf\" , format ! (\"{}\" , \"x\")"), "generated: {}", out);
 }
+
+#[test]
+fn an_exception_field_holding_a_class_instance_is_loud() {
+    // `raise PoolError(self, "empty")` whose __init__ stores `self.pool =
+    // pool`: a class instance has no box, so the field cannot be kept —
+    // a loud refusal, never a dropped field (urllib3's EmptyPoolError;
+    // the sweep after the inherited-init model on #330).
+    let out = compile(
+        concat!(
+            "class PoolError(Exception):\n",
+            "    def __init__(self, pool, message: str):\n",
+            "        self.pool = pool\n",
+            "        super().__init__(f\"{message}\")\n",
+            "\n",
+            "class EmptyPoolError(PoolError):\n",
+            "    pass\n",
+            "\n",
+            "class Pool:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "    def take(self) -> int:\n",
+            "        if self.n == 0:\n",
+            "            raise EmptyPoolError(self, \"empty\")\n",
+            "        return self.n\n",
+        ),
+        "raise_instance_field.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("is a class instance"), "generated: {}", out);
+}
