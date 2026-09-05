@@ -207,20 +207,26 @@ thread_local! {
     /// (`try: R = Root / except: R = Exception` — which one the program
     /// takes is not static): out of the closure, and loud wherever an
     /// exception name resolves (Devin review on #330).
-    static AMBIGUOUS_ALIASES: std::cell::RefCell<std::rc::Rc<std::collections::HashSet<String>>> =
+    static AMBIGUOUS_ALIASES: std::cell::RefCell<std::rc::Rc<std::collections::HashSet<(Vec<String>, String)>>> =
         std::cell::RefCell::new(std::rc::Rc::new(std::collections::HashSet::new()));
 }
 
-/// Whether `name` is an alias the conversion in progress binds to more
-/// than one target at runtime.
-pub fn is_runtime_ambiguous_alias(name: &str) -> bool {
-    AMBIGUOUS_ALIASES.with(|r| r.borrow().contains(name))
+/// Whether `name` is an alias MODULE `module` binds to more than one
+/// target at runtime (module-scoped: an unrelated module's `R` is not
+/// this module's — Devin review on #330).
+pub fn is_runtime_ambiguous_alias(name: &str, module: &[String]) -> bool {
+    AMBIGUOUS_ALIASES.with(|r| {
+        r.borrow()
+            .iter()
+            .any(|(m, n)| n == name && m[..] == module[..])
+    })
 }
 
-/// The exception closure with the runtime-ambiguous alias names.
+/// The exception closure with the runtime-ambiguous alias names, each
+/// with its module.
 pub struct ExceptionIndex {
     pub classes: std::collections::HashSet<String>,
-    pub ambiguous_aliases: std::collections::HashSet<String>,
+    pub ambiguous_aliases: std::collections::HashSet<(Vec<String>, String)>,
 }
 
 /// A module's bindings of one name to another — `X = Y` and `from m
@@ -229,30 +235,64 @@ pub struct ExceptionIndex {
 /// an `if` the emission cannot fold is one too; nested definitions are
 /// not), over the body with its static gates already folded, as the
 /// emitted classes are (Devin review on #330).
+///
+/// FLOW-SENSITIVE in the module's straight line: a binding at the top
+/// level REPLACES the name's earlier bindings (`R = A` then `R = B` is
+/// B, as CPython's module init leaves it), while a binding inside a
+/// control-flow body the gates could not fold ADDS an alternative — a
+/// name with two alternatives is decided at runtime (the caller's
+/// ambiguity). Devin review on #330.
 pub(crate) fn module_name_aliases(body: &[crate::Statement]) -> Vec<(String, String)> {
-    use crate::ast::tree::visit::{Descend, Flow, walk_stmts};
-    let mut out = Vec::new();
-    walk_stmts(body, Descend::SkipDefs, &mut |s| {
-        match &s.statement {
-            crate::StatementType::Assign(a) => {
-                if let ([ExprType::Name(t)], ExprType::Name(v)) = (a.targets.as_slice(), &a.value) {
-                    out.push((t.id.clone(), v.id.clone()));
+    use crate::ast::tree::visit::{Descend, stmt_bodies_for};
+    // name → its current alternatives, in first-seen order
+    let mut bindings: Vec<(String, Vec<String>)> = Vec::new();
+    fn bind(bindings: &mut Vec<(String, Vec<String>)>, name: &str, target: &str, nested: bool) {
+        match bindings.iter_mut().find(|(n, _)| n == name) {
+            Some((_, alts)) => {
+                if nested {
+                    if !alts.iter().any(|t| t == target) {
+                        alts.push(target.to_string());
+                    }
+                } else {
+                    *alts = vec![target.to_string()];
                 }
             }
-            crate::StatementType::ImportFrom(i) => {
-                for a in &i.names {
-                    if let Some(asname) = &a.asname
-                        && asname != &a.name
-                    {
-                        out.push((asname.clone(), a.name.clone()));
+            None => bindings.push((name.to_string(), vec![target.to_string()])),
+        }
+    }
+    fn collect(
+        stmts: &[crate::Statement],
+        nested: bool,
+        bindings: &mut Vec<(String, Vec<String>)>,
+    ) {
+        for s in stmts {
+            match &s.statement {
+                crate::StatementType::Assign(a) => {
+                    if let ([ExprType::Name(t)], ExprType::Name(v)) = (a.targets.as_slice(), &a.value) {
+                        bind(bindings, &t.id, &v.id, nested);
                     }
                 }
+                crate::StatementType::ImportFrom(i) => {
+                    for a in &i.names {
+                        if let Some(asname) = &a.asname
+                            && asname != &a.name
+                        {
+                            bind(bindings, asname, &a.name, nested);
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+            for body in stmt_bodies_for(s, Descend::SkipDefs) {
+                collect(body, true, bindings);
+            }
         }
-        Flow::Continue
-    });
-    out
+    }
+    collect(body, false, &mut bindings);
+    bindings
+        .into_iter()
+        .flat_map(|(n, alts)| alts.into_iter().map(move |t| (n.clone(), t)))
+        .collect()
 }
 
 /// Whether `name` is an exception class of the conversion in progress.
@@ -264,7 +304,7 @@ pub fn is_registered_exception_class(name: &str) -> bool {
 /// registries.
 pub fn install_exception_classes(
     classes: &std::collections::HashSet<String>,
-    ambiguous: &std::collections::HashSet<String>,
+    ambiguous: &std::collections::HashSet<(Vec<String>, String)>,
 ) {
     EXCEPTION_CLASSES.with(|r| *r.borrow_mut() = std::rc::Rc::new(classes.clone()));
     AMBIGUOUS_ALIASES.with(|r| *r.borrow_mut() = std::rc::Rc::new(ambiguous.clone()));
@@ -298,8 +338,10 @@ pub fn compute_exception_classes(
     // at RUNTIME: never followed (the first target is not "the" one —
     // Devin review on #330), out of the closure, and registered so a
     // base, a raise, a handler, or an issubclass naming it is loud.
-    let mut ambiguous_aliases: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (_, _, aliases) in per_module.iter_mut() {
+    let mut ambiguous_aliases: std::collections::HashSet<(Vec<String>, String)> =
+        std::collections::HashSet::new();
+    for (path, _, aliases) in per_module.iter_mut() {
+        let module: Vec<String> = path.clone().unwrap_or_else(|| options.this_module_path.clone());
         let mut targets: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
             std::collections::HashMap::new();
         for (a, t) in aliases.iter() {
@@ -310,7 +352,9 @@ pub fn compute_exception_classes(
             .filter(|(_, t)| t.len() > 1)
             .map(|(a, _)| a.to_string())
             .collect();
-        for a in &multi {
+        // Warned once, by the module that owns the binding (every module's
+        // conversion recomputes the crate-wide index).
+        for a in multi.iter().filter(|_| path.is_none()) {
             options.definition_warnings.borrow_mut().push(format!(
                 "`{a}` is bound to more than one class at module level (a `try:`/`except:` \
                  or an `if` the conversion cannot fold): which class it names is decided at \
@@ -319,7 +363,7 @@ pub fn compute_exception_classes(
             ));
         }
         aliases.retain(|(a, _)| !multi.contains(a));
-        ambiguous_aliases.extend(multi);
+        ambiguous_aliases.extend(multi.into_iter().map(|a| (module.clone(), a)));
     }
     // (class, its module's alias bindings)
     let mut all: Vec<(&ClassDef, std::rc::Rc<Vec<(String, String)>>)> = Vec::new();
@@ -2929,7 +2973,7 @@ impl CodeGen for ClassDef {
                 // A base bound to more than one class at runtime (`try: R
                 // = Root / except: R = Exception`): the ambiguity is the
                 // error, not a missing definition (Devin review on #330).
-                _ if is_runtime_ambiguous_alias(base_name) => {
+                _ if is_runtime_ambiguous_alias(base_name, &options.this_module_path) => {
                     return Err(format!(
                         "class `{}` inherits from `{}`, which is bound to more than one \
                          class at module level (a `try:`/`except:` or an `if` the \

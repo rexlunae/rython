@@ -4042,11 +4042,52 @@ fn hoisted_declarations(
     let scope =
         crate::analyze_scope_with(body, &[], &crate::class_call_resolver(ctx, &symbols, options));
     let mut out = TokenStream::new();
+    // A name every store of which binds a CLASS reference (`R = Root`,
+    // `R = Exception` — a module-level alias, straight-line or under a
+    // gate) is a compile-time binding the class closure and the
+    // exception canonicalizer resolve; its stores lower to nothing, so
+    // there is no runtime binding to hoist — an uninitialized `let mut
+    // R;` was E0282 (Devin review on #330).
+    let class_ref = |value: &crate::ExprType| -> bool {
+        match value {
+            crate::ExprType::Name(v) => {
+                matches!(
+                    symbols.get(&v.id),
+                    Some(SymbolTableNode::ClassDef(_)) | Some(SymbolTableNode::Alias(_))
+                ) || (symbols.get(&v.id).is_none()
+                    && crate::ast::tree::raise_stmt::is_builtin_exception_name(&v.id))
+                    || crate::ast::tree::call::resolve_construction_class(&v.id, &symbols, options)
+                        .is_some()
+            }
+            other => is_type_alias_value(other),
+        }
+    };
+    let mut stores: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new(); // name → (class-reference stores, all stores)
+    crate::ast::tree::visit::walk_stmts(
+        body,
+        crate::ast::tree::visit::Descend::SkipDefs,
+        &mut |s| {
+            if let crate::StatementType::Assign(a) = &s.statement
+                && let [crate::ExprType::Name(t)] = a.targets.as_slice()
+            {
+                let e = stores.entry(t.id.clone()).or_insert((0, 0));
+                e.1 += 1;
+                if class_ref(&a.value) {
+                    e.0 += 1;
+                }
+            }
+            crate::ast::tree::visit::Flow::Continue
+        },
+    );
     for name in &scope.assigned {
         // rust.bind names are compile-time symbols: the declaration
         // assignment lowers to nothing, so there is no runtime binding to
         // hoist — declaring one would be a dead variable.
         if matches!(symbols.get(name), Some(SymbolTableNode::RustBinding(_))) {
+            continue;
+        }
+        if matches!(stores.get(name), Some((c, n)) if c == n && *n > 0) {
             continue;
         }
         // Promoted LazyLock statics have no `let` binding in the init body.

@@ -417,7 +417,7 @@ fn exception_value(
         ExprType::Name(n) => Some(n.id.as_str()),
         _ => None,
     };
-    if let Some(msg) = alias_name.and_then(ambiguous_alias_refusal) {
+    if let Some(msg) = alias_name.and_then(|n| ambiguous_alias_refusal(n, &options)) {
         return Ok(quote!(compile_error!(#msg)));
     }
     match exc {
@@ -921,25 +921,10 @@ pub(crate) fn exception_init_owner(
     scope: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<(crate::ClassDef, SymbolTableScopes)> {
-    let mut cur: Option<(crate::ClassDef, SymbolTableScopes)> = Some((cls.clone(), scope.clone()));
-    let mut guard = 0;
-    while let Some((c, c_scope)) = cur.take() {
-        guard += 1;
-        if guard > 64 {
-            break;
-        }
-        if c.init_method().is_some() {
-            return Some((c, c_scope));
-        }
-        let Some(ExprType::Name(base)) = c.bases.first() else {
-            break;
-        };
-        cur = match canonical_exception_class(&base.id, &c_scope, options) {
-            Some((_, Some(next))) => Some(next),
-            _ => None,
-        };
-    }
-    None
+    exception_mro(cls, scope, options)
+        .into_iter()
+        .filter_map(|(_, def)| def)
+        .find(|(c, _)| c.init_method().is_some())
 }
 
 /// The ONE construction of an in-crate exception class, wherever the
@@ -1011,60 +996,99 @@ pub(crate) fn exception_ancestors(
     symbols: &crate::SymbolTableScopes,
     options: &crate::PythonOptions,
 ) -> Vec<String> {
-    use crate::ExprType;
-    // Each base resolves in the scope its class was defined in — a
-    // class imported from another module (`from .errors import MyError`)
-    // names ITS bases in that module (Devin review on #330); the one
-    // construction-class resolver follows the import.
-    let mut ancestors: Vec<String> = Vec::new();
-    let mut cur: Option<(crate::ClassDef, crate::SymbolTableScopes)> =
-        Some((cls.clone(), symbols.clone()));
-    let mut guard = 0;
-    while let Some((c, scope)) = cur.take() {
-        guard += 1;
-        if guard > 64 {
-            break;
-        }
-        let Some(ExprType::Name(base)) = c.bases.first() else {
-            break;
-        };
-        // Every base the chain resolves is an ancestor — Python's MRO
-        // holds each of them whatever it is named (`Root(Exception)`,
-        // `Mid(Root)`, `LeafError(Mid)`: `except Mid:` catches a
-        // LeafError; judging each hop by its own name dropped Mid —
-        // Devin review on #330), recorded by its CANONICAL name (a base
-        // named through an alias, `R = Root` or `import Root as R`, is
-        // Root; the alias spelling would miss `except Root:` — Devin
-        // review on #330). The chain ends at the first base with no
-        // definition in the crate: a builtin exception by name, else an
-        // import the model does not follow.
-        match canonical_exception_class(&base.id, &scope, options) {
-            Some((name, Some(next))) => {
-                ancestors.push(name);
-                cur = Some(next);
-            }
-            Some((name, None)) => {
-                ancestors.push(name);
-                break;
-            }
-            None => break,
-        }
-    }
-    ancestors
+    exception_mro(cls, symbols, options)
+        .into_iter()
+        .skip(1)
+        .map(|(name, _)| name)
+        .collect()
 }
 
-/// The canonical name of an exception class as a handler, a raise, a
-/// base, or an `issubclass` operand spells it — the one place an alias
-/// resolves: a class of the crate (local, imported, or through `R =
-/// Root`) is its definition's name, with the definition and its scope;
-/// a stdlib alias (`socket.timeout`, `import timeout as T`) or a local
-/// alias of a builtin (`Base = ValueError`) is the builtin; a bare
-/// exception-named binding the model does not follow is itself. None
-/// for a name that is no exception class.
+/// A class's method resolution order as Python computes it (C3
+/// linearization over EVERY base, left to right — `class Both(A, B)` is
+/// caught by `except B:` too; following the first base alone dropped
+/// every other branch; Devin review on #330): the class first, then each
+/// ancestor by its canonical name with its definition and scope when the
+/// crate defines it. A builtin base is a leaf (the runtime expands its
+/// own MRO from the interpreter table); a base the crate does not define
+/// and that is not a builtin ends its branch. An inconsistent hierarchy
+/// (a TypeError at class creation in CPython) falls back to the
+/// left-to-right depth-first order.
+pub(crate) fn exception_mro(
+    cls: &crate::ClassDef,
+    scope: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> Vec<(String, Option<(crate::ClassDef, crate::SymbolTableScopes)>)> {
+    type Entry = (String, Option<(crate::ClassDef, crate::SymbolTableScopes)>);
+    fn linearize(
+        name: String,
+        def: Option<(crate::ClassDef, crate::SymbolTableScopes)>,
+        options: &crate::PythonOptions,
+        depth: usize,
+    ) -> Vec<Entry> {
+        let Some((cls, scope)) = def else {
+            return vec![(name, None)];
+        };
+        if depth > 32 {
+            return vec![(name, Some((cls, scope)))];
+        }
+        // Each base by its canonical name, with its definition.
+        let bases: Vec<Entry> = cls
+            .bases
+            .iter()
+            .filter_map(|b| match b {
+                crate::ExprType::Name(n) => canonical_exception_class(&n.id, &scope, options),
+                _ => None,
+            })
+            .collect();
+        let mut seqs: Vec<Vec<Entry>> = bases
+            .iter()
+            .map(|(n, d)| linearize(n.clone(), d.clone(), options, depth + 1))
+            .collect();
+        seqs.push(bases.clone());
+        let mut out: Vec<Entry> = vec![(name, Some((cls, scope)))];
+        // C3 merge: take the first head that is in no other sequence's
+        // tail; none such is an inconsistent hierarchy.
+        loop {
+            seqs.retain(|s| !s.is_empty());
+            if seqs.is_empty() {
+                break;
+            }
+            let pick = seqs.iter().find_map(|s| {
+                let head = &s[0].0;
+                let in_tail = seqs.iter().any(|t| t[1..].iter().any(|(n, _)| n == head));
+                (!in_tail).then(|| s[0].clone())
+            });
+            match pick {
+                Some(entry) => {
+                    for s in seqs.iter_mut() {
+                        if !s.is_empty() && s[0].0 == entry.0 {
+                            s.remove(0);
+                        }
+                    }
+                    out.push(entry);
+                }
+                None => {
+                    // Inconsistent: depth-first, left to right, deduped.
+                    for s in seqs.iter() {
+                        for e in s {
+                            if !out.iter().any(|(n, _)| *n == e.0) {
+                                out.push(e.clone());
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        out
+    }
+    linearize(cls.name.clone(), Some((cls.clone(), scope.clone())), options, 0)
+}
+
 /// The refusal for an exception name that is a runtime-ambiguous alias
 /// (bound to more than one class at module level), or None.
-pub(crate) fn ambiguous_alias_refusal(name: &str) -> Option<String> {
-    crate::ast::tree::class_def::is_runtime_ambiguous_alias(name).then(|| {
+pub(crate) fn ambiguous_alias_refusal(name: &str, options: &PythonOptions) -> Option<String> {
+    crate::ast::tree::class_def::is_runtime_ambiguous_alias(name, &options.this_module_path).then(|| {
         format!(
             "rython: `{name}` is bound to more than one class at module level (a \
              `try:`/`except:` or an `if` the conversion cannot fold), so which exception \
@@ -1079,7 +1103,7 @@ pub(crate) fn canonical_exception_class(
     scope: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<(String, Option<(crate::ClassDef, SymbolTableScopes)>)> {
-    if crate::ast::tree::class_def::is_runtime_ambiguous_alias(name) {
+    if crate::ast::tree::class_def::is_runtime_ambiguous_alias(name, &options.this_module_path) {
         return None;
     }
     if let Some((cls, cls_scope)) =
@@ -1484,9 +1508,12 @@ pub(crate) fn exception_class_raise(
         // urllib3's connectionpool) has no box, and dropping the field
         // would make `e.pool` a silent AttributeError; refused at the
         // site instead.
+        // A temporary's type lives in msg_options (the raise-site
+        // binding), so an evaluated construction or a captured name is
+        // seen too (Devin review on #330).
         let instance = crate::ast::tree::visit::is_self(value)
             || matches!(
-                crate::infer_type(Some(&ctx), value, &options, &symbols),
+                crate::infer_type(Some(&ctx), value, &msg_options, &symbols),
                 crate::TypeInfo::Class(_)
             );
         if instance {
@@ -1535,20 +1562,14 @@ pub(crate) fn exception_field_type(
     symbols: &crate::SymbolTableScopes,
     options: &crate::PythonOptions,
 ) -> Option<crate::TypeInfo> {
-    // Walk the class AND its bases: the field may be defined on a BASE
-    // (an `except BankError as e` catching an InsufficientFunds whose
+    // Walk the class's MRO: the field may be defined on a BASE (an
+    // `except BankError as e` catching an InsufficientFunds whose
     // __init__ stores the field — Devin review on #328), local or
-    // imported, named directly or through an alias — the one canonical
-    // chain, each hop's annotation resolved in its own scope (Devin
-    // review on #330).
-    let mut cur: Option<(crate::ClassDef, crate::SymbolTableScopes)> =
-        Some((cls.clone(), symbols.clone()));
-    let mut guard = 0;
-    while let Some((c, c_scope)) = cur.take() {
-        guard += 1;
-        if guard > 32 {
-            break;
-        }
+    // imported, named directly or through an alias, on any branch of a
+    // multiple inheritance — the one linearization, each hop's
+    // annotation resolved in its own scope (Devin review on #330).
+    for (_, def) in exception_mro(cls, symbols, options) {
+        let Some((c, c_scope)) = def else { continue };
         if let Some(init) = c.init_method() {
             for stmt in &init.body {
                 if let crate::StatementType::Assign(a) = &stmt.statement
@@ -1580,13 +1601,6 @@ pub(crate) fn exception_field_type(
                 }
             }
         }
-        let Some(ExprType::Name(base)) = c.bases.first() else {
-            break;
-        };
-        cur = match canonical_exception_class(&base.id, &c_scope, options) {
-            Some((_, Some(next))) => Some(next),
-            _ => None,
-        };
     }
     None
 }

@@ -126,7 +126,14 @@ impl CodeGen for Name {
             // A BUILTIN exception class read as a value (`Base =
             // ValueError`, the module-level alias a base or a handler
             // then spells) is its name string too, unless a binding
-            // shadows the name (Devin review on #330).
+            // shadows the name (Devin review on #330). A runtime-ambiguous
+            // alias (bound to two classes under a gate) names no one
+            // class: loud.
+            if let Some(msg) =
+                crate::ast::tree::raise_stmt::ambiguous_alias_refusal(&self.id, &options)
+            {
+                return Ok(quote!(compile_error!(#msg)));
+            }
             if matches!(symbols.get(&self.id), Some(crate::SymbolTableNode::ClassDef(_)))
                 || matches!(symbols.get(&self.id), Some(crate::SymbolTableNode::Alias(c))
                     if matches!(symbols.get(c), Some(crate::SymbolTableNode::ClassDef(_))))

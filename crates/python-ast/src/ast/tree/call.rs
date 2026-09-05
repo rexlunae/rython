@@ -2609,7 +2609,7 @@ impl<'a> CodeGen for Call {
                             .unwrap_or((name.to_string(), None))
                         };
                         for n in [&c1.id, &c2.id] {
-                            if let Some(msg) = crate::ast::tree::raise_stmt::ambiguous_alias_refusal(n) {
+                            if let Some(msg) = crate::ast::tree::raise_stmt::ambiguous_alias_refusal(n, &options) {
                                 return Err(msg.into());
                             }
                         }
@@ -2778,7 +2778,7 @@ impl<'a> CodeGen for Call {
                             };
                             // The target by its canonical name (`R = Root`
                             // — Devin review on #330).
-                            if let Some(msg) = crate::ast::tree::raise_stmt::ambiguous_alias_refusal(&t.id) {
+                            if let Some(msg) = crate::ast::tree::raise_stmt::ambiguous_alias_refusal(&t.id, &options) {
                                 return Ok(quote!(compile_error!(#msg)));
                             }
                             let kind = crate::ast::tree::raise_stmt::canonical_exception_class(

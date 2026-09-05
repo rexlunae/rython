@@ -8563,6 +8563,19 @@ fn the_exception_model_matches_python_at_runtime() {
             "        super().__init__(\"ignored\")\n",
             "\n",
             "\n",
+            "class A(ValueError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class B(IndexError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Both(A, B):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "R = Exception\n",
             "R = Root\n",
             "\n",
             "\n",
@@ -8679,6 +8692,15 @@ fn the_exception_model_matches_python_at_runtime() {
             "        raise Ignores(n)\n",
             "    except Ignores as e:\n",
             "        print(e)\n",
+            "    try:\n",
+            "        raise Both(\"x\")\n",
+            "    except B as e:\n",
+            "        print(\"B:\", e)\n",
+            "    try:\n",
+            "        raise Both(\"y\")\n",
+            "    except LookupError as e:\n",
+            "        print(\"LookupError:\", e)\n",
+            "    print(issubclass(Both, IndexError), issubclass(Both, ValueError), issubclass(Both, OSError))\n",
             "\n",
             "\n",
             "if __name__ == \"__main__\":\n",
@@ -8728,6 +8750,9 @@ fn the_exception_model_matches_python_at_runtime() {
             "a b",
             "[] m",
             "ignored",
+            "B: x",
+            "LookupError: y",
+            "True True False",
         ],
         "the exception model diverged from CPython"
     );
@@ -8967,6 +8992,95 @@ fn a_message_reading_another_modules_global_is_refused_at_a_foreign_raise_site()
     let cli = fs::read_to_string(krate.root.join("src/cli.rs")).unwrap();
     assert!(cli.contains("compile_error !"), "generated: {}", cli);
     assert!(cli.contains("message reads `PREFIX`"), "generated: {}", cli);
+}
+
+#[test]
+fn an_alias_ambiguity_is_scoped_to_its_module() {
+    // other.py binds `R` two ways at runtime; errors.py binds its own `R`
+    // once: errors' `class Leaf(R)` is an exception over Root, unaffected
+    // by the unrelated module (Devin review on #330).
+    let scratch = Scratch::new("aliaspkg");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"aliaspkg\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("aliaspkg");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("errors.py"),
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "R = Root\n",
+            "\n",
+            "\n",
+            "class Leaf(R):\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("other.py"),
+        concat!(
+            "class A(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class B(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "try:\n",
+            "    R = A\n",
+            "except NameError:\n",
+            "    R = B\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("cli.py"),
+        concat!(
+            "from errors import Leaf\n",
+            "from errors import Root\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    try:\n",
+            "        raise Leaf(\"leaf\")\n",
+            "    except Root as e:\n",
+            "        print(\"Root:\", e)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    assert!(
+        krate.warnings.iter().any(|w| w.contains("`R` is bound to more than one class")),
+        "warnings: {:?}",
+        krate.warnings
+    );
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/aliaspkg"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["Root: leaf"],
+        "the module-scoped alias diverged from CPython"
+    );
 }
 
 #[test]

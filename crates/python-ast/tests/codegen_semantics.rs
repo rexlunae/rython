@@ -20013,6 +20013,33 @@ fn an_exception_field_holding_a_class_instance_is_loud() {
     );
     assert!(out.contains("compile_error !"), "generated: {}", out);
     assert!(out.contains("is a class instance"), "generated: {}", out);
+    // An evaluated construction (a temporary) and a captured name are
+    // class instances too — the temporary's type is the raise-site
+    // binding's (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class PoolError(Exception):\n",
+            "    def __init__(self, pool, message: str):\n",
+            "        self.pool = pool\n",
+            "        super().__init__(f\"{message}\")\n",
+            "\n",
+            "class Pool:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise PoolError(Pool(1), \"empty\")\n",
+            "\n",
+            "def tag() -> str:\n",
+            "    return \"t\"\n",
+            "\n",
+            "def g() -> None:\n",
+            "    p = Pool(2)\n",
+            "    raise PoolError(p, tag())\n",
+        ),
+        "raise_instance_field_temp.py",
+    );
+    assert_eq!(out.matches("is a class instance").count(), 2, "generated: {}", out);
 }
 
 #[test]
@@ -20056,4 +20083,51 @@ fn every_exception_argument_is_evaluated_and_an_isinstance_target_is_canonical()
     assert!(out.contains("(\"Prefixed\" , String :: new () , vec ! []"), "generated: {}", out);
     assert!(out.contains("let _ = p ;"), "generated: {}", out);
     assert!(out.contains("(\"Prefixed\" , format ! (\"{}\" , \"m\") , vec ! []"), "generated: {}", out);
+}
+
+#[test]
+fn a_multiple_inheritance_exception_records_every_branch_in_mro_order() {
+    // `class Both(A, B)` over A(ValueError), B(IndexError): the ancestor
+    // chain is Python's C3 order — A, ValueError, B, IndexError — so
+    // `except B:` and `except LookupError:` catch it and the issubclass
+    // fold sees both branches; a straight-line rebinding (`R = Exception`
+    // then `R = Root`) is the final binding, not an ambiguity (Devin
+    // review on #330).
+    let out = compile(
+        concat!(
+            "class A(ValueError):\n",
+            "    pass\n",
+            "\n",
+            "class B(IndexError):\n",
+            "    pass\n",
+            "\n",
+            "class Both(A, B):\n",
+            "    pass\n",
+            "\n",
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "R = Exception\n",
+            "R = Root\n",
+            "\n",
+            "class Leaf(R):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Both(\"x\")\n",
+            "\n",
+            "def g() -> None:\n",
+            "    print(issubclass(Both, IndexError), issubclass(Both, ValueError), issubclass(Both, OSError))\n",
+            "    raise Leaf(\"leaf\")\n",
+        ),
+        "raise_multiple_bases.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("vec ! [(\"A\") . to_string () , (\"ValueError\") . to_string () , (\"B\") . to_string () , (\"IndexError\") . to_string ()]"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("(& (true)) , py_display (& (true)) , py_display (& (false))"), "generated: {}", out);
+    assert!(out.contains("(\"Leaf\" , format ! (\"{}\" , \"leaf\") , vec ! [] , vec ! [(\"Root\") . to_string () , (\"Exception\") . to_string ()])"), "generated: {}", out);
 }
