@@ -162,18 +162,28 @@ fn base_names(c: &ClassDef) -> Vec<String> {
 /// each other module of `options.module_defs`, its classes as its own
 /// emission sees them. One enumeration for every crate-wide index (the
 /// hierarchy roots, the exception closure).
+/// One module of the crate: its path (None for the module being
+/// converted), its emitted classes, its name aliases (`X = Y`, `from m
+/// import Y as X` of a crate module), and the names its EXTERNAL imports
+/// bind.
+pub type ModuleClasses = (
+    Option<Vec<String>>,
+    Vec<ClassDef>,
+    Vec<(String, String)>,
+    std::collections::HashSet<String>,
+);
+
 pub fn crate_emitted_classes(
     this_body: &[crate::Statement],
     this_classes: &[ClassDef],
     options: &PythonOptions,
-) -> Vec<(Option<Vec<String>>, Vec<ClassDef>, Vec<(String, String)>)> {
-    let mut per_module: Vec<(Option<Vec<String>>, Vec<ClassDef>, Vec<(String, String)>)> =
-        Vec::new();
-    let this_aliases = crate::ast::tree::class_def::module_name_aliases(
+) -> Vec<ModuleClasses> {
+    let mut per_module: Vec<ModuleClasses> = Vec::new();
+    let (this_aliases, this_externals) = crate::ast::tree::class_def::module_name_aliases(
         &crate::ast::tree::module::splice_gated_branches(this_body.to_vec(), options),
         options,
     );
-    per_module.push((None, this_classes.to_vec(), this_aliases));
+    per_module.push((None, this_classes.to_vec(), this_aliases, this_externals));
     for (path, module) in options.module_defs.iter() {
         if path[..] == options.this_module_path[..] {
             continue;
@@ -194,11 +204,11 @@ pub fn crate_emitted_classes(
         };
         module_opts.this_module_path = path.clone();
         let defs = crate::ast::tree::module::emitted_class_defs(module, &module_opts);
-        let aliases = crate::ast::tree::class_def::module_name_aliases(
+        let (aliases, externals) = crate::ast::tree::class_def::module_name_aliases(
             &crate::ast::tree::module::splice_gated_branches(module.raw.body.clone(), &module_opts),
             &module_opts,
         );
-        per_module.push((Some(path.clone()), defs, aliases));
+        per_module.push((Some(path.clone()), defs, aliases, externals));
     }
     per_module
 }
@@ -218,13 +228,13 @@ pub fn compute_roots(
     // structs) rather than joining the wrong subtree.
     let mut defined_in: BTreeMap<String, usize> = BTreeMap::new();
     let per_module = crate_emitted_classes(this_body, this_classes, options);
-    for (_, defs, _) in &per_module {
+    for (_, defs, _, _) in &per_module {
         for c in defs {
             *defined_in.entry(c.name.clone()).or_insert(0) += 1;
         }
     }
     let unambiguous = |name: &str| defined_in.get(name).copied().unwrap_or(0) == 1;
-    for (path, defs, _) in &per_module {
+    for (path, defs, _, _) in &per_module {
         for c in defs {
             if participates(c) && unambiguous(&c.name) {
                 classes.insert(

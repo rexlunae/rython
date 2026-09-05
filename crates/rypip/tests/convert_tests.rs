@@ -8452,7 +8452,8 @@ fn the_exception_model_matches_python_at_runtime() {
     // a keyword through super, a chain through a class without its own
     // `__init__`), a bare name captured before a message that runs code,
     // a property-read argument bound once, a composite argument captured
-    // before the message (round 16); a raise through an alias is the canonical
+    // before the message (round 16); an issubclass over a multiple
+    // inheritance walks every builtin branch's MRO (round 17); a raise through an alias is the canonical
     // kind, an inherited __init__ runs (round 7); the message reads the
     // fields as they stood at the super call (round 8).
     let scratch = Scratch::new("exc_model");
@@ -8582,6 +8583,18 @@ fn the_exception_model_matches_python_at_runtime() {
             "\n",
             "\n",
             "class Both(A, B):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Arith(ZeroDivisionError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Look(LookupError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Branches(Arith, Look):\n",
             "    pass\n",
             "\n",
             "\n",
@@ -8784,6 +8797,7 @@ fn the_exception_model_matches_python_at_runtime() {
             "    except LookupError as e:\n",
             "        print(\"LookupError:\", e)\n",
             "    print(issubclass(Both, IndexError), issubclass(Both, ValueError), issubclass(Both, OSError))\n",
+            "    print(issubclass(Branches, ArithmeticError), issubclass(Branches, LookupError), issubclass(Branches, KeyError), issubclass(Branches, Exception))\n",
             "    print(str(Outer(Inner(\"a\", \"b\"), \"x\")))\n",
             "    print(str(Outer(Inner(\"a\"), 2)))\n",
             "    print(str(Prefixed(\"p\", \"m\", \"n\")))\n",
@@ -8880,6 +8894,7 @@ fn the_exception_model_matches_python_at_runtime() {
             "B: x",
             "LookupError: y",
             "True True False",
+            "True True False True",
             "(Inner('a', 'b'), 'x')",
             "(Inner('a'), 2)",
             "('m', 'n')",
@@ -9256,6 +9271,29 @@ fn an_external_import_alias_never_resolves_to_an_unrelated_crate_class() {
         ),
     )
     .unwrap();
+    // The same through an ASSIGNMENT after an external import of the bare
+    // name (`from somewhere_else import Root` / `R = Root`), and a base
+    // naming the external `Root` directly: the module's external binding
+    // is that object, never the crate's `Root` (Devin review on #330).
+    fs::write(
+        pkg.join("third.py"),
+        concat!(
+            "from somewhere_else import Root\n",
+            "\n",
+            "R = Root\n",
+            "\n",
+            "\n",
+            "class Node2(R):\n",
+            "    def label(self) -> str:\n",
+            "        return \"node2\"\n",
+            "\n",
+            "\n",
+            "class Node3(Root):\n",
+            "    def label(self) -> str:\n",
+            "        return \"node3\"\n",
+        ),
+    )
+    .unwrap();
     let out = scratch.path().join("crate");
 
     let pkg = rypip::discover(scratch.path()).expect("discover");
@@ -9263,6 +9301,10 @@ fn an_external_import_alias_never_resolves_to_an_unrelated_crate_class() {
     let other = fs::read_to_string(krate.root.join("src/other.rs")).unwrap();
     assert!(other.contains("fn label"), "the ordinary class lost its method: {}", other);
     assert!(!other.contains("pub struct Node;"), "lowered as an exception marker: {}", other);
+    let third = fs::read_to_string(krate.root.join("src/third.rs")).unwrap();
+    assert!(third.matches("fn label").count() >= 2, "an ordinary class lost its method: {}", third);
+    assert!(!third.contains("pub struct Node2;"), "lowered as an exception marker: {}", third);
+    assert!(!third.contains("pub struct Node3;"), "lowered as an exception marker: {}", third);
     assert!(
         krate.warnings.iter().any(|w| w.contains("somewhere_else")),
         "warnings: {:?}",

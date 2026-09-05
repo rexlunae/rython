@@ -2627,10 +2627,26 @@ impl<'a> CodeGen for Call {
                             )?);
                         }
                         let mut found = chain.iter().any(|n| *n == c2_name || n == target);
+                        // EVERY builtin of the chain takes its full MRO
+                        // into the test (`C(A, B)` over ZeroDivisionError
+                        // and LookupError: ArithmeticError is A's branch,
+                        // not the last one's — Devin review on #330).
+                        let mut any_builtin = false;
                         if !found {
+                            for n in &chain {
+                                if let Some(m) = mro(n)? {
+                                    any_builtin = true;
+                                    if m.iter().any(|a| a == target) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if !found && !any_builtin {
                             let last = chain.last().expect("c1 itself");
                             match mro(last)? {
-                                Some(m) => found = m.iter().any(|a| a == target),
+                                Some(_) => unreachable!("a builtin in the chain was walked above"),
                                 None if resolve(last).is_some() => {
                                     // A user chain that leaves the crate
                                     // (a base the model does not follow):

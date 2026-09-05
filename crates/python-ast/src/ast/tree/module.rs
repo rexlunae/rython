@@ -365,6 +365,7 @@ impl CodeGen for Module {
             crate::ast::tree::class_def::install_exception_classes(
                 &exceptions.classes,
                 &exceptions.ambiguous_aliases,
+                &exceptions.this_externals,
             );
             let roots =
                 crate::ast::tree::hierarchy::compute_roots(&self.raw.body, &items, &options);
