@@ -4124,7 +4124,9 @@ impl ClassDef {
         // concrete class always carries the generated impl (round 34),
         // so the bound is satisfiable by every implementor (round 41).
         let display_bound = if options.with_std_python {
-            quote!(where Self: stdpython::PyDisplay)
+            // PyRepr too: an exception constructed with `self` as an
+            // argument records `repr(self)` (every class implements both).
+            quote!(where Self: stdpython::PyDisplay + stdpython::PyRepr)
         } else {
             quote!()
         };
