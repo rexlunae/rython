@@ -3895,3 +3895,19 @@ fn a_user_exception_over_base_exception_is_not_an_exception() {
     assert!(unknown.matches("Exception"));
     assert!(!unknown.matches_builtin(B::ValueError));
 }
+
+#[test]
+fn an_exceptions_repr_is_its_class_and_its_args() {
+    // CPython's BaseException.__repr__: the class name and the args
+    // tuple's contents, from the recorded reprs; a construction that
+    // recorded none quotes its message, or is `Kind()` when empty (Devin
+    // review on #330).
+    use stdpython::{PyException, PyRepr};
+    let e = PyException::new_with_attrs_and_ancestors("Inner", "('a', 'b')", vec![], vec![])
+        .with_args_repr(vec!["'a'".to_string(), "'b'".to_string()]);
+    assert_eq!(e.py_repr(), "Inner('a', 'b')");
+    let one = PyException::new("Inner", "x");
+    assert_eq!(one.py_repr(), "Inner('x')");
+    let none = PyException::new("Inner", "");
+    assert_eq!(none.py_repr(), "Inner()");
+}

@@ -6336,6 +6336,13 @@ pub struct PyException {
     /// `except BankError` reachability, round 99). Builtin exceptions
     /// keep this empty (their MRO is the interpreter table).
     pub user_ancestors: alloc::vec::Vec<alloc::string::String>,
+    /// The constructor arguments' reprs, when the construction recorded
+    /// them: `repr(e)` is `Kind(repr(a), repr(b))` — an exception passed
+    /// as an argument to another keeps its structure (`(Inner('a', 'b'),
+    /// 'x')`), never a quoted flattened message (Devin review on #330).
+    /// None for a construction that did not record them (the runtime's
+    /// own raises): `repr` then quotes the message.
+    pub args_repr: Option<alloc::vec::Vec<alloc::string::String>>,
 }
 
 impl PyException {
@@ -6347,6 +6354,7 @@ impl PyException {
             discriminant: crate::builtin_exceptions::BuiltinException::from_name(exception_type),
             attrs: alloc::vec::Vec::new(),
             user_ancestors: alloc::vec::Vec::new(),
+            args_repr: None,
         }
     }
 
@@ -6373,7 +6381,14 @@ impl PyException {
             discriminant: crate::builtin_exceptions::BuiltinException::from_name(exception_type),
             attrs,
             user_ancestors: ancestors,
+            args_repr: None,
         }
+    }
+
+    /// Record the constructor arguments' reprs (see `args_repr`).
+    pub fn with_args_repr(mut self, reprs: alloc::vec::Vec<alloc::string::String>) -> Self {
+        self.args_repr = Some(reprs);
+        self
     }
 
     /// The exception instance's int-typed attribute (`e.needed` on a
@@ -6594,8 +6609,14 @@ impl PyDisplay for PyException {
 
 /// Python's `repr(exception)` is `ValueError('boom')`.
 impl PyRepr for PyException {
+    /// CPython's `BaseException.__repr__`: the class name and the args
+    /// tuple's contents — `Inner('a', 'b')`, `Inner(5)`, `Inner()`.
     fn py_repr(&self) -> String {
-        format!("{}({})", self.exception_type, py_str_repr(&self.message))
+        match &self.args_repr {
+            Some(parts) => format!("{}({})", self.exception_type, parts.join(", ")),
+            None if self.message.is_empty() => format!("{}()", self.exception_type),
+            None => format!("{}({})", self.exception_type, py_str_repr(&self.message)),
+        }
     }
 }
 

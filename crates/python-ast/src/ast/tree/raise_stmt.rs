@@ -644,8 +644,13 @@ mod tests {
 /// one message expression, or its own `*args` (the variadic forwarder).
 pub(crate) enum SuperMessage {
     Empty,
-    Expr(crate::ExprType),
+    /// The arguments as written: one is the message, two or more make
+    /// `str(e)` the args tuple's repr.
+    Args(alloc_vec::Vec<crate::ExprType>),
     Forwarded,
+}
+mod alloc_vec {
+    pub use std::vec::Vec;
 }
 
 /// Classify an exception `__init__` body into the model — the
@@ -743,23 +748,21 @@ pub(crate) fn classify_exception_init<'a>(
                                 cls.name
                             ));
                             return Flow::Stop;
-                        } else if sc.args.len() > 1 || !sc.keywords.is_empty() {
-                            // `BaseException.__init__(a, b)` sets `args`
-                            // to the tuple and `str(e)` to ITS repr
-                            // (`('a', 'b')`), which the one-message model
-                            // does not render.
+                        } else if !sc.keywords.is_empty() {
+                            // BaseException.__init__ takes no keywords: a
+                            // TypeError in CPython.
                             refusal = Some(format!(
-                                "rython: `{}.__init__` calls `super().__init__` with more \
-                                 than one argument: `str(e)` is then the repr of the args \
-                                 tuple, which rython's one-message exception model does not \
-                                 reproduce; pass one message and store the rest as fields",
+                                "rython: `{}.__init__` calls `super().__init__` with a keyword \
+                                 argument, which BaseException.__init__ does not accept (a \
+                                 TypeError in CPython)",
                                 cls.name
                             ));
                             return Flow::Stop;
                         } else {
-                            super_init = Some(match sc.args.first() {
-                                None => SuperMessage::Empty,
-                                Some(m) => SuperMessage::Expr(m.clone()),
+                            super_init = Some(if sc.args.is_empty() {
+                                SuperMessage::Empty
+                            } else {
+                                SuperMessage::Args(sc.args.clone())
                             });
                         }
                     }
@@ -845,7 +848,7 @@ fn variadic_exception_raise(
             cls.name
         ));
     }
-    if let Some(SuperMessage::Expr(_) | SuperMessage::Empty) = model.super_init {
+    if let Some(SuperMessage::Args(_) | SuperMessage::Empty) = model.super_init {
         return site_error(format!(
             "rython: `{}.__init__` takes `*args` but does not forward them to \
              `super().__init__(*args)`: the message would not be the raise's argument; \
@@ -884,28 +887,53 @@ fn variadic_exception_raise(
         let tokens = a.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
         prelude.push(quote::quote!(let _ = #tokens;));
     }
-    let msg = match &call.args[named.len()..] {
+    // The forwarded slice, each argument evaluated once: `str(e)` is the
+    // one argument, empty for none, the tuple's repr for two or more —
+    // the same rule as the generic construction (Devin review on #330).
+    let mut arg_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
+    for (i, a) in call.args[named.len()..].iter().enumerate() {
+        let tokens = a.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let runs_code = crate::ast::tree::visit::any_expr_for(
+            a,
+            crate::ast::tree::visit::Descend::All,
+            |e| matches!(e, crate::ExprType::Call(_)),
+        );
+        if runs_code {
+            let ident = proc_macro2::Ident::new(
+                &format!("__rython_exc_a{i}"),
+                proc_macro2::Span::call_site(),
+            );
+            prelude.push(quote::quote!(let #ident = #tokens;));
+            arg_tokens.push(quote::quote!(#ident));
+        } else {
+            arg_tokens.push(tokens);
+        }
+    }
+    let forwarded_runs_code = call.args[named.len()..].iter().any(|a| {
+        crate::ast::tree::visit::any_expr_for(a, crate::ast::tree::visit::Descend::All, |e| {
+            matches!(e, crate::ExprType::Call(_))
+        })
+    });
+    let msg = match arg_tokens.as_slice() {
         [] => quote::quote!(String::new()),
-        [one] => {
-            let m = message_arg(one, ctx, options.clone(), symbols)?;
+        [one] if !forwarded_runs_code => {
+            let m = message_arg(&call.args[named.len()], ctx, options.clone(), symbols)?;
+            let _ = one;
             quote::quote!(format!("{}", #m))
         }
+        [one] => quote::quote!(format!("{}", stdpython::py_display(&(#one)))),
         many => {
-            return site_error(format!(
-                "rython: `{}.__init__` forwards its {} positional arguments to \
-                 `super().__init__`, so `str(e)` is their tuple's repr, which rython's \
-                 one-message exception model does not reproduce; pass one message",
-                cls.name,
-                many.len()
-            ));
+            let fmt = format!("({})", vec!["{}"; many.len()].join(", "));
+            quote::quote!(format!(#fmt, #(stdpython::PyRepr::py_repr(&(#many))),*))
         }
     };
+    let args_repr = quote::quote!(vec![#(stdpython::PyRepr::py_repr(&(#arg_tokens))),*]);
     let kind = &cls.name;
     let ancestor_tokens = exception_ancestor_tokens(cls, class_symbols, &options)?;
     let construct = quote::quote! {
         stdpython :: PyException :: new_with_attrs_and_ancestors (
             #kind , #msg , vec ! [] , vec ! [#(#ancestor_tokens),*]
-        )
+        ) . with_args_repr (#args_repr)
     };
     Ok(Some(if prelude.is_empty() {
         construct
@@ -963,32 +991,58 @@ pub(crate) fn exception_construction(
         );
         return Ok(quote!(compile_error!(#msg)));
     }
-    let msg = match call.args.as_slice() {
+    // Every argument evaluated once (a temporary when it runs code),
+    // read by `str(e)` and by the recorded `repr(e)` parts.
+    let mut prelude: Vec<TokenStream> = Vec::new();
+    let mut arg_tokens: Vec<TokenStream> = Vec::new();
+    for (i, a) in call.args.iter().enumerate() {
+        let tokens = a.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let runs_code = crate::ast::tree::visit::any_expr_for(
+            a,
+            crate::ast::tree::visit::Descend::All,
+            |e| matches!(e, ExprType::Call(_)),
+        );
+        if runs_code {
+            let ident = proc_macro2::Ident::new(
+                &format!("__rython_exc_a{i}"),
+                proc_macro2::Span::call_site(),
+            );
+            prelude.push(quote!(let #ident = #tokens;));
+            arg_tokens.push(quote!(#ident));
+        } else {
+            arg_tokens.push(tokens);
+        }
+    }
+    // `str(e)` is `str(e.args)`: the one argument's str, empty for none,
+    // and for two or more the tuple's repr — each argument's repr,
+    // parenthesized and comma-joined (`(<Pool object>, 'Pool is
+    // closed.')`; the default object repr drops CPython's address, the
+    // documented §12.3 divergence). The old comma-joined display was a
+    // silent divergence (the CI transcript on #330).
+    let msg = match arg_tokens.as_slice() {
         [] => quote!(String::new()),
-        [one] => {
-            let m = message_arg(one, ctx, options.clone(), symbols)?;
+        [one] if prelude.is_empty() => {
+            // Read in place: the display wrapping the message builder
+            // applies (a class instance, an Option, a boxed value).
+            let m = message_arg(&call.args[0], ctx, options.clone(), symbols)?;
             quote!(format!("{}", #m))
         }
+        [one] => quote!(format!("{}", stdpython::py_display(&(#one)))),
         many => {
-            // `str(e)` is `str(e.args)`: the tuple's repr — each
-            // argument's repr, parenthesized and comma-joined
-            // (`(<Pool object>, 'Pool is closed.')`; the default object
-            // repr drops CPython's address, the documented §12.3
-            // divergence). The old comma-joined display was a silent
-            // divergence (the CI transcript on #330).
-            let mut parts: Vec<TokenStream> = Vec::new();
-            for a in many {
-                let tokens = a.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                parts.push(quote!(stdpython::PyRepr::py_repr(&(#tokens))));
-            }
-            let fmt = format!("({})", vec!["{}"; parts.len()].join(", "));
-            quote!(format!(#fmt, #(#parts),*))
+            let fmt = format!("({})", vec!["{}"; many.len()].join(", "));
+            quote!(format!(#fmt, #(stdpython::PyRepr::py_repr(&(#many))),*))
         }
     };
+    let args_repr = quote!(vec![#(stdpython::PyRepr::py_repr(&(#arg_tokens))),*]);
     let ancestors = exception_ancestor_tokens(cls, class_symbols, &options)?;
-    Ok(quote!(PyException::new_with_attrs_and_ancestors(
+    let construct = quote!(PyException::new_with_attrs_and_ancestors(
         #kind, #msg, vec![], vec![#(#ancestors),*]
-    )))
+    ).with_args_repr(#args_repr));
+    Ok(if prelude.is_empty() {
+        construct
+    } else {
+        quote!({ #(#prelude)* #construct })
+    })
 }
 
 /// The ancestor chain of an in-crate exception class, base-most last
@@ -1359,18 +1413,18 @@ pub(crate) fn exception_class_raise(
     // `BaseException.__new__` still records the call's positional
     // arguments as `args`, so `str(e)` is the one positional argument,
     // or empty for none — more than one is the tuple's repr, refused.
-    let msg_expr: Option<ExprType> = match super_init {
-        Some(SuperMessage::Empty) => None,
-        Some(SuperMessage::Expr(m)) => Some(m),
+    let msg_exprs: Vec<ExprType> = match super_init {
+        Some(SuperMessage::Empty) => Vec::new(),
+        Some(SuperMessage::Args(args)) => args,
         // `super().__init__(*args)` cannot appear here: the variadic
         // initializer took the branch above, and a non-variadic body
         // naming `*args` is refused by the classifier.
         Some(SuperMessage::Forwarded) => unreachable!("forwarding needs a vararg"),
         None => match call.args.len() {
-            0 => None,
-            1 => Some(ExprType::Name(crate::ast::tree::name::Name {
+            0 => Vec::new(),
+            1 => vec![ExprType::Name(crate::ast::tree::name::Name {
                 id: positional[0].to_string(),
-            })),
+            })],
             _ => {
                 return site_error(format!(
                     "rython: `{}.__init__` never calls `super().__init__`, so `str(e)` is \
@@ -1389,7 +1443,7 @@ pub(crate) fn exception_class_raise(
     // is a NameError before the construction in CPython, an unresolved
     // name in rustc here — Devin review on #330).
     let mut read_by_model: Vec<&str> = fields.iter().map(|(_, p)| *p).collect();
-    if let Some(m0) = &msg_expr {
+    for m0 in &msg_exprs {
         crate::ast::tree::visit::walk_expr(m0, &mut |e| {
             if let ExprType::Name(n) = e
                 && let Some(p) = params.iter().find(|p| **p == n.id)
@@ -1413,98 +1467,110 @@ pub(crate) fn exception_class_raise(
             prelude.push(quote::quote!(let _ = &#ident;));
         }
     }
-    let msg = match msg_expr {
-        None => quote::quote!(String::new()),
-        Some(mut m) => {
-            // The rewrite binds names by the __init__'s OWN scope: a
-            // lambda or a comprehension in the message would bind names
-            // of its own, which the parameter substitution must not touch
-            // and the raise site cannot re-bind; refused.
-            if crate::ast::tree::visit::any_expr_for(&m, crate::ast::tree::visit::Descend::All, |e| {
-                matches!(
-                    e,
-                    ExprType::Lambda(_)
-                        | ExprType::ListComp(_)
-                        | ExprType::SetComp(_)
-                        | ExprType::DictComp(_)
-                        | ExprType::GeneratorExp(_)
-                )
-            }) {
+    // Each message argument rewritten to the raise site, evaluated once:
+    // a lambda or a comprehension is refused (bindings of its own the
+    // rewrite cannot model); `self.<field>` means the parameter the
+    // field stored at the super call; every parameter means its
+    // substitution — one pre-order pass through the mutable visitor (a
+    // replaced node is a leaf, never rewritten again, so a caller name
+    // that matches another parameter binds ONCE — Devin review on #330);
+    // every name the rewritten expression still reads must be bound at
+    // the site as the `__init__` sees it. An argument that runs code
+    // binds to a temporary, read by the message and by the args repr.
+    let mut arg_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
+    for (i, m0) in msg_exprs.iter().enumerate() {
+        let mut m = m0.clone();
+        if crate::ast::tree::visit::any_expr_for(&m, crate::ast::tree::visit::Descend::All, |e| {
+            matches!(
+                e,
+                ExprType::Lambda(_)
+                    | ExprType::ListComp(_)
+                    | ExprType::SetComp(_)
+                    | ExprType::DictComp(_)
+                    | ExprType::GeneratorExp(_)
+            )
+        }) {
+            return site_error(format!(
+                "rython: `{}.__init__`'s message holds a lambda or a comprehension, \
+                 whose own bindings the raise-site rewrite cannot model; compute the \
+                 message in a local first",
+                cls.name
+            ));
+        }
+        crate::ast::tree::visit::walk_expr_mut(&mut m, &mut |e| {
+            if let ExprType::Attribute(attr) = e
+                && crate::ast::tree::visit::is_self(&attr.value)
+                && let Some((_, param)) = fields_at_super.iter().find(|(f, _)| *f == attr.attr)
+            {
+                *e = ExprType::Name(crate::ast::tree::name::Name { id: param.to_string() });
+            }
+            if let ExprType::Name(n) = e
+                && let Some(sub) = substitution.get(n.id.as_str())
+            {
+                *e = sub.clone();
+            }
+        });
+        let site_names: Vec<&str> = substitution
+            .values()
+            .filter_map(|v| match v {
+                ExprType::Name(n) => Some(n.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut free: Vec<String> = Vec::new();
+        crate::ast::tree::visit::walk_expr(&m, &mut |e| {
+            if let ExprType::Name(n) = e
+                && !n.id.starts_with("__rython_exc_arg")
+                && !site_names.contains(&n.id.as_str())
+                && !free.contains(&n.id)
+            {
+                free.push(n.id.clone());
+            }
+        });
+        for name in free {
+            let at_def = format!("{:?}", owner_scope.module_get(&name));
+            let at_site = format!("{:?}", symbols.get(&name));
+            let local = options.name_types.contains_key(&name)
+                && owner_scope.module_get(&name).is_some();
+            if at_def != at_site || local {
                 return site_error(format!(
-                    "rython: `{}.__init__`'s message holds a lambda or a comprehension, \
-                     whose own bindings the raise-site rewrite cannot model; compute the \
-                     message in a local first",
-                    cls.name
+                    "rython: `{}.__init__`'s message reads `{}`, which at this raise \
+                     site is not the binding the `__init__` sees (a local, or another \
+                     module's global of the same name): rython renders the message at \
+                     the raise site and refuses to silently read the wrong one; pass \
+                     the value as an argument, or store it as a field",
+                    cls.name, name
                 ));
             }
-            // The message at the raise site: a `self.<field>` read means
-            // the parameter the field stores, and each parameter means
-            // its substitution — one pre-order pass through the mutable
-            // visitor; a node the pass replaces is a leaf (a name, a
-            // constant, a temporary), never rewritten again, so a caller
-            // name that happens to match another parameter binds ONCE
-            // (`E(b, "second")` for `__init__(self, a, b)` reads the
-            // caller's `b` — Devin review on #330).
-            crate::ast::tree::visit::walk_expr_mut(&mut m, &mut |e| {
-                if let ExprType::Attribute(attr) = e
-                    && crate::ast::tree::visit::is_self(&attr.value)
-                    && let Some((_, param)) = fields_at_super.iter().find(|(f, _)| *f == attr.attr)
-                {
-                    *e = ExprType::Name(crate::ast::tree::name::Name { id: param.to_string() });
-                }
-                if let ExprType::Name(n) = e
-                    && let Some(sub) = substitution.get(n.id.as_str())
-                {
-                    *e = sub.clone();
-                }
-            });
-            // The message renders at the raise site, so every name it
-            // still reads — a module global of the defining module, a
-            // builtin — must be bound there exactly as the `__init__`
-            // sees it; a caller local or a same-named global of another
-            // module would silently change the message (Devin review on
-            // #330). Refused otherwise.
-            // A bare-name ARGUMENT inlined for a parameter is the raise
-            // site's own name, read there by design.
-            let site_names: Vec<&str> = substitution
-                .values()
-                .filter_map(|v| match v {
-                    ExprType::Name(n) => Some(n.id.as_str()),
-                    _ => None,
-                })
-                .collect();
-            let mut free: Vec<String> = Vec::new();
-            crate::ast::tree::visit::walk_expr(&m, &mut |e| {
-                if let ExprType::Name(n) = e
-                    && !n.id.starts_with("__rython_exc_arg")
-                    && !site_names.contains(&n.id.as_str())
-                    && !free.contains(&n.id)
-                {
-                    free.push(n.id.clone());
-                }
-            });
-            for name in free {
-                let at_def = format!("{:?}", owner_scope.module_get(&name));
-                let at_site = format!("{:?}", symbols.get(&name));
-                // A raise-site LOCAL of the name (a parameter or a local
-                // store — the function's typed names) shadows the global.
-                let local = options.name_types.contains_key(&name)
-                    && owner_scope.module_get(&name).is_some();
-                if at_def != at_site || local {
-                    return site_error(format!(
-                        "rython: `{}.__init__`'s message reads `{}`, which at this raise \
-                         site is not the binding the `__init__` sees (a local, or another \
-                         module's global of the same name): rython renders the message at \
-                         the raise site and refuses to silently read the wrong one; pass \
-                         the value as an argument, or store it as a field",
-                        cls.name, name
-                    ));
-                }
-            }
-            let msg_tok = m.to_rust(ctx.clone(), msg_options.clone(), symbols.clone())?;
-            quote::quote!(format!("{}", #msg_tok))
+        }
+        let runs_code = crate::ast::tree::visit::any_expr_for(
+            &m,
+            crate::ast::tree::visit::Descend::All,
+            |e| matches!(e, ExprType::Call(_)),
+        );
+        let tokens = m.to_rust(ctx.clone(), msg_options.clone(), symbols.clone())?;
+        if runs_code {
+            let ident = proc_macro2::Ident::new(
+                &format!("__rython_exc_m{i}"),
+                proc_macro2::Span::call_site(),
+            );
+            prelude.push(quote::quote!(let #ident = #tokens;));
+            arg_tokens.push(quote::quote!(#ident));
+        } else {
+            arg_tokens.push(tokens);
+        }
+    }
+    // `str(e)`: the one argument, empty for none, the args tuple's repr
+    // for two or more; `repr(e)` records every argument's repr.
+    let msg = match arg_tokens.as_slice() {
+        [] => quote::quote!(String::new()),
+        [one] => quote::quote!(format!("{}", #one)),
+        many => {
+            let fmt = format!("({})", vec!["{}"; many.len()].join(", "));
+            quote::quote!(format!(#fmt, #(stdpython::PyRepr::py_repr(&(#many))),*))
         }
     };
+    let args_repr = quote::quote!(vec![#(stdpython::PyRepr::py_repr(&(#arg_tokens))),*]);
     // The attrs: each field's substitution, boxed.
     let kind = &cls.name;
     let mut attr_pairs: Vec<proc_macro2::TokenStream> = Vec::new();
@@ -1550,7 +1616,7 @@ pub(crate) fn exception_class_raise(
         stdpython :: PyException :: new_with_attrs_and_ancestors (
             #kind , #msg , vec ! [#(#attr_pairs),*] ,
             vec ! [#(#ancestor_tokens),*]
-        )
+        ) . with_args_repr (#args_repr)
     };
     if prelude.is_empty() {
         Ok(Some(construct))

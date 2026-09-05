@@ -15308,14 +15308,20 @@ fn exception_message_args_wrap_class_instances_in_py_display() {
         ),
         "disp.py",
     );
+    // The construction runs code, so it is evaluated once into a
+    // temporary the message (py_display) and the recorded repr read.
     assert!(
-        out.contains("py_display (& ({ Pool :: new")
-            || out.contains("py_display(&({ Pool::new"),
+        out.contains("let __rython_exc_a0 = { Pool :: new (\"x\") ? } ;"),
+        "the argument is evaluated once: {}",
+        out
+    );
+    assert!(
+        out.contains("py_display (& (__rython_exc_a0))"),
         "the message arg must wrap the class instance: {}",
         out
     );
     assert!(
-        out.contains("format ! (\"({}, {})\" , stdpython :: PyRepr :: py_repr (& ({ Pool :: new (\"x\") ? })) , stdpython :: PyRepr :: py_repr (& (\"closed.\")))"),
+        out.contains("format ! (\"({}, {})\" , stdpython :: PyRepr :: py_repr (& (__rython_exc_a0)) , stdpython :: PyRepr :: py_repr (& (\"closed.\")))"),
         "generated: {}",
         out
     );
@@ -19465,8 +19471,14 @@ fn a_zero_argument_super_init_keeps_the_fields_and_no_super_call_keeps_the_argum
         ),
         "raise_two_arg_super.py",
     );
-    assert!(out.contains("compile_error !"), "generated: {}", out);
-    assert!(out.contains("more than one argument"), "generated: {}", out);
+    // `super().__init__(a, b)` is the args tuple's repr, as CPython's
+    // `str(e)` is.
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("format ! (\"({}, {})\" , stdpython :: PyRepr :: py_repr (& (1)) , stdpython :: PyRepr :: py_repr (& (2)))"),
+        "generated: {}",
+        out
+    );
     let out = compile(
         concat!(
             "class Silent2(Exception):\n",
@@ -19650,7 +19662,13 @@ fn a_variadic_exception_init_forwards_or_is_loud() {
     );
     assert!(out.contains("(\"Var\" , format ! (\"{}\" , \"v\") , vec ! []"), "generated: {}", out);
     assert!(out.contains("(\"Var\" , String :: new () , vec ! []"), "generated: {}", out);
-    assert!(out.contains("forwards its 2 positional arguments"), "generated: {}", out);
+    // Two forwarded arguments: the args tuple's repr, as the generic
+    // construction renders it.
+    assert!(
+        out.contains("format ! (\"({}, {})\" , stdpython :: PyRepr :: py_repr (& (\"a\")) , stdpython :: PyRepr :: py_repr (& (\"b\")))"),
+        "generated: {}",
+        out
+    );
     let out = compile(
         concat!(
             "class Req(Exception):\n",
