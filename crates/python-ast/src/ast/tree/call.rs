@@ -2593,7 +2593,7 @@ impl<'a> CodeGen for Call {
                         // builtin's MRO. C2's canonical name (an alias —
                         // `EnvironmentError` IS `OSError`) is its MRO head.
                         let mro = crate::ast::tree::raise_stmt::builtin_exception_mro;
-                        let target: &str = mro(&c2.id)
+                        let target: &str = mro(&c2.id)?
                             .and_then(|m| m.first())
                             .map(|s| s.as_str())
                             .unwrap_or(&c2.id);
@@ -2617,7 +2617,7 @@ impl<'a> CodeGen for Call {
                                     })
                                 }
                                 _ => {
-                                    let Some(chain) = mro(cur) else {
+                                    let Some(chain) = mro(cur)? else {
                                         return Err(format!(
                                             "issubclass({}, {}): `{}` is neither a class this \
                                              crate defines nor a builtin exception; rython \

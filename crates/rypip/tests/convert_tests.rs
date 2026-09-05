@@ -8435,7 +8435,10 @@ fn the_exception_model_matches_python_at_runtime() {
     // class over a builtin caught by the builtin's handler and by the
     // builtin's alias; a modeled constructor bound positionally, by
     // keyword, and by keyword-only default; a property argument evaluated
-    // once; issubclass through the interpreter's own MRO.
+    // once; issubclass through the interpreter's own MRO; a caller name
+    // that matches another parameter; a neutral-named intermediate class
+    // caught by its own handler; a zero-argument super call and no super
+    // call (round 3).
     let scratch = Scratch::new("exc_model");
     let file = scratch.path().join("exc_model.py");
     fs::write(
@@ -8466,6 +8469,36 @@ fn the_exception_model_matches_python_at_runtime() {
             "        return 7\n",
             "\n",
             "\n",
+            "class Pair(Exception):\n",
+            "    def __init__(self, a: str, b: str):\n",
+            "        super().__init__(f\"{a}\")\n",
+            "        self.a = a\n",
+            "        self.b = b\n",
+            "\n",
+            "\n",
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Mid(Root):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class LeafError(Mid):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Bare(Exception):\n",
+            "    def __init__(self, code: int):\n",
+            "        super().__init__()\n",
+            "        self.code = code\n",
+            "\n",
+            "\n",
+            "class Silent(Exception):\n",
+            "    def __init__(self, code: int):\n",
+            "        self.code = code\n",
+            "\n",
+            "\n",
             "def main() -> None:\n",
             "    try:\n",
             "        raise MyError(\"bad\")\n",
@@ -8489,6 +8522,23 @@ fn the_exception_model_matches_python_at_runtime() {
             "    except Short as e:\n",
             "        print(e, e.needed, m.reads)\n",
             "    print(issubclass(FileNotFoundError, OSError), issubclass(MyError, Exception), issubclass(KeyError, ValueError))\n",
+            "    b = \"first\"\n",
+            "    try:\n",
+            "        raise Pair(b, \"second\")\n",
+            "    except Pair as e:\n",
+            "        print(e, e.a, e.b)\n",
+            "    try:\n",
+            "        raise LeafError(\"leaf\")\n",
+            "    except Mid as e:\n",
+            "        print(\"caught Mid:\", e)\n",
+            "    try:\n",
+            "        raise Bare(9)\n",
+            "    except Bare as e:\n",
+            "        print(\"[\" + str(e) + \"]\", e.code)\n",
+            "    try:\n",
+            "        raise Silent(5)\n",
+            "    except Silent as e:\n",
+            "        print(\"[\" + str(e) + \"]\", e.code)\n",
             "\n",
             "\n",
             "if __name__ == \"__main__\":\n",
@@ -8518,6 +8568,10 @@ fn the_exception_model_matches_python_at_runtime() {
             "need 4 marks 4 marks",
             "need 7 credits 7 1",
             "True True False",
+            "first first second",
+            "caught Mid: leaf",
+            "[] 9",
+            "[5] 5",
         ],
         "the exception model diverged from CPython"
     );

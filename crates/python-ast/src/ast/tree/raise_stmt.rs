@@ -652,13 +652,25 @@ pub(crate) fn exception_ancestors(
         let Some(ExprType::Name(base)) = c.bases.first() else {
             break;
         };
-        let resolved = crate::ast::tree::call::resolve_construction_class(&base.id, &scope, options);
-        let is_exc = is_exception_class_name(&base.id)
-            || resolved.as_ref().is_some_and(|(b, _)| crate::is_exception_class(b));
-        if is_exc {
-            ancestors.push(base.id.clone());
+        // Every base the chain resolves is an ancestor — Python's MRO
+        // holds each of them whatever it is named (`Root(Exception)`,
+        // `Mid(Root)`, `LeafError(Mid)`: `except Mid:` catches a
+        // LeafError; judging each hop by its own name dropped Mid —
+        // Devin review on #330). The chain ends at the first base with
+        // no definition in the crate: a builtin exception by name, else
+        // an import the model does not follow.
+        match crate::ast::tree::call::resolve_construction_class(&base.id, &scope, options) {
+            Some(next) => {
+                ancestors.push(base.id.clone());
+                cur = Some(next);
+            }
+            None => {
+                if is_exception_class_name(&base.id) {
+                    ancestors.push(base.id.clone());
+                }
+                break;
+            }
         }
-        cur = resolved;
     }
     ancestors
 }
@@ -848,7 +860,9 @@ pub(crate) fn exception_class_raise(
     // The __init__ body: `self.<field> = <param>` stores and the
     // `super().__init__(<message>)` call; a docstring and `pass` are
     // inert; anything else would not run at the raise site.
-    let mut msg_expr: Option<ExprType> = None;
+    // The `super().__init__(...)` call seen: None until one is, then its
+    // message argument (None for the zero-argument call).
+    let mut super_init: Option<Option<ExprType>> = None;
     let mut fields: Vec<(String, &str)> = Vec::new(); // (field, param)
     for stmt in &init.body {
         let modeled = match &stmt.statement {
@@ -874,8 +888,21 @@ pub(crate) fn exception_class_raise(
                         }
                         _ => false,
                     };
-                    if is_super_init && !sc.args.is_empty() && msg_expr.is_none() {
-                        msg_expr = Some((sc.args[0]).clone());
+                    if is_super_init && super_init.is_none() {
+                        if sc.args.len() > 1 || !sc.keywords.is_empty() {
+                            // `BaseException.__init__(a, b)` sets `args`
+                            // to the tuple and `str(e)` to ITS repr
+                            // (`('a', 'b')`), which the one-message model
+                            // does not render.
+                            return site_error(format!(
+                                "rython: `{}.__init__` calls `super().__init__` with more \
+                                 than one argument: `str(e)` is then the repr of the args \
+                                 tuple, which rython's one-message exception model does not \
+                                 reproduce; pass one message and store the rest as fields",
+                                cls.name
+                            ));
+                        }
+                        super_init = Some(sc.args.first().cloned());
                     }
                     is_super_init
                 } else {
@@ -900,39 +927,81 @@ pub(crate) fn exception_class_raise(
             ));
         }
     }
-    let Some(mut m) = msg_expr else {
-        return Ok(None);
+    // The message, as CPython sets `str(e)`: the `super().__init__`
+    // argument; the empty string for the zero-argument call (a class
+    // that stores fields and calls `super().__init__()` keeps its fields
+    // — Devin review on #330); with no super call at all,
+    // `BaseException.__new__` still records the call's positional
+    // arguments as `args`, so `str(e)` is the one positional argument,
+    // or empty for none — more than one is the tuple's repr, refused.
+    let msg_expr: Option<ExprType> = match super_init {
+        Some(m) => m,
+        None => match call.args.len() {
+            0 => None,
+            1 => Some(ExprType::Name(crate::ast::tree::name::Name {
+                id: positional[0].to_string(),
+            })),
+            _ => {
+                return site_error(format!(
+                    "rython: `{}.__init__` never calls `super().__init__`, so `str(e)` is \
+                     the repr of the {} positional arguments as a tuple, which rython's \
+                     one-message exception model does not reproduce; call \
+                     `super().__init__(<message>)`",
+                    cls.name,
+                    call.args.len()
+                ));
+            }
+        },
     };
-    // The message at the raise site: a `self.<field>` read means the
-    // parameter the field stores, and each parameter means its
-    // substitution — one rewrite through the mutable visitor.
-    crate::ast::tree::visit::walk_expr_mut(&mut m, &mut |e| {
-        if let ExprType::Attribute(attr) = e
-            && crate::ast::tree::visit::is_self(&attr.value)
-            && let Some((_, param)) = fields.iter().find(|(f, _)| *f == attr.attr)
-        {
-            *e = ExprType::Name(crate::ast::tree::name::Name { id: param.to_string() });
+    let msg = match msg_expr {
+        None => quote::quote!(String::new()),
+        Some(mut m) => {
+            // The rewrite binds names by the __init__'s OWN scope: a
+            // lambda or a comprehension in the message would bind names
+            // of its own, which the parameter substitution must not touch
+            // and the raise site cannot re-bind; refused.
+            if crate::ast::tree::visit::any_expr_for(&m, crate::ast::tree::visit::Descend::All, |e| {
+                matches!(
+                    e,
+                    ExprType::Lambda(_)
+                        | ExprType::ListComp(_)
+                        | ExprType::SetComp(_)
+                        | ExprType::DictComp(_)
+                        | ExprType::GeneratorExp(_)
+                )
+            }) {
+                return site_error(format!(
+                    "rython: `{}.__init__`'s message holds a lambda or a comprehension, \
+                     whose own bindings the raise-site rewrite cannot model; compute the \
+                     message in a local first",
+                    cls.name
+                ));
+            }
+            // The message at the raise site: a `self.<field>` read means
+            // the parameter the field stores, and each parameter means
+            // its substitution — one pre-order pass through the mutable
+            // visitor; a node the pass replaces is a leaf (a name, a
+            // constant, a temporary), never rewritten again, so a caller
+            // name that happens to match another parameter binds ONCE
+            // (`E(b, "second")` for `__init__(self, a, b)` reads the
+            // caller's `b` — Devin review on #330).
+            crate::ast::tree::visit::walk_expr_mut(&mut m, &mut |e| {
+                if let ExprType::Attribute(attr) = e
+                    && crate::ast::tree::visit::is_self(&attr.value)
+                    && let Some((_, param)) = fields.iter().find(|(f, _)| *f == attr.attr)
+                {
+                    *e = ExprType::Name(crate::ast::tree::name::Name { id: param.to_string() });
+                }
+                if let ExprType::Name(n) = e
+                    && let Some(sub) = substitution.get(n.id.as_str())
+                {
+                    *e = sub.clone();
+                }
+            });
+            let msg_tok = m.to_rust(ctx.clone(), msg_options.clone(), symbols.clone())?;
+            quote::quote!(format!("{}", #msg_tok))
         }
-        if let ExprType::Name(n) = e
-            && let Some(sub) = substitution.get(n.id.as_str())
-        {
-            *e = sub.clone();
-        }
-    });
-    if let Some(left) = positional
-        .iter()
-        .chain(kwonly.iter())
-        .find(|p| crate::expr_references(&m, p))
-    {
-        return site_error(format!(
-            "rython: `{}.__init__`'s message still reads its parameter `{}` after the \
-             raise-site rewrite; simplify the message expression, or store the value as a \
-             field",
-            cls.name, left
-        ));
-    }
-    let msg_tok = m.to_rust(ctx.clone(), msg_options.clone(), symbols.clone())?;
-    let msg = quote::quote!(format!("{}", #msg_tok));
+    };
     // The attrs: each field's substitution, boxed.
     let kind = &cls.name;
     let mut attr_pairs: Vec<proc_macro2::TokenStream> = Vec::new();
@@ -1037,13 +1106,28 @@ pub(crate) fn exception_field_type(
 /// generated table on day one (44 of 84 names missing, so
 /// `issubclass(FileNotFoundError, OSError)` folded to `false`; Devin
 /// review on #328 / the evaluation on issue #137).
-pub(crate) fn builtin_exception_mro(name: &str) -> Option<&'static [String]> {
-    static TREE: std::sync::OnceLock<std::collections::HashMap<String, Vec<String>>> =
-        std::sync::OnceLock::new();
-    let tree = TREE.get_or_init(|| {
-        crate::exception_tree::dump_builtin_exception_tree()
-            .map(|(_, _, entries)| entries.into_iter().collect())
-            .unwrap_or_default()
-    });
-    tree.get(name).map(|v| v.as_slice())
+/// An interpreter that cannot be run is an error, never an empty
+/// hierarchy — an empty map would fold every `issubclass` of a builtin
+/// pair to `false` and strip every alias, silently (Devin review on
+/// #330).
+pub(crate) fn builtin_exception_mro(
+    name: &str,
+) -> Result<Option<&'static [String]>, Box<dyn std::error::Error>> {
+    static TREE: std::sync::OnceLock<
+        Result<std::collections::HashMap<String, Vec<String>>, String>,
+    > = std::sync::OnceLock::new();
+    let tree = TREE
+        .get_or_init(|| {
+            crate::exception_tree::dump_builtin_exception_tree()
+                .map(|(_, _, entries)| entries.into_iter().collect())
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|e| {
+            format!(
+                "rython: the builtin exception hierarchy comes from the live interpreter \
+                 (`python3`), which could not be run: {e}"
+            )
+        })?;
+    Ok(tree.get(name).map(|v| v.as_slice()))
 }

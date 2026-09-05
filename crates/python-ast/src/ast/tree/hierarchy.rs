@@ -157,16 +157,15 @@ fn base_names(c: &ClassDef) -> Vec<String> {
 
 /// Compute the index over the module being converted (`this_classes`, in
 /// scope bare) and every other module of the crate (`options.module_defs`).
-pub fn compute_roots(this_classes: &[ClassDef], options: &PythonOptions) -> HierarchyRoots {
-    // name → (its direct bases, the module defining it)
-    let mut classes: BTreeMap<String, (Vec<String>, Option<Vec<String>>)> = BTreeMap::new();
-    // The index is keyed by BARE class name — the identity the type side
-    // carries (`TypeInfo::Class(name)`) — so a name two modules both
-    // define (`Timeout` in urllib3's util.timeout and in requests'
-    // exceptions) is ambiguous: it is excluded, as a class and as a base,
-    // and its classes lower as before the index existed (concrete
-    // structs) rather than joining the wrong subtree.
-    let mut defined_in: BTreeMap<String, usize> = BTreeMap::new();
+/// The emitted classes of every module of the crate, per module: the
+/// module being converted first (path None — its scope is bare), then
+/// each other module of `options.module_defs`, its classes as its own
+/// emission sees them. One enumeration for every crate-wide index (the
+/// hierarchy roots, the exception closure).
+pub fn crate_emitted_classes(
+    this_classes: &[ClassDef],
+    options: &PythonOptions,
+) -> Vec<(Option<Vec<String>>, Vec<ClassDef>)> {
     let mut per_module: Vec<(Option<Vec<String>>, Vec<ClassDef>)> = Vec::new();
     per_module.push((None, this_classes.to_vec()));
     for (path, module) in options.module_defs.iter() {
@@ -191,6 +190,20 @@ pub fn compute_roots(this_classes: &[ClassDef], options: &PythonOptions) -> Hier
         let defs = crate::ast::tree::module::emitted_class_defs(module, &module_opts);
         per_module.push((Some(path.clone()), defs));
     }
+    per_module
+}
+
+pub fn compute_roots(this_classes: &[ClassDef], options: &PythonOptions) -> HierarchyRoots {
+    // name → (its direct bases, the module defining it)
+    let mut classes: BTreeMap<String, (Vec<String>, Option<Vec<String>>)> = BTreeMap::new();
+    // The index is keyed by BARE class name — the identity the type side
+    // carries (`TypeInfo::Class(name)`) — so a name two modules both
+    // define (`Timeout` in urllib3's util.timeout and in requests'
+    // exceptions) is ambiguous: it is excluded, as a class and as a base,
+    // and its classes lower as before the index existed (concrete
+    // structs) rather than joining the wrong subtree.
+    let mut defined_in: BTreeMap<String, usize> = BTreeMap::new();
+    let per_module = crate_emitted_classes(this_classes, options);
     for (_, defs) in &per_module {
         for c in defs {
             *defined_in.entry(c.name.clone()).or_insert(0) += 1;

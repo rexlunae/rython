@@ -169,6 +169,16 @@ pub(crate) fn is_enum_base_name(id: &str) -> bool {
 /// or another custom exception (`IDNABidiError(IDNAError)`) is an exception
 /// class too. Lowered as a marker struct; the runtime matches exceptions by
 /// name string, so the class carries no data.
+///
+/// Exception-ness is TRANSITIVE through the crate: `Root(Exception)`,
+/// `Mid(Root)`, `LeafError(Mid)` are all exception classes whatever they
+/// are named, so a neutral-named intermediate lowers as a marker like
+/// its base (judged by its own bases alone, `Mid` lowered as an ordinary
+/// class with a trait over a marker base, E0405 — Devin review on #330).
+/// The closure is computed once per conversion over every emitted class
+/// of the crate (`compute_exception_classes`) and mirrored into a
+/// registry the many call sites without options in hand consult, the
+/// way the hierarchy roots are.
 pub fn is_exception_class(class: &ClassDef) -> bool {
     // The canonical predicate from the raise lowering: the builtin set
     // plus the naming convention. (The convention alone previously missed
@@ -180,9 +190,65 @@ pub fn is_exception_class(class: &ClassDef) -> bool {
         return true;
     }
     class.bases.iter().any(|b| match b {
-        ExprType::Name(n) => is_exception(&n.id),
+        ExprType::Name(n) => is_exception(&n.id) || is_registered_exception_class(&n.id),
         _ => false,
     })
+}
+
+thread_local! {
+    /// The exception classes of the conversion in progress, by bare
+    /// name: the transitive closure over the crate's emitted classes.
+    /// Set by `install_exception_classes` when the module computes its
+    /// indexes; empty outside module generation (then the convention
+    /// and the direct bases alone decide).
+    static EXCEPTION_CLASSES: std::cell::RefCell<std::rc::Rc<std::collections::HashSet<String>>> =
+        std::cell::RefCell::new(std::rc::Rc::new(std::collections::HashSet::new()));
+}
+
+/// Whether `name` is an exception class of the conversion in progress.
+pub fn is_registered_exception_class(name: &str) -> bool {
+    EXCEPTION_CLASSES.with(|r| r.borrow().contains(name))
+}
+
+/// Mirror the computed closure into the registry.
+pub fn install_exception_classes(classes: &std::collections::HashSet<String>) {
+    EXCEPTION_CLASSES.with(|r| *r.borrow_mut() = std::rc::Rc::new(classes.clone()));
+}
+
+/// The transitive closure of exception-ness over every emitted class of
+/// the crate: a class whose name or a base follows the convention, or
+/// whose base is itself in the closure — to a fixpoint. Keyed by bare
+/// name, like the hierarchy index; a name two modules define differently
+/// is an exception if either definition is (the marker lowering is the
+/// conservative side: a class lowered as a marker never fails to build).
+pub fn compute_exception_classes(
+    this_classes: &[ClassDef],
+    options: &crate::PythonOptions,
+) -> std::collections::HashSet<String> {
+    let per_module = crate::ast::tree::hierarchy::crate_emitted_classes(this_classes, options);
+    let all: Vec<&ClassDef> = per_module.iter().flat_map(|(_, defs)| defs.iter()).collect();
+    let is_exception = crate::ast::tree::raise_stmt::is_exception_class_name;
+    let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let before = set.len();
+        for c in &all {
+            if set.contains(&c.name) {
+                continue;
+            }
+            let yes = is_exception(&c.name)
+                || c.bases.iter().any(|b| match b {
+                    ExprType::Name(n) => is_exception(&n.id) || set.contains(&n.id),
+                    _ => false,
+                });
+            if yes {
+                set.insert(c.name.clone());
+            }
+        }
+        if set.len() == before {
+            break;
+        }
+    }
+    set
 }
 
 impl ClassDef {

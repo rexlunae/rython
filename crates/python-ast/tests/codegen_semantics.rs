@@ -19337,3 +19337,155 @@ fn the_mutable_visitor_twin_agrees_with_the_immutable_one() {
     assert!(seen_ro.len() > 40, "the expression exercises the forms: {}", seen_ro.len());
     assert_eq!(seen_ro, seen_mut, "the two enumerations diverged");
 }
+
+#[test]
+fn exception_arguments_bind_once_even_when_a_caller_name_matches_a_parameter() {
+    // `E(b, "second")` for `__init__(self, a, b)`: the message's `a`
+    // means the caller's `b`, bound once — the raise-site rewrite never
+    // re-substitutes a replacement, and no leftover check mistakes the
+    // caller's name for the parameter (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Pair(Exception):\n",
+            "    def __init__(self, a: str, b: str):\n",
+            "        super().__init__(f\"{a}\")\n",
+            "        self.a = a\n",
+            "        self.b = b\n",
+            "\n",
+            "def f(b: str) -> None:\n",
+            "    raise Pair(b, \"second\")\n",
+        ),
+        "raise_collide.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("(\"a\" . to_string () , stdpython :: PyValue :: from (b))"), "generated: {}", out);
+    assert!(out.contains("(\"b\" . to_string () , stdpython :: PyValue :: from (\"second\"))"), "generated: {}", out);
+    // A lambda or a comprehension in the message binds names of its own
+    // the rewrite cannot model: refused at the site.
+    let out = compile(
+        concat!(
+            "class Listing(Exception):\n",
+            "    def __init__(self, items: list[str]):\n",
+            "        super().__init__(\", \".join(i for i in items))\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Listing([\"x\"])\n",
+        ),
+        "raise_comprehension_msg.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("lambda or a comprehension"), "generated: {}", out);
+}
+
+#[test]
+fn exception_ness_and_the_ancestor_chain_are_transitive() {
+    // `Root(Exception)`, `Mid(Root)`, `LeafError(Mid)`: Mid IS an
+    // exception class (a marker, no trait machinery) and LeafError's
+    // ancestors record Mid, so `except Mid:` catches it (Devin review on
+    // #330).
+    let out = compile(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "class Mid(Root):\n",
+            "    pass\n",
+            "\n",
+            "class LeafError(Mid):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise LeafError(\"leaf\")\n",
+        ),
+        "raise_neutral_mid.py",
+    );
+    assert!(!out.contains("MidTrait"), "generated: {}", out);
+    assert!(
+        out.contains("vec ! [(\"Mid\") . to_string () , (\"Root\") . to_string () , (\"Exception\") . to_string ()]"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn a_zero_argument_super_init_keeps_the_fields_and_no_super_call_keeps_the_argument() {
+    // `super().__init__()` is the empty message with the fields kept;
+    // no super call at all leaves `str(e)` to BaseException.__new__: the
+    // one positional argument, or empty; two would be the tuple's repr,
+    // refused; so is a two-argument super call (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Bare(Exception):\n",
+            "    def __init__(self, code: int):\n",
+            "        super().__init__()\n",
+            "        self.code = code\n",
+            "\n",
+            "class Silent(Exception):\n",
+            "    def __init__(self, code: int):\n",
+            "        self.code = code\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Bare(9)\n",
+            "\n",
+            "def g() -> None:\n",
+            "    raise Silent(5)\n",
+        ),
+        "raise_zero_arg_super.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("(\"Bare\" , String :: new () , vec ! [(\"code\" . to_string () , stdpython :: PyValue :: from (9))]"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("(\"Silent\" , format ! (\"{}\" , 5) , vec ! [(\"code\" . to_string () , stdpython :: PyValue :: from (5))]"),
+        "generated: {}",
+        out
+    );
+    let out = compile(
+        concat!(
+            "class Two(Exception):\n",
+            "    def __init__(self, a: int, b: int):\n",
+            "        super().__init__(a, b)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Two(1, 2)\n",
+        ),
+        "raise_two_arg_super.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("more than one argument"), "generated: {}", out);
+    let out = compile(
+        concat!(
+            "class Silent2(Exception):\n",
+            "    def __init__(self, a: int, b: int):\n",
+            "        self.a = a\n",
+            "        self.b = b\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Silent2(1, 2)\n",
+        ),
+        "raise_two_arg_no_super.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("never calls `super().__init__`"), "generated: {}", out);
+}
+
+#[test]
+fn not_implemented_is_the_identity_fallback_only_in_a_method_named_eq() {
+    // A FREE function named `__eq__` is an ordinary function: its
+    // `return NotImplemented` stays the loud refusal (Devin review on
+    // #330).
+    let out = compile(
+        concat!(
+            "def __eq__(a: int, b: int) -> bool:\n",
+            "    if a < 0:\n",
+            "        return NotImplemented\n",
+            "    return a == b\n",
+        ),
+        "notimpl_free_eq.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("outside `__eq__`"), "generated: {}", out);
+}
