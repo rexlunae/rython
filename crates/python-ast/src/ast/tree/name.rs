@@ -123,11 +123,17 @@ impl CodeGen for Name {
             // classes as values lower to their NAME STRINGS (round 33
             // design — the exception model is string-tagged). The raw
             // Python spelling, matching what the raise side emits.
+            // A BUILTIN exception class read as a value (`Base =
+            // ValueError`, the module-level alias a base or a handler
+            // then spells) is its name string too, unless a binding
+            // shadows the name (Devin review on #330).
             if matches!(symbols.get(&self.id), Some(crate::SymbolTableNode::ClassDef(_)))
                 || matches!(symbols.get(&self.id), Some(crate::SymbolTableNode::Alias(c))
                     if matches!(symbols.get(c), Some(crate::SymbolTableNode::ClassDef(_))))
                 || (matches!(symbols.get(&self.id), Some(crate::SymbolTableNode::ImportFrom(_)))
                     && crate::resolve_class_referenced(&self.id, &symbols, &options).is_some())
+                || (symbols.get(&self.id).is_none()
+                    && crate::ast::tree::raise_stmt::is_builtin_exception_name(&self.id))
             {
                 let name = self.id.clone();
                 return Ok(quote!(#name.to_string()));

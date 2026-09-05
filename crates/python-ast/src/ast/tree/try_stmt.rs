@@ -713,12 +713,14 @@ fn exception_match_guard(
             // `from socket import timeout as SocketTimeout` — urllib3):
             // canonicalize to the builtin, matching the raise side
             // (issue #137).
-            let n = crate::ast::tree::raise_stmt::imported_exception_alias(
-                &name.id,
-                symbols,
-                Some(options),
+            // A USER class named through an alias (`except R:` under
+            // `R = Root`, `import Root as R`) is its definition's name —
+            // the name the raise's ancestor chain records (Devin review
+            // on #330). One canonicalizer for both.
+            let n = crate::ast::tree::raise_stmt::canonical_exception_class(
+                &name.id, symbols, options,
             )
-            .map(str::to_string)
+            .map(|(n, _)| n)
             .unwrap_or_else(|| name.id.clone());
             // Round 52: a literal BUILTIN clause (`except ValueError:`)
             // lowers to the discriminant comparison — the class name is

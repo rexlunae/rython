@@ -3868,3 +3868,30 @@ fn a_user_exception_over_a_builtin_is_caught_by_the_builtin_handler() {
     assert!(!e.matches_builtin(B::KeyError), "siblings do not catch");
     assert!(!e.matches_builtin(B::LookupError));
 }
+
+#[test]
+fn a_user_exception_over_base_exception_is_not_an_exception() {
+    // `class Exit(BaseException)`: the recorded chain decides — caught by
+    // `except BaseException:`, not by `except Exception:` (Devin review
+    // on #330). A chain with no builtin in it keeps the broad posture.
+    use stdpython::{BuiltinException as B, PyException};
+    let e = PyException::new_with_attrs_and_ancestors(
+        "Exit",
+        "bye",
+        vec![],
+        vec!["BaseException".to_string()],
+    );
+    assert!(e.matches_builtin(B::BaseException));
+    assert!(!e.matches_builtin(B::Exception));
+    assert!(e.matches("BaseException"));
+    assert!(!e.matches("Exception"));
+    let unknown = PyException::new_with_attrs_and_ancestors(
+        "Odd",
+        "x",
+        vec![],
+        vec!["SomeImportedError".to_string()],
+    );
+    assert!(unknown.matches_builtin(B::Exception));
+    assert!(unknown.matches("Exception"));
+    assert!(!unknown.matches_builtin(B::ValueError));
+}

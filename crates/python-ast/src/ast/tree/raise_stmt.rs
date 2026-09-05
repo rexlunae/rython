@@ -869,23 +869,61 @@ pub(crate) fn exception_ancestors(
         // holds each of them whatever it is named (`Root(Exception)`,
         // `Mid(Root)`, `LeafError(Mid)`: `except Mid:` catches a
         // LeafError; judging each hop by its own name dropped Mid —
-        // Devin review on #330). The chain ends at the first base with
-        // no definition in the crate: a builtin exception by name, else
-        // an import the model does not follow.
-        match crate::ast::tree::call::resolve_construction_class(&base.id, &scope, options) {
-            Some(next) => {
-                ancestors.push(base.id.clone());
+        // Devin review on #330), recorded by its CANONICAL name (a base
+        // named through an alias, `R = Root` or `import Root as R`, is
+        // Root; the alias spelling would miss `except Root:` — Devin
+        // review on #330). The chain ends at the first base with no
+        // definition in the crate: a builtin exception by name, else an
+        // import the model does not follow.
+        match canonical_exception_class(&base.id, &scope, options) {
+            Some((name, Some(next))) => {
+                ancestors.push(name);
                 cur = Some(next);
             }
-            None => {
-                if is_exception_class_name(&base.id) {
-                    ancestors.push(base.id.clone());
-                }
+            Some((name, None)) => {
+                ancestors.push(name);
                 break;
             }
+            None => break,
         }
     }
     ancestors
+}
+
+/// The canonical name of an exception class as a handler, a raise, a
+/// base, or an `issubclass` operand spells it — the one place an alias
+/// resolves: a class of the crate (local, imported, or through `R =
+/// Root`) is its definition's name, with the definition and its scope;
+/// a stdlib alias (`socket.timeout`, `import timeout as T`) or a local
+/// alias of a builtin (`Base = ValueError`) is the builtin; a bare
+/// exception-named binding the model does not follow is itself. None
+/// for a name that is no exception class.
+pub(crate) fn canonical_exception_class(
+    name: &str,
+    scope: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<(String, Option<(crate::ClassDef, SymbolTableScopes)>)> {
+    if let Some((cls, cls_scope)) =
+        crate::ast::tree::call::resolve_construction_class(name, scope, options)
+    {
+        return Some((cls.name.clone(), Some((cls, cls_scope))));
+    }
+    if let Some(builtin) = imported_exception_alias(name, scope, Some(options)) {
+        return Some((builtin.to_string(), None));
+    }
+    // A local alias chain (`Base = ValueError`) ending at a builtin's
+    // own name.
+    let mut current = name.to_string();
+    for _ in 0..8 {
+        match scope.get(&current) {
+            Some(SymbolTableNode::Alias(canonical)) => current = canonical.clone(),
+            Some(SymbolTableNode::Assign { value: ExprType::Name(v), .. }) => {
+                current = v.id.clone()
+            }
+            _ => break,
+        }
+    }
+    is_exception_class_name(&current).then_some((current, None))
 }
 
 /// The ancestor chain as tokens for `new_with_attrs_and_ancestors`.

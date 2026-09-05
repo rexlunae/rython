@@ -357,8 +357,11 @@ impl CodeGen for Module {
             // Exception-ness first (class_def.rs): the roots exclude
             // exception classes, transitively (`Mid(Root)` over
             // `Root(Exception)` is one).
-            let exceptions =
-                crate::ast::tree::class_def::compute_exception_classes(&items, &options);
+            let exceptions = crate::ast::tree::class_def::compute_exception_classes(
+                &self.raw.body,
+                &items,
+                &options,
+            );
             crate::ast::tree::class_def::install_exception_classes(&exceptions);
             let roots = crate::ast::tree::hierarchy::compute_roots(&items, &options);
             crate::ast::tree::hierarchy::install_roots(&roots);

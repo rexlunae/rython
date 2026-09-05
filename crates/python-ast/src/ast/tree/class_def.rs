@@ -205,6 +205,32 @@ thread_local! {
         std::cell::RefCell::new(std::rc::Rc::new(std::collections::HashSet::new()));
 }
 
+/// A module's top-level bindings of one name to another — `X = Y` and
+/// `from m import Y as X` — the alias spellings a base may use.
+fn top_level_name_aliases(body: &[crate::Statement]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for s in body {
+        match &s.statement {
+            crate::StatementType::Assign(a) => {
+                if let ([ExprType::Name(t)], ExprType::Name(v)) = (a.targets.as_slice(), &a.value) {
+                    out.push((t.id.clone(), v.id.clone()));
+                }
+            }
+            crate::StatementType::ImportFrom(i) => {
+                for a in &i.names {
+                    if let Some(asname) = &a.asname
+                        && asname != &a.name
+                    {
+                        out.push((asname.clone(), a.name.clone()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Whether `name` is an exception class of the conversion in progress.
 pub fn is_registered_exception_class(name: &str) -> bool {
     EXCEPTION_CLASSES.with(|r| r.borrow().contains(name))
@@ -225,33 +251,74 @@ pub fn install_exception_classes(classes: &std::collections::HashSet<String>) {
 /// erased by an exception `Node(Root)` in another; Devin review on
 /// #330), with a definition warning when the exclusion loses a
 /// transitive exception.
+///
+/// A module-level ALIAS of an exception class (`Base = ValueError`, `R =
+/// Root`) is a name a base may spell, so it joins the closure in its
+/// module's terms — `class Bad(Base)` is an exception class (Devin
+/// review on #330); an alias name counts toward ambiguity like a class
+/// name.
 pub fn compute_exception_classes(
+    this_body: &[crate::Statement],
     this_classes: &[ClassDef],
     options: &crate::PythonOptions,
 ) -> std::collections::HashSet<String> {
     let per_module = crate::ast::tree::hierarchy::crate_emitted_classes(this_classes, options);
-    let all: Vec<&ClassDef> = per_module.iter().flat_map(|(_, defs)| defs.iter()).collect();
+    // (class, its module's top-level `X = Y` aliases)
+    let mut all: Vec<(&ClassDef, std::rc::Rc<Vec<(String, String)>>)> = Vec::new();
+    let mut alias_names: Vec<(String, String)> = Vec::new();
+    for (path, defs) in &per_module {
+        let aliases: Vec<(String, String)> = match path {
+            None => top_level_name_aliases(this_body),
+            Some(p) => options
+                .module_defs
+                .get(p)
+                .map(|m| top_level_name_aliases(&m.raw.body))
+                .unwrap_or_default(),
+        };
+        alias_names.extend(aliases.iter().cloned());
+        let aliases = std::rc::Rc::new(aliases);
+        for c in defs {
+            all.push((c, aliases.clone()));
+        }
+    }
     let mut defined_in: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for c in &all {
+    for (c, _) in &all {
         *defined_in.entry(c.name.as_str()).or_insert(0) += 1;
+    }
+    for (a, _) in &alias_names {
+        *defined_in.entry(a.as_str()).or_insert(0) += 1;
     }
     let unambiguous = |name: &str| defined_in.get(name).copied().unwrap_or(0) == 1;
     let is_exception = crate::ast::tree::raise_stmt::is_exception_class_name;
+    // A base name through its module's alias chain.
+    let canonical = |name: &str, aliases: &[(String, String)]| -> String {
+        let mut cur = name.to_string();
+        for _ in 0..8 {
+            match aliases.iter().find(|(a, _)| *a == cur) {
+                Some((_, target)) => cur = target.clone(),
+                None => break,
+            }
+        }
+        cur
+    };
     let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let closure_says = |c: &ClassDef, set: &std::collections::HashSet<String>| {
+    let closure_says = |c: &ClassDef, aliases: &[(String, String)], set: &std::collections::HashSet<String>| {
         is_exception(&c.name)
             || c.bases.iter().any(|b| match b {
-                ExprType::Name(n) => is_exception(&n.id) || (unambiguous(&n.id) && set.contains(&n.id)),
+                ExprType::Name(n) => {
+                    let base = canonical(&n.id, aliases);
+                    is_exception(&base) || (unambiguous(&base) && set.contains(&base))
+                }
                 _ => false,
             })
     };
     loop {
         let before = set.len();
-        for c in &all {
+        for (c, aliases) in &all {
             if set.contains(&c.name) || !unambiguous(&c.name) {
                 continue;
             }
-            if closure_says(c, &set) {
+            if closure_says(c, aliases, &set) {
                 set.insert(c.name.clone());
             }
         }
@@ -259,8 +326,19 @@ pub fn compute_exception_classes(
             break;
         }
     }
-    for c in &all {
-        if !unambiguous(&c.name) && closure_says(c, &set) && !is_exception_class(c) {
+    // The alias names whose target is an exception: what `is_exception_class`
+    // sees in a base position.
+    for (alias, _) in &alias_names {
+        if !unambiguous(alias) {
+            continue;
+        }
+        let target = canonical(alias, &alias_names);
+        if is_exception(&target) || (unambiguous(&target) && set.contains(&target)) {
+            set.insert(alias.clone());
+        }
+    }
+    for (c, aliases) in &all {
+        if !unambiguous(&c.name) && closure_says(c, aliases, &set) && !is_exception_class(c) {
             options.definition_warnings.borrow_mut().push(format!(
                 "class `{}` is defined by more than one module of the crate: its \
                  exception-ness through the crate's class chain is not tracked (the \

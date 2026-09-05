@@ -6419,17 +6419,27 @@ impl PyException {
     pub fn matches_builtin(&self, target: crate::builtin_exceptions::BuiltinException) -> bool {
         use crate::builtin_exceptions::BuiltinException;
         let Some(raised) = self.discriminant else {
-            // A raised user class: caught by `except Exception:` /
-            // `except BaseException:`, and by any BUILTIN in its
-            // recorded ancestor chain (`class MyError(ValueError)` is
-            // caught by `except ValueError:` — the chain the construction
-            // attached; the evaluation on issue #137).
-            return target == BuiltinException::Exception
-                || target == BuiltinException::BaseException
-                || self.user_ancestors.iter().any(|a| {
-                    BuiltinException::from_name(a)
-                        .is_some_and(|b| b == target || b.ancestors().contains(&target))
-                });
+            // A raised user class: caught by any BUILTIN in its recorded
+            // ancestor chain and that builtin's ancestors (`class
+            // MyError(ValueError)` is caught by `except ValueError:` and
+            // `except Exception:`; `class Exit(BaseException)` by `except
+            // BaseException:` and NOT by `except Exception:` — the chain
+            // the construction attached decides; Devin review on #330).
+            // Only a chain with no builtin in it (none attached, or one
+            // that leaves the crate) keeps the broad posture:
+            // Exception/BaseException catch it.
+            let builtins: alloc::vec::Vec<BuiltinException> = self
+                .user_ancestors
+                .iter()
+                .filter_map(|a| BuiltinException::from_name(a))
+                .collect();
+            if builtins.is_empty() {
+                return target == BuiltinException::Exception
+                    || target == BuiltinException::BaseException;
+            }
+            return builtins
+                .iter()
+                .any(|b| *b == target || b.ancestors().contains(&target));
         };
         if raised == target {
             return true;
@@ -6491,7 +6501,15 @@ impl PyException {
         }) {
             return true;
         }
-        name == "Exception" || name == "BaseException"
+        // The broad posture only for a chain with no builtin in it (none
+        // attached, or one that leaves the crate): a chain that reaches a
+        // builtin decided above — `class Exit(BaseException)` is not an
+        // Exception (Devin review on #330).
+        let chain_has_builtin = self.user_ancestors.iter().any(|a| {
+            crate::builtin_exceptions::canonical_name(a).is_some()
+                || BUILTIN_EXCEPTION_MRO.iter().any(|(n, _)| n == a)
+        });
+        !chain_has_builtin && (name == "Exception" || name == "BaseException")
     }
 
     /// Whether an `except <value>:` clause with a BOXED runtime value

@@ -1649,6 +1649,11 @@ fn resolve_construction_class_depth(
         Some(SymbolTableNode::Alias(canonical)) => {
             resolve_construction_class_depth(canonical, symbols, options, depth + 1)
         }
+        // A module-level rebinding of a class (`R = Root`): the class
+        // (Devin review on #330).
+        Some(SymbolTableNode::Assign { value: ExprType::Name(v), .. }) => {
+            resolve_construction_class_depth(&v.id, symbols, options, depth + 1)
+        }
         Some(SymbolTableNode::ImportFrom(i)) => {
             let path = i.resolved_module_path(options);
             if options.module_defs.contains_key(&path) {
@@ -2595,18 +2600,28 @@ impl<'a> CodeGen for Call {
                         // True when C2 is in the chain or in that MRO.
                         // C2's canonical name (an alias —
                         // `EnvironmentError` IS `OSError`) is its MRO head.
+                        // Both operands by their canonical names (an
+                        // alias `R = Root` is Root — Devin review on #330).
+                        let canon = |name: &str| {
+                            crate::ast::tree::raise_stmt::canonical_exception_class(
+                                name, &symbols, &options,
+                            )
+                            .unwrap_or((name.to_string(), None))
+                        };
+                        let (c2_name, _) = canon(&c2.id);
                         let mro = crate::ast::tree::raise_stmt::builtin_exception_mro;
-                        let target: &str = mro(&c2.id)?
+                        let target: &str = mro(&c2_name)?
                             .and_then(|m| m.first())
                             .map(|s| s.as_str())
-                            .unwrap_or(&c2.id);
-                        let mut chain: Vec<String> = vec![c1.id.clone()];
-                        if let Some((cls, scope)) = resolve(&c1.id) {
+                            .unwrap_or(&c2_name);
+                        let (c1_name, c1_class) = canon(&c1.id);
+                        let mut chain: Vec<String> = vec![c1_name];
+                        if let Some((cls, scope)) = c1_class {
                             chain.extend(crate::ast::tree::raise_stmt::exception_ancestors(
                                 &cls, &scope, &options,
                             ));
                         }
-                        let mut found = chain.iter().any(|n| *n == c2.id || n == target);
+                        let mut found = chain.iter().any(|n| *n == c2_name || n == target);
                         if !found {
                             let last = chain.last().expect("c1 itself");
                             match mro(last)? {

@@ -19755,3 +19755,54 @@ fn a_variadic_exception_init_forwarding_something_else_is_loud() {
     assert!(out.contains("compile_error !"), "generated: {}", out);
     assert!(out.contains("not its own `*args`"), "generated: {}", out);
 }
+
+#[test]
+fn an_aliased_base_is_recorded_by_its_canonical_name_everywhere() {
+    // `R = Root`, `class LeafError(R)`: the ancestor chain records Root,
+    // `except R:` matches "Root", `issubclass(LeafError, R)` folds, and
+    // a module-level alias of a builtin (`Base = ValueError`) makes
+    // `class Bad(Base)` an exception class over ValueError (Devin review
+    // on #330).
+    let out = compile(
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "R = Root\n",
+            "\n",
+            "class LeafError(R):\n",
+            "    pass\n",
+            "\n",
+            "Base = ValueError\n",
+            "\n",
+            "class Bad(Base):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> None:\n",
+            "    try:\n",
+            "        raise LeafError(\"leaf\")\n",
+            "    except R as e:\n",
+            "        print(e)\n",
+            "    raise Bad(\"bad\")\n",
+            "\n",
+            "def g() -> None:\n",
+            "    print(issubclass(LeafError, R), issubclass(Bad, Exception))\n",
+        ),
+        "raise_alias_base.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("(\"LeafError\" , format ! (\"{}\" , \"leaf\") , vec ! [] , vec ! [(\"Root\") . to_string () , (\"Exception\") . to_string ()])"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("__rython_exc . matches (\"Root\")"), "generated: {}", out);
+    assert!(!out.contains("matches (\"R\")"), "generated: {}", out);
+    assert!(
+        out.contains("(\"Bad\" , format ! (\"{}\" , \"bad\") , vec ! [] , vec ! [(\"ValueError\") . to_string ()])"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("(& (true)) , py_display (& (true))"), "generated: {}", out);
+    assert!(out.contains("PyValue :: from (\"ValueError\" . to_string ())"), "generated: {}", out);
+}
