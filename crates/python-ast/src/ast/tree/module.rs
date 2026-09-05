@@ -113,6 +113,21 @@ impl CodeGen for Module {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut stream = TokenStream::new();
 
+        // A name under the conversion's own temporary prefix is refused
+        // at the module: the generated `__rython_*` bindings would shadow
+        // it, or it them, silently (Devin review on #331).
+        if let Some((name, line)) = crate::ast::tree::visit::reserved_prefix_binding(&self.raw.body) {
+            return Err(format!(
+                "`{name}` (line {line}) binds a name under the `{}` prefix, which rython \
+                 reserves for the temporaries it emits into the generated crate (a \
+                 bound receiver, a captured argument, a loaded value); the program's \
+                 binding and the temporaries would shadow each other silently, so \
+                 rython refuses it — rename the binding",
+                crate::ast::tree::visit::RESERVED_PREFIX
+            )
+            .into());
+        }
+
         // Issue #137: a module-level `try/except ImportError` guard whose
         // try body's imports are ALL statically unresolvable (external to
         // the crate, the runtime, and the vendored deps) FAILS at runtime

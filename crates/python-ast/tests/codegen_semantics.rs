@@ -20830,6 +20830,42 @@ fn a_shared_read_modify_write_reads_the_target_once_before_the_operand() {
 }
 
 #[test]
+fn a_binding_under_the_reserved_temporary_prefix_is_refused() {
+    // `__rython_recv`, `__rython_load`, ... are the conversion's own
+    // temporaries in the generated crate: a program binding such a name
+    // (a local, a parameter, a def, a loop target, a walrus) would be
+    // shadowed by them, or shadow them, silently — refused at the
+    // module, naming the binding and its line (Devin review on #331).
+    let err = compile_err(
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "def pick(cs: list[Counter]) -> Counter:\n",
+            "    return cs[0]\n",
+            "\n",
+            "def f() -> None:\n",
+            "    cs = [Counter()]\n",
+            "    __rython_recv = 5\n",
+            "    pick(cs).n += __rython_recv\n",
+        ),
+        "reserved_local.py",
+    );
+    assert!(err.contains("`__rython_recv` (line 10)") && err.contains("reserves"), "error: {}", err);
+    let err = compile_err(
+        concat!("def g(__rython_load: int) -> int:\n", "    return __rython_load\n"),
+        "reserved_param.py",
+    );
+    assert!(err.contains("`__rython_load` (line 1)"), "error: {}", err);
+    let err = compile_err(
+        concat!("def h(xs: list[int]) -> int:\n", "    return sum((__rython_val := x) for x in xs)\n"),
+        "reserved_walrus.py",
+    );
+    assert!(err.contains("`__rython_val`"), "error: {}", err);
+}
+
+#[test]
 fn a_parameter_or_local_named_not_implemented_is_a_value() {
     // A parameter or a local named `NotImplemented` shadows the singleton
     // in `__eq__`: the return is that value — no decline, no identity
