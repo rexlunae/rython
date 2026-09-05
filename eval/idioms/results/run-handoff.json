@@ -1,10 +1,10 @@
 {
-  "converter_commit": "4cb6df3",
-  "repo_head": "4cb6df3",
+  "converter_commit": "fbccc0a",
+  "repo_head": "fbccc0a",
   "rypip_path": "target/release/rypip",
   "oracle": "CPython 3.11.15",
-  "passed": 12,
-  "total": 14,
+  "passed": 13,
+  "total": 15,
   "passing": [
     "bank",
     "clauses",
@@ -13,6 +13,7 @@
     "ledger",
     "matrix",
     "records",
+    "rmw",
     "shapes",
     "text_stats",
     "tokenizer",
@@ -63,6 +64,11 @@
     },
     "records": {
       "program": "records",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "rmw": {
+      "program": "rmw",
       "warnings": 0,
       "status": "pass"
     },
