@@ -624,6 +624,201 @@ mod tests {
     // Tests would go here - currently commented out as they need full AST infrastructure
     // create_parse_test!(test_simple_raise, "raise ValueError('error')", "test.py");
 }
+/// What an exception `__init__` passes to `super().__init__`: nothing,
+/// one message expression, or its own `*args` (the variadic forwarder).
+pub(crate) enum SuperMessage {
+    Empty,
+    Expr(crate::ExprType),
+    Forwarded,
+}
+
+/// Classify an exception `__init__` body into the model — the
+/// `super().__init__` call (at most one: a second would replace the
+/// first's `args`, refused) and the `self.<field> = <param>` stores, the
+/// LAST store of a field winning as in Python — or the refusal message
+/// for the first statement the model does not run. Walks the body
+/// through the one statement visitor; a modeled statement has no
+/// bodies, and an unmodeled one stops the walk at its head.
+pub(crate) fn classify_exception_init<'a>(
+    cls: &crate::ClassDef,
+    body: &'a [crate::Statement],
+    params: &[&'a str],
+) -> Result<(Option<SuperMessage>, Vec<(String, &'a str)>), String> {
+    use crate::ast::tree::visit::{Descend, Flow, is_self, walk_stmts};
+    use crate::{ExprType, StatementType};
+    let mut super_init: Option<SuperMessage> = None;
+    let mut fields: Vec<(String, &'a str)> = Vec::new(); // (field, param)
+    let mut refusal: Option<String> = None;
+    walk_stmts(body, Descend::OwnScope, &mut |stmt| {
+        let modeled = match &stmt.statement {
+            StatementType::Assign(a) => {
+                if let [ExprType::Attribute(attr)] = a.targets.as_slice()
+                    && is_self(&attr.value)
+                    && let ExprType::Name(v) = &a.value
+                    && let Some(param) = params.iter().find(|p| **p == v.id)
+                {
+                    if let Some(existing) = fields.iter_mut().find(|(f, _)| *f == attr.attr) {
+                        existing.1 = param;
+                    } else {
+                        fields.push((attr.attr.clone(), param));
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            StatementType::Expr(e) => match &e.value {
+                ExprType::Call(sc) => {
+                    let is_super_init = match sc.func.as_ref() {
+                        ExprType::Attribute(attr) if attr.attr == "__init__" => {
+                            matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "super")
+                                || matches!(attr.value.as_ref(), ExprType::Call(c2)
+                                    if matches!(c2.func.as_ref(), ExprType::Name(n) if n.id == "super"))
+                        }
+                        _ => false,
+                    };
+                    if is_super_init {
+                        if super_init.is_some() {
+                            refusal = Some(format!(
+                                "rython: `{}.__init__` (line {}) calls `super().__init__` a \
+                                 second time, which replaces the exception's args; rython's \
+                                 one-message model refuses to pick either call silently — \
+                                 keep one call",
+                                cls.name,
+                                stmt.lineno.unwrap_or(0)
+                            ));
+                            return Flow::Stop;
+                        }
+                        // The forwarder: `super().__init__(*args)` or
+                        // `(*args, **kwargs)`, its own variadics only.
+                        let forwards = matches!(sc.args.as_slice(), [ExprType::Starred(_)])
+                            && sc.keywords.iter().all(|k| k.arg.is_none());
+                        if forwards {
+                            super_init = Some(SuperMessage::Forwarded);
+                        } else if sc.args.len() > 1
+                            || !sc.keywords.is_empty()
+                            || matches!(sc.args.first(), Some(ExprType::Starred(_)))
+                        {
+                            // `BaseException.__init__(a, b)` sets `args`
+                            // to the tuple and `str(e)` to ITS repr
+                            // (`('a', 'b')`), which the one-message model
+                            // does not render.
+                            refusal = Some(format!(
+                                "rython: `{}.__init__` calls `super().__init__` with more \
+                                 than one argument: `str(e)` is then the repr of the args \
+                                 tuple, which rython's one-message exception model does not \
+                                 reproduce; pass one message and store the rest as fields",
+                                cls.name
+                            ));
+                            return Flow::Stop;
+                        } else {
+                            super_init = Some(match sc.args.first() {
+                                None => SuperMessage::Empty,
+                                Some(m) => SuperMessage::Expr(m.clone()),
+                            });
+                        }
+                    }
+                    is_super_init
+                }
+                ExprType::Constant(c) => matches!(&c.0, Some(litrs::Literal::String(_))),
+                _ => false,
+            },
+            StatementType::Pass => true,
+            _ => false,
+        };
+        if modeled {
+            Flow::Skip
+        } else {
+            refusal = Some(format!(
+                "rython: `{}.__init__` (line {}) has a statement beyond `self.<field> = \
+                 <param>` stores and the `super().__init__(<message>)` call: rython models \
+                 an exception class's construction as its message and its stored fields, \
+                 so that statement would not run at `raise {}(...)`; rython refuses to \
+                 silently drop it. Move the logic to the raise site, or store the value \
+                 as a field",
+                cls.name,
+                stmt.lineno.unwrap_or(0),
+                cls.name
+            ));
+            Flow::Stop
+        }
+    });
+    match refusal {
+        Some(msg) => Err(msg),
+        None => Ok((super_init, fields)),
+    }
+}
+
+/// A raise of a class whose `__init__` is variadic (`*args` / `**kwargs`):
+/// nothing binds by name, so the body may only forward to
+/// `super().__init__(*args)` (a docstring and `pass` aside); the message
+/// is then the raise's one positional argument per `BaseException`, or
+/// empty for none; a keyword (BaseException takes none — a TypeError in
+/// CPython) and two or more positionals (the args tuple's repr) are loud.
+fn variadic_exception_raise(
+    cls: &crate::ClassDef,
+    init: &crate::FunctionDef,
+    call: &crate::Call,
+    ctx: crate::CodeGenContext,
+    options: crate::PythonOptions,
+    symbols: crate::SymbolTableScopes,
+    class_symbols: &crate::SymbolTableScopes,
+) -> Result<Option<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
+    let site_error = |msg: String| -> Result<Option<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
+        Ok(Some(quote::quote!(compile_error!(#msg))))
+    };
+    let (super_init, fields) = match classify_exception_init(cls, &init.body, &[]) {
+        Ok(model) => model,
+        Err(msg) => return site_error(msg),
+    };
+    debug_assert!(fields.is_empty(), "no parameter to store");
+    if let Some(SuperMessage::Expr(_) | SuperMessage::Empty) = super_init {
+        return site_error(format!(
+            "rython: `{}.__init__` takes `*args` but does not forward them to \
+             `super().__init__(*args)`: the message would not be the raise's argument; \
+             forward the arguments, or name the parameters",
+            cls.name
+        ));
+    }
+    if !call.keywords.is_empty() {
+        return site_error(format!(
+            "rython: `{}()` takes no keyword arguments (BaseException.__init__ accepts \
+             none)",
+            cls.name
+        ));
+    }
+    let msg = match call.args.as_slice() {
+        [] => quote::quote!(String::new()),
+        [crate::ExprType::Starred(_)] => {
+            return site_error(format!(
+                "rython: `raise {}(*...)`: a starred argument to an exception constructor \
+                 is not modeled; pass the arguments explicitly",
+                cls.name
+            ));
+        }
+        [one] => {
+            let m = message_arg(one, ctx, options.clone(), symbols)?;
+            quote::quote!(format!("{}", #m))
+        }
+        many => {
+            return site_error(format!(
+                "rython: `{}.__init__` forwards its {} positional arguments to \
+                 `super().__init__`, so `str(e)` is their tuple's repr, which rython's \
+                 one-message exception model does not reproduce; pass one message",
+                cls.name,
+                many.len()
+            ));
+        }
+    };
+    let kind = &cls.name;
+    let ancestor_tokens = exception_ancestor_tokens(cls, class_symbols, &options);
+    Ok(Some(quote::quote! {
+        stdpython :: PyException :: new_with_attrs_and_ancestors (
+            #kind , #msg , vec ! [] , vec ! [#(#ancestor_tokens),*]
+        )
+    }))
+}
+
 /// The ancestor chain of an in-crate exception class, base-most last
 /// (`InsufficientFunds` → `["BankError", "Exception"]`): the bases
 /// resolved through the symbol table, ending at the first builtin. Class
@@ -714,7 +909,7 @@ pub(crate) fn exception_class_raise(
     symbols: crate::SymbolTableScopes,
     class_symbols: &crate::SymbolTableScopes,
 ) -> Result<Option<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
-    use crate::{ExprType, StatementType};
+    use crate::ExprType;
     use std::collections::HashMap;
     if !crate::is_exception_class(cls) {
         return Ok(None);
@@ -737,12 +932,17 @@ pub(crate) fn exception_class_raise(
         .map(|a| a.arg.as_str())
         .collect();
     let kwonly: Vec<&str> = init.args.kwonlyargs.iter().map(|a| a.arg.as_str()).collect();
-    if positional.is_empty() && kwonly.is_empty() {
-        return Ok(None);
-    }
     let site_error = |msg: String| -> Result<Option<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
         Ok(Some(quote::quote!(compile_error!(#msg))))
     };
+    // A VARIADIC `__init__(self, *args, **kwargs)` binds nothing by name:
+    // modeled when its body only forwards to `super().__init__(*args)`
+    // (idna's IDNAError), the message then being the raise's one
+    // positional argument — the BaseException rule below; any other
+    // statement in it is the same refusal as an unmodeled body.
+    if init.args.vararg.is_some() || init.args.kwarg.is_some() {
+        return variadic_exception_raise(cls, init, call, ctx, options, symbols, class_symbols);
+    }
     // Defaults: positional defaults align to the tail of the positional
     // parameters, keyword-only defaults to their parameters.
     let mut defaults: HashMap<&str, &ExprType> = HashMap::new();
@@ -818,15 +1018,28 @@ pub(crate) fn exception_class_raise(
     let mut msg_options = options.clone();
     let mut name_types = (*msg_options.name_types).clone();
     let mut substitution: HashMap<&str, ExprType> = HashMap::new();
+    let evaluated = |a: &ExprType| !matches!(a, ExprType::Name(_) | ExprType::Constant(_));
     for (k, (param, arg)) in given.iter().enumerate() {
-        if matches!(arg, ExprType::Name(_) | ExprType::Constant(_)) {
+        // A bare name is read in place — unless a LATER argument runs
+        // code, which could rebind it before the message and the attrs
+        // read it (`E(counter, bump())`): then it is captured in source
+        // order too, a clone (the raise site may read it again — an
+        // `isinstance(E(x, f()), ...)` construction; Devin review on
+        // #330).
+        let captured_name = matches!(arg, ExprType::Name(_))
+            && given[k + 1..].iter().any(|(_, later)| evaluated(later));
+        if !evaluated(arg) && !captured_name {
             substitution.insert(param, (*arg).clone());
             continue;
         }
         let temp = format!("__rython_exc_arg{k}");
         let ident = proc_macro2::Ident::new(&temp, proc_macro2::Span::call_site());
         let tokens = (*arg).clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        prelude.push(quote::quote!(let #ident = #tokens;));
+        if captured_name {
+            prelude.push(quote::quote!(let #ident = (#tokens).clone();));
+        } else {
+            prelude.push(quote::quote!(let #ident = #tokens;));
+        }
         let ty = crate::infer_type(Some(&ctx), arg, &options, &symbols);
         if !matches!(ty, crate::TypeInfo::PyObject) {
             name_types.insert(temp.clone(), ty);
@@ -857,76 +1070,16 @@ pub(crate) fn exception_class_raise(
         substitution.insert(param, (*d).clone());
     }
     msg_options.name_types = std::rc::Rc::new(name_types);
-    // The __init__ body: `self.<field> = <param>` stores and the
+    // The __init__ body — `self.<field> = <param>` stores and the
     // `super().__init__(<message>)` call; a docstring and `pass` are
-    // inert; anything else would not run at the raise site.
-    // The `super().__init__(...)` call seen: None until one is, then its
-    // message argument (None for the zero-argument call).
-    let mut super_init: Option<Option<ExprType>> = None;
-    let mut fields: Vec<(String, &str)> = Vec::new(); // (field, param)
-    for stmt in &init.body {
-        let modeled = match &stmt.statement {
-            StatementType::Assign(a) => {
-                if let [ExprType::Attribute(attr)] = a.targets.as_slice()
-                    && crate::ast::tree::visit::is_self(&attr.value)
-                    && let ExprType::Name(v) = &a.value
-                    && let Some(param) = positional.iter().chain(kwonly.iter()).find(|p| **p == v.id)
-                {
-                    fields.push((attr.attr.clone(), param));
-                    true
-                } else {
-                    false
-                }
-            }
-            StatementType::Expr(e) => {
-                if let ExprType::Call(sc) = &e.value {
-                    let is_super_init = match sc.func.as_ref() {
-                        ExprType::Attribute(attr) if attr.attr == "__init__" => {
-                            matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "super")
-                                || matches!(attr.value.as_ref(), ExprType::Call(c2)
-                                    if matches!(c2.func.as_ref(), ExprType::Name(n) if n.id == "super"))
-                        }
-                        _ => false,
-                    };
-                    if is_super_init && super_init.is_none() {
-                        if sc.args.len() > 1 || !sc.keywords.is_empty() {
-                            // `BaseException.__init__(a, b)` sets `args`
-                            // to the tuple and `str(e)` to ITS repr
-                            // (`('a', 'b')`), which the one-message model
-                            // does not render.
-                            return site_error(format!(
-                                "rython: `{}.__init__` calls `super().__init__` with more \
-                                 than one argument: `str(e)` is then the repr of the args \
-                                 tuple, which rython's one-message exception model does not \
-                                 reproduce; pass one message and store the rest as fields",
-                                cls.name
-                            ));
-                        }
-                        super_init = Some(sc.args.first().cloned());
-                    }
-                    is_super_init
-                } else {
-                    matches!(&e.value, ExprType::Constant(c)
-                        if matches!(&c.0, Some(litrs::Literal::String(_))))
-                }
-            }
-            StatementType::Pass => true,
-            _ => false,
-        };
-        if !modeled {
-            return site_error(format!(
-                "rython: `{}.__init__` (line {}) has a statement beyond `self.<field> = \
-                 <param>` stores and the `super().__init__(<message>)` call: rython models \
-                 an exception class's construction as its message and its stored fields, \
-                 so that statement would not run at `raise {}(...)`; rython refuses to \
-                 silently drop it. Move the logic to the raise site, or store the value \
-                 as a field",
-                cls.name,
-                stmt.lineno.unwrap_or(0),
-                cls.name
-            ));
-        }
-    }
+    // inert; anything else would not run at the raise site — classified
+    // through the one statement visitor (a compound statement is
+    // unmodeled at its head, so its bodies are never entered).
+    let params: Vec<&str> = positional.iter().chain(kwonly.iter()).copied().collect();
+    let (super_init, fields) = match classify_exception_init(cls, &init.body, &params) {
+        Ok(model) => model,
+        Err(msg) => return site_error(msg),
+    };
     // The message, as CPython sets `str(e)`: the `super().__init__`
     // argument; the empty string for the zero-argument call (a class
     // that stores fields and calls `super().__init__()` keeps its fields
@@ -935,7 +1088,12 @@ pub(crate) fn exception_class_raise(
     // arguments as `args`, so `str(e)` is the one positional argument,
     // or empty for none — more than one is the tuple's repr, refused.
     let msg_expr: Option<ExprType> = match super_init {
-        Some(m) => m,
+        Some(SuperMessage::Empty) => None,
+        Some(SuperMessage::Expr(m)) => Some(m),
+        // `super().__init__(*args)` cannot appear here: the variadic
+        // initializer took the branch above, and a non-variadic body
+        // naming `*args` is refused by the classifier.
+        Some(SuperMessage::Forwarded) => unreachable!("forwarding needs a vararg"),
         None => match call.args.len() {
             0 => None,
             1 => Some(ExprType::Name(crate::ast::tree::name::Name {

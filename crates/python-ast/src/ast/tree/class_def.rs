@@ -218,34 +218,56 @@ pub fn install_exception_classes(classes: &std::collections::HashSet<String>) {
 /// The transitive closure of exception-ness over every emitted class of
 /// the crate: a class whose name or a base follows the convention, or
 /// whose base is itself in the closure — to a fixpoint. Keyed by bare
-/// name, like the hierarchy index; a name two modules define differently
-/// is an exception if either definition is (the marker lowering is the
-/// conservative side: a class lowered as a marker never fails to build).
+/// name, like the hierarchy index, and with the index's rule for a name
+/// two modules both define: AMBIGUOUS, excluded from the closure as a
+/// class and as a base (each definition is then judged by its own name
+/// and direct bases alone — an ordinary `Node` in one module is never
+/// erased by an exception `Node(Root)` in another; Devin review on
+/// #330), with a definition warning when the exclusion loses a
+/// transitive exception.
 pub fn compute_exception_classes(
     this_classes: &[ClassDef],
     options: &crate::PythonOptions,
 ) -> std::collections::HashSet<String> {
     let per_module = crate::ast::tree::hierarchy::crate_emitted_classes(this_classes, options);
     let all: Vec<&ClassDef> = per_module.iter().flat_map(|(_, defs)| defs.iter()).collect();
+    let mut defined_in: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for c in &all {
+        *defined_in.entry(c.name.as_str()).or_insert(0) += 1;
+    }
+    let unambiguous = |name: &str| defined_in.get(name).copied().unwrap_or(0) == 1;
     let is_exception = crate::ast::tree::raise_stmt::is_exception_class_name;
     let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let closure_says = |c: &ClassDef, set: &std::collections::HashSet<String>| {
+        is_exception(&c.name)
+            || c.bases.iter().any(|b| match b {
+                ExprType::Name(n) => is_exception(&n.id) || (unambiguous(&n.id) && set.contains(&n.id)),
+                _ => false,
+            })
+    };
     loop {
         let before = set.len();
         for c in &all {
-            if set.contains(&c.name) {
+            if set.contains(&c.name) || !unambiguous(&c.name) {
                 continue;
             }
-            let yes = is_exception(&c.name)
-                || c.bases.iter().any(|b| match b {
-                    ExprType::Name(n) => is_exception(&n.id) || set.contains(&n.id),
-                    _ => false,
-                });
-            if yes {
+            if closure_says(c, &set) {
                 set.insert(c.name.clone());
             }
         }
         if set.len() == before {
             break;
+        }
+    }
+    for c in &all {
+        if !unambiguous(&c.name) && closure_says(c, &set) && !is_exception_class(c) {
+            options.definition_warnings.borrow_mut().push(format!(
+                "class `{}` is defined by more than one module of the crate: its \
+                 exception-ness through the crate's class chain is not tracked (the \
+                 closure is keyed by the bare class name), so this definition lowers \
+                 as an ordinary class; rename one of the two classes",
+                c.name
+            ));
         }
     }
     set

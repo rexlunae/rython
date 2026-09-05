@@ -8438,7 +8438,9 @@ fn the_exception_model_matches_python_at_runtime() {
     // once; issubclass through the interpreter's own MRO; a caller name
     // that matches another parameter; a neutral-named intermediate class
     // caught by its own handler; a zero-argument super call and no super
-    // call (round 3).
+    // call (round 3); a global captured before a later argument rebinds
+    // it, a zero-parameter fixed message, a variadic forwarder, the last
+    // store of a field (round 4).
     let scratch = Scratch::new("exc_model");
     let file = scratch.path().join("exc_model.py");
     fs::write(
@@ -8499,6 +8501,37 @@ fn the_exception_model_matches_python_at_runtime() {
             "        self.code = code\n",
             "\n",
             "\n",
+            "counter = 0\n",
+            "\n",
+            "\n",
+            "def bump() -> int:\n",
+            "    global counter\n",
+            "    counter += 1\n",
+            "    return counter\n",
+            "\n",
+            "\n",
+            "class Pair2(Exception):\n",
+            "    def __init__(self, first: int, second: int):\n",
+            "        super().__init__(f\"{first} {second}\")\n",
+            "\n",
+            "\n",
+            "class Fixed(Exception):\n",
+            "    def __init__(self):\n",
+            "        super().__init__(\"fixed message\")\n",
+            "\n",
+            "\n",
+            "class Var(Exception):\n",
+            "    def __init__(self, *args):\n",
+            "        super().__init__(*args)\n",
+            "\n",
+            "\n",
+            "class Twice(Exception):\n",
+            "    def __init__(self, a: int, b: int):\n",
+            "        super().__init__(\"t\")\n",
+            "        self.v = a\n",
+            "        self.v = b\n",
+            "\n",
+            "\n",
             "def main() -> None:\n",
             "    try:\n",
             "        raise MyError(\"bad\")\n",
@@ -8539,6 +8572,22 @@ fn the_exception_model_matches_python_at_runtime() {
             "        raise Silent(5)\n",
             "    except Silent as e:\n",
             "        print(\"[\" + str(e) + \"]\", e.code)\n",
+            "    try:\n",
+            "        raise Pair2(counter, bump())\n",
+            "    except Pair2 as e:\n",
+            "        print(e)\n",
+            "    try:\n",
+            "        raise Fixed()\n",
+            "    except Fixed as e:\n",
+            "        print(e)\n",
+            "    try:\n",
+            "        raise Var(\"v\")\n",
+            "    except Var as e:\n",
+            "        print(e)\n",
+            "    try:\n",
+            "        raise Twice(1, 2)\n",
+            "    except Twice as e:\n",
+            "        print(e, e.v)\n",
             "\n",
             "\n",
             "if __name__ == \"__main__\":\n",
@@ -8572,6 +8621,10 @@ fn the_exception_model_matches_python_at_runtime() {
             "caught Mid: leaf",
             "[] 9",
             "[5] 5",
+            "0 1",
+            "fixed message",
+            "v",
+            "t 2",
         ],
         "the exception model diverged from CPython"
     );
@@ -8651,5 +8704,83 @@ fn imported_exception_classes_match_python_at_runtime() {
             .collect::<Vec<_>>(),
         vec!["caught ValueError: imported", "need 2 credits 2 credits", "need 5 coins"],
         "the imported exception model diverged from CPython"
+    );
+}
+
+#[test]
+fn a_class_name_two_modules_define_is_never_erased_by_the_exception_closure() {
+    // `Node(Root)` (an exception through the chain) in one module and an
+    // ordinary `Node` in another: the crate-wide closure is keyed by bare
+    // name, so the ambiguous name stays out of it — the ordinary Node
+    // keeps its implementation, and the exclusion is a definition
+    // warning (Devin review on #330).
+    let scratch = Scratch::new("nodepkg");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"nodepkg\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("nodepkg");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("errors.py"),
+        concat!(
+            "class Root(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Node(Root):\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("tree.py"),
+        concat!(
+            "class Node:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "    def label(self) -> str:\n",
+            "        return \"node:\" + self.name\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("cli.py"),
+        concat!(
+            "from tree import Node\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    print(Node(\"a\").label())\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    assert!(
+        krate.warnings.iter().any(|w| w.contains("`Node` is defined by more than one module")),
+        "warnings: {:?}",
+        krate.warnings
+    );
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/nodepkg"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["node:a"],
+        "the ordinary Node lost its implementation"
     );
 }

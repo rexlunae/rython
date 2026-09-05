@@ -19489,3 +19489,169 @@ fn not_implemented_is_the_identity_fallback_only_in_a_method_named_eq() {
     assert!(out.contains("compile_error !"), "generated: {}", out);
     assert!(out.contains("outside `__eq__`"), "generated: {}", out);
 }
+
+#[test]
+fn a_zero_parameter_exception_init_is_modeled_like_any_other() {
+    // `__init__(self)` runs the body analysis too: a fixed message is the
+    // message, an argument at the raise is the arity error, an unmodeled
+    // statement is the refusal (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Fixed(Exception):\n",
+            "    def __init__(self):\n",
+            "        super().__init__(\"fixed message\")\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Fixed()\n",
+            "\n",
+            "def g() -> None:\n",
+            "    raise Fixed(1)\n",
+        ),
+        "raise_zero_param.py",
+    );
+    assert!(out.contains("(\"Fixed\" , format ! (\"{}\" , \"fixed message\") , vec ! []"), "generated: {}", out);
+    assert!(out.contains("takes 0 positional argument(s) but 1 were given"), "generated: {}", out);
+    let out = compile(
+        concat!(
+            "class Noisy(Exception):\n",
+            "    def __init__(self):\n",
+            "        print(\"constructed\")\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Noisy()\n",
+        ),
+        "raise_zero_param_stmt.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("refuses to silently drop it"), "generated: {}", out);
+}
+
+#[test]
+fn an_exception_init_models_the_last_store_and_refuses_a_second_super_call() {
+    // The last `self.v = ...` wins, as in Python; a second
+    // `super().__init__` (which would replace the args) is refused
+    // (Devin review on #330).
+    let out = compile(
+        concat!(
+            "class Twice(Exception):\n",
+            "    def __init__(self, a: int, b: int):\n",
+            "        super().__init__(\"t\")\n",
+            "        self.v = a\n",
+            "        self.v = b\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Twice(1, 2)\n",
+        ),
+        "raise_last_store.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("vec ! [(\"v\" . to_string () , stdpython :: PyValue :: from (2))]"), "generated: {}", out);
+    let out = compile(
+        concat!(
+            "class Again(Exception):\n",
+            "    def __init__(self, a: str):\n",
+            "        super().__init__(\"first\")\n",
+            "        super().__init__(a)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Again(\"x\")\n",
+        ),
+        "raise_second_super.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("a second time"), "generated: {}", out);
+    // A compound statement is refused at its head — the walk never
+    // enters its body.
+    let out = compile(
+        concat!(
+            "class Cond(Exception):\n",
+            "    def __init__(self, a: str):\n",
+            "        if a:\n",
+            "            super().__init__(a)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Cond(\"x\")\n",
+        ),
+        "raise_compound_init.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("(line 3) has a statement beyond"), "generated: {}", out);
+}
+
+#[test]
+fn a_bare_name_argument_is_captured_before_a_later_argument_runs() {
+    // `E(counter, bump())`: bump may rebind counter, so counter is
+    // captured (a clone) in source order before bump runs; with no later
+    // evaluated argument the name is read in place (Devin review on
+    // #330).
+    let out = compile(
+        concat!(
+            "counter = 0\n",
+            "\n",
+            "def bump() -> int:\n",
+            "    global counter\n",
+            "    counter += 1\n",
+            "    return counter\n",
+            "\n",
+            "class Pair2(Exception):\n",
+            "    def __init__(self, first: int, second: int):\n",
+            "        super().__init__(f\"{first} {second}\")\n",
+            "\n",
+            "def f(x: int) -> None:\n",
+            "    raise Pair2(counter, bump())\n",
+            "\n",
+            "def g(x: int) -> None:\n",
+            "    raise Pair2(x, 2)\n",
+        ),
+        "raise_capture_name.py",
+    );
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
+    assert!(
+        out.contains("let __rython_exc_arg0 = (stdpython :: py_global_read (& counter)) . clone () ; let __rython_exc_arg1 = bump () ?"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("format ! (\"{} {}\" , py_display (& (x)) , py_display (& (2)))"), "generated: {}", out);
+}
+
+#[test]
+fn a_variadic_exception_init_forwards_or_is_loud() {
+    // `__init__(self, *args)` forwarding to `super().__init__(*args)`
+    // (idna's IDNAError): the message is the raise's one argument; a
+    // body doing more, a keyword, or two arguments are loud (Devin
+    // review on #330).
+    let out = compile(
+        concat!(
+            "class Var(Exception):\n",
+            "    def __init__(self, *args):\n",
+            "        super().__init__(*args)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Var(\"v\")\n",
+            "\n",
+            "def g() -> None:\n",
+            "    raise Var()\n",
+            "\n",
+            "def h() -> None:\n",
+            "    raise Var(\"a\", \"b\")\n",
+        ),
+        "raise_variadic.py",
+    );
+    assert!(out.contains("(\"Var\" , format ! (\"{}\" , \"v\") , vec ! []"), "generated: {}", out);
+    assert!(out.contains("(\"Var\" , String :: new () , vec ! []"), "generated: {}", out);
+    assert!(out.contains("forwards its 2 positional arguments"), "generated: {}", out);
+    let out = compile(
+        concat!(
+            "class Req(Exception):\n",
+            "    def __init__(self, *args, **kwargs):\n",
+            "        self.response = kwargs.pop(\"response\", None)\n",
+            "        super().__init__(*args, **kwargs)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    raise Req(\"boom\")\n",
+        ),
+        "raise_variadic_stmt.py",
+    );
+    assert!(out.contains("compile_error !"), "generated: {}", out);
+    assert!(out.contains("refuses to silently drop it"), "generated: {}", out);
+}
