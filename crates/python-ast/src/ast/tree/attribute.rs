@@ -304,6 +304,21 @@ impl<'a> CodeGen for Attribute {
             _ => None,
         };
         let module_chain = is_module_path_chain(&self.value, &symbols, &options);
+        // A stdlib module's EXCEPTION CLASS read as a VALUE (`BaseSSLError
+        // = ssl.SSLError` — urllib3's connection.py): the class-as-value
+        // model is the class's name string (the same as a bare `ValueError`
+        // in value position, name.rs); the runtime module path
+        // `ssl::SSLError` names no item (issue #333). A raise or a handler
+        // naming the attribute resolves through its own canonicalizer.
+        if module_chain
+            && let ExprType::Name(m) = self.value.as_ref()
+            && crate::is_stdpython_module(&m.id)
+            && !crate::module_name_shadowed(&m.id, &symbols)
+            && let Some(canonical) =
+                crate::ast::tree::raise_stmt::stdlib_exception_canonical(&m.id, &self.attr)
+        {
+            return Ok(quote!(#canonical.to_string()));
+        }
         // A module-path member read into a CRATE module whose generated
         // code has no item of that name (`util.ssl_.PROTOCOL_TLS` —
         // urllib3's pyopenssl, where PROTOCOL_TLS is an external ssl

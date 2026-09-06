@@ -112,6 +112,18 @@ pub(crate) const RUNTIME_KEYWORD_SIGNATURES: &[(&str, &str, &[&str])] = &[
 /// sit INSIDE a brace group. A block whose last statement ends with `?`
 /// strips there: the block still evaluates to the (now un-unwrapped)
 /// value, exactly like the bare-call form.
+/// Whether `?` appears anywhere in the tokens, reaching into groups: a
+/// fallible sub-expression (`compute()? + 1`) is as fallible as a trailing
+/// `?`, and a closure that does not return Result cannot hold it.
+pub(crate) fn contains_question(stream: proc_macro2::TokenStream) -> bool {
+    use proc_macro2::TokenTree;
+    stream.into_iter().any(|tt| match tt {
+        TokenTree::Punct(p) => p.as_char() == '?',
+        TokenTree::Group(g) => contains_question(g.stream()),
+        _ => false,
+    })
+}
+
 pub(crate) fn strip_trailing_question(tokens: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
     use proc_macro2::{Delimiter, Group, TokenTree};
 

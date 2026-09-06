@@ -300,6 +300,69 @@ impl CodeGen for Module {
             }
         }
 
+        // A function local or parameter that shares its name with a module
+        // STATIC of the generated crate — a constant or promoted module
+        // value, a mutable global, a `use`-bound import — cannot be a Rust
+        // `let` or parameter (E0530: a binding never shadows a static), and
+        // name.rs would read the static where the program reads the local.
+        // The local is spelled apart under the reserved prefix before any
+        // pass below sees the body (requests' compat.py binds a local
+        // `chardet` beside the module's `chardet`; issue #333). The set is
+        // an over-approximation of what becomes a static (a needless
+        // rename is only a spelling), never an under-approximation.
+        {
+            let mut statics: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let free_reads = module_function_free_reads(&self.raw.body);
+            for s in &self.raw.body {
+                if let crate::StatementType::Assign(a) = &s.statement
+                    && let Some(targets) = assign_name_targets(a)
+                {
+                    for n in targets {
+                        if module_assign_counts.get(&n) == Some(&1)
+                            && (const_static_type(&a.value).is_some() || free_reads.contains(&n))
+                        {
+                            statics.insert(n);
+                        }
+                    }
+                }
+            }
+            statics.extend(
+                module_promoted_static_names(&options, &options.this_module_path)
+                    .iter()
+                    .cloned(),
+            );
+            statics.extend(global_mutables.keys().cloned());
+            walk_stmts(&self.raw.body, Descend::SkipDefs, &mut |s| {
+                match &s.statement {
+                    crate::StatementType::Import(i) => {
+                        for a in &i.names {
+                            statics.insert(a.asname.clone().unwrap_or_else(|| {
+                                a.name.split('.').next().unwrap_or(&a.name).to_string()
+                            }));
+                        }
+                    }
+                    crate::StatementType::ImportFrom(i) => {
+                        for a in &i.names {
+                            statics.insert(a.asname.clone().unwrap_or_else(|| a.name.clone()));
+                        }
+                    }
+                    _ => {}
+                }
+                Flow::Continue
+            });
+            if crate::ast::tree::rename::rename_locals_shadowing_statics(&mut self.raw.body, &statics)
+                > 0
+            {
+                // The symbol table was built from the unrenamed body: the
+                // renamed defs re-register (the folded body carries every
+                // live statement, so nothing registered above is lost).
+                symbols = self.clone().find_symbols(SymbolTableScopes::new());
+                // The converter registered rust-module imports into the
+                // table it handed us; the rebuilt table needs them too.
+                crate::register_rust_module_imports(&self.raw.body, &options, &mut symbols)?;
+            }
+        }
+
         // Statically-decided module names (issue #137): a single-store
         // None or False constant — typically the folded handler of a
         // failed import guard above — makes `if brotli is not None:` /
@@ -472,6 +535,53 @@ impl CodeGen for Module {
                     if f.name == "main" && f.resolved_return_type(&symbols, &options).is_some()
             )
         });
+
+        // A boxed mutable static with NO top-level store (a module value
+        // stored only under module-level control flow, read by functions —
+        // requests' `_preloaded_ssl_context`; issue #333): no statement's
+        // lowering declares it, so it is declared here; its stores write
+        // through py_global_write from __module_init__.
+        {
+            let top_level_stored: std::collections::HashSet<String> = self
+                .raw
+                .body
+                .iter()
+                .filter_map(|s| match &s.statement {
+                    crate::StatementType::Assign(a) => assign_name_targets(a),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            for (name, kind) in global_mutables.iter() {
+                if matches!(kind, crate::MutableGlobalKind::Boxed) && !top_level_stored.contains(name) {
+                    let ident = crate::safe_ident(name);
+                    stream.extend(quote! {
+                        pub static #ident: std::sync::Mutex<stdpython::PyValue> =
+                            std::sync::Mutex::new(stdpython::PyValue::None_);
+                    });
+                }
+            }
+        }
+
+        // The single-store aliases of a stdpython-module constant (`_ver =
+        // sys.version_info` — requests' compat.py): they emit a `pub use
+        // ... as name` item below, so the init hoisting must not declare
+        // the same name as a local (E0530; issue #333).
+        let stdlib_aliases: Vec<String> = self
+            .raw
+            .body
+            .iter()
+            .filter_map(|s| match &s.statement {
+                crate::StatementType::Assign(a) => {
+                    let names = assign_name_targets(a)?;
+                    (names.len() == 1
+                        && module_assign_counts.get(&names[0]) == Some(&1)
+                        && stdlib_const_attr(&a.value).is_some())
+                    .then(|| names[0].clone())
+                }
+                _ => None,
+            })
+            .collect();
 
         // Pass 1: classify statements so the hoisted-name sets are known
         // before any statement renders — a `for` target on a name that
@@ -857,6 +967,12 @@ impl CodeGen for Module {
         // (`__rython_unpack_0`, ...) get; one per unpack assignment, in
         // source order.
         let mut unpack_counter = 0usize;
+        // A mutable static is declared by its FIRST top-level store (the
+        // initializer); every later top-level store of the name lowers as
+        // an ordinary statement, a py_global_write (a flattened import
+        // guard leaves two stores of one name at top level — issue #333).
+        let mut emitted_mutable_statics: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for (stmt_index, s) in self.raw.body.into_iter().enumerate() {
             // Issue #118: module-level argparse. Parser-building statements
             // vanish; the parse_args assignment becomes the typed-namespace
@@ -1159,6 +1275,7 @@ impl CodeGen for Module {
                 // scopes as py_global_write.
                 if let [crate::ExprType::Name(target)] = a.targets.as_slice()
                     && let Some(kind) = global_mutables.get(&target.id)
+                    && emitted_mutable_statics.insert(target.id.clone())
                 {
                     use crate::MutableGlobalKind as Kind;
                     let ident = crate::safe_ident(&target.id);
@@ -1220,21 +1337,7 @@ impl CodeGen for Module {
                                 options.clone(),
                                 symbols.clone(),
                             )?;
-                            let stripped =
-                                crate::ast::tree::call::strip_trailing_question(&rhs);
-                            let is_fallible = stripped.to_string() != rhs.to_string();
-                            let value_tokens = if is_fallible {
-                                quote!(match #stripped {
-                                    Ok(__rython_v) => __rython_v,
-                                    Err(__rython_e) => panic!(
-                                        "module-level `{}` initialization failed: {}",
-                                        stringify!(#ident),
-                                        __rython_e
-                                    ),
-                                })
-                            } else {
-                                stripped
-                            };
+                            let value_tokens = module_init_value(&rhs, &ident);
                             let (ty, wrapped) = if *boxed {
                                 (
                                     quote!(stdpython::PyValue),
@@ -1375,20 +1478,7 @@ impl CodeGen for Module {
                     .clone()
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())
                     .map_err(|e| wrap_module_error(&module_filename, e))?;
-                let stripped = crate::ast::tree::call::strip_trailing_question(&rhs);
-                let is_fallible = stripped.to_string() != rhs.to_string();
-                let value_tokens = if is_fallible {
-                    quote!(match #stripped {
-                        Ok(__rython_v) => __rython_v,
-                        Err(__rython_e) => panic!(
-                            "module-level `{}` initialization failed: {}",
-                            stringify!(#promoted_first),
-                            __rython_e
-                        ),
-                    })
-                } else {
-                    stripped
-                };
+                let value_tokens = module_init_value(&rhs, &format_ident!("{}", promoted_first));
                 // A TUPLE-UNPACK promotion (`_STATUS_VALID, ... =
                 // b"VMDI"` — idna): one SHARED static evaluates the RHS
                 // exactly ONCE (Devin review on #263, Finding 4: per-name
@@ -1784,10 +1874,15 @@ impl CodeGen for Module {
         // Promoted LazyLock statics and mutable statics (issue #115) have
         // no `let` in the init body — their COMPUTED initializers stay in
         // module_init_raw only for the type analysis.
+        // A single-store alias of a stdpython-module constant (`_ver =
+        // sys.version_info` — requests' compat.py) emits a `pub use ... as
+        // name` item: the same name hoisted as an init local would shadow
+        // the static (E0530; issue #333).
         let init_hoist_skip: std::collections::HashSet<String> = promoted_statics
             .iter()
             .cloned()
             .chain(global_mutables.keys().cloned())
+            .chain(stdlib_aliases.into_iter())
             .collect();
         let init_decls = hoisted_declarations(
             &module_init_raw,
@@ -1826,14 +1921,36 @@ impl CodeGen for Module {
         // Generate module initialization function if needed. Like all
         // generated functions it returns Result so module-level raises and
         // calls propagate.
-        if has_module_init_code {
+        // In a multi-module crate every module has one, empty or not: the
+        // entry module's `main` calls each sibling's at startup (see
+        // `startup_module_inits`) without knowing which siblings have
+        // module-level statements.
+        if has_module_init_code || !options.module_defs.is_empty() {
             stream.extend(quote! {
-                fn __module_init__() -> Result<(), PyException> {
+                #[allow(dead_code)]
+                pub(crate) fn __module_init__() -> Result<(), PyException> {
                     #(#module_init_stmts;)*
                     Ok(())
                 }
             });
         }
+        // The startup sequence of the entry module: the sibling modules'
+        // bodies in dependency order, then this module's own.
+        let sibling_inits: Vec<TokenStream> = options
+            .startup_module_inits
+            .iter()
+            .map(|path| {
+                let segs: Vec<_> = path.iter().map(|s| crate::safe_ident(s)).collect();
+                quote!(crate::#(#segs::)*__module_init__()?;)
+            })
+            .collect();
+        let own_init = if has_module_init_code {
+            quote!(__module_init__()?;)
+        } else {
+            quote!()
+        };
+        let startup_init = quote!(#(#sibling_inits)* #own_init);
+        let needs_init_wrapper = has_module_init_code || !sibling_inits.is_empty();
         
         // A `__main__` block wants a process entry point, and a no_std
         // target has no OS to enter from: refuse loudly instead of emitting
@@ -1883,7 +2000,7 @@ impl CodeGen for Module {
                         .unwrap_or_else(|_| stream);
                         
                     // If we have module init code, we need to modify the user's main to call it first
-                    if has_module_init_code {
+                    if needs_init_wrapper {
                         // This is more complex - we'd need to modify the user's main function body
                         // For now, let's fall back to the rename approach for async functions with module init
                         let renamed_stream_str = Self::rename_main_function_and_references(&stream_str);
@@ -1894,7 +2011,7 @@ impl CodeGen for Module {
                             #[cfg_attr(feature = #ASYNC_RUNTIME_FEATURE, #attr_tokens)]
                             async fn main() {
                                 let __rython_result: Result<(), PyException> = async {
-                                    __module_init__()?;
+                                    #startup_init
                                     python_main().await?;
                                     Ok(())
                                 }.await;
@@ -1923,7 +2040,7 @@ impl CodeGen for Module {
                         .unwrap_or_else(|_| stream);
                     
                     // If we have module init code, we need to modify the user's main to call it first
-                    if has_module_init_code {
+                    if needs_init_wrapper {
                         // For simplicity, we'll use the rename approach when module init is needed
                         let renamed_stream_str = Self::rename_main_function_and_references(&stream_str);
                         stream = renamed_stream_str.parse::<proc_macro2::TokenStream>()
@@ -1932,7 +2049,7 @@ impl CodeGen for Module {
                         stream.extend(quote! {
                             fn main() {
                                 let __rython_result = (|| -> Result<(), PyException> {
-                                    __module_init__()?;
+                                    #startup_init
                                     python_main()?;
                                     Ok(())
                                 })();
@@ -1974,11 +2091,7 @@ impl CodeGen for Module {
                     let attr_tokens: proc_macro2::TokenStream = runtime_attr.parse()
                         .unwrap_or_else(|_| quote!(tokio::main)); // fallback to tokio::main
                     
-                    let init_call = if has_module_init_code {
-                        quote!(__module_init__()?;)
-                    } else {
-                        quote!()
-                    };
+                    let init_call = &startup_init;
                     // The runtime attribute applies only when the generated
                     // crate's `async-tokio` feature is enabled (rypip
                     // declares it default-on for async binaries); without
@@ -2005,11 +2118,7 @@ impl CodeGen for Module {
                         }
                     });
                 } else {
-                    let init_call = if has_module_init_code {
-                        quote!(__module_init__()?;)
-                    } else {
-                        quote!()
-                    };
+                    let init_call = &startup_init;
                     stream.extend(quote! {
                         fn main() {
                             let __rython_result = (|| -> Result<(), PyException> {
@@ -2025,12 +2134,16 @@ impl CodeGen for Module {
                     });
                 }
             }
-        } else if has_module_init_code {
-            // No main block, but we have module initialization code
-            // Generate a main function that just runs module initialization
+        } else if needs_init_wrapper {
+            // No main block, but module initialization code (this module's
+            // or a sibling's): a main that runs just the startup sequence.
             stream.extend(quote! {
                 fn main() {
-                    if let Err(e) = __module_init__() {
+                    let __rython_result = (|| -> Result<(), PyException> {
+                        #startup_init
+                        Ok(())
+                    })();
+                    if let Err(e) = __rython_result {
                         eprintln!("{}", e);
                         std::process::exit(1);
                     }
@@ -2271,15 +2384,21 @@ pub(crate) fn module_promoted_static_names(
     };
     let mut target = options.clone();
     target.this_module_path = path.to_vec();
+    target.module_path = module_package_path_from_defs(path, options);
+    // The body as `Module::to_rust` sees it: the import guards folded (a
+    // resolvable `try: import ssl; CTX = build() ... except ImportError:`
+    // is its try body at top level — requests' adapters.py), so the store
+    // counts here and there agree (issue #333).
+    let (body, _) = fold_static_import_trys(&module.raw.body, &target);
     let mut counts = std::collections::HashMap::new();
-    count_module_stores(&module.raw.body, &mut counts);
-    let free_reads = module_function_free_reads(&module.raw.body);
+    count_module_stores(&body, &mut counts);
+    let free_reads = module_function_free_reads(&body);
     let sibling = sibling_imported_names(&target);
     // Issue #115: names written by functions through `global` are MUTABLE
     // statics (Mutex), never immutable LazyLock promotions — an immutable
     // promotion would freeze the initial value. (Function-bound names are
     // already absent from free_reads; this guards the sibling-import path.)
-    let (global_written, _) = module_global_write_sets(&module.raw.body);
+    let (global_written, _) = module_global_write_sets(&body);
     let symbols = (**module).clone().find_symbols(crate::SymbolTableScopes::new());
     let mut names = std::collections::HashSet::new();
     // Module-level name → the module-level names its INITIALIZER reads.
@@ -2291,7 +2410,7 @@ pub(crate) fn module_promoted_static_names(
     // module-init local (E0425). Computed transitively to a fixpoint.
     let mut init_reads: std::collections::HashMap<String, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
-    for stmt in &module.raw.body {
+    for stmt in &body {
         if let crate::StatementType::Assign(a) = &stmt.statement {
             // Only NON-const single-store names participate: const names
             // are already emitted as plain `pub static` items, so the
@@ -2309,7 +2428,7 @@ pub(crate) fn module_promoted_static_names(
             }
         }
     }
-    for stmt in &module.raw.body {
+    for stmt in &body {
         if let crate::StatementType::If(if_stmt) = &stmt.statement {
             if Module::is_type_checking_test(&if_stmt.test) {
                 continue;
@@ -3098,6 +3217,89 @@ pub(crate) fn module_global_mutable_names(
             out.insert(n.id.clone(), Kind::Boxed);
         }
     }
+    // The same for a module value stored ONLY inside module-level control
+    // flow — no top-level store at all (`try: import ssl;
+    // _preloaded_ssl_context = create_urllib3_context(); ... except
+    // ImportError: _preloaded_ssl_context = None` — requests' adapters.py)
+    // — and read by function bodies: a module-init local is invisible to
+    // them (E0425). The boxed mutable static carries it: module-init
+    // stores write through, reads render py_global_read. A definite
+    // conditional the promotion pass turns into a LazyLock static (one
+    // store per branch, nothing else in the branches) is that static, not
+    // this (issue #333).
+    let definite_conditionals = definite_conditional_names(body, module_assign_counts, &free_reads);
+    // A name with a top-level store as well (`CTX = build()` at top level,
+    // reassigned under a gate) takes the COMPUTED kind: the top-level
+    // store is the static's initializer, every other store writes through.
+    // (The import guard flattening at emission leaves a `try` body's stores
+    // at top level; the counts here see the `try`, so both shapes arrive.)
+    for (name, count) in module_assign_counts {
+        if *count >= 2
+            && free_reads.contains(name)
+            && !global_written.contains(name)
+            && !bound_without_global.contains(name)
+            && !definite_conditionals.contains(name)
+            && !out.contains_key(name)
+            && !matches!(
+                symbols.get(name),
+                Some(crate::SymbolTableNode::ImportFrom(_))
+                    | Some(crate::SymbolTableNode::Import(_))
+                    | Some(crate::SymbolTableNode::ClassDef(_))
+                    | Some(crate::SymbolTableNode::FunctionDef(_))
+            )
+        {
+            // Every store of the name, top level and nested: a
+            // declaration-shaped or CLASS-valued store anywhere (`BaseSSLError
+            // = ssl.SSLError` under a `try:` — urllib3's connection.py) is a
+            // compile-time binding the class closure and the hoist resolve,
+            // never a runtime value.
+            let mut stores: Vec<&crate::ExprType> = Vec::new();
+            walk_stmts(body, Descend::SkipDefs, &mut |s| {
+                if let crate::StatementType::Assign(a) = &s.statement
+                    && assign_name_targets(a).is_some_and(|t| t.contains(name))
+                {
+                    stores.push(&a.value);
+                }
+                Flow::Continue
+            });
+            let declaration_shaped = |v: &crate::ExprType| -> bool {
+                is_type_alias_value(v)
+                    || crate::ast::tree::assign::builtin_scalar_alias_type(v).is_some()
+                    || crate::is_rust_bind_call(v)
+                    || stdlib_const_attr(v).is_some()
+                    || crate::ast::tree::class_def::is_class_value_expr(v, symbols)
+                    || matches!(
+                        v,
+                        crate::ExprType::Attribute(a)
+                            if crate::ast::tree::raise_stmt::is_exception_class_name(&a.attr)
+                    )
+                    || matches!(
+                        v,
+                        crate::ExprType::Name(n) if matches!(
+                            symbols.get(&n.id),
+                            Some(crate::SymbolTableNode::FunctionDef(_))
+                        )
+                    )
+            };
+            if stores.iter().any(|v| declaration_shaped(v)) {
+                continue;
+            }
+            let top_level_value = body.iter().find_map(|s| match &s.statement {
+                crate::StatementType::Assign(a)
+                    if assign_name_targets(a).is_some_and(|t| t.contains(name)) =>
+                {
+                    Some(&a.value)
+                }
+                _ => None,
+            });
+            let kind = match top_level_value {
+                Some(v) if crate::is_none_expr(v) => Kind::Boxed,
+                Some(_) => Kind::Computed { boxed: true },
+                None => Kind::Boxed,
+            };
+            out.insert(name.clone(), kind);
+        }
+    }
     if global_written.is_empty() {
         return out;
     }
@@ -3161,6 +3363,80 @@ pub(crate) fn module_global_mutable_names(
     out
 }
 
+/// The module names the promotion pass turns into a LazyLock static from a
+/// DEFINITE conditional — one store in each branch of an `if`/`else`, or
+/// one in a `try` body and one in each handler, nothing else in the
+/// branches, read by a function (the `promoted_conditional` detection in
+/// `Module::to_rust`, mirrored so the mutable-static decision never claims
+/// the same name).
+fn definite_conditional_names(
+    body: &[crate::Statement],
+    module_assign_counts: &std::collections::HashMap<String, usize>,
+    free_reads: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for s in body {
+        match &s.statement {
+            crate::StatementType::If(if_stmt) if !if_stmt.orelse.is_empty() => {
+                if let (Some(b1), Some(b2)) =
+                    (single_assign_name(&if_stmt.body), single_assign_name(&if_stmt.orelse))
+                    && b1 == b2
+                    && module_assign_counts.get(&b1) == Some(&4)
+                    && free_reads.contains(&b1)
+                {
+                    names.insert(b1);
+                }
+            }
+            crate::StatementType::Try(t) => {
+                if let Some(name) = single_assign_name(&t.body)
+                    && t.handlers
+                        .iter()
+                        .all(|h| single_assign_name(&h.body) == Some(name.clone()))
+                    && module_assign_counts.get(&name) == Some(&4)
+                    && free_reads.contains(&name)
+                {
+                    names.insert(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// The value expression of a module-level static's initializer closure.
+/// A fallible initializer unwraps inside the closure, panicking on failure
+/// — the import-time raise becomes an abort (the §12.2 divergence). A
+/// trailing `?` (the call itself fails) matches on the call's Result; a
+/// `?` anywhere deeper (`compute()? + 1`, `f(g()?)`) runs the whole
+/// expression in a Result-returning closure, since the LazyLock closure
+/// returns the value, not a Result (issue #333).
+fn module_init_value(rhs: &TokenStream, ident: &proc_macro2::Ident) -> TokenStream {
+    let stripped = crate::ast::tree::call::strip_trailing_question(rhs);
+    let trailing = stripped.to_string() != rhs.to_string();
+    if trailing && !crate::ast::tree::call::contains_question(stripped.clone()) {
+        quote!(match #stripped {
+            Ok(__rython_v) => __rython_v,
+            Err(__rython_e) => panic!(
+                "module-level `{}` initialization failed: {}",
+                stringify!(#ident),
+                __rython_e
+            ),
+        })
+    } else if crate::ast::tree::call::contains_question(rhs.clone()) {
+        quote!(match (|| -> Result<_, PyException> { Ok(#rhs) })() {
+            Ok(__rython_v) => __rython_v,
+            Err(__rython_e) => panic!(
+                "module-level `{}` initialization failed: {}",
+                stringify!(#ident),
+                __rython_e
+            ),
+        })
+    } else {
+        stripped
+    }
+}
+
 /// Names READ as free variables inside function bodies anywhere in the
 /// module (top-level and nested): every Name that appears in a function
 /// body and is not bound there (param, assignment target, def/class name,
@@ -3171,12 +3447,9 @@ pub(crate) fn module_global_mutable_names(
 /// cluster: `log = logging.getLogger(...)` in urllib3 / charset_normalizer).
 fn module_function_free_reads(body: &[crate::Statement]) -> std::collections::HashSet<String> {
     use crate::StatementType as ST;
-    let mut all_names = std::collections::HashSet::new();
-    let mut bound = std::collections::HashSet::new();
-
     // Collect every Name AND every bound target inside an expression. The
-    // free reads are all_names minus bound; a name that is both read and
-    // bound (a local, a def name) cancels out.
+    // free reads of one scope are its names minus its bound names; a name
+    // that is both read and bound (a local, a def name) cancels out.
     fn walk_expr(
         expr: &crate::ExprType,
         all: &mut std::collections::HashSet<String>,
@@ -3418,12 +3691,52 @@ fn module_function_free_reads(body: &[crate::Statement]) -> std::collections::Ha
     // own scope). The control-flow shells only HOST defs — their own
     // assignments bind MODULE scope, not a function's locals, so they must
     // not enter the bound set — and a TYPE_CHECKING block never runs.
+    // Each DEF is its own scope: a local of one function never cancels
+    // another function's free read of the same module name (the locals
+    // that shadow a module static are spelled apart; issue #333). A
+    // class body walks per method the same way.
+    let mut free: std::collections::HashSet<String> = std::collections::HashSet::new();
+    fn scope_free_reads(
+        def: &crate::Statement,
+        free: &mut std::collections::HashSet<String>,
+        visit: &dyn Fn(
+            &crate::Statement,
+            &mut std::collections::HashSet<String>,
+            &mut std::collections::HashSet<String>,
+        ),
+    ) {
+        let mut all = std::collections::HashSet::new();
+        let mut bound = std::collections::HashSet::new();
+        walk_stmts(std::slice::from_ref(def), Descend::All, &mut |inner| {
+            visit(inner, &mut all, &mut bound);
+            Flow::Continue
+        });
+        free.extend(all.difference(&bound).cloned());
+    }
     walk_stmts(body, Descend::SkipDefs, &mut |s| {
         if opens_scope(s) {
-            walk_stmts(std::slice::from_ref(s), Descend::All, &mut |inner| {
-                visit_stmt(inner, &mut all_names, &mut bound);
-                Flow::Continue
-            });
+            if let ST::ClassDef(c) = &s.statement {
+                // The class HEADER's reads (bases, keywords, decorators
+                // — `class Bad(Base)`) are module reads.
+                let mut all = std::collections::HashSet::new();
+                let mut bound = std::collections::HashSet::new();
+                visit_stmt(s, &mut all, &mut bound);
+                free.extend(all.difference(&bound).cloned());
+                for member in &c.body {
+                    if opens_scope(member) {
+                        scope_free_reads(member, &mut free, &visit_stmt);
+                    } else {
+                        // A class-level statement's reads (a default, a
+                        // base, a class attr's value) are module reads.
+                        let mut all = std::collections::HashSet::new();
+                        let mut bound = std::collections::HashSet::new();
+                        visit_stmt(member, &mut all, &mut bound);
+                        free.extend(all.difference(&bound).cloned());
+                    }
+                }
+            } else {
+                scope_free_reads(s, &mut free, &visit_stmt);
+            }
             return Flow::Skip;
         }
         if let ST::If(i) = &s.statement {
@@ -3440,11 +3753,38 @@ fn module_function_free_reads(body: &[crate::Statement]) -> std::collections::Ha
         }
         Flow::Continue
     });
+    free
+}
 
-    all_names
-        .difference(&bound)
-        .cloned()
-        .collect()
+/// Is `name` a class the module at `path` defines ONLY under a
+/// `TYPE_CHECKING` block (`if TYPE_CHECKING: class BaseHTTPConnection
+/// (Protocol)` — urllib3's _base_connection)? Such a class is never
+/// generated, so an annotation naming it is the boxed value. A module that
+/// does not define the class at all is not judged here: the symbol table
+/// an annotation resolves in may be another module's (a cross-module
+/// function's return annotation), whose class is a real item.
+pub(crate) fn module_def_has_type_checking_stub(
+    options: &crate::PythonOptions,
+    path: &[String],
+    name: &str,
+) -> bool {
+    let Some(module) = options.module_defs.get(path) else {
+        return false;
+    };
+    let module: &crate::Module = module;
+    let mut stub = false;
+    walk_stmts(&module.raw.body, Descend::SkipDefs, &mut |s| {
+        if let crate::StatementType::If(i) = &s.statement
+            && Module::is_type_checking_test(&i.test)
+        {
+            stub |= i.body.iter().any(|b| {
+                matches!(&b.statement, crate::StatementType::ClassDef(c) if c.name == name)
+            });
+            return Flow::Skip;
+        }
+        Flow::Continue
+    });
+    stub && !module_def_has_runtime_item(options, path, name)
 }
 
 /// Does `name` have a runtime item in the module at `path` — i.e. is it
@@ -3733,9 +4073,13 @@ pub(crate) fn module_def_has_path_item(
     // emission condition `module_assign_counts.get(n) == Some(&1)`):
     // conditional stores count DOUBLE, so a const with a conditional
     // reassignment is NOT a plain static.
+    let mut target = options.clone();
+    target.this_module_path = path.to_vec();
+    target.module_path = module_package_path_from_defs(path, options);
+    let (body, _) = fold_static_import_trys(&module.raw.body, &target);
     let mut counts = std::collections::HashMap::new();
-    count_module_stores(&module.raw.body, &mut counts);
-    if counts.get(name) == Some(&1) && module.raw.body.iter().any(|s| {
+    count_module_stores(&body, &mut counts);
+    if counts.get(name) == Some(&1) && body.iter().any(|s| {
         matches!(&s.statement, crate::StatementType::Assign(a)
             if a.targets.iter().any(|t| {
                 matches!(t, crate::ExprType::Name(n) if n.id == name)
@@ -3876,7 +4220,7 @@ fn scan_module_body_for_item(
     })
 }
 
-fn is_type_alias_value(value: &crate::ExprType) -> bool {
+pub(crate) fn is_type_alias_value(value: &crate::ExprType) -> bool {
     match value {
         crate::ExprType::Subscript(sub) => match sub.value.as_ref() {
             crate::ExprType::Name(n) => matches!(

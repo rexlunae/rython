@@ -882,9 +882,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             tokens.to_string(),
-            "fn __module_init__ () -> Result < () , PyException > { test () ; Ok (()) } \
-             fn main () { if let Err (e) = __module_init__ () { eprintln ! (\"{}\" , e) ; \
-             std :: process :: exit (1) ; } }"
+            "# [allow (dead_code)] pub (crate) fn __module_init__ () -> Result < () , PyException > \
+             { test () ; Ok (()) } fn main () { let __rython_result = (|| -> Result < () , \
+             PyException > { __module_init__ () ? ; Ok (()) }) () ; if let Err (e) = \
+             __rython_result { eprintln ! (\"{}\" , e) ; std :: process :: exit (1) ; } }"
         );
     }
 }

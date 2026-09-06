@@ -19921,9 +19921,12 @@ fn a_message_reads_the_fields_as_they_stood_at_the_super_call() {
 
 #[test]
 fn a_message_free_name_must_be_the_binding_the_init_sees() {
-    // A message reading a module global renders at the raise site: fine
-    // where the site sees the same binding, refused where a local
-    // shadows it (Devin review on #330).
+    // A message reading a module global renders at the raise site, and
+    // reads the MODULE binding there even where the site binds a local of
+    // the same name (Devin review on #330): a local that shares a module
+    // static's name is spelled apart (`__rython_local_PREFIX` — rustc's
+    // E0530 forbids the shadowing `let`; issue #333), so the raise site's
+    // `PREFIX` is the static the initializer reads.
     let out = compile(
         concat!(
             "PREFIX = \"P\"\n",
@@ -19942,8 +19945,9 @@ fn a_message_free_name_must_be_the_binding_the_init_sees() {
         "raise_free_name.py",
     );
     assert!(out.contains("format ! (\"{}{}\" , py_display (& (PREFIX)) , py_display (& (3)))"), "generated: {}", out);
-    assert!(out.contains("compile_error !"), "generated: {}", out);
-    assert!(out.contains("message reads `PREFIX`"), "generated: {}", out);
+    assert!(out.contains("format ! (\"{}{}\" , py_display (& (PREFIX)) , py_display (& (4)))"), "generated: {}", out);
+    assert!(out.contains("let __rython_local_PREFIX ; __rython_local_PREFIX = \"L\" ;"), "generated: {}", out);
+    assert!(!out.contains("compile_error !"), "generated: {}", out);
 }
 
 #[test]
