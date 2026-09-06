@@ -11193,6 +11193,52 @@ fn importing_a_package_attribute_the_package_deletes_is_refused() {
 }
 
 #[test]
+fn a_type_checking_only_name_in_the_package_does_not_hide_the_submodule() {
+    // conf/__init__.py binds `settings` only under `if TYPE_CHECKING:`,
+    // which never runs: `from .conf import settings` therefore imports
+    // the submodule conf/settings.py (its body prints) and reads its
+    // export, as Python does. A TYPE_CHECKING block binds nothing at
+    // runtime for the package-attribute rule either (Devin review on
+    // #338, round 14).
+    let scratch = Scratch::new("tcpkg");
+    fs::create_dir_all(scratch.path().join("tcpkg").join("conf")).unwrap();
+    let krate = package_crate(
+        &scratch,
+        "tcpkg",
+        &[
+            (
+                "conf/__init__.py",
+                "from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    settings = None\n",
+            ),
+            ("conf/settings.py", "print(\"settings loaded\")\nLEVEL = 3\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from .conf import settings\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"level\", settings.LEVEL)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let cli = fs::read_to_string(krate.root.join("src/cli.rs")).unwrap();
+    assert!(
+        cli.contains("crate::conf::settings::__module_init__()?;")
+            && !cli.contains("__rython_bound__(&[") ,
+        "the submodule loads unconditionally: {}",
+        cli
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "tcpkg"), vec!["settings loaded", "level 3"]);
+}
+
+#[test]
 fn a_bare_annotation_in_the_package_does_not_hide_the_submodule() {
     // `settings: dict` in conf/__init__.py binds only `__annotations__`:
     // `from .conf import settings` therefore imports the submodule

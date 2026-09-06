@@ -5098,7 +5098,7 @@ impl Module {
     /// the compile-time-only guard that never runs at runtime — its block
     /// (imports, type-only class definitions) must be skipped entirely
     /// (requests' _types.py).
-    fn is_type_checking_test(test: &crate::ExprType) -> bool {
+    pub(crate) fn is_type_checking_test(test: &crate::ExprType) -> bool {
         match test {
             crate::ExprType::Name(n) => n.id == "TYPE_CHECKING",
             crate::ExprType::Attribute(a) => {

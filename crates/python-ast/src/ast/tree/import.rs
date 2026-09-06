@@ -653,7 +653,8 @@ pub(crate) fn binds_for<'a>(
 
 /// A module body's bindings — every (statement, name) pair for a
 /// statement that binds a module-scope name, under module-level control
-/// flow too, a def's own body excluded — in source order, each with
+/// flow too, a def's own body and a TYPE_CHECKING block excluded — in
+/// source order, each with
 /// where the binding happens and whether the statement is top-level. A
 /// pair's index here is its MARK: one bit of the module's
 /// `__RYTHON_BOUND` words, set where the binding happens (after the
@@ -666,6 +667,14 @@ fn binding_entries(body: &[crate::Statement]) -> Vec<(&crate::Statement, NameMar
     use crate::ast::tree::visit::{stmt_targets, target_names, walk_stmts, Descend, Flow};
     let mut out: Vec<(&crate::Statement, NameMark, bool)> = Vec::new();
     walk_stmts(body, Descend::SkipDefs, &mut |s| {
+        // A TYPE_CHECKING block is compile-time only: nothing under it
+        // binds at runtime, as the emission and the runtime-item check
+        // already hold (Devin review on #338, round 14).
+        if let crate::StatementType::If(i) = &s.statement
+            && crate::ast::tree::module::Module::is_type_checking_test(&i.test)
+        {
+            return Flow::Skip;
+        }
         let names = stmt_bound_names(s);
         if names.is_empty() {
             return Flow::Continue;
