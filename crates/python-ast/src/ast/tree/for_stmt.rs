@@ -71,14 +71,13 @@ impl CodeGen for For {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // The statement's own binding mark, recorded at the top of each
-        // body where Python has bound the target (Devin review on #338,
-        // round 9); cleared for the bodies' statements.
-        let mut options = options;
-        let body_bind = options
-            .body_bind
-            .take()
-            .map(|(word, mask)| quote!(__rython_bind__(#word, #mask);));
+        // The target's binding marks, recorded at the top of the body,
+        // where Python has bound it (Devin review on #338, rounds 9 to
+        // 12); the iterable's own walrus records itself.
+        let body_bind = crate::ast::tree::import::binds_for(
+            options.stmt_binds.as_deref(),
+            crate::ast::tree::visit::target_names(&self.target).into_iter(),
+        );
         // Python's loop variable is function-scoped: when the target name
         // LEAKS (a later statement reads it, unshadowed), the scope analysis
         // hoists it and this loop must STORE into that binding — a fresh
@@ -124,7 +123,7 @@ impl CodeGen for For {
             .map(|stmt| stmt.to_rust(body_ctx.clone(), options.clone(), symbols.clone()))
             .collect();
         let mut body_stmts = body_stmts?;
-        if let Some(bind) = body_bind.clone() {
+        if let Some(bind) = body_bind {
             body_stmts.insert(0, bind);
         }
 

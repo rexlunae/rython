@@ -63,7 +63,7 @@ impl CodeGen for Lambda {
         // A lambda's body is its own scope: a walrus there binds the
         // lambda's local, never the enclosing statement's module name.
         let mut options = options;
-        options.walrus_bind = None;
+        options.stmt_binds = None;
         let body = wrap_fallible_body(self.body.to_rust(ctx, options, symbols)?);
 
         Ok(quote! {

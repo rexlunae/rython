@@ -11002,6 +11002,149 @@ fn a_walrus_is_bound_at_its_store_before_a_later_operand_runs() {
 }
 
 #[test]
+fn a_with_items_target_is_bound_before_the_next_items_context_runs() {
+    // `with CM() as X, trigger() as Y:` — Python binds X after the first
+    // context expression, before trigger() runs (which imports b): X's
+    // mark is recorded right after its item, not at the body's top
+    // (Devin review on #338, round 12). A `with` target is a module-init
+    // local, so b cannot import X back: the generated order is the pin.
+    let scratch = Scratch::new("withtwo");
+    let krate = package_crate(
+        &scratch,
+        "withtwo",
+        &[
+            (
+                "a.py",
+                concat!(
+                    "print(\"a start\")\n",
+                    "\n",
+                    "\n",
+                    "class CM:\n",
+                    "    def __enter__(self) -> int:\n",
+                    "        return 1\n",
+                    "\n",
+                    "    def __exit__(self, *args) -> bool:\n",
+                    "        return False\n",
+                    "\n",
+                    "\n",
+                    "def trigger() -> CM:\n",
+                    "    from .b import value\n",
+                    "    print(\"trigger\", value())\n",
+                    "    return CM()\n",
+                    "\n",
+                    "\n",
+                    "with CM() as X, trigger() as Y:\n",
+                    "    print(\"a body\")\n",
+                    "print(\"a end\")\n",
+                ),
+            ),
+            ("b.py", "def value() -> int:\n    return 3\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from .a import trigger\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\")\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let a = fs::read_to_string(krate.root.join("src/a.rs")).unwrap();
+    let init = &a[a.find("fn __module_init__").expect("the init")..];
+    let x_store = init.find("let mut X = ").expect("X's item");
+    let x_bound = init.find("__rython_bind__(0usize, 4u32);").expect("X's mark");
+    let y_item = init.find("let mut Y = trigger()?;").expect("Y's item");
+    assert!(
+        x_store < x_bound && x_bound < y_item,
+        "X is bound before the next item's context runs: {}",
+        init
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "withtwo"),
+        vec!["a start", "trigger 3", "a body", "a end", "main"]
+    );
+}
+
+#[test]
+fn a_walrus_marks_only_its_own_name_not_the_statements_store_target() {
+    // `Y = (X := 1) + g()` — g imports b, which asks a for Y while the
+    // statement is still evaluating: Python has bound X (the walrus) but
+    // not Y, so b's import raises ImportError (b catches it). Each name a
+    // statement binds has its own mark (Devin review on #338, round 12);
+    // the walrus sets X's, the store sets Y's afterwards. (The walrus
+    // inside a promoted static's initializer is the closure's own
+    // binding, not an init local — an unassigned `let X;` had no type.)
+    let scratch = Scratch::new("walrusrhs");
+    let krate = package_crate(
+        &scratch,
+        "walrusrhs",
+        &[
+            (
+                "a.py",
+                concat!(
+                    "print(\"a start\")\n",
+                    "\n",
+                    "\n",
+                    "def g() -> int:\n",
+                    "    from .b import value\n",
+                    "    return value()\n",
+                    "\n",
+                    "\n",
+                    "Y = (X := 1) + g()\n",
+                    "print(\"a end\", Y)\n",
+                ),
+            ),
+            (
+                "b.py",
+                concat!(
+                    "try:\n",
+                    "    from .a import Y\n",
+                    "    print(\"b sees\", Y)\n",
+                    "except Exception:\n",
+                    "    print(\"b caught\")\n",
+                    "\n",
+                    "\n",
+                    "def value() -> int:\n",
+                    "    return 2\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .a import Y\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\", Y)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let b = fs::read_to_string(krate.root.join("src/b.rs")).unwrap();
+    assert!(
+        b.contains("crate::a::__rython_bound__(&[(0usize, 2u32)], \"Y\", \"walrusrhs.a\")?;"),
+        "b asks for Y's own mark: {}",
+        b
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "walrusrhs"),
+        vec!["a start", "b caught", "a end 3", "main 3"]
+    );
+}
+
+#[test]
 fn a_bare_annotation_in_the_package_does_not_hide_the_submodule() {
     // `settings: dict` in conf/__init__.py binds only `__annotations__`:
     // `from .conf import settings` therefore imports the submodule

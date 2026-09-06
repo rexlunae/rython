@@ -597,26 +597,22 @@ pub struct PythonOptions {
     pub in_module_init_body: bool,
 
     /// The current module's binding marks (see `import::BindingMarks`):
-    /// each module-scope binding statement's `(mark, top_level)` by its
-    /// source position. A nested statement lowered with
-    /// `in_module_init_body` records its mark where it runs
-    /// (`__rython_bind__`), so a cyclic importer can ask which names the
-    /// body has bound (Devin review on #338, round 8).
-    pub init_binding_marks: std::rc::Rc<std::collections::HashMap<(usize, usize), (usize, bool)>>,
+    /// each module-scope binding statement's per-name marks by its source
+    /// position. A nested statement lowered with `in_module_init_body`
+    /// records its marks where its bindings happen (`__rython_bind__`),
+    /// so a cyclic importer can ask which names the body has bound
+    /// (Devin review on #338, rounds 8 to 12).
+    pub init_binding_marks:
+        std::rc::Rc<std::collections::HashMap<(usize, usize), crate::ast::tree::import::StmtMarks>>,
 
-    /// The `(word, mask)` of the loop or `with` statement about to be
-    /// lowered, when its target is a module-scope binding: the lowering
-    /// records the mark at the top of its body — where Python has bound
-    /// the target — and clears the field for the body (Devin review on
-    /// #338, rounds 9 to 11).
-    pub body_bind: Option<(usize, u32)>,
-
-    /// The `(word, mask)` of the module-scope statement being lowered,
-    /// for the walruses in its own expressions: a walrus records the
-    /// mark right after it stores, where Python binds the name — inside
-    /// a boolean chain or a loop header alike (Devin review on #338,
-    /// round 11). A lambda's body is its own scope and clears it.
-    pub walrus_bind: Option<(usize, u32)>,
+    /// The module-scope statement being lowered: its bound names' bits
+    /// (`name -> (word, mask)`). The lowerings that bind a name before the
+    /// statement completes record it there and then: a loop or `with`
+    /// target at the top of the body, each `with` item's target after its
+    /// context expression, a walrus right after its store (Devin review on
+    /// #338, rounds 9 to 12). A lambda's body is its own scope and clears
+    /// it; every statement sets its own.
+    pub stmt_binds: Option<std::rc::Rc<std::collections::HashMap<String, (usize, u32)>>>,
 
     /// The normalized bodies of the crate's modules (see
     /// `module::normalize_module_body`), cached per module path: an
@@ -750,8 +746,7 @@ impl Default for PythonOptions {
             module_defs: std::rc::Rc::new(std::collections::HashMap::new()),
             in_module_init_body: false,
             init_binding_marks: std::rc::Rc::new(std::collections::HashMap::new()),
-            body_bind: None,
-            walrus_bind: None,
+            stmt_binds: None,
             normalized_bodies: std::rc::Rc::new(std::cell::RefCell::new(
                 std::collections::HashMap::new(),
             )),

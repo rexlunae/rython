@@ -80,14 +80,13 @@ impl CodeGen for AsyncFor {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // The statement's own binding mark, recorded at the top of each
-        // body where Python has bound the target (Devin review on #338,
-        // round 9); cleared for the bodies' statements.
-        let mut options = options;
-        let body_bind = options
-            .body_bind
-            .take()
-            .map(|(word, mask)| quote!(__rython_bind__(#word, #mask);));
+        // The target's binding marks, recorded at the top of the body,
+        // where Python has bound it (Devin review on #338, rounds 9 to
+        // 12); the iterable's own walrus records itself.
+        let body_bind = crate::ast::tree::import::binds_for(
+            options.stmt_binds.as_deref(),
+            crate::ast::tree::visit::target_names(&self.target).into_iter(),
+        );
         // Python's loop variable is function-scoped; a target name whose
         // value LEAKS (a later read, unshadowed) receives a STORE into the
         // hoisted binding, not a fresh `for` binding (same reasoning as the
@@ -110,7 +109,7 @@ impl CodeGen for AsyncFor {
             .map(|stmt| stmt.to_rust(body_ctx.clone(), options.clone(), symbols.clone()))
             .collect();
         let mut body_tokens = body_tokens?;
-        if let Some(bind) = body_bind.clone() {
+        if let Some(bind) = body_bind {
             body_tokens.insert(0, bind);
         }
 

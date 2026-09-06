@@ -577,73 +577,135 @@ fn stmt_bound_names(s: &crate::Statement) -> Vec<String> {
     crate::ast::tree::visit::stmt_bound_names(s, crate::ast::tree::visit::Bindings::Scope)
 }
 
-/// Whether one statement itself binds `name` at module scope.
-fn stmt_binds(s: &crate::Statement, name: &str) -> bool {
-    stmt_bound_names(s).iter().any(|n| n == name)
+/// One binding of a module body: a statement, one name it binds, and
+/// where that binding happens — the statement's index in the walk is
+/// not the mark; each (statement, name) pair has its own bit (Devin
+/// review on #338, round 12), since a statement binds its names at
+/// different times (`Y = (X := f()) + g()` binds X at the walrus and Y
+/// after; `with a() as X, b() as Y:` binds X before b() runs).
+/// Where a name's mark is recorded: after the statement's init code for
+/// a def or class name, an import alias, or a store's target (`after`);
+/// otherwise by the lowering that binds it — a loop target at the top of
+/// the body, a `with` item's target right after its context expression,
+/// a walrus right after its store — each looking its own names up in
+/// the statement's bits (`options.stmt_binds`).
+#[derive(Clone, Debug)]
+pub struct NameMark {
+    pub name: String,
+    /// The bit's index in the module's `__RYTHON_BOUND` words.
+    pub mark: usize,
+    /// Bound after the statement's init code: a def or class name, an
+    /// import alias, a store's target (an assignment, an augmented one).
+    pub after: bool,
 }
 
-/// A loop or `with` statement binds its TARGET before its body runs
-/// (Python binds it at each iteration, or after `__enter__`) and only
-/// then — an empty iterable binds nothing, so neither the `else` clause
-/// nor the statement's end may count it: the loop lowering records the
-/// mark at the top of the body, not after the statement like a store's
-/// (Devin review on #338, rounds 9 to 11). A walrus anywhere in a
-/// statement records the mark where it stores (the walrus lowering); a
-/// def or class binds its name when the statement executes.
-pub(crate) fn binds_before_body(stmt: &crate::StatementType) -> bool {
-    matches!(
-        stmt,
-        crate::StatementType::For(_)
-            | crate::StatementType::AsyncFor(_)
-            | crate::StatementType::With(_)
-            | crate::StatementType::AsyncWith(_)
-    )
+/// One statement's marks (see [`NameMark`]) and whether it is a
+/// top-level statement of the body (whose after-marks the module
+/// emission records at the end of its init range; a nested one records
+/// its own where it runs).
+#[derive(Clone, Debug)]
+pub struct StmtMarks {
+    pub names: Vec<NameMark>,
+    pub top_level: bool,
 }
 
-/// The names a statement binds ONLY through walruses in its own
-/// expressions (`if (x := f()):`, `print((y := 2))`): those marks are
-/// recorded by the walrus lowering, at the store, so the statement
-/// itself records nothing — after it, the walrus may not have run (a
-/// short-circuited operand).
-pub(crate) fn binds_only_by_walrus(s: &crate::Statement) -> bool {
-    use crate::ast::tree::visit::{any_expr_for, stmt_exprs, target_names, Descend};
-    let mut walrus: Vec<String> = Vec::new();
-    for e in stmt_exprs(s) {
-        any_expr_for(e, Descend::OwnScope, |x| {
-            if let crate::ExprType::NamedExpr(ne) = x {
-                walrus.extend(target_names(&ne.left).into_iter().map(str::to_string));
-            }
-            false
-        });
+impl StmtMarks {
+    /// The `__rython_bind__` calls for the names bound after the
+    /// statement's init code, if any.
+    pub(crate) fn after_binds(&self) -> Option<TokenStream> {
+        bind_calls(self.names.iter().filter(|n| n.after).map(|n| n.mark))
     }
-    !walrus.is_empty() && stmt_bound_names(s).iter().all(|n| walrus.contains(n))
+
+    /// `name -> (word, mask)` for the statement's lowering.
+    pub(crate) fn bits(&self) -> std::collections::HashMap<String, (usize, u32)> {
+        self.names
+            .iter()
+            .map(|n| (n.name.clone(), bound_word_and_mask(n.mark)))
+            .collect()
+    }
 }
 
-/// Whether a statement's own expressions contain a walrus (whose lowering
-/// records the statement's mark at the store).
-pub(crate) fn has_walrus(s: &crate::Statement) -> bool {
-    use crate::ast::tree::visit::{any_expr_for, stmt_exprs, Descend};
-    stmt_exprs(s).into_iter().any(|e| {
-        any_expr_for(e, Descend::OwnScope, |x| matches!(x, crate::ExprType::NamedExpr(_)))
-    })
+/// The `__rython_bind__` calls setting the given marks; None for none.
+pub(crate) fn bind_calls(marks: impl Iterator<Item = usize>) -> Option<TokenStream> {
+    let calls: Vec<TokenStream> = marks
+        .map(|mark| {
+            let (word, mask) = bound_word_and_mask(mark);
+            quote!(__rython_bind__(#word, #mask);)
+        })
+        .collect();
+    (!calls.is_empty()).then(|| quote!(#(#calls)*))
 }
 
-/// A module body's binding statements — every statement that binds a
-/// module-scope name, under module-level control flow too, a def's own
-/// body excluded — in source order, each with whether it is a top-level
-/// statement of the body. A statement's index here is its MARK: one bit
-/// of the module's `__RYTHON_BOUND` words, set where the statement runs
-/// (after its init code; a loop or `with` target at the top of its body;
-/// a walrus at its store), which is what a cyclic importer's bound check
-/// reads (Devin review on #338, rounds 8 to 11). The body is the module's
-/// NORMALIZED one (`module::normalize_module_body`), on both sides.
-fn binding_statements(body: &[crate::Statement]) -> Vec<(&crate::Statement, bool)> {
-    use crate::ast::tree::visit::{walk_stmts, Descend, Flow};
-    let mut out: Vec<(&crate::Statement, bool)> = Vec::new();
+/// The `__rython_bind__` calls for `names` in a statement's bits map
+/// (`options.stmt_binds`): what a loop, `with` or walrus lowering emits
+/// for the names it has just bound.
+pub(crate) fn binds_for<'a>(
+    bits: Option<&std::collections::HashMap<String, (usize, u32)>>,
+    names: impl Iterator<Item = &'a str>,
+) -> Option<TokenStream> {
+    let bits = bits?;
+    let calls: Vec<TokenStream> = names
+        .filter_map(|name| bits.get(name))
+        .map(|(word, mask)| quote!(__rython_bind__(#word, #mask);))
+        .collect();
+    (!calls.is_empty()).then(|| quote!(#(#calls)*))
+}
+
+/// A module body's bindings — every (statement, name) pair for a
+/// statement that binds a module-scope name, under module-level control
+/// flow too, a def's own body excluded — in source order, each with
+/// where the binding happens and whether the statement is top-level. A
+/// pair's index here is its MARK: one bit of the module's
+/// `__RYTHON_BOUND` words, set where the binding happens (after the
+/// statement's init code; at the top of a loop body or after a `with`
+/// item; right after a walrus's store), which is what a cyclic
+/// importer's bound check reads (Devin review on #338, rounds 8 to 12).
+/// The body is the module's NORMALIZED one
+/// (`module::normalize_module_body`), on both sides.
+fn binding_entries(body: &[crate::Statement]) -> Vec<(&crate::Statement, NameMark, bool)> {
+    use crate::ast::tree::visit::{stmt_targets, target_names, walk_stmts, Descend, Flow};
+    let mut out: Vec<(&crate::Statement, NameMark, bool)> = Vec::new();
     walk_stmts(body, Descend::SkipDefs, &mut |s| {
-        if !stmt_bound_names(s).is_empty() {
-            let top_level = body.iter().any(|top| std::ptr::eq(top, s));
-            out.push((s, top_level));
+        let names = stmt_bound_names(s);
+        if names.is_empty() {
+            return Flow::Continue;
+        }
+        let is_loop = matches!(
+            &s.statement,
+            crate::StatementType::For(_)
+                | crate::StatementType::AsyncFor(_)
+                | crate::StatementType::With(_)
+                | crate::StatementType::AsyncWith(_)
+        );
+        let stored: Vec<String> = stmt_targets(s)
+            .into_iter()
+            .flat_map(target_names)
+            .map(str::to_string)
+            .collect();
+        let declared: Vec<String> = match &s.statement {
+            crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
+                vec![f.name.clone()]
+            }
+            crate::StatementType::ClassDef(c) => vec![c.name.clone()],
+            crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_) => {
+                names.clone()
+            }
+            _ => Vec::new(),
+        };
+        let top_level = body.iter().any(|top| std::ptr::eq(top, s));
+        let mut seen: Vec<String> = Vec::new();
+        for name in names {
+            if seen.contains(&name) {
+                continue;
+            }
+            let after = declared.contains(&name) || (!is_loop && stored.contains(&name));
+            let mark = NameMark {
+                mark: out.len(),
+                after,
+                name: name.clone(),
+            };
+            out.push((s, mark, top_level));
+            seen.push(name);
         }
         Flow::Continue
     });
@@ -651,11 +713,10 @@ fn binding_statements(body: &[crate::Statement]) -> Vec<(&crate::Statement, bool
 }
 
 /// The marks of a module body by source position (see
-/// [`binding_statements`]): what the module emission and the nested
-/// statement lowering consult to record a binding where it runs.
+/// [`binding_entries`]): what the module emission and the statement
+/// lowering consult to record each binding where it happens.
 pub(crate) struct BindingMarks {
-    /// `(mark, top_level)` by `(lineno, col_offset)`.
-    pub by_pos: std::collections::HashMap<(usize, usize), (usize, bool)>,
+    pub by_pos: std::collections::HashMap<(usize, usize), StmtMarks>,
     /// How many marks the body has (the size of the bound bitmap).
     pub count: usize,
 }
@@ -666,23 +727,27 @@ pub(crate) const BOUND_WORD_BITS: usize = 32;
 
 impl BindingMarks {
     pub(crate) fn of(body: &[crate::Statement]) -> Self {
-        let stmts = binding_statements(body);
-        let by_pos = stmts
-            .iter()
-            .enumerate()
-            .filter_map(|(mark, (s, top_level))| {
-                Some(((s.lineno?, s.col_offset?), (mark, *top_level)))
-            })
-            .collect();
-        Self { by_pos, count: stmts.len() }
+        let entries = binding_entries(body);
+        let count = entries.len();
+        let mut by_pos: std::collections::HashMap<(usize, usize), StmtMarks> =
+            std::collections::HashMap::new();
+        for (s, mark, top_level) in entries {
+            let (Some(line), Some(col)) = (s.lineno, s.col_offset) else {
+                continue;
+            };
+            by_pos
+                .entry((line, col))
+                .or_insert_with(|| StmtMarks { names: Vec::new(), top_level })
+                .names
+                .push(mark);
+        }
+        Self { by_pos, count }
     }
 
-    /// The `__rython_bind__` call recording that the statement at `pos`
-    /// has run, when it is a binding statement.
-    pub(crate) fn bind_call(&self, pos: (usize, usize)) -> Option<TokenStream> {
-        let (mark, _) = self.by_pos.get(&pos)?;
-        let (word, mask) = bound_word_and_mask(*mark);
-        Some(quote!(__rython_bind__(#word, #mask);))
+    /// The `__rython_bind__` calls for the names the statement at `pos`
+    /// binds after its init code, if any.
+    pub(crate) fn after_binds(&self, pos: (usize, usize)) -> Option<TokenStream> {
+        self.by_pos.get(&pos)?.after_binds()
     }
 }
 
@@ -692,8 +757,8 @@ pub(crate) fn bound_word_and_mask(mark: usize) -> (usize, u32) {
 }
 
 /// The bindings of `name` in the body of the crate module at `key` (a
-/// def's locals excluded): every binding statement's mark, and whether
-/// all of them are nested under module-level control flow. A package's
+/// def's locals excluded): every binding's mark, and whether all of them
+/// are nested under module-level control flow. A package's
 /// own `from . import name` binds the SUBMODULE — it is the submodule
 /// import, not an attribute the package has before it — so it never
 /// counts (the entry's `from . import helper` in its `__init__`).
@@ -708,12 +773,10 @@ fn module_binding(options: &PythonOptions, key: &[String], name: &str) -> Option
         }
         _ => false,
     };
-    let stmts = binding_statements(&body);
-    let bindings: Vec<(usize, bool)> = stmts
-        .iter()
-        .enumerate()
-        .filter(|(_, (s, _))| stmt_binds(s, name) && !imports_own_submodule(s))
-        .map(|(mark, (_, top_level))| (mark, *top_level))
+    let bindings: Vec<(usize, bool)> = binding_entries(&body)
+        .into_iter()
+        .filter(|(s, mark, _)| mark.name == name && !imports_own_submodule(s))
+        .map(|(_, mark, top_level)| (mark.mark, top_level))
         .collect();
     if bindings.is_empty() {
         return None;

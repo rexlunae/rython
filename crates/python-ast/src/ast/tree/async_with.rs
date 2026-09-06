@@ -106,14 +106,6 @@ impl CodeGen for AsyncWith {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // The statement's own binding mark, recorded at the top of each
-        // body where Python has bound the target (Devin review on #338,
-        // round 9); cleared for the bodies' statements.
-        let mut options = options;
-        let body_bind = options
-            .body_bind
-            .take()
-            .map(|(word, mask)| quote!(__rython_bind__(#word, #mask);));
         // Evaluate each context manager and bind its `as` target, mirroring
         // the synchronous `with` lowering (async __aenter__/__aexit__
         // protocol semantics are not modeled yet).
@@ -124,8 +116,15 @@ impl CodeGen for AsyncWith {
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             match item.optional_vars {
                 Some(vars) => {
+                    // The item's target is bound right after its context
+                    // expression, before the next item's runs: its marks go
+                    // there (Devin review on #338, round 12).
+                    let bind = crate::ast::tree::import::binds_for(
+                        options.stmt_binds.as_deref(),
+                        crate::ast::tree::visit::target_names(&vars).into_iter(),
+                    );
                     let target = vars.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    item_tokens.push(quote! { let mut #target = #context_expr; });
+                    item_tokens.push(quote! { let mut #target = #context_expr; #bind });
                 }
                 None => {
                     item_tokens.push(quote! { let _ = #context_expr; });
@@ -136,10 +135,7 @@ impl CodeGen for AsyncWith {
         let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.body.into_iter()
             .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
             .collect();
-        let mut body_tokens = body_tokens?;
-        if let Some(bind) = body_bind.clone() {
-            body_tokens.insert(0, bind);
-        }
+        let body_tokens = body_tokens?;
 
         Ok(quote! {
             {

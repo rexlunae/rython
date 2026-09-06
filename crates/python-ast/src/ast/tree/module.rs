@@ -995,18 +995,13 @@ impl CodeGen for Module {
         options.init_binding_marks = std::rc::Rc::new(binding_marks.by_pos.clone());
         let mut top_level_binds: Vec<(Option<TokenStream>, usize)> = Vec::new();
         for (stmt_index, s) in self.raw.body.into_iter().enumerate() {
-            // A loop or `with` target's mark is recorded at the top of the
-            // body, a walrus's at its store — both by the statement
-            // lowering, not at the end of the statement's range.
-            let end_of_range_bind = if crate::ast::tree::import::binds_before_body(&s.statement)
-                || crate::ast::tree::import::binds_only_by_walrus(&s)
-            {
-                None
-            } else {
-                s.lineno
-                    .zip(s.col_offset)
-                    .and_then(|pos| binding_marks.bind_call(pos))
-            };
+            // The names the statement binds after its init code (a loop or
+            // `with` target's mark is recorded at the top of the body, a
+            // walrus's at its store — by the statement lowering).
+            let end_of_range_bind = s
+                .lineno
+                .zip(s.col_offset)
+                .and_then(|pos| binding_marks.after_binds(pos));
             top_level_binds.push((end_of_range_bind, module_init_stmts.len()));
             match &s.statement {
                 crate::StatementType::FunctionDef(f)
@@ -1953,9 +1948,6 @@ impl CodeGen for Module {
                             o
                         };
                         let body_pos = body_stmt.lineno.zip(body_stmt.col_offset);
-                        let body_binds_target_first =
-                            crate::ast::tree::import::binds_before_body(&body_stmt.statement)
-                                || crate::ast::tree::import::binds_only_by_walrus(&body_stmt);
                         let body_tokens = body_stmt
                             .to_rust(ctx.clone(), body_options, symbols.clone())
                             .map_err(|e| wrap_module_error(&module_filename, e))?;
@@ -1968,12 +1960,10 @@ impl CodeGen for Module {
                             }
                         }
                         // The flattened statement binds where Python runs
-                        // it: its mark, after its init code (the nested
-                        // lowering records marks only under a lowered
-                        // control-flow statement).
-                        if !body_binds_target_first
-                            && let Some(bind) = body_pos.and_then(|pos| binding_marks.bind_call(pos))
-                        {
+                        // it: the names bound after its init code (the
+                        // nested lowering records marks only under a
+                        // lowered control-flow statement).
+                        if let Some(bind) = body_pos.and_then(|pos| binding_marks.after_binds(pos)) {
                             module_init_stmts.push(bind);
                         }
                     }
@@ -2110,9 +2100,9 @@ impl CodeGen for Module {
             }
         }
 
-        // Each top-level binding statement's `__rython_bind__`, at the end
-        // of its init range (a def or class has none: the call sits at
-        // its position, where Python binds the name).
+        // Each top-level statement's after-marks (`__rython_bind__`), at
+        // the end of its init range (a def or class has none: the calls
+        // sit at its position, where Python binds the name).
         {
             let ends: Vec<usize> = top_level_binds
                 .iter()
@@ -2140,11 +2130,50 @@ impl CodeGen for Module {
         // sys.version_info` — requests' compat.py) emits a `pub use ... as
         // name` item: the same name hoisted as an init local would shadow
         // the static (E0530; issue #333).
+        // A walrus inside a PROMOTED static's initializer (`Y = (X := 1)
+        // + g()`) stores X in the static's closure, where an init local
+        // cannot be reached: when nothing else binds X, the closure's own
+        // `let` is its binding and the init declares nothing (an unassigned
+        // `let X;` has no type — E0282; Devin review on #338, round 12).
+        let promoted_walrus_targets: Vec<String> = {
+            use crate::ast::tree::visit::{
+                any_expr_for, stmt_bound_names, target_names, Bindings, Descend,
+            };
+            let mut out: Vec<String> = Vec::new();
+            for (index, s) in module_init_raw.iter().enumerate() {
+                let crate::StatementType::Assign(a) = &s.statement else { continue };
+                let [crate::ExprType::Name(n)] = a.targets.as_slice() else { continue };
+                if !(promoted_statics.contains(&n.id) || promoted_conditional.contains_key(&n.id)) {
+                    continue;
+                }
+                any_expr_for(&a.value, Descend::OwnScope, |x| {
+                    if let crate::ExprType::NamedExpr(ne) = x {
+                        for name in target_names(&ne.left) {
+                            let bound_elsewhere = module_init_raw
+                                .iter()
+                                .enumerate()
+                                .any(|(other, o)| {
+                                    other != index
+                                        && stmt_bound_names(o, Bindings::Scope)
+                                            .iter()
+                                            .any(|b| b == name)
+                                });
+                            if !bound_elsewhere {
+                                out.push(name.to_string());
+                            }
+                        }
+                    }
+                    false
+                });
+            }
+            out
+        };
         let init_hoist_skip: std::collections::HashSet<String> = promoted_statics
             .iter()
             .cloned()
             .chain(global_mutables.keys().cloned())
             .chain(stdlib_aliases.into_iter())
+            .chain(promoted_walrus_targets.into_iter())
             .collect();
         let init_decls = hoisted_declarations(
             &module_init_raw,

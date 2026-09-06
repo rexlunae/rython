@@ -71,43 +71,22 @@ impl CodeGen for Statement {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let (lineno, col_offset) = (self.lineno, self.col_offset);
         let (end_lineno, end_col_offset) = (self.end_lineno, self.end_col_offset);
-        // A binding statement nested in module-level control flow records
-        // its mark where it runs (`__rython_bind__`), so a cyclic importer
-        // can ask whether the name is bound yet; the module emission
-        // records the top-level ones (Devin review on #338, round 8).
-        // Where the statement's mark is recorded: a loop or `with`
-        // target at the top of the body (`body_bind`); a walrus at its
-        // store (`walrus_bind`, for the walruses in this statement's own
-        // expressions); anything else after the statement. A statement
-        // binding only through walruses records nothing itself.
+        // The statement's binding marks (Devin review on #338, rounds 8 to
+        // 12): its names' bits go to the lowerings that bind before the
+        // statement completes (`stmt_binds` — a loop or `with` target, a
+        // walrus); the names bound after its init code are recorded here
+        // for a nested statement, and by the module emission at the end
+        // of a top-level one's init range.
         let mut options = options;
-        let before_body = crate::ast::tree::import::binds_before_body(&self.statement);
-        let mark = match (options.in_module_init_body, lineno, col_offset) {
-            (true, Some(line), Some(col)) => options
-                .init_binding_marks
-                .get(&(line, col))
-                .map(|(mark, top_level)| {
-                    (crate::ast::tree::import::bound_word_and_mask(*mark), *top_level)
-                }),
+        let marks = match (options.in_module_init_body, lineno, col_offset) {
+            (true, Some(line), Some(col)) => options.init_binding_marks.get(&(line, col)).cloned(),
             _ => None,
         };
-        // A walrus records the mark at its store, at any level; the module
-        // emission records a top-level store's mark itself.
-        options.walrus_bind = mark
-            .map(|(bits, _)| bits)
-            .filter(|_| crate::ast::tree::import::has_walrus(&self));
-        let bind = mark
-            .filter(|(_, top_level)| before_body || !top_level)
-            .map(|(bits, _)| bits);
-        let bind = match (bind, before_body) {
-            (Some(bits), true) => {
-                options.body_bind = Some(bits);
-                None
-            }
-            (Some(_), false) if crate::ast::tree::import::binds_only_by_walrus(&self) => None,
-            (Some((word, mask)), false) => Some(quote!(__rython_bind__(#word, #mask);)),
-            (None, _) => None,
-        };
+        options.stmt_binds = marks.as_ref().map(|m| std::rc::Rc::new(m.bits()));
+        let bind = marks
+            .as_ref()
+            .filter(|m| !m.top_level)
+            .and_then(|m| m.after_binds());
         // An import a folded guard spliced in, nested in module-level
         // control flow: its site (the init calls) is loud when a crate
         // module raises ImportError at runtime.
