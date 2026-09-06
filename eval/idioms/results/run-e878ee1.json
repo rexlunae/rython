@@ -1,6 +1,6 @@
 {
-  "converter_commit": "4daf246",
-  "repo_head": "4daf246",
+  "converter_commit": "e878ee1",
+  "repo_head": "e878ee1",
   "rypip_path": "target/debug/rypip",
   "oracle": "CPython 3.11.15",
   "passed": 13,
