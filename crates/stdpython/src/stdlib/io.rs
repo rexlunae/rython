@@ -68,6 +68,15 @@ enum BytesBackend {
     /// standard output (`FileType("wb")("-")` — Devin review on #339).
     #[cfg(feature = "std")]
     DiskWrite(alloc::boxed::Box<dyn std::io::Write>),
+    /// The live standard input (`sys.stdin.buffer`): reads through the
+    /// process's one stdin buffer; the closed state is
+    /// crate::STDIN_CLOSED, shared with the text handle (Devin review on
+    /// #339, round 5).
+    #[cfg(feature = "std")]
+    Stdin,
+    /// The live standard output (`sys.stdout.buffer`).
+    #[cfg(feature = "std")]
+    Stdout,
     Closed,
 }
 
@@ -109,10 +118,7 @@ impl PyBytesIO {
     /// argparse's `FileType("rb")("-")`).
     #[cfg(feature = "std")]
     pub fn stdin() -> Self {
-        thread_local! {
-            static STDIN: PyBytesIO = PyBytesIO::new_disk_read(std::io::BufReader::new(std::io::stdin()), "<stdin>");
-        }
-        STDIN.with(|f| f.clone())
+        Self::from_backend(BytesBackend::Stdin, "<stdin>")
     }
 
     /// The live standard output as a binary file (`sys.stdout.buffer`;
@@ -120,16 +126,20 @@ impl PyBytesIO {
     /// descriptor open.
     #[cfg(feature = "std")]
     pub fn stdout() -> Self {
-        thread_local! {
-            static STDOUT: PyBytesIO = PyBytesIO::new_disk_write(std::io::stdout(), "<stdout>");
-        }
-        STDOUT.with(|f| f.clone())
+        Self::from_backend(BytesBackend::Stdout, "<stdout>")
     }
 
     /// Python `f.closed`: whether close() ran on this stream (through
     /// any alias of it).
     pub fn closed(&self) -> bool {
-        matches!(*self.inner.borrow(), BytesBackend::Closed)
+        match &*self.inner.borrow() {
+            BytesBackend::Closed => true,
+            #[cfg(feature = "std")]
+            BytesBackend::Stdin => crate::stdin_closed(),
+            #[cfg(feature = "std")]
+            BytesBackend::Stdout => crate::stdout_closed(),
+            _ => false,
+        }
     }
 
     /// Python `b.read()`: the remaining bytes from the cursor (a disk
@@ -151,7 +161,26 @@ impl PyBytesIO {
                 Ok(out)
             }
             #[cfg(feature = "std")]
+            BytesBackend::Stdin => {
+                use std::io::Read;
+                if crate::stdin_closed() {
+                    return Err(crate::closed_file_error());
+                }
+                let mut out = Vec::new();
+                std::io::stdin()
+                    .lock()
+                    .read_to_end(&mut out)
+                    .map_err(|e| crate::runtime_error(&format!("Read error: {}", e)))?;
+                Ok(out)
+            }
+            #[cfg(feature = "std")]
             BytesBackend::DiskWrite(_) => Err(crate::unsupported_operation("read")),
+            #[cfg(feature = "std")]
+            BytesBackend::Stdout => Err(if crate::stdout_closed() {
+                crate::closed_file_error()
+            } else {
+                crate::unsupported_operation("read")
+            }),
             BytesBackend::Closed => Err(crate::closed_file_error()),
         }
     }
@@ -179,7 +208,25 @@ impl PyBytesIO {
                 Ok(bytes.len() as i64)
             }
             #[cfg(feature = "std")]
+            BytesBackend::Stdout => {
+                use std::io::Write;
+                if crate::stdout_closed() {
+                    return Err(crate::closed_file_error());
+                }
+                std::io::stdout()
+                    .lock()
+                    .write_all(bytes)
+                    .map_err(|e| crate::runtime_error(&format!("Write error: {}", e)))?;
+                Ok(bytes.len() as i64)
+            }
+            #[cfg(feature = "std")]
             BytesBackend::DiskRead(_) => Err(crate::unsupported_operation("write")),
+            #[cfg(feature = "std")]
+            BytesBackend::Stdin => Err(if crate::stdin_closed() {
+                crate::closed_file_error()
+            } else {
+                crate::unsupported_operation("write")
+            }),
             BytesBackend::Closed => Err(crate::closed_file_error()),
         }
     }
@@ -191,8 +238,17 @@ impl PyBytesIO {
         match &*self.inner.borrow() {
             BytesBackend::Buffer { data, .. } => Ok(data.clone()),
             BytesBackend::Closed => Err(crate::closed_file_error()),
+            // CPython's AttributeError names the receiver's class: a
+            // read handle is a BufferedReader, a write handle a
+            // BufferedWriter (Devin review on #339, round 5).
             #[cfg(feature = "std")]
-            _ => Err(crate::runtime_error("getvalue() is a BytesIO method; a disk file has none")),
+            BytesBackend::DiskRead(_) | BytesBackend::Stdin => Err(crate::attribute_error(
+                "'_io.BufferedReader' object has no attribute 'getvalue'",
+            )),
+            #[cfg(feature = "std")]
+            BytesBackend::DiskWrite(_) | BytesBackend::Stdout => Err(crate::attribute_error(
+                "'_io.BufferedWriter' object has no attribute 'getvalue'",
+            )),
         }
     }
 
@@ -206,6 +262,18 @@ impl PyBytesIO {
                     .flush()
                     .map_err(|e| crate::runtime_error(&format!("Flush error: {}", e)))
             }
+            #[cfg(feature = "std")]
+            BytesBackend::Stdout => {
+                use std::io::Write;
+                if crate::stdout_closed() {
+                    return Err(crate::closed_file_error());
+                }
+                std::io::stdout()
+                    .flush()
+                    .map_err(|e| crate::runtime_error(&format!("Flush error: {}", e)))
+            }
+            #[cfg(feature = "std")]
+            BytesBackend::Stdin if crate::stdin_closed() => Err(crate::closed_file_error()),
             BytesBackend::Closed => Err(crate::closed_file_error()),
             _ => Ok(()),
         }
@@ -213,6 +281,26 @@ impl PyBytesIO {
 
     /// Python `b.close()`.
     pub fn close(&self) -> Result<(), PyException> {
+        // The standard streams close process-wide and keep the
+        // descriptor open (see PyFile::close).
+        #[cfg(feature = "std")]
+        match &*self.inner.borrow() {
+            BytesBackend::Stdin => {
+                crate::STDIN_CLOSED.store(true, core::sync::atomic::Ordering::SeqCst);
+                return Ok(());
+            }
+            BytesBackend::Stdout => {
+                use std::io::Write;
+                if !crate::stdout_closed() {
+                    std::io::stdout()
+                        .flush()
+                        .map_err(|e| crate::runtime_error(&format!("Flush error: {}", e)))?;
+                    crate::STDOUT_CLOSED.store(true, core::sync::atomic::Ordering::SeqCst);
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
         let old = core::mem::replace(&mut *self.inner.borrow_mut(), BytesBackend::Closed);
         #[cfg(feature = "std")]
         if let BytesBackend::DiskWrite(mut writer) = old {

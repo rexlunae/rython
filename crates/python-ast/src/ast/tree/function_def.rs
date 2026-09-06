@@ -592,6 +592,20 @@ pub(crate) fn scan_argparse(
                     version_bindings.push((i, local.clone(), v));
                     ArgparseKind::Version(local)
                 } else if store_true {
+                    // A positional store_true is a degenerate CPython shape
+                    // (the flag is set to True without consuming a token,
+                    // so the argument means nothing on the command line);
+                    // refused rather than modeled as a value-taking
+                    // positional (Devin review on #339, round 5).
+                    if is_positional {
+                        return Err(format!(
+                            "add_argument('{}'): action=\"store_true\" on a positional \
+                             consumes no token in CPython (the flag is simply True); \
+                             it is only supported on options",
+                            name
+                        )
+                        .into());
+                    }
                     // `default=False` is store_true's own default (Python
                     // allows spelling it); anything else is a divergent
                     // flag.

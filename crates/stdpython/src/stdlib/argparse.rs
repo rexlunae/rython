@@ -233,54 +233,205 @@ fn prog_name(explicit: Option<&str>) -> String {
     }
 }
 
-fn usage_line(prog: &str, specs: &[ArgSpec]) -> String {
-    let mut parts = vec![format!("usage: {} [-h]", prog)];
-    for s in specs.iter().filter(|s| !s.is_positional()) {
-        parts.push(format!("[{}]", s.usage_invocation()));
+/// `shutil.get_terminal_size().columns`: the COLUMNS variable when it
+/// is a positive integer, else the width of the terminal on stdout,
+/// else 80 (not a tty). The formatter's width is that minus 2.
+fn terminal_columns() -> usize {
+    if let Ok(c) = std::env::var("COLUMNS")
+        && let Ok(n) = c.trim().parse::<i64>()
+        && n > 0
+    {
+        return n as usize;
     }
-    for s in specs.iter().filter(|s| s.is_positional()) {
-        parts.push(s.positional_spelling());
+    #[cfg(unix)]
+    {
+        let mut ws: libc::winsize = unsafe { core::mem::zeroed() };
+        if unsafe { libc::ioctl(1, libc::TIOCGWINSZ as _, &mut ws) } == 0 && ws.ws_col > 0 {
+            return ws.ws_col as usize;
+        }
     }
-    parts.join(" ")
+    80
 }
 
-fn help_text(prog: &str, description: Option<&str>, specs: &[ArgSpec]) -> String {
-    // Python's help column: two-space indent + the longest invocation
-    // (capped at 24) + two spaces. Longer invocations push their help
-    // onto the next line at that column.
-    // Python's formula (HelpFormatter): the help column is indent(2) +
-    // longest invocation + 2, capped at max_help_position=24.
-    let help_spec = "-h, --help".to_string();
-    let max_len = specs
+fn formatter_width() -> usize {
+    terminal_columns().saturating_sub(2)
+}
+
+/// The formatter's `_whitespace_matcher.sub(' ', text).strip()`: runs
+/// of ASCII whitespace become one space.
+fn collapse_whitespace(text: &str) -> String {
+    let is_ws = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c');
+    let mut out = String::with_capacity(text.len());
+    let mut in_ws = false;
+    for c in text.chars() {
+        if is_ws(c) {
+            in_ws = true;
+        } else {
+            if in_ws && !out.is_empty() {
+                out.push(' ');
+            }
+            in_ws = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn char_len(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// The usage parts of the positionals, as `_format_usage`'s part
+/// regexp splits them: a bracketed group (`[files ...]`) is one part,
+/// any other run of non-space is one part — so `files [files ...]`
+/// is two parts and may wrap between them.
+fn positional_parts(spec: &ArgSpec) -> Vec<String> {
+    match spec.nargs {
+        Nargs::One => vec![spec.name.to_string()],
+        Nargs::Plus => vec![spec.name.to_string(), format!("[{} ...]", spec.name)],
+        Nargs::Star => vec![format!("[{} ...]", spec.name)],
+    }
+}
+
+/// The usage line(s) — CPython's `_format_usage`: `usage: prog`
+/// followed by every option's bracketed invocation and the
+/// positionals; when that exceeds the formatter width it is wrapped by
+/// parts, continuation lines aligned after the program name (a short
+/// prog) or under the prefix (a long one), the optionals and the
+/// positionals on separate lines.
+fn usage_line(prog: &str, specs: &[ArgSpec]) -> String {
+    let prefix = "usage: ";
+    let text_width = formatter_width();
+    let mut opt_parts: Vec<String> = vec!["[-h]".to_string()];
+    for s in specs.iter().filter(|s| !s.is_positional()) {
+        opt_parts.push(format!("[{}]", s.usage_invocation()));
+    }
+    let pos_parts: Vec<String> = specs
         .iter()
-        .map(|s| s.invocation().chars().count())
-        .chain([help_spec.chars().count()])
+        .filter(|s| s.is_positional())
+        .flat_map(positional_parts)
+        .collect();
+    let opt_usage = opt_parts.join(" ");
+    let pos_usage = pos_parts.join(" ");
+    let action_usage = [opt_usage.as_str(), pos_usage.as_str()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let usage = if action_usage.is_empty() {
+        prog.to_string()
+    } else {
+        format!("{} {}", prog, action_usage)
+    };
+    if char_len(prefix) + char_len(&usage) <= text_width {
+        return format!("{}{}", prefix, usage);
+    }
+    let get_lines = |parts: &[String], indent: &str, with_prefix: bool| -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        let mut line: Vec<&str> = Vec::new();
+        let mut line_len: isize = if with_prefix {
+            char_len(prefix) as isize - 1
+        } else {
+            char_len(indent) as isize - 1
+        };
+        for part in parts {
+            if line_len + 1 + char_len(part) as isize > text_width as isize && !line.is_empty() {
+                lines.push(format!("{}{}", indent, line.join(" ")));
+                line.clear();
+                line_len = char_len(indent) as isize - 1;
+            }
+            line.push(part);
+            line_len += char_len(part) as isize + 1;
+        }
+        if !line.is_empty() {
+            lines.push(format!("{}{}", indent, line.join(" ")));
+        }
+        if with_prefix && !lines.is_empty() {
+            lines[0] = lines[0].chars().skip(char_len(indent)).collect();
+        }
+        lines
+    };
+    let lines: Vec<String> = if (char_len(prefix) + char_len(prog)) as f64 <= 0.75 * text_width as f64 {
+        let indent = " ".repeat(char_len(prefix) + char_len(prog) + 1);
+        let mut head: Vec<String> = vec![prog.to_string()];
+        head.extend(opt_parts.iter().cloned());
+        let mut lines = get_lines(&head, &indent, true);
+        lines.extend(get_lines(&pos_parts, &indent, false));
+        lines
+    } else {
+        let indent = " ".repeat(char_len(prefix));
+        let mut all: Vec<String> = opt_parts.clone();
+        all.extend(pos_parts.iter().cloned());
+        let mut lines = get_lines(&all, &indent, false);
+        if lines.len() > 1 {
+            lines = get_lines(&opt_parts, &indent, false);
+            lines.extend(get_lines(&pos_parts, &indent, false));
+        }
+        let mut with_prog = vec![prog.to_string()];
+        with_prog.extend(lines);
+        with_prog
+    };
+    format!("{}{}", prefix, lines.join("\n"))
+}
+
+/// The whole help text — CPython's HelpFormatter: the usage, the
+/// description filled to the width, then the positional and option
+/// sections. The help column is `min(action_max_length + 2,
+/// max_help_position)` with `max_help_position = min(24, width - 20)`;
+/// an invocation that fits before it shares its line with the first
+/// help line, a longer one pushes the help to the next line; help
+/// strings are `%`-expanded, whitespace-collapsed and wrapped at
+/// `width - help_position` (at least 11), continuation lines at the
+/// help column.
+fn help_text(prog: &str, description: Option<&str>, specs: &[ArgSpec]) -> String {
+    let width = formatter_width();
+    let max_help_position = 24usize.min(width.saturating_sub(20).max(4));
+    let help_spec = "-h, --help".to_string();
+    let action_max_length = specs
+        .iter()
+        .map(|s| char_len(&s.invocation()))
+        .chain([char_len(&help_spec)])
+        .map(|l| l + 2)
         .max()
         .unwrap_or(0);
-    let help_col = (2 + max_len + 2).min(24);
+    let help_position = (action_max_length + 2).min(max_help_position);
+    let help_width = width.saturating_sub(help_position).max(11);
+    let action_width = help_position.saturating_sub(4);
 
     let mut out = usage_line(prog, specs);
     out.push('\n');
     if let Some(d) = description {
+        let text = collapse_whitespace(&format_text(d, prog));
         out.push('\n');
-        out.push_str(&format_text(d, prog));
+        out.push_str(
+            &crate::stdlib::textwrap::fill(&text, width.max(1) as i64)
+                .unwrap_or_else(|e| loud_exit(&e)),
+        );
         out.push('\n');
     }
     let entry = |out: &mut String, invocation: &str, help: Option<&str>| {
+        let help = help.map(collapse_whitespace).filter(|h| !h.is_empty());
         out.push_str("  ");
         out.push_str(invocation);
         match help {
             None => out.push('\n'),
             Some(h) => {
-                let used = 2 + invocation.chars().count();
-                if used + 2 > help_col {
-                    out.push('\n');
-                    out.push_str(&" ".repeat(help_col));
+                let lines = crate::stdlib::textwrap::wrap(&h, help_width as i64)
+                    .unwrap_or_else(|e| loud_exit(&e));
+                let mut lines = lines.into_iter();
+                if char_len(invocation) <= action_width {
+                    out.push_str(&" ".repeat(action_width - char_len(invocation) + 2));
                 } else {
-                    out.push_str(&" ".repeat(help_col - used));
+                    out.push('\n');
+                    out.push_str(&" ".repeat(help_position));
                 }
-                out.push_str(h);
+                out.push_str(&lines.next().unwrap_or_default());
                 out.push('\n');
+                for line in lines {
+                    out.push_str(&" ".repeat(help_position));
+                    out.push_str(&line);
+                    out.push('\n');
+                }
             }
         }
     };
@@ -303,7 +454,6 @@ fn help_text(prog: &str, description: Option<&str>, specs: &[ArgSpec]) -> String
     out
 }
 
-/// `action="version"`: Python prints the version string to stdout and
 /// Python's `text % params` for the `%(name)s` directives argparse
 /// substitutes (`%(prog)s` in a version or description, `%(prog)s`,
 /// `%(default)s`, `%(dest)s`, `%(type)s` in a help string) and `%%`.
@@ -1051,12 +1201,15 @@ pub fn run_parser(
     parse.extras.extend(leftovers);
 
     // Required arguments first (`_parse_known_args`), then the leftovers
-    // (`parse_args`): a positional that takes zero or more is never
-    // required.
+    // (`parse_args`). Every positional is required — a `*` positional
+    // without a default included (`_get_positional_kwargs`); it is
+    // satisfied by being consumed with zero tokens, and reported only
+    // when an earlier positional failed to match, exactly as CPython
+    // lists `first, rest` for `--` alone (Devin review on #339, round 5).
     let missing: Vec<String> = specs
         .iter()
         .enumerate()
-        .filter(|(i, s)| !parse.seen[*i] && s.is_positional() && s.nargs != Nargs::Star)
+        .filter(|(i, s)| !parse.seen[*i] && s.is_positional())
         .map(|(_, s)| s.action_name())
         .collect();
     if !missing.is_empty() {

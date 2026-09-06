@@ -6843,6 +6843,13 @@ fn update_file_modes_are_refused_at_conversion() {
             "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"f\", choices=[\"a\"])\n",
             "keyword 'choices' is not supported yet",
         ),
+        // A positional store_true consumes no token in CPython (the flag
+        // is simply True): refused rather than modeled as a value
+        // (round 5).
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"flag\", action=\"store_true\")\n",
+            "action=\"store_true\" on a positional consumes no token in CPython",
+        ),
     ] {
         let src = format!(
             "import argparse\n\ndef main(argv: list[str] | None = None) -> int:\n{}    args = p.parse_args(argv)\n    return 0\n",

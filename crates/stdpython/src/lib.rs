@@ -7342,10 +7342,22 @@ enum PyFileBackend {
     /// input (argparse's `FileType("r")("-")`).
     #[cfg(feature = "std")]
     DiskRead(alloc::boxed::Box<dyn std::io::BufRead>),
-    /// A writable stream: a buffered disk file, or the live standard
-    /// output (`FileType("w")("-")` — Devin review on #339).
+    /// A writable stream: a buffered disk file.
     #[cfg(feature = "std")]
     DiskWrite(alloc::boxed::Box<dyn std::io::Write>),
+    /// The live standard input (`sys.stdin`; argparse's
+    /// `FileType("r")("-")`): reads go through the process's one
+    /// `std::io::stdin()` buffer, and the closed state is the
+    /// process-wide [`STDIN_CLOSED`], so every handle on every thread is
+    /// an alias of one object, as in CPython (Devin review on #339,
+    /// round 5).
+    #[cfg(feature = "std")]
+    Stdin,
+    /// The live standard output (`sys.stdout`; `FileType("w")("-")`):
+    /// writes go through `std::io::stdout()`, the closed state is
+    /// [`STDOUT_CLOSED`]; close() flushes and leaves the descriptor open.
+    #[cfg(feature = "std")]
+    Stdout,
     /// io.StringIO: contents plus a cursor in CHARACTERS (Python
     /// counts positions in code points). write() OVERWRITES at the
     /// cursor, as in Python — StringIO("seeded").write("!") yields
@@ -7382,10 +7394,7 @@ impl PyFile {
     /// they are asked for, never from a copy.
     #[cfg(feature = "std")]
     pub fn stdin() -> Self {
-        thread_local! {
-            static STDIN: PyFile = PyFile::new_read(std::io::BufReader::new(std::io::stdin()), "<stdin>");
-        }
-        STDIN.with(|f| f.clone())
+        Self::from_backend(PyFileBackend::Stdin, "<stdin>")
     }
 
     /// The live standard output as a text file (`sys.stdout`; argparse's
@@ -7394,10 +7403,7 @@ impl PyFile {
     /// `closefd=False` stream does.
     #[cfg(feature = "std")]
     pub fn stdout() -> Self {
-        thread_local! {
-            static STDOUT: PyFile = PyFile::new_write(std::io::stdout(), "<stdout>");
-        }
-        STDOUT.with(|f| f.clone())
+        Self::from_backend(PyFileBackend::Stdout, "<stdout>")
     }
 
     /// io.StringIO backing constructor.
@@ -7414,12 +7420,38 @@ impl PyFile {
     /// Python `f.closed`: whether close() ran on this stream (through
     /// any alias of it).
     pub fn closed(&self) -> bool {
-        matches!(*self.inner.borrow(), PyFileBackend::Closed)
+        match &*self.inner.borrow() {
+            PyFileBackend::Closed => true,
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdin => stdin_closed(),
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdout => stdout_closed(),
+            _ => false,
+        }
     }
 
     /// Python file.read() method
     pub fn read(&self) -> Result<String, PyException> {
         match &mut *self.inner.borrow_mut() {
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdin => {
+                use std::io::Read;
+                if stdin_closed() {
+                    return Err(closed_file_error());
+                }
+                let mut contents = String::new();
+                std::io::stdin()
+                    .lock()
+                    .read_to_string(&mut contents)
+                    .map_err(|e| runtime_error(&format!("Read error: {}", e)))?;
+                Ok(contents)
+            }
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdout => Err(if stdout_closed() {
+                closed_file_error()
+            } else {
+                unsupported_operation("not readable")
+            }),
             #[cfg(feature = "std")]
             PyFileBackend::DiskRead(reader) => {
                 use std::io::Read;
@@ -7443,6 +7475,25 @@ impl PyFile {
     /// terminator, as in Python; empty means end of file.
     pub fn readline(&self) -> Result<String, PyException> {
         match &mut *self.inner.borrow_mut() {
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdin => {
+                use std::io::BufRead;
+                if stdin_closed() {
+                    return Err(closed_file_error());
+                }
+                let mut line = String::new();
+                std::io::stdin()
+                    .lock()
+                    .read_line(&mut line)
+                    .map_err(|e| runtime_error(&format!("Read error: {}", e)))?;
+                Ok(line)
+            }
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdout => Err(if stdout_closed() {
+                closed_file_error()
+            } else {
+                unsupported_operation("not readable")
+            }),
             #[cfg(feature = "std")]
             PyFileBackend::DiskRead(reader) => {
                 use std::io::BufRead;
@@ -7489,6 +7540,24 @@ impl PyFile {
     pub fn write<D: AsRef<str>>(&self, data: D) -> Result<i64, PyException> {
         let text = data.as_ref();
         match &mut *self.inner.borrow_mut() {
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdout => {
+                use std::io::Write;
+                if stdout_closed() {
+                    return Err(closed_file_error());
+                }
+                std::io::stdout()
+                    .lock()
+                    .write_all(text.as_bytes())
+                    .map_err(|e| runtime_error(&format!("Write error: {}", e)))?;
+                Ok(text.chars().count() as i64)
+            }
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdin => Err(if stdin_closed() {
+                closed_file_error()
+            } else {
+                unsupported_operation("not writable")
+            }),
             #[cfg(feature = "std")]
             PyFileBackend::DiskWrite(writer) => {
                 use std::io::Write;
@@ -7543,6 +7612,16 @@ impl PyFile {
                 use std::io::Write;
                 writer.flush().map_err(|e| runtime_error(&format!("Flush error: {}", e)))
             }
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdout => {
+                use std::io::Write;
+                if stdout_closed() {
+                    return Err(closed_file_error());
+                }
+                std::io::stdout().flush().map_err(|e| runtime_error(&format!("Flush error: {}", e)))
+            }
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdin if stdin_closed() => Err(closed_file_error()),
             PyFileBackend::Closed => Err(closed_file_error()),
             _ => Ok(()),
         }
@@ -7550,6 +7629,27 @@ impl PyFile {
 
     /// Python file.close() method
     pub fn close(&self) -> Result<(), PyException> {
+        // The standard streams close PROCESS-WIDE (every alias, on every
+        // thread, sees it — CPython's one object) and keep the
+        // descriptor open; closing twice is a no-op as in Python.
+        #[cfg(feature = "std")]
+        match &*self.inner.borrow() {
+            PyFileBackend::Stdin => {
+                STDIN_CLOSED.store(true, core::sync::atomic::Ordering::SeqCst);
+                return Ok(());
+            }
+            PyFileBackend::Stdout => {
+                use std::io::Write;
+                if !stdout_closed() {
+                    std::io::stdout()
+                        .flush()
+                        .map_err(|e| runtime_error(&format!("Flush error: {}", e)))?;
+                    STDOUT_CLOSED.store(true, core::sync::atomic::Ordering::SeqCst);
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
         let old = core::mem::replace(&mut *self.inner.borrow_mut(), PyFileBackend::Closed);
         #[cfg(feature = "std")]
         if let PyFileBackend::DiskWrite(mut writer) = old {
@@ -7561,6 +7661,27 @@ impl PyFile {
         let _ = old;
         Ok(())
     }
+}
+
+/// The process-wide closed state of the standard streams: CPython has
+/// ONE `sys.stdin` and ONE `sys.stdout`, whose text wrapper and binary
+/// buffer close together, so the text and the binary handles on every
+/// thread share these (Devin review on #339, round 5).
+#[cfg(feature = "std")]
+pub(crate) static STDIN_CLOSED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "std")]
+pub(crate) static STDOUT_CLOSED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "std")]
+pub(crate) fn stdin_closed() -> bool {
+    STDIN_CLOSED.load(core::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(feature = "std")]
+pub(crate) fn stdout_closed() -> bool {
+    STDOUT_CLOSED.load(core::sync::atomic::Ordering::SeqCst)
 }
 
 // ============================================================================

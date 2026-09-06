@@ -3944,17 +3944,33 @@ fn file_errors_quote_paths_as_python_does_and_wrong_direction_io_is_unsupported_
     assert_eq!(err.message, "not writable");
     let err = stdpython::open(p, Some("w")).unwrap().read().err().expect("write-only text");
     assert_eq!(err.message, "not readable");
+    // getvalue() on a disk handle is CPython's AttributeError, naming the
+    // receiver's class (round 5).
+    let err = stdpython::open_binary(p, "rb").unwrap().getvalue().err().expect("no getvalue");
+    assert!(err.matches("AttributeError"), "{:?}", err);
+    assert_eq!(err.message, "'_io.BufferedReader' object has no attribute 'getvalue'");
+    let err = stdpython::open_binary(p, "wb").unwrap().getvalue().err().expect("no getvalue");
+    assert_eq!(err.message, "'_io.BufferedWriter' object has no attribute 'getvalue'");
+    let err = stdpython::open(p, Some("r")).unwrap().getvalue().err().expect("no getvalue");
+    assert_eq!(err.message, "'_io.TextIOWrapper' object has no attribute 'getvalue'");
     std::fs::remove_dir_all(&dir).unwrap();
-    // One stdout object: `FileType("w")("-")` twice is two aliases of it.
+    // ONE stdin and ONE stdout object, process-wide (round 5): the text
+    // and the binary handles are aliases of the same stream, and a close
+    // on another thread is seen here — CPython's `sys.stdin`/`sys.stdout`
+    // (whose text wrapper and binary buffer close together).
+    let text_in = stdpython::PyFile::stdin();
+    assert!(!text_in.closed());
+    stdpython::io::PyBytesIO::stdin().close().unwrap();
+    assert!(text_in.closed(), "the binary alias closed the one stdin");
+    assert_eq!(text_in.read().err().expect("closed").message, "I/O operation on closed file.");
     let a = stdpython::PyFile::stdout();
-    let b = stdpython::PyFile::stdout();
+    let b = stdpython::io::PyBytesIO::stdout();
     assert!(!a.closed() && !b.closed());
-    a.close().unwrap();
-    assert!(b.closed(), "the aliases share one state");
-    let c = stdpython::io::PyBytesIO::stdout();
-    let d = stdpython::io::PyBytesIO::stdout();
-    c.close().unwrap();
-    assert!(d.closed(), "the binary aliases share one state");
+    std::thread::spawn(|| stdpython::PyFile::stdout().close().unwrap())
+        .join()
+        .unwrap();
+    assert!(a.closed() && b.closed(), "a close on another thread closes every alias");
+    assert_eq!(b.write(b"x").err().expect("closed").message, "I/O operation on closed file.");
 }
 
 #[test]

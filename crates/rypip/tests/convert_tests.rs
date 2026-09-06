@@ -7039,8 +7039,9 @@ fn dash_aliases_share_one_stream_and_wrong_direction_io_is_unsupported_operation
     // double quotes) while argparse's own "can't open" wrapper keeps its
     // literal quotes; a write on a read-only stream is
     // io.UnsupportedOperation, caught as itself, as OSError and as
-    // ValueError, with CPython's messages. Transcripts captured from
-    // python3 3.11 verbatim.
+    // ValueError, with CPython's messages; `getvalue()` on a disk handle
+    // is CPython's AttributeError naming the receiver's class (round 5).
+    // Transcripts captured from python3 3.11 verbatim.
     let scratch = Scratch::new("apdash2");
     let file = scratch.path().join("r4.py");
     fs::write(
@@ -7078,6 +7079,15 @@ fn dash_aliases_share_one_stream_and_wrong_direction_io_is_unsupported_operation
             "            h.write(\"x\")\n",
             "        except ValueError as e:\n",
             "            print(\"caught text:\", e)\n",
+            "    try:\n",
+            "        args.blob.getvalue()\n",
+            "    except AttributeError as e:\n",
+            "        print(\"caught attr:\", e)\n",
+            "    with open(\"w2.bin\", \"wb\") as w:\n",
+            "        try:\n",
+            "            w.getvalue()\n",
+            "        except AttributeError as e:\n",
+            "            print(\"caught attr:\", e)\n",
             "    return 0\n",
             "\n",
             "\n",
@@ -7112,7 +7122,7 @@ fn dash_aliases_share_one_stream_and_wrong_direction_io_is_unsupported_operation
     assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "first read: 'line one\\nline two\\n'\nalias read: ''\ncaught closed: I/O operation on closed file.\ncaught: write\ncaught os: read\ncaught text: not writable\n"
+        "first read: 'line one\\nline two\\n'\nalias read: ''\ncaught closed: I/O operation on closed file.\ncaught: write\ncaught os: read\ncaught text: not writable\ncaught attr: '_io.BufferedReader' object has no attribute 'getvalue'\ncaught attr: '_io.BufferedWriter' object has no attribute 'getvalue'\n"
     );
     let output = run(&["n", "missing'x.bin", "-", "-"]);
     assert_eq!(output.status.code(), Some(2));
@@ -7120,6 +7130,168 @@ fn dash_aliases_share_one_stream_and_wrong_direction_io_is_unsupported_operation
         String::from_utf8_lossy(&output.stderr),
         "usage: r4 [-h] name blob src alias\nr4: error: argument blob: can't open 'missing'x.bin': [Errno 2] No such file or directory: \"missing'x.bin\"\n"
     );
+}
+
+#[test]
+fn argparse_differential_coverage_repeated_options_prefixes_and_dash_dash() {
+    // Round 5 of the review on #339: differential coverage of the ported
+    // consumption — repeated options (last wins, `=` and split forms
+    // mixed), overlapping long prefixes (`--nu` ambiguous between --num
+    // and --number, `--n` among three, `--numb` and `--na` unique), `--`
+    // at the start, in the middle, twice, before a value an option
+    // wanted, and alone; an option value that looks like an option
+    // (`--name --num` is "expected one argument", `--name=--num` is the
+    // value); an empty value; packed and repeated flags. Every transcript
+    // captured from python3 3.11 verbatim.
+    let scratch = Scratch::new("apcov");
+    let file = scratch.path().join("cov.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"cov\")\n",
+            "    parser.add_argument(\"--num\", type=int, default=0)\n",
+            "    parser.add_argument(\"--number\", type=int, default=0)\n",
+            "    parser.add_argument(\"--name\", default=\"none\")\n",
+            "    parser.add_argument(\"-v\", \"--verbose\", action=\"store_true\")\n",
+            "    parser.add_argument(\"first\")\n",
+            "    parser.add_argument(\"rest\", nargs=\"*\")\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(args.num, args.number, args.name, args.verbose, args.first, args.rest)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/cov");
+    let usage = "usage: cov [-h] [--num NUM] [--number NUMBER] [--name NAME] [-v]\n           first [rest ...]\n";
+    let cases: &[(&[&str], i32, &str, &str)] = &[
+        (&["--num", "1", "--num", "2", "a"], 0, "2 0 none False a []\n", ""),
+        (&["--nu", "1", "a"], 2, "", "cov: error: ambiguous option: --nu could match --num, --number\n"),
+        (&["--numb", "3", "a"], 0, "0 3 none False a []\n", ""),
+        (&["--na", "x", "a"], 0, "0 0 x False a []\n", ""),
+        (&["--n", "1", "a"], 2, "", "cov: error: ambiguous option: --n could match --num, --number, --name\n"),
+        (&["--number=4", "--num=5", "a"], 0, "5 4 none False a []\n", ""),
+        (&["--", "--num", "a"], 0, "0 0 none False --num ['a']\n", ""),
+        (&["a", "--", "--num", "b"], 0, "0 0 none False a ['--num', 'b']\n", ""),
+        (&["a", "b", "--", "c", "--", "d"], 0, "0 0 none False a ['b', 'c', '--', 'd']\n", ""),
+        (&["--num", "1", "--", "-v", "a"], 0, "1 0 none False -v ['a']\n", ""),
+        (&["-v", "--", "--verbose", "a"], 0, "0 0 none True --verbose ['a']\n", ""),
+        (&["a", "--num", "--", "b"], 2, "", "cov: error: argument --num: expected one argument\n"),
+        (&["--", "a"], 0, "0 0 none False a []\n", ""),
+        (&["--"], 2, "", "cov: error: the following arguments are required: first, rest\n"),
+        (&["a", "--num=1", "--num", "2", "-v", "b", "c"], 2, "", "cov: error: unrecognized arguments: b c\n"),
+        (&["--name", "--num", "a"], 2, "", "cov: error: argument --name: expected one argument\n"),
+        (&["--name=--num", "a"], 0, "0 0 --num False a []\n", ""),
+        (&["--name", "", "a"], 0, "0 0  False a []\n", ""),
+        (&["-vv", "a"], 0, "0 0 none True a []\n", ""),
+        (&["--verbose", "--verbose", "a"], 0, "0 0 none True a []\n", ""),
+    ];
+    for (args, code, stdout, stderr) in cases {
+        let output = Command::new(&bin)
+            .args(*args)
+            .current_dir(scratch.path())
+            .output()
+            .expect("run");
+        assert_eq!(output.status.code(), Some(*code), "{:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), *stdout, "{:?}", args);
+        let expected_err = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!("{}{}", usage, stderr)
+        };
+        assert_eq!(String::from_utf8_lossy(&output.stderr), expected_err, "{:?}", args);
+    }
+}
+
+#[test]
+fn argparse_usage_and_help_wrap_at_the_terminal_width() {
+    // Round 5 of the review on #339: CPython's HelpFormatter wraps the
+    // usage line (its `_format_usage` part algorithm), the description
+    // (`textwrap.fill`) and each help string (`textwrap.wrap` at the help
+    // column, with whitespace collapsed) at the terminal width — the
+    // COLUMNS variable when set, else the tty width, else 80 — minus 2;
+    // the help column is min(24, width - 20). The same wrapped usage
+    // heads every error. Transcripts captured from python3 3.11 with
+    // COLUMNS unset (no tty: 80), 40 and 120.
+    let scratch = Scratch::new("apwrap");
+    let file = scratch.path().join("wrap.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"wrap\", description=\"A description long enough that the formatter has to wrap it onto a second line, and then onto a third one so the fill is exercised properly.\")\n",
+            "    parser.add_argument(\"--alpha-option\", default=\"a\", help=\"the alpha option takes a value and this help text is long enough to wrap around at the help column more than once, really\")\n",
+            "    parser.add_argument(\"--beta\", type=int, default=0, help=\"short\")\n",
+            "    parser.add_argument(\"-v\", \"--verbose\", action=\"store_true\", help=\"say   more   with   odd   spacing\")\n",
+            "    parser.add_argument(\"files\", nargs=\"+\", help=\"input files\")\n",
+            "    parser.add_argument(\"output\")\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(args.alpha_option, args.beta, args.verbose, args.files, args.output)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/wrap");
+    let run = |columns: Option<&str>, args: &[&str]| {
+        let mut cmd = Command::new(&bin);
+        cmd.args(args).current_dir(scratch.path()).env_remove("COLUMNS");
+        if let Some(c) = columns {
+            cmd.env("COLUMNS", c);
+        }
+        cmd.output().expect("run")
+    };
+    let usage80 = "usage: wrap [-h] [--alpha-option ALPHA_OPTION] [--beta BETA] [-v]\n            files [files ...] output\n";
+    let help80 = format!(
+        "{}\nA description long enough that the formatter has to wrap it onto a second\nline, and then onto a third one so the fill is exercised properly.\n\npositional arguments:\n  files                 input files\n  output\n\noptions:\n  -h, --help            show this help message and exit\n  --alpha-option ALPHA_OPTION\n                        the alpha option takes a value and this help text is\n                        long enough to wrap around at the help column more\n                        than once, really\n  --beta BETA           short\n  -v, --verbose         say more with odd spacing\n",
+        usage80
+    );
+    let usage40 = "usage: wrap [-h]\n            [--alpha-option ALPHA_OPTION]\n            [--beta BETA] [-v]\n            files [files ...] output\n";
+    let help40 = format!(
+        "{}\nA description long enough that the\nformatter has to wrap it onto a second\nline, and then onto a third one so the\nfill is exercised properly.\n\npositional arguments:\n  files           input files\n  output\n\noptions:\n  -h, --help      show this help\n                  message and exit\n  --alpha-option ALPHA_OPTION\n                  the alpha option\n                  takes a value and\n                  this help text is\n                  long enough to wrap\n                  around at the help\n                  column more than\n                  once, really\n  --beta BETA     short\n  -v, --verbose   say more with odd\n                  spacing\n",
+        usage40
+    );
+    let usage120 = "usage: wrap [-h] [--alpha-option ALPHA_OPTION] [--beta BETA] [-v] files [files ...] output\n";
+    let help120 = format!(
+        "{}\nA description long enough that the formatter has to wrap it onto a second line, and then onto a third one so the fill\nis exercised properly.\n\npositional arguments:\n  files                 input files\n  output\n\noptions:\n  -h, --help            show this help message and exit\n  --alpha-option ALPHA_OPTION\n                        the alpha option takes a value and this help text is long enough to wrap around at the help\n                        column more than once, really\n  --beta BETA           short\n  -v, --verbose         say more with odd spacing\n",
+        usage120
+    );
+    for (columns, usage, help) in [(None, usage80, help80), (Some("40"), usage40, help40), (Some("120"), usage120, help120)] {
+        let output = run(columns, &["-h"]);
+        assert_eq!(output.status.code(), Some(0), "{:?}", columns);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), help, "{:?}", columns);
+        let output = run(columns, &["--bogus"]);
+        assert_eq!(output.status.code(), Some(2), "{:?}", columns);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("{}wrap: error: the following arguments are required: files, output\n", usage),
+            "{:?}",
+            columns
+        );
+    }
 }
 
 #[test]
