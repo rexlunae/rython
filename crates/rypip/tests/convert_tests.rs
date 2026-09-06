@@ -6803,6 +6803,7 @@ fn argparse_filetype_dash_is_the_live_standard_stream_for_the_mode() {
             .output()
             .expect("run")
     };
+    // Verified against python3.
     let output = run(&["-", "b.bin"]);
     assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(
@@ -6871,6 +6872,7 @@ fn argparse_consumes_arguments_in_cpython_order() {
     assert!(status.success(), "generated crate failed to compile");
     let bin = krate.root.join("target/debug/order");
     let usage = "usage: tool [-h] [-n NUM] [-v] [--version] files [files ...] out\n";
+    // Verified against python3.
     let cases: &[(&[&str], i32, &str, &str)] = &[
         (&["a.txt", "b.txt", "o"], 0, "a.txt\nb.txt\n0 False o\n", ""),
         (&["a.txt", "--num", "1", "b.txt"], 0, "a.txt\n1 False b.txt\n", ""),
@@ -6995,6 +6997,7 @@ fn argparse_formats_prog_placeholders_and_rejects_negative_flags_and_binary_text
     let bin = krate.root.join("target/debug/vers");
     let usage = "usage: mytool [-h] [--version] [-1] [--num NUM] [files ...]\n";
     let ok_tail = "caught: binary mode doesn't take an encoding argument\ncaught: binary mode doesn't take an errors argument\nTrue\n";
+    // Verified against python3.
     let cases: &[(&[&str], i32, String, &str)] = &[
         (&["--version"], 0, "mytool 2.1 (100%)\n".to_string(), ""),
         (
@@ -7112,6 +7115,7 @@ fn dash_aliases_share_one_stream_and_wrong_direction_io_is_unsupported_operation
             .output()
             .expect("run")
     };
+    // Verified against python3.
     let output = run(&["-h"]);
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
@@ -7176,6 +7180,7 @@ fn argparse_differential_coverage_repeated_options_prefixes_and_dash_dash() {
     assert!(status.success(), "generated crate failed to compile");
     let bin = krate.root.join("target/debug/cov");
     let usage = "usage: cov [-h] [--num NUM] [--number NUMBER] [--name NAME] [-v]\n           first [rest ...]\n";
+    // Verified against python3.
     let cases: &[(&[&str], i32, &str, &str)] = &[
         (&["--num", "1", "--num", "2", "a"], 0, "2 0 none False a []\n", ""),
         (&["--nu", "1", "a"], 2, "", "cov: error: ambiguous option: --nu could match --num, --number\n"),
@@ -7279,6 +7284,7 @@ fn argparse_usage_and_help_wrap_at_the_terminal_width() {
         "{}\nA description long enough that the formatter has to wrap it onto a second line, and then onto a third one so the fill\nis exercised properly.\n\npositional arguments:\n  files                 input files\n  output\n\noptions:\n  -h, --help            show this help message and exit\n  --alpha-option ALPHA_OPTION\n                        the alpha option takes a value and this help text is long enough to wrap around at the help\n                        column more than once, really\n  --beta BETA           short\n  -v, --verbose         say more with odd spacing\n",
         usage120
     );
+    // Verified against python3.
     for (columns, usage, help) in [(None, usage80, help80), (Some("40"), usage40, help40), (Some("120"), usage120, help120)] {
         let output = run(columns, &["-h"]);
         assert_eq!(output.status.code(), Some(0), "{:?}", columns);
@@ -7344,6 +7350,7 @@ fn closing_a_dash_stream_closes_it_for_print_and_input_too() {
     let status = build_generated(&krate.root);
     assert!(status.success(), "generated crate failed to compile");
     let bin = krate.root.join("target/debug/closed");
+    // Verified against python3.
     let output = Command::new(&bin)
         .args(["-", "-"])
         .current_dir(scratch.path())
@@ -7398,6 +7405,7 @@ fn argparse_defaults_bind_where_add_argument_stood() {
     let status = build_generated(&krate.root);
     assert!(status.success(), "generated crate failed to compile");
     let bin = krate.root.join("target/debug/order");
+    // Verified against python3.
     for (args, expected) in [
         (&[][..], "early lit-early late\n"),
         (&["--name", "given", "--tag", "t"][..], "given t late\n"),
@@ -7478,6 +7486,7 @@ fn numeric_argparse_values_follow_pythons_underscore_grammar() {
     let status = build_generated(&krate.root);
     assert!(status.success(), "generated crate failed to compile");
     let bin = krate.root.join("target/debug/under");
+    // Verified against python3.
     let cases: &[(&[&str], i32, &str, &str)] = &[
         (&[], 0, "1000 10.5 0.51 10000000000.0\n", ""),
         (&["--count", "1_0", "--ratio", "2_5.5"], 0, "10 25.5 0.51 10000000000.0\n", ""),
@@ -7535,6 +7544,7 @@ fn numeric_argparse_values_keep_the_i64_minimum_and_a_nans_sign() {
     let status = build_generated(&krate.root);
     assert!(status.success(), "generated crate failed to compile");
     let bin = krate.root.join("target/debug/edge");
+    // Verified against python3.
     let cases: &[(&[&str], i32, &str, &str)] = &[
         (&[], 0, "-9223372036854775808 -1.0\n", ""),
         (&["--n", "-9223372036854775808", "--f=-nan"], 0, "-9223372036854775808 -1.0\n", ""),
@@ -7612,6 +7622,7 @@ fn input_without_a_prompt_ignores_a_closed_stdout() {
     let status = build_generated(&krate.root);
     assert!(status.success(), "generated crate failed to compile");
     let bin = krate.root.join("target/debug/promptless");
+    // Verified against python3.
     let output = Command::new(&bin)
         .arg("-")
         .current_dir(scratch.path())
@@ -7681,6 +7692,7 @@ fn a_failed_write_to_stdout_is_a_catchable_broken_pipe_error() {
         let mut stdin = child.stdin.take().unwrap();
         stdin.write_all(b"go\n").unwrap();
     }
+    // Verified against python3.
     let output = child.wait_with_output().expect("wait");
     assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
@@ -7729,6 +7741,7 @@ fn equals_after_a_packed_short_flag_is_an_explicit_argument_error() {
     assert!(status.success(), "generated crate failed to compile");
     let bin = krate.root.join("target/debug/packed");
     let usage = "usage: tool [-h] [-v] [-x] [-n NUM]\n";
+    // Verified against python3.
     let cases: &[(&[&str], i32, &str, &str)] = &[
         (&["-v=x"], 2, "", "tool: error: argument -v/--verbose: ignored explicit argument 'x'\n"),
         (&["-vx"], 0, "True True 0\n", ""),
@@ -7797,6 +7810,7 @@ fn argparse_defaults_keep_cpythons_types() {
     let status = build_generated(&krate.root);
     assert!(status.success(), "generated crate failed to compile");
     let bin = krate.root.join("target/debug/defaults");
+    // Verified against python3.
     let cases: &[(&[&str], i32, &str, &str)] = &[
         (&[], 0, "1.5 3 2.0 -1 none\n", ""),
         (
