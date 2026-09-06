@@ -11956,6 +11956,70 @@ fn a_cyclic_import_of_an_except_alias_is_refused() {
 }
 
 #[test]
+fn a_star_import_does_not_export_a_name_the_source_deleted() {
+    // values binds x, deletes it, binds y; the package star-imports
+    // values; a sibling reads y through the root. CPython: `main 2`, and
+    // x is no attribute of the package (`from . import x` raises
+    // ImportError). A module-level `del` is a no-op in the emission, so
+    // the glob would re-export x's static: the star export list follows
+    // source order (x removed) and the re-export is explicit (Devin
+    // review on #338, round 22). A `del` of a public name under a
+    // module-level condition leaves the exports unknown: the star import
+    // is refused.
+    let scratch = Scratch::new("delstar");
+    let files = |values: &'static str| -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("__init__.py", "from .values import *\n"),
+            ("values.py", values),
+            ("helper.py", "from . import y\n\n\ndef helper_value() -> int:\n    return y\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from .helper import helper_value\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\", helper_value())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ]
+    };
+    let krate = package_crate(&scratch, "delstar", &files("x = 1\ndel x\ny = 2\n"));
+    let root = fs::read_to_string(krate.root.join("src/lib.rs")).unwrap();
+    assert!(
+        root.contains("use crate::values::y;") && !root.contains("values::*"),
+        "the deleted name must not be re-exported: {}",
+        root
+    );
+    assert_eq!(run_package(&krate, "delstar"), vec!["main 2"]);
+    let scratch = Scratch::new("delstarcond");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"delstarcond\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("delstarcond");
+    fs::create_dir_all(&pkg).unwrap();
+    for (name, source) in files("x = 1\nflag = True\nif flag:\n    del x\ny = 2\n") {
+        fs::write(pkg.join(name), source).unwrap();
+    }
+    let discovered = rypip::discover(scratch.path()).expect("discover");
+    let err = rypip::convert(&discovered, &scratch.path().join("crate"), &ConvertOptions::default())
+        .err()
+        .expect("a star import over a conditional delete is refused");
+    let msg = format!("{:#}", err);
+    assert!(
+        msg.contains("`from .values import *` is refused: `values` deletes `x` under a module-level condition"),
+        "{}",
+        msg
+    );
+}
+
+#[test]
 fn a_star_import_of_a_cycle_source_is_refused_unless_the_importer_is_its_package() {
     // b does `from .a import *`; a imports b before binding Y. CPython
     // (a starts first): b's star import runs while a is partially

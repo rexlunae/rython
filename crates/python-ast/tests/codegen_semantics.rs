@@ -8905,12 +8905,19 @@ fn a_star_import_follows_the_latest_effective_all() {
         };
         compile_with_options(src, "star.py", options).expect("the star import converts")
     };
+    // Round 22: a read of the list (`__all__.copy()`, `len(__all__)`, a
+    // membership-keeping method) leaves the literal in force; a top-level
+    // `del __all__` unbinds it (the public names again — the glob, or
+    // the explicit list when a public name was deleted).
     for (src, listed) in [
         ("names = [\"thing\"]\n__all__ = list(names)\n__all__ = [\"other\"]\nthing = 1\nother = 2\n", true),
         ("flag = True\nif flag:\n    __all__ = [\"thing\"]\n__all__ = [\"other\"]\nthing = 1\nother = 2\n", true),
         ("__all__ = [\"other\"]\n__all__.append(\"thing\")\nthing = 1\nother = 2\n", false),
         ("__all__ = [\"other\"]\n__all__ += [\"thing\"]\nthing = 1\nother = 2\n", false),
         ("__all__ = [\"other\"]\nflag = True\nif flag:\n    __all__ = [\"thing\"]\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\nnames = __all__.copy()\nn = len(__all__)\n__all__.sort()\nthing = 1\nother = 2\n", true),
+        ("__all__ = [\"other\"]\nregister(__all__)\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\ndel __all__\nthing = 1\nother = 2\n", false),
     ] {
         let out = glob(src);
         if listed {
@@ -8924,6 +8931,46 @@ fn a_star_import_follows_the_latest_effective_all() {
             assert!(out.contains("values :: *"), "{}: generated: {}", src, out);
         }
     }
+}
+
+#[test]
+fn a_star_import_re_exports_explicitly_when_the_source_deleted_a_public_name() {
+    // `x = 1; del x; y = 2` star-imported: the glob would re-export x's
+    // static (a module-level `del` is a no-op in the emission), so the
+    // re-export lists the surviving names (Devin review on #338, round
+    // 22); after `del __all__` the public names are the list too.
+    let glob = |values_src: &str| -> String {
+        let src = "from .values import *\n";
+        let mut defs = std::collections::HashMap::new();
+        defs.insert(
+            vec!["pkg".to_string(), "values".to_string()],
+            std::rc::Rc::new(parse(values_src, "values.py").unwrap()),
+        );
+        defs.insert(
+            vec!["pkg".to_string(), "star".to_string()],
+            std::rc::Rc::new(parse(src, "star.py").unwrap()),
+        );
+        let options = PythonOptions {
+            module_defs: std::rc::Rc::new(defs),
+            module_path: vec!["pkg".to_string()],
+            this_module_path: vec!["pkg".to_string(), "star".to_string()],
+            python_namespace: "pkg".to_string(),
+            ..Default::default()
+        };
+        compile_with_options(src, "star.py", options).expect("the star import converts")
+    };
+    let out = glob("x = 1\ndel x\ny = 2\n");
+    assert!(
+        out.contains("values :: { y }") && !out.contains("values :: *"),
+        "generated: {}",
+        out
+    );
+    let out = glob("__all__ = [\"x\"]\ndel __all__\nx = 1\ndel x\ny = 2\n");
+    assert!(
+        out.contains("values :: { y }") && !out.contains("values :: *"),
+        "generated: {}",
+        out
+    );
 }
 
 #[test]

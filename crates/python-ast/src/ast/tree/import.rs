@@ -800,24 +800,45 @@ pub(crate) fn literal_all(
     // (`__all__.append(...)`, `__all__ += [...]`, `__all__[0] = ...`)
     // anywhere the module runs, makes the exports unknown again (Devin
     // review on #338, round 21).
+    // What MAY change the list's membership: a store through it
+    // (`__all__[i] = ...`, `__all__.x = ...`), a method that changes
+    // membership or one the analysis does not know, or the list handed
+    // to a callee that is not a known non-mutating builtin. A method
+    // that keeps membership (`copy`, `count`, `index`, `sort`,
+    // `reverse`) or a read (`len(__all__)`, `x in __all__`) leaves the
+    // literal in force (Devin review on #338, round 22).
     let mutates_all = |st: &crate::Statement| -> bool {
-        use crate::ast::tree::visit::{any_expr_for, stmt_targets, Descend};
-        let on_all = |e: &crate::ExprType| -> bool {
+        use crate::ast::tree::visit::{any_expr_for, stmt_exprs, stmt_targets, Descend};
+        let is_all = |e: &crate::ExprType| matches!(e, crate::ExprType::Name(n) if n.id == "__all__");
+        let through_all = |e: &crate::ExprType| -> bool {
             match e {
-                crate::ExprType::Attribute(a) => {
-                    matches!(a.value.as_ref(), crate::ExprType::Name(n) if n.id == "__all__")
-                }
-                crate::ExprType::Subscript(sub) => {
-                    matches!(sub.value.as_ref(), crate::ExprType::Name(n) if n.id == "__all__")
-                }
+                crate::ExprType::Attribute(a) => is_all(&a.value),
+                crate::ExprType::Subscript(sub) => is_all(&sub.value),
                 _ => false,
             }
         };
-        stmt_targets(st).into_iter().any(on_all)
-            || matches!(&st.statement, crate::StatementType::Expr(e)
-                if any_expr_for(&e.value, Descend::OwnScope, |x| {
-                    matches!(x, crate::ExprType::Call(c) if on_all(&c.func))
-                }))
+        const KEEPS_MEMBERSHIP: &[&str] = &["copy", "count", "index", "sort", "reverse"];
+        const NON_MUTATING_BUILTINS: &[&str] = &[
+            "len", "sorted", "list", "tuple", "set", "frozenset", "print", "iter", "enumerate",
+            "reversed", "any", "all", "min", "max", "sum", "str", "repr", "bool", "isinstance",
+            "map", "filter", "zip", "dict", "id", "type",
+        ];
+        stmt_targets(st).into_iter().any(through_all)
+            || stmt_exprs(st).into_iter().any(|e| {
+                any_expr_for(e, Descend::OwnScope, |x| match x {
+                    crate::ExprType::Call(c) => match c.func.as_ref() {
+                        crate::ExprType::Attribute(a) if is_all(&a.value) => {
+                            !KEEPS_MEMBERSHIP.contains(&a.attr.as_str())
+                        }
+                        crate::ExprType::Name(f) => {
+                            c.args.iter().any(is_all)
+                                && !NON_MUTATING_BUILTINS.contains(&f.id.as_str())
+                        }
+                        _ => c.args.iter().any(is_all),
+                    },
+                    _ => false,
+                })
+            })
     };
     let mut all: Result<Option<Vec<String>>, ()> = Ok(None);
     let mut all_by_stmt: std::collections::HashMap<(usize, usize), Option<Vec<String>>> =
@@ -849,6 +870,17 @@ pub(crate) fn literal_all(
                 all = match literal {
                     Some(names) => Ok(Some(names.clone())),
                     None => Err(()),
+                };
+            } else if let crate::StatementType::Delete(targets) = &st.statement
+                && targets.iter().any(|t| matches!(t, crate::ExprType::Name(n) if n.id == "__all__"))
+            {
+                // `del __all__` unbinds it: the star import is back to
+                // the public names (at the top level), or unknown
+                // (under control flow).
+                all = if body.iter().any(|top| std::ptr::eq(top, st)) {
+                    Ok(None)
+                } else {
+                    Err(())
                 };
             } else if mutates_all(st) {
                 all = Err(());
@@ -884,24 +916,115 @@ pub(crate) fn star_exports(
         Ok(None) => {}
         Err(()) => return None,
     }
+    // Source order, so a later `del x` at the top level removes x (a
+    // module-level `del` is a no-op in the emission, so the static
+    // outlives the name — the export list must not) and a later store
+    // rebinds it; a `del` of a public name under control flow leaves the
+    // exports UNKNOWN (Python decides at runtime) — a star import of the
+    // module is then refused (Devin review on #338, round 22).
+    if !module_conditional_deletes(options, key).is_empty() {
+        return None;
+    }
     let mut names: Vec<String> = Vec::new();
-    for (st, mark, _) in binding_entries(&body) {
-        if mark.name == "*" {
-            let crate::StatementType::ImportFrom(i) = &st.statement else {
-                continue;
-            };
-            let path = i.resolved_module_path(&ctx);
-            let source = crate::module_defs_key(options, &path)?;
-            for n in star_exports(options, source, depth + 1)? {
-                if !names.contains(&n) {
-                    names.push(n);
+    let mut unknown = false;
+    crate::ast::tree::visit::walk_stmts(
+        &body,
+        crate::ast::tree::visit::Descend::SkipDefs,
+        &mut |st| {
+            if let crate::StatementType::If(i) = &st.statement
+                && crate::ast::tree::module::Module::is_type_checking_test(&i.test)
+            {
+                return crate::ast::tree::visit::Flow::Skip;
+            }
+            if let crate::StatementType::Delete(targets) = &st.statement {
+                for t in targets {
+                    if let crate::ExprType::Name(n) = t {
+                        names.retain(|m| m != &n.id);
+                    }
+                }
+                return crate::ast::tree::visit::Flow::Continue;
+            }
+            for name in stmt_bound_names(st) {
+                if name == "*" {
+                    let crate::StatementType::ImportFrom(i) = &st.statement else {
+                        continue;
+                    };
+                    let path = i.resolved_module_path(&ctx);
+                    match crate::module_defs_key(options, &path)
+                        .and_then(|source| star_exports(options, source, depth + 1))
+                    {
+                        Some(exports) => {
+                            for n in exports {
+                                if !names.contains(&n) {
+                                    names.push(n);
+                                }
+                            }
+                        }
+                        None => unknown = true,
+                    }
+                } else if !name.starts_with('_') && !names.contains(&name) {
+                    names.push(name);
                 }
             }
-        } else if !mark.name.starts_with('_') && !names.contains(&mark.name) {
-            names.push(mark.name.clone());
-        }
+            crate::ast::tree::visit::Flow::Continue
+        },
+    );
+    if unknown {
+        return None;
     }
     Some(names)
+}
+
+/// The public names the crate module at `key` deletes under module-level
+/// control flow (`if flag: del x`): whether the name is bound when the
+/// body has run is decided at runtime.
+pub(crate) fn module_conditional_deletes(options: &PythonOptions, key: &[String]) -> Vec<String> {
+    let Some(body) = crate::ast::tree::module::normalized_body_of(options, key) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    crate::ast::tree::visit::walk_stmts(
+        &body,
+        crate::ast::tree::visit::Descend::SkipDefs,
+        &mut |st| {
+            if let crate::StatementType::Delete(targets) = &st.statement
+                && !body.iter().any(|top| std::ptr::eq(top, st))
+            {
+                for t in targets {
+                    if let crate::ExprType::Name(n) = t
+                        && !n.id.starts_with('_')
+                        && !names.contains(&n.id)
+                    {
+                        names.push(n.id.clone());
+                    }
+                }
+            }
+            crate::ast::tree::visit::Flow::Continue
+        },
+    );
+    names
+}
+
+/// The names a `from m import *` of the crate module at `key` must
+/// re-export EXPLICITLY (`use m::{a, b}`) rather than by glob: when `m`
+/// has a literal `__all__` (the glob would expose a name it leaves out),
+/// or deletes a public name at the top level (the glob would expose the
+/// deleted name's static). None when the glob is right.
+pub(crate) fn star_reexport_list(options: &PythonOptions, key: &[String]) -> Option<Vec<String>> {
+    if let Ok(Some(all)) = literal_all(options, key) {
+        return Some(all);
+    }
+    let body = crate::ast::tree::module::normalized_body_of(options, key)?;
+    let deletes_public = body.iter().any(|st| match &st.statement {
+        crate::StatementType::Delete(targets) => targets
+            .iter()
+            .any(|t| matches!(t, crate::ExprType::Name(n) if !n.id.starts_with('_'))),
+        _ => false,
+    });
+    if deletes_public {
+        return star_exports(options, key, 0);
+    }
+    None
 }
 
 /// The names a sibling's `from m import *` takes from the crate module
@@ -1440,6 +1563,22 @@ pub(crate) fn import_site_init(
                     key.join(".")
                 )
                 .into());
+            }
+            if i.names.iter().any(|a| a.name == "*") {
+                let conditional = module_conditional_deletes(options, key);
+                if !conditional.is_empty() {
+                    return Err(format!(
+                        "`from {}{} import *` is refused: `{}` deletes `{}` under a \
+                         module-level condition, so whether the star import binds it is \
+                         decided at runtime, which the static re-export cannot represent; \
+                         import the names explicitly, or delete unconditionally",
+                        ".".repeat(i.level),
+                        i.module,
+                        key.join("."),
+                        conditional.join("`, `")
+                    )
+                    .into());
+                }
             }
             for a in i.names.iter().filter(|a| a.name != "*") {
                 // The module imports the name, then imports THIS module
@@ -2338,7 +2477,7 @@ impl CodeGen for ImportFrom {
                 // submodule of that name (Devin review on #338, round 20).
                 let source = self.resolved_module_path(&options);
                 let listed = crate::module_defs_key(&options, &source)
-                    .and_then(|key| literal_all(&options, key).ok().flatten());
+                    .and_then(|key| star_reexport_list(&options, key));
                 if let Some(names) = listed {
                     if !names.is_empty() {
                         let idents: Vec<_> = names.iter().map(|n| crate::safe_ident(n)).collect();
