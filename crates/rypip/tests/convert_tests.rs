@@ -11239,6 +11239,83 @@ fn a_type_checking_only_name_in_the_package_does_not_hide_the_submodule() {
 }
 
 #[test]
+fn importing_a_name_a_module_imports_and_later_redefines_inside_its_cycle_is_refused() {
+    // a imports f from c, imports b (which does `from .a import f` and
+    // calls it), then defines its own f: CPython's b gets c's f (`a end
+    // 1`, `main 1`); the converted a holds one item, the definition, so
+    // b would get 2 — silently. The import site refuses that shape, naming
+    // the fix (Devin review on #338, round 15). A sibling OUTSIDE the
+    // cycle imports the definition, as Python does after a's body.
+    let scratch = Scratch::new("rebindcyc");
+    let write_pkg = |name: &str, b_source: &str| {
+        let root = scratch.path().join(name);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("pyproject.toml"),
+            format!("[project]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+        )
+        .unwrap();
+        let pkg = root.join(name);
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("__init__.py"), "").unwrap();
+        fs::write(
+            pkg.join("a.py"),
+            concat!(
+                "print(\"a start\")\n",
+                "from .c import f\n",
+                "from .b import b_value\n",
+                "\n",
+                "\n",
+                "def f() -> int:\n",
+                "    return 2\n",
+                "\n",
+                "\n",
+                "print(\"a end\", b_value())\n",
+            ),
+        )
+        .unwrap();
+        fs::write(pkg.join("b.py"), b_source).unwrap();
+        fs::write(pkg.join("c.py"), "def f() -> int:\n    return 1\n").unwrap();
+        fs::write(
+            pkg.join("cli.py"),
+            concat!(
+                "from .a import f\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    print(\"main\", f())\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )
+        .unwrap();
+        root
+    };
+    // b inside a's cycle asks for f: refused.
+    let root = write_pkg("rebindcyc", "from .a import f\n\n\ndef b_value() -> int:\n    return f()\n");
+    let discovered = rypip::discover(&root).expect("discover");
+    let err = rypip::convert(&discovered, &root.join("crate"), &ConvertOptions::default())
+        .err()
+        .expect("the cyclic import of a rebound name is refused");
+    let msg = format!("{:#}", err);
+    assert!(
+        msg.contains("`from .a import f` is refused: `a` imports `f`, then imports this module, then redefines `f`")
+            && msg.contains("move the definition before the import"),
+        "{}",
+        msg
+    );
+    // b outside the question (it does not import f), cli outside the cycle:
+    // cli's f is a's definition, as python3 prints (`a end 5`, `main 2`).
+    let root = write_pkg("rebindok", "def b_value() -> int:\n    return 5\n");
+    let discovered = rypip::discover(&root).expect("discover");
+    let krate = rypip::convert(&discovered, &root.join("crate"), &ConvertOptions::default())
+        .expect("a sibling outside the cycle converts");
+    assert_eq!(run_package(&krate, "rebindok"), vec!["a start", "a end 5", "main 2"]);
+}
+
+#[test]
 fn a_bare_annotation_in_the_package_does_not_hide_the_submodule() {
     // `settings: dict` in conf/__init__.py binds only `__annotations__`:
     // `from .conf import settings` therefore imports the submodule

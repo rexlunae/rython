@@ -901,6 +901,137 @@ fn module_deletes(options: &PythonOptions, key: &[String], name: &str) -> bool {
     })
 }
 
+/// The crate modules one import statement loads (every package on a
+/// dotted path, the resolved module, each from-list name that is a
+/// submodule), as module_defs keys, in `ctx` (the importing module's
+/// package context).
+fn stmt_import_keys(stmt: &crate::StatementType, ctx: &PythonOptions) -> Vec<Vec<String>> {
+    let mut paths: Vec<Vec<String>> = Vec::new();
+    match stmt {
+        crate::StatementType::Import(i) => {
+            for a in &i.names {
+                let path: Vec<String> = a.name.split('.').map(str::to_string).collect();
+                for len in 1..=path.len() {
+                    paths.push(path[..len].to_vec());
+                }
+            }
+        }
+        crate::StatementType::ImportFrom(i) => {
+            let base = i.resolved_module_path(ctx);
+            for len in 0..=base.len() {
+                paths.push(base[..len].to_vec());
+            }
+            for a in &i.names {
+                let mut sub = base.clone();
+                sub.push(a.name.clone());
+                paths.push(sub);
+            }
+        }
+        _ => {}
+    }
+    paths
+        .iter()
+        .filter_map(|p| crate::module_defs_key(ctx, p).map(<[String]>::to_vec))
+        .collect()
+}
+
+/// Whether the crate module at `from` imports the module at `to`,
+/// directly or through other crate modules — function-local imports
+/// included, since a function `from`'s body calls may import it — so
+/// `to` can be initialized WHILE `from`'s body runs (a cycle).
+fn module_reaches(options: &PythonOptions, from: &[String], to: &[String]) -> bool {
+    use crate::ast::tree::visit::{walk_stmts, Descend, Flow};
+    if from == to {
+        return true;
+    }
+    let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+    let mut queue: Vec<Vec<String>> = vec![from.to_vec()];
+    while let Some(current) = queue.pop() {
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        let Some(module) = options.module_defs.get(&current) else {
+            continue;
+        };
+        let module: &crate::Module = module;
+        let ctx = crate::ast::tree::module::defining_module_context(options, &current);
+        let mut found = false;
+        walk_stmts(&module.raw.body, Descend::All, &mut |s| {
+            for key in stmt_import_keys(&s.statement, &ctx) {
+                if key == to {
+                    found = true;
+                    return Flow::Stop;
+                }
+                queue.push(key);
+            }
+            Flow::Continue
+        });
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the crate module at `key` binds `name` by an import (from
+/// another module), then imports the module at `to` — directly or
+/// through the modules that import runs — and only then rebinds `name`
+/// by a def, a class or a store. The import is dropped (the local
+/// definition wins, `ImportFrom::to_rust`), so the converted module
+/// holds one item, the definition; but `to`, initialized while `key`'s
+/// body sits between the two bindings, would read the IMPORTED value in
+/// Python (Devin review on #338, round 15). A rebinding that runs before
+/// the cycle's import is the definition on both sides.
+fn imported_value_exposed_to(
+    options: &PythonOptions,
+    key: &[String],
+    name: &str,
+    to: &[String],
+) -> bool {
+    use crate::ast::tree::visit::{walk_stmts, Descend, Flow};
+    let Some(body) = crate::ast::tree::module::normalized_body_of(options, key) else {
+        return false;
+    };
+    let ctx = crate::ast::tree::module::defining_module_context(options, key);
+    let mut imported = false;
+    let mut cycle_between = false;
+    let mut exposed = false;
+    walk_stmts(&body, Descend::SkipDefs, &mut |s| {
+        let is_import = matches!(
+            &s.statement,
+            crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
+        );
+        if is_import && imported {
+            let keys = stmt_import_keys(&s.statement, &ctx);
+            if keys.iter().any(|k| k == to || module_reaches(options, k, to)) {
+                cycle_between = true;
+            }
+        }
+        if !stmt_bound_names(s).iter().any(|n| n == name) {
+            return Flow::Continue;
+        }
+        if is_import {
+            // A self-import (`from .a import x` inside a) imports nothing
+            // from elsewhere: the value Python would expose is this
+            // module's own binding.
+            let from_elsewhere = !stmt_import_keys(&s.statement, &ctx)
+                .iter()
+                .any(|k| k == key);
+            if from_elsewhere {
+                imported = true;
+                cycle_between = false;
+            }
+        } else if imported && cycle_between {
+            exposed = true;
+            return Flow::Stop;
+        } else {
+            imported = false;
+        }
+        Flow::Continue
+    });
+    exposed
+}
+
 /// What an import statement runs at its site: the loaded modules' init
 /// calls, then the checks of the from-list names the package binds —
 /// the one lowering every import site (module level, nested,
@@ -917,6 +1048,29 @@ pub(crate) fn import_site_init(
         let base = i.resolved_module_path(options);
         if let Some(key) = crate::module_defs_key(options, &base) {
             for a in &i.names {
+                // The module imports the name, then imports THIS module
+                // (a cycle), then redefines the name: Python exposes the
+                // imported value here, which the converted module (one
+                // item, the definition) cannot (Devin review on #338,
+                // round 15). A rebinding before the cycle's import, or a
+                // sibling outside the cycle, gets the definition on both
+                // sides.
+                if imported_value_exposed_to(options, key, &a.name, &options.this_module_path) {
+                    return Err(format!(
+                        "`from {}{} import {}` is refused: `{}` imports `{}`, then imports \
+                         this module, then redefines `{}`, so Python exposes the imported \
+                         value here where the converted module holds only its definition; \
+                         import the value from the module that defines it, or move the \
+                         definition before the import",
+                        ".".repeat(i.level),
+                        i.module,
+                        a.name,
+                        key.join("."),
+                        a.name,
+                        a.name
+                    )
+                    .into());
+                }
                 if module_binding(options, key, &a.name).is_some()
                     && module_deletes(options, key, &a.name)
                 {
