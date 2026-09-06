@@ -7487,6 +7487,7 @@ impl TextReader {
 fn utf8_decode_failure(data: &[u8], err: core::str::Utf8Error) -> PyException {
     let start = err.valid_up_to();
     let (end, reason) = match err.error_len() {
+#[cfg(feature = "std")]
         None => (data.len() - 1, "unexpected end of data"),
         Some(n) => (
             start + n - 1,
@@ -7519,6 +7520,7 @@ fn utf8_decode_failure(data: &[u8], err: core::str::Utf8Error) -> PyException {
 fn decode_utf8_final(data: &[u8]) -> Result<String, PyException> {
     core::str::from_utf8(data)
         .map(str::to_string)
+#[cfg(feature = "std")]
         .map_err(|e| utf8_decode_failure(data, e))
 }
 
@@ -7527,6 +7529,7 @@ fn decode_utf8_final(data: &[u8]) -> Result<String, PyException> {
 fn decode_utf8_partial(data: &[u8]) -> Result<(String, alloc::vec::Vec<u8>), PyException> {
     match core::str::from_utf8(data) {
         Ok(text) => Ok((text.to_string(), alloc::vec::Vec::new())),
+#[cfg(feature = "std")]
         Err(e) if e.error_len().is_none() => {
             let valid = e.valid_up_to();
             Ok((
