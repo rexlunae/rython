@@ -4886,9 +4886,15 @@ fn module_reexports_item(
             .unwrap_or_else(|| name.to_string());
         if !target.is_empty() && options.module_defs.contains_key(&target) {
             if star && defining == name {
+                // The exports when the conversion can enumerate them,
+                // else every public name — what the glob re-exports
+                // (Devin review on #338, round 23).
                 let exported = crate::module_defs_key(options, &target)
-                    .and_then(|key| crate::ast::tree::import::star_exports(options, key, 0))
-                    .is_some_and(|names| names.iter().any(|n| n == name));
+                    .is_some_and(|key| {
+                        crate::ast::tree::import::sibling_star_names(options, key)
+                            .iter()
+                            .any(|n| n == name)
+                    });
                 if !exported {
                     continue;
                 }
@@ -4965,8 +4971,9 @@ pub(crate) fn reexport_origin(
         let defining = match explicit {
             Some(defining) => defining,
             None => {
-                let exported = crate::ast::tree::import::star_exports(options, &key, 0)
-                    .is_some_and(|names| names.iter().any(|n| n == name));
+                let exported = crate::ast::tree::import::sibling_star_names(options, &key)
+                    .iter()
+                    .any(|n| n == name);
                 if !exported {
                     continue;
                 }

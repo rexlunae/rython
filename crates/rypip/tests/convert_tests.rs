@@ -12020,6 +12020,154 @@ fn a_star_import_does_not_export_a_name_the_source_deleted() {
 }
 
 #[test]
+fn the_cycle_tracing_resolves_a_called_name_by_its_latest_binding_and_treats_the_unseen_as_reaching() {
+    // a imports `f` from c (no cycle), then from d (whose f imports b),
+    // imports `g` from e, calls f(), then defines its own g; b imports g
+    // from a. CPython: b's import runs inside a's call of f, while a's
+    // partial state holds e's g — `a calls from e`, `a end a-def`, `main
+    // a-def`. The tracing resolved `f` to its FIRST import (c) and saw no
+    // cycle; Python calls the latest binding (d), so the import is
+    // refused as the exposed-then-redefined shape (Devin review on #338,
+    // round 23). A call the tracing cannot see into — a method on an
+    // object (`R().run()`, whose body imports b) — counts as reaching:
+    // the same refusal.
+    let cli = concat!(
+        "from .a import g\n",
+        "\n",
+        "\n",
+        "def main() -> None:\n",
+        "    print(\"main\", g())\n",
+        "\n",
+        "\n",
+        "if __name__ == \"__main__\":\n",
+        "    main()\n",
+    );
+    for (tag, a_source) in [
+        (
+            "latecall",
+            concat!(
+                "from .c import f\n",
+                "from .d import f\n",
+                "from .e import g\n",
+                "print(\"a calls\", f())\n",
+                "\n",
+                "\n",
+                "def g() -> str:\n",
+                "    return \"a-def\"\n",
+                "\n",
+                "\n",
+                "print(\"a end\", g())\n",
+            ),
+        ),
+        (
+            "methcall",
+            concat!(
+                "from .e import g\n",
+                "\n",
+                "\n",
+                "class R:\n",
+                "    def run(self) -> str:\n",
+                "        from .b import b_value\n",
+                "        return b_value()\n",
+                "\n",
+                "\n",
+                "print(\"a calls\", R().run())\n",
+                "\n",
+                "\n",
+                "def g() -> str:\n",
+                "    return \"a-def\"\n",
+                "\n",
+                "\n",
+                "print(\"a end\", g())\n",
+            ),
+        ),
+    ] {
+        let scratch = Scratch::new(tag);
+        fs::write(
+            scratch.path().join("pyproject.toml"),
+            format!("[project]\nname = \"{}\"\nversion = \"0.1.0\"\n", tag),
+        )
+        .unwrap();
+        let pkg = scratch.path().join(tag);
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("__init__.py"), "").unwrap();
+        fs::write(pkg.join("a.py"), a_source).unwrap();
+        fs::write(pkg.join("b.py"), "from .a import g\n\n\ndef b_value() -> str:\n    return str(g)\n").unwrap();
+        fs::write(pkg.join("c.py"), "def f() -> str:\n    return \"c\"\n").unwrap();
+        fs::write(
+            pkg.join("d.py"),
+            "def f() -> str:\n    from .b import b_value\n    return b_value()\n",
+        )
+        .unwrap();
+        fs::write(pkg.join("e.py"), "g = \"from e\"\n").unwrap();
+        fs::write(pkg.join("cli.py"), cli).unwrap();
+        let discovered = rypip::discover(scratch.path()).expect("discover");
+        let err = rypip::convert(&discovered, &scratch.path().join("crate"), &ConvertOptions::default())
+            .err()
+            .expect("the exposed-then-redefined shape is refused");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("`from .a import g` is refused: `a` imports `g`, then imports this module (directly, or through a call), then redefines `g`"),
+            "{}: {}",
+            tag,
+            msg
+        );
+    }
+}
+
+#[test]
+fn a_callee_handed_all_by_keyword_makes_the_star_exports_unknown() {
+    // values lists `other` in `__all__`, then hands the list to a callee
+    // by keyword (`grow(exports=__all__)`) that appends `thing`; the
+    // package star-imports values and a sibling reads `thing`. CPython:
+    // `main 1` — the star import took the grown list. The literal is no
+    // longer in force after the keyword passage (as after a positional
+    // one), so the re-export is the glob and `thing` resolves (Devin
+    // review on #338, round 23).
+    let scratch = Scratch::new("kwall");
+    let krate = package_crate(
+        &scratch,
+        "kwall",
+        &[
+            ("__init__.py", "from .values import *\n"),
+            (
+                "values.py",
+                concat!(
+                    "__all__ = [\"other\"]\n",
+                    "\n",
+                    "\n",
+                    "def grow(exports: list[str]) -> None:\n",
+                    "    exports.append(\"thing\")\n",
+                    "\n",
+                    "\n",
+                    "grow(exports=__all__)\n",
+                    "thing = 1\n",
+                    "other = 2\n",
+                ),
+            ),
+            ("helper.py", "from . import thing\n\n\ndef helper_value() -> int:\n    return thing\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from .helper import helper_value\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\", helper_value())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let root = fs::read_to_string(krate.root.join("src/lib.rs")).unwrap();
+    assert!(root.contains("values::*"), "the glob, not the stale literal: {}", root);
+    assert_eq!(run_package(&krate, "kwall"), vec!["main 1"]);
+}
+
+#[test]
 fn a_star_import_of_a_cycle_source_is_refused_unless_the_importer_is_its_package() {
     // b does `from .a import *`; a imports b before binding Y. CPython
     // (a starts first): b's star import runs while a is partially

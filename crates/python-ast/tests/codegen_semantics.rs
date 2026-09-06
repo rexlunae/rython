@@ -8917,6 +8917,8 @@ fn a_star_import_follows_the_latest_effective_all() {
         ("__all__ = [\"other\"]\nflag = True\nif flag:\n    __all__ = [\"thing\"]\nthing = 1\nother = 2\n", false),
         ("__all__ = [\"other\"]\nnames = __all__.copy()\nn = len(__all__)\n__all__.sort()\nthing = 1\nother = 2\n", true),
         ("__all__ = [\"other\"]\nregister(__all__)\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\nregister(exports=__all__)\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\nprint(names=__all__)\nthing = 1\nother = 2\n", true),
         ("__all__ = [\"other\"]\ndel __all__\nthing = 1\nother = 2\n", false),
     ] {
         let out = glob(src);

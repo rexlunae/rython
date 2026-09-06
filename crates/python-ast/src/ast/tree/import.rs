@@ -765,6 +765,57 @@ pub(crate) fn bound_word_and_mask(mark: usize) -> (usize, u32) {
     (mark / BOUND_WORD_BITS, 1u32 << (mark % BOUND_WORD_BITS))
 }
 
+/// A list method that keeps the list's membership: `__all__.copy()`,
+/// `.count(x)`, `.index(x)`, `.sort()`, `.reverse()` leave the export
+/// set as it was. Any other method (`append`, `extend`, `insert`,
+/// `remove`, `pop`, `clear`, one the analysis does not know) may not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ListReadMethod {
+    Copy,
+    Count,
+    Index,
+    Sort,
+    Reverse,
+}
+
+impl ListReadMethod {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "copy" => Self::Copy,
+            "count" => Self::Count,
+            "index" => Self::Index,
+            "sort" => Self::Sort,
+            "reverse" => Self::Reverse,
+            _ => return None,
+        })
+    }
+}
+
+/// A builtin that reads a list handed to it without mutating it
+/// (`len(__all__)`, `sorted(__all__)`, `print(__all__)`, ...). Any
+/// other callee may mutate what it is handed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NonMutatingBuiltin {
+    Len, Sorted, List, Tuple, Set, FrozenSet, Print, Iter, Enumerate, Reversed, Any, All, Min,
+    Max, Sum, Str, Repr, Bool, IsInstance, Map, Filter, Zip, Dict, Id, Type,
+}
+
+impl NonMutatingBuiltin {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "len" => Self::Len, "sorted" => Self::Sorted, "list" => Self::List,
+            "tuple" => Self::Tuple, "set" => Self::Set, "frozenset" => Self::FrozenSet,
+            "print" => Self::Print, "iter" => Self::Iter, "enumerate" => Self::Enumerate,
+            "reversed" => Self::Reversed, "any" => Self::Any, "all" => Self::All,
+            "min" => Self::Min, "max" => Self::Max, "sum" => Self::Sum, "str" => Self::Str,
+            "repr" => Self::Repr, "bool" => Self::Bool, "isinstance" => Self::IsInstance,
+            "map" => Self::Map, "filter" => Self::Filter, "zip" => Self::Zip,
+            "dict" => Self::Dict, "id" => Self::Id, "type" => Self::Type,
+            _ => return None,
+        })
+    }
+}
+
 /// The crate module's `__all__` as a list of names: `Ok(Some(names))`
 /// for a literal list or tuple of string constants bound at the top
 /// level (the last one), `Ok(None)` when the module binds no `__all__`,
@@ -817,24 +868,22 @@ pub(crate) fn literal_all(
                 _ => false,
             }
         };
-        const KEEPS_MEMBERSHIP: &[&str] = &["copy", "count", "index", "sort", "reverse"];
-        const NON_MUTATING_BUILTINS: &[&str] = &[
-            "len", "sorted", "list", "tuple", "set", "frozenset", "print", "iter", "enumerate",
-            "reversed", "any", "all", "min", "max", "sum", "str", "repr", "bool", "isinstance",
-            "map", "filter", "zip", "dict", "id", "type",
-        ];
+        // Handed to a callee by position OR by keyword (`mutate(exports=
+        // __all__)` — Devin review on #338, round 23).
+        let handed_all = |c: &crate::ast::tree::call::Call| -> bool {
+            c.args.iter().any(is_all) || c.keywords.iter().any(|k| is_all(&k.value))
+        };
         stmt_targets(st).into_iter().any(through_all)
             || stmt_exprs(st).into_iter().any(|e| {
                 any_expr_for(e, Descend::OwnScope, |x| match x {
                     crate::ExprType::Call(c) => match c.func.as_ref() {
                         crate::ExprType::Attribute(a) if is_all(&a.value) => {
-                            !KEEPS_MEMBERSHIP.contains(&a.attr.as_str())
+                            ListReadMethod::from_name(&a.attr).is_none()
                         }
                         crate::ExprType::Name(f) => {
-                            c.args.iter().any(is_all)
-                                && !NON_MUTATING_BUILTINS.contains(&f.id.as_str())
+                            handed_all(c) && NonMutatingBuiltin::from_name(&f.id).is_none()
                         }
-                        _ => c.args.iter().any(is_all),
+                        _ => handed_all(c),
                     },
                     _ => false,
                 })
@@ -1323,28 +1372,135 @@ fn module_reaches(options: &PythonOptions, from: &[String], to: &[String]) -> bo
 
 /// A module body's local def by name (top-level, or under module-level
 /// control flow).
-fn local_def<'a>(body: &'a [crate::Statement], name: &str) -> Option<&'a crate::FunctionDef> {
-    use crate::ast::tree::visit::{walk_stmts, Descend, Flow};
-    let mut found: Option<&'a crate::FunctionDef> = None;
-    walk_stmts(body, Descend::SkipDefs, &mut |st| match &st.statement {
-        crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f)
-            if f.name == name =>
-        {
-            found = Some(f);
-            Flow::Stop
-        }
-        _ => Flow::Continue,
-    });
-    found
+
+/// What a module-level name a call may resolve to, by the module's own
+/// bindings of it: a local def (its body is traced), a crate module (the
+/// module's import chain is traced), an external module (a stdlib or
+/// third-party import: its calls load no crate module), or something
+/// the tracing cannot see into (a stored value, a class — its
+/// constructor may import; a loop or `with` target; a handler alias).
+enum CalleeBinding<'a> {
+    Def(&'a crate::FunctionDef),
+    Module(Vec<String>),
+    External,
+    Opaque,
 }
 
-/// The crate modules a statement's own calls can initialize: a call to a
-/// local def whose body (or the local defs it calls, transitively) has
-/// an import statement reaching `to`, or to a function bound by a
-/// module-scope import from a crate module that reaches `to`, or a
-/// `module.function(...)` call on an imported crate module that does. A
-/// builtin or a method call is not a path this can show, and is not
-/// counted (Devin review on #338, round 16).
+/// The bindings of `name` that may be in force when a module-level call
+/// of it runs, in source order, by Python's later-binding-wins rule: the
+/// last UNCONDITIONAL (top-level) binding replaces everything before it,
+/// and every binding under module-level control flow after it is an
+/// alternative beside it (Devin review on #338, round 23 — the first
+/// binding was taken before, missing a later `from .d import f` that
+/// replaced `from .c import f`).
+fn callee_bindings<'a>(
+    body: &'a [crate::Statement],
+    ctx: &PythonOptions,
+    name: &str,
+) -> Vec<CalleeBinding<'a>> {
+    use crate::ast::tree::visit::{walk_stmts, Descend, Flow};
+    let mut bindings: Vec<CalleeBinding<'a>> = Vec::new();
+    walk_stmts(body, Descend::SkipDefs, &mut |st| {
+        if let crate::StatementType::If(i) = &st.statement
+            && crate::ast::tree::module::Module::is_type_checking_test(&i.test)
+        {
+            return Flow::Skip;
+        }
+        if !stmt_bound_names(st).iter().any(|n| n == name) {
+            return Flow::Continue;
+        }
+        let binding = match &st.statement {
+            crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f)
+                if f.name == name =>
+            {
+                CalleeBinding::Def(f)
+            }
+            crate::StatementType::ImportFrom(i)
+                if i.names.iter().any(|a| a.asname.as_deref().unwrap_or(&a.name) == name) =>
+            {
+                match crate::module_defs_key(ctx, &i.resolved_module_path(ctx)) {
+                    Some(key) => CalleeBinding::Module(key.to_vec()),
+                    None => CalleeBinding::External,
+                }
+            }
+            crate::StatementType::Import(i) => {
+                let alias = i.names.iter().find(|a| {
+                    a.asname
+                        .as_deref()
+                        .unwrap_or_else(|| a.name.split('.').next().unwrap_or(&a.name))
+                        == name
+                });
+                match alias {
+                    Some(a) => {
+                        let path: Vec<String> = a.name.split('.').map(str::to_string).collect();
+                        match crate::module_defs_key(ctx, &path) {
+                            Some(key) => CalleeBinding::Module(key.to_vec()),
+                            None => CalleeBinding::External,
+                        }
+                    }
+                    None => CalleeBinding::Opaque,
+                }
+            }
+            _ => CalleeBinding::Opaque,
+        };
+        if body.iter().any(|top| std::ptr::eq(top, st)) {
+            bindings.clear();
+        }
+        bindings.push(binding);
+        Flow::Continue
+    });
+    bindings
+}
+
+/// A builtin a module-level call may name without binding it: none of
+/// these loads a crate module, except the ones that run code the tracing
+/// cannot see (`exec`, `eval`, `__import__`, `getattr` — treated as
+/// reaching).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InertBuiltin {
+    Print, Len, Str, Int, Float, Bool, List, Dict, Set, Tuple, FrozenSet, Range, Enumerate, Zip,
+    Map, Filter, Sorted, Reversed, IsInstance, IsSubclass, HasAttr, Min, Max, Sum, Abs, Repr,
+    Type, Id, Hash, Iter, Next, Format, Round, DivMod, Pow, Chr, Ord, Any, All, Callable, Bytes,
+    ByteArray, Slice, Open, Input, Vars, Dir, Object, Super, Property, StaticMethod, ClassMethod,
+}
+
+impl InertBuiltin {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "print" => Self::Print, "len" => Self::Len, "str" => Self::Str, "int" => Self::Int,
+            "float" => Self::Float, "bool" => Self::Bool, "list" => Self::List, "dict" => Self::Dict,
+            "set" => Self::Set, "tuple" => Self::Tuple, "frozenset" => Self::FrozenSet,
+            "range" => Self::Range, "enumerate" => Self::Enumerate, "zip" => Self::Zip,
+            "map" => Self::Map, "filter" => Self::Filter, "sorted" => Self::Sorted,
+            "reversed" => Self::Reversed, "isinstance" => Self::IsInstance,
+            "issubclass" => Self::IsSubclass, "hasattr" => Self::HasAttr, "min" => Self::Min,
+            "max" => Self::Max, "sum" => Self::Sum, "abs" => Self::Abs, "repr" => Self::Repr,
+            "type" => Self::Type, "id" => Self::Id, "hash" => Self::Hash, "iter" => Self::Iter,
+            "next" => Self::Next, "format" => Self::Format, "round" => Self::Round,
+            "divmod" => Self::DivMod, "pow" => Self::Pow, "chr" => Self::Chr, "ord" => Self::Ord,
+            "any" => Self::Any, "all" => Self::All, "callable" => Self::Callable,
+            "bytes" => Self::Bytes, "bytearray" => Self::ByteArray, "slice" => Self::Slice,
+            "open" => Self::Open, "input" => Self::Input, "vars" => Self::Vars, "dir" => Self::Dir,
+            "object" => Self::Object, "super" => Self::Super, "property" => Self::Property,
+            "staticmethod" => Self::StaticMethod, "classmethod" => Self::ClassMethod,
+            _ => return None,
+        })
+    }
+}
+
+/// Whether a module-level statement's calls can load the crate module at
+/// `to` (its own imports are handled by the caller): a call of a local
+/// def whose body imports it or calls a local def that does, or of a
+/// function imported from a crate module that reaches `to`, or a method
+/// called through such a module (`mod.f()`). Each called name resolves
+/// by the module's bindings in force at the call (`callee_bindings`).
+/// What the tracing cannot see into COUNTS AS REACHING — correct or
+/// loud (Devin review on #338, round 23): a call of a stored value or a
+/// class (its constructor may import), a method on an object, a call of
+/// a call or a subscript, a free name that is no inert builtin
+/// (`exec`, `eval`, `__import__`, `getattr`, a name bound by a function
+/// through `global`). A builtin that runs no user code, and a function
+/// or method of an external module, load no crate module.
 fn stmt_calls_reach(
     options: &PythonOptions,
     ctx: &PythonOptions,
@@ -1352,7 +1508,7 @@ fn stmt_calls_reach(
     s: &crate::Statement,
     to: &[String],
 ) -> bool {
-    use crate::ast::tree::visit::{any_expr_for, stmt_exprs, walk_stmts, Descend, Flow};
+    use crate::ast::tree::visit::{any_expr_for, stmt_exprs, Descend};
     // Callee expressions of the statement's own calls.
     let mut callees: Vec<&crate::ExprType> = Vec::new();
     for e in stmt_exprs(s) {
@@ -1366,39 +1522,9 @@ fn stmt_calls_reach(
     if callees.is_empty() {
         return false;
     }
-    // The crate module a module-scope import binds `name` to: the module
-    // of `from .x import name`, or `x` of `import x`.
-    let imported_from = |name: &str| -> Option<Vec<String>> {
-        let mut found: Option<Vec<String>> = None;
-        walk_stmts(body, Descend::SkipDefs, &mut |st| {
-            match &st.statement {
-                crate::StatementType::ImportFrom(i)
-                    if i.names.iter().any(|a| a.asname.as_deref().unwrap_or(&a.name) == name) =>
-                {
-                    found = crate::module_defs_key(ctx, &i.resolved_module_path(ctx))
-                        .map(<[String]>::to_vec);
-                }
-                crate::StatementType::Import(i) => {
-                    for a in &i.names {
-                        let bound = a
-                            .asname
-                            .as_deref()
-                            .unwrap_or_else(|| a.name.split('.').next().unwrap_or(&a.name));
-                        if bound == name {
-                            let path: Vec<String> =
-                                a.name.split('.').map(str::to_string).collect();
-                            found = crate::module_defs_key(ctx, &path).map(<[String]>::to_vec);
-                        }
-                    }
-                }
-                _ => {}
-            }
-            if found.is_some() { Flow::Stop } else { Flow::Continue }
-        });
-        found
-    };
     // Whether a local def's body reaches `to`: its imports, or the local
-    // defs it calls (a visited set bounds the recursion).
+    // defs it calls (a visited set bounds the recursion); what it calls
+    // that the tracing cannot see into counts as reaching.
     fn def_reaches(
         options: &PythonOptions,
         ctx: &PythonOptions,
@@ -1424,9 +1550,7 @@ fn stmt_calls_reach(
             for e in stmt_exprs(st) {
                 any_expr_for(e, Descend::All, |x| {
                     if let crate::ExprType::Call(c) = x
-                        && let crate::ExprType::Name(n) = c.func.as_ref()
-                        && let Some(callee) = local_def(body, &n.id)
-                        && def_reaches(options, ctx, body, callee, to, visited)
+                        && callee_reaches(options, ctx, body, &c.func, to, visited)
                     {
                         reaches = true;
                     }
@@ -1440,24 +1564,52 @@ fn stmt_calls_reach(
         });
         reaches
     }
-    let mut visited: Vec<String> = Vec::new();
-    callees.into_iter().any(|callee| match callee {
-        crate::ExprType::Name(n) => {
-            if let Some(f) = local_def(body, &n.id) {
-                def_reaches(options, ctx, body, f, to, &mut visited)
-            } else if let Some(module) = imported_from(&n.id) {
-                module == to || module_reaches(options, &module, to)
-            } else {
-                false
+    fn callee_reaches(
+        options: &PythonOptions,
+        ctx: &PythonOptions,
+        body: &[crate::Statement],
+        callee: &crate::ExprType,
+        to: &[String],
+        visited: &mut Vec<String>,
+    ) -> bool {
+        match callee {
+            crate::ExprType::Name(n) => {
+                let bindings = callee_bindings(body, ctx, &n.id);
+                if bindings.is_empty() {
+                    // A free name: an inert builtin loads nothing; any
+                    // other (`exec`, `getattr`, a `global`-written name)
+                    // may.
+                    return InertBuiltin::from_name(&n.id).is_none();
+                }
+                bindings.into_iter().any(|b| match b {
+                    CalleeBinding::Def(f) => def_reaches(options, ctx, body, f, to, visited),
+                    CalleeBinding::Module(m) => m == to || module_reaches(options, &m, to),
+                    CalleeBinding::External => false,
+                    CalleeBinding::Opaque => true,
+                })
             }
+            crate::ExprType::Attribute(a) => match a.value.as_ref() {
+                crate::ExprType::Name(n) => {
+                    let bindings = callee_bindings(body, ctx, &n.id);
+                    if bindings.is_empty() {
+                        // `self.x()` inside a def, a free object: opaque.
+                        return true;
+                    }
+                    bindings.into_iter().any(|b| match b {
+                        CalleeBinding::Module(m) => m == to || module_reaches(options, &m, to),
+                        CalleeBinding::External => false,
+                        CalleeBinding::Def(_) | CalleeBinding::Opaque => true,
+                    })
+                }
+                _ => true,
+            },
+            _ => true,
         }
-        crate::ExprType::Attribute(a) => match a.value.as_ref() {
-            crate::ExprType::Name(n) => imported_from(&n.id)
-                .is_some_and(|module| module == to || module_reaches(options, &module, to)),
-            _ => false,
-        },
-        _ => false,
-    })
+    }
+    let mut visited: Vec<String> = Vec::new();
+    callees
+        .into_iter()
+        .any(|callee| callee_reaches(options, ctx, body, callee, to, &mut visited))
 }
 
 /// Whether the crate module at `key` binds `name` by an import (from
