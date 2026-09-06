@@ -1856,6 +1856,24 @@ impl CodeGen for Module {
                 .to_rust(ctx.clone(), init_options, symbols.clone())
                 .map_err(|e| wrap_module_error(&module_filename, e))?;
             
+            // A module-level import of a crate module runs that module's
+            // body at the import site, once (Python's import-time
+            // semantics; a cycle sees the importer's partial state —
+            // issue #333, Devin review on #336): the `use` is an item,
+            // the once-guarded `__module_init__` calls go into this
+            // module's init in statement order.
+            if matches!(
+                &s.statement,
+                crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
+            ) {
+                let loaded =
+                    crate::ast::tree::import::imported_crate_modules(&s.statement, &options);
+                if !loaded.is_empty() {
+                    module_init_stmts
+                        .push(crate::ast::tree::import::module_init_calls(&loaded));
+                    has_module_init_code = true;
+                }
+            }
             if statement.to_string() != "" {
                 if is_declaration {
                     // Declarations go at module level (functions, classes, imports)
@@ -1921,36 +1939,38 @@ impl CodeGen for Module {
         // Generate module initialization function if needed. Like all
         // generated functions it returns Result so module-level raises and
         // calls propagate.
-        // In a multi-module crate every module has one, empty or not: the
-        // entry module's `main` calls each sibling's at startup (see
-        // `startup_module_inits`) without knowing which siblings have
-        // module-level statements.
+        // In a multi-module crate every module has one, empty or not: an
+        // importer calls it at the import site without knowing whether
+        // the module has module-level statements. It runs ONCE: the guard
+        // is taken on entry, so an import cycle (a imports b imports a)
+        // finds a's init already running and continues with a's partial
+        // state — Python's partially-initialized module.
         if has_module_init_code || !options.module_defs.is_empty() {
             stream.extend(quote! {
                 #[allow(dead_code)]
                 pub(crate) fn __module_init__() -> Result<(), PyException> {
+                    // `::core` — a crate module named `core` (textlib/core.py)
+                    // would shadow the extern crate's path otherwise.
+                    static __RYTHON_MODULE_INIT_DONE: ::core::sync::atomic::AtomicBool =
+                        ::core::sync::atomic::AtomicBool::new(false);
+                    if __RYTHON_MODULE_INIT_DONE
+                        .swap(true, ::core::sync::atomic::Ordering::SeqCst)
+                    {
+                        return Ok(());
+                    }
                     #(#module_init_stmts;)*
                     Ok(())
                 }
             });
         }
-        // The startup sequence of the entry module: the sibling modules'
-        // bodies in dependency order, then this module's own.
-        let sibling_inits: Vec<TokenStream> = options
-            .startup_module_inits
-            .iter()
-            .map(|path| {
-                let segs: Vec<_> = path.iter().map(|s| crate::safe_ident(s)).collect();
-                quote!(crate::#(#segs::)*__module_init__()?;)
-            })
-            .collect();
-        let own_init = if has_module_init_code {
+        // The entry's startup: its own body (whose import sites run the
+        // sibling modules' bodies in Python's order).
+        let startup_init = if has_module_init_code {
             quote!(__module_init__()?;)
         } else {
             quote!()
         };
-        let startup_init = quote!(#(#sibling_inits)* #own_init);
-        let needs_init_wrapper = has_module_init_code || !sibling_inits.is_empty();
+        let needs_init_wrapper = has_module_init_code;
         
         // A `__main__` block wants a process entry point, and a no_std
         // target has no OS to enter from: refuse loudly instead of emitting

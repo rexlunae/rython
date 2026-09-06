@@ -596,6 +596,24 @@ impl CodeGen for StatementType {
                     s.to_rust(ctx, options, symbols)
                 }
             }
+            // An import INSIDE a function or method runs the imported
+            // module's body on first execution (Python's import-time
+            // semantics; issue #333): the `use` plus the once-guarded
+            // `__module_init__` calls. A module-level import is an item;
+            // the module emission adds its init calls to __module_init__
+            // in statement order.
+            StatementType::Import(_) | StatementType::ImportFrom(_)
+                if !matches!(ctx, CodeGenContext::Module(_)) =>
+            {
+                let loaded = crate::ast::tree::import::imported_crate_modules(&self, &options);
+                let calls = crate::ast::tree::import::module_init_calls(&loaded);
+                let uses = match self {
+                    StatementType::Import(s) => s.to_rust(ctx, options, symbols)?,
+                    StatementType::ImportFrom(s) => s.to_rust(ctx, options, symbols)?,
+                    _ => unreachable!("matched an import"),
+                };
+                Ok(quote!(#uses #calls))
+            }
             StatementType::Import(s) => s.to_rust(ctx, options, symbols),
             StatementType::ImportFrom(s) => s.to_rust(ctx, options, symbols),
             StatementType::Expr(s) => s.to_rust(ctx, options, symbols),

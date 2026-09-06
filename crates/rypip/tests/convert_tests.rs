@@ -10144,9 +10144,9 @@ fn a_module_value_stored_only_under_an_import_guard_is_visible_to_functions() {
 fn sibling_module_bodies_run_at_startup_in_dependency_order() {
     // Python runs a module's top-level statements when it is first
     // imported: `cli` imports `a`, `a` imports `b` — b's body, a's body,
-    // then the entry's. The crate has no import step, so the entry's
-    // `main` runs each sibling's `__module_init__` in that order before
-    // its own (issue #333).
+    // then the entry's. Every import site calls the loaded module's
+    // once-guarded `__module_init__`, so the order is Python's (issue
+    // #333).
     let scratch = Scratch::new("startpkg");
     let krate = package_crate(
         &scratch,
@@ -10190,20 +10190,244 @@ fn sibling_module_bodies_run_at_startup_in_dependency_order() {
             ),
         ],
     );
+    // Each import site runs the imported module's body: the entry's init
+    // calls a's, a's init calls b's (before a's own print).
     let main = fs::read_to_string(krate.root.join("src/main.rs")).unwrap();
-    let b_at = main.find("crate::b::__module_init__()?").expect("b's init runs");
-    let a_at = main.find("crate::a::__module_init__()?").expect("a's init runs");
-    assert!(b_at < a_at, "the imported module's body runs first: {}", main);
+    assert!(main.contains("crate::a::__module_init__()?"), "the entry runs a's body: {}", main);
+    let a = fs::read_to_string(krate.root.join("src/a.rs")).unwrap();
+    let b_at = a.find("crate::b::__module_init__()?").expect("a's init runs b's");
+    let print_at = a.find("init a").expect("a's own print");
+    assert!(b_at < print_at, "the import site precedes a's own statements: {}", a);
     // Verified against python3.
     assert_eq!(run_package(&krate, "startpkg"), vec!["init b", "init a", "b,a"]);
 }
 
 #[test]
+fn a_cyclic_import_continues_with_the_partial_module_like_python() {
+    // `a` imports `b` mid-body, `b` imports `a` back: CPython resumes b
+    // with a's PARTIAL state (A_VALUE, bound before the import) and runs
+    // a's remainder after b — never a second run of a. The once-guard is
+    // taken on entry, so b's import of a returns at once (Devin review
+    // on #336).
+    let scratch = Scratch::new("cycpkg");
+    let krate = package_crate(
+        &scratch,
+        "cycpkg",
+        &[
+            (
+                "a.py",
+                concat!(
+                    "print(\"a start\")\n",
+                    "A_VALUE = 1\n",
+                    "from .b import b_value\n",
+                    "print(\"a end\", b_value())\n",
+                    "\n",
+                    "\n",
+                    "def a_total() -> int:\n",
+                    "    return A_VALUE + b_value()\n",
+                ),
+            ),
+            (
+                "b.py",
+                concat!(
+                    "print(\"b start\")\n",
+                    "from .a import A_VALUE\n",
+                    "\n",
+                    "\n",
+                    "def b_value() -> int:\n",
+                    "    return A_VALUE + 1\n",
+                    "\n",
+                    "\n",
+                    "print(\"b end\")\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .a import a_total\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\", a_total())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "cycpkg"),
+        vec!["a start", "b start", "b end", "a end 2", "main 3"]
+    );
+}
+
+#[test]
+fn a_function_local_import_runs_the_module_body_on_first_call_only() {
+    // `from .noisy import shout` inside a function that is never called:
+    // noisy's body never runs (Python imports lazily). `from .quiet
+    // import whisper` inside a function called twice: quiet's body runs
+    // once, at the first call — never at startup (Devin review on #336).
+    let scratch = Scratch::new("lazyimp");
+    let krate = package_crate(
+        &scratch,
+        "lazyimp",
+        &[
+            (
+                "noisy.py",
+                concat!(
+                    "print(\"noisy loaded\")\n",
+                    "\n",
+                    "\n",
+                    "def shout() -> str:\n",
+                    "    return \"loud\"\n",
+                ),
+            ),
+            (
+                "quiet.py",
+                concat!(
+                    "print(\"quiet loaded\")\n",
+                    "\n",
+                    "\n",
+                    "def whisper() -> str:\n",
+                    "    return \"soft\"\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "def never() -> str:\n",
+                    "    from .noisy import shout\n",
+                    "    return shout()\n",
+                    "\n",
+                    "\n",
+                    "def sometimes() -> str:\n",
+                    "    from .quiet import whisper\n",
+                    "    return whisper()\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"start\")\n",
+                    "    print(sometimes())\n",
+                    "    print(sometimes())\n",
+                    "    print(\"end\")\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let main = fs::read_to_string(krate.root.join("src/main.rs")).unwrap();
+    assert!(
+        main.contains("crate::quiet::__module_init__()?"),
+        "the call site runs quiet's body: {}",
+        main
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "lazyimp"),
+        vec!["start", "quiet loaded", "soft", "soft", "end"]
+    );
+}
+
+#[test]
+fn a_later_crate_import_rebinds_a_class_name_for_the_exception_closure() {
+    // errors.py defines the exception `Root`; late.py defines an ordinary
+    // `Root` THEN imports errors' — the import is the name's last binding,
+    // so late's `LateLeaf(Root)` is an exception; early.py imports first
+    // and defines after — its `EarlyLeaf(Root)` is ordinary (Devin review
+    // on #336). Conversion only: a module carrying both a struct and a
+    // `use` of one name is loud in rustc.
+    let scratch = Scratch::new("rebind");
+    let krate = package_crate(
+        &scratch,
+        "rebind",
+        &[
+            ("errors.py", "class Root(Exception):\n    pass\n"),
+            (
+                "late.py",
+                concat!(
+                    "class Root:\n",
+                    "    pass\n",
+                    "\n",
+                    "\n",
+                    "from .errors import Root\n",
+                    "\n",
+                    "\n",
+                    "class LateLeaf(Root):\n",
+                    "    pass\n",
+                    "\n",
+                    "\n",
+                    "def boom() -> None:\n",
+                    "    raise LateLeaf(\"late\")\n",
+                ),
+            ),
+            (
+                "early.py",
+                concat!(
+                    "from .errors import Root\n",
+                    "\n",
+                    "\n",
+                    "class Root:\n",
+                    "    def tag(self) -> str:\n",
+                    "        return \"plain\"\n",
+                    "\n",
+                    "\n",
+                    "class EarlyLeaf(Root):\n",
+                    "    pass\n",
+                    "\n",
+                    "\n",
+                    "def make() -> str:\n",
+                    "    return EarlyLeaf().tag()\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .late import boom\n",
+                    "from .early import make\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    try:\n",
+                    "        boom()\n",
+                    "    except Exception as e:\n",
+                    "        print(\"caught\", e)\n",
+                    "    print(make())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let late = fs::read_to_string(krate.root.join("src/late.rs")).unwrap();
+    assert!(
+        late.contains("\"LateLeaf\"") && late.contains("(\"Root\").to_string(), (\"Exception\").to_string()"),
+        "late's Leaf raises as an exception under errors' Root: {}",
+        late
+    );
+    let early = fs::read_to_string(krate.root.join("src/early.rs")).unwrap();
+    assert!(
+        early.contains("fn tag") && !early.contains("new_with_attrs_and_ancestors"),
+        "early's Leaf is the ordinary class: {}",
+        early
+    );
+}
+
+#[test]
 fn a_package_root_init_with_statements_warns_that_they_do_not_run() {
     // The package root `__init__` is the lib root, which the binary does
-    // not contain (it compiles the sibling modules as its own): a
-    // statement there (`configure()`) never runs for the binary. That is
-    // said, not silently skipped (issue #333).
+    // not contain (it compiles the sibling modules as its own): what it
+    // runs at import time — a computed assignment (`SETTINGS =
+    // configure()`), the body of a crate module its import loads — never
+    // runs for the binary. That is said, not silently skipped (issue
+    // #333, Devin review on #336).
     let scratch = Scratch::new("rootinit");
     let krate = package_crate(
         &scratch,
@@ -10216,14 +10440,18 @@ fn a_package_root_init_with_statements_warns_that_they_do_not_run() {
                     "from .cfg import configure\n",
                     "\n",
                     "VERSION = \"1\"\n",
-                    "configure()\n",
+                    "SETTINGS = configure()\n",
                 ),
             ),
             (
                 "cfg.py",
                 concat!(
-                    "def configure() -> None:\n",
+                    "print(\"cfg loaded\")\n",
+                    "\n",
+                    "\n",
+                    "def configure() -> str:\n",
                     "    print(\"configured\")\n",
+                    "    return \"ok\"\n",
                 ),
             ),
             (
@@ -10240,11 +10468,29 @@ fn a_package_root_init_with_statements_warns_that_they_do_not_run() {
         ],
     );
     assert!(
-        krate.warnings.iter().any(|w| w.contains("module-level statements in the package `__init__` do not run")),
+        krate.warnings.iter().any(|w| w.contains("what the package `__init__` runs at import time")),
         "warnings: {:?}",
         krate.warnings
     );
     assert_eq!(run_package(&krate, "rootinit"), vec!["run"]);
+
+    // An import of a crate module alone warns too: Python would run
+    // cfg's body (its print) when the package loads.
+    let scratch = Scratch::new("rootimp");
+    let krate = package_crate(
+        &scratch,
+        "rootimp",
+        &[
+            ("__init__.py", "from .cfg import configure\n"),
+            ("cfg.py", "print(\"cfg loaded\")\n\n\ndef configure() -> None:\n    pass\n"),
+            ("cli.py", "def main() -> None:\n    print(\"run\")\n\n\nif __name__ == \"__main__\":\n    main()\n"),
+        ],
+    );
+    assert!(
+        krate.warnings.iter().any(|w| w.contains("what the package `__init__` runs at import time")),
+        "warnings: {:?}",
+        krate.warnings
+    );
 }
 
 #[test]

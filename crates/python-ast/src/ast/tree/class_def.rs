@@ -258,8 +258,15 @@ pub fn crate_import_in_defining_module(class: &str, name: &str) -> Option<(Vec<S
 pub struct ModuleBindings {
     pub externals: std::collections::HashSet<String>,
     /// Every crate import's local name → (the source module's key, the
-    /// name there), `as` binding or not.
+    /// name there), `as` binding or not. Flow-sensitive over the module's
+    /// straight line: a class definition AFTER the import rebinds the
+    /// name (the import is dropped here), an import AFTER a class
+    /// definition rebinds it too (`import_after_def`).
     pub crate_imports: std::collections::HashMap<String, (Vec<String>, String)>,
+    /// Names whose LAST module-level binding is a crate import that
+    /// follows a class definition of the same name: the import wins
+    /// (Devin review on #336).
+    pub import_after_def: std::collections::HashSet<String>,
 }
 
 thread_local! {
@@ -412,6 +419,8 @@ pub(crate) fn module_name_aliases_depth(
         nested: bool,
         bindings: &mut Vec<(String, Vec<String>)>,
         crate_imports: &mut std::collections::HashMap<String, (Vec<String>, String)>,
+        seen_defs: &mut std::collections::HashSet<String>,
+        import_after_def: &mut std::collections::HashSet<String>,
         options: &crate::PythonOptions,
         depth: usize,
     ) {
@@ -449,6 +458,11 @@ pub(crate) fn module_name_aliases_depth(
                 }
                 crate::StatementType::ClassDef(c) => {
                     bind(bindings, &c.name, CLASS_ALTERNATIVE, nested);
+                    // The definition is the name's latest binding: an
+                    // earlier crate import of the name is rebound.
+                    seen_defs.insert(c.name.clone());
+                    crate_imports.remove(&c.name);
+                    import_after_def.remove(&c.name);
                 }
                 crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
                     bind(bindings, &f.name, LOCAL_ALTERNATIVE, nested);
@@ -483,25 +497,48 @@ pub(crate) fn module_name_aliases_depth(
                             options, &source_key, &a.name, depth,
                         ) {
                             bind(bindings, local, EXTERNAL_ALTERNATIVE, nested);
-                        } else if local != a.name {
-                            bind(bindings, local, &a.name, nested);
-                            crate_imports
-                                .insert(local.to_string(), (source_key.clone(), a.name.clone()));
                         } else {
-                            bind(bindings, local, LOCAL_ALTERNATIVE, nested);
+                            if local != a.name {
+                                bind(bindings, local, &a.name, nested);
+                            } else {
+                                bind(bindings, local, LOCAL_ALTERNATIVE, nested);
+                            }
                             crate_imports
                                 .insert(local.to_string(), (source_key.clone(), a.name.clone()));
+                            if seen_defs.contains(local) {
+                                import_after_def.insert(local.to_string());
+                            }
                         }
                     }
                 }
                 _ => {}
             }
             for body in stmt_bodies_for(s, Descend::SkipDefs) {
-                collect(body, true, bindings, crate_imports, options, depth);
+                collect(
+                    body,
+                    true,
+                    bindings,
+                    crate_imports,
+                    seen_defs,
+                    import_after_def,
+                    options,
+                    depth,
+                );
             }
         }
     }
-    collect(body, false, &mut bindings, &mut crate_imports, options, depth);
+    let mut seen_defs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut import_after_def: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect(
+        body,
+        false,
+        &mut bindings,
+        &mut crate_imports,
+        &mut seen_defs,
+        &mut import_after_def,
+        options,
+        depth,
+    );
     let externals: std::collections::HashSet<String> = bindings
         .iter()
         .filter(|(_, alts)| alts.iter().any(|t| t == EXTERNAL_ALTERNATIVE))
@@ -512,7 +549,7 @@ pub(crate) fn module_name_aliases_depth(
             .into_iter()
             .flat_map(|(n, alts)| alts.into_iter().map(move |t| (n.clone(), t)))
             .collect(),
-        ModuleBindings { externals, crate_imports },
+        ModuleBindings { externals, crate_imports, import_after_def },
     )
 }
 
@@ -774,7 +811,9 @@ pub fn compute_exception_classes(
             if f.bindings.externals.contains(&cur) {
                 return None;
             }
-            if f.defs.contains(&cur) {
+            // The module's own class, unless a LATER crate import rebinds
+            // the name (the straight line's last binding wins).
+            if f.defs.contains(&cur) && !f.bindings.import_after_def.contains(&cur) {
                 return Some((key, cur));
             }
             match f.bindings.crate_imports.get(&cur) {

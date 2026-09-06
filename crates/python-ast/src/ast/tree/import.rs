@@ -462,6 +462,61 @@ pub struct Import {
 /// 1. Declares the imported object within the existing scope.
 /// 2. Causes the referenced module to be compiled into the program (only once).
 
+/// The crate modules an import statement LOADS, in Python's order — the
+/// modules whose bodies run at the import site (issue #333, Devin review
+/// on #336): for `import a.b.c`, each package on the path that is a crate
+/// module, then the module; for `from .a import x, y`, the resolved
+/// module (its crate packages first) and each imported name that is a
+/// submodule. The package root (the lib root, which the binary does not
+/// contain) and modules outside the crate are never listed; a
+/// single-module conversion (no `module_defs`) lists nothing.
+pub(crate) fn imported_crate_modules(
+    stmt: &crate::StatementType,
+    options: &PythonOptions,
+) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let push_chain = |path: &[String], out: &mut Vec<Vec<String>>| {
+        for len in 1..=path.len() {
+            if let Some(key) = crate::module_defs_key(options, &path[..len]) {
+                let key = key.to_vec();
+                if !key.is_empty() && key != options.this_module_path && !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+        }
+    };
+    match stmt {
+        crate::StatementType::Import(i) => {
+            for a in &i.names {
+                let path: Vec<String> = a.name.split('.').map(|s| s.to_string()).collect();
+                push_chain(&path, &mut out);
+            }
+        }
+        crate::StatementType::ImportFrom(i) => {
+            let base = i.resolved_module_path(options);
+            push_chain(&base, &mut out);
+            for a in &i.names {
+                let mut sub = base.clone();
+                sub.push(a.name.clone());
+                push_chain(&sub, &mut out);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// The `__module_init__` calls for the modules an import loads, in
+/// order: each module's body runs once (the function is once-guarded),
+/// exactly where Python runs it — the import site.
+pub(crate) fn module_init_calls(paths: &[Vec<String>]) -> TokenStream {
+    let calls = paths.iter().map(|path| {
+        let segs: Vec<_> = path.iter().map(|s| crate::safe_ident(s)).collect();
+        quote!(crate::#(#segs::)*__module_init__()?;)
+    });
+    quote!(#(#calls)*)
+}
+
 impl CodeGen for Import {
     type Context = CodeGenContext;
     type Options = PythonOptions;

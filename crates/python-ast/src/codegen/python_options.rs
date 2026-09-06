@@ -588,17 +588,6 @@ pub struct PythonOptions {
     pub module_defs:
         std::rc::Rc<std::collections::HashMap<Vec<String>, std::rc::Rc<crate::Module>>>,
 
-    /// Module paths whose `__module_init__` the ENTRY module's `main` runs
-    /// at startup, before its own, in dependency order (a module's imports
-    /// before the module — the order Python runs module bodies when the
-    /// entry is imported). Python runs a module's top-level statements when
-    /// the module is first imported; the generated crate has no import
-    /// step, so the entry binary runs them all at startup instead
-    /// (function-local imports are hoisted to startup too — the same eager
-    /// model as the crate's lazily-initialized statics). Set by the
-    /// converter on the entry module only; empty otherwise (issue #333).
-    pub startup_module_inits: std::rc::Rc<Vec<Vec<String>>>,
-
     /// Lazily-computed merged trait-mut table over ALL modules of the crate
     /// (`module_defs`), shared across every module's conversion: the
     /// cross-module fallback in `method_needs_mut_self` scans each module
@@ -707,7 +696,6 @@ impl Default for PythonOptions {
             rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),
             module_defs: std::rc::Rc::new(std::collections::HashMap::new()),
-            startup_module_inits: std::rc::Rc::new(Vec::new()),
             cross_module_mut_self: std::rc::Rc::new(std::cell::RefCell::new(
                 CrossModuleMutSelf::Uncomputed,
             )),

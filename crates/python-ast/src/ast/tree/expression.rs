@@ -883,7 +883,10 @@ mod tests {
         assert_eq!(
             tokens.to_string(),
             "# [allow (dead_code)] pub (crate) fn __module_init__ () -> Result < () , PyException > \
-             { test () ; Ok (()) } fn main () { let __rython_result = (|| -> Result < () , \
+             { static __RYTHON_MODULE_INIT_DONE : :: core :: sync :: atomic :: AtomicBool = :: core \
+             :: sync :: atomic :: AtomicBool :: new (false) ; if __RYTHON_MODULE_INIT_DONE . swap \
+             (true , :: core :: sync :: atomic :: Ordering :: SeqCst) { return Ok (()) ; } test () ; \
+             Ok (()) } fn main () { let __rython_result = (|| -> Result < () , \
              PyException > { __module_init__ () ? ; Ok (()) }) () ; if let Err (e) = \
              __rython_result { eprintln ! (\"{}\" , e) ; std :: process :: exit (1) ; } }"
         );

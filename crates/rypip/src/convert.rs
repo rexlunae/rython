@@ -1993,27 +1993,16 @@ pub fn convert(
             transpiled.push((module, code));
         }
     }
-    // The entry module's `main` runs every sibling's module body at
-    // startup, in dependency order (issue #333): Python runs a module's
-    // top-level statements when it is first imported; the crate has no
-    // import step.
-    let by_path = modules_by_path(package, &python_deps);
-    let mut entry_options = base_options.clone();
+    // The package root `__init__` is the lib root, which the binary does
+    // not contain: say so when it has statements the binary would skip.
     if let Some(entry) = package.entry_module() {
-        entry_options.startup_module_inits =
-            std::rc::Rc::new(startup_module_inits(entry, &by_path, &reachable));
         warn_root_init_statements(package, entry, &mut warnings);
     }
     for module in &package.modules {
         if !reachable.contains(&module.path) {
             continue;
         }
-        let options = if entry_file.as_ref() == Some(&module.file) {
-            &entry_options
-        } else {
-            &base_options
-        };
-        let code = transpile(module, &mut warnings, options)?;
+        let code = transpile(module, &mut warnings, &base_options)?;
         transpiled.push((module, code));
     }
     // An entry module named `main` (path ["main"]) is bin-only: its module
@@ -3812,58 +3801,26 @@ fn crate_imports_of(
         return Vec::new();
     };
     let mut queue: VecDeque<Vec<String>> = VecDeque::new();
-    for stmt in &ast.raw.body {
-        reachable_walk_imports(stmt, module, &module.path, by_path, &mut queue);
-    }
+    python_ast::ast::tree::visit::walk_stmts(
+        &ast.raw.body,
+        python_ast::ast::tree::visit::Descend::All,
+        &mut |stmt| {
+            reachable_walk_imports(stmt, module, &module.path, by_path, &mut queue);
+            python_ast::ast::tree::visit::Flow::Continue
+        },
+    );
     let mut seen: HashSet<Vec<String>> = HashSet::new();
     queue.into_iter().filter(|p| seen.insert(p.clone())).collect()
 }
 
-/// The modules whose bodies the entry binary runs at startup, in the
-/// order Python would run them when importing the entry: a depth-first
-/// post-order over crate imports from the entry (a module's imports before
-/// the module, each module once, an import cycle broken at the module
-/// already being entered — Python's partially-initialized module). The
-/// entry itself runs last (its own `__module_init__`), and the package root
-/// `__init__` is excluded: the bin crate compiles the sibling modules as
-/// its own and does not contain the lib root at all (see
-/// `warn_root_init_statements`).
-fn startup_module_inits(
-    entry: &PyModule,
-    by_path: &HashMap<Vec<String>, &PyModule>,
-    reachable: &HashSet<Vec<String>>,
-) -> Vec<Vec<String>> {
-    fn visit(
-        path: &[String],
-        by_path: &HashMap<Vec<String>, &PyModule>,
-        reachable: &HashSet<Vec<String>>,
-        visiting: &mut HashSet<Vec<String>>,
-        order: &mut Vec<Vec<String>>,
-    ) {
-        if !visiting.insert(path.to_vec()) {
-            return;
-        }
-        let Some(module) = by_path.get(path) else { return };
-        for dep in crate_imports_of(module, by_path) {
-            visit(&dep, by_path, reachable, visiting, order);
-        }
-        if !path.is_empty() && reachable.contains(path) {
-            order.push(path.to_vec());
-        }
-    }
-    let mut visiting = HashSet::new();
-    let mut order = Vec::new();
-    visit(&entry.path, by_path, reachable, &mut visiting, &mut order);
-    order.retain(|p| p != &entry.path);
-    order
-}
-
 /// The package root `__init__` (path `[]`) becomes the lib root, which the
 /// bin crate does not compile (it declares the sibling modules itself), so
-/// its module-level STATEMENTS never run for the binary: say so instead of
-/// silently skipping them. Imports, defs, classes, docstrings and plain
-/// assignments (which lower to items and statics) are not statements the
-/// startup sequence would run.
+/// what the root runs at import time never runs for the binary: its
+/// STATEMENTS, the bodies of the crate modules its IMPORTS load, and the
+/// code a computed ASSIGNMENT's right-hand side executes. Say so instead
+/// of silently skipping them (Devin review on #336). Defs, classes,
+/// docstrings and constant assignments are items the binary never needed
+/// to run.
 fn warn_root_init_statements(package: &PyPackage, entry: &PyModule, warnings: &mut Vec<String>) {
     use python_ast::ast::tree::{ExprType, StatementType};
     let Some(root) = package.modules.iter().find(|m| m.path.is_empty()) else {
@@ -3875,21 +3832,38 @@ fn warn_root_init_statements(package: &PyPackage, entry: &PyModule, warnings: &m
     let Ok(ast) = python_ast::parse_enhanced(&root.source, parse_filename(root)) else {
         return;
     };
+    let crate_roots: HashSet<String> = package
+        .modules
+        .iter()
+        .filter_map(|m| m.path.first().cloned())
+        .collect();
+    let loads_crate_module = |s: &StatementType| match s {
+        StatementType::Import(i) => i
+            .names
+            .iter()
+            .any(|a| crate_roots.contains(a.name.split('.').next().unwrap_or(""))),
+        StatementType::ImportFrom(i) => {
+            i.level > 0
+                || crate_roots.contains(i.module.split('.').next().unwrap_or(""))
+        }
+        _ => false,
+    };
+    let is_constant = |e: &ExprType| matches!(e, ExprType::Constant(_));
     let runs_at_import = ast.raw.body.iter().any(|s| match &s.statement {
-        StatementType::Import(_)
-        | StatementType::ImportFrom(_)
-        | StatementType::FunctionDef(_)
+        StatementType::Import(_) | StatementType::ImportFrom(_) => loads_crate_module(&s.statement),
+        StatementType::FunctionDef(_)
         | StatementType::AsyncFunctionDef(_)
         | StatementType::ClassDef(_)
-        | StatementType::Assign(_)
         | StatementType::AnnotatedName { .. }
         | StatementType::Pass => false,
-        StatementType::Expr(e) => !matches!(e.value, ExprType::Constant(_)),
+        StatementType::Assign(a) => !is_constant(&a.value),
+        StatementType::Expr(e) => !is_constant(&e.value),
         _ => true,
     });
     if runs_at_import {
         warnings.push(format!(
-            "{}: module-level statements in the package `__init__` do not run when the \
+            "{}: what the package `__init__` runs at import time (its statements, the \
+             crate modules its imports load, computed assignments) does not run when the \
              binary starts (the binary compiles the package's modules as its own and does \
              not contain the package root); move startup side effects into the entry module",
             parse_filename(root),
@@ -3897,13 +3871,12 @@ fn warn_root_init_statements(package: &PyPackage, entry: &PyModule, warnings: &m
     }
 }
 
-/// Walk one statement for imports to enqueue, recursing into nested
-/// statement lists (if/while/for/with/try bodies) AND function bodies:
-/// `from pip._internal.utils.entrypoints import _wrapper` inside `main()`
-/// (a function-local import) still makes `pip._internal...` reachable.
-/// Function bodies are walked with the function's own package path — a
-/// function-local import is relative to the module's package, not to the
-/// function.
+/// Enqueue the crate modules one statement's import loads — the one
+/// import walk; `crate_imports_of` drives it through the shared statement
+/// visitor over EVERY body (control flow and function bodies alike: `from
+/// pip._internal.utils.entrypoints import _wrapper` inside `main()` still
+/// makes `pip._internal...` reachable). A relative import is relative to
+/// the module's package, wherever the statement sits.
 fn reachable_walk_imports(
     stmt: &python_ast::ast::tree::Statement,
     module: &PyModule,
@@ -3977,50 +3950,6 @@ fn reachable_walk_imports(
                         queue.push_back(cand);
                     }
                 }
-            }
-        }
-        _ => {}
-    }
-    // Recurse into nested statement lists and function bodies.
-    match &stmt.statement {
-        StatementType::FunctionDef(f) => {
-            for b in &f.body {
-                reachable_walk_imports(b, module, path, by_path, queue);
-            }
-        }
-        StatementType::If(s) => {
-            for b in s.body.iter().chain(s.orelse.iter()) {
-                reachable_walk_imports(b, module, path, by_path, queue);
-            }
-        }
-        StatementType::While(s) => {
-            for b in s.body.iter().chain(s.orelse.iter()) {
-                reachable_walk_imports(b, module, path, by_path, queue);
-            }
-        }
-        StatementType::For(s) => {
-            for b in s.body.iter().chain(s.orelse.iter()) {
-                reachable_walk_imports(b, module, path, by_path, queue);
-            }
-        }
-        StatementType::With(s) => {
-            for b in &s.body {
-                reachable_walk_imports(b, module, path, by_path, queue);
-            }
-        }
-        StatementType::Try(s) => {
-            for b in s.body.iter().chain(s.orelse.iter()).chain(s.finalbody.iter()) {
-                reachable_walk_imports(b, module, path, by_path, queue);
-            }
-            for h in &s.handlers {
-                for b in &h.body {
-                    reachable_walk_imports(b, module, path, by_path, queue);
-                }
-            }
-        }
-        StatementType::ClassDef(c) => {
-            for b in &c.body {
-                reachable_walk_imports(b, module, path, by_path, queue);
             }
         }
         _ => {}
