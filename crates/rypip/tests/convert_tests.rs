@@ -7363,6 +7363,201 @@ fn closing_a_dash_stream_closes_it_for_print_and_input_too() {
 }
 
 #[test]
+fn argparse_defaults_bind_where_add_argument_stood() {
+    // Round 10 of the review on #339: Python evaluates `default=` when
+    // add_argument runs, so a name rebound before parse_args does not
+    // change an omitted option's value — in a function body and at module
+    // level alike. Transcripts captured from python3 3.11 verbatim.
+    let scratch = Scratch::new("apdeforder");
+    let file = scratch.path().join("order.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    fallback = \"early\"\n",
+            "    parser = argparse.ArgumentParser(prog=\"order\")\n",
+            "    parser.add_argument(\"--name\", default=fallback)\n",
+            "    parser.add_argument(\"--tag\", default=\"lit-\" + fallback)\n",
+            "    fallback = \"late\"\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(args.name, args.tag, fallback)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/order");
+    for (args, expected) in [
+        (&[][..], "early lit-early late\n"),
+        (&["--name", "given", "--tag", "t"][..], "given t late\n"),
+    ] {
+        let output = Command::new(&bin).args(args).output().expect("run");
+        assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "args: {:?}", args);
+    }
+
+    // The same at module level: the binding lands in __module_init__
+    // where the add_argument stood.
+    let scratch = Scratch::new("apdefordermod");
+    let file = scratch.path().join("ordermod.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "fallback = \"early\"\n",
+            "parser = argparse.ArgumentParser(prog=\"ordermod\")\n",
+            "parser.add_argument(\"--name\", default=fallback)\n",
+            "fallback = \"late\"\n",
+            "args = parser.parse_args()\n",
+            "print(args.name, fallback)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/ordermod");
+    for (args, expected) in [(&[][..], "early late\n"), (&["--name", "given"][..], "given late\n")] {
+        let output = Command::new(&bin).args(args).output().expect("run");
+        assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "args: {:?}", args);
+    }
+}
+
+#[test]
+fn numeric_argparse_values_follow_pythons_underscore_grammar() {
+    // Round 10 of the review on #339: `type=int` / `type=float` are the
+    // builtins, so a string default and a command-line value accept single
+    // underscores BETWEEN digits (`1_000`, `1_0.5`, `.5_1`, `1e1_0`) and
+    // nothing else (`1__0` is CPython's invalid-value error). Transcripts
+    // captured from python3 3.11 verbatim.
+    let scratch = Scratch::new("apunder");
+    let file = scratch.path().join("under.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"under\")\n",
+            "    parser.add_argument(\"--count\", type=int, default=\"1_000\")\n",
+            "    parser.add_argument(\"--ratio\", type=float, default=\"1_0.5\")\n",
+            "    parser.add_argument(\"--tail\", type=float, default=\".5_1\")\n",
+            "    parser.add_argument(\"--big\", type=float, default=\"1e1_0\")\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(args.count, args.ratio, args.tail, args.big)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/under");
+    let cases: &[(&[&str], i32, &str, &str)] = &[
+        (&[], 0, "1000 10.5 0.51 10000000000.0\n", ""),
+        (&["--count", "1_0", "--ratio", "2_5.5"], 0, "10 25.5 0.51 10000000000.0\n", ""),
+        (
+            &["--count", "1__0"],
+            2,
+            "",
+            "usage: under [-h] [--count COUNT] [--ratio RATIO] [--tail TAIL] [--big BIG]\nunder: error: argument --count: invalid int value: '1__0'\n",
+        ),
+    ];
+    for (args, code, stdout, stderr) in cases {
+        let output = Command::new(&bin).args(*args).env_remove("COLUMNS").output().expect("run");
+        assert_eq!(output.status.code(), Some(*code), "args: {:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), *stdout, "args: {:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stderr), *stderr, "args: {:?}", args);
+    }
+}
+
+#[test]
+fn input_without_a_prompt_ignores_a_closed_stdout() {
+    // Round 10 of the review on #339: `input()` without a prompt writes
+    // nothing to sys.stdout (CPython flushes it and clears the error), so
+    // a closed `FileType("w")("-")` does not stop it reading; a prompt IS
+    // written, so `input("prompt> ")` is the closed-file ValueError, like
+    // `print()`. Transcript captured from python3 3.11 with piped stdin.
+    let scratch = Scratch::new("appromptless");
+    let file = scratch.path().join("promptless.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"promptless\")\n",
+            "    parser.add_argument(\"out\", type=argparse.FileType(\"w\"))\n",
+            "    args = parser.parse_args(argv)\n",
+            "    args.out.close()\n",
+            "    with open(\"log.txt\", \"w\") as log:\n",
+            "        line = input()\n",
+            "        log.write(\"read: \" + line + \"\\n\")\n",
+            "        try:\n",
+            "            input(\"prompt> \")\n",
+            "        except ValueError as e:\n",
+            "            log.write(\"prompted: \" + str(e) + \"\\n\")\n",
+            "        try:\n",
+            "            print(\"gone\")\n",
+            "        except ValueError as e:\n",
+            "            log.write(\"print: \" + str(e) + \"\\n\")\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(scratch.path().join("input.txt"), "first\nsecond\n").unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/promptless");
+    let output = Command::new(&bin)
+        .arg("-")
+        .current_dir(scratch.path())
+        .stdin(fs::File::open(scratch.path().join("input.txt")).unwrap())
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(
+        fs::read_to_string(scratch.path().join("log.txt")).unwrap(),
+        "read: first\nprompted: I/O operation on closed file.\nprint: I/O operation on closed file.\n"
+    );
+}
+
+#[test]
 fn a_failed_write_to_stdout_is_a_catchable_broken_pipe_error() {
     // Round 7 of the review on #339: print() writes through the fallible
     // path, so stdout rejecting a write — the reader of a pipe gone — is

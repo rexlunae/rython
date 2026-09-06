@@ -2867,7 +2867,7 @@ mod dict_and_exception_display {
 }
 
 mod cpython_numeric_and_stdlib_fixes {
-    use stdpython::{datetime::date, py_pow, PyInt, PyMul};
+    use stdpython::{datetime::date, py_pow, py_str_repr, PyFloat, PyInt, PyMul};
 
     #[test]
     fn float_power_uses_libm_pow_not_repeated_squaring() {
@@ -2876,6 +2876,90 @@ mod cpython_numeric_and_stdlib_fixes {
         assert_eq!(py_pow(0.1f64, 4i64), 0.1f64.powf(4.0));
         assert_eq!(format!("{:?}", py_pow(0.1f64, 4i64)), "0.00010000000000000002");
         assert_eq!(format!("{:?}", py_pow(1.05f64, 10i64)), "1.628894626777442");
+    }
+
+    #[test]
+    fn numeric_strings_follow_pythons_underscore_grammar() {
+        // Round 10 of the review on #339: `int(s)` and `float(s)` accept
+        // single underscores BETWEEN digits only — `_1`, `1_` and `1__2`
+        // are CPython's ValueError, never a number with the underscores
+        // dropped. Every row is python3 3.11's answer (VE = ValueError).
+        let table: &[(&str, Option<i64>, Option<f64>)] = &[
+            ("_1", None, None),
+            ("1_", None, None),
+            ("1__2", None, None),
+            ("1_000", Some(1000), Some(1000.0)),
+            (" 1_0 ", Some(10), Some(10.0)),
+            ("+1_0", Some(10), Some(10.0)),
+            ("-1_0", Some(-10), Some(-10.0)),
+            ("1_0_0", Some(100), Some(100.0)),
+            ("0_1", Some(1), Some(1.0)),
+            ("1 0", None, None),
+            ("", None, None),
+            ("  ", None, None),
+            ("1_0.5", None, Some(10.5)),
+            ("1_.0", None, None),
+            ("1__0.5", None, None),
+            ("1e1_0", None, Some(1e10)),
+            ("1_e10", None, None),
+            ("1.5_", None, None),
+            ("_1.5", None, None),
+            (".5", None, Some(0.5)),
+            (".5_1", None, Some(0.51)),
+            ("5.", None, Some(5.0)),
+            ("5._1", None, None),
+            ("1e_1", None, None),
+            ("in_f", None, None),
+            ("inf", None, Some(f64::INFINITY)),
+            ("-Infinity", None, Some(f64::NEG_INFINITY)),
+            ("1_0e-1_0", None, Some(1e-9)),
+            ("1.", None, Some(1.0)),
+            ("-.5e+2", None, Some(-50.0)),
+            ("1e", None, None),
+            ("e1", None, None),
+            ("0x1_0", None, None),
+            ("1_0j", None, None),
+        ];
+        for (text, int, float) in table {
+            match (text.py_int(), int) {
+                (Ok(v), Some(want)) => assert_eq!(v, *want, "int({:?})", text),
+                (Err(e), None) => assert_eq!(
+                    e.to_string(),
+                    format!("ValueError: invalid literal for int() with base 10: {}", py_str_repr(text)),
+                    "int({:?})",
+                    text
+                ),
+                (got, want) => panic!("int({:?}): got {:?}, python3 gives {:?}", text, got, want),
+            }
+            match (text.py_float(), float) {
+                (Ok(v), Some(want)) => assert_eq!(v, *want, "float({:?})", text),
+                (Err(e), None) => assert_eq!(
+                    e.to_string(),
+                    format!("ValueError: could not convert string to float: {}", py_str_repr(text)),
+                    "float({:?})",
+                    text
+                ),
+                (got, want) => panic!("float({:?}): got {:?}, python3 gives {:?}", text, got, want),
+            }
+        }
+        // python3: float("nan") is nan (both spellings), and the message
+        // quotes the string as Python's repr does.
+        assert!("+nan".py_float().unwrap().is_nan());
+        assert!("NaN".py_float().unwrap().is_nan());
+        assert_eq!(
+            "it's".py_int().unwrap_err().to_string(),
+            "ValueError: invalid literal for int() with base 10: \"it's\""
+        );
+        // What CPython reads and the runtime's i64 cannot hold is loud,
+        // never a different value: non-ASCII decimal digits (python3:
+        // int("٣") == 3) and an int outside i64.
+        let e = "٣".py_int().unwrap_err();
+        assert_eq!(e.to_string(), "NotImplementedError: int('٣'): non-ASCII digits are not supported yet");
+        let e = "99999999999999999999".py_int().unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "NotImplementedError: int('99999999999999999999'): an int outside i64 are not supported yet"
+        );
     }
 
     #[test]

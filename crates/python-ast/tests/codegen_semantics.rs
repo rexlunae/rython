@@ -6639,6 +6639,34 @@ fn argparse_version_strings_bind_where_add_argument_stood() {
     let rebind = out.find("v = \"2.0\"").expect("the rebinding survives");
     let parse = out.find("argparse :: run_parser").expect("the parse site");
     assert!(bind < rebind && rebind < parse, "order: {}", out);
+
+    // Round 10: a non-literal `default=` is evaluated when add_argument
+    // runs too (python3: `fallback = "early"; add_argument("--name",
+    // default=fallback); fallback = "late"` parses to "early"), so it is
+    // bound the same way; a string literal stays where it was.
+    let out = compile(
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    fallback = \"early\"\n",
+            "    p = argparse.ArgumentParser(prog=\"tool\")\n",
+            "    p.add_argument(\"--name\", default=fallback)\n",
+            "    p.add_argument(\"--tag\", default=\"lit\")\n",
+            "    fallback = \"late\"\n",
+            "    args = p.parse_args(argv)\n",
+            "    print(args.name, fallback)\n",
+            "    return 0\n",
+        ),
+        "apdef.py",
+    );
+    let bind = out.find("let __argparse_default_0 : String = ").expect("the default binding is emitted");
+    let rebind = out.find("fallback = \"late\"").expect("the rebinding survives");
+    let parse = out.find("argparse :: run_parser").expect("the parse site");
+    assert!(bind < rebind && rebind < parse, "order: {}", out);
+    assert!(out.contains("Str (__argparse_default_0 . clone ())"), "the spec takes the local: {}", out);
+    assert!(out.contains("Str ((\"lit\") . to_string ())"), "a literal default stays inline: {}", out);
+    assert!(!out.contains("__argparse_default_1"), "only the non-literal default is bound: {}", out);
 }
 
 #[test]
@@ -6909,6 +6937,35 @@ fn update_file_modes_are_refused_at_conversion() {
         (
             "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--i\", type=int, default=\"abc\")\n",
             "argument --i: invalid int value: 'abc'",
+        ),
+        // Python's numeric-string grammar allows single underscores
+        // BETWEEN digits only; `_1`, `1_`, `1__2`, `1_.0` and `1__0.5` are
+        // CPython's ValueError at every run, refused (round 10). A number
+        // CPython reads that the typed field cannot hold is refused with
+        // the reason.
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--i\", type=int, default=\"_1\")\n",
+            "argument --i: invalid int value: '_1'",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--i\", type=int, default=\"1_\")\n",
+            "argument --i: invalid int value: '1_'",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--i\", type=int, default=\"1__2\")\n",
+            "argument --i: invalid int value: '1__2'",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--f\", type=float, default=\"1_.0\")\n",
+            "argument --f: invalid float value: '1_.0'",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--f\", type=float, default=\"1__0.5\")\n",
+            "argument --f: invalid float value: '1__0.5'",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--i\", type=int, default=\"99999999999999999999\")\n",
+            "default='99999999999999999999' is an int outside i64, which the i64 field cannot hold",
         ),
         // A positional store_true consumes no token in CPython (the flag
         // is simply True): refused rather than modeled as a value

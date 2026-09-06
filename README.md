@@ -242,8 +242,10 @@ line, never a silent behaviour change:
 - **`argparse`** supports literal specs only (the parser is evaluated at
   conversion time, from the body's top-level statements): `str`/`int`/
   `float`/`FileType(mode)` positionals and `--long` (or `-s`, `--long`)
-  options with `default=`, `store_true`, `action="version"` with
-  `version=`, `help=`, `dest=`, `nargs="+"`/`"*"` on one positional,
+  options with `default=` (evaluated where `add_argument` stood, as in
+  Python; a string default converts as the parser would), `store_true`,
+  `action="version"` with `version=`, `help=`, `dest=`, `nargs="+"`/`"*"`
+  on one positional,
   `prog=`, `description=`, `parse_args(argv)`, with `%(prog)s`/
   `%(default)s` in help and version text; argument consumption is a port
   of CPython's, so help, usage and every error message match byte for

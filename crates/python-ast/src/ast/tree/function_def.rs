@@ -79,9 +79,15 @@ pub(crate) struct ArgparseSpec {
 pub(crate) enum ArgparseDefault {
     Int(i64),
     Float(f64),
-    /// A str option's default: any str expression, rendered at the parse
-    /// site.
+    /// A str option's default given as a string literal, rendered at the
+    /// parse site.
     Str(ExprType),
+    /// A str option's default given as any other expression: the Rust
+    /// local it is bound to WHERE THE add_argument STATEMENT STOOD, as a
+    /// version string is (Python evaluates `default=` when add_argument
+    /// runs, so a name rebound before parse_args does not change it;
+    /// Devin review on #339, round 10).
+    Bound(String),
 }
 
 /// The keywords `argparse.ArgumentParser(...)` may take here. Every
@@ -205,8 +211,8 @@ pub(crate) enum ArgparseKind {
     BinaryFile(String),
     /// `action="version"`: the Rust local holding the version string,
     /// bound where the add_argument statement stood (see
-    /// [`ArgparseRewrite::version_bindings`]) and carried as the spec's
-    /// default at the parse site.
+    /// [`ArgparseRewrite::bindings`]) and carried as the spec's default
+    /// at the parse site.
     Version(String),
 }
 
@@ -225,14 +231,33 @@ pub(crate) struct ArgparseRewrite {
     /// `parse_args(argv)`: the explicit argument list (a `list[str]` or
     /// `list[str] | None` expression); None is sys.argv[1:].
     argv: Option<ExprType>,
-    /// `version=` expressions, each evaluated WHERE ITS add_argument
-    /// STATEMENT STOOD: Python evaluates the string when add_argument
-    /// runs, so a name rebound before parse_args does not change it
-    /// (Devin review on #339, round 2). Each entry is the statement
-    /// index, the Rust local's name and the expression; the callers emit
-    /// `let <name>: String = <expr>` at that index through
-    /// [`lower_argparse_bindings`].
-    version_bindings: Vec<(usize, String, ExprType)>,
+    /// `version=` and non-literal `default=` expressions, each evaluated
+    /// WHERE ITS add_argument STATEMENT STOOD: Python evaluates them when
+    /// add_argument runs, so a name rebound before parse_args does not
+    /// change them (Devin review on #339, rounds 2 and 10). The callers
+    /// emit `let <local>: String = <expr>` at that statement's index
+    /// through [`lower_argparse_bindings`].
+    bindings: Vec<ArgparseBinding>,
+}
+
+/// One expression a skipped add_argument statement leaves bound at its
+/// position (see [`ArgparseRewrite::bindings`]).
+pub(crate) struct ArgparseBinding {
+    /// The statement index in the body.
+    at: usize,
+    /// The Rust local's name.
+    local: String,
+    expr: ExprType,
+    role: BindingRole,
+}
+
+/// What a bound expression is for: the type each accepts differs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BindingRole {
+    /// `version=`: must be a str (CPython's TypeError otherwise).
+    Version,
+    /// A str option's `default=`: any str expression.
+    Default,
 }
 
 fn literal_str(e: &ExprType) -> Option<String> {
@@ -282,19 +307,128 @@ fn literal_float(e: &ExprType) -> Option<f64> {
     }
 }
 
-/// Python's `int(s)` on a string default: surrounding whitespace, a
-/// sign and underscores between digits are accepted.
-fn python_int_of(s: &str) -> Option<i64> {
-    let t = s.trim().replace('_', "");
-    t.parse::<i64>().ok()
+/// A string default converted through `type=` at conversion time, as
+/// the parser would at every run: the value, CPython's ValueError (the
+/// program fails on every run, refused with that message), or a value
+/// CPython accepts that the typed field cannot hold (refused with the
+/// reason). The grammar mirrors the runtime's one authority,
+/// `stdpython::python_int_of` / `python_float_of` (the compiler does not
+/// link the runtime); `string_default_tests` pins both to the same
+/// python3 table.
+enum StringDefault<T> {
+    Value(T),
+    Invalid,
+    Unsupported(&'static str),
 }
 
-/// Python's `float(s)` on a string default.
-fn python_float_of(s: &str) -> Option<f64> {
-    let t = s.trim().replace('_', "");
-    match t.to_ascii_lowercase().trim_start_matches(['+', '-']) {
-        "inf" | "infinity" | "nan" => t.to_ascii_lowercase().replace("infinity", "inf").parse::<f64>().ok(),
-        _ => t.parse::<f64>().ok(),
+/// Python's digit-run grammar, `digit (["_"] digit)*`: ASCII digits with
+/// single underscores BETWEEN digits (`1_000`; never `_1`, `1_`, `1__2`).
+/// Returns the run without underscores and the rest of the input.
+fn python_digitpart(s: &str) -> Option<(String, &str)> {
+    let bytes = s.as_bytes();
+    let mut digits = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_digit() {
+            digits.push(b as char);
+            i += 1;
+        } else if b == b'_' && !digits.is_empty() && bytes.get(i + 1).is_some_and(|n| n.is_ascii_digit()) {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    (!digits.is_empty()).then(|| (digits, &s[i..]))
+}
+
+/// Python's `int(s)` on a string default: surrounding whitespace, a
+/// sign and single underscores between digits are accepted, nothing
+/// else (Devin review on #339, round 10: `_1`, `1_` and `1__2` are
+/// CPython's ValueError). Non-ASCII decimal digits, which CPython
+/// accepts, and values outside i64 are unsupported.
+fn python_int_of(s: &str) -> StringDefault<i64> {
+    if s.chars().any(|c| !c.is_ascii() && c.is_numeric()) {
+        return StringDefault::Unsupported("non-ASCII digits in a string default");
+    }
+    let t = s.trim();
+    let (negative, body) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let Some((digits, rest)) = python_digitpart(body) else {
+        return StringDefault::Invalid;
+    };
+    if !rest.is_empty() {
+        return StringDefault::Invalid;
+    }
+    match digits.parse::<i64>() {
+        Ok(v) => StringDefault::Value(if negative { -v } else { v }),
+        Err(_) => StringDefault::Unsupported("an int outside i64"),
+    }
+}
+
+/// Python's `float(s)` on a string default: whitespace, a sign, then
+/// `inf`/`infinity`/`nan` (any case) or `digitpart? ["." digitpart?]
+/// [("e" | "E") sign? digitpart]` with at least one mantissa digit —
+/// underscores only between digits of one run, as in `int`.
+fn python_float_of(s: &str) -> StringDefault<f64> {
+    if s.chars().any(|c| !c.is_ascii() && c.is_numeric()) {
+        return StringDefault::Unsupported("non-ASCII digits in a string default");
+    }
+    let t = s.trim();
+    let (sign, body) = match t.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", t.strip_prefix('+').unwrap_or(t)),
+    };
+    match body.to_ascii_lowercase().as_str() {
+        "inf" | "infinity" => {
+            return StringDefault::Value(if sign == "-" { f64::NEG_INFINITY } else { f64::INFINITY })
+        }
+        "nan" => return StringDefault::Value(f64::NAN),
+        _ => {}
+    }
+    let mut text = String::from(sign);
+    let mut rest = body;
+    let mut mantissa_digits = false;
+    if let Some((digits, after)) = python_digitpart(rest) {
+        text.push_str(&digits);
+        mantissa_digits = true;
+        rest = after;
+    }
+    if let Some(after) = rest.strip_prefix('.') {
+        text.push('.');
+        rest = after;
+        if let Some((digits, after)) = python_digitpart(rest) {
+            text.push_str(&digits);
+            mantissa_digits = true;
+            rest = after;
+        }
+    }
+    if !mantissa_digits {
+        return StringDefault::Invalid;
+    }
+    if let Some(after) = rest.strip_prefix(['e', 'E']) {
+        text.push('e');
+        let after = match after.strip_prefix('-') {
+            Some(r) => {
+                text.push('-');
+                r
+            }
+            None => after.strip_prefix('+').unwrap_or(after),
+        };
+        let Some((digits, after)) = python_digitpart(after) else {
+            return StringDefault::Invalid;
+        };
+        text.push_str(&digits);
+        rest = after;
+    }
+    if !rest.is_empty() {
+        return StringDefault::Invalid;
+    }
+    match text.parse::<f64>() {
+        Ok(v) => StringDefault::Value(v),
+        Err(_) => StringDefault::Invalid,
     }
 }
 
@@ -416,7 +550,7 @@ pub(crate) fn scan_argparse(
     let mut specs = Vec::new();
     let mut parse: Option<(usize, String)> = None;
     let mut argv: Option<ExprType> = None;
-    let mut version_bindings: Vec<(usize, String, ExprType)> = Vec::new();
+    let mut bindings: Vec<ArgparseBinding> = Vec::new();
     for (i, stmt) in body.iter().enumerate().skip(ctor_index + 1) {
         let call_on_parser = |call: &crate::Call| -> Option<String> {
             let ExprType::Attribute(attr) = call.func.as_ref() else {
@@ -686,8 +820,8 @@ pub(crate) fn scan_argparse(
                         )
                         .into());
                     }
-                    let local = format!("__argparse_version_{}", version_bindings.len());
-                    version_bindings.push((i, local.clone(), v));
+                    let local = format!("__argparse_version_{}", bindings.len());
+                    bindings.push(ArgparseBinding { at: i, local: local.clone(), expr: v, role: BindingRole::Version });
                     ArgparseKind::Version(local)
                 } else if store_true {
                     // A positional store_true is a degenerate CPython shape
@@ -801,14 +935,26 @@ pub(crate) fn scan_argparse(
                     (_, None) => None,
                     (ArgparseKind::Int, Some(e)) => Some(match (literal_int(&e), literal_str(&e)) {
                         (Some(v), _) => ArgparseDefault::Int(v),
-                        (None, Some(text)) => ArgparseDefault::Int(python_int_of(&text).ok_or_else(|| {
-                            format!(
-                                "add_argument('{}'): argument {}: invalid int value: {} (CPython \
-                                 converts a string default through type= at parse time, so this \
-                                 program fails on every run)",
-                                name, name, py_repr_str(&text)
-                            )
-                        })?),
+                        (None, Some(text)) => ArgparseDefault::Int(match python_int_of(&text) {
+                            StringDefault::Value(v) => v,
+                            StringDefault::Invalid => {
+                                return Err(format!(
+                                    "add_argument('{}'): argument {}: invalid int value: {} (CPython \
+                                     converts a string default through type= at parse time, so this \
+                                     program fails on every run)",
+                                    name, name, py_repr_str(&text)
+                                )
+                                .into())
+                            }
+                            StringDefault::Unsupported(why) => {
+                                return Err(format!(
+                                    "add_argument('{}'): default={} is {}, which the i64 field \
+                                     cannot hold",
+                                    name, py_repr_str(&text), why
+                                )
+                                .into())
+                            }
+                        }),
                         (None, None) => {
                             return Err(format!(
                                 "add_argument('{}'): CPython keeps a non-string default as it is \
@@ -830,14 +976,26 @@ pub(crate) fn scan_argparse(
                             )
                             .into())
                         }
-                        (None, None, Some(text)) => ArgparseDefault::Float(python_float_of(&text).ok_or_else(|| {
-                            format!(
-                                "add_argument('{}'): argument {}: invalid float value: {} (CPython \
-                                 converts a string default through type= at parse time, so this \
-                                 program fails on every run)",
-                                name, name, py_repr_str(&text)
-                            )
-                        })?),
+                        (None, None, Some(text)) => ArgparseDefault::Float(match python_float_of(&text) {
+                            StringDefault::Value(v) => v,
+                            StringDefault::Invalid => {
+                                return Err(format!(
+                                    "add_argument('{}'): argument {}: invalid float value: {} (CPython \
+                                     converts a string default through type= at parse time, so this \
+                                     program fails on every run)",
+                                    name, name, py_repr_str(&text)
+                                )
+                                .into())
+                            }
+                            StringDefault::Unsupported(why) => {
+                                return Err(format!(
+                                    "add_argument('{}'): default={} is {}, which the f64 field \
+                                     cannot hold",
+                                    name, py_repr_str(&text), why
+                                )
+                                .into())
+                            }
+                        }),
                         (None, None, None) => {
                             return Err(format!(
                                 "add_argument('{}'): CPython keeps a non-string default as it is \
@@ -848,7 +1006,14 @@ pub(crate) fn scan_argparse(
                             .into())
                         }
                     }),
-                    (_, Some(e)) => Some(ArgparseDefault::Str(e)),
+                    (_, Some(e)) if literal_str(&e).is_some() => Some(ArgparseDefault::Str(e)),
+                    // Any other str expression is evaluated where the
+                    // add_argument stood, as a version string is.
+                    (_, Some(e)) => {
+                        let local = format!("__argparse_default_{}", bindings.len());
+                        bindings.push(ArgparseBinding { at: i, local: local.clone(), expr: e, role: BindingRole::Default });
+                        Some(ArgparseDefault::Bound(local))
+                    }
                 };
                 specs.push(ArgparseSpec {
                     name,
@@ -940,14 +1105,15 @@ pub(crate) fn scan_argparse(
         description,
         specs,
         argv,
-        version_bindings,
+        bindings,
     }))
 }
 
-/// The Rust binding a skipped parser statement leaves behind, if any:
-/// `let <local>: String = <version expr>` for an `action="version"`
-/// add_argument, evaluated at that statement's position. None for every
-/// other skipped statement (they vanish).
+/// The Rust bindings a skipped parser statement leaves behind, if any:
+/// `let <local>: String = <expr>` for an `action="version"` add_argument's
+/// version string and for a str option's non-literal `default=`,
+/// evaluated at that statement's position. None for every other skipped
+/// statement (they vanish).
 pub(crate) fn lower_argparse_bindings(
     rw: &ArgparseRewrite,
     index: usize,
@@ -956,30 +1122,40 @@ pub(crate) fn lower_argparse_bindings(
     symbols: &SymbolTableScopes,
 ) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
     let mut out = TokenStream::new();
-    for (_, local, expr) in rw.version_bindings.iter().filter(|(at, _, _)| *at == index) {
-        let ident = quote::format_ident!("{}", local);
-        // `version=` must be a str: CPython's formatter raises TypeError
-        // (`argument of type 'int' is not iterable`) when `--version`
-        // runs with anything else, so a program whose version action can
-        // never print is refused here; a value the inference cannot type
-        // is bound through `String::from`, which rustc rejects for a
-        // non-string (Devin review on #339, round 4).
-        let inferred = crate::ast::tree::type_ctx::infer_type(Some(ctx), expr, options, symbols);
-        let value = expr
+    for binding in rw.bindings.iter().filter(|b| b.at == index) {
+        let ident = quote::format_ident!("{}", binding.local);
+        let value = binding
+            .expr
             .clone()
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        let bound = match inferred {
-            crate::TypeInfo::String | crate::TypeInfo::StrRef => quote!((#value).to_string()),
-            crate::TypeInfo::PyObject => quote!(String::from(#value)),
-            other => {
-                return Err(format!(
-                    "add_argument(version=...): the version must be a str (CPython raises \
-                     TypeError when --version runs with anything else); this expression is \
-                     a {:?}",
-                    other
-                )
-                .into());
+        let bound = match binding.role {
+            BindingRole::Version => {
+                // `version=` must be a str: CPython's formatter raises
+                // TypeError (`argument of type 'int' is not iterable`) when
+                // `--version` runs with anything else, so a program whose
+                // version action can never print is refused here; a value
+                // the inference cannot type is bound through
+                // `String::from`, which rustc rejects for a non-string
+                // (Devin review on #339, round 4).
+                let inferred =
+                    crate::ast::tree::type_ctx::infer_type(Some(ctx), &binding.expr, options, symbols);
+                match inferred {
+                    crate::TypeInfo::String | crate::TypeInfo::StrRef => quote!((#value).to_string()),
+                    crate::TypeInfo::PyObject => quote!(String::from(#value)),
+                    other => {
+                        return Err(format!(
+                            "add_argument(version=...): the version must be a str (CPython raises \
+                             TypeError when --version runs with anything else); this expression is \
+                             a {:?}",
+                            other
+                        )
+                        .into());
+                    }
+                }
             }
+            // The str field's default, as the parse site rendered it
+            // before round 10.
+            BindingRole::Default => quote!((#value).to_string()),
         };
         out.extend(quote!(let #ident: String = #bound;));
     }
@@ -992,9 +1168,9 @@ pub(crate) fn lower_argparse_bindings(
 /// they sit where the add_argument stood.
 pub(crate) fn argparse_bindings_before(rw: &ArgparseRewrite) -> std::collections::HashMap<usize, Vec<usize>> {
     let mut before: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
-    for (at, _, _) in &rw.version_bindings {
-        let effective = (0..*at).filter(|i| !rw.skip.contains(i)).count();
-        before.entry(effective).or_default().push(*at);
+    for binding in &rw.bindings {
+        let effective = (0..binding.at).filter(|i| !rw.skip.contains(i)).count();
+        before.entry(effective).or_default().push(binding.at);
     }
     before
 }
@@ -1060,6 +1236,10 @@ pub(crate) fn lower_parse_args(
                     .clone()
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                 quote!(Some(argparse::ParsedValue::Str((#d).to_string())))
+            }
+            (_, Some(ArgparseDefault::Bound(local))) => {
+                let local = quote::format_ident!("{}", local);
+                quote!(Some(argparse::ParsedValue::Str(#local.clone())))
             }
         };
         let name = &spec.name;
@@ -5925,4 +6105,65 @@ pub fn body_returns_not_implemented(f: &FunctionDef, symbols: &SymbolTableScopes
             matches!(&s.statement, crate::StatementType::Return(Some(e))
                 if matches!(&e.value, ExprType::Name(n) if n.id == "NotImplemented"))
         })
+}
+
+#[cfg(test)]
+mod string_default_tests {
+    use super::{python_float_of, python_int_of, StringDefault};
+
+    #[test]
+    fn numeric_string_defaults_follow_pythons_underscore_grammar() {
+        // Round 10 of the review on #339: the same python3 3.11 table the
+        // runtime's `numeric_strings_follow_pythons_underscore_grammar`
+        // pins (None = ValueError): single underscores BETWEEN digits only.
+        let table: &[(&str, Option<i64>, Option<f64>)] = &[
+            ("_1", None, None),
+            ("1_", None, None),
+            ("1__2", None, None),
+            ("1_000", Some(1000), Some(1000.0)),
+            (" 1_0 ", Some(10), Some(10.0)),
+            ("+1_0", Some(10), Some(10.0)),
+            ("-1_0", Some(-10), Some(-10.0)),
+            ("1_0_0", Some(100), Some(100.0)),
+            ("0_1", Some(1), Some(1.0)),
+            ("1 0", None, None),
+            ("", None, None),
+            ("1_0.5", None, Some(10.5)),
+            ("1_.0", None, None),
+            ("1__0.5", None, None),
+            ("1e1_0", None, Some(1e10)),
+            ("1_e10", None, None),
+            ("1.5_", None, None),
+            ("_1.5", None, None),
+            (".5", None, Some(0.5)),
+            (".5_1", None, Some(0.51)),
+            ("5.", None, Some(5.0)),
+            ("5._1", None, None),
+            ("1e_1", None, None),
+            ("in_f", None, None),
+            ("inf", None, Some(f64::INFINITY)),
+            ("-Infinity", None, Some(f64::NEG_INFINITY)),
+            ("1_0e-1_0", None, Some(1e-9)),
+            ("1.", None, Some(1.0)),
+            ("-.5e+2", None, Some(-50.0)),
+            ("1e", None, None),
+            ("e1", None, None),
+            ("0x1_0", None, None),
+        ];
+        for (text, int, float) in table {
+            match (python_int_of(text), int) {
+                (StringDefault::Value(v), Some(want)) => assert_eq!(v, *want, "int({:?})", text),
+                (StringDefault::Invalid, None) => {}
+                (_, want) => panic!("int({:?}): python3 gives {:?}", text, want),
+            }
+            match (python_float_of(text), float) {
+                (StringDefault::Value(v), Some(want)) => assert_eq!(v, *want, "float({:?})", text),
+                (StringDefault::Invalid, None) => {}
+                (_, want) => panic!("float({:?}): python3 gives {:?}", text, want),
+            }
+        }
+        assert!(matches!(python_float_of("+nan"), StringDefault::Value(v) if v.is_nan()));
+        assert!(matches!(python_int_of("٣"), StringDefault::Unsupported("non-ASCII digits in a string default")));
+        assert!(matches!(python_int_of("99999999999999999999"), StringDefault::Unsupported("an int outside i64")));
+    }
 }

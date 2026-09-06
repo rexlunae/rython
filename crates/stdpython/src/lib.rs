@@ -1711,16 +1711,151 @@ impl PyBool for &PyStr {
     }
 }
 
+/// What a string is to Python's `int()` / `float()`: the value, a
+/// ValueError (the string is not a number), or a number CPython accepts
+/// that the runtime's `i64`/`f64` cannot hold or read (non-ASCII decimal
+/// digits, an int outside i64) — reported loudly, never as a different
+/// value. The one authority for the numeric-string grammar at runtime:
+/// `int(s)`, `float(s)` and argparse's `type=int`/`type=float` share it
+/// (Devin review on #339, round 10; the converter mirrors it for a
+/// string `default=` converted at conversion time).
+pub enum PyNumberParse<T> {
+    Value(T),
+    Invalid,
+    Unsupported(&'static str),
+}
+
+/// Python's digit-run grammar, `digit (["_"] digit)*`: ASCII digits with
+/// single underscores BETWEEN digits (`1_000`; never `_1`, `1_`, `1__2`).
+/// Returns the run without underscores and the rest of the input.
+fn python_digitpart(s: &str) -> Option<(String, &str)> {
+    let bytes = s.as_bytes();
+    let mut digits = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_digit() {
+            digits.push(b as char);
+            i += 1;
+        } else if b == b'_' && !digits.is_empty() && bytes.get(i + 1).is_some_and(|n| n.is_ascii_digit()) {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    (!digits.is_empty()).then(|| (digits, &s[i..]))
+}
+
+/// Python's `int(s)` (base 10): surrounding whitespace, a sign and single
+/// underscores between digits are accepted, nothing else.
+pub fn python_int_of(s: &str) -> PyNumberParse<i64> {
+    if s.chars().any(|c| !c.is_ascii() && c.is_numeric()) {
+        return PyNumberParse::Unsupported("non-ASCII digits");
+    }
+    let t = s.trim();
+    let (negative, body) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let Some((digits, rest)) = python_digitpart(body) else {
+        return PyNumberParse::Invalid;
+    };
+    if !rest.is_empty() {
+        return PyNumberParse::Invalid;
+    }
+    match digits.parse::<i64>() {
+        Ok(v) => PyNumberParse::Value(if negative { -v } else { v }),
+        Err(_) => PyNumberParse::Unsupported("an int outside i64"),
+    }
+}
+
+/// Python's `float(s)`: whitespace, a sign, then `inf`/`infinity`/`nan`
+/// (any case) or `digitpart? ["." digitpart?] [("e" | "E") sign?
+/// digitpart]` with at least one mantissa digit — underscores only
+/// between the digits of one run, as in `int`.
+pub fn python_float_of(s: &str) -> PyNumberParse<f64> {
+    if s.chars().any(|c| !c.is_ascii() && c.is_numeric()) {
+        return PyNumberParse::Unsupported("non-ASCII digits");
+    }
+    let t = s.trim();
+    let (sign, body) = match t.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", t.strip_prefix('+').unwrap_or(t)),
+    };
+    match body.to_ascii_lowercase().as_str() {
+        "inf" | "infinity" => {
+            return PyNumberParse::Value(if sign == "-" { f64::NEG_INFINITY } else { f64::INFINITY })
+        }
+        "nan" => return PyNumberParse::Value(f64::NAN),
+        _ => {}
+    }
+    let mut text = String::from(sign);
+    let mut rest = body;
+    let mut mantissa_digits = false;
+    if let Some((digits, after)) = python_digitpart(rest) {
+        text.push_str(&digits);
+        mantissa_digits = true;
+        rest = after;
+    }
+    if let Some(after) = rest.strip_prefix('.') {
+        text.push('.');
+        rest = after;
+        if let Some((digits, after)) = python_digitpart(rest) {
+            text.push_str(&digits);
+            mantissa_digits = true;
+            rest = after;
+        }
+    }
+    if !mantissa_digits {
+        return PyNumberParse::Invalid;
+    }
+    if let Some(after) = rest.strip_prefix(['e', 'E']) {
+        text.push('e');
+        let after = match after.strip_prefix('-') {
+            Some(r) => {
+                text.push('-');
+                r
+            }
+            None => after.strip_prefix('+').unwrap_or(after),
+        };
+        let Some((digits, after)) = python_digitpart(after) else {
+            return PyNumberParse::Invalid;
+        };
+        text.push_str(&digits);
+        rest = after;
+    }
+    if !rest.is_empty() {
+        return PyNumberParse::Invalid;
+    }
+    match text.parse::<f64>() {
+        Ok(v) => PyNumberParse::Value(v),
+        Err(_) => PyNumberParse::Invalid,
+    }
+}
+
+/// The loud exception for a numeric string CPython reads and the runtime
+/// cannot (see [`PyNumberParse::Unsupported`]).
+pub fn unsupported_number(callee: &str, s: &str, why: &str) -> PyException {
+    PyException::new(
+        "NotImplementedError",
+        &format!("{}({}): {} are not supported yet", callee, py_str_repr(s), why),
+    )
+}
+
 // PyInt implementations
 impl PyInt for &str {
     fn py_int(self) -> Result<i64, PyException> {
-        // Python strips surrounding whitespace and accepts `_` digit
-        // separators, so int(line) over a file's lines works; Rust's
-        // parse() rejects both.
-        let cleaned = self.trim().replace('_', "");
-        cleaned
-            .parse()
-            .map_err(|_| value_error(&format!("invalid literal for int(): '{}'", self)))
+        // Python's grammar: surrounding whitespace, a sign, single
+        // underscores between digits (`1_000`; `_1`, `1_` and `1__2` are
+        // ValueError), with CPython's message.
+        match python_int_of(self) {
+            PyNumberParse::Value(v) => Ok(v),
+            PyNumberParse::Invalid => Err(value_error(&format!(
+                "invalid literal for int() with base 10: {}",
+                py_str_repr(self)
+            ))),
+            PyNumberParse::Unsupported(why) => Err(unsupported_number("int", self, why)),
+        }
     }
 }
 
@@ -1779,10 +1914,14 @@ impl PyInt for u8 {
 // PyFloat implementations
 impl PyFloat for &str {
     fn py_float(self) -> Result<f64, PyException> {
-        let cleaned = self.trim().replace('_', "");
-        cleaned
-            .parse()
-            .map_err(|_| value_error(&format!("could not convert string to float: '{}'", self)))
+        match python_float_of(self) {
+            PyNumberParse::Value(v) => Ok(v),
+            PyNumberParse::Invalid => Err(value_error(&format!(
+                "could not convert string to float: {}",
+                py_str_repr(self)
+            ))),
+            PyNumberParse::Unsupported(why) => Err(unsupported_number("float", self, why)),
+        }
     }
 }
 
@@ -7097,8 +7236,11 @@ pub fn input<P: AsRef<str>>(prompt: Option<P>) -> Result<String, PyException> {
 
     // input() reads sys.stdin and writes its prompt to sys.stdout — the
     // one object each, closed process-wide by a `FileType("-")` handle's
-    // close(): CPython's closed-file ValueError then (round 6).
-    if stdin_closed() || stdout_closed() {
+    // close(): CPython's closed-file ValueError then (round 6). Without a
+    // prompt nothing is written, so a closed stdout does not matter
+    // (CPython flushes it and clears the error; Devin review on #339,
+    // round 10).
+    if stdin_closed() || (prompt.is_some() && stdout_closed()) {
         return Err(closed_file_error());
     }
     if let Some(p) = prompt {
@@ -7484,10 +7626,10 @@ impl TextReader {
 /// byte`, or an `invalid continuation byte`), or a run (`can't decode
 /// bytes in position 0-1: invalid continuation byte` / `unexpected end
 /// of data`).
+#[cfg(feature = "std")]
 fn utf8_decode_failure(data: &[u8], err: core::str::Utf8Error) -> PyException {
     let start = err.valid_up_to();
     let (end, reason) = match err.error_len() {
-#[cfg(feature = "std")]
         None => (data.len() - 1, "unexpected end of data"),
         Some(n) => (
             start + n - 1,
@@ -7517,19 +7659,19 @@ fn utf8_decode_failure(data: &[u8], err: core::str::Utf8Error) -> PyException {
 }
 
 /// Decode with `final=True`: an incomplete trailing sequence is an error.
+#[cfg(feature = "std")]
 fn decode_utf8_final(data: &[u8]) -> Result<String, PyException> {
     core::str::from_utf8(data)
         .map(str::to_string)
-#[cfg(feature = "std")]
         .map_err(|e| utf8_decode_failure(data, e))
 }
 
 /// Decode with `final=False`: an incomplete trailing sequence is returned
 /// as the pending tail rather than an error.
+#[cfg(feature = "std")]
 fn decode_utf8_partial(data: &[u8]) -> Result<(String, alloc::vec::Vec<u8>), PyException> {
     match core::str::from_utf8(data) {
         Ok(text) => Ok((text.to_string(), alloc::vec::Vec::new())),
-#[cfg(feature = "std")]
         Err(e) if e.error_len().is_none() => {
             let valid = e.valid_up_to();
             Ok((

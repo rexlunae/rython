@@ -621,21 +621,25 @@ fn convert(
 ) -> ParsedValue {
     match spec.kind {
         ArgKind::Untyped | ArgKind::Str => ParsedValue::Str(raw.to_string()),
-        ArgKind::Int => match raw.parse::<i64>() {
-            Ok(i) => ParsedValue::Int(i),
-            Err(_) => exit_error(
+        // `type=int` / `type=float` are the builtins: Python's numeric-string
+        // grammar (`1_0` is 10, `1__0` is not), the runtime's one authority.
+        ArgKind::Int => match crate::python_int_of(raw) {
+            crate::PyNumberParse::Value(i) => ParsedValue::Int(i),
+            crate::PyNumberParse::Invalid => exit_error(
                 prog,
                 specs,
-                &format!("argument {}: invalid int value: '{}'", spec.action_name(), raw),
+                &format!("argument {}: invalid int value: {}", spec.action_name(), py_repr(raw)),
             ),
+            crate::PyNumberParse::Unsupported(why) => loud_exit(&crate::unsupported_number("int", raw, why)),
         },
-        ArgKind::Float => match raw.parse::<f64>() {
-            Ok(f) => ParsedValue::Float(f),
-            Err(_) => exit_error(
+        ArgKind::Float => match crate::python_float_of(raw) {
+            crate::PyNumberParse::Value(f) => ParsedValue::Float(f),
+            crate::PyNumberParse::Invalid => exit_error(
                 prog,
                 specs,
-                &format!("argument {}: invalid float value: '{}'", spec.action_name(), raw),
+                &format!("argument {}: invalid float value: {}", spec.action_name(), py_repr(raw)),
             ),
+            crate::PyNumberParse::Unsupported(why) => loud_exit(&crate::unsupported_number("float", raw, why)),
         },
         ArgKind::StoreTrue | ArgKind::Version => ParsedValue::Flag(true),
         // Python opens the file at parse time and reports a failure as an
