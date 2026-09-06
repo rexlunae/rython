@@ -10311,7 +10311,7 @@ fn a_cyclic_import_of_a_name_bound_later_raises_import_error_like_python() {
     );
     let b = fs::read_to_string(krate.root.join("src/b.rs")).unwrap();
     assert!(
-        b.contains("crate::a::__rython_bound__(1usize, \"X\", \"fut.a\")?;"),
+        b.contains("crate::a::__rython_bound__(0usize, 2u32, \"X\", \"fut.a\")?;"),
         "b's import checks a's binding of X: {}",
         b
     );
@@ -10375,7 +10375,7 @@ fn a_root_cycle_of_a_name_bound_later_raises_import_error_like_python() {
     let helper = fs::read_to_string(krate.root.join("src/helper.rs")).unwrap();
     assert!(
         helper.contains("crate::__rython_root::__module_init__()?;")
-            && helper.contains("crate::__rython_root::__rython_bound__(1usize, \"NAME\", \"rootcyc\")?;"),
+            && helper.contains("crate::__rython_root::__rython_bound__(0usize, 2u32, \"NAME\", \"rootcyc\")?;"),
         "helper runs and checks the root: {}",
         helper
     );
@@ -10385,6 +10385,219 @@ fn a_root_cycle_of_a_name_bound_later_raises_import_error_like_python() {
     assert_eq!(
         run_package(&krate, "rootcyc"),
         vec!["helper caught", "root end hi", "main pkg"]
+    );
+}
+
+#[test]
+fn a_binding_nested_before_a_nested_cyclic_import_is_bound_when_the_importer_asks() {
+    // Inside a's import guard, `from .c import c_value` runs before `from
+    // .b import b_value`; b asks a for c_value during a's initialization
+    // and Python finds it bound. Each binding statement records its own
+    // mark where it runs — nested ones too — so the check reads the
+    // statement, not its enclosing top-level one (Devin review on #338,
+    // round 8). A nested import's hoisted `use` is a re-export like a
+    // top-level one, which is what lets b import c_value from a.
+    let scratch = Scratch::new("guardcyc");
+    let krate = package_crate(
+        &scratch,
+        "guardcyc",
+        &[
+            (
+                "a.py",
+                concat!(
+                    "print(\"a start\")\n",
+                    "try:\n",
+                    "    from .c import c_value\n",
+                    "    from .b import b_value\n",
+                    "except ImportError:\n",
+                    "    pass\n",
+                    "LATE = 2\n",
+                ),
+            ),
+            (
+                "b.py",
+                "from .a import c_value\n\n\ndef b_value() -> int:\n    return c_value() + 1\n",
+            ),
+            ("c.py", "def c_value() -> int:\n    return 1\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from .a import b_value\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\", b_value())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let a = fs::read_to_string(krate.root.join("src/a.rs")).unwrap();
+    let c_import = a.find("crate::c::__module_init__()?;").expect("c's init call");
+    let c_bound = a.find("__rython_bind__(0usize, 1u32);").expect("c_value's mark");
+    let b_import = a.find("crate::b::__module_init__()?;").expect("b's init call");
+    assert!(c_import < c_bound && c_bound < b_import, "c_value is bound before b runs: {}", a);
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "guardcyc"), vec!["a start", "main 2"]);
+}
+
+#[test]
+fn an_untaken_conditional_binding_is_unbound_when_a_cyclic_importer_asks() {
+    // a's `from .c import c_value` sits under a condition that is false;
+    // b, imported by a afterwards, asks a for c_value during a's
+    // initialization: Python raises ImportError (b catches it). The
+    // binding's mark is set only where its statement runs, so the untaken
+    // branch leaves it unset (Devin review on #338, round 8). After a's
+    // body completes, the hoisted `use` answers for the name — the
+    // static-import divergence the -W warning names.
+    let scratch = Scratch::new("untaken");
+    let krate = package_crate(
+        &scratch,
+        "untaken",
+        &[
+            (
+                "a.py",
+                concat!(
+                    "print(\"a start\")\n",
+                    "if len(\"x\") == 2:\n",
+                    "    from .c import c_value\n",
+                    "from .b import b_value\n",
+                    "print(\"a end\", b_value())\n",
+                ),
+            ),
+            (
+                "b.py",
+                concat!(
+                    "try:\n",
+                    "    from .a import c_value\n",
+                    "    print(\"b sees\", c_value())\n",
+                    "except Exception:\n",
+                    "    print(\"b caught\")\n",
+                    "\n",
+                    "\n",
+                    "def b_value() -> int:\n",
+                    "    return 3\n",
+                ),
+            ),
+            ("c.py", "def c_value() -> int:\n    return 1\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from .a import b_value\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\", b_value())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "untaken"),
+        vec!["a start", "b caught", "a end 3", "main 3"]
+    );
+}
+
+#[test]
+fn a_walrus_in_the_package_is_its_attribute_before_the_same_named_submodule() {
+    // conf/__init__.py binds `settings` with a walrus; `from .conf import
+    // settings` therefore finds the package attribute and never runs the
+    // submodule conf/settings.py (Devin review on #338, round 8).
+    let scratch = Scratch::new("walruspkg");
+    fs::create_dir_all(scratch.path().join("walruspkg").join("conf")).unwrap();
+    let krate = package_crate(
+        &scratch,
+        "walruspkg",
+        &[
+            (
+                "conf/__init__.py",
+                "if (settings := 3) > 2:\n    print(\"conf walrus\", settings)\n",
+            ),
+            ("conf/settings.py", "print(\"settings body\")\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from .conf import settings\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\")\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let cli = fs::read_to_string(krate.root.join("src/cli.rs")).unwrap();
+    assert!(
+        cli.contains("crate::conf::__module_init__()?;")
+            && !cli.contains("conf::settings::__module_init__"),
+        "the package binds settings; the submodule never loads: {}",
+        cli
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "walruspkg"), vec!["conf walrus 3", "main"]);
+}
+
+#[test]
+fn a_self_import_of_a_name_bound_later_raises_import_error_like_python() {
+    // a imports X from itself before binding it: Python finds the
+    // partially initialized a without X and raises ImportError. The
+    // current module is checked like any other (Devin review on #338,
+    // round 8); the `use` itself is dropped with the existing warning.
+    // The self-import is not a's binding of X (a package's own `from .
+    // import name` binds the submodule): the check reads `X = 1`'s mark.
+    let scratch = Scratch::new("selfpkg");
+    let krate = package_crate(
+        &scratch,
+        "selfpkg",
+        &[
+            ("a.py", "print(\"a start\")\nfrom .a import X\nX = 1\n"),
+            (
+                "cli.py",
+                concat!(
+                    "def load() -> int:\n",
+                    "    from .a import X\n",
+                    "    return X\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    try:\n",
+                    "        print(load())\n",
+                    "    except Exception as e:\n",
+                    "        print(\"caught\", e)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let a = fs::read_to_string(krate.root.join("src/a.rs")).unwrap();
+    assert!(
+        a.contains("crate::a::__rython_bound__(0usize, 2u32, \"X\", \"selfpkg.a\")?;"),
+        "a checks its own binding of X: {}",
+        a
+    );
+    // Verified against python3 (the message there ends with a's path).
+    assert_eq!(
+        run_package(&krate, "selfpkg"),
+        vec![
+            "a start",
+            "caught cannot import name 'X' from partially initialized module 'selfpkg.a' \
+             (most likely due to a circular import)"
+        ]
     );
 }
 

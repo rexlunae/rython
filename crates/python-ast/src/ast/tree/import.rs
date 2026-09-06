@@ -555,57 +555,144 @@ pub(crate) fn imported_crate_modules(
 
 /// Where a crate module binds a name in its own body: the package
 /// attribute a `from package import name` finds before falling back to
-/// the submodule `package.name`, and the point in the body at which a
-/// cyclic importer may read it.
+/// the submodule `package.name`, and the mark a cyclic importer asks
+/// about.
 pub(crate) struct ModuleBinding {
-    /// The index of the first top-level statement that binds the name.
-    pub index: usize,
+    /// The binding statement's mark (see [`BindingMarks`]).
+    pub mark: usize,
     /// The binding sits under module-level control flow (an `if`, a
     /// `try`), so Python binds the name only when that branch runs.
     pub conditional: bool,
 }
 
-/// Whether one statement itself binds `name`: a def, a class, a store,
-/// an import alias. A bare annotation (`name: int`) binds only
-/// `__annotations__`, never `name` (Devin review on #338, round 6).
-fn stmt_binds(s: &crate::Statement, name: &str) -> bool {
-    use crate::ast::tree::visit::{stmt_targets, target_names};
+/// The module-scope names one statement binds: a def or class name, an
+/// import alias, a store's targets (an assignment, a loop or `with`
+/// target), a walrus in the statement's own expressions (a lambda's body
+/// is its own scope; a comprehension's walrus binds here). A bare
+/// annotation (`name: int`) binds only `__annotations__`, never `name`
+/// (Devin review on #338, rounds 6 and 8).
+fn stmt_bound_names(s: &crate::Statement) -> Vec<String> {
+    use crate::ast::tree::visit::{any_expr_for, stmt_exprs, stmt_targets, target_names, Descend};
+    let mut names: Vec<String> = Vec::new();
     match &s.statement {
         crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
-            f.name == name
+            names.push(f.name.clone());
         }
-        crate::StatementType::ClassDef(c) => c.name == name,
-        crate::StatementType::AnnotatedName { .. } => false,
-        crate::StatementType::Import(i) => i.names.iter().any(|a| {
-            a.asname.as_deref().unwrap_or_else(|| a.name.split('.').next().unwrap_or(&a.name))
-                == name
-        }),
-        crate::StatementType::ImportFrom(i) => i
-            .names
+        crate::StatementType::ClassDef(c) => names.push(c.name.clone()),
+        crate::StatementType::Import(i) => names.extend(i.names.iter().map(|a| {
+            a.asname
+                .clone()
+                .unwrap_or_else(|| a.name.split('.').next().unwrap_or(&a.name).to_string())
+        })),
+        crate::StatementType::ImportFrom(i) => names.extend(
+            i.names
+                .iter()
+                .map(|a| a.asname.clone().unwrap_or_else(|| a.name.clone())),
+        ),
+        _ => {}
+    }
+    for t in stmt_targets(s) {
+        names.extend(target_names(t).into_iter().map(str::to_string));
+    }
+    for e in stmt_exprs(s) {
+        any_expr_for(e, Descend::OwnScope, |x| {
+            if let crate::ExprType::NamedExpr(ne) = x {
+                names.extend(target_names(&ne.left).into_iter().map(str::to_string));
+            }
+            false
+        });
+    }
+    names
+}
+
+/// Whether one statement itself binds `name` at module scope.
+fn stmt_binds(s: &crate::Statement, name: &str) -> bool {
+    stmt_bound_names(s).iter().any(|n| n == name)
+}
+
+/// A module body's binding statements — every statement that binds a
+/// module-scope name, under module-level control flow too, a def's own
+/// body excluded — in source order, each with whether it is a top-level
+/// statement of the body. A statement's index here is its MARK: one bit
+/// of the module's `__RYTHON_BOUND` words, set where the statement runs
+/// (after its init code), which is what a cyclic importer's bound check
+/// reads (Devin review on #338, round 8). A loop or `with` target counts
+/// as bound when its statement completes.
+fn binding_statements(body: &[crate::Statement]) -> Vec<(&crate::Statement, bool)> {
+    use crate::ast::tree::visit::{walk_stmts, Descend, Flow};
+    let mut out: Vec<(&crate::Statement, bool)> = Vec::new();
+    walk_stmts(body, Descend::SkipDefs, &mut |s| {
+        if !stmt_bound_names(s).is_empty() {
+            let top_level = body.iter().any(|top| std::ptr::eq(top, s));
+            out.push((s, top_level));
+        }
+        Flow::Continue
+    });
+    out
+}
+
+/// The marks of a module body by source position (see
+/// [`binding_statements`]): what the module emission and the nested
+/// statement lowering consult to record a binding where it runs.
+pub(crate) struct BindingMarks {
+    /// `(mark, top_level)` by `(lineno, col_offset)`.
+    pub by_pos: std::collections::HashMap<(usize, usize), (usize, bool)>,
+    /// How many marks the body has (the size of the bound bitmap).
+    pub count: usize,
+}
+
+/// The bits of one `__RYTHON_BOUND` word: `AtomicU32`, which every
+/// target with atomics has (the no_std tier included).
+pub(crate) const BOUND_WORD_BITS: usize = 32;
+
+impl BindingMarks {
+    pub(crate) fn of(body: &[crate::Statement]) -> Self {
+        let stmts = binding_statements(body);
+        let by_pos = stmts
             .iter()
-            .any(|a| a.asname.as_deref().unwrap_or(&a.name) == name),
-        _ => stmt_targets(s)
-            .into_iter()
-            .any(|t| target_names(t).contains(&name)),
+            .enumerate()
+            .filter_map(|(mark, (s, top_level))| {
+                Some(((s.lineno?, s.col_offset?), (mark, *top_level)))
+            })
+            .collect();
+        Self { by_pos, count: stmts.len() }
+    }
+
+    /// The `__rython_bind__` call recording that the statement at `pos`
+    /// has run, when it is a binding statement.
+    pub(crate) fn bind_call(&self, pos: (usize, usize)) -> Option<TokenStream> {
+        let (mark, _) = self.by_pos.get(&pos)?;
+        let (word, mask) = bound_word_and_mask(*mark);
+        Some(quote!(__rython_bind__(#word, #mask);))
     }
 }
 
+/// The word index and bit mask of a mark in the bound bitmap.
+pub(crate) fn bound_word_and_mask(mark: usize) -> (usize, u32) {
+    (mark / BOUND_WORD_BITS, 1u32 << (mark % BOUND_WORD_BITS))
+}
+
 /// The first binding of `name` in the body of the crate module at `key`
-/// (a def's locals excluded): its top-level statement, and whether it is
-/// unconditional there or nested under module-level control flow.
+/// (a def's locals excluded): its mark, and whether it is unconditional
+/// (a top-level statement) or nested under module-level control flow.
+/// A package's own `from . import name` binds the SUBMODULE — it is the
+/// submodule import, not an attribute the package has before it — so it
+/// never counts (the entry's `from . import helper` in its `__init__`).
 fn module_binding(options: &PythonOptions, key: &[String], name: &str) -> Option<ModuleBinding> {
-    use crate::ast::tree::visit::{any_stmt, Descend};
     let module = options.module_defs.get(key)?;
     let module: &crate::Module = module;
-    module.raw.body.iter().enumerate().find_map(|(index, s)| {
-        if stmt_binds(s, name) {
-            Some(ModuleBinding { index, conditional: false })
-        } else if any_stmt(std::slice::from_ref(s), Descend::SkipDefs, |n| stmt_binds(n, name)) {
-            Some(ModuleBinding { index, conditional: true })
-        } else {
-            None
+    let ctx = crate::ast::tree::module::defining_module_context(options, key);
+    let imports_own_submodule = |s: &crate::Statement| match &s.statement {
+        crate::StatementType::ImportFrom(i) => {
+            crate::module_defs_key(options, &i.resolved_module_path(&ctx)) == Some(key)
         }
-    })
+        _ => false,
+    };
+    let stmts = binding_statements(&module.raw.body);
+    let mark = stmts
+        .iter()
+        .position(|(s, _)| stmt_binds(s, name) && !imports_own_submodule(s))?;
+    Some(ModuleBinding { mark, conditional: !stmts[mark].1 })
 }
 
 /// The bound checks a `from package import name` makes after the
@@ -615,11 +702,11 @@ fn module_binding(options: &PythonOptions, key: &[String], name: &str) -> Option
 /// (`cannot import name ... from partially initialized module ...`)
 /// where the generated static would hand out its eventual value (Devin
 /// review on #338, round 6). Each module's `__rython_bound__` answers
-/// from its init progress; a fully initialized module answers yes. The
-/// package root (`from . import name`) is checked through
-/// [`ROOT_INIT_MODULE`] like any module: its body runs first for the
-/// binary, but a sibling it imports asks while that body is still
-/// running.
+/// from its bound bitmap — the binding statement's bit, set where that
+/// statement ran (round 8) — and a fully initialized module answers
+/// yes. The package root (`from . import name`) is checked through
+/// [`ROOT_INIT_MODULE`] like any module, and so is the current module
+/// (a self-import during its own initialization is the same cycle).
 pub(crate) fn import_site_bound_checks(
     stmt: &crate::StatementType,
     options: &PythonOptions,
@@ -631,9 +718,6 @@ pub(crate) fn import_site_bound_checks(
     let Some(key) = crate::module_defs_key(options, &base) else {
         return quote!();
     };
-    if key == options.this_module_path.as_slice() {
-        return quote!();
-    }
     let segs: Vec<_> = init_module_path(key)
         .iter()
         .map(|s| crate::safe_ident(s))
@@ -645,9 +729,9 @@ pub(crate) fn import_site_bound_checks(
         .join(".");
     let checks = i.names.iter().filter_map(|a| {
         let binding = module_binding(options, key, &a.name)?;
-        let index = binding.index;
+        let (word, mask) = bound_word_and_mask(binding.mark);
         let name = a.name.as_str();
-        Some(quote!(crate::#(#segs::)*__rython_bound__(#index, #name, #qualified)?;))
+        Some(quote!(crate::#(#segs::)*__rython_bound__(#word, #mask, #name, #qualified)?;))
     });
     quote!(#(#checks)*)
 }
@@ -687,11 +771,7 @@ pub(crate) fn import_site_init(
     stmt: &crate::StatementType,
     options: &PythonOptions,
 ) -> TokenStream {
-    let loaded = imported_crate_modules(stmt, options);
-    if loaded.is_empty() {
-        return quote!();
-    }
-    let calls = module_init_calls(&loaded);
+    let calls = module_init_calls(&imported_crate_modules(stmt, options));
     let checks = import_site_bound_checks(stmt, options);
     quote!(#calls #checks)
 }

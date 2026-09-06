@@ -71,9 +71,28 @@ impl CodeGen for Statement {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let (lineno, col_offset) = (self.lineno, self.col_offset);
         let (end_lineno, end_col_offset) = (self.end_lineno, self.end_col_offset);
+        // A binding statement nested in module-level control flow records
+        // its mark where it runs (`__rython_bind__`), so a cyclic importer
+        // can ask whether the name is bound yet; the module emission
+        // records the top-level ones (Devin review on #338, round 8).
+        let bind = match (options.in_module_init_body, lineno, col_offset) {
+            (true, Some(line), Some(col)) => options
+                .init_binding_marks
+                .get(&(line, col))
+                .filter(|(_, top_level)| !top_level)
+                .map(|(mark, _)| {
+                    let (word, mask) = crate::ast::tree::import::bound_word_and_mask(*mark);
+                    quote!(__rython_bind__(#word, #mask);)
+                }),
+            _ => None,
+        };
         let result = self.statement
             .clone()
             .to_rust(ctx, options, symbols)
+            .map(|tokens| match bind {
+                Some(bind) => quote!(#tokens #bind),
+                None => tokens,
+            })
             .map_err(|e| {
                 let location = crate::SourceLocation::with_span(
                     "<module>",

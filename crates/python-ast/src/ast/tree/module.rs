@@ -987,14 +987,24 @@ impl CodeGen for Module {
         // body that raises in such a module cannot run again faithfully —
         // the module stays failed (Devin review on #338).
         let mut init_touches_statics = false;
-        // Where each body statement's init code starts: the init records
-        // its progress (the index of the statement about to run) before
-        // that code, so a cyclic importer can tell which names the body
-        // has bound so far (`__rython_bound__`; Devin review on #338,
-        // round 6).
-        let mut progress_marks: Vec<(usize, usize)> = Vec::new();
+        // The body's binding marks: each binding statement records its
+        // mark (`__rython_bind__`) right after its init code, so a cyclic
+        // importer can ask which names the body has bound so far
+        // (`__rython_bound__`; Devin review on #338, rounds 6 and 8). A
+        // nested statement records its own where it runs (statement.rs,
+        // with `in_module_init_body`); a top-level one's call is inserted
+        // at the end of its init range below.
+        let binding_marks = crate::ast::tree::import::BindingMarks::of(&self.raw.body);
+        let mut options = options;
+        options.init_binding_marks = std::rc::Rc::new(binding_marks.by_pos.clone());
+        let mut top_level_binds: Vec<(Option<TokenStream>, usize)> = Vec::new();
         for (stmt_index, s) in self.raw.body.into_iter().enumerate() {
-            progress_marks.push((stmt_index, module_init_stmts.len()));
+            top_level_binds.push((
+                s.lineno
+                    .zip(s.col_offset)
+                    .and_then(|pos| binding_marks.bind_call(pos)),
+                module_init_stmts.len(),
+            ));
             match &s.statement {
                 crate::StatementType::FunctionDef(f)
                 | crate::StatementType::AsyncFunctionDef(f) => {
@@ -1931,6 +1941,7 @@ impl CodeGen for Module {
                             o.in_module_init_body = true;
                             o
                         };
+                        let body_pos = body_stmt.lineno.zip(body_stmt.col_offset);
                         let body_tokens = body_stmt
                             .to_rust(ctx.clone(), body_options, symbols.clone())
                             .map_err(|e| wrap_module_error(&module_filename, e))?;
@@ -1941,6 +1952,13 @@ impl CodeGen for Module {
                                 module_init_stmts.push(body_tokens);
                                 has_module_init_code = true;
                             }
+                        }
+                        // The flattened statement binds where Python runs
+                        // it: its mark, after its init code (the nested
+                        // lowering records marks only under a lowered
+                        // control-flow statement).
+                        if let Some(bind) = body_pos.and_then(|pos| binding_marks.bind_call(pos)) {
+                            module_init_stmts.push(bind);
                         }
                     }
                     continue;
@@ -2064,31 +2082,23 @@ impl CodeGen for Module {
             }
         }
 
-        // The progress stores, before each statement's init code (a
-        // statement with none — a def, a class — needs no store: the next
-        // one's index counts it as done).
+        // Each top-level binding statement's `__rython_bind__`, at the end
+        // of its init range (a def or class has none: the call sits at
+        // its position, where Python binds the name).
         {
-            let ends = progress_marks
+            let ends: Vec<usize> = top_level_binds
                 .iter()
                 .skip(1)
                 .map(|(_, at)| *at)
-                .chain(std::iter::once(module_init_stmts.len()));
-            let stores: Vec<(usize, usize)> = progress_marks
-                .iter()
-                .zip(ends)
-                .filter(|((_, start), end)| end > start)
-                .map(|((index, start), _)| (*index, *start))
+                .chain(std::iter::once(module_init_stmts.len()))
                 .collect();
-            for (index, at) in stores.into_iter().rev() {
-                module_init_stmts.insert(
-                    at,
-                    quote! {
-                        __RYTHON_INIT_PROGRESS.store(
-                            #index,
-                            ::core::sync::atomic::Ordering::Release,
-                        )
-                    },
-                );
+            let binds: Vec<(TokenStream, usize)> = top_level_binds
+                .into_iter()
+                .zip(ends)
+                .filter_map(|((bind, _), end)| bind.map(|b| (b, end)))
+                .collect();
+            for (bind, at) in binds.into_iter().rev() {
+                module_init_stmts.insert(at, bind);
             }
         }
 
@@ -2225,24 +2235,38 @@ impl CodeGen for Module {
                     __rython_init_guard.finish(__rython_init_result.clone());
                 }
             };
-            // The body's progress: the index of the statement it is about
-            // to run, `usize::MAX` once done. A cyclic importer's `from
-            // .this import name` asks `__rython_bound__` whether the
-            // statement binding `name` has run; Python raises ImportError
-            // for a name the partially initialized module has not bound
-            // yet (Devin review on #338, round 6).
+            // The body's bound bitmap: one bit per binding statement
+            // (`BindingMarks`), set where the statement ran; a cyclic
+            // importer's `from .this import name` asks `__rython_bound__`
+            // whether the statement binding `name` has run, and Python
+            // raises ImportError for a name the partially initialized
+            // module has not bound yet (Devin review on #338, rounds 6
+            // and 8). A completed body answers yes for every name.
+            let words = binding_marks.count.div_ceil(crate::ast::tree::import::BOUND_WORD_BITS).max(1);
+            let word_inits = (0..words).map(|_| quote!(::core::sync::atomic::AtomicU32::new(0)));
             stream.extend(quote! {
                 #[allow(dead_code)]
-                pub(crate) static __RYTHON_INIT_PROGRESS: ::core::sync::atomic::AtomicUsize =
-                    ::core::sync::atomic::AtomicUsize::new(0);
+                pub(crate) static __RYTHON_BOUND: [::core::sync::atomic::AtomicU32; #words] =
+                    [#(#word_inits),*];
+                #[allow(dead_code)]
+                pub(crate) static __RYTHON_INIT_DONE: ::core::sync::atomic::AtomicBool =
+                    ::core::sync::atomic::AtomicBool::new(false);
+                #[allow(dead_code)]
+                fn __rython_bind__(__rython_word: usize, __rython_mask: u32) {
+                    __RYTHON_BOUND[__rython_word]
+                        .fetch_or(__rython_mask, ::core::sync::atomic::Ordering::Release);
+                }
                 #[allow(dead_code)]
                 pub(crate) fn __rython_bound__(
-                    __rython_stmt: usize,
+                    __rython_word: usize,
+                    __rython_mask: u32,
                     __rython_name: &str,
                     __rython_module: &str,
                 ) -> Result<(), PyException> {
-                    if __RYTHON_INIT_PROGRESS.load(::core::sync::atomic::Ordering::Acquire)
-                        > __rython_stmt
+                    if __RYTHON_INIT_DONE.load(::core::sync::atomic::Ordering::Acquire)
+                        || __RYTHON_BOUND[__rython_word].load(::core::sync::atomic::Ordering::Acquire)
+                            & __rython_mask
+                            != 0
                     {
                         Ok(())
                     } else {
@@ -2260,14 +2284,14 @@ impl CodeGen for Module {
                 pub(crate) fn __module_init__() -> Result<(), PyException> {
                     #guard_enter
                     // A retried body starts from no bound names: the
-                    // previous attempt's progress must not answer for it.
-                    __RYTHON_INIT_PROGRESS.store(0, ::core::sync::atomic::Ordering::Release);
+                    // previous attempt's bits must not answer for it.
+                    __RYTHON_INIT_DONE.store(false, ::core::sync::atomic::Ordering::Release);
+                    for __rython_word in __RYTHON_BOUND.iter() {
+                        __rython_word.store(0, ::core::sync::atomic::Ordering::Release);
+                    }
                     let __rython_init_result = (|| -> Result<(), PyException> {
                         #(#module_init_stmts;)*
-                        __RYTHON_INIT_PROGRESS.store(
-                            usize::MAX,
-                            ::core::sync::atomic::Ordering::Release,
-                        );
+                        __RYTHON_INIT_DONE.store(true, ::core::sync::atomic::Ordering::Release);
                         Ok(())
                     })();
                     #guard_leave
@@ -4529,7 +4553,24 @@ fn module_reexports_item(
     };
     let module: &crate::Module = module;
     use crate::StatementType as ST;
-    for s in &module.raw.body {
+    // Every module-scope import, the ones under module-level control flow
+    // included: the module emission hoists a nested import's `use` to
+    // module scope, so it is a re-export like a top-level one (a
+    // TYPE_CHECKING block is compile-time only; Devin review on #338,
+    // round 8).
+    let mut imports: Vec<&crate::Statement> = Vec::new();
+    walk_stmts(&module.raw.body, Descend::SkipDefs, &mut |s| {
+        if let ST::If(i) = &s.statement
+            && Module::is_type_checking_test(&i.test)
+        {
+            return Flow::Skip;
+        }
+        if matches!(&s.statement, ST::Import(_) | ST::ImportFrom(_)) {
+            imports.push(s);
+        }
+        Flow::Continue
+    });
+    for s in imports {
         // A plain `import json` binding the name (requests' compat.py
         // re-exports stdlib json): the name resolves through the
         // stdpython glob, so the re-export has a runtime item.

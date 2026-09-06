@@ -596,6 +596,14 @@ pub struct PythonOptions {
     /// (the module body) there, conditionally (Devin review on #338).
     pub in_module_init_body: bool,
 
+    /// The current module's binding marks (see `import::BindingMarks`):
+    /// each module-scope binding statement's `(mark, top_level)` by its
+    /// source position. A nested statement lowered with
+    /// `in_module_init_body` records its mark where it runs
+    /// (`__rython_bind__`), so a cyclic importer can ask which names the
+    /// body has bound (Devin review on #338, round 8).
+    pub init_binding_marks: std::rc::Rc<std::collections::HashMap<(usize, usize), (usize, bool)>>,
+
     /// Set on the ENTRY module by the converter when the package root
     /// `__init__` has a body the binary must run: the bin-side module that
     /// carries it (`__rython_root`), whose `__module_init__` the entry's
@@ -712,6 +720,7 @@ impl Default for PythonOptions {
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),
             module_defs: std::rc::Rc::new(std::collections::HashMap::new()),
             in_module_init_body: false,
+            init_binding_marks: std::rc::Rc::new(std::collections::HashMap::new()),
             root_init_module: None,
             cross_module_mut_self: std::rc::Rc::new(std::cell::RefCell::new(
                 CrossModuleMutSelf::Uncomputed,
