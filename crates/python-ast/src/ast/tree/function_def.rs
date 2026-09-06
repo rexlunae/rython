@@ -362,8 +362,11 @@ fn python_int_of(s: &str) -> StringDefault<i64> {
     if !rest.is_empty() {
         return StringDefault::Invalid;
     }
-    match digits.parse::<i64>() {
-        Ok(v) => StringDefault::Value(if negative { -v } else { v }),
+    // Parsed with its sign, so i64::MIN (whose magnitude is not an i64)
+    // is read as CPython reads it (Devin review on #339, round 11).
+    let signed = if negative { format!("-{}", digits) } else { digits };
+    match signed.parse::<i64>() {
+        Ok(v) => StringDefault::Value(v),
         Err(_) => StringDefault::Unsupported("an int outside i64"),
     }
 }
@@ -385,7 +388,9 @@ fn python_float_of(s: &str) -> StringDefault<f64> {
         "inf" | "infinity" => {
             return StringDefault::Value(if sign == "-" { f64::NEG_INFINITY } else { f64::INFINITY })
         }
-        "nan" => return StringDefault::Value(f64::NAN),
+        // The sign survives on a nan as it does in CPython (`float("-nan")`
+        // has its sign bit set; `math.copysign(1.0, x)` is -1.0).
+        "nan" => return StringDefault::Value(if sign == "-" { -f64::NAN } else { f64::NAN }),
         _ => {}
     }
     let mut text = String::from(sign);
@@ -1223,7 +1228,8 @@ pub(crate) fn lower_parse_args(
             (_, Some(ArgparseDefault::Int(v))) => quote!(Some(argparse::ParsedValue::Int(#v))),
             (_, Some(ArgparseDefault::Float(v))) => {
                 let lit = if v.is_nan() {
-                    quote!(f64::NAN)
+                    // The sign survives (`default="-nan"`; round 11).
+                    if v.is_sign_negative() { quote!(-f64::NAN) } else { quote!(f64::NAN) }
                 } else if v.is_infinite() {
                     if *v > 0.0 { quote!(f64::INFINITY) } else { quote!(f64::NEG_INFINITY) }
                 } else {
@@ -6149,6 +6155,8 @@ mod string_default_tests {
             ("1e", None, None),
             ("e1", None, None),
             ("0x1_0", None, None),
+            ("-9223372036854775808", Some(i64::MIN), Some(-9223372036854775808.0)),
+            ("9223372036854775807", Some(i64::MAX), Some(9223372036854775807.0)),
         ];
         for (text, int, float) in table {
             match (python_int_of(text), int) {
@@ -6162,7 +6170,9 @@ mod string_default_tests {
                 (_, want) => panic!("float({:?}): python3 gives {:?}", text, want),
             }
         }
-        assert!(matches!(python_float_of("+nan"), StringDefault::Value(v) if v.is_nan()));
+        assert!(matches!(python_float_of("+nan"), StringDefault::Value(v) if v.is_nan() && v.is_sign_positive()));
+        // python3: math.copysign(1.0, float("-nan")) == -1.0 (round 11).
+        assert!(matches!(python_float_of("-nan"), StringDefault::Value(v) if v.is_nan() && v.is_sign_negative()));
         assert!(matches!(python_int_of("٣"), StringDefault::Unsupported("non-ASCII digits in a string default")));
         assert!(matches!(python_int_of("99999999999999999999"), StringDefault::Unsupported("an int outside i64")));
     }

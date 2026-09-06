@@ -2867,7 +2867,7 @@ mod dict_and_exception_display {
 }
 
 mod cpython_numeric_and_stdlib_fixes {
-    use stdpython::{datetime::date, py_pow, py_str_repr, PyFloat, PyInt, PyMul};
+    use stdpython::{datetime::date, math, py_pow, py_str_repr, PyFloat, PyInt, PyMul};
 
     #[test]
     fn float_power_uses_libm_pow_not_repeated_squaring() {
@@ -2919,6 +2919,10 @@ mod cpython_numeric_and_stdlib_fixes {
             ("e1", None, None),
             ("0x1_0", None, None),
             ("1_0j", None, None),
+            // i64::MIN, whose magnitude is not an i64, reads as CPython
+            // reads it (round 11).
+            ("-9223372036854775808", Some(i64::MIN), Some(-9223372036854775808.0)),
+            ("9223372036854775807", Some(i64::MAX), Some(9223372036854775807.0)),
         ];
         for (text, int, float) in table {
             match (text.py_int(), int) {
@@ -2946,6 +2950,13 @@ mod cpython_numeric_and_stdlib_fixes {
         // quotes the string as Python's repr does.
         assert!("+nan".py_float().unwrap().is_nan());
         assert!("NaN".py_float().unwrap().is_nan());
+        // python3: math.copysign(1.0, float("-nan")) == -1.0 — the sign
+        // survives on a nan (round 11); "+nan" and "nan" are positive.
+        assert!("-nan".py_float().unwrap().is_sign_negative());
+        assert!(" -NaN ".py_float().unwrap().is_sign_negative());
+        assert!("+nan".py_float().unwrap().is_sign_positive());
+        assert!("nan".py_float().unwrap().is_sign_positive());
+        assert_eq!(math::copysign(1.0, "-nan".py_float().unwrap()), -1.0);
         assert_eq!(
             "it's".py_int().unwrap_err().to_string(),
             "ValueError: invalid literal for int() with base 10: \"it's\""

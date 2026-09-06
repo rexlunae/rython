@@ -1763,8 +1763,11 @@ pub fn python_int_of(s: &str) -> PyNumberParse<i64> {
     if !rest.is_empty() {
         return PyNumberParse::Invalid;
     }
-    match digits.parse::<i64>() {
-        Ok(v) => PyNumberParse::Value(if negative { -v } else { v }),
+    // Parsed with its sign, so i64::MIN (whose magnitude is not an i64)
+    // is read as CPython reads it (Devin review on #339, round 11).
+    let signed = if negative { alloc::format!("-{}", digits) } else { digits };
+    match signed.parse::<i64>() {
+        Ok(v) => PyNumberParse::Value(v),
         Err(_) => PyNumberParse::Unsupported("an int outside i64"),
     }
 }
@@ -1786,7 +1789,9 @@ pub fn python_float_of(s: &str) -> PyNumberParse<f64> {
         "inf" | "infinity" => {
             return PyNumberParse::Value(if sign == "-" { f64::NEG_INFINITY } else { f64::INFINITY })
         }
-        "nan" => return PyNumberParse::Value(f64::NAN),
+        // The sign survives on a nan as it does in CPython (`float("-nan")`
+        // has its sign bit set; `math.copysign(1.0, x)` is -1.0).
+        "nan" => return PyNumberParse::Value(if sign == "-" { -f64::NAN } else { f64::NAN }),
         _ => {}
     }
     let mut text = String::from(sign);

@@ -7497,6 +7497,76 @@ fn numeric_argparse_values_follow_pythons_underscore_grammar() {
 }
 
 #[test]
+fn numeric_argparse_values_keep_the_i64_minimum_and_a_nans_sign() {
+    // Round 11 of the review on #339: `int("-9223372036854775808")` is
+    // i64::MIN (its magnitude is not an i64, so the string is parsed with
+    // its sign), and `float("-nan")` keeps its sign bit — visible only
+    // through `math.copysign`. Both as string defaults and as command-line
+    // values; `--f -nan` is CPython's "expected one argument", since `-nan`
+    // looks like an option, while `--f=-nan` is the value. An int CPython
+    // reads that i64 cannot hold is loud. Transcripts captured from
+    // python3 3.11 verbatim.
+    let scratch = Scratch::new("apedge");
+    let file = scratch.path().join("edge.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "import math\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"edge\")\n",
+            "    parser.add_argument(\"--n\", type=int, default=\"-9223372036854775808\")\n",
+            "    parser.add_argument(\"--f\", type=float, default=\"-nan\")\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(args.n, math.copysign(1.0, args.f))\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/edge");
+    let cases: &[(&[&str], i32, &str, &str)] = &[
+        (&[], 0, "-9223372036854775808 -1.0\n", ""),
+        (&["--n", "-9223372036854775808", "--f=-nan"], 0, "-9223372036854775808 -1.0\n", ""),
+        (&["--n", "9223372036854775807", "--f", "nan"], 0, "9223372036854775807 1.0\n", ""),
+        (&["--f=+nan"], 0, "-9223372036854775808 1.0\n", ""),
+        (&["--f=-inf"], 0, "-9223372036854775808 -1.0\n", ""),
+        (
+            &["--f", "-nan"],
+            2,
+            "",
+            "usage: edge [-h] [--n N] [--f F]\nedge: error: argument --f: expected one argument\n",
+        ),
+    ];
+    for (args, code, stdout, stderr) in cases {
+        let output = Command::new(&bin).args(*args).env_remove("COLUMNS").output().expect("run");
+        assert_eq!(output.status.code(), Some(*code), "args: {:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), *stdout, "args: {:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stderr), *stderr, "args: {:?}", args);
+    }
+    // python3 prints -9223372036854775809; the i64 field cannot hold it,
+    // so the run is loud rather than a different number.
+    let output = Command::new(&bin).args(["--n", "-9223372036854775809"]).output().expect("run");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("NotImplementedError: int('-9223372036854775809'): an int outside i64 are not supported yet"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn input_without_a_prompt_ignores_a_closed_stdout() {
     // Round 10 of the review on #339: `input()` without a prompt writes
     // nothing to sys.stdout (CPython flushes it and clears the error), so
