@@ -8919,6 +8919,15 @@ fn a_star_import_follows_the_latest_effective_all() {
         ("__all__ = [\"other\"]\nregister(__all__)\nthing = 1\nother = 2\n", false),
         ("__all__ = [\"other\"]\nregister(exports=__all__)\nthing = 1\nother = 2\n", false),
         ("__all__ = [\"other\"]\nprint(names=__all__)\nthing = 1\nother = 2\n", true),
+        // Round 24: an alias of the list escapes the analysis (a mutation
+        // through it is invisible), a builtin the module shadows is not
+        // the builtin, a def naming the list may mutate it when called;
+        // a loop over it, an `in` test and a subscript read see through.
+        ("__all__ = [\"other\"]\nexports = __all__\nexports.append(\"thing\")\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\npair = (__all__, 1)\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\n\n\ndef len(items: list[str]) -> int:\n    items.append(\"thing\")\n    return 0\n\n\nlen(__all__)\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\n\n\ndef grow() -> None:\n    __all__.append(\"thing\")\n\n\ngrow()\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\nfor n in __all__:\n    print(n)\nok = \"other\" in __all__\nfirst = __all__[0]\nthing = 1\nother = 2\n", true),
         ("__all__ = [\"other\"]\ndel __all__\nthing = 1\nother = 2\n", false),
     ] {
         let out = glob(src);

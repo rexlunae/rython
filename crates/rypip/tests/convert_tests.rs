@@ -12116,6 +12116,84 @@ fn the_cycle_tracing_resolves_a_called_name_by_its_latest_binding_and_treats_the
 }
 
 #[test]
+fn an_alias_of_all_mutated_or_a_shadowed_builtin_makes_the_star_exports_unknown() {
+    // values lists `other`, then shadows `len` with a def that appends
+    // and calls it on the list. CPython's star import takes the grown
+    // list (`main 1`). A shadowed builtin is not the builtin, so the
+    // literal is no longer in force: the re-export is the glob and
+    // `thing` resolves (Devin review on #338, round 24). The alias shape
+    // (`exports = __all__` then `exports.append("thing")`) is refused
+    // before the star import matters — rython copies containers by
+    // value, so a mutation through a second name is refused loudly
+    // (issue #79) — pinned here so the two rules stay in step.
+    let files = |values: &'static str| -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("__init__.py", "from .values import *\n"),
+            ("values.py", values),
+            ("helper.py", "from . import thing\n\n\ndef helper_value() -> int:\n    return thing\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from .helper import helper_value\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\", helper_value())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ]
+    };
+    let scratch = Scratch::new("shadowlen");
+    let krate = package_crate(
+        &scratch,
+        "shadowlen",
+        &files(concat!(
+            "__all__ = [\"other\"]\n",
+            "\n",
+            "\n",
+            "def len(items: list[str]) -> int:\n",
+            "    items.append(\"thing\")\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "len(__all__)\n",
+            "thing = 1\n",
+            "other = 2\n",
+        )),
+    );
+    let root = fs::read_to_string(krate.root.join("src/lib.rs")).unwrap();
+    assert!(root.contains("values::*"), "the glob, not the stale literal: {}", root);
+    assert_eq!(run_package(&krate, "shadowlen"), vec!["main 1"]);
+    let scratch = Scratch::new("aliasall");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"aliasall\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("aliasall");
+    fs::create_dir_all(&pkg).unwrap();
+    for (name, source) in files(
+        "__all__ = [\"other\"]\nexports = __all__\nexports.append(\"thing\")\nthing = 1\nother = 2\n",
+    ) {
+        fs::write(pkg.join(name), source).unwrap();
+    }
+    let discovered = rypip::discover(scratch.path()).expect("discover");
+    let err = rypip::convert(&discovered, &scratch.path().join("crate"), &ConvertOptions::default())
+        .err()
+        .expect("a container mutated through an alias is refused");
+    let msg = format!("{:#}", err);
+    assert!(
+        msg.contains("`exports = __all__` shares one container between two names, and the container is mutated afterwards"),
+        "{}",
+        msg
+    );
+}
+
+#[test]
 fn a_callee_handed_all_by_keyword_makes_the_star_exports_unknown() {
     // values lists `other` in `__all__`, then hands the list to a callee
     // by keyword (`grow(exports=__all__)`) that appends `thing`; the

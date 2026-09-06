@@ -851,13 +851,21 @@ pub(crate) fn literal_all(
     // (`__all__.append(...)`, `__all__ += [...]`, `__all__[0] = ...`)
     // anywhere the module runs, makes the exports unknown again (Devin
     // review on #338, round 21).
-    // What MAY change the list's membership: a store through it
-    // (`__all__[i] = ...`, `__all__.x = ...`), a method that changes
-    // membership or one the analysis does not know, or the list handed
-    // to a callee that is not a known non-mutating builtin. A method
-    // that keeps membership (`copy`, `count`, `index`, `sort`,
-    // `reverse`) or a read (`len(__all__)`, `x in __all__`) leaves the
-    // literal in force (Devin review on #338, round 22).
+    // What MAY change the list's membership, or let something else
+    // change it: a store through it (`__all__[i] = ...`), a method that
+    // changes membership or one the analysis does not know, the list
+    // handed to a callee that is not a known non-mutating builtin (by
+    // position or by keyword), and — Devin review on #338, round 24 —
+    // any other use of the name that could ALIAS the list (`exports =
+    // __all__`, a tuple or list holding it, a walrus, a return): after
+    // an alias escapes, a mutation through it is invisible here, so the
+    // exports are unknown from then on. Only the reads the analysis can
+    // see through leave the literal in force: a membership-keeping
+    // method, a known builtin that is not shadowed by a module binding,
+    // an `in` test, a subscript read, a loop over it. A def or class
+    // body naming `__all__` at all (a `global __all__` mutator a
+    // module-level call may run) makes the exports unknown too.
+    let ctx = crate::ast::tree::module::defining_module_context(options, key);
     let mutates_all = |st: &crate::Statement| -> bool {
         use crate::ast::tree::visit::{any_expr_for, stmt_exprs, stmt_targets, Descend};
         let is_all = |e: &crate::ExprType| matches!(e, crate::ExprType::Name(n) if n.id == "__all__");
@@ -868,27 +876,88 @@ pub(crate) fn literal_all(
                 _ => false,
             }
         };
-        // Handed to a callee by position OR by keyword (`mutate(exports=
-        // __all__)` — Devin review on #338, round 23).
-        let handed_all = |c: &crate::ast::tree::call::Call| -> bool {
-            c.args.iter().any(is_all) || c.keywords.iter().any(|k| is_all(&k.value))
-        };
-        stmt_targets(st).into_iter().any(through_all)
-            || stmt_exprs(st).into_iter().any(|e| {
-                any_expr_for(e, Descend::OwnScope, |x| match x {
+        if stmt_targets(st).into_iter().any(through_all) {
+            return true;
+        }
+        // A builtin's name the module binds itself is not the builtin.
+        let unshadowed_builtin =
+            |name: &str| NonMutatingBuiltin::from_name(name).is_some() && callee_bindings(&body, &ctx, name).is_empty();
+        for e in stmt_exprs(st) {
+            // The occurrences of `__all__` the analysis can see through.
+            let mut safe: Vec<*const crate::ExprType> = Vec::new();
+            any_expr_for(e, Descend::OwnScope, |x| {
+                match x {
                     crate::ExprType::Call(c) => match c.func.as_ref() {
-                        crate::ExprType::Attribute(a) if is_all(&a.value) => {
-                            ListReadMethod::from_name(&a.attr).is_none()
+                        crate::ExprType::Attribute(a)
+                            if is_all(&a.value) && ListReadMethod::from_name(&a.attr).is_some() =>
+                        {
+                            safe.push(a.value.as_ref() as *const _);
                         }
-                        crate::ExprType::Name(f) => {
-                            handed_all(c) && NonMutatingBuiltin::from_name(&f.id).is_none()
+                        crate::ExprType::Name(f) if unshadowed_builtin(&f.id) => {
+                            safe.extend(c.args.iter().filter(|a| is_all(a)).map(|a| a as *const _));
+                            safe.extend(
+                                c.keywords.iter().filter(|k| is_all(&k.value)).map(|k| &k.value as *const _),
+                            );
                         }
-                        _ => handed_all(c),
+                        _ => {}
                     },
-                    _ => false,
-                })
-            })
+                    crate::ExprType::Compare(cmp) => {
+                        if is_all(&cmp.left) {
+                            safe.push(cmp.left.as_ref() as *const _);
+                        }
+                        safe.extend(cmp.comparators.iter().filter(|a| is_all(a)).map(|a| a as *const _));
+                    }
+                    crate::ExprType::Subscript(sub) if is_all(&sub.value) => {
+                        safe.push(sub.value.as_ref() as *const _);
+                    }
+                    _ => {}
+                }
+                false
+            });
+            // A loop over the list reads it.
+            if let crate::StatementType::For(f) = &st.statement
+                && is_all(&f.iter)
+            {
+                safe.push(&f.iter as *const _);
+            }
+            let mut escapes = false;
+            any_expr_for(e, Descend::OwnScope, |x| {
+                if is_all(x) && !safe.iter().any(|p| std::ptr::eq(*p, x)) {
+                    escapes = true;
+                }
+                escapes
+            });
+            if escapes {
+                return true;
+            }
+        }
+        false
     };
+    // A def or class body naming `__all__`: a mutator a module-level
+    // call may run during initialization.
+    let named_in_a_def = {
+        use crate::ast::tree::visit::{any_expr_for, stmt_exprs, walk_stmts, Descend, Flow};
+        let mut named = false;
+        walk_stmts(&body, Descend::All, &mut |st| {
+            let in_def = !body.iter().any(|top| std::ptr::eq(top, st));
+            if in_def
+                && (matches!(&st.statement, crate::StatementType::Global(ns) if ns.iter().any(|n| n == "__all__"))
+                    || stmt_exprs(st).into_iter().any(|e| {
+                        any_expr_for(e, Descend::All, |x| {
+                            matches!(x, crate::ExprType::Name(n) if n.id == "__all__")
+                        })
+                    }))
+            {
+                named = true;
+                return Flow::Stop;
+            }
+            Flow::Continue
+        });
+        named
+    };
+    if named_in_a_def {
+        return Err(());
+    }
     let mut all: Result<Option<Vec<String>>, ()> = Ok(None);
     let mut all_by_stmt: std::collections::HashMap<(usize, usize), Option<Vec<String>>> =
         std::collections::HashMap::new();
