@@ -3826,8 +3826,30 @@ fn resolve_alias_typeinfo_inner(
                 }
             }
             // A user-defined class name (`list[CharsetMatch]`): the struct
-            // ident, the same path parameters use.
-            Some(SymbolTableNode::ClassDef(_)) => {
+            // ident, the same path parameters use. A TypedDict class is a
+            // dict at runtime (`class ResultDict(TypedDict)` under
+            // `TYPE_CHECKING` — charset_normalizer's legacy.py returns a
+            // dict literal as one): the boxed-value dict. A class that is
+            // only a TYPE_CHECKING stub of this module is never generated:
+            // the boxed value, like the imported case above (issue #333).
+            Some(SymbolTableNode::ClassDef(c)) => {
+                if c.bases.iter().any(|b| match b {
+                    ExprType::Name(base) => base.id == "TypedDict",
+                    ExprType::Attribute(a) => a.attr == "TypedDict",
+                    _ => false,
+                }) {
+                    return Some(TypeInfo::Dict(
+                        Box::new(TypeInfo::String),
+                        Box::new(TypeInfo::PyValue),
+                    ));
+                }
+                if crate::ast::tree::module::module_def_has_type_checking_stub(
+                    options,
+                    &options.this_module_path,
+                    &n.id,
+                ) {
+                    return Some(TypeInfo::PyValue);
+                }
                 Some(TypeInfo::Class(n.id.clone()))
             }
             _ => annotation_type_info(ann),
@@ -4172,6 +4194,65 @@ pub(crate) fn is_typevar_call(value: &ExprType) -> bool {
             if matches!(c.func.as_ref(), ExprType::Name(f) if f.id == "TypeVar")
                 || matches!(c.func.as_ref(), ExprType::Attribute(a) if a.attr == "TypeVar")
     )
+}
+
+/// An annotation with every TYPE-ALIAS name expanded to the alias's own
+/// expression, resolved in the module that binds it: a synthesized
+/// definition rendered in ANOTHER module (the `lru_cache(...)(f)` wrapper
+/// api.py builds over cd.py's `-> CoherenceMatches`) would otherwise name
+/// an alias that module never bound (charset_normalizer; issue #333). A
+/// crate import of an alias follows into the defining module; a class name
+/// stays (the struct ident); anything else is copied.
+pub(crate) fn expand_type_alias_names(
+    ann: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> ExprType {
+    fn expand(
+        ann: &ExprType,
+        symbols: &SymbolTableScopes,
+        options: &PythonOptions,
+        depth: usize,
+    ) -> ExprType {
+        if depth > 8 {
+            return ann.clone();
+        }
+        if let ExprType::Name(n) = ann {
+            match symbols.get(&n.id) {
+                Some(SymbolTableNode::Assign { value, .. })
+                    if crate::ast::tree::module::is_type_alias_value(value) =>
+                {
+                    return expand(value, symbols, options, depth + 1);
+                }
+                Some(SymbolTableNode::ImportFrom(i)) => {
+                    let path = i.resolved_module_path(options);
+                    if let Some(key) = crate::module_defs_key(options, &path) {
+                        let syms = module_symbols(options, key);
+                        let defining = i
+                            .names
+                            .iter()
+                            .find(|a| a.asname.as_deref() == Some(n.id.as_str()))
+                            .map(|a| a.name.clone())
+                            .unwrap_or_else(|| n.id.clone());
+                        if let Some(SymbolTableNode::Assign { value, .. }) = syms.get(&defining)
+                            && crate::ast::tree::module::is_type_alias_value(value)
+                        {
+                            return expand(value, &syms, options, depth + 1);
+                        }
+                    }
+                    return ann.clone();
+                }
+                _ => return ann.clone(),
+            }
+        }
+        let mut out = ann.clone();
+        visit::each_subexpr_mut(&mut out, Descend::All, &mut |sub| {
+            *sub = expand(sub, symbols, options, depth + 1);
+            true
+        });
+        out
+    }
+    expand(ann, symbols, options, 0)
 }
 
 fn module_symbols(options: &PythonOptions, path: &[String]) -> SymbolTableScopes {

@@ -19,6 +19,17 @@ use super::expression::ExprType;
 use super::statement::{Statement, StatementType};
 use super::*;
 
+/// What the renamed name is: a method RECEIVER (never rebound — a
+/// rebinding is a loud error, and a nested binder of the name shadows it),
+/// or a function LOCAL (its binders — stores, loop and `with` targets,
+/// `except ... as` — are the name and rename with it; a nested scope that
+/// binds the name itself keeps its own binding).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Receiver,
+    Local,
+}
+
 /// Rewrite `from` -> `to` across a statement list. Fails loudly when the
 /// body rebinds the receiver name directly.
 pub(crate) fn rename_receiver_in_body(
@@ -26,10 +37,219 @@ pub(crate) fn rename_receiver_in_body(
     from: &str,
     to: &str,
 ) -> Result<Vec<Statement>, String> {
-    body.iter().map(|s| rename_statement(s, from, to)).collect()
+    rename_in_body(body, from, to, Mode::Receiver)
 }
 
-fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement, String> {
+/// Rewrite a function LOCAL `from` -> `to` across its body: every read and
+/// every binder of the name, into nested scopes that capture it, never
+/// into one that binds it itself (a local that shadows a module static —
+/// rustc's E0530 — is spelled apart this way; issue #333).
+pub(crate) fn rename_local_in_body(body: &[Statement], from: &str, to: &str) -> Vec<Statement> {
+    rename_in_body(body, from, to, Mode::Local)
+        .expect("the local mode never refuses a binder")
+}
+
+/// The prefix a function local takes when its name is also a module
+/// STATIC of the generated crate (a promoted or constant module value, a
+/// `use`-bound import): rustc refuses a `let` or a parameter that shadows
+/// a static (E0530), so the local is spelled apart under the reserved
+/// temporary prefix — which no program name can collide with.
+pub(crate) fn shadowing_local_ident(name: &str) -> String {
+    format!("{}local_{}", super::visit::RESERVED_PREFIX, name)
+}
+
+/// Every `def` in `body` (module-level, method, nested, under any
+/// control flow): a parameter or a local that shares its name with one of
+/// `statics` is renamed to [`shadowing_local_ident`] throughout the def —
+/// its parameter list and its body, into nested scopes that capture it.
+/// A name the def declares `global` is the static itself, not a local.
+/// Returns the number of renamed bindings (requests' compat.py has a
+/// local `chardet` beside the module's `chardet`; issue #333).
+pub(crate) fn rename_locals_shadowing_statics(
+    body: &mut Vec<Statement>,
+    statics: &std::collections::HashSet<String>,
+) -> usize {
+    use super::visit::{Descend, stmt_bodies_for, stmt_targets};
+    fn bound_names(f: &FunctionDef) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        let mut push = |n: &str| {
+            if !names.iter().any(|x| x == n) {
+                names.push(n.to_string());
+            }
+        };
+        for p in f
+            .args
+            .posonlyargs
+            .iter()
+            .chain(f.args.args.iter())
+            .chain(f.args.kwonlyargs.iter())
+            .chain(f.args.vararg.iter())
+            .chain(f.args.kwarg.iter())
+        {
+            push(&p.arg);
+        }
+        fn walk(stmts: &[Statement], push: &mut dyn FnMut(&str)) {
+            for s in stmts {
+                for t in stmt_targets(s) {
+                    for n in super::visit::target_names(t) {
+                        push(n);
+                    }
+                }
+                match &s.statement {
+                    StatementType::Try(t) => {
+                        for h in &t.handlers {
+                            if let Some(n) = &h.name {
+                                push(n);
+                            }
+                        }
+                    }
+                    StatementType::AnnotatedName { name, .. } => push(name),
+                    _ => {}
+                }
+                for b in stmt_bodies_for(s, Descend::SkipDefs) {
+                    walk(b, push);
+                }
+            }
+        }
+        walk(&f.body, &mut push);
+        names
+    }
+    fn declared_global(body: &[Statement], name: &str) -> bool {
+        let mut found = false;
+        fn walk(stmts: &[Statement], name: &str, found: &mut bool) {
+            for s in stmts {
+                if let StatementType::Global(names) = &s.statement
+                    && names.iter().any(|n| n == name)
+                {
+                    *found = true;
+                }
+                for b in stmt_bodies_for(s, Descend::SkipDefs) {
+                    walk(b, name, found);
+                }
+            }
+        }
+        walk(body, name, &mut found);
+        found
+    }
+    fn rename_def(f: &mut FunctionDef, statics: &std::collections::HashSet<String>) -> usize {
+        let mut count = 0;
+        for name in bound_names(f) {
+            if !statics.contains(&name) || declared_global(&f.body, &name) {
+                continue;
+            }
+            let to = shadowing_local_ident(&name);
+            for p in f
+                .args
+                .posonlyargs
+                .iter_mut()
+                .chain(f.args.args.iter_mut())
+                .chain(f.args.kwonlyargs.iter_mut())
+                .chain(f.args.vararg.iter_mut())
+                .chain(f.args.kwarg.iter_mut())
+            {
+                if p.arg == name {
+                    p.arg = to.clone();
+                }
+            }
+            f.body = rename_local_in_body(&f.body, &name, &to);
+            count += 1;
+        }
+        count
+    }
+    fn walk(stmts: &mut Vec<Statement>, statics: &std::collections::HashSet<String>) -> usize {
+        let mut count = 0;
+        for s in stmts.iter_mut() {
+            match &mut s.statement {
+                StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
+                    count += rename_def(f, statics);
+                    count += walk(&mut f.body, statics);
+                }
+                StatementType::ClassDef(c) => count += walk(&mut c.body, statics),
+                StatementType::If(i) => {
+                    count += walk(&mut i.body, statics);
+                    count += walk(&mut i.orelse, statics);
+                }
+                StatementType::For(f) => {
+                    count += walk(&mut f.body, statics);
+                    count += walk(&mut f.orelse, statics);
+                }
+                StatementType::AsyncFor(f) => {
+                    count += walk(&mut f.body, statics);
+                    count += walk(&mut f.orelse, statics);
+                }
+                StatementType::While(w) => {
+                    count += walk(&mut w.body, statics);
+                    count += walk(&mut w.orelse, statics);
+                }
+                StatementType::With(w) => count += walk(&mut w.body, statics),
+                StatementType::AsyncWith(w) => count += walk(&mut w.body, statics),
+                StatementType::Try(t) => {
+                    count += walk(&mut t.body, statics);
+                    for h in t.handlers.iter_mut() {
+                        count += walk(&mut h.body, statics);
+                    }
+                    count += walk(&mut t.orelse, statics);
+                    count += walk(&mut t.finalbody, statics);
+                }
+                _ => {}
+            }
+        }
+        count
+    }
+    walk(body, statics)
+}
+
+fn rename_in_body(
+    body: &[Statement],
+    from: &str,
+    to: &str,
+    mode: Mode,
+) -> Result<Vec<Statement>, String> {
+    body.iter().map(|s| rename_statement(s, from, to, mode)).collect()
+}
+
+/// Whether a function body binds `name` as ITS OWN local: a store, a loop
+/// or `with` target, an `except ... as`, an annotated declaration, in its
+/// own scope (nested defs are their own). A `nonlocal`/`global`
+/// declaration of the name means the binder is not local.
+fn body_binds_locally(body: &[Statement], name: &str) -> bool {
+    use super::visit::{Descend, stmt_bodies_for, stmt_targets};
+    let mut declared_outer = false;
+    let mut binds = false;
+    fn walk(stmts: &[Statement], name: &str, declared_outer: &mut bool, binds: &mut bool) {
+        for s in stmts {
+            match &s.statement {
+                StatementType::Global(names) | StatementType::Nonlocal(names)
+                    if names.iter().any(|n| n == name) =>
+                {
+                    *declared_outer = true;
+                }
+                StatementType::AnnotatedName { name: n, .. } if n == name => *binds = true,
+                StatementType::Try(t) => {
+                    if t.handlers.iter().any(|h| h.name.as_deref() == Some(name)) {
+                        *binds = true;
+                    }
+                }
+                _ => {}
+            }
+            if stmt_targets(s).iter().any(|t| expr_binds_name(t, name)) {
+                *binds = true;
+            }
+            for body in stmt_bodies_for(s, Descend::SkipDefs) {
+                walk(body, name, declared_outer, binds);
+            }
+        }
+    }
+    walk(body, name, &mut declared_outer, &mut binds);
+    binds && !declared_outer
+}
+
+fn rename_statement(
+    stmt: &Statement,
+    from: &str,
+    to: &str,
+    mode: Mode,
+) -> Result<Statement, String> {
     let statement = match &stmt.statement {
         StatementType::Assign(a) => {
             // Rebinding the receiver name itself cannot live on `&self`.
@@ -37,7 +257,7 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
                 // Unpacking targets count: `factory_self, x = f()` binds
                 // the receiver through a Tuple just as much as a bare
                 // `factory_self = ...` does.
-                if expr_binds_name(target, from) {
+                if mode == Mode::Receiver && expr_binds_name(target, from) {
                     return Err(format!(
                         "method rebinds its receiver `{from}`; rython's receiver is \
                          an immutable `&self`, so the reassignment has no lowering"
@@ -52,7 +272,7 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
             })
         }
         StatementType::AugAssign(a) => {
-            if matches!(&a.target, ExprType::Name(n) if n.id == from) {
+            if mode == Mode::Receiver && matches!(&a.target, ExprType::Name(n) if n.id == from) {
                 return Err(format!(
                     "method aug-rebinds its receiver `{from}`; rython's receiver is \
                      an immutable `&self`, so the reassignment has no lowering"
@@ -83,8 +303,8 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
         }),
         StatementType::If(i) => StatementType::If(If {
             test: rename_expr(&i.test, from, to),
-            body: rename_receiver_in_body(&i.body, from, to)?,
-            orelse: rename_receiver_in_body(&i.orelse, from, to)?,
+            body: rename_in_body(&i.body, from, to, mode)?,
+            orelse: rename_in_body(&i.orelse, from, to, mode)?,
             lineno: i.lineno,
             col_offset: i.col_offset,
             end_lineno: i.end_lineno,
@@ -92,8 +312,8 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
         }),
         StatementType::While(w) => StatementType::While(super::while_stmt::While {
             test: rename_expr(&w.test, from, to),
-            body: rename_receiver_in_body(&w.body, from, to)?,
-            orelse: rename_receiver_in_body(&w.orelse, from, to)?,
+            body: rename_in_body(&w.body, from, to, mode)?,
+            orelse: rename_in_body(&w.orelse, from, to, mode)?,
             lineno: w.lineno,
             col_offset: w.col_offset,
             end_lineno: w.end_lineno,
@@ -101,20 +321,25 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
         }),
         StatementType::For(f) => {
             // A for-target binding the receiver name shadows it inside the
-            // loop — leave that scope alone.
-            let binds = expr_binds_name(&f.target, from);
+            // loop — leave that scope alone. A LOCAL's loop target is the
+            // local itself: it renames with the body.
+            let binds = mode == Mode::Receiver && expr_binds_name(&f.target, from);
             let body = if binds {
                 f.body.clone()
             } else {
-                rename_receiver_in_body(&f.body, from, to)?
+                rename_in_body(&f.body, from, to, mode)?
             };
             let orelse = if binds {
                 f.orelse.clone()
             } else {
-                rename_receiver_in_body(&f.orelse, from, to)?
+                rename_in_body(&f.orelse, from, to, mode)?
             };
             StatementType::For(super::for_stmt::For {
-                target: f.target.clone(),
+                target: if mode == Mode::Local {
+                    rename_expr(&f.target, from, to)
+                } else {
+                    f.target.clone()
+                },
                 iter: rename_expr(&f.iter, from, to),
                 body,
                 orelse,
@@ -125,33 +350,40 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
             })
         }
         StatementType::Try(t) => StatementType::Try(Try {
-            body: rename_receiver_in_body(&t.body, from, to)?,
+            body: rename_in_body(&t.body, from, to, mode)?,
             handlers: {
                 let mut handlers = Vec::with_capacity(t.handlers.len());
                 for h in &t.handlers {
                     let mut h = h.clone();
                     // An `except ... as <name>:` handler binding the
-                    // receiver name shadows it inside the handler body.
-                    if h.name.as_deref() != Some(from) {
-                        h.body = rename_receiver_in_body(&h.body, from, to)?;
+                    // receiver name shadows it inside the handler body; a
+                    // LOCAL's `as` binding is the local and renames.
+                    if mode == Mode::Local {
+                        if h.name.as_deref() == Some(from) {
+                            h.name = Some(to.to_string());
+                        }
+                        h.body = rename_in_body(&h.body, from, to, mode)?;
+                    } else if h.name.as_deref() != Some(from) {
+                        h.body = rename_in_body(&h.body, from, to, mode)?;
                     }
                     handlers.push(h);
                 }
                 handlers
             },
-            orelse: rename_receiver_in_body(&t.orelse, from, to)?,
-            finalbody: rename_receiver_in_body(&t.finalbody, from, to)?,
+            orelse: rename_in_body(&t.orelse, from, to, mode)?,
+            finalbody: rename_in_body(&t.finalbody, from, to, mode)?,
             lineno: t.lineno,
             col_offset: t.col_offset,
             end_lineno: t.end_lineno,
             end_col_offset: t.end_col_offset,
         }),
         StatementType::With(w) => {
-            let binds = w.items.iter().any(|item| {
-                item.optional_vars
-                    .as_ref()
-                    .is_some_and(|v| expr_binds_name(v, from))
-            });
+            let binds = mode == Mode::Receiver
+                && w.items.iter().any(|item| {
+                    item.optional_vars
+                        .as_ref()
+                        .is_some_and(|v| expr_binds_name(v, from))
+                });
             StatementType::With(With {
                 items: w
                     .items
@@ -167,7 +399,7 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
                 body: if binds {
                     w.body.clone()
                 } else {
-                    rename_receiver_in_body(&w.body, from, to)?
+                    rename_in_body(&w.body, from, to, mode)?
                 },
                 lineno: w.lineno,
                 col_offset: w.col_offset,
@@ -194,7 +426,7 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
         // as rebinding it; index targets rename through.
         StatementType::Delete(targets) => {
             for target in targets {
-                if matches!(target, ExprType::Name(n) if n.id == from) {
+                if mode == Mode::Receiver && matches!(target, ExprType::Name(n) if n.id == from) {
                     return Err(format!(
                         "method deletes its receiver `{from}`; rython's receiver is \
                          an immutable `&self`, so the unbinding has no lowering"
@@ -208,23 +440,27 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
             StatementType::Delete(renamed)
         }
         StatementType::AsyncFor(f) => {
-            let binds = expr_binds_name(&f.target, from);
+            let binds = mode == Mode::Receiver && expr_binds_name(&f.target, from);
             let mut f = f.clone();
             // The iterable is OUTSIDE the target's scope: rename it even
             // when the target itself shadows the receiver name.
             f.iter = rename_expr(&f.iter, from, to);
+            if mode == Mode::Local {
+                f.target = rename_expr(&f.target, from, to);
+            }
             if !binds {
-                f.body = rename_receiver_in_body(&f.body, from, to)?;
-                f.orelse = rename_receiver_in_body(&f.orelse, from, to)?;
+                f.body = rename_in_body(&f.body, from, to, mode)?;
+                f.orelse = rename_in_body(&f.orelse, from, to, mode)?;
             }
             StatementType::AsyncFor(f)
         },
         StatementType::AsyncWith(w) => {
-            let binds = w.items.iter().any(|item| {
-                item.optional_vars
-                    .as_ref()
-                    .is_some_and(|v| expr_binds_name(v, from))
-            });
+            let binds = mode == Mode::Receiver
+                && w.items.iter().any(|item| {
+                    item.optional_vars
+                        .as_ref()
+                        .is_some_and(|v| expr_binds_name(v, from))
+                });
             let mut w = w.clone();
             // Context-manager expressions sit outside the optional_vars
             // binding's scope: rename them even when it shadows the
@@ -234,13 +470,18 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
                 .iter()
                 .map(|item| WithItem {
                     context_expr: rename_expr(&item.context_expr, from, to),
-                    // An `as <name>` binding KEEPS its name: it shadows the
-                    // receiver inside the body rather than referencing it.
-                    optional_vars: item.optional_vars.clone(),
+                    // An `as <name>` binding KEEPS its name in receiver
+                    // mode: it shadows the receiver inside the body rather
+                    // than referencing it. A local's binding renames.
+                    optional_vars: if mode == Mode::Local {
+                        item.optional_vars.as_ref().map(|v| rename_expr(v, from, to))
+                    } else {
+                        item.optional_vars.clone()
+                    },
                 })
                 .collect();
             if !binds {
-                w.body = rename_receiver_in_body(&w.body, from, to)?;
+                w.body = rename_in_body(&w.body, from, to, mode)?;
             }
             StatementType::AsyncWith(w)
         },
@@ -249,24 +490,38 @@ fn rename_statement(stmt: &Statement, from: &str, to: &str) -> Result<Statement,
         // enclosing receiver and must be renamed through. Class bodies are
         // skipped wholesale (their methods have receivers of their own).
         StatementType::FunctionDef(f) => {
-            if parameter_list_binds(&f.args, from) || f.name == from {
+            if parameter_list_binds(&f.args, from)
+                || f.name == from
+                || (mode == Mode::Local && body_binds_locally(&f.body, from))
+            {
                 StatementType::FunctionDef(f.clone())
             } else {
                 let mut f = f.clone();
-                f.body = rename_receiver_in_body(&f.body, from, to)?;
+                f.body = rename_in_body(&f.body, from, to, mode)?;
                 StatementType::FunctionDef(f)
             }
         }
         StatementType::AsyncFunctionDef(f) => {
-            if parameter_list_binds(&f.args, from) || f.name == from {
+            if parameter_list_binds(&f.args, from)
+                || f.name == from
+                || (mode == Mode::Local && body_binds_locally(&f.body, from))
+            {
                 StatementType::AsyncFunctionDef(f.clone())
             } else {
                 let mut f = f.clone();
-                f.body = rename_receiver_in_body(&f.body, from, to)?;
+                f.body = rename_in_body(&f.body, from, to, mode)?;
                 StatementType::AsyncFunctionDef(f)
             }
         }
         StatementType::ClassDef(_) => stmt.statement.clone(),
+        // A bare annotated declaration of the local (`x: int`) is a binder
+        // of the name; the receiver never has one.
+        StatementType::AnnotatedName { name, annotation } if mode == Mode::Local && name == from => {
+            StatementType::AnnotatedName {
+                name: to.to_string(),
+                annotation: annotation.clone(),
+            }
+        }
         // Everything else carries no expressions bound to the receiver.
         other => other.clone(),
     };

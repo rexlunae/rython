@@ -83,14 +83,7 @@ fn wrap_fallible_body(body: TokenStream) -> TokenStream {
     // a parenthesized call (`lambda s: [f(x) for x in s]`) is as fallible
     // as one at the top level, and was left unwrapped in a non-Result
     // closure before (a rustc error).
-    fn contains_question(stream: TokenStream) -> bool {
-        stream.into_iter().any(|tt| match tt {
-            TokenTree::Punct(p) => p.as_char() == '?',
-            TokenTree::Group(g) => contains_question(g.stream()),
-            _ => false,
-        })
-    }
-    if !contains_question(body.clone()) {
+    if !crate::ast::tree::call::contains_question(body.clone()) {
         return body;
     }
     quote! {{

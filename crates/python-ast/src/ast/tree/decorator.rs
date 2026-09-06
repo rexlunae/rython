@@ -417,7 +417,17 @@ pub fn try_lru_cache_factory(
             let Some(key) = crate::module_defs_key(&options, &path) else {
                 return None;
             };
-            let (f, _) = crate::module_function_def(&options, key, &fn_name.id)?;
+            let (mut f, f_symbols) = crate::module_function_def(&options, key, &fn_name.id)?;
+            // The wrapper renders in THIS module, where the wrapped
+            // function's return annotation may name a type alias only ITS
+            // module binds (`-> CoherenceMatches` — charset_normalizer's
+            // cd.py, wrapped in api.py): expand the aliases in the
+            // defining module's terms (issue #333).
+            if let Some(returns) = f.returns.take() {
+                f.returns = Some(Box::new(crate::ast::tree::type_ctx::expand_type_alias_names(
+                    &returns, &f_symbols, options,
+                )));
+            }
             f
         }
         _ => return None,

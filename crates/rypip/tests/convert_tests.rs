@@ -9074,10 +9074,12 @@ fn imported_exception_classes_match_python_at_runtime() {
 #[test]
 fn a_class_name_two_modules_define_is_never_erased_by_the_exception_closure() {
     // `Node(Root)` (an exception through the chain) in one module and an
-    // ordinary `Node` in another: the crate-wide closure is keyed by bare
-    // name, so the ambiguous name stays out of it — the ordinary Node
-    // keeps its implementation, and the exclusion is a definition
-    // warning (Devin review on #330).
+    // ordinary `Node` in another: the module-qualified closure holds
+    // errors' Node and not tree's — the ordinary Node keeps its
+    // implementation, errors' Node raises and is caught as a `Root`, and
+    // no definition warning is needed (the exception Node is judged by
+    // its direct base, which the bare-name registry holds; Devin review
+    // on #330, issue #333).
     let scratch = Scratch::new("nodepkg");
     fs::write(
         scratch.path().join("pyproject.toml"),
@@ -9096,6 +9098,10 @@ fn a_class_name_two_modules_define_is_never_erased_by_the_exception_closure() {
             "\n",
             "class Node(Root):\n",
             "    pass\n",
+            "\n",
+            "\n",
+            "def fail() -> None:\n",
+            "    raise Node(\"bad node\")\n",
         ),
     )
     .unwrap();
@@ -9115,10 +9121,15 @@ fn a_class_name_two_modules_define_is_never_erased_by_the_exception_closure() {
         pkg.join("cli.py"),
         concat!(
             "from tree import Node\n",
+            "from errors import Root, fail\n",
             "\n",
             "\n",
             "def run() -> None:\n",
             "    print(Node(\"a\").label())\n",
+            "    try:\n",
+            "        fail()\n",
+            "    except Root as e:\n",
+            "        print(\"caught\", e)\n",
             "\n",
             "\n",
             "if __name__ == \"__main__\":\n",
@@ -9131,7 +9142,7 @@ fn a_class_name_two_modules_define_is_never_erased_by_the_exception_closure() {
     let pkg = rypip::discover(scratch.path()).expect("discover");
     let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
     assert!(
-        krate.warnings.iter().any(|w| w.contains("`Node` is defined by more than one module")),
+        !krate.warnings.iter().any(|w| w.contains("`Node` is defined by more than one module")),
         "warnings: {:?}",
         krate.warnings
     );
@@ -9144,7 +9155,7 @@ fn a_class_name_two_modules_define_is_never_erased_by_the_exception_closure() {
     // Verified against python3.
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
-        vec!["node:a"],
+        vec!["node:a", "caught bad node"],
         "the ordinary Node lost its implementation"
     );
 }
@@ -9779,6 +9790,515 @@ fn a_crate_import_alias_beside_a_local_class_of_its_name_is_the_source_modules_c
         krate.warnings.iter().any(|w| w.contains(
             "`BaseHTTPError` imports `HTTPError` of `base` beside the crate's own class `HTTPError` of the same name"
         )),
+        "warnings: {:?}",
+        krate.warnings
+    );
+}
+
+
+/// A multi-module package under `scratch/<pkg>/` with a `cli.py` entry
+/// (`if __name__ == "__main__": main()`), converted and built; the
+/// generated binary is `target/debug/<pkg>`.
+fn package_crate(scratch: &Scratch, pkg_name: &str, files: &[(&str, &str)]) -> rypip::convert::ConvertedCrate {
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        format!("[project]\nname = \"{pkg_name}\"\nversion = \"0.1.0\"\n"),
+    )
+    .unwrap();
+    let pkg = scratch.path().join(pkg_name);
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    for (file, source) in files {
+        fs::write(pkg.join(file), source).unwrap();
+    }
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert")
+}
+
+/// Build the package crate and run its binary; the stdout lines.
+fn run_package(krate: &rypip::convert::ConvertedCrate, pkg_name: &str) -> Vec<String> {
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join(format!("target/debug/{pkg_name}")))
+        .output()
+        .expect("running generated binary");
+    assert!(
+        output.status.success(),
+        "generated binary failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn a_local_shadowing_a_module_static_is_spelled_apart_at_runtime() {
+    // `LIMIT = compute() + 1` is a module value functions read (a promoted
+    // static); `scaled` binds a LOCAL of the same name (a store, then a
+    // loop target), `bump` a PARAMETER. rustc forbids a `let` or a
+    // parameter that shadows a static (E0530), and name.rs would read the
+    // static where Python reads the local: the local is spelled apart
+    // under the reserved prefix (requests' compat.py; issue #333).
+    let scratch = Scratch::new("shadowpkg");
+    let krate = package_crate(
+        &scratch,
+        "shadowpkg",
+        &[
+            (
+                "consts.py",
+                concat!(
+                    "def compute() -> int:\n",
+                    "    return 41\n",
+                    "\n",
+                    "\n",
+                    "LIMIT = compute() + 1\n",
+                    "\n",
+                    "\n",
+                    "def scaled(n: int) -> int:\n",
+                    "    LIMIT = n * 2\n",
+                    "    for LIMIT in [LIMIT + 1]:\n",
+                    "        pass\n",
+                    "    return LIMIT + 1\n",
+                    "\n",
+                    "\n",
+                    "def bump(LIMIT: int) -> int:\n",
+                    "    LIMIT += 1\n",
+                    "    return LIMIT\n",
+                    "\n",
+                    "\n",
+                    "def read() -> int:\n",
+                    "    return LIMIT\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .consts import scaled, bump, read\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(scaled(5), bump(10), read())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let consts = fs::read_to_string(krate.root.join("src/consts.rs")).unwrap();
+    assert!(consts.contains("__rython_local_LIMIT"), "the local was not spelled apart: {}", consts);
+    assert!(
+        consts.contains("pub static LIMIT"),
+        "the module value must stay the static functions read: {}",
+        consts
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "shadowpkg"), vec!["12 11 42"]);
+}
+
+#[test]
+fn a_class_derives_from_its_own_modules_exception_when_another_module_shares_the_name() {
+    // util.py defines an ordinary `Timeout`; errors.py defines the
+    // exception `Timeout(RequestException)` and `ReadTimeout(Timeout)`
+    // (requests' exceptions.py beside urllib3's util/timeout.py). The
+    // bare name is defined twice in the crate, so the bare-name registry
+    // cannot hold it — but `ReadTimeout` derives from ITS module's
+    // `Timeout`, which the module-qualified closure resolves: it is an
+    // exception class, caught by `except Timeout:` (issue #333).
+    let scratch = Scratch::new("twinpkg");
+    let krate = package_crate(
+        &scratch,
+        "twinpkg",
+        &[
+            (
+                "util.py",
+                concat!(
+                    "class Timeout:\n",
+                    "    def __init__(self, total: float) -> None:\n",
+                    "        self.total = total\n",
+                    "\n",
+                    "    def label(self) -> str:\n",
+                    "        return \"timeout \" + str(self.total)\n",
+                ),
+            ),
+            (
+                "errors.py",
+                concat!(
+                    "class RequestException(IOError):\n",
+                    "    pass\n",
+                    "\n",
+                    "\n",
+                    "class Timeout(RequestException):\n",
+                    "    pass\n",
+                    "\n",
+                    "\n",
+                    "class ReadTimeout(Timeout):\n",
+                    "    pass\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .errors import ReadTimeout, Timeout\n",
+                    "from .util import Timeout as PoolTimeout\n",
+                    "\n",
+                    "\n",
+                    "def read() -> None:\n",
+                    "    raise ReadTimeout(\"slow\")\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    try:\n",
+                    "        read()\n",
+                    "    except Timeout as e:\n",
+                    "        print(\"caught\", e)\n",
+                    "    print(PoolTimeout(2.5).label())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let errors = fs::read_to_string(krate.root.join("src/errors.rs")).unwrap();
+    assert!(
+        errors.contains("pub struct ReadTimeout;"),
+        "ReadTimeout must lower as an exception marker: {}",
+        errors
+    );
+    assert!(!errors.contains("TimeoutTrait"), "no hierarchy traits over an exception: {}", errors);
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "twinpkg"), vec!["caught slow", "timeout 2.5"]);
+}
+
+#[test]
+fn a_wrapped_functions_alias_return_type_expands_in_the_wrapping_module() {
+    // models.py binds the type aliases, cd.py's `ratio` returns `Pairs`,
+    // and api.py wraps it with `lru_cache(maxsize=8)(ratio)`: the wrapper
+    // renders in api.py, which never bound `Pairs` — the alias expands to
+    // its type in the defining module's terms (charset_normalizer's
+    // `CoherenceMatches`; issue #333).
+    let scratch = Scratch::new("lrupkg");
+    let krate = package_crate(
+        &scratch,
+        "lrupkg",
+        &[
+            ("models.py", concat!("Pair = tuple[str, float]\n", "Pairs = list[Pair]\n")),
+            (
+                "cd.py",
+                concat!(
+                    "from .models import Pairs\n",
+                    "\n",
+                    "\n",
+                    "def ratio(text: str) -> Pairs:\n",
+                    "    return [(text, float(len(text)))]\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from functools import lru_cache\n",
+                    "\n",
+                    "from .cd import ratio\n",
+                    "\n",
+                    "cached_ratio = lru_cache(maxsize=8)(ratio)\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(cached_ratio(\"abc\"), cached_ratio(\"abc\"))\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // (A call to the wrapper from another module than the wrapped function's
+    // is not yet `?`-propagated — a separate gap; this pins the type.)
+    let cli = fs::read_to_string(krate.root.join("src/cli.rs")).unwrap();
+    assert!(
+        cli.contains("-> Result<Vec<(String, f64)>, PyException>"),
+        "the alias must expand to its type in the wrapper: {}",
+        cli
+    );
+    assert!(!cli.contains("Pairs"), "the wrapper must not name the unbound alias: {}", cli);
+}
+
+#[test]
+fn a_typed_dict_return_type_under_type_checking_is_a_dict() {
+    // `class ResultDict(TypedDict)` under `if TYPE_CHECKING:` is never a
+    // runtime item, and a TypedDict IS a dict: `-> ResultDict` types the
+    // returned dict literal as the boxed-value dict instead of naming a
+    // struct the crate never generates (charset_normalizer's legacy.py;
+    // issue #333).
+    let scratch = Scratch::new("tdpkg");
+    let krate = package_crate(
+        &scratch,
+        "tdpkg",
+        &[
+            (
+                "legacy.py",
+                concat!(
+                    "from __future__ import annotations\n",
+                    "\n",
+                    "from typing import TYPE_CHECKING\n",
+                    "\n",
+                    "if TYPE_CHECKING:\n",
+                    "    from typing import TypedDict\n",
+                    "\n",
+                    "    class ResultDict(TypedDict):\n",
+                    "        encoding: str | None\n",
+                    "        confidence: float | None\n",
+                    "\n",
+                    "\n",
+                    "def detect(data: bytes) -> ResultDict:\n",
+                    "    return {\"encoding\": \"utf_8\", \"confidence\": 1.0}\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .legacy import detect\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    r = detect(b\"abc\")\n",
+                    "    print(r[\"encoding\"], r[\"confidence\"])\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let legacy = fs::read_to_string(krate.root.join("src/legacy.rs")).unwrap();
+    assert!(!legacy.contains("ResultDict"), "the TYPE_CHECKING class must not be named: {}", legacy);
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "tdpkg"), vec!["utf_8 1.0"]);
+}
+
+#[test]
+fn a_module_value_stored_only_under_an_import_guard_is_visible_to_functions() {
+    // `CTX` is stored twice inside a `try: import json ...` guard (the
+    // guard folds to its body, so both stores are top level at emission)
+    // and read by `size()`: a module-init local would be invisible to the
+    // function (E0425). It is a mutable static — the first store its
+    // initializer, the second a write-through (requests' adapters.py
+    // `_preloaded_ssl_context`; issue #333).
+    let scratch = Scratch::new("initpkg");
+    let krate = package_crate(
+        &scratch,
+        "initpkg",
+        &[
+            (
+                "a.py",
+                concat!(
+                    "def build() -> str:\n",
+                    "    return \"ctx\"\n",
+                    "\n",
+                    "\n",
+                    "try:\n",
+                    "    import json\n",
+                    "\n",
+                    "    CTX = build()\n",
+                    "    CTX = CTX + \"!\"\n",
+                    "except ImportError:\n",
+                    "    CTX = None\n",
+                    "\n",
+                    "\n",
+                    "def size() -> int:\n",
+                    "    return len(CTX)\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .a import size\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(size())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let a = fs::read_to_string(krate.root.join("src/a.rs")).unwrap();
+    assert!(a.contains("pub static CTX"), "the module value must be a static: {}", a);
+    assert!(a.contains("py_global_write(&*CTX"), "the second store must write through: {}", a);
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "initpkg"), vec!["4"]);
+}
+
+#[test]
+fn sibling_module_bodies_run_at_startup_in_dependency_order() {
+    // Python runs a module's top-level statements when it is first
+    // imported: `cli` imports `a`, `a` imports `b` — b's body, a's body,
+    // then the entry's. The crate has no import step, so the entry's
+    // `main` runs each sibling's `__module_init__` in that order before
+    // its own (issue #333).
+    let scratch = Scratch::new("startpkg");
+    let krate = package_crate(
+        &scratch,
+        "startpkg",
+        &[
+            (
+                "b.py",
+                concat!(
+                    "print(\"init b\")\n",
+                    "\n",
+                    "\n",
+                    "def names() -> str:\n",
+                    "    return \"b\"\n",
+                ),
+            ),
+            (
+                "a.py",
+                concat!(
+                    "from .b import names\n",
+                    "\n",
+                    "print(\"init a\")\n",
+                    "\n",
+                    "\n",
+                    "def report() -> str:\n",
+                    "    return names() + \",a\"\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .a import report\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(report())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let main = fs::read_to_string(krate.root.join("src/main.rs")).unwrap();
+    let b_at = main.find("crate::b::__module_init__()?").expect("b's init runs");
+    let a_at = main.find("crate::a::__module_init__()?").expect("a's init runs");
+    assert!(b_at < a_at, "the imported module's body runs first: {}", main);
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "startpkg"), vec!["init b", "init a", "b,a"]);
+}
+
+#[test]
+fn a_package_root_init_with_statements_warns_that_they_do_not_run() {
+    // The package root `__init__` is the lib root, which the binary does
+    // not contain (it compiles the sibling modules as its own): a
+    // statement there (`configure()`) never runs for the binary. That is
+    // said, not silently skipped (issue #333).
+    let scratch = Scratch::new("rootinit");
+    let krate = package_crate(
+        &scratch,
+        "rootinit",
+        &[
+            (
+                "__init__.py",
+                concat!(
+                    "\"\"\"A package.\"\"\"\n",
+                    "from .cfg import configure\n",
+                    "\n",
+                    "VERSION = \"1\"\n",
+                    "configure()\n",
+                ),
+            ),
+            (
+                "cfg.py",
+                concat!(
+                    "def configure() -> None:\n",
+                    "    print(\"configured\")\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "def main() -> None:\n",
+                    "    print(\"run\")\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    assert!(
+        krate.warnings.iter().any(|w| w.contains("module-level statements in the package `__init__` do not run")),
+        "warnings: {:?}",
+        krate.warnings
+    );
+    assert_eq!(run_package(&krate, "rootinit"), vec!["run"]);
+}
+
+#[test]
+fn an_external_import_bound_as_a_name_a_crate_module_also_binds_reads_as_the_external_value() {
+    // `from cryptography import __version__ as cryptography_version` under
+    // an `if` inside an import guard, beside the crate's own `__version__`
+    // module: the alias hop lands on the crate's item, but the binding is
+    // the external one — the read is the boxed None with the external
+    // divergence warning, never a dangling identifier (requests'
+    // __init__.py; issue #333). The resolvable `import json` keeps the
+    // guard (a guard whose imports all fail folds to its handler). Not a
+    // runtime transcript: CPython without the package raises ImportError
+    // there; rython's imports are static.
+    let scratch = Scratch::new("extverpkg");
+    let krate = package_crate(
+        &scratch,
+        "extverpkg",
+        &[
+            ("__version__.py", "__version__ = \"1.0\"\n"),
+            (
+                "core.py",
+                concat!(
+                    "from .__version__ import __version__\n",
+                    "\n",
+                    "\n",
+                    "def flag() -> bool:\n",
+                    "    return False\n",
+                    "\n",
+                    "\n",
+                    "def check(v) -> None:\n",
+                    "    print(\"checked\", v)\n",
+                    "\n",
+                    "\n",
+                    "try:\n",
+                    "    import json\n",
+                    "\n",
+                    "    if flag():\n",
+                    "        from cryptography import __version__ as cryptography_version\n",
+                    "\n",
+                    "        check(cryptography_version)\n",
+                    "except ImportError:\n",
+                    "    pass\n",
+                ),
+            ),
+        ],
+    );
+    let core = fs::read_to_string(krate.root.join("src/core.rs")).unwrap();
+    assert!(
+        core.contains("check(stdpython::PyValue::None_)"),
+        "the external binding must read as the boxed None: {}",
+        core
+    );
+    assert!(
+        krate.warnings.iter().any(|w| w.contains("`cryptography_version` is dropped")),
         "warnings: {:?}",
         krate.warnings
     );

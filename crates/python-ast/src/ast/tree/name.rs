@@ -341,11 +341,17 @@ impl CodeGen for Name {
             // import has no runtime item, so the read lowers to the boxed
             // None (external-module divergence, the same model call.rs and
             // attribute.rs use for external imports).
+            // An `as` binding of an external import whose bare name a
+            // crate module ALSO binds (`from cryptography import
+            // __version__ as cryptography_version` beside requests' own
+            // `__version__`): the alias hop lands on the crate's item, but
+            // the binding is the external one (issue #333).
             if crate::ast::tree::import::resolves_to_external_import(
                 &self.id,
                 &options,
                 &symbols,
-            ) {
+            ) || crate::ast::tree::module::aliased_external_import(&self.id, &options)
+            {
                 options.definition_warnings.borrow_mut().push(format!(
                     "`{}` is dropped: it is imported from a module that is \
                      external to the generated crate (external-module divergence)",

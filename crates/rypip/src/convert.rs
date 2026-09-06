@@ -1993,11 +1993,27 @@ pub fn convert(
             transpiled.push((module, code));
         }
     }
+    // The entry module's `main` runs every sibling's module body at
+    // startup, in dependency order (issue #333): Python runs a module's
+    // top-level statements when it is first imported; the crate has no
+    // import step.
+    let by_path = modules_by_path(package, &python_deps);
+    let mut entry_options = base_options.clone();
+    if let Some(entry) = package.entry_module() {
+        entry_options.startup_module_inits =
+            std::rc::Rc::new(startup_module_inits(entry, &by_path, &reachable));
+        warn_root_init_statements(package, entry, &mut warnings);
+    }
     for module in &package.modules {
         if !reachable.contains(&module.path) {
             continue;
         }
-        let code = transpile(module, &mut warnings, &base_options)?;
+        let options = if entry_file.as_ref() == Some(&module.file) {
+            &entry_options
+        } else {
+            &base_options
+        };
+        let code = transpile(module, &mut warnings, options)?;
         transpiled.push((module, code));
     }
     // An entry module named `main` (path ["main"]) is bin-only: its module
@@ -3747,9 +3763,28 @@ fn reachable_module_paths(
     package: &PyPackage,
     deps: &[(String, PyPackage)],
 ) -> std::collections::HashSet<Vec<String>> {
-    
-    use std::collections::{HashMap, HashSet, VecDeque};
+    let by_path = modules_by_path(package, deps);
+    let mut reachable: HashSet<Vec<String>> = HashSet::new();
+    let mut queue: VecDeque<Vec<String>> = VecDeque::new();
+    for m in &package.modules {
+        queue.push_back(m.path.clone());
+    }
+    while let Some(path) = queue.pop_front() {
+        if !reachable.insert(path.clone()) {
+            continue;
+        }
+        let Some(module) = by_path.get(&path) else { continue };
+        queue.extend(crate_imports_of(module, &by_path));
+    }
+    reachable
+}
 
+/// Every module the crate may emit — the package's own and its vendored
+/// python-module deps' — by module path.
+fn modules_by_path<'a>(
+    package: &'a PyPackage,
+    deps: &'a [(String, PyPackage)],
+) -> HashMap<Vec<String>, &'a PyModule> {
     let mut by_path: HashMap<Vec<String>, &PyModule> = HashMap::new();
     for (_, dep) in deps {
         for m in &dep.modules {
@@ -3759,30 +3794,107 @@ fn reachable_module_paths(
     for m in &package.modules {
         by_path.insert(m.path.clone(), m);
     }
+    by_path
+}
 
-    let mut reachable: HashSet<Vec<String>> = HashSet::new();
+/// The crate modules `module` imports, in source order, each once:
+/// module-level and function-local imports alike (the one import walk,
+/// shared by reachability and the startup order).
+fn crate_imports_of(
+    module: &PyModule,
+    by_path: &HashMap<Vec<String>, &PyModule>,
+) -> Vec<Vec<String>> {
+    // Parse with the RELATIVE module filename (like `transpile` does):
+    // parse_enhanced derives the module name from the filename, and an
+    // absolute path produces an invalid identifier (`__home__tserica__...`)
+    // which fails parsing and silently drops every import of the module.
+    let Ok(ast) = python_ast::parse_enhanced(&module.source, parse_filename(module)) else {
+        return Vec::new();
+    };
     let mut queue: VecDeque<Vec<String>> = VecDeque::new();
-    for m in &package.modules {
-        queue.push_back(m.path.clone());
+    for stmt in &ast.raw.body {
+        reachable_walk_imports(stmt, module, &module.path, by_path, &mut queue);
     }
+    let mut seen: HashSet<Vec<String>> = HashSet::new();
+    queue.into_iter().filter(|p| seen.insert(p.clone())).collect()
+}
 
-    while let Some(path) = queue.pop_front() {
-        if !reachable.insert(path.clone()) {
-            continue;
+/// The modules whose bodies the entry binary runs at startup, in the
+/// order Python would run them when importing the entry: a depth-first
+/// post-order over crate imports from the entry (a module's imports before
+/// the module, each module once, an import cycle broken at the module
+/// already being entered — Python's partially-initialized module). The
+/// entry itself runs last (its own `__module_init__`), and the package root
+/// `__init__` is excluded: the bin crate compiles the sibling modules as
+/// its own and does not contain the lib root at all (see
+/// `warn_root_init_statements`).
+fn startup_module_inits(
+    entry: &PyModule,
+    by_path: &HashMap<Vec<String>, &PyModule>,
+    reachable: &HashSet<Vec<String>>,
+) -> Vec<Vec<String>> {
+    fn visit(
+        path: &[String],
+        by_path: &HashMap<Vec<String>, &PyModule>,
+        reachable: &HashSet<Vec<String>>,
+        visiting: &mut HashSet<Vec<String>>,
+        order: &mut Vec<Vec<String>>,
+    ) {
+        if !visiting.insert(path.to_vec()) {
+            return;
         }
-        let Some(module) = by_path.get(&path) else { continue };
-        // Parse with the RELATIVE module filename (like `transpile` does):
-        // parse_enhanced derives the module name from the filename, and an
-        // absolute path produces an invalid identifier (`__home__tserica__...`)
-        // which fails parsing and silently drops every import of the module.
-        let Ok(ast) = python_ast::parse_enhanced(&module.source, parse_filename(module)) else {
-            continue;
-        };
-        for stmt in &ast.raw.body {
-            reachable_walk_imports(stmt, module, &path, &by_path, &mut queue);
+        let Some(module) = by_path.get(path) else { return };
+        for dep in crate_imports_of(module, by_path) {
+            visit(&dep, by_path, reachable, visiting, order);
+        }
+        if !path.is_empty() && reachable.contains(path) {
+            order.push(path.to_vec());
         }
     }
-    reachable
+    let mut visiting = HashSet::new();
+    let mut order = Vec::new();
+    visit(&entry.path, by_path, reachable, &mut visiting, &mut order);
+    order.retain(|p| p != &entry.path);
+    order
+}
+
+/// The package root `__init__` (path `[]`) becomes the lib root, which the
+/// bin crate does not compile (it declares the sibling modules itself), so
+/// its module-level STATEMENTS never run for the binary: say so instead of
+/// silently skipping them. Imports, defs, classes, docstrings and plain
+/// assignments (which lower to items and statics) are not statements the
+/// startup sequence would run.
+fn warn_root_init_statements(package: &PyPackage, entry: &PyModule, warnings: &mut Vec<String>) {
+    use python_ast::ast::tree::{ExprType, StatementType};
+    let Some(root) = package.modules.iter().find(|m| m.path.is_empty()) else {
+        return;
+    };
+    if root.file == entry.file {
+        return;
+    }
+    let Ok(ast) = python_ast::parse_enhanced(&root.source, parse_filename(root)) else {
+        return;
+    };
+    let runs_at_import = ast.raw.body.iter().any(|s| match &s.statement {
+        StatementType::Import(_)
+        | StatementType::ImportFrom(_)
+        | StatementType::FunctionDef(_)
+        | StatementType::AsyncFunctionDef(_)
+        | StatementType::ClassDef(_)
+        | StatementType::Assign(_)
+        | StatementType::AnnotatedName { .. }
+        | StatementType::Pass => false,
+        StatementType::Expr(e) => !matches!(e.value, ExprType::Constant(_)),
+        _ => true,
+    });
+    if runs_at_import {
+        warnings.push(format!(
+            "{}: module-level statements in the package `__init__` do not run when the \
+             binary starts (the binary compiles the package's modules as its own and does \
+             not contain the package root); move startup side effects into the entry module",
+            parse_filename(root),
+        ));
+    }
 }
 
 /// Walk one statement for imports to enqueue, recursing into nested
