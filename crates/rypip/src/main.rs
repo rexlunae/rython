@@ -90,6 +90,30 @@ enum Cmd {
         #[arg(long)]
         no_deps: bool,
     },
+    /// Convert, build and run a Python program, like `python program.py`:
+    /// the arguments after the package path (or after `--`) are the
+    /// program's, its output is yours, and its exit status is rypip's.
+    Run {
+        /// Path to a Python package directory or a single .py file.
+        package: PathBuf,
+        /// Where to write the generated crate (defaults to a directory under
+        /// the system temp dir, reused across runs so rebuilds are
+        /// incremental).
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        stdpython: Option<PathBuf>,
+        /// How to treat lossy-conversion warnings: warn, deny, or allow.
+        #[arg(long, short = 'W', value_enum, default_value_t = WarningMode::Warn)]
+        warnings: WarningMode,
+        /// Skip resolving the packaging metadata's dependencies against
+        /// PyPI.
+        #[arg(long)]
+        no_deps: bool,
+        /// The program's own arguments (sys.argv[1:]).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
     /// Build a Python package as a native binary and install it where cargo
     /// installs binaries (~/.cargo/bin unless --root is given).
     Install {
@@ -177,6 +201,47 @@ fn main() -> Result<()> {
             report_warnings(&krate);
             rypip::cargo_build(&krate)?;
             println!("built `{}` in {}", krate.name, krate.root.display());
+        }
+        Cmd::Run {
+            package,
+            out,
+            stdpython,
+            warnings,
+            no_deps,
+            args,
+        } => {
+            let pkg = rypip::discover(&package)?;
+            let out = out.unwrap_or_else(|| work_dir(&pkg.name));
+            let krate = rypip::convert(
+                &pkg,
+                &out,
+                &ConvertOptions {
+                    pyo3: false,
+                    stdpython_path: stdpython,
+                    warnings,
+                    no_std: false,
+                    kernel_module: false,
+                    driver: false,
+                    rust_for_linux: false,
+                    no_deps,
+                },
+            )?;
+            report_warnings(&krate);
+            let status = rypip::cargo_run(&krate, &args)?;
+            // The program's exit status is ours: the code as is; a signal
+            // death as the shell reports it (128 + the signal number).
+            let code = status.code().unwrap_or_else(|| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    128 + status.signal().unwrap_or(0)
+                }
+                #[cfg(not(unix))]
+                {
+                    1
+                }
+            });
+            std::process::exit(code);
         }
         Cmd::Install {
             package,
