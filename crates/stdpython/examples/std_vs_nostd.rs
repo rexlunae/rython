@@ -7,7 +7,7 @@ fn main() {
     println!("=== STD MODE EXAMPLE ===");
     
     // Standard I/O operations available
-    print("Hello from std mode!");
+    print("Hello from std mode!").unwrap();
     
     // File operations available
     match open("example.txt", Some("w")) {

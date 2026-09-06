@@ -2242,11 +2242,14 @@ fn calls_to_user_functions_propagate_with_question_mark() {
     let out = compile(src, "prop.py");
     assert!(out.contains("helper () ?"), "generated: {}", out);
 
-    // Builtins that don't raise stay plain (print takes its argument by
-    // reference).
+    // print raises too since round 6 of the review on #339 (sys.stdout
+    // may be closed through a FileType("-") handle): its call carries the
+    // `?` like every fallible builtin, by reference still.
     let out = compile("def f(x: int):\n    print(x)\n", "plaincall.py");
-    assert!(out.contains("print (& (x))"), "generated: {}", out);
-    assert!(!out.contains("print (& (x)) ?"), "generated: {}", out);
+    assert!(out.contains("print (& (x)) ?"), "generated: {}", out);
+    // A builtin that cannot raise stays plain.
+    let out = compile("def f(xs: list[int]) -> int:\n    return len(xs)\n", "plainlen.py");
+    assert!(out.contains("len (") && !out.contains("len (& (xs)) ?"), "generated: {}", out);
 }
 
 #[test]
@@ -5788,8 +5791,10 @@ fn print_sep_end_flush_keywords_map() {
 
 #[test]
 fn print_zero_and_single_arg_shapes() {
+    // A bare print() goes through the runtime too (round 6 of the review
+    // on #339: sys.stdout may be closed), never a bare println!.
     let out = compile("def f():\n    print()\n", "pr4.py");
-    assert!(out.contains("println ! ()"), "generated: {}", out);
+    assert!(out.contains("print_parts (& [] as & [& str] , \"\" , \"\\n\") ?"), "generated: {}", out);
 
     // print(end="") with no arguments still needs a typed empty slice.
     let out = compile("def f():\n    print(end='')\n", "pr5.py");
@@ -6842,6 +6847,21 @@ fn update_file_modes_are_refused_at_conversion() {
         (
             "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"f\", choices=[\"a\"])\n",
             "keyword 'choices' is not supported yet",
+        ),
+        // An option string already registered (a previous argument's
+        // short or long alias, or -h/--help) is CPython's ArgumentError
+        // at add_argument: refused (round 6).
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--value\", dest=\"first\", default=\"a\")\n    p.add_argument(\"-x\", \"--value\", dest=\"second\", default=\"b\")\n",
+            "argument -x/--value: conflicting option string: --value",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"-x\", \"--one\", default=\"a\")\n    p.add_argument(\"-x\", \"--two\", default=\"b\")\n",
+            "argument -x/--two: conflicting option string: -x",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"-h\", \"--hh\", action=\"store_true\")\n",
+            "argument -h/--hh: conflicting option string: -h",
         ),
         // A positional store_true consumes no token in CPython (the flag
         // is simply True): refused rather than modeled as a value

@@ -7295,6 +7295,74 @@ fn argparse_usage_and_help_wrap_at_the_terminal_width() {
 }
 
 #[test]
+fn closing_a_dash_stream_closes_it_for_print_and_input_too() {
+    // Round 6 of the review on #339: `FileType("r")("-")` IS sys.stdin and
+    // `FileType("w")("-")` IS sys.stdout, so closing one closes the stream
+    // every builtin uses — a later `input()` and a later `print()` are
+    // CPython's `ValueError: I/O operation on closed file.` (the print
+    // failure is recorded in a file, since stdout is gone). Transcript
+    // captured from python3 3.11 with piped stdin.
+    let scratch = Scratch::new("apclosed");
+    let file = scratch.path().join("closed.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"closed\")\n",
+            "    parser.add_argument(\"src\", type=argparse.FileType(\"r\"))\n",
+            "    parser.add_argument(\"out\", type=argparse.FileType(\"w\"))\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(\"before\", args.src.read().strip())\n",
+            "    args.src.close()\n",
+            "    try:\n",
+            "        input()\n",
+            "    except ValueError as e:\n",
+            "        print(\"input:\", e)\n",
+            "    args.out.write(\"written\\n\")\n",
+            "    args.out.flush()\n",
+            "    args.out.close()\n",
+            "    with open(\"after.txt\", \"w\") as log:\n",
+            "        try:\n",
+            "            print(\"after\")\n",
+            "        except ValueError as e:\n",
+            "            log.write(\"print: \" + str(e) + \"\\n\")\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(scratch.path().join("input.txt"), "piped\n").unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/closed");
+    let output = Command::new(&bin)
+        .args(["-", "-"])
+        .current_dir(scratch.path())
+        .stdin(fs::File::open(scratch.path().join("input.txt")).unwrap())
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "before piped\ninput: I/O operation on closed file.\nwritten\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(
+        fs::read_to_string(scratch.path().join("after.txt")).unwrap(),
+        "print: I/O operation on closed file.\n"
+    );
+}
+
+#[test]
 fn binary_filetype_and_binary_open_match_python_at_runtime() {
     // Issue #332: `type=argparse.FileType("rb")` with `nargs="*"` (zero
     // files is an empty list), and `open(p, "wb")` / `open(p, "rb")` —

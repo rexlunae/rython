@@ -2273,7 +2273,7 @@ impl<'a> CodeGen for Call {
                     | "issubclass"
                     | "hash"
                     | "print"
-                    | "open"
+                    | "open" | "input"
                     | "round"
                     | "divmod"
                     | "bytes"
@@ -3461,7 +3461,10 @@ impl<'a> CodeGen for Call {
                         };
                         if sep.is_none() && end.is_none() && flush.is_none() {
                             match rendered.as_slice() {
-                                [] => return Ok(quote!(println!())),
+                                // print() is fallible: sys.stdout may have
+                                // been closed through a `FileType("-")`
+                                // handle (Devin review on #339, round 6).
+                                [] => return Ok(quote!(print_parts(&[] as &[&str], "", "\n")?)),
                                 // A BYTES argument prints its CPython form
                                 // (`b'ab'`), not the int-list the blanket
                                 // Vec<T> display renders (issue #137): route
@@ -3474,9 +3477,9 @@ impl<'a> CodeGen for Call {
                                         &symbols,
                                     ) {
                                         let runtime = crate::safe_ident(&options.stdpython);
-                                        return Ok(quote!(print(&(#runtime::py_bytes_repr(&(#a))))));
+                                        return Ok(quote!(print(&(#runtime::py_bytes_repr(&(#a))))?));
                                     }
-                                    return Ok(quote!(print(&(#a))));
+                                    return Ok(quote!(print(&(#a))?));
                                 }
                                 _ => {}
                             }
@@ -3497,10 +3500,29 @@ impl<'a> CodeGen for Call {
                             quote!(&[#(py_display(&(#rendered))),*])
                         };
                         return Ok(match flush {
-                            None => quote!(print_parts(#parts, #sep, #end)),
+                            None => quote!(print_parts(#parts, #sep, #end)?),
                             Some(f) => {
                                 let f = render(f)?;
-                                quote!(print_parts_flush(#parts, #sep, #end, #f))
+                                quote!(print_parts_flush(#parts, #sep, #end, #f)?)
+                            }
+                        });
+                    }
+                    "input" => {
+                        // input([prompt]): the runtime reads sys.stdin (and
+                        // writes the prompt to sys.stdout) — both fallible:
+                        // EOFError at end of input, the closed-file
+                        // ValueError after a `FileType("-")` close (Devin
+                        // review on #339, round 6).
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        return Ok(match rendered.as_slice() {
+                            [] => quote!(input(None::<&str>)?),
+                            [p] => quote!(input(Some(#p))?),
+                            _ => {
+                                return Err("input() takes at most one argument (the prompt)"
+                                    .to_string()
+                                    .into())
                             }
                         });
                     }

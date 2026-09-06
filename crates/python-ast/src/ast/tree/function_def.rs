@@ -657,6 +657,35 @@ pub(crate) fn scan_argparse(
                     )
                     .into());
                 }
+                // An option string already registered — by a previous
+                // add_argument's short or long alias, or the parser's own
+                // -h/--help — is CPython's ArgumentError at add_argument
+                // (`argument -x/--two: conflicting option string: -x`):
+                // refused here, since the runtime would otherwise resolve
+                // the first registration (Devin review on #339, round 6).
+                if !is_positional {
+                    let mine: Vec<&str> = short.iter().map(String::as_str).chain([name.as_str()]).collect();
+                    let taken = |candidate: &str| -> bool {
+                        candidate == "-h"
+                            || candidate == "--help"
+                            || specs.iter().any(|s: &ArgparseSpec| {
+                                !s.name.starts_with('-') == false
+                                    && (s.name == candidate || s.short.as_deref() == Some(candidate))
+                            })
+                    };
+                    let conflicts: Vec<&str> = mine.iter().copied().filter(|c| taken(c)).collect();
+                    if !conflicts.is_empty() {
+                        return Err(format!(
+                            "add_argument('{}'): argument {}: conflicting option string{}: {} \
+                             (Python raises argparse.ArgumentError at add_argument)",
+                            name,
+                            mine.join("/"),
+                            if conflicts.len() > 1 { "s" } else { "" },
+                            conflicts.join(", ")
+                        )
+                        .into());
+                    }
+                }
                 if nargs.is_some() && specs.iter().any(|s: &ArgparseSpec| s.nargs.is_some()) {
                     return Err(format!(
                         "add_argument('{}'): only one variadic (nargs) positional is \

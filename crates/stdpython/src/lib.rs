@@ -321,21 +321,34 @@ pub fn py_display<T: PyDisplay + ?Sized>(x: &T) -> String {
 /// Python print() with a single argument and default sep/end.
 /// Note: Only available with `std` feature - requires OS I/O capabilities
 #[cfg(feature = "std")]
-pub fn print<T: PyDisplay>(object: T) {
-    println!("{}", object.py_display());
+pub fn print<T: PyDisplay>(object: T) -> Result<(), PyException> {
+    print_parts(&[object.py_display()], "", "\n")?;
+    Ok(())
 }
 
 /// Python print() with multiple arguments and/or explicit sep=/end=:
 /// the arguments arrive pre-rendered through py_display.
 /// Note: Only available with `std` feature - requires OS I/O capabilities
 #[cfg(feature = "std")]
-pub fn print_parts<S: AsRef<str>, Sep: AsRef<str>, E: AsRef<str>>(parts: &[S], sep: Sep, end: E) {
+pub fn print_parts<S: AsRef<str>, Sep: AsRef<str>, E: AsRef<str>>(
+    parts: &[S],
+    sep: Sep,
+    end: E,
+) -> Result<(), PyException> {
+    // print() writes to sys.stdout — the ONE stdout object, which a
+    // `FileType("w")("-")` handle can have closed: then this is
+    // CPython's `ValueError: I/O operation on closed file.` (Devin review
+    // on #339, round 6).
+    if stdout_closed() {
+        return Err(closed_file_error());
+    }
     let output = parts
         .iter()
         .map(|p| p.as_ref())
         .collect::<Vec<_>>()
         .join(sep.as_ref());
     print!("{}{}", output, end.as_ref());
+    Ok(())
 }
 
 /// print(..., flush=True): as print_parts, then flush stdout when asked.
@@ -346,14 +359,15 @@ pub fn print_parts_flush<S: AsRef<str>, Sep: AsRef<str>, E: AsRef<str>>(
     sep: Sep,
     end: E,
     flush: bool,
-) {
-    print_parts(parts, sep, end);
+) -> Result<(), PyException> {
+    print_parts(parts, sep, end)?;
     if flush {
         use std::io::Write;
         std::io::stdout()
             .flush()
-            .expect("print(flush=True): I/O error flushing stdout");
+            .map_err(|e| runtime_error(&format!("I/O error flushing stdout: {}", e)))?;
     }
+    Ok(())
 }
 
 /// No-std version of print - stores output in a string instead of printing
@@ -7074,7 +7088,13 @@ pub const __name__: &str = "__main__";
 #[cfg(feature = "std")]
 pub fn input<P: AsRef<str>>(prompt: Option<P>) -> Result<String, PyException> {
     use std::io::{self, Write};
-    
+
+    // input() reads sys.stdin and writes its prompt to sys.stdout — the
+    // one object each, closed process-wide by a `FileType("-")` handle's
+    // close(): CPython's closed-file ValueError then (round 6).
+    if stdin_closed() || stdout_closed() {
+        return Err(closed_file_error());
+    }
     if let Some(p) = prompt {
         print!("{}", p.as_ref());
         io::stdout().flush().map_err(|e| runtime_error(&format!("I/O error: {}", e)))?;
