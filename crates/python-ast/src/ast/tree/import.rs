@@ -495,7 +495,17 @@ pub(crate) fn imported_crate_modules(
         crate::StatementType::ImportFrom(i) => {
             let base = i.resolved_module_path(options);
             push_chain(&base, &mut out);
+            // A from-list name is the package's own attribute when the
+            // package binds it; only otherwise does Python import the
+            // submodule of that name (Devin review on #338).
+            let package_key = crate::module_defs_key(options, &base).map(<[String]>::to_vec);
             for a in &i.names {
+                if package_key
+                    .as_deref()
+                    .is_some_and(|key| module_binds_name(options, key, &a.name))
+                {
+                    continue;
+                }
                 let mut sub = base.clone();
                 sub.push(a.name.clone());
                 push_chain(&sub, &mut out);
@@ -504,6 +514,36 @@ pub(crate) fn imported_crate_modules(
         _ => {}
     }
     out
+}
+
+/// Whether the crate module at `key` binds `name` in its own body (a
+/// def, a class, a store, an import alias — under control flow too, a
+/// def's locals excluded): the package attribute a `from package import
+/// name` finds before falling back to the submodule `package.name`.
+fn module_binds_name(options: &PythonOptions, key: &[String], name: &str) -> bool {
+    use crate::ast::tree::visit::{any_stmt, stmt_targets, target_names, Descend};
+    let Some(module) = options.module_defs.get(key) else {
+        return false;
+    };
+    let module: &crate::Module = module;
+    any_stmt(&module.raw.body, Descend::SkipDefs, |s| match &s.statement {
+        crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
+            f.name == name
+        }
+        crate::StatementType::ClassDef(c) => c.name == name,
+        crate::StatementType::AnnotatedName { name: n, .. } => n == name,
+        crate::StatementType::Import(i) => i.names.iter().any(|a| {
+            a.asname.as_deref().unwrap_or_else(|| a.name.split('.').next().unwrap_or(&a.name))
+                == name
+        }),
+        crate::StatementType::ImportFrom(i) => i
+            .names
+            .iter()
+            .any(|a| a.asname.as_deref().unwrap_or(&a.name) == name),
+        _ => stmt_targets(s)
+            .into_iter()
+            .any(|t| target_names(t).contains(&name)),
+    })
 }
 
 /// The `__module_init__` calls for the modules an import loads, in

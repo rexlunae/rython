@@ -10574,6 +10574,115 @@ fn an_imported_class_rebound_by_a_store_or_a_def_is_no_longer_a_base() {
 }
 
 #[test]
+fn a_from_import_of_a_package_attribute_does_not_load_the_same_named_submodule() {
+    // `from . import name` where the package binds `name` and also has a
+    // name.py: Python takes the attribute and never runs name.py (Devin
+    // review on #338). The importer is a sibling module: the entry's own
+    // code sits at the bin root beside the `mod name;` declaration, where
+    // a `use crate::name` of the attribute collides with the module
+    // (E0255, loud) — a layout limit outside this round.
+    let scratch = Scratch::new("attrpkg");
+    let krate = package_crate(
+        &scratch,
+        "attrpkg",
+        &[
+            ("__init__.py", "name = \"attr\"\n"),
+            ("name.py", "print(\"submodule loaded\")\nname = \"sub\"\n"),
+            (
+                "helper.py",
+                concat!(
+                    "from . import name\n",
+                    "\n",
+                    "\n",
+                    "def show() -> None:\n",
+                    "    print(name)\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .helper import show\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    show()\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let helper = fs::read_to_string(krate.root.join("src/helper.rs")).unwrap();
+    assert!(!helper.contains("crate::name::__module_init__"), "the submodule is not loaded: {}", helper);
+    // Verified against python3 (-m).
+    assert_eq!(run_package(&krate, "attrpkg"), vec!["attr"]);
+}
+
+#[test]
+fn a_module_body_that_raises_after_initializing_a_static_stays_failed() {
+    // stateful's body initializes `SEEN` (a promoted static — read by a
+    // function) and then raises: the static cannot be re-initialized, so
+    // a re-run would see the first attempt's value. The module stays
+    // failed and every later import raises the same exception — loud.
+    // CPython runs the body again with fresh globals (`body 2`, `2`);
+    // that is the documented divergence (Devin review on #338).
+    let scratch = Scratch::new("poison");
+    let krate = package_crate(
+        &scratch,
+        "poison",
+        &[
+            (
+                "counter.py",
+                "CALLS = 0\n\n\ndef bump() -> int:\n    global CALLS\n    CALLS += 1\n    return CALLS\n",
+            ),
+            (
+                "stateful.py",
+                concat!(
+                    "from .counter import bump\n",
+                    "\n",
+                    "SEEN = bump()\n",
+                    "print(\"body\", SEEN)\n",
+                    "if SEEN == 1:\n",
+                    "    raise RuntimeError(\"first attempt fails\")\n",
+                    "\n",
+                    "\n",
+                    "def seen() -> int:\n",
+                    "    return SEEN\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "def load() -> int:\n",
+                    "    from .stateful import seen\n",
+                    "    return seen()\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    for _ in range(2):\n",
+                    "        try:\n",
+                    "            print(load())\n",
+                    "        except RuntimeError as e:\n",
+                    "            print(\"caught\", e)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let stateful = fs::read_to_string(krate.root.join("src/stateful.rs")).unwrap();
+    assert!(stateful.contains(".poison(e.clone())"), "a static-touching body poisons: {}", stateful);
+    assert_eq!(
+        run_package(&krate, "poison"),
+        vec!["body 1", "caught first attempt fails", "caught first attempt fails"]
+    );
+}
+
+#[test]
 fn a_concurrent_import_waits_for_the_module_body_like_pythons_import_lock() {
     // Two threads import `slow` (a 200 ms body) 50 ms apart: CPython's
     // per-module import lock makes the second wait, so `slow loaded`
@@ -10821,11 +10930,18 @@ fn a_wait_cycle_across_threads_continues_with_the_partial_module_like_python() {
             ),
         ],
     );
-    // Verified against python3.
-    assert_eq!(
-        run_package(&krate, "xcyc"),
-        vec!["a start", "b start", "b end True", "thread b True", "a end True", "thread a True"]
-    );
+    // Verified against python3. Once b's body ends, thread b's own print
+    // and thread a's remaining two prints race on the scheduler (in
+    // CPython too), so the tail is checked as a set with each thread's
+    // own order kept.
+    let lines = run_package(&krate, "xcyc");
+    assert_eq!(&lines[..3], ["a start", "b start", "b end True"], "{:?}", lines);
+    let mut tail: Vec<&str> = lines[3..].iter().map(String::as_str).collect();
+    let a_end = tail.iter().position(|l| *l == "a end True").expect("a's body ends");
+    let a_thread = tail.iter().position(|l| *l == "thread a True").expect("thread a prints");
+    assert!(a_end < a_thread, "thread a prints after its own body: {:?}", lines);
+    tail.sort();
+    assert_eq!(tail, ["a end True", "thread a True", "thread b True"], "{:?}", lines);
 }
 
 #[test]

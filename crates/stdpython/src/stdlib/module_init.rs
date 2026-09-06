@@ -17,11 +17,16 @@ use std::collections::HashMap;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread::ThreadId;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Debug)]
 enum State {
     NotStarted,
     Running(ThreadId),
     Done,
+    /// The body raised after touching a module static (a value the
+    /// process cannot re-initialize): the module stays failed and every
+    /// later import raises the same exception — loud, where CPython would
+    /// run the body again with fresh globals.
+    Failed(crate::PyException),
 }
 
 /// The lock of one module (a `static` in the generated module).
@@ -79,6 +84,9 @@ pub enum ModuleInitEntry {
     Cycle,
     /// This caller runs the body; `finish` (or the drop) settles the state.
     Run(ModuleInitGuard),
+    /// The body failed before and cannot run again faithfully: the same
+    /// exception, raised again.
+    Failed(crate::PyException),
 }
 
 /// The running body's guard: `finish(ok)` marks the module DONE (or NOT
@@ -107,10 +115,12 @@ impl ModuleInitLock {
         let me = std::thread::current().id();
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
         loop {
-            match *st {
+            match &*st {
                 State::Done => return ModuleInitEntry::Done,
-                State::Running(owner) if owner == me => return ModuleInitEntry::Cycle,
+                State::Failed(e) => return ModuleInitEntry::Failed(e.clone()),
+                State::Running(owner) if *owner == me => return ModuleInitEntry::Cycle,
                 State::Running(owner) => {
+                    let owner = *owner;
                     let mut g = graph().lock().unwrap_or_else(|p| p.into_inner());
                     if g.would_deadlock(me, owner) {
                         return ModuleInitEntry::Cycle;
@@ -166,6 +176,16 @@ impl ModuleInitGuard {
         self.lock
             .settle(if ok { State::Done } else { State::NotStarted });
     }
+
+    /// The body raised after touching a module static, which the process
+    /// cannot re-initialize: the module stays FAILED, and every later
+    /// import raises `err` again (CPython would run the body again with
+    /// fresh globals — a re-run here would see the first attempt's
+    /// values, so the failure is kept loud instead).
+    pub fn poison(mut self, err: crate::PyException) {
+        self.finished = true;
+        self.lock.settle(State::Failed(err));
+    }
 }
 
 impl Drop for ModuleInitGuard {
@@ -217,6 +237,21 @@ mod tests {
         };
         guard.finish(true);
         assert!(matches!(LOCK.enter(), ModuleInitEntry::Done));
+    }
+
+    #[test]
+    fn a_poisoned_module_raises_the_same_error_on_every_later_import() {
+        static LOCK: ModuleInitLock = ModuleInitLock::new();
+        let ModuleInitEntry::Run(guard) = LOCK.enter() else {
+            panic!("first entry runs");
+        };
+        guard.poison(crate::PyException::new("RuntimeError", "first attempt fails"));
+        for _ in 0..2 {
+            let ModuleInitEntry::Failed(e) = LOCK.enter() else {
+                panic!("a poisoned module never runs again");
+            };
+            assert_eq!(e.message, "first attempt fails");
+        }
     }
 
     #[test]

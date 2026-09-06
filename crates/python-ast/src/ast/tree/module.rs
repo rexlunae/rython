@@ -981,6 +981,12 @@ impl CodeGen for Module {
         // the same import under two branches emits one item (E0252).
         let mut hoisted_uses: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // Whether the module body initializes a static (a promoted value,
+        // a mutable global): such a value cannot be re-initialized by the
+        // process, so a body that raises after touching one cannot run
+        // again faithfully — the module stays failed (Devin review on
+        // #338).
+        let mut init_touches_statics = false;
         for (stmt_index, s) in self.raw.body.into_iter().enumerate() {
             match &s.statement {
                 crate::StatementType::FunctionDef(f)
@@ -1414,6 +1420,7 @@ impl CodeGen for Module {
                                     });
                             });
                             module_init_stmts.push(quote!(let _ = &*#ident;));
+                            init_touches_statics = true;
                             has_module_init_code = true;
                         }
                     }
@@ -1565,6 +1572,7 @@ impl CodeGen for Module {
                             std::sync::LazyLock::new(|| stdpython::PyValue::from(#value_tokens));
                     });
                     module_init_stmts.push(quote!(let _ = &*#ident;));
+                    init_touches_statics = true;
                     ident
                 });
                 for n in promoted {
@@ -1654,6 +1662,7 @@ impl CodeGen for Module {
                             std::sync::LazyLock::new(|| #wrapped);
                     });
                     module_init_stmts.push(quote!(let _ = &*#ident;));
+                    init_touches_statics = true;
                 }
                 has_module_init_code = true;
                 continue;
@@ -1729,6 +1738,7 @@ impl CodeGen for Module {
                     });
                 }
                 module_init_stmts.push(quote!(let _ = &*#ident;));
+                init_touches_statics = true;
                 has_module_init_code = true;
                 continue;
             }
@@ -1969,6 +1979,7 @@ impl CodeGen for Module {
                             });
                     });
                     module_init_stmts.push(quote!(let _ = &*#ident;));
+                    init_touches_statics = true;
                     has_module_init_code = true;
                     continue;
                 }
@@ -2117,16 +2128,22 @@ impl CodeGen for Module {
                 quote! {
                     static __RYTHON_INIT_STATE: ::core::sync::atomic::AtomicU8 =
                         ::core::sync::atomic::AtomicU8::new(0);
-                    if __RYTHON_INIT_STATE
-                        .compare_exchange(
-                            0,
-                            1,
-                            ::core::sync::atomic::Ordering::SeqCst,
-                            ::core::sync::atomic::Ordering::SeqCst,
-                        )
-                        .is_err()
-                    {
-                        return Ok(());
+                    match __RYTHON_INIT_STATE.compare_exchange(
+                        0,
+                        1,
+                        ::core::sync::atomic::Ordering::SeqCst,
+                        ::core::sync::atomic::Ordering::SeqCst,
+                    ) {
+                        Ok(_) => {}
+                        // 3: failed after touching a static — loud again.
+                        Err(3) => {
+                            return Err(PyException::new(
+                                "ImportError",
+                                "the module body raised on its first import after \
+                                 initializing a module value; it cannot run again",
+                            ));
+                        }
+                        Err(_) => return Ok(()),
                     }
                 }
             } else {
@@ -2141,16 +2158,30 @@ impl CodeGen for Module {
                         stdpython::ModuleInitEntry::Done | stdpython::ModuleInitEntry::Cycle => {
                             return Ok(());
                         }
+                        stdpython::ModuleInitEntry::Failed(e) => return Err(e),
                         stdpython::ModuleInitEntry::Run(guard) => guard,
                     };
                 }
             };
+            // A body that raised AFTER initializing a static cannot run
+            // again faithfully (the static keeps the first attempt's
+            // value): the module stays failed and later imports raise the
+            // same exception. A body with no statics runs again, as
+            // CPython's fresh re-import does.
+            let failed_state: u8 = if init_touches_statics { 3 } else { 0 };
             let guard_leave = if options.no_std {
                 quote! {
                     __RYTHON_INIT_STATE.store(
-                        if __rython_init_result.is_ok() { 2 } else { 0 },
+                        if __rython_init_result.is_ok() { 2 } else { #failed_state },
                         ::core::sync::atomic::Ordering::SeqCst,
                     );
+                }
+            } else if init_touches_statics {
+                quote! {
+                    match &__rython_init_result {
+                        Ok(()) => __rython_init_guard.finish(true),
+                        Err(e) => __rython_init_guard.poison(e.clone()),
+                    }
                 }
             } else {
                 quote! {
