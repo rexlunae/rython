@@ -11484,6 +11484,83 @@ fn a_function_local_import_runs_the_module_body_on_first_call_only() {
 }
 
 #[test]
+fn a_value_rebinding_before_a_same_named_exception_class_is_refused_as_one_item() {
+    // shadow.py imports errors' `Root`, stores `Root = 1`, then defines
+    // `class Root(Exception)` and `class Child(Root)`; cli raises Child
+    // and catches Root. CPython: `caught boom` — the class is the name's
+    // final binding. The class binding collector's rebound-import marker
+    // (set by the store) is cleared by the later class, so the exception
+    // index judges Child's base as the class it is (Devin review on #338,
+    // round 18) — what fails conversion is the one-item layout: a Rust
+    // module cannot hold the value's static and the class under one
+    // name, so the DEFINITION is refused with the fix named, the mirror
+    // of the def-then-import refusal above. The false "not an exception
+    // class" verdict must not appear.
+    let scratch = Scratch::new("reclass");
+    let krate_err = {
+        fs::write(
+            scratch.path().join("pyproject.toml"),
+            "[project]\nname = \"reclass\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let pkg = scratch.path().join("reclass");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("__init__.py"), "").unwrap();
+        fs::write(pkg.join("errors.py"), "class Root(Exception):\n    pass\n").unwrap();
+        fs::write(
+            pkg.join("shadow.py"),
+            concat!(
+                "from .errors import Root\n",
+                "Root = 1\n",
+                "\n",
+                "\n",
+                "class Root(Exception):\n",
+                "    pass\n",
+                "\n",
+                "\n",
+                "class Child(Root):\n",
+                "    pass\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            pkg.join("cli.py"),
+            concat!(
+                "from .shadow import Child, Root\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    try:\n",
+                "        raise Child(\"boom\")\n",
+                "    except Root as e:\n",
+                "        print(\"caught\", e)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )
+        .unwrap();
+        let discovered = rypip::discover(scratch.path()).expect("discover");
+        rypip::convert(&discovered, &scratch.path().join("crate"), &ConvertOptions::default())
+            .err()
+            .expect("the store-then-class rebinding is refused")
+    };
+    let msg = format!("{:#}", krate_err);
+    assert!(
+        msg.contains("the definition of `Root` rebinds a value this module stores above (`Root = ...`)")
+            && msg.contains("rename one of the two"),
+        "error: {}",
+        msg
+    );
+    assert!(
+        !msg.contains("is not an exception class"),
+        "the class must not be misjudged by the stale rebound marker: {}",
+        msg
+    );
+}
+
+#[test]
 fn a_module_that_defines_a_name_and_later_imports_it_is_refused() {
     // late.py defines an ordinary `Root`, then imports errors' `Root`:
     // Python's later binding wins, but a Rust module holds one item per

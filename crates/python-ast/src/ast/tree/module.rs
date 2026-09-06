@@ -973,6 +973,11 @@ impl CodeGen for Module {
         // rebinds one is refused (below) — Rust holds one item per name.
         let mut defined_above: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // The names an unconditional top-level statement STORED (a value
+        // binding the one binding enumeration recognizes) before a
+        // definition of the same name: that definition is refused (below).
+        let mut stored_above: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         // `use` items hoisted from module-level control flow, by text, so
         // the same import under two branches emits one item (E0252).
         let mut hoisted_uses: std::collections::HashSet<String> =
@@ -1003,6 +1008,48 @@ impl CodeGen for Module {
                 .zip(s.col_offset)
                 .and_then(|pos| binding_marks.after_binds(pos));
             top_level_binds.push((end_of_range_bind, module_init_stmts.len()));
+            // A definition (a def, a class) of a name an unconditional
+            // store bound above (`Root = 1` then `class Root(Exception)`):
+            // Python's later binding wins, but a Rust module cannot hold
+            // the value's static and the definition under one name (a
+            // struct or fn beside a static of the name — E0428 for an
+            // exception class's constructor, a silently stale value for
+            // a struct), and dropping the store would lose what read it
+            // between the two — refuse with the fix, as the def-then-
+            // import rule does (Devin review on #338, round 18).
+            let definition_name = match &s.statement {
+                crate::StatementType::FunctionDef(f)
+                | crate::StatementType::AsyncFunctionDef(f) => Some(&f.name),
+                crate::StatementType::ClassDef(c) => Some(&c.name),
+                _ => None,
+            };
+            match definition_name {
+                Some(name) if stored_above.contains(name) => {
+                    return Err(wrap_module_error(
+                        &module_filename,
+                        format!(
+                            "the definition of `{}` rebinds a value this module stores \
+                             above (`{} = ...`): rython holds one item per module name \
+                             and refuses to silently drop either binding; rename one of \
+                             the two",
+                            name, name
+                        )
+                        .into(),
+                    ));
+                }
+                Some(_) => {}
+                None if !matches!(
+                    &s.statement,
+                    crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
+                ) =>
+                {
+                    stored_above.extend(crate::ast::tree::visit::stmt_bound_names(
+                        &s,
+                        crate::ast::tree::visit::Bindings::Scope,
+                    ));
+                }
+                None => {}
+            }
             match &s.statement {
                 crate::StatementType::FunctionDef(f)
                 | crate::StatementType::AsyncFunctionDef(f) => {

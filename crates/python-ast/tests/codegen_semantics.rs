@@ -8843,6 +8843,33 @@ fn imported_class_constant_default_resolves_through_import() {
 }
 
 #[test]
+fn a_definition_rebinding_a_stored_value_is_refused() {
+    // `X = 1` then `class X` (or `def X`): Python's later binding wins,
+    // but a Rust module cannot hold the value's static and the definition
+    // under one name — refused with the fix named (Devin review on #338,
+    // round 18), the mirror of the def-then-import refusal.
+    for src in [
+        "X = 1\n\n\nclass X(Exception):\n    pass\n",
+        "X = 1\n\n\ndef X() -> int:\n    return 2\n",
+        "X, y = 1, 2\n\n\nclass X:\n    pass\n",
+    ] {
+        let msg = compile_err(src, "storedef.py");
+        assert!(
+            msg.contains("the definition of `X` rebinds a value this module stores above (`X = ...`)")
+                && msg.contains("rename one of the two"),
+            "{}: {}",
+            src,
+            msg
+        );
+    }
+    // A store AFTER the definition is a different shape (Python's
+    // later binding is the value; a decorator idiom) and is not this
+    // refusal's.
+    let out = compile("def f() -> int:\n    return 1\n\n\ng = f\n", "defstore.py");
+    assert!(out.contains("fn f"), "generated: {}", out);
+}
+
+#[test]
 fn import_site_refusals_are_codegen_errors_of_the_importing_module() {
     // The three import-site refusals (Devin review on #338, rounds 14, 15
     // and 17) are decided by the importing module's own conversion from
