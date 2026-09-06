@@ -8843,6 +8843,74 @@ fn imported_class_constant_default_resolves_through_import() {
 }
 
 #[test]
+fn import_site_refusals_are_codegen_errors_of_the_importing_module() {
+    // The three import-site refusals (Devin review on #338, rounds 14, 15
+    // and 17) are decided by the importing module's own conversion from
+    // the module_defs it is handed — pinned here at the codegen level, one
+    // two-module package each, the importing module converted with its
+    // package path set (rypip's convert_tests run the same shapes end to
+    // end).
+    let refusal = |modules: &[(&str, &str)], importer: &str, src: &str| -> String {
+        let mut defs = std::collections::HashMap::new();
+        for (name, source) in modules {
+            defs.insert(
+                vec!["pkg".to_string(), name.to_string()],
+                std::rc::Rc::new(parse(source, &format!("{}.py", name)).unwrap()),
+            );
+        }
+        defs.insert(
+            vec!["pkg".to_string(), importer.to_string()],
+            std::rc::Rc::new(parse(src, &format!("{}.py", importer)).unwrap()),
+        );
+        let options = PythonOptions {
+            module_defs: std::rc::Rc::new(defs),
+            module_path: vec!["pkg".to_string()],
+            this_module_path: vec!["pkg".to_string(), importer.to_string()],
+            python_namespace: "pkg".to_string(),
+            ..Default::default()
+        };
+        compile_with_options(src, &format!("{}.py", importer), options)
+            .expect_err("the import is refused")
+    };
+    // A handler alias imported back through the handler's own cycle.
+    let msg = refusal(
+        &[(
+            "a",
+            "try:\n    raise ValueError(\"boom\")\nexcept ValueError as err:\n    from .b import b_value\n    print(b_value())\n",
+        )],
+        "b",
+        "from .a import err\n\n\ndef b_value() -> str:\n    return str(err)\n",
+    );
+    assert!(
+        msg.contains("`from .a import err` is refused: `pkg.a` binds `err` only as an `except ... as err` alias"),
+        "{}",
+        msg
+    );
+    // A name the module imports, exposes through a cycle, then redefines.
+    let msg = refusal(
+        &[("a", "from .c import f\nfrom .b import b_value\n\n\ndef f() -> int:\n    return 2\n"), ("c", "def f() -> int:\n    return 1\n")],
+        "b",
+        "from .a import f\n\n\ndef b_value() -> int:\n    return f()\n",
+    );
+    assert!(
+        msg.contains("`from .a import f` is refused: `pkg.a` imports `f`, then imports this module (directly, or through a call), then redefines `f`"),
+        "{}",
+        msg
+    );
+    // A name the module binds and deletes.
+    let msg = refusal(
+        &[("a", "helper = 1\ndel helper\n")],
+        "b",
+        "from .a import helper\n\n\ndef b_value() -> int:\n    return helper\n",
+    );
+    assert!(
+        msg.contains("`from .a import helper` is refused: the package binds `helper` and deletes it (`del helper`)"),
+        "{}",
+        msg
+    );
+}
+
+#[test]
 fn itertools_takewhile_swaps_predicate_and_iterable() {
     // urllib3's retry.get_backoff_time: `takewhile(lambda x: ..., reversed(
     // self.history))` — Python (predicate, iterable) maps to the runtime

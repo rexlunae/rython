@@ -11686,8 +11686,20 @@ fn an_imported_class_rebound_by_a_store_or_a_def_is_no_longer_a_base() {
     // (the base is not a class). The rebinding invalidates the crate
     // import in the closure's bindings, so Leaf does not inherit the
     // stale exception hierarchy — the base is refused loudly (Devin
-    // review on #338).
-    for (tag, rebinding) in [("byvalue", "Root = 5\n"), ("byfunc", "def Root() -> int:\n    return 1\n")] {
+    // review on #338). Every binding form the statement visitor
+    // recognizes rebinds the same way (round 17): an augmented
+    // assignment, a tuple store, a walrus, and a loop target (CPython:
+    // TypeError at the class statement for each). The loop target is a
+    // conditional binding (the loop over nothing leaves the import),
+    // so the name is runtime-ambiguous there — refused as such.
+    for (tag, rebinding) in [
+        ("byvalue", "Root = 5\n"),
+        ("byfunc", "def Root() -> int:\n    return 1\n"),
+        ("byaug", "Root += 1\n"),
+        ("bytuple", "Root, other = 5, 6\n"),
+        ("bywalrus", "print((Root := 1))\n"),
+        ("byfor", "for Root in [1]:\n    pass\n"),
+    ] {
         let scratch = Scratch::new(tag);
         fs::write(
             scratch.path().join("pyproject.toml"),
@@ -11715,6 +11727,80 @@ fn an_imported_class_rebound_by_a_store_or_a_def_is_no_longer_a_base() {
         let msg = format!("{:#}", err);
         assert!(
             msg.contains("class `Leaf` inherits from `Root`, which is not an exception class"),
+            "{}: {}",
+            tag,
+            msg
+        );
+    }
+}
+
+#[test]
+fn a_cyclic_import_of_an_except_alias_is_refused() {
+    // a.py binds `err` only as `except ValueError as err`, and the handler
+    // imports b, which imports `err` back from a. CPython (with or without
+    // an err.py submodule beside it):
+    //   a start
+    //   a handler boom
+    //   a end
+    //   main
+    // — b sees the exception while the handler runs; after the handler
+    // Python deletes `err`, so a later import would find nothing (or the
+    // submodule). The bound bitmap only sets bits, so the converted
+    // program cannot time the bind-then-unbind: refused loudly, the same
+    // with the same-named submodule (Devin review on #338, round 17).
+    for (tag, submodule) in [("excalias", false), ("excaliassub", true)] {
+        let scratch = Scratch::new(tag);
+        let mut files: Vec<(&str, &str)> = vec![
+            ("__init__.py", ""),
+            (
+                "a.py",
+                concat!(
+                    "print(\"a start\")\n",
+                    "try:\n",
+                    "    raise ValueError(\"boom\")\n",
+                    "except ValueError as err:\n",
+                    "    from .b import b_value\n",
+                    "    print(\"a handler\", b_value())\n",
+                    "print(\"a end\")\n",
+                ),
+            ),
+            ("b.py", "from .a import err\n\n\ndef b_value() -> str:\n    return str(err)\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from .a import b_value\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\")\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ];
+        if submodule {
+            files.push(("err.py", "print(\"submodule err loaded\")\n"));
+        }
+        let pkg = scratch.path().join(tag);
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            scratch.path().join("pyproject.toml"),
+            format!("[project]\nname = \"{}\"\nversion = \"0.1.0\"\n", tag),
+        )
+        .unwrap();
+        for (name, source) in &files {
+            fs::write(pkg.join(name), source).unwrap();
+        }
+        let discovered = rypip::discover(scratch.path()).expect("discover");
+        let err = rypip::convert(&discovered, &scratch.path().join("crate"), &ConvertOptions::default())
+            .err()
+            .expect("the cyclic import of a handler alias is refused");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("`from .a import err` is refused: `a` binds `err` only as an `except ... as err` alias, which Python deletes when the handler ends, and that module imports this one")
+                && msg.contains("nothing (or a submodule of that name) after it"),
             "{}: {}",
             tag,
             msg

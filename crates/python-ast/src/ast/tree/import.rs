@@ -901,6 +901,24 @@ fn module_deletes(options: &PythonOptions, key: &[String], name: &str) -> bool {
     })
 }
 
+/// Whether module `key`'s body binds `name` as a module-scope `except
+/// ... as name` handler alias (nested definitions aside). Python binds
+/// the alias for the handler's body and DELETES it when the handler
+/// ends, so the name exists only while the handler runs: an import of it
+/// from inside that window (the handler imports a sibling, which imports
+/// the alias back — a cycle) sees the exception, and one from outside
+/// finds nothing (Devin review on #338, round 17).
+fn module_handler_alias(options: &PythonOptions, key: &[String], name: &str) -> bool {
+    use crate::ast::tree::visit::{any_stmt, Descend};
+    let Some(body) = crate::ast::tree::module::normalized_body_of(options, key) else {
+        return false;
+    };
+    any_stmt(&body, Descend::SkipDefs, |s| match &s.statement {
+        crate::StatementType::Try(t) => t.handlers.iter().any(|h| h.name.as_deref() == Some(name)),
+        _ => false,
+    })
+}
+
 /// The crate modules one import statement loads (every package on a
 /// dotted path, the resolved module, each from-list name that is a
 /// submodule), as module_defs keys, in `ctx` (the importing module's
@@ -1205,6 +1223,34 @@ pub(crate) fn import_site_init(
                          so Python exposes the imported value here where the converted \
                          module holds only its definition; import the value from the \
                          module that defines it, or move the definition before the import",
+                        ".".repeat(i.level),
+                        i.module,
+                        a.name,
+                        key.join("."),
+                        a.name,
+                        a.name
+                    )
+                    .into());
+                }
+                // The module binds the name as an `except ... as` alias —
+                // bound for the handler's body, deleted at its end — and
+                // reaches this module (the handler imports a sibling that
+                // imports the alias back): Python hands out the exception
+                // in that window and nothing after it, a bind-then-unbind
+                // the bound bitmap (bits only set) cannot time; with a
+                // same-named submodule the after-window answer is that
+                // submodule instead (Devin review on #338, round 17).
+                if module_handler_alias(options, key, &a.name)
+                    && module_reaches(options, key, &options.this_module_path)
+                {
+                    return Err(format!(
+                        "`from {}{} import {}` is refused: `{}` binds `{}` only as an \
+                         `except ... as {}` alias, which Python deletes when the handler \
+                         ends, and that module imports this one (directly, or through a \
+                         call), so the import finds the exception while the handler runs \
+                         and nothing (or a submodule of that name) after it, a timing the \
+                         converted program cannot represent; bind the exception to a name \
+                         the module keeps, or break the import cycle",
                         ".".repeat(i.level),
                         i.module,
                         a.name,

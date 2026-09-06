@@ -1113,6 +1113,14 @@ pub(crate) fn canonical_exception_base(
     scope: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<(String, Option<(crate::ClassDef, SymbolTableScopes)>)> {
+    // The module imported `name` from a crate module and then rebound it
+    // unconditionally by a form the symbol table does not record (`Root
+    // += 1`, a `with` target, a walrus, a tuple store): the base is that
+    // later value, never the imported class — loud, as the `Root = 5`
+    // form already is (Devin review on #338, round 17).
+    if crate::ast::tree::class_def::is_rebound_crate_import_in_defining_module(&cls.name, name) {
+        return None;
+    }
     canonical_exception_class_bound(
         name,
         scope,
