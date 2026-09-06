@@ -2191,10 +2191,11 @@ impl CodeGen for Module {
                 // deadlock detection (the later importer proceeds with
                 // the partial module, CPython's _DeadlockError path), and
                 // an RAII guard that resets an unwound body to NOT STARTED.
+                let retry = !init_touches_statics;
                 quote! {
                     static __RYTHON_INIT_LOCK: stdpython::ModuleInitLock =
                         stdpython::ModuleInitLock::new();
-                    let __rython_init_guard = match __RYTHON_INIT_LOCK.enter() {
+                    let __rython_init_guard = match __RYTHON_INIT_LOCK.enter(#retry) {
                         stdpython::ModuleInitEntry::Done | stdpython::ModuleInitEntry::Cycle => {
                             return Ok(());
                         }
@@ -2203,12 +2204,14 @@ impl CodeGen for Module {
                     };
                 }
             };
-            // A body that raised in a module holding a static — one it
-            // initialized, or a mutable global a called function may have
-            // written — cannot run again faithfully (the static keeps the
-            // first attempt's value): the module stays failed and later
-            // imports raise the same exception. A body with no such
-            // statics runs again, as CPython's fresh re-import does.
+            // A body that raised (or unwound) in a module holding a static
+            // — one it initialized, or a mutable global a called function
+            // may have written — cannot run again faithfully (the static
+            // keeps the first attempt's value): the module stays failed
+            // and later imports raise the same exception. A body with no
+            // such statics runs again, as CPython's fresh re-import does.
+            // The lock holds that policy (`enter(retry)`), so a raise and
+            // an unwind settle the same way.
             let failed_state: u8 = if init_touches_statics { 3 } else { 0 };
             let guard_leave = if options.no_std {
                 quote! {
@@ -2217,16 +2220,9 @@ impl CodeGen for Module {
                         ::core::sync::atomic::Ordering::SeqCst,
                     );
                 }
-            } else if init_touches_statics {
-                quote! {
-                    match &__rython_init_result {
-                        Ok(()) => __rython_init_guard.finish(true),
-                        Err(e) => __rython_init_guard.poison(e.clone()),
-                    }
-                }
             } else {
                 quote! {
-                    __rython_init_guard.finish(__rython_init_result.is_ok());
+                    __rython_init_guard.finish(__rython_init_result.clone());
                 }
             };
             // The body's progress: the index of the statement it is about
@@ -2263,6 +2259,9 @@ impl CodeGen for Module {
                 #[allow(dead_code)]
                 pub(crate) fn __module_init__() -> Result<(), PyException> {
                     #guard_enter
+                    // A retried body starts from no bound names: the
+                    // previous attempt's progress must not answer for it.
+                    __RYTHON_INIT_PROGRESS.store(0, ::core::sync::atomic::Ordering::Release);
                     let __rython_init_result = (|| -> Result<(), PyException> {
                         #(#module_init_stmts;)*
                         __RYTHON_INIT_PROGRESS.store(

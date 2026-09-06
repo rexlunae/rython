@@ -10326,6 +10326,69 @@ fn a_cyclic_import_of_a_name_bound_later_raises_import_error_like_python() {
 }
 
 #[test]
+fn a_root_cycle_of_a_name_bound_later_raises_import_error_like_python() {
+    // pkg/__init__.py imports helper before binding NAME; helper does
+    // `from . import NAME` while the root's body is still running: CPython
+    // raises ImportError there (caught in helper), the root finishes, and
+    // cli's later `from . import NAME` finds the bound name. The root is
+    // checked like any module, through `crate::__rython_root` in both
+    // crates (Devin review on #338, round 6).
+    let scratch = Scratch::new("rootcyc");
+    let krate = package_crate(
+        &scratch,
+        "rootcyc",
+        &[
+            (
+                "__init__.py",
+                "from .helper import greet\nNAME = \"pkg\"\nprint(\"root end\", greet())\n",
+            ),
+            (
+                "helper.py",
+                concat!(
+                    "try:\n",
+                    "    from . import NAME\n",
+                    "    print(\"helper sees\", NAME)\n",
+                    "except Exception as e:\n",
+                    "    print(\"helper caught\")\n",
+                    "\n",
+                    "\n",
+                    "def greet() -> str:\n",
+                    "    return \"hi\"\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from . import NAME\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\", NAME)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let helper = fs::read_to_string(krate.root.join("src/helper.rs")).unwrap();
+    assert!(
+        helper.contains("crate::__rython_root::__module_init__()?;")
+            && helper.contains("crate::__rython_root::__rython_bound__(1usize, \"NAME\", \"rootcyc\")?;"),
+        "helper runs and checks the root: {}",
+        helper
+    );
+    let lib = fs::read_to_string(krate.root.join("src/lib.rs")).unwrap();
+    assert!(lib.contains("pub(crate) use crate::{__module_init__, __rython_bound__};"), "the lib shim: {}", lib);
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "rootcyc"),
+        vec!["helper caught", "root end hi", "main pkg"]
+    );
+}
+
+#[test]
 fn a_bare_annotation_in_the_package_does_not_hide_the_submodule() {
     // `settings: dict` in conf/__init__.py binds only `__annotations__`:
     // `from .conf import settings` therefore imports the submodule
@@ -10780,7 +10843,7 @@ fn a_module_body_that_raises_after_initializing_a_static_stays_failed() {
         ],
     );
     let stateful = fs::read_to_string(krate.root.join("src/stateful.rs")).unwrap();
-    assert!(stateful.contains(".poison(e.clone())"), "a static-touching body poisons: {}", stateful);
+    assert!(stateful.contains("__RYTHON_INIT_LOCK.enter(false)"), "a static-touching body cannot retry: {}", stateful);
     assert_eq!(
         run_package(&krate, "poison"),
         vec!["body 1", "caught first attempt fails", "caught first attempt fails"]
@@ -10890,7 +10953,7 @@ fn a_module_body_that_raises_while_holding_a_mutable_global_stays_failed() {
         ],
     );
     let tally = fs::read_to_string(krate.root.join("src/tally.rs")).unwrap();
-    assert!(tally.contains(".poison(e.clone())"), "a mutable global poisons: {}", tally);
+    assert!(tally.contains("__RYTHON_INIT_LOCK.enter(false)"), "a mutable global cannot retry: {}", tally);
     // CPython: `tally body 1`, `caught count too low`, `tally body 1`,
     // `caught count too low` (a fresh module each attempt).
     assert_eq!(
@@ -11172,6 +11235,83 @@ fn a_module_body_that_panics_runs_again_on_the_next_import() {
     );
     // Verified against python3 (stdout; the first attempt's error is on stderr in both).
     assert_eq!(run_package(&krate, "panicky"), vec!["panicky body 1", "panicky body 2", "7"]);
+}
+
+#[test]
+fn a_module_body_that_panics_after_initializing_a_static_stays_failed() {
+    // Like `panicky`, but the body initializes `SEEN` (a promoted static
+    // — read by a function) before the panic: the static cannot be
+    // re-initialized, so the unwound module stays failed and the main
+    // thread's import raises an ImportError instead of re-running the
+    // body over the first attempt's value (Devin review on #338, round
+    // 7). CPython reruns the body (`body 2`, `2`) — the documented poison
+    // divergence, loud.
+    let scratch = Scratch::new("statpanic");
+    let krate = package_crate(
+        &scratch,
+        "statpanic",
+        &[
+            (
+                "counter.py",
+                "CALLS = 0\n\n\ndef bump() -> int:\n    global CALLS\n    CALLS += 1\n    return CALLS\n",
+            ),
+            (
+                "stateful.py",
+                concat!(
+                    "from .counter import bump\n",
+                    "\n",
+                    "SEEN = bump()\n",
+                    "print(\"body\", SEEN)\n",
+                    "if SEEN == 1:\n",
+                    "    sizes = list(map(lambda k: 10 // k, [1, 0]))\n",
+                    "\n",
+                    "\n",
+                    "def seen() -> int:\n",
+                    "    return SEEN\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "import threading\n",
+                    "\n",
+                    "\n",
+                    "def first() -> None:\n",
+                    "    from .stateful import seen\n",
+                    "    print(\"thread\", seen())\n",
+                    "\n",
+                    "\n",
+                    "def load() -> int:\n",
+                    "    from .stateful import seen\n",
+                    "    return seen()\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    t = threading.Thread(target=first)\n",
+                    "    t.start()\n",
+                    "    t.join()\n",
+                    "    try:\n",
+                    "        print(load())\n",
+                    "    except Exception as e:\n",
+                    "        print(\"caught\", e)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // CPython (stdout): `body 1`, `body 2`, `2` — the thread's error is on
+    // stderr in both.
+    assert_eq!(
+        run_package(&krate, "statpanic"),
+        vec![
+            "body 1",
+            "caught the module body panicked on its first import after initializing a \
+             module value; it cannot run again"
+        ]
+    );
 }
 
 #[test]

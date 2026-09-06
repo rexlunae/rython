@@ -19,7 +19,7 @@ use crate::package::{PyModule, PyPackage, sanitize_name};
 
 /// The bin-side module carrying the package root `__init__`'s body (the
 /// lib root, which the bin crate does not otherwise contain).
-const ROOT_BIN_MODULE: &str = "__rython_root";
+const ROOT_BIN_MODULE: &str = python_ast::ROOT_INIT_MODULE;
 
 /// Lint allowances for generated code: transpiled Python legitimately
 /// produces unused imports/variables and similar noise, and the generated
@@ -2143,15 +2143,13 @@ pub fn convert(
         }
         let is_root = module.path.is_empty();
         let mut decls = mod_decls(&children, &module.path, module.is_init || is_root);
-        // The entry module is also a lib-side module; its startup names
-        // the root's body as `crate::__rython_root::__module_init__`,
-        // which the lib root answers with this shim (the bin has the real
-        // module).
-        if is_root && entry_options.root_init_module.is_some() {
-            decls.push_str(&format!(
-                "pub(crate) mod {} {{\n    pub(crate) use crate::__module_init__;\n}}\n",
-                ROOT_BIN_MODULE
-            ));
+        // Every import site reaches the root's init and bound check as
+        // `crate::__rython_root::...` (the entry's startup too), which
+        // the lib root answers with this shim onto its own items (the
+        // bin has the real module, or the same shim when the entry is
+        // the root).
+        if is_root {
+            decls.push_str(&root_shim());
         }
         let allows = if is_root {
             format!(
@@ -2241,6 +2239,11 @@ pub fn convert(
                 "mod {};\npub use {}::*;\n",
                 ROOT_BIN_MODULE, ROOT_BIN_MODULE
             ));
+        } else if entry.path.is_empty() {
+            // The entry IS the root: its body is the bin crate root, and
+            // the siblings' `crate::__rython_root::...` paths take the
+            // lib's shim.
+            decls.push_str(&root_shim());
         }
         let main_contents = format!("{}{}\n{}", generated_lint_attrs(opts.warnings), code, decls);
         fs::write(src_dir.join("main.rs"), format_rust(&main_contents))?;
@@ -3160,6 +3163,17 @@ fn conversion_base_options(
         python_namespace: package_name.to_string(),
         ..Default::default()
     }
+}
+
+/// The shim a crate root emits so the package root's init and bound
+/// check answer at `crate::__rython_root::...` — the path every import
+/// site and the entry's startup use for the root (see
+/// `python_ast::ROOT_INIT_MODULE`).
+fn root_shim() -> String {
+    format!(
+        "pub(crate) mod {} {{\n    pub(crate) use crate::{{__module_init__, __rython_bound__}};\n}}\n",
+        ROOT_BIN_MODULE
+    )
 }
 
 /// `pub mod child;` declarations for a container module.

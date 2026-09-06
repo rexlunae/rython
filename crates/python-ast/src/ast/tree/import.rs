@@ -467,9 +467,11 @@ pub struct Import {
 /// on #336): for `import a.b.c`, each package on the path that is a crate
 /// module, then the module; for `from .a import x, y`, the resolved
 /// module (its crate packages first) and each imported name that is a
-/// submodule. The package root (the lib root, which the binary does not
-/// contain) and modules outside the crate are never listed; a
-/// single-module conversion (no `module_defs`) lists nothing.
+/// submodule. The package root (`from . import x`) is listed as the
+/// [`ROOT_INIT_MODULE`] path, which both crates answer: the lib root
+/// through a shim, the binary through the root's body as that module.
+/// Modules outside the crate are never listed; a single-module
+/// conversion (no `module_defs`) lists nothing.
 pub(crate) fn imported_crate_modules(
     stmt: &crate::StatementType,
     options: &PythonOptions,
@@ -478,8 +480,11 @@ pub(crate) fn imported_crate_modules(
     let push_chain = |path: &[String], out: &mut Vec<Vec<String>>| {
         for len in 1..=path.len() {
             if let Some(key) = crate::module_defs_key(options, &path[..len]) {
-                let key = key.to_vec();
-                if !key.is_empty() && key != options.this_module_path && !out.contains(&key) {
+                if key == options.this_module_path.as_slice() {
+                    continue;
+                }
+                let key = init_module_path(key);
+                if !out.contains(&key) {
                     out.push(key);
                 }
             }
@@ -494,7 +499,17 @@ pub(crate) fn imported_crate_modules(
         }
         crate::StatementType::ImportFrom(i) => {
             let base = i.resolved_module_path(options);
-            push_chain(&base, &mut out);
+            if base.is_empty() {
+                // `from . import x` at the package's top level: the root
+                // itself, whose empty path no chain prefix names.
+                if let Some(key) = crate::module_defs_key(options, &base)
+                    && key != options.this_module_path.as_slice()
+                {
+                    out.push(init_module_path(key));
+                }
+            } else {
+                push_chain(&base, &mut out);
+            }
             // A from-list name is the package's own attribute when the
             // package binds it; only otherwise does Python import the
             // submodule of that name (Devin review on #338).
@@ -601,7 +616,10 @@ fn module_binding(options: &PythonOptions, key: &[String], name: &str) -> Option
 /// where the generated static would hand out its eventual value (Devin
 /// review on #338, round 6). Each module's `__rython_bound__` answers
 /// from its init progress; a fully initialized module answers yes. The
-/// package root is never checked (its body runs before the entry).
+/// package root (`from . import name`) is checked through
+/// [`ROOT_INIT_MODULE`] like any module: its body runs first for the
+/// binary, but a sibling it imports asks while that body is still
+/// running.
 pub(crate) fn import_site_bound_checks(
     stmt: &crate::StatementType,
     options: &PythonOptions,
@@ -613,10 +631,13 @@ pub(crate) fn import_site_bound_checks(
     let Some(key) = crate::module_defs_key(options, &base) else {
         return quote!();
     };
-    if key.is_empty() || key == options.this_module_path.as_slice() {
+    if key == options.this_module_path.as_slice() {
         return quote!();
     }
-    let segs: Vec<_> = key.iter().map(|s| crate::safe_ident(s)).collect();
+    let segs: Vec<_> = init_module_path(key)
+        .iter()
+        .map(|s| crate::safe_ident(s))
+        .collect();
     let qualified = std::iter::once(options.python_namespace.as_str())
         .filter(|ns| !ns.is_empty())
         .chain(key.iter().map(String::as_str))
@@ -629,6 +650,22 @@ pub(crate) fn import_site_bound_checks(
         Some(quote!(crate::#(#segs::)*__rython_bound__(#index, #name, #qualified)?;))
     });
     quote!(#(#checks)*)
+}
+
+/// The module through which every crate reaches the package root's
+/// init and bound check: the binary carries the root's body under this
+/// name (rypip writes it beside the sibling modules), and the lib root
+/// answers the same path with a shim onto its own items.
+pub const ROOT_INIT_MODULE: &str = "__rython_root";
+
+/// The crate path an init call or bound check for the module at `key`
+/// takes: the module's own path, or [`ROOT_INIT_MODULE`] for the root.
+fn init_module_path(key: &[String]) -> Vec<String> {
+    if key.is_empty() {
+        vec![ROOT_INIT_MODULE.to_string()]
+    } else {
+        key.to_vec()
+    }
 }
 
 /// The `__module_init__` calls for the modules an import loads, in
