@@ -6786,6 +6786,32 @@ fn duplicate_open_arguments_and_non_str_versions_are_refused() {
 }
 
 #[test]
+fn a_repeated_keyword_argument_is_refused_as_cpythons_syntax_error() {
+    // Round 7 of the review on #339: `f(a=1, a=2)` is CPython's
+    // `SyntaxError: keyword argument repeated: a`. rython's front end
+    // accepts the spelling, so `scan_argparse` refuses it for the parser
+    // constructor and for add_argument (a repeated action= included)
+    // rather than letting the last value win.
+    for (src, expected) in [
+        (
+            "import argparse\n\ndef main(argv: list[str] | None = None) -> int:\n    p = argparse.ArgumentParser(prog=\"t\", prog=\"u\")\n    args = p.parse_args(argv)\n    return 0\n",
+            "argparse.ArgumentParser: keyword argument repeated: prog",
+        ),
+        (
+            "import argparse\n\ndef main(argv: list[str] | None = None) -> int:\n    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--x\", default=\"a\", help=\"a\", help=\"b\")\n    args = p.parse_args(argv)\n    return 0\n",
+            "add_argument('--x'): keyword argument repeated: help",
+        ),
+        (
+            "import argparse\n\ndef main(argv: list[str] | None = None) -> int:\n    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--x\", action=\"store\", action=\"store_true\")\n    args = p.parse_args(argv)\n    return 0\n",
+            "add_argument('--x'): keyword argument repeated: action",
+        ),
+    ] {
+        let err = compile_err(src, "dupkw.py");
+        assert!(err.contains(expected), "{}\nerror: {}", src, err);
+    }
+}
+
+#[test]
 fn update_file_modes_are_refused_at_conversion() {
     // Round 2 of the review on #339: an update mode (`+`) is valid Python
     // the runtime does not model; a literal one is refused when the

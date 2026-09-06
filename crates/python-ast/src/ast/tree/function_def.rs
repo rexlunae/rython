@@ -298,7 +298,23 @@ pub(crate) fn scan_argparse(
         }
         let mut prog = None;
         let mut description = None;
+        let mut seen_keywords: Vec<String> = Vec::new();
         for kw in &call.keywords {
+            // A repeated keyword is CPython's SyntaxError (`keyword
+            // argument repeated: prog`); rython's front end accepts the
+            // spelling, so the scan refuses it rather than letting the
+            // last value win (Devin review on #339, round 7).
+            if let Some(name) = kw.arg.as_deref() {
+                if seen_keywords.iter().any(|k| k == name) {
+                    return Err(format!(
+                        "argparse.ArgumentParser: keyword argument repeated: {} (Python's \
+                         SyntaxError)",
+                        name
+                    )
+                    .into());
+                }
+                seen_keywords.push(name.to_string());
+            }
             let value = literal_str(&kw.value).ok_or_else(|| {
                 format!(
                     "argparse.ArgumentParser: {} must be a string literal (the parser \
@@ -412,7 +428,20 @@ pub(crate) fn scan_argparse(
                 let mut dest: Option<String> = None;
                 let mut nargs: Option<ArgparseNargs> = None;
                 let is_positional = !name.starts_with('-');
+                let mut seen_keywords: Vec<String> = Vec::new();
                 for kw in &call.keywords {
+                    // A repeated keyword is CPython's SyntaxError (round 7).
+                    if let Some(kname) = kw.arg.as_deref() {
+                        if seen_keywords.iter().any(|k| k == kname) {
+                            return Err(format!(
+                                "add_argument('{}'): keyword argument repeated: {} (Python's \
+                                 SyntaxError)",
+                                name, kname
+                            )
+                            .into());
+                        }
+                        seen_keywords.push(kname.to_string());
+                    }
                     let keyword = kw.arg.as_deref().and_then(ArgparseKeyword::from_name);
                     match keyword {
                         Some(ArgparseKeyword::Type) => {

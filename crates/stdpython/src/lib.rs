@@ -347,7 +347,15 @@ pub fn print_parts<S: AsRef<str>, Sep: AsRef<str>, E: AsRef<str>>(
         .map(|p| p.as_ref())
         .collect::<Vec<_>>()
         .join(sep.as_ref());
-    print!("{}{}", output, end.as_ref());
+    // Through std::io::Write, never the print! macro (which panics on a
+    // failed write): a rejected write — a closed pipe — is the OSError
+    // CPython raises, `BrokenPipeError: [Errno 32] Broken pipe`, catchable
+    // by the program (round 7).
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    out.write_all(output.as_bytes())
+        .and_then(|_| out.write_all(end.as_ref().as_bytes()))
+        .map_err(|e| stream_error(&e))?;
     Ok(())
 }
 
@@ -363,9 +371,7 @@ pub fn print_parts_flush<S: AsRef<str>, Sep: AsRef<str>, E: AsRef<str>>(
     print_parts(parts, sep, end)?;
     if flush {
         use std::io::Write;
-        std::io::stdout()
-            .flush()
-            .map_err(|e| runtime_error(&format!("I/O error flushing stdout: {}", e)))?;
+        std::io::stdout().flush().map_err(|e| stream_error(&e))?;
     }
     Ok(())
 }
@@ -7096,8 +7102,11 @@ pub fn input<P: AsRef<str>>(prompt: Option<P>) -> Result<String, PyException> {
         return Err(closed_file_error());
     }
     if let Some(p) = prompt {
-        print!("{}", p.as_ref());
-        io::stdout().flush().map_err(|e| runtime_error(&format!("I/O error: {}", e)))?;
+        // The prompt goes to sys.stdout through the fallible path too.
+        let mut out = io::stdout().lock();
+        out.write_all(p.as_ref().as_bytes())
+            .and_then(|_| out.flush())
+            .map_err(|e| stream_error(&e))?;
     }
     
     let mut input = String::new();
@@ -7126,15 +7135,7 @@ pub fn input<P: AsRef<str>>(prompt: Option<P>) -> Result<String, PyException> {
 /// RuntimeError would never match, and the error would escape the try.
 #[cfg(feature = "std")]
 fn os_error(e: &std::io::Error, path: &str) -> PyException {
-    use std::io::ErrorKind;
-    let kind = match e.kind() {
-        ErrorKind::NotFound => "FileNotFoundError",
-        ErrorKind::PermissionDenied => "PermissionError",
-        ErrorKind::AlreadyExists => "FileExistsError",
-        ErrorKind::IsADirectory => "IsADirectoryError",
-        ErrorKind::NotADirectory => "NotADirectoryError",
-        _ => "OSError",
-    };
+    let kind = os_error_kind(e);
     // CPython's str(OSError): `[Errno 2] No such file or directory:
     // 'path'` — the errno and the OS's own text (Rust's Display appends
     // " (os error N)", which Python never shows).
@@ -7151,6 +7152,43 @@ fn os_error(e: &std::io::Error, path: &str) -> PyException {
         None => format!("{}: {}", text, py_str_repr(path)),
     };
     PyException::new(kind, message)
+}
+
+/// The OSError subclass CPython raises for an I/O failure's errno.
+#[cfg(feature = "std")]
+fn os_error_kind(e: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::NotFound => "FileNotFoundError",
+        ErrorKind::PermissionDenied => "PermissionError",
+        ErrorKind::AlreadyExists => "FileExistsError",
+        ErrorKind::IsADirectory => "IsADirectoryError",
+        ErrorKind::NotADirectory => "NotADirectoryError",
+        ErrorKind::BrokenPipe => "BrokenPipeError",
+        ErrorKind::ConnectionReset => "ConnectionResetError",
+        ErrorKind::ConnectionRefused => "ConnectionRefusedError",
+        ErrorKind::ConnectionAborted => "ConnectionAbortedError",
+        ErrorKind::TimedOut => "TimeoutError",
+        ErrorKind::Interrupted => "InterruptedError",
+        _ => "OSError",
+    }
+}
+
+/// An I/O failure on a stream with no filename — a write to a closed
+/// pipe on stdout is CPython's `BrokenPipeError: [Errno 32] Broken pipe`
+/// (Devin review on #339, round 7): the errno and the OS's own text.
+#[cfg(feature = "std")]
+pub(crate) fn stream_error(e: &std::io::Error) -> PyException {
+    let text = e.to_string();
+    let text = text
+        .split_once(" (os error ")
+        .map(|(t, _)| t.to_string())
+        .unwrap_or(text);
+    let message = match e.raw_os_error() {
+        Some(code) => format!("[Errno {}] {}", code, text),
+        None => text,
+    };
+    PyException::new(os_error_kind(e), message)
 }
 
 /// The access a validated Python open() mode asks for.
@@ -7463,7 +7501,7 @@ impl PyFile {
                 std::io::stdin()
                     .lock()
                     .read_to_string(&mut contents)
-                    .map_err(|e| runtime_error(&format!("Read error: {}", e)))?;
+                    .map_err(|e| stream_error(&e))?;
                 Ok(contents)
             }
             #[cfg(feature = "std")]
@@ -7477,7 +7515,7 @@ impl PyFile {
                 use std::io::Read;
                 let mut contents = String::new();
                 reader.read_to_string(&mut contents)
-                    .map_err(|e| runtime_error(&format!("Read error: {}", e)))?;
+                    .map_err(|e| stream_error(&e))?;
                 Ok(contents)
             }
             PyFileBackend::Buffer { data, pos } => {
@@ -7505,7 +7543,7 @@ impl PyFile {
                 std::io::stdin()
                     .lock()
                     .read_line(&mut line)
-                    .map_err(|e| runtime_error(&format!("Read error: {}", e)))?;
+                    .map_err(|e| stream_error(&e))?;
                 Ok(line)
             }
             #[cfg(feature = "std")]
@@ -7519,7 +7557,7 @@ impl PyFile {
                 use std::io::BufRead;
                 let mut line = String::new();
                 reader.read_line(&mut line)
-                    .map_err(|e| runtime_error(&format!("Read error: {}", e)))?;
+                    .map_err(|e| stream_error(&e))?;
                 Ok(line)
             }
             PyFileBackend::Buffer { data, pos } => {
@@ -7569,7 +7607,7 @@ impl PyFile {
                 std::io::stdout()
                     .lock()
                     .write_all(text.as_bytes())
-                    .map_err(|e| runtime_error(&format!("Write error: {}", e)))?;
+                    .map_err(|e| stream_error(&e))?;
                 Ok(text.chars().count() as i64)
             }
             #[cfg(feature = "std")]
@@ -7582,7 +7620,7 @@ impl PyFile {
             PyFileBackend::DiskWrite(writer) => {
                 use std::io::Write;
                 writer.write_all(text.as_bytes())
-                    .map_err(|e| runtime_error(&format!("Write error: {}", e)))?;
+                    .map_err(|e| stream_error(&e))?;
                 Ok(text.chars().count() as i64)
             }
             PyFileBackend::Buffer { data, pos } => {
@@ -7630,7 +7668,7 @@ impl PyFile {
             #[cfg(feature = "std")]
             PyFileBackend::DiskWrite(writer) => {
                 use std::io::Write;
-                writer.flush().map_err(|e| runtime_error(&format!("Flush error: {}", e)))
+                writer.flush().map_err(|e| stream_error(&e))
             }
             #[cfg(feature = "std")]
             PyFileBackend::Stdout => {
@@ -7638,7 +7676,7 @@ impl PyFile {
                 if stdout_closed() {
                     return Err(closed_file_error());
                 }
-                std::io::stdout().flush().map_err(|e| runtime_error(&format!("Flush error: {}", e)))
+                std::io::stdout().flush().map_err(|e| stream_error(&e))
             }
             #[cfg(feature = "std")]
             PyFileBackend::Stdin if stdin_closed() => Err(closed_file_error()),
@@ -7663,7 +7701,7 @@ impl PyFile {
                 if !stdout_closed() {
                     std::io::stdout()
                         .flush()
-                        .map_err(|e| runtime_error(&format!("Flush error: {}", e)))?;
+                        .map_err(|e| stream_error(&e))?;
                     STDOUT_CLOSED.store(true, core::sync::atomic::Ordering::SeqCst);
                 }
                 return Ok(());
@@ -7675,7 +7713,7 @@ impl PyFile {
         if let PyFileBackend::DiskWrite(mut writer) = old {
             use std::io::Write;
             writer.flush()
-                .map_err(|e| runtime_error(&format!("Flush error: {}", e)))?;
+                .map_err(|e| stream_error(&e))?;
         }
         #[cfg(not(feature = "std"))]
         let _ = old;
@@ -7693,6 +7731,19 @@ pub(crate) static STDIN_CLOSED: core::sync::atomic::AtomicBool =
 #[cfg(feature = "std")]
 pub(crate) static STDOUT_CLOSED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+/// Reopen the standard streams: clear the process-wide closed state of
+/// sys.stdin and sys.stdout. CPython has no such call — a closed
+/// `sys.stdout` stays closed for the interpreter's life unless the program
+/// rebinds it (`sys.stdout = sys.__stdout__`) — so generated programs
+/// never call this; it is the entry point for an embedder that runs
+/// several converted programs in one process, and for in-process tests
+/// (Devin review on #339, round 7).
+#[cfg(feature = "std")]
+pub fn reopen_standard_streams() {
+    STDIN_CLOSED.store(false, core::sync::atomic::Ordering::SeqCst);
+    STDOUT_CLOSED.store(false, core::sync::atomic::Ordering::SeqCst);
+}
 
 #[cfg(feature = "std")]
 pub(crate) fn stdin_closed() -> bool {

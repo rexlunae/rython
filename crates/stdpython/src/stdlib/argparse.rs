@@ -560,14 +560,39 @@ fn print_version_and_exit(prog: &str, spec: &ArgSpec) -> ! {
         Some(ParsedValue::Str(v)) => v.clone(),
         _ => String::new(),
     };
-    println!("{}", format_text(&version, prog));
+    // ArgumentParser._print_message swallows an OSError from the write
+    // (a closed pipe), so the exit code is still 0 (round 7).
+    print_message(&format!("{}\n", format_text(&version, prog)), false);
     std::process::exit(0);
 }
 
 fn exit_error(prog: &str, specs: &[ArgSpec], message: &str) -> ! {
-    eprintln!("{}", usage_line(prog, specs));
-    eprintln!("{}: error: {}", prog, message);
+    print_message(&format!("{}\n", usage_line(prog, specs)), true);
+    print_message(&format!("{}: error: {}\n", prog, message), true);
     std::process::exit(2);
+}
+
+/// `ArgumentParser._print_message`: write to stdout or stderr and
+/// IGNORE an OSError from the write (CPython's `except (AttributeError,
+/// OSError): pass`), so a closed pipe never turns usage, help or the
+/// version into a crash — the exit code is the parser's (round 7).
+fn print_message(text: &str, to_stderr: bool) {
+    use std::io::Write;
+    // A stdout closed through a `FileType("-")` handle is the closed
+    // sys.stdout `_print_message` writes to: its ValueError is NOT among
+    // the exceptions it ignores, so it escapes as CPython's traceback
+    // (round 8 of the review on #339).
+    if !to_stderr && crate::stdout_closed() {
+        loud_exit(&crate::closed_file_error());
+    }
+    let _ = if to_stderr {
+        std::io::stderr().lock().write_all(text.as_bytes())
+    } else {
+        std::io::stdout()
+            .lock()
+            .write_all(text.as_bytes())
+            .and_then(|_| std::io::stdout().flush())
+    };
 }
 
 impl ArgSpec {
@@ -977,7 +1002,7 @@ impl<'a> Parse<'a> {
     fn take_action(&mut self, action: OptAction, mut args: Vec<String>) {
         match action {
             OptAction::Help => {
-                print!("{}", help_text(&self.prog, self.description, self.specs));
+                print_message(&help_text(&self.prog, self.description, self.specs), false);
                 std::process::exit(0);
             }
             OptAction::Spec(i) => {

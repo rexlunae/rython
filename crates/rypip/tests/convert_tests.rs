@@ -7363,6 +7363,134 @@ fn closing_a_dash_stream_closes_it_for_print_and_input_too() {
 }
 
 #[test]
+fn a_failed_write_to_stdout_is_a_catchable_broken_pipe_error() {
+    // Round 7 of the review on #339: print() writes through the fallible
+    // path, so stdout rejecting a write — the reader of a pipe gone — is
+    // CPython's `BrokenPipeError: [Errno 32] Broken pipe`, caught by the
+    // program, never a panic; input()'s prompt takes the same path. The
+    // test closes the pipe's read end before the program prints (the
+    // program waits on stdin first), and reads the recorded exceptions
+    // from a file since stdout is gone. Transcript captured from python3
+    // 3.11 the same way.
+    let scratch = Scratch::new("appipe");
+    let file = scratch.path().join("pipe.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> None:\n",
+            "    line = input()\n",
+            "    try:\n",
+            "        print(\"x\" * 10)\n",
+            "    except BrokenPipeError as e:\n",
+            "        with open(\"pipe_err.txt\", \"w\") as f:\n",
+            "            f.write(\"print: \" + str(e) + \"\\n\")\n",
+            "    try:\n",
+            "        input(\"prompt\")\n",
+            "    except OSError as e:\n",
+            "        with open(\"pipe_err.txt\", \"a\") as f:\n",
+            "            f.write(\"input: \" + str(e) + \"\\n\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/pipe");
+    let mut child = Command::new(&bin)
+        .current_dir(scratch.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    // Close the read end of stdout before the program prints.
+    drop(child.stdout.take());
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"go\n").unwrap();
+    }
+    let output = child.wait_with_output().expect("wait");
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(
+        fs::read_to_string(scratch.path().join("pipe_err.txt")).unwrap(),
+        "print: [Errno 32] Broken pipe\ninput: [Errno 32] Broken pipe\n"
+    );
+}
+
+#[test]
+fn equals_after_a_packed_short_flag_is_an_explicit_argument_error() {
+    // Round 8 of the review on #339 claimed CPython accepts `-v=x` with
+    // `-v` and `-x` both flags. It does not: `consume_optional` raises
+    // `ignored explicit argument` when the explicit argument came with a
+    // separator (`=`) on a zero-argument single-dash option, whatever
+    // the letters after it name; `-vx` packs, `-vn=3` and `-vn3` give the
+    // value-taking `-n` its value, `-vz` is unrecognized, `-v=` is the
+    // empty explicit argument. Transcripts captured from python3 3.11.
+    let scratch = Scratch::new("appacked");
+    let file = scratch.path().join("packed.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"tool\")\n",
+            "    parser.add_argument(\"-v\", \"--verbose\", action=\"store_true\")\n",
+            "    parser.add_argument(\"-x\", \"--extra\", action=\"store_true\")\n",
+            "    parser.add_argument(\"-n\", \"--num\", type=int, default=0)\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(args.verbose, args.extra, args.num)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/packed");
+    let usage = "usage: tool [-h] [-v] [-x] [-n NUM]\n";
+    let cases: &[(&[&str], i32, &str, &str)] = &[
+        (&["-v=x"], 2, "", "tool: error: argument -v/--verbose: ignored explicit argument 'x'\n"),
+        (&["-vx"], 0, "True True 0\n", ""),
+        (&["-vn=3"], 0, "True False 3\n", ""),
+        (&["-vn3"], 0, "True False 3\n", ""),
+        (&["-v=n"], 2, "", "tool: error: argument -v/--verbose: ignored explicit argument 'n'\n"),
+        (&["-vz"], 2, "", "tool: error: unrecognized arguments: -z\n"),
+        (&["-v="], 2, "", "tool: error: argument -v/--verbose: ignored explicit argument ''\n"),
+    ];
+    for (args, code, stdout, stderr) in cases {
+        let output = Command::new(&bin)
+            .args(*args)
+            .current_dir(scratch.path())
+            .output()
+            .expect("run");
+        assert_eq!(output.status.code(), Some(*code), "{:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), *stdout, "{:?}", args);
+        let expected_err = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!("{}{}", usage, stderr)
+        };
+        assert_eq!(String::from_utf8_lossy(&output.stderr), expected_err, "{:?}", args);
+    }
+}
+
+#[test]
 fn binary_filetype_and_binary_open_match_python_at_runtime() {
     // Issue #332: `type=argparse.FileType("rb")` with `nargs="*"` (zero
     // files is an empty list), and `open(p, "wb")` / `open(p, "rb")` —

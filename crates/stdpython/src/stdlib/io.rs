@@ -157,7 +157,7 @@ impl PyBytesIO {
                 let mut out = Vec::new();
                 reader
                     .read_to_end(&mut out)
-                    .map_err(|e| crate::runtime_error(&format!("Read error: {}", e)))?;
+                    .map_err(|e| crate::stream_error(&e))?;
                 Ok(out)
             }
             #[cfg(feature = "std")]
@@ -170,7 +170,7 @@ impl PyBytesIO {
                 std::io::stdin()
                     .lock()
                     .read_to_end(&mut out)
-                    .map_err(|e| crate::runtime_error(&format!("Read error: {}", e)))?;
+                    .map_err(|e| crate::stream_error(&e))?;
                 Ok(out)
             }
             #[cfg(feature = "std")]
@@ -204,7 +204,7 @@ impl PyBytesIO {
                 use std::io::Write;
                 writer
                     .write_all(bytes)
-                    .map_err(|e| crate::runtime_error(&format!("Write error: {}", e)))?;
+                    .map_err(|e| crate::stream_error(&e))?;
                 Ok(bytes.len() as i64)
             }
             #[cfg(feature = "std")]
@@ -216,7 +216,7 @@ impl PyBytesIO {
                 std::io::stdout()
                     .lock()
                     .write_all(bytes)
-                    .map_err(|e| crate::runtime_error(&format!("Write error: {}", e)))?;
+                    .map_err(|e| crate::stream_error(&e))?;
                 Ok(bytes.len() as i64)
             }
             #[cfg(feature = "std")]
@@ -260,7 +260,7 @@ impl PyBytesIO {
                 use std::io::Write;
                 writer
                     .flush()
-                    .map_err(|e| crate::runtime_error(&format!("Flush error: {}", e)))
+                    .map_err(|e| crate::stream_error(&e))
             }
             #[cfg(feature = "std")]
             BytesBackend::Stdout => {
@@ -270,7 +270,7 @@ impl PyBytesIO {
                 }
                 std::io::stdout()
                     .flush()
-                    .map_err(|e| crate::runtime_error(&format!("Flush error: {}", e)))
+                    .map_err(|e| crate::stream_error(&e))
             }
             #[cfg(feature = "std")]
             BytesBackend::Stdin if crate::stdin_closed() => Err(crate::closed_file_error()),
@@ -294,7 +294,7 @@ impl PyBytesIO {
                 if !crate::stdout_closed() {
                     std::io::stdout()
                         .flush()
-                        .map_err(|e| crate::runtime_error(&format!("Flush error: {}", e)))?;
+                        .map_err(|e| crate::stream_error(&e))?;
                     crate::STDOUT_CLOSED.store(true, core::sync::atomic::Ordering::SeqCst);
                 }
                 return Ok(());
@@ -305,9 +305,7 @@ impl PyBytesIO {
         #[cfg(feature = "std")]
         if let BytesBackend::DiskWrite(mut writer) = old {
             use std::io::Write;
-            writer
-                .flush()
-                .map_err(|e| crate::runtime_error(&format!("Flush error: {}", e)))?;
+            writer.flush().map_err(|e| crate::stream_error(&e))?;
         }
         #[cfg(not(feature = "std"))]
         let _ = old;

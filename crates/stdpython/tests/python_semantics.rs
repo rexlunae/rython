@@ -3944,6 +3944,21 @@ fn file_errors_quote_paths_as_python_does_and_wrong_direction_io_is_unsupported_
     assert_eq!(err.message, "not writable");
     let err = stdpython::open(p, Some("w")).unwrap().read().err().expect("write-only text");
     assert_eq!(err.message, "not readable");
+    // A post-open I/O failure is the OSError CPython raises (round 8):
+    // /dev/full accepts the buffered write and fails the flush with
+    // `[Errno 28] No space left on device`, text and binary alike.
+    if std::path::Path::new("/dev/full").exists() {
+        let full = stdpython::open_binary("/dev/full", "wb").unwrap();
+        full.write(b"x").unwrap();
+        let err = full.flush().err().expect("no space");
+        assert!(err.matches("OSError"), "{:?}", err);
+        assert_eq!(err.message, "[Errno 28] No space left on device");
+        let full = stdpython::open("/dev/full", Some("w")).unwrap();
+        full.write("x").unwrap();
+        let err = full.flush().err().expect("no space");
+        assert!(err.matches("OSError"), "{:?}", err);
+        assert_eq!(err.message, "[Errno 28] No space left on device");
+    }
     // getvalue() on a disk handle is CPython's AttributeError, naming the
     // receiver's class (round 5).
     let err = stdpython::open_binary(p, "rb").unwrap().getvalue().err().expect("no getvalue");
@@ -3971,6 +3986,15 @@ fn file_errors_quote_paths_as_python_does_and_wrong_direction_io_is_unsupported_
         .unwrap();
     assert!(a.closed() && b.closed(), "a close on another thread closes every alias");
     assert_eq!(b.write(b"x").err().expect("closed").message, "I/O operation on closed file.");
+    // print() sees the same closed stdout; the embedder's reset reopens
+    // both streams for the next program (round 7).
+    assert_eq!(
+        stdpython::print_parts(&["x"], " ", "\n").err().expect("closed stdout").message,
+        "I/O operation on closed file."
+    );
+    stdpython::reopen_standard_streams();
+    assert!(!a.closed() && !b.closed() && !text_in.closed());
+    stdpython::print_parts(&[] as &[&str], "", "").unwrap();
 }
 
 #[test]
