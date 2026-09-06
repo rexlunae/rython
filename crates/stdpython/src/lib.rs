@@ -7395,11 +7395,154 @@ pub struct PyFile {
     pub name: String,
 }
 
+/// The text-mode reader of a disk file — CPython's TextIOWrapper over
+/// its buffer: the bytes are read in 8192-byte chunks and each chunk is
+/// decoded as UTF-8 (an incomplete sequence at a chunk's end waits for
+/// the next chunk, as the incremental decoder's pending bytes do);
+/// `read()` decodes everything that remains at once. A decode failure is
+/// `UnicodeDecodeError` with CPython's message, its positions relative
+/// to the bytes handed to the decoder — the pending tail plus the chunk
+/// — which for a file under one chunk is the file offset (Devin review
+/// on #339, round 9).
+#[cfg(feature = "std")]
+struct TextReader {
+    inner: alloc::boxed::Box<dyn std::io::BufRead>,
+    /// An incomplete UTF-8 sequence carried from the last chunk.
+    pending: alloc::vec::Vec<u8>,
+    /// Decoded text not yet handed out.
+    decoded: String,
+    eof: bool,
+}
+
+#[cfg(feature = "std")]
+const TEXT_CHUNK_SIZE: usize = 8192;
+
+#[cfg(feature = "std")]
+impl TextReader {
+    fn new(inner: alloc::boxed::Box<dyn std::io::BufRead>) -> Self {
+        Self {
+            inner,
+            pending: alloc::vec::Vec::new(),
+            decoded: String::new(),
+            eof: false,
+        }
+    }
+
+    /// `read()`: everything remaining, decoded as one final chunk.
+    fn read_all(&mut self) -> Result<String, PyException> {
+        use std::io::Read;
+        let mut rest = core::mem::take(&mut self.pending);
+        self.inner.read_to_end(&mut rest).map_err(|e| stream_error(&e))?;
+        self.eof = true;
+        let text = decode_utf8_final(&rest)?;
+        let mut out = core::mem::take(&mut self.decoded);
+        out.push_str(&text);
+        Ok(out)
+    }
+
+    /// Decode one more chunk into `decoded`; false once the stream is
+    /// exhausted and nothing was added.
+    fn fill(&mut self) -> Result<bool, PyException> {
+        use std::io::Read;
+        if self.eof {
+            return Ok(false);
+        }
+        let mut chunk = alloc::vec![0u8; TEXT_CHUNK_SIZE];
+        let n = self.inner.read(&mut chunk).map_err(|e| stream_error(&e))?;
+        chunk.truncate(n);
+        let mut data = core::mem::take(&mut self.pending);
+        data.extend_from_slice(&chunk);
+        if n == 0 {
+            self.eof = true;
+            let text = decode_utf8_final(&data)?;
+            let added = !text.is_empty();
+            self.decoded.push_str(&text);
+            return Ok(added);
+        }
+        let (text, tail) = decode_utf8_partial(&data)?;
+        self.pending = tail;
+        self.decoded.push_str(&text);
+        Ok(true)
+    }
+
+    /// `readline()`: up to and including the next newline, or the rest.
+    fn readline(&mut self) -> Result<String, PyException> {
+        loop {
+            if let Some(at) = self.decoded.find('\n') {
+                let line: String = self.decoded.drain(..=at).collect();
+                return Ok(line);
+            }
+            if !self.fill()? {
+                return Ok(core::mem::take(&mut self.decoded));
+            }
+        }
+    }
+}
+
+/// CPython's UnicodeDecodeError for a UTF-8 failure at `err` in `data`:
+/// one byte (`can't decode byte 0xff in position 2: invalid start
+/// byte`, or an `invalid continuation byte`), or a run (`can't decode
+/// bytes in position 0-1: invalid continuation byte` / `unexpected end
+/// of data`).
+fn utf8_decode_failure(data: &[u8], err: core::str::Utf8Error) -> PyException {
+    let start = err.valid_up_to();
+    let (end, reason) = match err.error_len() {
+        None => (data.len() - 1, "unexpected end of data"),
+        Some(n) => (
+            start + n - 1,
+            // A byte that cannot begin a sequence (a continuation byte,
+            // an overlong lead, a lead past U+10FFFF) is an invalid start
+            // byte; a lead whose followers are wrong, an invalid
+            // continuation byte.
+            if (0xC2..=0xF4).contains(&data[start]) {
+                "invalid continuation byte"
+            } else {
+                "invalid start byte"
+            },
+        ),
+    };
+    let message = if end == start {
+        format!(
+            "'utf-8' codec can't decode byte 0x{:02x} in position {}: {}",
+            data[start], start, reason
+        )
+    } else {
+        format!(
+            "'utf-8' codec can't decode bytes in position {}-{}: {}",
+            start, end, reason
+        )
+    };
+    unicode_decode_error(message)
+}
+
+/// Decode with `final=True`: an incomplete trailing sequence is an error.
+fn decode_utf8_final(data: &[u8]) -> Result<String, PyException> {
+    core::str::from_utf8(data)
+        .map(str::to_string)
+        .map_err(|e| utf8_decode_failure(data, e))
+}
+
+/// Decode with `final=False`: an incomplete trailing sequence is returned
+/// as the pending tail rather than an error.
+fn decode_utf8_partial(data: &[u8]) -> Result<(String, alloc::vec::Vec<u8>), PyException> {
+    match core::str::from_utf8(data) {
+        Ok(text) => Ok((text.to_string(), alloc::vec::Vec::new())),
+        Err(e) if e.error_len().is_none() => {
+            let valid = e.valid_up_to();
+            Ok((
+                core::str::from_utf8(&data[..valid]).expect("valid prefix").to_string(),
+                data[valid..].to_vec(),
+            ))
+        }
+        Err(e) => Err(utf8_decode_failure(data, e)),
+    }
+}
+
 enum PyFileBackend {
-    /// A readable stream: a buffered disk file, or the live standard
-    /// input (argparse's `FileType("r")("-")`).
+    /// A readable disk file in text mode, decoded chunk by chunk as
+    /// CPython's TextIOWrapper does (see [`TextReader`]).
     #[cfg(feature = "std")]
-    DiskRead(alloc::boxed::Box<dyn std::io::BufRead>),
+    DiskRead(TextReader),
     /// A writable stream: a buffered disk file.
     #[cfg(feature = "std")]
     DiskWrite(alloc::boxed::Box<dyn std::io::Write>),
@@ -7439,7 +7582,10 @@ impl PyFile {
 
     #[cfg(feature = "std")]
     fn new_read(reader: impl std::io::BufRead + 'static, name: &str) -> Self {
-        Self::from_backend(PyFileBackend::DiskRead(alloc::boxed::Box::new(reader)), name)
+        Self::from_backend(
+            PyFileBackend::DiskRead(TextReader::new(alloc::boxed::Box::new(reader))),
+            name,
+        )
     }
 
     #[cfg(feature = "std")]
@@ -7497,12 +7643,12 @@ impl PyFile {
                 if stdin_closed() {
                     return Err(closed_file_error());
                 }
-                let mut contents = String::new();
+                let mut bytes = Vec::new();
                 std::io::stdin()
                     .lock()
-                    .read_to_string(&mut contents)
+                    .read_to_end(&mut bytes)
                     .map_err(|e| stream_error(&e))?;
-                Ok(contents)
+                decode_utf8_final(&bytes)
             }
             #[cfg(feature = "std")]
             PyFileBackend::Stdout => Err(if stdout_closed() {
@@ -7511,13 +7657,7 @@ impl PyFile {
                 unsupported_operation("not readable")
             }),
             #[cfg(feature = "std")]
-            PyFileBackend::DiskRead(reader) => {
-                use std::io::Read;
-                let mut contents = String::new();
-                reader.read_to_string(&mut contents)
-                    .map_err(|e| stream_error(&e))?;
-                Ok(contents)
-            }
+            PyFileBackend::DiskRead(reader) => reader.read_all(),
             PyFileBackend::Buffer { data, pos } => {
                 let out: String = data.chars().skip(*pos).collect();
                 *pos = data.chars().count();
@@ -7539,12 +7679,12 @@ impl PyFile {
                 if stdin_closed() {
                     return Err(closed_file_error());
                 }
-                let mut line = String::new();
+                let mut bytes = Vec::new();
                 std::io::stdin()
                     .lock()
-                    .read_line(&mut line)
+                    .read_until(b'\n', &mut bytes)
                     .map_err(|e| stream_error(&e))?;
-                Ok(line)
+                decode_utf8_final(&bytes)
             }
             #[cfg(feature = "std")]
             PyFileBackend::Stdout => Err(if stdout_closed() {
@@ -7553,13 +7693,7 @@ impl PyFile {
                 unsupported_operation("not readable")
             }),
             #[cfg(feature = "std")]
-            PyFileBackend::DiskRead(reader) => {
-                use std::io::BufRead;
-                let mut line = String::new();
-                reader.read_line(&mut line)
-                    .map_err(|e| stream_error(&e))?;
-                Ok(line)
-            }
+            PyFileBackend::DiskRead(reader) => reader.readline(),
             PyFileBackend::Buffer { data, pos } => {
                 let mut line = String::new();
                 for c in data.chars().skip(*pos) {

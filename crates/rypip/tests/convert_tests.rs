@@ -7491,6 +7491,76 @@ fn equals_after_a_packed_short_flag_is_an_explicit_argument_error() {
 }
 
 #[test]
+fn argparse_defaults_keep_cpythons_types() {
+    // Round 9 of the review on #339: CPython applies `type=` to
+    // command-line strings and to a STRING default only; a default of
+    // the declared type is kept as it is. So `type=float, default=1.5`
+    // prints `1.5` when omitted and `2.0` when given `2`; `type=int,
+    // default="3"` is the int 3; `type=float, default="2"` is `2.0`
+    // (converted through float); `default=-1` is the int -1. A
+    // non-string default of another type (`type=float, default=1`) is
+    // refused at conversion, since CPython would keep the int.
+    // Transcripts captured from python3 3.11 verbatim.
+    let scratch = Scratch::new("apdefaults");
+    let file = scratch.path().join("defaults.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"defaults\")\n",
+            "    parser.add_argument(\"--scale\", type=float, default=1.5)\n",
+            "    parser.add_argument(\"--count\", type=int, default=\"3\")\n",
+            "    parser.add_argument(\"--ratio\", type=float, default=\"2\")\n",
+            "    parser.add_argument(\"--neg\", type=int, default=-1)\n",
+            "    parser.add_argument(\"--name\", default=\"none\")\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(args.scale, args.count, args.ratio, args.neg, args.name)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/defaults");
+    let cases: &[(&[&str], i32, &str, &str)] = &[
+        (&[], 0, "1.5 3 2.0 -1 none\n", ""),
+        (
+            &["--scale", "2", "--count", "4", "--ratio", "1", "--neg", "5", "--name", "x"],
+            0,
+            "2.0 4 1.0 5 x\n",
+            "",
+        ),
+        (
+            &["--scale", "2.5", "--count", "x"],
+            2,
+            "",
+            "usage: defaults [-h] [--scale SCALE] [--count COUNT] [--ratio RATIO]\n                [--neg NEG] [--name NAME]\ndefaults: error: argument --count: invalid int value: 'x'\n",
+        ),
+    ];
+    for (args, code, stdout, stderr) in cases {
+        let output = Command::new(&bin)
+            .args(*args)
+            .current_dir(scratch.path())
+            .env_remove("COLUMNS")
+            .output()
+            .expect("run");
+        assert_eq!(output.status.code(), Some(*code), "{:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), *stdout, "{:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stderr), *stderr, "{:?}", args);
+    }
+}
+
+#[test]
 fn binary_filetype_and_binary_open_match_python_at_runtime() {
     // Issue #332: `type=argparse.FileType("rb")` with `nargs="*"` (zero
     // files is an empty list), and `open(p, "wb")` / `open(p, "rb")` —

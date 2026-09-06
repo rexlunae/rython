@@ -3998,6 +3998,52 @@ fn file_errors_quote_paths_as_python_does_and_wrong_direction_io_is_unsupported_
 }
 
 #[test]
+fn invalid_utf8_in_a_text_file_is_cpythons_unicode_decode_error() {
+    // Round 9 of the review on #339: a text-mode read of invalid UTF-8 is
+    // UnicodeDecodeError, never an OSError, with CPython's message — one
+    // byte (`can't decode byte 0xff in position 2: invalid start byte`)
+    // or a run (`bytes in position 0-1: unexpected end of data`). The
+    // reader decodes 8192-byte chunks as TextIOWrapper does, so
+    // readline() on a small file fails on its first call even when the
+    // bad byte sits on a later line, with the same position; the seven
+    // cases are python3 3.11's messages verbatim.
+    let dir = std::env::temp_dir().join(format!("rython-utf8-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bad.txt");
+    let p = path.to_str().unwrap();
+    let cases: &[(&[u8], &str)] = &[
+        (b"\xff", "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"),
+        (b"ab\xffcd", "'utf-8' codec can't decode byte 0xff in position 2: invalid start byte"),
+        (b"\xe2\x82", "'utf-8' codec can't decode bytes in position 0-1: unexpected end of data"),
+        (b"\xe2\x82x", "'utf-8' codec can't decode bytes in position 0-1: invalid continuation byte"),
+        (b"ab\xc0\xafz", "'utf-8' codec can't decode byte 0xc0 in position 2: invalid start byte"),
+        (b"\xed\xa0\x80", "'utf-8' codec can't decode byte 0xed in position 0: invalid continuation byte"),
+        (b"ok\n\xffbad\n", "'utf-8' codec can't decode byte 0xff in position 3: invalid start byte"),
+    ];
+    for (bytes, expected) in cases {
+        std::fs::write(&path, bytes).unwrap();
+        let err = stdpython::open(p, Some("r")).unwrap().read().err().expect("read fails");
+        assert!(err.matches("UnicodeDecodeError") && !err.matches("OSError"), "{:?}", err);
+        assert_eq!(err.message, *expected, "read of {:?}", bytes);
+        let err = stdpython::open(p, Some("r")).unwrap().readline().err().expect("readline fails");
+        assert!(err.matches("UnicodeDecodeError"), "{:?}", err);
+        assert_eq!(err.message, *expected, "readline of {:?}", bytes);
+    }
+    // Valid text still reads line by line, a multi-byte character across
+    // the chunk boundary included.
+    let mut big = "a".repeat(8191).into_bytes();
+    big.extend_from_slice("é\nsecond\n".as_bytes());
+    std::fs::write(&path, &big).unwrap();
+    let f = stdpython::open(p, Some("r")).unwrap();
+    let first = f.readline().unwrap();
+    assert_eq!(first.chars().count(), 8193);
+    assert!(first.ends_with("é\n"));
+    assert_eq!(f.readline().unwrap(), "second\n");
+    assert_eq!(f.readline().unwrap(), "");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn open_binary_validates_the_mode_before_touching_the_path() {
     // CPython's mode grammar, in its order, before the path is looked
     // at (Devin review on #339, rounds 1 and 2): a letter outside

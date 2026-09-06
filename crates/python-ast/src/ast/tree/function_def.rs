@@ -64,8 +64,24 @@ pub(crate) struct ArgparseSpec {
     dest: Option<String>,
     /// `nargs="+"` / `"*"` on a positional: a list-valued field.
     nargs: Option<ArgparseNargs>,
-    default: Option<ExprType>,
+    default: Option<ArgparseDefault>,
     help: Option<String>,
+}
+
+/// An option's `default=`, as CPython keeps it: `type=` is applied to
+/// command-line strings and to a STRING default only, a non-string
+/// default is kept as it is (`type=float, default=1` is the int 1). A
+/// typed field can hold only its own type, so the converter accepts a
+/// literal of the declared type, or a string literal it converts here as
+/// the parser would, and refuses anything else (Devin review on #339,
+/// round 9).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ArgparseDefault {
+    Int(i64),
+    Float(f64),
+    /// A str option's default: any str expression, rendered at the parse
+    /// site.
+    Str(ExprType),
 }
 
 /// The keywords `argparse.ArgumentParser(...)` may take here. Every
@@ -226,6 +242,59 @@ fn literal_str(e: &ExprType) -> Option<String> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Python's repr of a plain string, for a message.
+fn py_repr_str(s: &str) -> String {
+    if s.contains('\'') && !s.contains('"') {
+        format!("\"{}\"", s)
+    } else {
+        format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+    }
+}
+
+/// An int literal, negated or not (`-1`).
+fn literal_int(e: &ExprType) -> Option<i64> {
+    match e {
+        ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::Integer(i)) => i.value::<i64>(),
+            _ => None,
+        },
+        ExprType::UnaryOp(u) if matches!(u.op, crate::ast::tree::unary_op::Ops::USub) => {
+            literal_int(&u.operand).map(|v| -v)
+        }
+        _ => None,
+    }
+}
+
+/// A float literal, negated or not (`-1.5`).
+fn literal_float(e: &ExprType) -> Option<f64> {
+    match e {
+        ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::Float(f)) => f.number_part().replace('_', "").parse::<f64>().ok(),
+            _ => None,
+        },
+        ExprType::UnaryOp(u) if matches!(u.op, crate::ast::tree::unary_op::Ops::USub) => {
+            literal_float(&u.operand).map(|v| -v)
+        }
+        _ => None,
+    }
+}
+
+/// Python's `int(s)` on a string default: surrounding whitespace, a
+/// sign and underscores between digits are accepted.
+fn python_int_of(s: &str) -> Option<i64> {
+    let t = s.trim().replace('_', "");
+    t.parse::<i64>().ok()
+}
+
+/// Python's `float(s)` on a string default.
+fn python_float_of(s: &str) -> Option<f64> {
+    let t = s.trim().replace('_', "");
+    match t.to_ascii_lowercase().trim_start_matches(['+', '-']) {
+        "inf" | "infinity" | "nan" => t.to_ascii_lowercase().replace("infinity", "inf").parse::<f64>().ok(),
+        _ => t.parse::<f64>().ok(),
     }
 }
 
@@ -723,6 +792,64 @@ pub(crate) fn scan_argparse(
                     )
                     .into());
                 }
+                // CPython applies `type=` to strings only and keeps a
+                // non-string default as it is; the typed field holds one
+                // type, so: a literal of the declared type, or a string
+                // literal converted here as the parser would (a failure is
+                // the error CPython raises at every run), else refused.
+                let default = match (&kind, default) {
+                    (_, None) => None,
+                    (ArgparseKind::Int, Some(e)) => Some(match (literal_int(&e), literal_str(&e)) {
+                        (Some(v), _) => ArgparseDefault::Int(v),
+                        (None, Some(text)) => ArgparseDefault::Int(python_int_of(&text).ok_or_else(|| {
+                            format!(
+                                "add_argument('{}'): argument {}: invalid int value: {} (CPython \
+                                 converts a string default through type= at parse time, so this \
+                                 program fails on every run)",
+                                name, name, py_repr_str(&text)
+                            )
+                        })?),
+                        (None, None) => {
+                            return Err(format!(
+                                "add_argument('{}'): CPython keeps a non-string default as it is \
+                                 (type= applies to strings only), so this default is not the int \
+                                 the i64 field holds; write an int literal or a string",
+                                name
+                            )
+                            .into())
+                        }
+                    }),
+                    (ArgparseKind::Float, Some(e)) => Some(match (literal_float(&e), literal_int(&e), literal_str(&e)) {
+                        (Some(v), _, _) => ArgparseDefault::Float(v),
+                        (None, Some(i), _) => {
+                            return Err(format!(
+                                "add_argument('{}'): CPython keeps a non-string default as it is \
+                                 (type= applies to strings only), so default={} with type=float \
+                                 is the int {} — which the f64 field cannot hold; write {}.0",
+                                name, i, i, i
+                            )
+                            .into())
+                        }
+                        (None, None, Some(text)) => ArgparseDefault::Float(python_float_of(&text).ok_or_else(|| {
+                            format!(
+                                "add_argument('{}'): argument {}: invalid float value: {} (CPython \
+                                 converts a string default through type= at parse time, so this \
+                                 program fails on every run)",
+                                name, name, py_repr_str(&text)
+                            )
+                        })?),
+                        (None, None, None) => {
+                            return Err(format!(
+                                "add_argument('{}'): CPython keeps a non-string default as it is \
+                                 (type= applies to strings only), so this default is not the float \
+                                 the f64 field holds; write a float literal or a string",
+                                name
+                            )
+                            .into())
+                        }
+                    }),
+                    (_, Some(e)) => Some(ArgparseDefault::Str(e)),
+                };
                 specs.push(ArgparseSpec {
                     name,
                     short,
@@ -914,19 +1041,25 @@ pub(crate) fn lower_parse_args(
                 quote!(Some(argparse::ParsedValue::Str(#local.clone())))
             }
             (_, None) => quote!(None),
-            (kind, Some(e)) => {
+            // The default as CPython keeps it (see ArgparseDefault): the
+            // declared type's own literal, or the string default already
+            // converted at conversion time.
+            (_, Some(ArgparseDefault::Int(v))) => quote!(Some(argparse::ParsedValue::Int(#v))),
+            (_, Some(ArgparseDefault::Float(v))) => {
+                let lit = if v.is_nan() {
+                    quote!(f64::NAN)
+                } else if v.is_infinite() {
+                    if *v > 0.0 { quote!(f64::INFINITY) } else { quote!(f64::NEG_INFINITY) }
+                } else {
+                    quote!(#v)
+                };
+                quote!(Some(argparse::ParsedValue::Float(#lit)))
+            }
+            (_, Some(ArgparseDefault::Str(e))) => {
                 let d = e
                     .clone()
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                // Coerce literal defaults onto the declared type
-                // (default=1 with type=float is valid Python).
-                match kind {
-                    ArgparseKind::Int => quote!(Some(argparse::ParsedValue::Int((#d) as i64))),
-                    ArgparseKind::Float => {
-                        quote!(Some(argparse::ParsedValue::Float((#d) as f64)))
-                    }
-                    _ => quote!(Some(argparse::ParsedValue::Str((#d).to_string()))),
-                }
+                quote!(Some(argparse::ParsedValue::Str((#d).to_string())))
             }
         };
         let name = &spec.name;

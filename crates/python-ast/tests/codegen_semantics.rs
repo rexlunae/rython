@@ -6889,6 +6889,27 @@ fn update_file_modes_are_refused_at_conversion() {
             "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"-h\", \"--hh\", action=\"store_true\")\n",
             "argument -h/--hh: conflicting option string: -h",
         ),
+        // CPython keeps a non-string default as it is (type= applies to
+        // strings only): default=1 with type=float is the int 1, which the
+        // f64 field cannot hold — refused; a string default converts as
+        // the parser would, and one that cannot is CPython's run-time
+        // error, refused (round 9).
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--f\", type=float, default=1)\n",
+            "default=1 with type=float is the int 1",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--i\", type=int, default=1.5)\n",
+            "not the int the i64 field holds",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--i\", type=int, default=True)\n",
+            "not the int the i64 field holds",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--i\", type=int, default=\"abc\")\n",
+            "argument --i: invalid int value: 'abc'",
+        ),
         // A positional store_true consumes no token in CPython (the flag
         // is simply True): refused rather than modeled as a value
         // (round 5).
