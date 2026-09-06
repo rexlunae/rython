@@ -521,11 +521,15 @@ pub(crate) fn imported_crate_modules(
                     .as_deref()
                     .and_then(|key| module_binding(options, key, &a.name));
                 if let Some(binding) = binding {
-                    // A binding under module-level control flow may not
-                    // run, and then Python would import the submodule of
-                    // that name instead: the converter takes the
-                    // attribute either way and says so (-W) when the
-                    // submodule exists (Devin review on #338, round 6).
+                    // The package binds the name: the attribute, unless
+                    // the binding has not happened yet when the import
+                    // runs (a cycle) — then Python imports the submodule
+                    // of that name, and so does the import site, at
+                    // runtime, when one exists (`import_site_name_checks`;
+                    // Devin review on #338, round 10). A binding under
+                    // module-level control flow may not run at all: the
+                    // converter says so (-W) when the submodule exists
+                    // (round 6).
                     if binding.conditional && crate::module_defs_key(options, &sub).is_some() {
                         let warning = format!(
                             "`from {} import {}`: the package binds `{}` under a \
@@ -578,18 +582,34 @@ fn stmt_binds(s: &crate::Statement, name: &str) -> bool {
     stmt_bound_names(s).iter().any(|n| n == name)
 }
 
-/// A loop or `with` statement binds its target BEFORE its body runs
-/// (Python binds it at each iteration, or after `__enter__`), so its
-/// mark is recorded at the top of the body by the loop lowering, not
-/// after the statement like a store's (Devin review on #338, round 9).
-pub(crate) fn binds_target_before_body(stmt: &crate::StatementType) -> bool {
+/// A compound statement that binds BEFORE its bodies run — a loop or
+/// `with` target (bound at each iteration, or after `__enter__`), a
+/// walrus in an `if`/`while`/loop/`with` header (bound when the header
+/// is evaluated): its mark is recorded at the top of each body by the
+/// statement's lowering, not after the statement like a store's (Devin
+/// review on #338, rounds 9 and 10). A def or class binds its name when
+/// the statement executes; its body is not run.
+pub(crate) fn binds_before_body(stmt: &crate::StatementType) -> bool {
     matches!(
         stmt,
         crate::StatementType::For(_)
             | crate::StatementType::AsyncFor(_)
             | crate::StatementType::With(_)
             | crate::StatementType::AsyncWith(_)
+            | crate::StatementType::If(_)
+            | crate::StatementType::While(_)
     )
+}
+
+/// Whether a statement's HEADER binds through a walrus (`if (x := f()):`,
+/// `for a in (xs := g()):`): such a binding also holds after the
+/// statement, whichever branch ran (a loop's target does not — an empty
+/// iterable binds nothing).
+pub(crate) fn header_binds_by_walrus(s: &crate::Statement) -> bool {
+    use crate::ast::tree::visit::{any_expr_for, stmt_exprs, Descend};
+    stmt_exprs(s).into_iter().any(|e| {
+        any_expr_for(e, Descend::OwnScope, |x| matches!(x, crate::ExprType::NamedExpr(_)))
+    })
 }
 
 /// A module body's binding statements — every statement that binds a
@@ -686,19 +706,21 @@ fn module_binding(options: &PythonOptions, key: &[String], name: &str) -> Option
     })
 }
 
-/// The bound checks a `from package import name` makes after the
-/// package's body ran: when that body is still running on this thread
-/// (an import cycle), the name is readable only once the statement
-/// binding it has executed — otherwise Python raises ImportError
-/// (`cannot import name ... from partially initialized module ...`)
-/// where the generated static would hand out its eventual value (Devin
-/// review on #338, round 6). Each module's `__rython_bound__` answers
-/// from its bound bitmap — the binding statement's bit, set where that
-/// statement ran (round 8) — and a fully initialized module answers
-/// yes. The package root (`from . import name`) is checked through
-/// [`ROOT_INIT_MODULE`] like any module, and so is the current module
-/// (a self-import during its own initialization is the same cycle).
-pub(crate) fn import_site_bound_checks(
+/// What a `from package import name` does for each name the package
+/// binds, after the package's body ran (Devin review on #338, rounds 6,
+/// 8 and 10). While that body is still running on this thread (an
+/// import cycle; a self-import included), the binding may not have
+/// happened yet — each module's `__rython_bound__` answers from its
+/// bound bitmap (the binding statements' bits, set where they ran; a
+/// completed body answers yes):
+/// - when a submodule `package.name` exists, Python imports it in that
+///   case, so the site runs its body then and only then;
+/// - otherwise Python raises ImportError (`cannot import name ... from
+///   partially initialized module ...`), and so does the check, rather
+///   than handing out the static's eventual value.
+/// The package root (`from . import name`) is checked through
+/// [`ROOT_INIT_MODULE`] like any module.
+pub(crate) fn import_site_name_checks(
     stmt: &crate::StatementType,
     options: &PythonOptions,
 ) -> TokenStream {
@@ -725,7 +747,20 @@ pub(crate) fn import_site_bound_checks(
             quote!((#word, #mask))
         });
         let name = a.name.as_str();
-        Some(quote!(crate::#(#segs::)*__rython_bound__(&[#(#bits),*], #name, #qualified)?;))
+        let bound = quote!(crate::#(#segs::)*__rython_bound__(&[#(#bits),*], #name, #qualified));
+        let mut sub = key.to_vec();
+        sub.push(a.name.clone());
+        Some(match crate::module_defs_key(options, &sub) {
+            Some(sub_key) => {
+                let sub_segs: Vec<_> = sub_key.iter().map(|s| crate::safe_ident(s)).collect();
+                quote! {
+                    if #bound.is_err() {
+                        crate::#(#sub_segs::)*__module_init__()?;
+                    }
+                }
+            }
+            None => quote!(#bound?;),
+        })
     });
     quote!(#(#checks)*)
 }
@@ -758,16 +793,48 @@ pub(crate) fn module_init_calls(paths: &[Vec<String>]) -> TokenStream {
 }
 
 /// What an import statement runs at its site: the loaded modules' init
-/// calls, then the bound checks of its from-list names — the one
-/// lowering every import site (module level, nested, function-local)
-/// shares. Empty when the statement loads no crate module.
+/// calls, then the checks of the from-list names the package binds —
+/// the one lowering every import site (module level, nested,
+/// function-local) shares. Empty when the statement loads no crate
+/// module.
 pub(crate) fn import_site_init(
     stmt: &crate::StatementType,
     options: &PythonOptions,
 ) -> TokenStream {
     let calls = module_init_calls(&imported_crate_modules(stmt, options));
-    let checks = import_site_bound_checks(stmt, options);
+    let checks = import_site_name_checks(stmt, options);
     quote!(#calls #checks)
+}
+
+/// The import site of a folded `try: <imports> except ImportError:`
+/// guard. The guard folds because rython's imports are static — but a
+/// crate module's body can raise ImportError at runtime (a cycle asking
+/// for a name bound later, a module that stays failed), where Python
+/// would run the fallback the fold discarded. That case is loud: an
+/// ImportError from the site names the guard and the folded fallback
+/// instead of leaving a bare error (Devin review on #338, round 10).
+pub(crate) fn folded_guard_site(site: TokenStream, spelling: &str) -> TokenStream {
+    if site.is_empty() {
+        return site;
+    }
+    let message = format!(
+        "`{}` raised ImportError at import time; its `except ImportError:` fallback \
+         was folded away (rython's imports are static), so the program cannot run \
+         the fallback as Python would",
+        spelling
+    );
+    quote! {
+        match (|| -> Result<(), PyException> { #site Ok(()) })() {
+            Ok(()) => {}
+            Err(__rython_import_error) if __rython_import_error.matches("ImportError") => {
+                return Err(PyException::new(
+                    "ImportError",
+                    format!("{}: {}", #message, __rython_import_error),
+                ));
+            }
+            Err(__rython_import_error) => return Err(__rython_import_error),
+        }
+    }
 }
 
 impl CodeGen for Import {

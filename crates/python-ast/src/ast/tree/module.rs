@@ -108,7 +108,7 @@ impl CodeGen for Module {
     fn to_rust(
         mut self,
         ctx: Self::Context,
-        mut options: Self::Options,
+        options: Self::Options,
         mut symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut stream = TokenStream::new();
@@ -145,8 +145,11 @@ impl CodeGen for Module {
         self.raw.body = crate::ast::tree::singledispatch::desugar_module(self.raw.body)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-        let (folded_body, newly_live) = fold_static_import_trys(&self.raw.body, &options);
+        let (folded_body, newly_live, folded_imports) =
+            fold_static_import_trys(&self.raw.body, &options);
         self.raw.body = folded_body;
+        let mut options = options;
+        options.folded_guard_imports = std::rc::Rc::new(folded_imports);
         // Handler statements the fold made live were invisible to
         // find_symbols (Try::find_symbols skips ImportError-handler
         // bodies, correctly, for the resolvable case): register them now
@@ -999,9 +1002,10 @@ impl CodeGen for Module {
         options.init_binding_marks = std::rc::Rc::new(binding_marks.by_pos.clone());
         let mut top_level_binds: Vec<(Option<TokenStream>, usize)> = Vec::new();
         for (stmt_index, s) in self.raw.body.into_iter().enumerate() {
-            // A loop or `with` records its target's mark at the top of its
-            // body (the statement lowering), not at the end of its range.
-            let end_of_range_bind = if crate::ast::tree::import::binds_target_before_body(
+            // A compound statement binding before its bodies (a loop or
+            // `with` target, a header walrus) records its mark through the
+            // statement lowering, not at the end of its range.
+            let end_of_range_bind = if crate::ast::tree::import::binds_before_body(
                 &s.statement,
             ) {
                 None
@@ -1788,8 +1792,10 @@ impl CodeGen for Module {
             // requests' adapters.py; `from .ssltransport import
             // SSLTransport` — urllib3's ssl_.py): rython's imports are
             // STATIC, so the try body always succeeds and the ImportError
-            // fallback (dropped in try_stmt.rs) never runs. The try wrapper
-            // is meaningless — flatten its body to MODULE level so import
+            // fallback (dropped in try_stmt.rs) never runs — a crate
+            // module's body raising ImportError at runtime is the loud
+            // exception (`folded_guard_site`). The try wrapper is
+            // meaningless — flatten its body to MODULE level so import
             // statements emit their `use` at module scope (where call sites
             // outside the wrapper can see them) instead of inside the
             // lowered try closure.
@@ -1853,9 +1859,15 @@ impl CodeGen for Module {
                             &body_stmt.statement,
                             crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
                         ) {
-                            let site = crate::ast::tree::import::import_site_init(
-                                &body_stmt.statement,
-                                &options,
+                            // A crate module's body can raise ImportError
+                            // at runtime (a cycle, a failed module), where
+                            // Python would run the folded fallback: loud.
+                            let site = crate::ast::tree::import::folded_guard_site(
+                                crate::ast::tree::import::import_site_init(
+                                    &body_stmt.statement,
+                                    &options,
+                                ),
+                                &import_spelling(&body_stmt.statement),
                             );
                             if !site.is_empty() {
                                 module_init_stmts.push(site);
@@ -1949,7 +1961,7 @@ impl CodeGen for Module {
                         };
                         let body_pos = body_stmt.lineno.zip(body_stmt.col_offset);
                         let body_binds_target_first =
-                            crate::ast::tree::import::binds_target_before_body(&body_stmt.statement);
+                            crate::ast::tree::import::binds_before_body(&body_stmt.statement);
                         let body_tokens = body_stmt
                             .to_rust(ctx.clone(), body_options, symbols.clone())
                             .map_err(|e| wrap_module_error(&module_filename, e))?;
@@ -2075,6 +2087,18 @@ impl CodeGen for Module {
                 crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
             ) {
                 let site = crate::ast::tree::import::import_site_init(&s.statement, &options);
+                // An import a folded guard spliced in: loud when a crate
+                // module raises ImportError at runtime (Python would run
+                // the folded fallback).
+                let site = if s
+                    .lineno
+                    .zip(s.col_offset)
+                    .is_some_and(|pos| options.folded_guard_imports.contains(&pos))
+                {
+                    crate::ast::tree::import::folded_guard_site(site, &import_spelling(&s.statement))
+                } else {
+                    site
+                };
                 if !site.is_empty() {
                     module_init_stmts.push(site);
                     has_module_init_code = true;
@@ -2767,7 +2791,7 @@ pub(crate) fn module_promoted_static_names(
     // resolvable `try: import ssl; CTX = build() ... except ImportError:`
     // is its try body at top level — requests' adapters.py), so the store
     // counts here and there agree (issue #333).
-    let (body, _) = fold_static_import_trys(&module.raw.body, &target);
+    let (body, _, _) = fold_static_import_trys(&module.raw.body, &target);
     let mut counts = std::collections::HashMap::new();
     count_module_stores(&body, &mut counts);
     let free_reads = module_function_free_reads(&body);
@@ -3437,22 +3461,31 @@ pub(crate) fn splice_gated_branches(
 pub(crate) fn fold_static_import_trys(
     body: &[crate::Statement],
     options: &crate::PythonOptions,
-) -> (Vec<crate::Statement>, Vec<crate::Statement>) {
+) -> (
+    Vec<crate::Statement>,
+    Vec<crate::Statement>,
+    std::collections::HashSet<(usize, usize)>,
+) {
     // The imports a try body runs at module init: nested control flow
     // included, a def's own imports excluded (they run when it is called).
     fn collect_imports<'a>(
         stmts: &'a [crate::Statement],
-        out: &mut Vec<&'a crate::StatementType>,
+        out: &mut Vec<&'a crate::Statement>,
     ) {
         walk_stmts(stmts, Descend::SkipDefs, &mut |s| {
-            if let st @ (crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)) =
-                &s.statement
-            {
-                out.push(st);
+            if matches!(
+                &s.statement,
+                crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
+            ) {
+                out.push(s);
             }
             Flow::Continue
         });
     }
+    // The positions of the imports spliced out of a folded guard: their
+    // sites are loud when a crate module raises ImportError at runtime.
+    let mut folded_imports: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
     let root_resolvable = |root: &str| -> bool {
         crate::ast::tree::import::is_stdpython_module(root)
             || options.python_modules.contains(&root.to_string())
@@ -3528,7 +3561,7 @@ pub(crate) fn fold_static_import_trys(
             // must assume an unknown absolute import is a crate sibling.
             if options.module_defs.len() > 1
                 && !imports.is_empty()
-                && imports.iter().all(|st| unresolvable(st))
+                && imports.iter().all(|st| unresolvable(&st.statement))
             {
                 out.extend(t.handlers[0].body.iter().cloned());
                 newly_live.extend(t.handlers[0].body.iter().cloned());
@@ -3540,7 +3573,8 @@ pub(crate) fn fold_static_import_trys(
             // otherwise hoist module-init locals that collide with the
             // imports' `use` bindings (urllib3's ssl_.py redefines
             // OP_NO_COMPRESSION and friends in its handler).
-            if !imports.is_empty() && imports.iter().all(|st| resolvable(st)) {
+            if !imports.is_empty() && imports.iter().all(|st| resolvable(&st.statement)) {
+                folded_imports.extend(imports.iter().filter_map(|st| st.lineno.zip(st.col_offset)));
                 out.extend(t.body.iter().cloned());
                 out.extend(t.orelse.iter().cloned());
                 continue;
@@ -3548,7 +3582,7 @@ pub(crate) fn fold_static_import_trys(
         }
         out.push(stmt.clone());
     }
-    (out, newly_live)
+    (out, newly_live, folded_imports)
 }
 
 pub(crate) fn module_global_mutable_names(
@@ -4160,7 +4194,7 @@ fn nested_import_stmts(stmts: &[crate::Statement]) -> Vec<crate::Statement> {
 }
 
 /// An import statement as the user wrote it, for messages.
-fn import_spelling(stmt: &crate::StatementType) -> String {
+pub(crate) fn import_spelling(stmt: &crate::StatementType) -> String {
     match stmt {
         crate::StatementType::Import(i) => format!(
             "import {}",
@@ -4519,7 +4553,7 @@ pub(crate) fn module_def_has_path_item(
     let mut target = options.clone();
     target.this_module_path = path.to_vec();
     target.module_path = module_package_path_from_defs(path, options);
-    let (body, _) = fold_static_import_trys(&module.raw.body, &target);
+    let (body, _, _) = fold_static_import_trys(&module.raw.body, &target);
     let mut counts = std::collections::HashMap::new();
     count_module_stores(&body, &mut counts);
     if counts.get(name) == Some(&1) && body.iter().any(|s| {
@@ -5341,7 +5375,7 @@ pub(crate) fn emitted_class_defs(
         top_level_class_defs(&module.raw.body, &mut out);
         return out;
     }
-    let (body, _) = fold_static_import_trys(&module.raw.body, options);
+    let (body, _, _) = fold_static_import_trys(&module.raw.body, options);
     let body = splice_gated_branches(body, options);
     let mut counts = std::collections::HashMap::new();
     count_module_stores(&body, &mut counts);

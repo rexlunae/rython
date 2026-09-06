@@ -604,12 +604,21 @@ pub struct PythonOptions {
     /// body has bound (Devin review on #338, round 8).
     pub init_binding_marks: std::rc::Rc<std::collections::HashMap<(usize, usize), (usize, bool)>>,
 
-    /// The `(word, mask)` of the loop or `with` statement about to be
-    /// lowered, when it is a module-scope binding statement: the loop
-    /// lowering records the mark at the top of its body — where Python
-    /// binds the target — and clears the field for the body (Devin
-    /// review on #338, round 9).
-    pub loop_target_bind: Option<(usize, u32)>,
+    /// The `(word, mask)` of the compound statement about to be lowered
+    /// (a loop, a `with`, an `if`, a `while`), when it is a module-scope
+    /// binding statement — its target, or a walrus in its header: the
+    /// lowering records the mark at the top of each of its bodies, where
+    /// Python has bound the name, and clears the field for the bodies
+    /// (Devin review on #338, rounds 9 and 10).
+    pub body_bind: Option<(usize, u32)>,
+
+    /// The source positions of the imports a folded `try: <imports>
+    /// except ImportError:` guard spliced into the module body (the fold
+    /// decided statically that every import resolves): their import
+    /// sites are loud when a crate module's body raises ImportError at
+    /// runtime, where Python would run the folded fallback (Devin review
+    /// on #338, round 10).
+    pub folded_guard_imports: std::rc::Rc<std::collections::HashSet<(usize, usize)>>,
 
     /// Set on the ENTRY module by the converter when the package root
     /// `__init__` has a body the binary must run: the bin-side module that
@@ -728,7 +737,8 @@ impl Default for PythonOptions {
             module_defs: std::rc::Rc::new(std::collections::HashMap::new()),
             in_module_init_body: false,
             init_binding_marks: std::rc::Rc::new(std::collections::HashMap::new()),
-            loop_target_bind: None,
+            body_bind: None,
+            folded_guard_imports: std::rc::Rc::new(std::collections::HashSet::new()),
             root_init_module: None,
             cross_module_mut_self: std::rc::Rc::new(std::cell::RefCell::new(
                 CrossModuleMutSelf::Uncomputed,

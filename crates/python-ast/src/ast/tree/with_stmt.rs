@@ -126,12 +126,12 @@ impl CodeGen for With {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // The statement's own binding mark, recorded at the top of the
-        // body where Python binds the target (Devin review on #338,
-        // round 9); cleared for the body's statements.
+        // The statement's own binding mark, recorded at the top of each
+        // body where Python has bound the target (Devin review on #338,
+        // round 9); cleared for the bodies' statements.
         let mut options = options;
-        let target_bind = options
-            .loop_target_bind
+        let body_bind = options
+            .body_bind
             .take()
             .map(|(word, mask)| quote!(__rython_bind__(#word, #mask);));
         // Evaluate each context manager and bind its `as` target (or a
@@ -179,7 +179,7 @@ impl CodeGen for With {
             .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
             .collect();
         let mut body_tokens = body_tokens?;
-        if let Some(bind) = target_bind {
+        if let Some(bind) = body_bind.clone() {
             body_tokens.insert(0, bind);
         }
 

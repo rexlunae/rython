@@ -75,29 +75,46 @@ impl CodeGen for Statement {
         // its mark where it runs (`__rython_bind__`), so a cyclic importer
         // can ask whether the name is bound yet; the module emission
         // records the top-level ones (Devin review on #338, round 8).
-        // A loop or `with` target binds before the body: the mark goes
-        // through `loop_target_bind` to the top of the body instead.
+        // A compound statement binding before its bodies (a loop or
+        // `with` target, a header walrus): the mark goes through
+        // `body_bind` to the top of each body; a header walrus also holds
+        // after the statement, whichever branch ran.
         let mut options = options;
-        let target_first = crate::ast::tree::import::binds_target_before_body(&self.statement);
+        let before_body = crate::ast::tree::import::binds_before_body(&self.statement);
         let bind = match (options.in_module_init_body, lineno, col_offset) {
             (true, Some(line), Some(col)) => options
                 .init_binding_marks
                 .get(&(line, col))
-                .filter(|(_, top_level)| target_first || !top_level)
+                .filter(|(_, top_level)| before_body || !top_level)
                 .map(|(mark, _)| crate::ast::tree::import::bound_word_and_mask(*mark)),
             _ => None,
         };
-        let bind = match (bind, target_first) {
-            (Some(bits), true) => {
-                options.loop_target_bind = Some(bits);
-                None
+        let bind = match (bind, before_body) {
+            (Some((word, mask)), true) => {
+                options.body_bind = Some((word, mask));
+                crate::ast::tree::import::header_binds_by_walrus(&self)
+                    .then(|| quote!(__rython_bind__(#word, #mask);))
             }
             (Some((word, mask)), false) => Some(quote!(__rython_bind__(#word, #mask);)),
             (None, _) => None,
         };
+        // An import a folded guard spliced in, nested in module-level
+        // control flow: its site (the init calls) is loud when a crate
+        // module raises ImportError at runtime.
+        let folded_guard = options.in_module_init_body
+            && matches!(self.statement, StatementType::Import(_) | StatementType::ImportFrom(_))
+            && lineno
+                .zip(col_offset)
+                .is_some_and(|pos| options.folded_guard_imports.contains(&pos));
+        let spelling = folded_guard
+            .then(|| crate::ast::tree::module::import_spelling(&self.statement));
         let result = self.statement
             .clone()
             .to_rust(ctx, options, symbols)
+            .map(|tokens| match &spelling {
+                Some(spelling) => crate::ast::tree::import::folded_guard_site(tokens, spelling),
+                None => tokens,
+            })
             .map(|tokens| match bind {
                 Some(bind) => quote!(#tokens #bind),
                 None => tokens,

@@ -10541,8 +10541,9 @@ fn a_walrus_in_the_package_is_its_attribute_before_the_same_named_submodule() {
     let cli = fs::read_to_string(krate.root.join("src/cli.rs")).unwrap();
     assert!(
         cli.contains("crate::conf::__module_init__()?;")
-            && !cli.contains("conf::settings::__module_init__"),
-        "the package binds settings; the submodule never loads: {}",
+            && cli.contains("if crate::conf::__rython_bound__(&[(0usize, 1u32)], \"settings\", \"walruspkg.conf\").is_err() {")
+            && cli.contains("crate::conf::settings::__module_init__()?;"),
+        "the package binds settings; the submodule loads only while that binding is pending: {}",
         cli
     );
     // Verified against python3.
@@ -10710,6 +10711,150 @@ fn a_loop_target_is_bound_at_the_top_of_the_loop_body() {
     );
     // Verified against python3.
     assert_eq!(run_package(&krate, "looptarget"), vec!["a start", "a end 3", "main 3"]);
+}
+
+#[test]
+fn a_package_binding_still_pending_in_a_cycle_falls_back_to_the_submodule() {
+    // subfall/__init__.py imports consumer before binding `extra`;
+    // consumer does `from . import extra` while the package is partially
+    // initialized: Python finds no attribute yet and imports the submodule
+    // subfall/extra.py (its body prints), then the package binds extra =
+    // 1. The import site runs the submodule's body exactly when the
+    // package's binding has not happened (Devin review on #338, round
+    // 10).
+    let scratch = Scratch::new("subfall");
+    let krate = package_crate(
+        &scratch,
+        "subfall",
+        &[
+            ("__init__.py", "from .consumer import value\nextra = 1\n"),
+            ("consumer.py", "from . import extra\n\n\ndef value() -> int:\n    return 2\n"),
+            ("extra.py", "print(\"submodule extra loaded\")\n"),
+            (
+                "cli.py",
+                "def main() -> None:\n    print(\"main\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+            ),
+        ],
+    );
+    // Verified against python3.
+    let consumer = fs::read_to_string(krate.root.join("src/consumer.rs")).unwrap();
+    assert!(
+        consumer.contains("if crate::__rython_root::__rython_bound__(&[(0usize, 2u32)], \"extra\", \"subfall\").is_err() {")
+            && consumer.contains("crate::extra::__module_init__()?;"),
+        "the submodule loads while the package's binding is pending: {}",
+        consumer
+    );
+    assert_eq!(run_package(&krate, "subfall"), vec!["submodule extra loaded", "main"]);
+}
+
+#[test]
+fn a_walrus_in_an_if_header_is_bound_at_the_top_of_its_body() {
+    // `if (X := 1): from .b import value` — Python binds X when the test
+    // is evaluated, before the body's import: the statement's mark is
+    // recorded at the top of the taken branch (and after the statement),
+    // not only after the whole `if` (Devin review on #338, round 10). A
+    // module-level walrus is a module-init local, so no sibling can
+    // import it back: the generated order is the pin.
+    let scratch = Scratch::new("hdrwalrus");
+    let krate = package_crate(
+        &scratch,
+        "hdrwalrus",
+        &[
+            (
+                "a.py",
+                "print(\"a start\")\nif (X := 1):\n    from .b import value\nprint(\"a end\", value())\n",
+            ),
+            ("b.py", "def value() -> int:\n    return 3\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from .a import value\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\", value())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let a = fs::read_to_string(krate.root.join("src/a.rs")).unwrap();
+    let test_start = a.find("X = 1;").expect("the walrus store");
+    let x_bound = a.find("__rython_bind__(0usize, 1u32);").expect("X's mark");
+    let b_init = a.find("crate::b::__module_init__()?;").expect("b's init call");
+    assert!(
+        test_start < x_bound && x_bound < b_init,
+        "X is bound after the test, before b runs: {}",
+        a
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "hdrwalrus"), vec!["a start", "a end 3", "main 3"]);
+}
+
+#[test]
+fn a_folded_import_guard_whose_module_raises_import_error_fails_loudly() {
+    // b guards `from .a import X` with `except ImportError: pass`; a
+    // imports b before binding X, so Python's guarded import raises
+    // ImportError there and the fallback runs (Python then fails later,
+    // with a NameError, when b_value reads the unbound X). rython folds
+    // the guard — its imports are static — so the fallback cannot run:
+    // the ImportError from a's partial state is loud, naming the guard
+    // and the folded fallback, instead of a bare error (Devin review on
+    // #338, round 10).
+    let scratch = Scratch::new("guardfold");
+    let krate = package_crate(
+        &scratch,
+        "guardfold",
+        &[
+            (
+                "a.py",
+                "from .b import b_value\nX = 1\nprint(\"a end\", b_value())\n",
+            ),
+            (
+                "b.py",
+                concat!(
+                    "try:\n",
+                    "    from .a import X\n",
+                    "except ImportError:\n",
+                    "    pass\n",
+                    "\n",
+                    "\n",
+                    "def b_value() -> int:\n",
+                    "    return X\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .a import X\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\", X)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/guardfold"))
+        .output()
+        .expect("running generated binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the folded fallback cannot run: {}", stderr);
+    assert!(
+        stderr.contains("`from .a import X` raised ImportError at import time; its `except ImportError:` fallback was folded away")
+            && stderr.contains("cannot import name 'X' from partially initialized module 'guardfold.a'"),
+        "the error names the guard, the fallback and the cause: {}",
+        stderr
+    );
 }
 
 #[test]
@@ -11107,7 +11252,14 @@ fn a_from_import_of_a_package_attribute_does_not_load_the_same_named_submodule()
         ],
     );
     let helper = fs::read_to_string(krate.root.join("src/helper.rs")).unwrap();
-    assert!(!helper.contains("crate::name::__module_init__"), "the submodule is not loaded: {}", helper);
+    // The submodule's body runs only while the package's binding of
+    // `name` is pending (a cycle); after the package's body, never.
+    assert!(
+        helper.contains("if crate::__rython_root::__rython_bound__(")
+            && helper.contains("crate::name::__module_init__()?;"),
+        "the submodule loads only behind the package's binding: {}",
+        helper
+    );
     // Verified against python3 (-m).
     assert_eq!(run_package(&krate, "attrpkg"), vec!["attr"]);
 }
