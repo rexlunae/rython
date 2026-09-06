@@ -307,6 +307,18 @@ impl CodeGen for Name {
                     {
                         return Ok(quote!((*#name).clone()));
                     }
+                    // A name the module RE-EXPORTS (`from . import C`
+                    // over the root's `from .core import *`): the
+                    // promotion is the DEFINING module's (Devin review
+                    // on #338, round 21).
+                    let mut visited = std::collections::HashSet::new();
+                    if let Some((origin, defining)) =
+                        crate::ast::tree::module::reexport_origin(&options, &path, &canonical, &mut visited)
+                        && crate::ast::tree::module::module_promoted_static_names(&options, &origin)
+                            .contains(&defining)
+                    {
+                        return Ok(quote!((*#name).clone()));
+                    }
                 }
             }
             // A CALLABLE name read as a VALUE (`hash_utf8 = sha256_utf8` —

@@ -978,6 +978,11 @@ impl CodeGen for Module {
         // definition of the same name: that definition is refused (below).
         let mut stored_above: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // The names a top-level walrus that MAY NOT run stored above
+        // (`flag and (X := 1)`): Python binds them only when it runs,
+        // but the store needs the name's value slot either way.
+        let mut walrus_above: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         // `use` items hoisted from module-level control flow, by text, so
         // the same import under two branches emits one item (E0252).
         let mut hoisted_uses: std::collections::HashSet<String> =
@@ -1037,16 +1042,44 @@ impl CodeGen for Module {
                         .into(),
                     ));
                 }
+                Some(name) if walrus_above.contains(name) => {
+                    return Err(wrap_module_error(
+                        &module_filename,
+                        format!(
+                            "the definition of `{}` follows a walrus `({} := ...)` above \
+                             that may or may not run (a short-circuited operand, a \
+                             conditional branch, a comprehension): Python binds the value \
+                             only when it runs, but the store needs the name's one value \
+                             slot beside the definition, which rython cannot give it; \
+                             rename one of the two",
+                            name, name
+                        )
+                        .into(),
+                    ));
+                }
                 Some(_) => {}
                 None if !matches!(
                     &s.statement,
                     crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
                 ) =>
                 {
-                    stored_above.extend(crate::ast::tree::visit::stmt_bound_names(
+                    // A walrus that may not run (a short-circuited
+                    // operand, a conditional branch, a comprehension) is
+                    // a binding under control flow — recorded apart, so
+                    // the refusal says what it is: its store still needs
+                    // the name's one value slot (Devin review on #338,
+                    // round 21).
+                    let conditional = crate::ast::tree::visit::conditional_walrus_names(&s);
+                    for n in crate::ast::tree::visit::stmt_bound_names(
                         &s,
                         crate::ast::tree::visit::Bindings::Scope,
-                    ));
+                    ) {
+                        if conditional.contains(&n) {
+                            walrus_above.insert(n);
+                        } else {
+                            stored_above.insert(n);
+                        }
+                    }
                 }
                 None => {}
             }
@@ -2838,7 +2871,20 @@ fn sibling_imported_names(options: &PythonOptions) -> std::collections::HashSet<
             if let ST::ImportFrom(ifm) = &stmt.statement {
                 if ifm.resolved_module_path(&sibling_options) == *this_path {
                     for alias in &ifm.names {
-                        names.insert(alias.name.clone());
+                        // A sibling's `from m import *` imports every
+                        // name m exports (a package root re-exporting a
+                        // submodule's names — Devin review on #338,
+                        // round 21).
+                        if alias.name == "*" {
+                            let key = crate::module_defs_key(options, this_path)
+                                .map(<[String]>::to_vec)
+                                .unwrap_or_else(|| this_path.clone());
+                            names.extend(crate::ast::tree::import::sibling_star_names(
+                                options, &key,
+                            ));
+                        } else {
+                            names.insert(alias.name.clone());
+                        }
                     }
                 }
             }
@@ -4802,10 +4848,16 @@ fn module_reexports_item(
             continue;
         }
         let ST::ImportFrom(i) = &s.statement else { continue };
-        // The import must bind OUR name (as itself or with an asname).
+        // The import must bind OUR name (as itself or with an asname) —
+        // or be a `from m import *` of a crate module whose exports
+        // (`import::star_exports`: m's literal `__all__`, else its
+        // public names) include it, the glob the emission re-exports
+        // honouring that `__all__` (Devin review on #338, round 21).
+        let star = i.names.iter().any(|a| a.name == "*");
         if !i.names.iter().any(|a| {
             a.asname.as_deref() == Some(name) || (a.asname.is_none() && a.name == name)
-        }) {
+        }) && !star
+        {
             continue;
         }
         // Resolve the re-export's defining module in THIS module's package
@@ -4833,6 +4885,14 @@ fn module_reexports_item(
             .map(|a| a.name.clone())
             .unwrap_or_else(|| name.to_string());
         if !target.is_empty() && options.module_defs.contains_key(&target) {
+            if star && defining == name {
+                let exported = crate::module_defs_key(options, &target)
+                    .and_then(|key| crate::ast::tree::import::star_exports(options, key, 0))
+                    .is_some_and(|names| names.iter().any(|n| n == name));
+                if !exported {
+                    continue;
+                }
+            }
             let mut sub = target.clone();
             sub.push(defining.clone());
             if options.module_defs.contains_key(&sub)
@@ -4844,6 +4904,83 @@ fn module_reexports_item(
         }
     }
     false
+}
+
+/// Where a name the module at `path` RE-EXPORTS is defined: the leaf of
+/// its re-export chain — through `from .core import C` (an asname
+/// followed to its canonical name) and through `from .core import *`
+/// when core exports the name — as (the defining module's key, the name
+/// there). None when the module defines the name itself, does not bind
+/// it, or the chain cycles. What an importing module's read lowering
+/// asks to learn whether the name is a promoted static of its defining
+/// module (`(*C).clone()` — Devin review on #338, round 21).
+pub(crate) fn reexport_origin(
+    options: &crate::PythonOptions,
+    path: &[String],
+    name: &str,
+    visited: &mut std::collections::HashSet<Vec<String>>,
+) -> Option<(Vec<String>, String)> {
+    if !visited.insert(path.to_vec()) {
+        return None;
+    }
+    let module: &crate::Module = options.module_defs.get(path)?;
+    use crate::StatementType as ST;
+    let mut imports: Vec<&crate::Statement> = Vec::new();
+    walk_stmts(&module.raw.body, Descend::SkipDefs, &mut |s| {
+        if let ST::If(i) = &s.statement
+            && Module::is_type_checking_test(&i.test)
+        {
+            return Flow::Skip;
+        }
+        if matches!(&s.statement, ST::ImportFrom(_)) {
+            imports.push(s);
+        }
+        Flow::Continue
+    });
+    let is_package = options
+        .module_defs
+        .keys()
+        .any(|k| k.len() > path.len() && k[..path.len()] == path[..]);
+    let mut ctx = options.clone();
+    ctx.module_path = if is_package {
+        path.to_vec()
+    } else {
+        path[..path.len().saturating_sub(1)].to_vec()
+    };
+    for s in imports {
+        let ST::ImportFrom(i) = &s.statement else { continue };
+        let star = i.names.iter().any(|a| a.name == "*");
+        let explicit = i
+            .names
+            .iter()
+            .find(|a| a.asname.as_deref() == Some(name) || (a.asname.is_none() && a.name == name))
+            .map(|a| a.name.clone());
+        if explicit.is_none() && !star {
+            continue;
+        }
+        let target = i.resolved_module_path(&ctx);
+        let Some(key) = crate::module_defs_key(options, &target).map(<[String]>::to_vec) else {
+            continue;
+        };
+        let defining = match explicit {
+            Some(defining) => defining,
+            None => {
+                let exported = crate::ast::tree::import::star_exports(options, &key, 0)
+                    .is_some_and(|names| names.iter().any(|n| n == name));
+                if !exported {
+                    continue;
+                }
+                name.to_string()
+            }
+        };
+        if scan_module_body_for_item(options, &key, &defining) {
+            return Some((key, defining));
+        }
+        if let Some(origin) = reexport_origin(options, &key, &defining, visited) {
+            return Some(origin);
+        }
+    }
+    None
 }
 
 /// Whether the module at `path` directly defines `name` (a function, class,

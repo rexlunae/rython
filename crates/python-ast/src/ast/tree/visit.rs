@@ -275,6 +275,58 @@ pub fn stmt_bound_names(s: &Statement, which: Bindings) -> Vec<String> {
     names
 }
 
+/// The names a statement's own expressions bind by a walrus that MAY
+/// NOT run: one in a short-circuited operand (`flag and (X := 1)` —
+/// every operand after the first), in a conditional expression's
+/// branch (`(X := 1) if c else 2`), or anywhere in a comprehension
+/// (its element, conditions and later iterables run per item — zero
+/// times over nothing). Such a walrus is a binding under control flow,
+/// never an unconditional store (Devin review on #338, round 21). A
+/// walrus in a lambda is that lambda's own scope and stays out.
+pub fn conditional_walrus_names(s: &Statement) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let walruses = |e: &ExprType, names: &mut Vec<String>| {
+        any_expr_for(e, Descend::OwnScope, |x| {
+            if let ExprType::NamedExpr(ne) = x {
+                for n in target_names(&ne.left) {
+                    if !names.iter().any(|m| m == n) {
+                        names.push(n.to_string());
+                    }
+                }
+            }
+            false
+        });
+    };
+    let exprs: Vec<&ExprType> = match &s.statement {
+        StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
+            def_header_exprs(f).into_iter().collect()
+        }
+        _ => stmt_exprs(s),
+    };
+    for e in exprs {
+        any_expr_for(e, Descend::OwnScope, |x| {
+            match x {
+                ExprType::BoolOp(b) => {
+                    for v in b.values.iter().skip(1) {
+                        walruses(v, &mut names);
+                    }
+                }
+                ExprType::IfExp(i) => {
+                    walruses(&i.body, &mut names);
+                    walruses(&i.orelse, &mut names);
+                }
+                ExprType::ListComp(_)
+                | ExprType::SetComp(_)
+                | ExprType::DictComp(_)
+                | ExprType::GeneratorExp(_) => walruses(x, &mut names),
+                _ => {}
+            }
+            false
+        });
+    }
+    names
+}
+
 /// The first binding in `body` (nested definitions included) of a name
 /// under [`RESERVED_PREFIX`], with its line: a store target, a loop or
 /// `with ... as` target, a walrus, a function or class name, a parameter,

@@ -8879,6 +8879,93 @@ fn a_star_import_of_a_crate_module_honours_its_literal_all() {
 }
 
 #[test]
+fn a_star_import_follows_the_latest_effective_all() {
+    // `__all__` is what it is when the module's body has run: a later
+    // top-level literal replaces a computed or conditional one (known
+    // again), a later mutation (`.append`, `+=`, a subscript store) or
+    // conditional binding makes the exports unknown (the glob) — Devin
+    // review on #338, round 21.
+    let glob = |values_src: &str| -> String {
+        let src = "from .values import *\n";
+        let mut defs = std::collections::HashMap::new();
+        defs.insert(
+            vec!["pkg".to_string(), "values".to_string()],
+            std::rc::Rc::new(parse(values_src, "values.py").unwrap()),
+        );
+        defs.insert(
+            vec!["pkg".to_string(), "star".to_string()],
+            std::rc::Rc::new(parse(src, "star.py").unwrap()),
+        );
+        let options = PythonOptions {
+            module_defs: std::rc::Rc::new(defs),
+            module_path: vec!["pkg".to_string()],
+            this_module_path: vec!["pkg".to_string(), "star".to_string()],
+            python_namespace: "pkg".to_string(),
+            ..Default::default()
+        };
+        compile_with_options(src, "star.py", options).expect("the star import converts")
+    };
+    for (src, listed) in [
+        ("names = [\"thing\"]\n__all__ = list(names)\n__all__ = [\"other\"]\nthing = 1\nother = 2\n", true),
+        ("flag = True\nif flag:\n    __all__ = [\"thing\"]\n__all__ = [\"other\"]\nthing = 1\nother = 2\n", true),
+        ("__all__ = [\"other\"]\n__all__.append(\"thing\")\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\n__all__ += [\"thing\"]\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\nflag = True\nif flag:\n    __all__ = [\"thing\"]\nthing = 1\nother = 2\n", false),
+    ] {
+        let out = glob(src);
+        if listed {
+            assert!(
+                out.contains("values :: { other }") && !out.contains("values :: *"),
+                "{}: generated: {}",
+                src,
+                out
+            );
+        } else {
+            assert!(out.contains("values :: *"), "{}: generated: {}", src, out);
+        }
+    }
+}
+
+#[test]
+fn a_walrus_that_may_not_run_is_a_runtime_alternative_of_an_imported_class() {
+    // `from .errors import Root` then `flag and (Root := 1)`: the walrus
+    // may not run, so Root is the imported class or a value at runtime —
+    // an alternative, never an invalidation of the import: a class
+    // deriving from it is refused as runtime-ambiguous, with the
+    // definition warning saying so (Devin review on #338, round 21).
+    let src = "from .errors import Root\nflag = False\nflag and (Root := 1)\n\n\nclass Leaf(Root):\n    pass\n";
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(
+        vec!["pkg".to_string(), "errors".to_string()],
+        std::rc::Rc::new(parse("class Root(Exception):\n    pass\n", "errors.py").unwrap()),
+    );
+    defs.insert(
+        vec!["pkg".to_string(), "m".to_string()],
+        std::rc::Rc::new(parse(src, "m.py").unwrap()),
+    );
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        module_path: vec!["pkg".to_string()],
+        this_module_path: vec!["pkg".to_string(), "m".to_string()],
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let warnings = options.definition_warnings.clone();
+    let msg = compile_with_options(src, "m.py", options).expect_err("the ambiguous base is refused");
+    assert!(
+        msg.contains("class `Leaf` inherits from `Root`, which is not an exception class"),
+        "{}",
+        msg
+    );
+    let warnings = warnings.borrow();
+    assert!(
+        warnings.iter().any(|w| w.contains("`Root` is bound more than one way at module level")),
+        "the walrus is an alternative, not a rebinding: {:?}",
+        *warnings
+    );
+}
+
+#[test]
 fn a_folded_guard_site_is_loud_for_what_its_handler_would_have_caught() {
     // A resolvable import guard folds; its import site is loud when the
     // crate module raises at runtime — for an ImportError under `except

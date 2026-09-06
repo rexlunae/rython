@@ -536,15 +536,22 @@ pub(crate) fn module_name_aliases_depth(
                     }
                 }
                 _ => {
-                    let conditional = nested
+                    let stmt_conditional = nested
                         || matches!(
                             &s.statement,
                             crate::StatementType::For(_) | crate::StatementType::AsyncFor(_)
                         );
+                    // A walrus that may not run (`flag and (X := 1)`, a
+                    // conditional branch, a comprehension) binds under
+                    // control flow: an alternative, never an
+                    // invalidation (Devin review on #338, round 21).
+                    let conditional_walruses =
+                        crate::ast::tree::visit::conditional_walrus_names(s);
                     for n in crate::ast::tree::visit::stmt_bound_names(
                         s,
                         crate::ast::tree::visit::Bindings::Scope,
                     ) {
+                        let conditional = stmt_conditional || conditional_walruses.contains(&n);
                         let target: &str = match &s.statement {
                             crate::StatementType::Assign(a) => match (a.targets.as_slice(), &a.value) {
                                 ([ExprType::Name(t)], ExprType::Name(v)) if t.id == n => &v.id,

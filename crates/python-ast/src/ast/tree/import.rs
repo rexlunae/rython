@@ -514,7 +514,7 @@ pub(crate) fn imported_crate_modules(
             // package binds it; only otherwise does Python import the
             // submodule of that name (Devin review on #338).
             let package_key = crate::module_defs_key(options, &base).map(<[String]>::to_vec);
-            for a in &i.names {
+            for a in i.names.iter().filter(|a| a.name != "*") {
                 let mut sub = base.clone();
                 sub.push(a.name.clone());
                 let binding = package_key
@@ -794,7 +794,34 @@ pub(crate) fn literal_all(
             })
             .collect()
     };
-    let mut all: Option<Vec<String>> = None;
+    // The LATEST effective binding in source order: a top-level literal
+    // replaces whatever came before (a computed or conditional one
+    // included); a later unknown binding, or a mutation of the list
+    // (`__all__.append(...)`, `__all__ += [...]`, `__all__[0] = ...`)
+    // anywhere the module runs, makes the exports unknown again (Devin
+    // review on #338, round 21).
+    let mutates_all = |st: &crate::Statement| -> bool {
+        use crate::ast::tree::visit::{any_expr_for, stmt_targets, Descend};
+        let on_all = |e: &crate::ExprType| -> bool {
+            match e {
+                crate::ExprType::Attribute(a) => {
+                    matches!(a.value.as_ref(), crate::ExprType::Name(n) if n.id == "__all__")
+                }
+                crate::ExprType::Subscript(sub) => {
+                    matches!(sub.value.as_ref(), crate::ExprType::Name(n) if n.id == "__all__")
+                }
+                _ => false,
+            }
+        };
+        stmt_targets(st).into_iter().any(on_all)
+            || matches!(&st.statement, crate::StatementType::Expr(e)
+                if any_expr_for(&e.value, Descend::OwnScope, |x| {
+                    matches!(x, crate::ExprType::Call(c) if on_all(&c.func))
+                }))
+    };
+    let mut all: Result<Option<Vec<String>>, ()> = Ok(None);
+    let mut all_by_stmt: std::collections::HashMap<(usize, usize), Option<Vec<String>>> =
+        std::collections::HashMap::new();
     for (st, mark, top_level) in binding_entries(&body) {
         if mark.name != "__all__" {
             continue;
@@ -806,12 +833,30 @@ pub(crate) fn literal_all(
             },
             _ => None,
         };
-        match literal {
-            Some(names) => all = Some(names),
-            None => return Err(()),
+        if let (Some(line), Some(col)) = (st.lineno, st.col_offset) {
+            all_by_stmt.insert((line, col), literal);
         }
     }
-    Ok(all)
+    // Source order over the body's statements (the entries are in walk
+    // order too, but a mutation is not a binding entry).
+    crate::ast::tree::visit::walk_stmts(
+        &body,
+        crate::ast::tree::visit::Descend::SkipDefs,
+        &mut |st| {
+            if let (Some(line), Some(col)) = (st.lineno, st.col_offset)
+                && let Some(literal) = all_by_stmt.get(&(line, col))
+            {
+                all = match literal {
+                    Some(names) => Ok(Some(names.clone())),
+                    None => Err(()),
+                };
+            } else if mutates_all(st) {
+                all = Err(());
+            }
+            crate::ast::tree::visit::Flow::Continue
+        },
+    );
+    all
 }
 
 /// The names `from m import *` binds from the crate module at `key`, as
@@ -824,7 +869,11 @@ pub(crate) fn literal_all(
 /// (computed, augmented, under control flow), a star import of an
 /// external module, or a chain deeper than the bound (Devin review on
 /// #338, round 20).
-fn star_exports(options: &PythonOptions, key: &[String], depth: usize) -> Option<Vec<String>> {
+pub(crate) fn star_exports(
+    options: &PythonOptions,
+    key: &[String],
+    depth: usize,
+) -> Option<Vec<String>> {
     if depth > 8 {
         return None;
     }
@@ -853,6 +902,27 @@ fn star_exports(options: &PythonOptions, key: &[String], depth: usize) -> Option
         }
     }
     Some(names)
+}
+
+/// The names a sibling's `from m import *` takes from the crate module
+/// at `key`: its star exports when the conversion can enumerate them,
+/// otherwise every public module-scope name (the conservative superset
+/// — what the glob re-export exposes), so each gets its runtime item
+/// (Devin review on #338, round 21).
+pub(crate) fn sibling_star_names(options: &PythonOptions, key: &[String]) -> Vec<String> {
+    if let Some(names) = star_exports(options, key, 0) {
+        return names;
+    }
+    let Some(body) = crate::ast::tree::module::normalized_body_of(options, key) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    for (_, mark, _) in binding_entries(&body) {
+        if mark.name != "*" && !mark.name.starts_with('_') && !names.contains(&mark.name) {
+            names.push(mark.name.clone());
+        }
+    }
+    names
 }
 
 /// What a `from X import *` statement of the module in `ctx` binds:
@@ -963,6 +1033,11 @@ pub(crate) fn import_site_name_checks(
         .collect::<Vec<_>>()
         .join(".");
     let checks = i.names.iter().filter_map(|a| {
+        // `from package import *` asks for no one name; a cyclic star
+        // import is refused at conversion (`import_site_init`).
+        if a.name == "*" {
+            return None;
+        }
         let binding = module_binding(options, key, &a.name)?;
         let bits = binding.marks.iter().map(|mark| {
             let (word, mask) = bound_word_and_mask(*mark);
@@ -1340,7 +1415,33 @@ pub(crate) fn import_site_init(
     if let crate::StatementType::ImportFrom(i) = stmt {
         let base = i.resolved_module_path(options);
         if let Some(key) = crate::module_defs_key(options, &base) {
-            for a in &i.names {
+            // `from m import *` while `m` is partially initialized (m
+            // starts first, reaches this module, which star-imports m
+            // back): Python copies only the names m has bound by then;
+            // the static glob binds every export, whenever. Refused
+            // (Devin review on #338, round 21) — unless this module is
+            // an ancestor package of m: Python initializes a package
+            // before any of its submodules, so m cannot be running when
+            // its package star-imports it (`__init__`'s `from .core
+            // import *` over core's `from . import utils`, the idiom).
+            if i.names.iter().any(|a| a.name == "*")
+                && !key.starts_with(&options.this_module_path)
+                && module_reaches(options, key, &options.this_module_path)
+            {
+                return Err(format!(
+                    "`from {}{} import *` is refused: `{}` imports this module (directly, \
+                     or through a call), so when `{}` starts first the star import runs \
+                     while it is partially initialized and Python copies only the names \
+                     bound by then, which the static glob cannot represent; import the \
+                     names explicitly, or break the import cycle",
+                    ".".repeat(i.level),
+                    i.module,
+                    key.join("."),
+                    key.join(".")
+                )
+                .into());
+            }
+            for a in i.names.iter().filter(|a| a.name != "*") {
                 // The module imports the name, then imports THIS module
                 // (a cycle), then redefines the name: Python exposes the
                 // imported value here, which the converted module (one

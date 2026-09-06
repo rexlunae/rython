@@ -11956,6 +11956,127 @@ fn a_cyclic_import_of_an_except_alias_is_refused() {
 }
 
 #[test]
+fn a_star_import_of_a_cycle_source_is_refused_unless_the_importer_is_its_package() {
+    // b does `from .a import *`; a imports b before binding Y. CPython
+    // (a starts first): b's star import runs while a is partially
+    // initialized and copies only the names a has bound by then — X,
+    // not Y — so `a end 1`, `main 1` here, and a NameError had b read Y
+    // at module level. The static glob binds every export whenever, so
+    // the cyclic star import is refused, with and without a's own star
+    // import (Devin review on #338, round 21). The package idiom is
+    // exempt: `__init__`'s `from .core import *` over core's `from .
+    // import utils` — a package initializes before any submodule, so
+    // core is never partial when its package star-imports it (CPython:
+    // `main 2`, the star-exported `C` a sibling reads through the root).
+    let cli = concat!(
+        "from .a import X\n",
+        "\n",
+        "\n",
+        "def main() -> None:\n",
+        "    print(\"main\", X)\n",
+        "\n",
+        "\n",
+        "if __name__ == \"__main__\":\n",
+        "    main()\n",
+    );
+    for (tag, a_source) in [
+        ("starcyc", "X = 1\nfrom .b import b_value\nY = 2\nprint(\"a end\", b_value())\n"),
+        (
+            "starcycown",
+            "from .c import *\nX = 1\nfrom .b import b_value\nY = 2\nprint(\"a end\", b_value(), Z)\n",
+        ),
+    ] {
+        let scratch = Scratch::new(tag);
+        fs::write(
+            scratch.path().join("pyproject.toml"),
+            format!("[project]\nname = \"{}\"\nversion = \"0.1.0\"\n", tag),
+        )
+        .unwrap();
+        let pkg = scratch.path().join(tag);
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("__init__.py"), "").unwrap();
+        fs::write(pkg.join("a.py"), a_source).unwrap();
+        fs::write(pkg.join("b.py"), "from .a import *\n\n\ndef b_value() -> int:\n    return X\n").unwrap();
+        fs::write(pkg.join("c.py"), "Z = 3\n").unwrap();
+        fs::write(pkg.join("cli.py"), cli).unwrap();
+        let discovered = rypip::discover(scratch.path()).expect("discover");
+        let err = rypip::convert(&discovered, &scratch.path().join("crate"), &ConvertOptions::default())
+            .err()
+            .expect("the cyclic star import is refused");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("`from .a import *` is refused: `a` imports this module (directly, or through a call), so when `a` starts first the star import runs while it is partially initialized")
+                && msg.contains("import the names explicitly, or break the import cycle"),
+            "{}: {}",
+            tag,
+            msg
+        );
+    }
+    let scratch = Scratch::new("rootstar");
+    let krate = package_crate(
+        &scratch,
+        "rootstar",
+        &[
+            ("__init__.py", "from .core import *\n"),
+            ("core.py", "from . import utils\nC = 2\n"),
+            ("utils.py", "U = 1\n"),
+            ("helper.py", "from . import C\n\n\ndef helper_value() -> int:\n    return C\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from .helper import helper_value\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\", helper_value())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    assert_eq!(run_package(&krate, "rootstar"), vec!["main 2"]);
+}
+
+#[test]
+fn a_walrus_that_may_not_run_before_a_same_named_definition_is_refused_as_such() {
+    // `flag and (X := 1)` then `class X`: the walrus is a binding under
+    // control flow (CPython binds X only when it runs; here it does not,
+    // and `m X` prints the class). It is not a store above — the
+    // refusal says what it is: the walrus's store needs the name's one
+    // value slot beside the class, which rython cannot give it (Devin
+    // review on #338, round 21).
+    let scratch = Scratch::new("walrusdef");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"walrusdef\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("walrusdef");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("m.py"),
+        "flag = False\nflag and (X := 1)\n\n\nclass X:\n    pass\n\n\nprint(\"m\", X().__class__.__name__)\n",
+    )
+    .unwrap();
+    fs::write(pkg.join("cli.py"), "from . import m\n\n\nif __name__ == \"__main__\":\n    print(\"main\")\n").unwrap();
+    let discovered = rypip::discover(scratch.path()).expect("discover");
+    let err = rypip::convert(&discovered, &scratch.path().join("crate"), &ConvertOptions::default())
+        .err()
+        .expect("the walrus-then-definition shape is refused");
+    let msg = format!("{:#}", err);
+    assert!(
+        msg.contains("the definition of `X` follows a walrus `(X := ...)` above that may or may not run")
+            && !msg.contains("stores above"),
+        "{}",
+        msg
+    );
+}
+
+#[test]
 fn a_star_import_binds_the_source_exports_for_the_from_list_rule() {
     // The package's `__init__` does `from .values import *`; values binds
     // `thing`; thing.py prints when it loads; helper does `from . import
