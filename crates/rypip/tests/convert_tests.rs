@@ -10750,11 +10750,11 @@ fn a_package_binding_still_pending_in_a_cycle_falls_back_to_the_submodule() {
 #[test]
 fn a_walrus_in_an_if_header_is_bound_at_the_top_of_its_body() {
     // `if (X := 1): from .b import value` — Python binds X when the test
-    // is evaluated, before the body's import: the statement's mark is
-    // recorded at the top of the taken branch (and after the statement),
-    // not only after the whole `if` (Devin review on #338, round 10). A
-    // module-level walrus is a module-init local, so no sibling can
-    // import it back: the generated order is the pin.
+    // is evaluated, before the body's import: the walrus records the
+    // statement's mark right after its store, not after the whole `if`
+    // (Devin review on #338, rounds 10 and 11). A module-level walrus is
+    // a module-init local, so no sibling can import it back: the
+    // generated order is the pin.
     let scratch = Scratch::new("hdrwalrus");
     let krate = package_crate(
         &scratch,
@@ -10854,6 +10854,150 @@ fn a_folded_import_guard_whose_module_raises_import_error_fails_loudly() {
             && stderr.contains("cannot import name 'X' from partially initialized module 'guardfold.a'"),
         "the error names the guard, the fallback and the cause: {}",
         stderr
+    );
+}
+
+#[test]
+fn a_cyclic_importer_numbers_the_target_modules_folded_body() {
+    // a's `try: from .c import helper / except ImportError: helper = None`
+    // folds at conversion time (every import resolves): the handler's
+    // store is gone from the body the emission numbers. The importer's
+    // check numbers the same normalized body, so b's `from .a import X`
+    // during a's initialization reads X's bit, not the dropped store's
+    // (Devin review on #338, round 11).
+    let scratch = Scratch::new("foldmarks");
+    let krate = package_crate(
+        &scratch,
+        "foldmarks",
+        &[
+            (
+                "a.py",
+                concat!(
+                    "print(\"a start\")\n",
+                    "try:\n",
+                    "    from .c import helper\n",
+                    "except ImportError:\n",
+                    "    helper = None\n",
+                    "X = 1\n",
+                    "from .b import b_value\n",
+                    "print(\"a end\", b_value())\n",
+                ),
+            ),
+            ("b.py", "from .a import X\n\n\ndef b_value() -> int:\n    return X + 1\n"),
+            ("c.py", "def helper() -> int:\n    return 0\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from .a import b_value\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\", b_value())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let b = fs::read_to_string(krate.root.join("src/b.rs")).unwrap();
+    assert!(
+        b.contains("crate::a::__rython_bound__(&[(0usize, 2u32)], \"X\", \"foldmarks.a\")?;"),
+        "X is the folded body's second binding statement: {}",
+        b
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "foldmarks"), vec!["a start", "a end 2", "main 2"]);
+}
+
+#[test]
+fn an_empty_loop_binds_no_target_when_its_else_imports_a_cyclic_consumer() {
+    // The package's `for item in range(0): ... else: from .consumer import
+    // value` never binds `item`; consumer's `from . import item` while
+    // the package is partially initialized therefore imports the
+    // submodule item.py (its body prints). The target's mark is recorded
+    // only inside the loop body — never in the `else` clause or after
+    // the statement (Devin review on #338, round 11).
+    let scratch = Scratch::new("emptyfor");
+    let krate = package_crate(
+        &scratch,
+        "emptyfor",
+        &[
+            (
+                "__init__.py",
+                "for item in range(0):\n    pass\nelse:\n    from .consumer import value\n",
+            ),
+            ("consumer.py", "from . import item\n\n\ndef value() -> int:\n    return 2\n"),
+            ("item.py", "print(\"submodule item loaded\")\n"),
+            (
+                "cli.py",
+                "def main() -> None:\n    print(\"main\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "emptyfor"), vec!["submodule item loaded", "main"]);
+}
+
+#[test]
+fn a_walrus_is_bound_at_its_store_before_a_later_operand_runs() {
+    // `if (X := 1) and trigger():` — trigger imports b while the test is
+    // still being evaluated; Python bound X at the walrus. The walrus
+    // records the mark right after its store, before the next operand
+    // (Devin review on #338, round 11). A module-level walrus is a
+    // module-init local, so b cannot import X back: the order is the pin.
+    let scratch = Scratch::new("hdrchain");
+    let krate = package_crate(
+        &scratch,
+        "hdrchain",
+        &[
+            (
+                "a.py",
+                concat!(
+                    "print(\"a start\")\n",
+                    "\n",
+                    "\n",
+                    "def trigger() -> bool:\n",
+                    "    from .b import value\n",
+                    "    return value() > 0\n",
+                    "\n",
+                    "\n",
+                    "if (X := 1) and trigger():\n",
+                    "    print(\"a taken\")\n",
+                    "print(\"a end\")\n",
+                ),
+            ),
+            ("b.py", "def value() -> int:\n    return 3\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from .a import trigger\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\", trigger())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let a = fs::read_to_string(krate.root.join("src/a.rs")).unwrap();
+    let store = a.find("X = 1;").expect("the walrus store");
+    let bound = a.find("__rython_bind__(0usize, 2u32);").expect("X's mark");
+    let operand = a.find("trigger()?").expect("the later operand");
+    assert!(
+        store < bound && bound < operand,
+        "X is bound at the walrus, before the next operand: {}",
+        a
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "hdrchain"),
+        vec!["a start", "a taken", "a end", "main True"]
     );
 }
 
@@ -11370,8 +11514,14 @@ fn a_concurrent_import_waits_for_the_module_body_like_pythons_import_lock() {
             ),
         ],
     );
-    // Verified against python3.
-    assert_eq!(run_package(&krate, "thrpkg"), vec!["slow loaded", "a True", "b True"]);
+    // Verified against python3. Which released thread prints first is
+    // the scheduler's choice, there and here (CI saw `b True` first):
+    // the property is that `slow loaded` precedes both prints, once.
+    let lines = run_package(&krate, "thrpkg");
+    let mut released: Vec<&str> = lines.iter().skip(1).map(String::as_str).collect();
+    released.sort_unstable();
+    assert_eq!(lines.first().map(String::as_str), Some("slow loaded"), "{:?}", lines);
+    assert_eq!(released, vec!["a True", "b True"], "{:?}", lines);
 }
 
 #[test]

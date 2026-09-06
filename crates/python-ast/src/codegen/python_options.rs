@@ -604,13 +604,26 @@ pub struct PythonOptions {
     /// body has bound (Devin review on #338, round 8).
     pub init_binding_marks: std::rc::Rc<std::collections::HashMap<(usize, usize), (usize, bool)>>,
 
-    /// The `(word, mask)` of the compound statement about to be lowered
-    /// (a loop, a `with`, an `if`, a `while`), when it is a module-scope
-    /// binding statement — its target, or a walrus in its header: the
-    /// lowering records the mark at the top of each of its bodies, where
-    /// Python has bound the name, and clears the field for the bodies
-    /// (Devin review on #338, rounds 9 and 10).
+    /// The `(word, mask)` of the loop or `with` statement about to be
+    /// lowered, when its target is a module-scope binding: the lowering
+    /// records the mark at the top of its body — where Python has bound
+    /// the target — and clears the field for the body (Devin review on
+    /// #338, rounds 9 to 11).
     pub body_bind: Option<(usize, u32)>,
+
+    /// The `(word, mask)` of the module-scope statement being lowered,
+    /// for the walruses in its own expressions: a walrus records the
+    /// mark right after it stores, where Python binds the name — inside
+    /// a boolean chain or a loop header alike (Devin review on #338,
+    /// round 11). A lambda's body is its own scope and clears it.
+    pub walrus_bind: Option<(usize, u32)>,
+
+    /// The normalized bodies of the crate's modules (see
+    /// `module::normalize_module_body`), cached per module path: an
+    /// importer's bound check numbers a target module's binding
+    /// statements over the same sequence the target's emission numbers.
+    pub normalized_bodies:
+        std::rc::Rc<std::cell::RefCell<std::collections::HashMap<Vec<String>, std::rc::Rc<Vec<crate::Statement>>>>>,
 
     /// The source positions of the imports a folded `try: <imports>
     /// except ImportError:` guard spliced into the module body (the fold
@@ -738,6 +751,10 @@ impl Default for PythonOptions {
             in_module_init_body: false,
             init_binding_marks: std::rc::Rc::new(std::collections::HashMap::new()),
             body_bind: None,
+            walrus_bind: None,
+            normalized_bodies: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            )),
             folded_guard_imports: std::rc::Rc::new(std::collections::HashSet::new()),
             root_init_module: None,
             cross_module_mut_self: std::rc::Rc::new(std::cell::RefCell::new(

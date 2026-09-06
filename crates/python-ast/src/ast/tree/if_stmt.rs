@@ -63,21 +63,6 @@ impl CodeGen for If {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // The statement's own binding mark (a walrus in the test),
-        // recorded at the top of each branch — the taken one of a gate
-        // folded at conversion time included (Devin review on #338,
-        // round 10); cleared for the branches' statements.
-        let mut options = options;
-        let body_bind = options
-            .body_bind
-            .take()
-            .map(|(word, mask)| quote!(__rython_bind__(#word, #mask);));
-        let with_bind = |mut stmts: Vec<TokenStream>| {
-            if let Some(bind) = body_bind.clone() {
-                stmts.insert(0, bind);
-            }
-            stmts
-        };
         // A VERSION-GATED branch (`if sys.version_info[0] < 3:` —
         // distlib's compat.py): rython targets Python 3, so the gate is
         // evaluated at conversion time and the dead branch is dropped.
@@ -97,7 +82,7 @@ impl CodeGen for If {
                 .cloned()
                 .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
                 .collect();
-            let stmts = with_bind(stmts?);
+            let stmts = stmts?;
             return Ok(quote! { #(#stmts;)* });
         }
 
@@ -114,7 +99,7 @@ impl CodeGen for If {
                 .cloned()
                 .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
                 .collect();
-            let stmts = with_bind(stmts?);
+            let stmts = stmts?;
             return Ok(quote! { #(#stmts;)* });
         }
 
@@ -189,7 +174,7 @@ impl CodeGen for If {
                 .into_iter()
                 .map(|stmt| stmt.to_rust(ctx.clone(), opts.clone(), symbols.clone()))
                 .collect();
-            let stmts = with_bind(stmts?);
+            let stmts = stmts?;
             return Ok(quote! { #(#stmts;)* });
         }
 
@@ -198,7 +183,7 @@ impl CodeGen for If {
             .into_iter()
             .map(|stmt| stmt.to_rust(ctx.clone(), body_options.clone(), symbols.clone()))
             .collect();
-        let body_stmts = with_bind(body_stmts?);
+        let body_stmts = body_stmts?;
 
         if self.orelse.is_empty() {
             Ok(quote! {
@@ -211,7 +196,7 @@ impl CodeGen for If {
                 .into_iter()
                 .map(|stmt| stmt.to_rust(ctx.clone(), else_options.clone(), symbols.clone()))
                 .collect();
-            let else_stmts = with_bind(else_stmts?);
+            let else_stmts = else_stmts?;
 
             Ok(quote! {
                 if #test {

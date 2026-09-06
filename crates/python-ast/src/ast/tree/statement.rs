@@ -75,26 +75,36 @@ impl CodeGen for Statement {
         // its mark where it runs (`__rython_bind__`), so a cyclic importer
         // can ask whether the name is bound yet; the module emission
         // records the top-level ones (Devin review on #338, round 8).
-        // A compound statement binding before its bodies (a loop or
-        // `with` target, a header walrus): the mark goes through
-        // `body_bind` to the top of each body; a header walrus also holds
-        // after the statement, whichever branch ran.
+        // Where the statement's mark is recorded: a loop or `with`
+        // target at the top of the body (`body_bind`); a walrus at its
+        // store (`walrus_bind`, for the walruses in this statement's own
+        // expressions); anything else after the statement. A statement
+        // binding only through walruses records nothing itself.
         let mut options = options;
         let before_body = crate::ast::tree::import::binds_before_body(&self.statement);
-        let bind = match (options.in_module_init_body, lineno, col_offset) {
+        let mark = match (options.in_module_init_body, lineno, col_offset) {
             (true, Some(line), Some(col)) => options
                 .init_binding_marks
                 .get(&(line, col))
-                .filter(|(_, top_level)| before_body || !top_level)
-                .map(|(mark, _)| crate::ast::tree::import::bound_word_and_mask(*mark)),
+                .map(|(mark, top_level)| {
+                    (crate::ast::tree::import::bound_word_and_mask(*mark), *top_level)
+                }),
             _ => None,
         };
+        // A walrus records the mark at its store, at any level; the module
+        // emission records a top-level store's mark itself.
+        options.walrus_bind = mark
+            .map(|(bits, _)| bits)
+            .filter(|_| crate::ast::tree::import::has_walrus(&self));
+        let bind = mark
+            .filter(|(_, top_level)| before_body || !top_level)
+            .map(|(bits, _)| bits);
         let bind = match (bind, before_body) {
-            (Some((word, mask)), true) => {
-                options.body_bind = Some((word, mask));
-                crate::ast::tree::import::header_binds_by_walrus(&self)
-                    .then(|| quote!(__rython_bind__(#word, #mask);))
+            (Some(bits), true) => {
+                options.body_bind = Some(bits);
+                None
             }
+            (Some(_), false) if crate::ast::tree::import::binds_only_by_walrus(&self) => None,
             (Some((word, mask)), false) => Some(quote!(__rython_bind__(#word, #mask);)),
             (None, _) => None,
         };

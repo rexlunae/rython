@@ -142,12 +142,16 @@ impl CodeGen for Module {
         // one `isinstance`-dispatching function that expresses it, before
         // any body analysis below — the shape the monomorphizing
         // specialization pass already lowers (ast::tree::singledispatch).
-        self.raw.body = crate::ast::tree::singledispatch::desugar_module(self.raw.body)
+        // The body every pass below sees (`normalize_module_body`): the
+        // one sequence the binding marks number, which an importer's
+        // bound check numbers too.
+        let NormalizedBody {
+            body,
+            newly_live,
+            folded_imports,
+        } = normalize_module_body(self.raw.body, &options)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-
-        let (folded_body, newly_live, folded_imports) =
-            fold_static_import_trys(&self.raw.body, &options);
-        self.raw.body = folded_body;
+        self.raw.body = body;
         let mut options = options;
         options.folded_guard_imports = std::rc::Rc::new(folded_imports);
         // Handler statements the fold made live were invisible to
@@ -158,17 +162,6 @@ impl CodeGen for Module {
         for s in &newly_live {
             symbols = s.clone().find_symbols(symbols);
         }
-
-        // Issue #137: module-level VERSION-GATED blocks (`if
-        // sys.version_info >= (3, 11):` — certifi's core.py) and
-        // static-name gates (`if brotli is not None:` where the module
-        // folded the import to `brotli = None`): rython's target version
-        // is fixed (3.11.0), so the taken branch is decided at conversion
-        // time and its statements are spliced into the module body BEFORE
-        // every pass below — a version-gated `def` is a module ITEM, not
-        // a nested function inside __module_init__ (which rustc rejects
-        // and the module re-exports cannot see).
-        self.raw.body = splice_gated_branches(self.raw.body, &options);
 
         // Capture the module's source filename before fields of `self` are
         // moved, so statement errors can point at the user's Python file.
@@ -1002,12 +995,12 @@ impl CodeGen for Module {
         options.init_binding_marks = std::rc::Rc::new(binding_marks.by_pos.clone());
         let mut top_level_binds: Vec<(Option<TokenStream>, usize)> = Vec::new();
         for (stmt_index, s) in self.raw.body.into_iter().enumerate() {
-            // A compound statement binding before its bodies (a loop or
-            // `with` target, a header walrus) records its mark through the
-            // statement lowering, not at the end of its range.
-            let end_of_range_bind = if crate::ast::tree::import::binds_before_body(
-                &s.statement,
-            ) {
+            // A loop or `with` target's mark is recorded at the top of the
+            // body, a walrus's at its store — both by the statement
+            // lowering, not at the end of the statement's range.
+            let end_of_range_bind = if crate::ast::tree::import::binds_before_body(&s.statement)
+                || crate::ast::tree::import::binds_only_by_walrus(&s)
+            {
                 None
             } else {
                 s.lineno
@@ -1961,7 +1954,8 @@ impl CodeGen for Module {
                         };
                         let body_pos = body_stmt.lineno.zip(body_stmt.col_offset);
                         let body_binds_target_first =
-                            crate::ast::tree::import::binds_before_body(&body_stmt.statement);
+                            crate::ast::tree::import::binds_before_body(&body_stmt.statement)
+                                || crate::ast::tree::import::binds_only_by_walrus(&body_stmt);
                         let body_tokens = body_stmt
                             .to_rust(ctx.clone(), body_options, symbols.clone())
                             .map_err(|e| wrap_module_error(&module_filename, e))?;
@@ -3435,6 +3429,74 @@ pub(crate) fn static_gate_names(
 /// (`sys.version_info` gates and single-store-name gates) with the taken
 /// branch's statements, recursively. Defs and class bodies inside the
 /// taken branch then lower as ordinary module items.
+/// A module body after the rewrites the emission applies before any
+/// analysis: the singledispatch desugar (issue #181), the failed-import
+/// try fold, and the version/static gate splice (issue #137) — in that
+/// order. `body` is the one statement sequence the emission lowers, so
+/// the binding marks (`BindingMarks::of`) number it; an importer's bound
+/// check (`import::module_binding`) numbers the target module's
+/// normalized body too, or the two would count different statements
+/// (Devin review on #338, round 11). `newly_live` are the handler
+/// statements a failed guard's fold made live; `folded_imports` the
+/// positions of the imports a resolvable guard's fold spliced in.
+pub(crate) struct NormalizedBody {
+    pub body: Vec<crate::Statement>,
+    pub newly_live: Vec<crate::Statement>,
+    pub folded_imports: std::collections::HashSet<(usize, usize)>,
+}
+
+pub(crate) fn normalize_module_body(
+    body: Vec<crate::Statement>,
+    options: &PythonOptions,
+) -> Result<NormalizedBody, String> {
+    // Issue #181: fuse each `@functools.singledispatch` family into the
+    // one `isinstance`-dispatching function that expresses it, before
+    // any body analysis — the shape the monomorphizing specialization
+    // pass already lowers (ast::tree::singledispatch).
+    let body = crate::ast::tree::singledispatch::desugar_module(body)?;
+    let (body, newly_live, folded_imports) = fold_static_import_trys(&body, options);
+    // Issue #137: module-level VERSION-GATED blocks (`if
+    // sys.version_info >= (3, 11):` — certifi's core.py) and static-name
+    // gates (`if brotli is not None:` where the module folded the import
+    // to `brotli = None`): rython's target version is fixed (3.11.0), so
+    // the taken branch is decided at conversion time and its statements
+    // are spliced into the module body BEFORE every pass — a
+    // version-gated `def` is a module ITEM, not a nested function inside
+    // __module_init__ (which rustc rejects and the module re-exports
+    // cannot see).
+    let body = splice_gated_branches(body, options);
+    Ok(NormalizedBody {
+        body,
+        newly_live,
+        folded_imports,
+    })
+}
+
+/// The normalized body of the crate module at `key`, as its own emission
+/// sees it (the module's package context; the static-gate name sets a
+/// module computes for itself are not yet known at that point, so they
+/// are empty here too), cached on the options.
+pub(crate) fn normalized_body_of(
+    options: &PythonOptions,
+    key: &[String],
+) -> Option<std::rc::Rc<Vec<crate::Statement>>> {
+    if let Some(body) = options.normalized_bodies.borrow().get(key) {
+        return Some(body.clone());
+    }
+    let module = options.module_defs.get(key)?;
+    let module: &crate::Module = module;
+    let mut ctx = defining_module_context(options, key);
+    ctx.statically_none_names = std::rc::Rc::default();
+    ctx.statically_false_names = std::rc::Rc::default();
+    ctx.statically_module_names = std::rc::Rc::default();
+    let body = std::rc::Rc::new(normalize_module_body(module.raw.body.clone(), &ctx).ok()?.body);
+    options
+        .normalized_bodies
+        .borrow_mut()
+        .insert(key.to_vec(), body.clone());
+    Some(body)
+}
+
 pub(crate) fn splice_gated_branches(
     body: Vec<crate::Statement>,
     options: &PythonOptions,
@@ -5375,8 +5437,9 @@ pub(crate) fn emitted_class_defs(
         top_level_class_defs(&module.raw.body, &mut out);
         return out;
     }
-    let (body, _, _) = fold_static_import_trys(&module.raw.body, options);
-    let body = splice_gated_branches(body, options);
+    let body = normalize_module_body(module.raw.body.clone(), options)
+        .map(|n| n.body)
+        .unwrap_or_else(|_| module.raw.body.clone());
     let mut counts = std::collections::HashMap::new();
     count_module_stores(&body, &mut counts);
     let symbols = module.clone().find_symbols(SymbolTableScopes::new());

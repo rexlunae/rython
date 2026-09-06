@@ -582,13 +582,14 @@ fn stmt_binds(s: &crate::Statement, name: &str) -> bool {
     stmt_bound_names(s).iter().any(|n| n == name)
 }
 
-/// A compound statement that binds BEFORE its bodies run — a loop or
-/// `with` target (bound at each iteration, or after `__enter__`), a
-/// walrus in an `if`/`while`/loop/`with` header (bound when the header
-/// is evaluated): its mark is recorded at the top of each body by the
-/// statement's lowering, not after the statement like a store's (Devin
-/// review on #338, rounds 9 and 10). A def or class binds its name when
-/// the statement executes; its body is not run.
+/// A loop or `with` statement binds its TARGET before its body runs
+/// (Python binds it at each iteration, or after `__enter__`) and only
+/// then — an empty iterable binds nothing, so neither the `else` clause
+/// nor the statement's end may count it: the loop lowering records the
+/// mark at the top of the body, not after the statement like a store's
+/// (Devin review on #338, rounds 9 to 11). A walrus anywhere in a
+/// statement records the mark where it stores (the walrus lowering); a
+/// def or class binds its name when the statement executes.
 pub(crate) fn binds_before_body(stmt: &crate::StatementType) -> bool {
     matches!(
         stmt,
@@ -596,16 +597,31 @@ pub(crate) fn binds_before_body(stmt: &crate::StatementType) -> bool {
             | crate::StatementType::AsyncFor(_)
             | crate::StatementType::With(_)
             | crate::StatementType::AsyncWith(_)
-            | crate::StatementType::If(_)
-            | crate::StatementType::While(_)
     )
 }
 
-/// Whether a statement's HEADER binds through a walrus (`if (x := f()):`,
-/// `for a in (xs := g()):`): such a binding also holds after the
-/// statement, whichever branch ran (a loop's target does not — an empty
-/// iterable binds nothing).
-pub(crate) fn header_binds_by_walrus(s: &crate::Statement) -> bool {
+/// The names a statement binds ONLY through walruses in its own
+/// expressions (`if (x := f()):`, `print((y := 2))`): those marks are
+/// recorded by the walrus lowering, at the store, so the statement
+/// itself records nothing — after it, the walrus may not have run (a
+/// short-circuited operand).
+pub(crate) fn binds_only_by_walrus(s: &crate::Statement) -> bool {
+    use crate::ast::tree::visit::{any_expr_for, stmt_exprs, target_names, Descend};
+    let mut walrus: Vec<String> = Vec::new();
+    for e in stmt_exprs(s) {
+        any_expr_for(e, Descend::OwnScope, |x| {
+            if let crate::ExprType::NamedExpr(ne) = x {
+                walrus.extend(target_names(&ne.left).into_iter().map(str::to_string));
+            }
+            false
+        });
+    }
+    !walrus.is_empty() && stmt_bound_names(s).iter().all(|n| walrus.contains(n))
+}
+
+/// Whether a statement's own expressions contain a walrus (whose lowering
+/// records the statement's mark at the store).
+pub(crate) fn has_walrus(s: &crate::Statement) -> bool {
     use crate::ast::tree::visit::{any_expr_for, stmt_exprs, Descend};
     stmt_exprs(s).into_iter().any(|e| {
         any_expr_for(e, Descend::OwnScope, |x| matches!(x, crate::ExprType::NamedExpr(_)))
@@ -617,9 +633,10 @@ pub(crate) fn header_binds_by_walrus(s: &crate::Statement) -> bool {
 /// body excluded — in source order, each with whether it is a top-level
 /// statement of the body. A statement's index here is its MARK: one bit
 /// of the module's `__RYTHON_BOUND` words, set where the statement runs
-/// (after its init code; a loop or `with` target at the top of its body),
-/// which is what a cyclic importer's bound check reads (Devin review on
-/// #338, rounds 8 and 9).
+/// (after its init code; a loop or `with` target at the top of its body;
+/// a walrus at its store), which is what a cyclic importer's bound check
+/// reads (Devin review on #338, rounds 8 to 11). The body is the module's
+/// NORMALIZED one (`module::normalize_module_body`), on both sides.
 fn binding_statements(body: &[crate::Statement]) -> Vec<(&crate::Statement, bool)> {
     use crate::ast::tree::visit::{walk_stmts, Descend, Flow};
     let mut out: Vec<(&crate::Statement, bool)> = Vec::new();
@@ -681,8 +698,9 @@ pub(crate) fn bound_word_and_mask(mark: usize) -> (usize, u32) {
 /// import, not an attribute the package has before it — so it never
 /// counts (the entry's `from . import helper` in its `__init__`).
 fn module_binding(options: &PythonOptions, key: &[String], name: &str) -> Option<ModuleBinding> {
-    let module = options.module_defs.get(key)?;
-    let module: &crate::Module = module;
+    // The target module's NORMALIZED body — the sequence its own emission
+    // numbers (Devin review on #338, round 11).
+    let body = crate::ast::tree::module::normalized_body_of(options, key)?;
     let ctx = crate::ast::tree::module::defining_module_context(options, key);
     let imports_own_submodule = |s: &crate::Statement| match &s.statement {
         crate::StatementType::ImportFrom(i) => {
@@ -690,7 +708,7 @@ fn module_binding(options: &PythonOptions, key: &[String], name: &str) -> Option
         }
         _ => false,
     };
-    let stmts = binding_statements(&module.raw.body);
+    let stmts = binding_statements(&body);
     let bindings: Vec<(usize, bool)> = stmts
         .iter()
         .enumerate()

@@ -56,11 +56,18 @@ impl CodeGen for NamedExpr {
             ExprType::Name(n) => options.hoisted_names.contains(&n.id),
             _ => false,
         };
+        // A module-scope walrus records its statement's binding mark
+        // right after the store — where Python binds the name, inside a
+        // boolean chain or a header alike (Devin review on #338, round
+        // 11).
+        let bind = options
+            .walrus_bind
+            .map(|(word, mask)| quote!(__rython_bind__(#word, #mask);));
         let right = self.right.clone().to_rust(ctx, options, symbols)?;
         Ok(if hoisted {
-            quote!({ #target = #right; #target })
+            quote!({ #target = #right; #bind #target })
         } else {
-            quote!({ let #target = #right; #target })
+            quote!({ let #target = #right; #bind #target })
         })
     }
 }

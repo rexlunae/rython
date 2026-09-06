@@ -288,10 +288,6 @@ impl CodeGen for For {
                 .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
                 .collect();
             let else_stmts = else_stmts?;
-            let mut else_stmts = else_stmts;
-            if let Some(bind) = body_bind.clone() {
-                else_stmts.insert(0, bind);
-            }
 
             if tracks_break {
                 Ok(quote! {

@@ -2207,19 +2207,23 @@ pub fn convert(
         // module's `use crate::...` imports resolve within the bin crate.
         // Order: lint allowances, entry code (may start with inner doc
         // attributes), then the sibling mod declarations.
+        // The modules are `pub` in the bin too: a sibling's `from .
+        // import helper` is a `pub use crate::helper;` (a relative import
+        // re-exports), which a private `mod helper;` refuses (E0365;
+        // Devin review on #338, round 11).
         let decls = if !is_dunder_main(entry) && entry.path.len() == 1 {
             // Exclude the entry module's own name from the bin-side decls.
             let mut decls = String::new();
             if let Some(kids) = children.get(&Vec::new()) {
                 for kid in kids {
                     if Some(kid) != entry.path.first() {
-                        decls.push_str(&format!("mod {};\n", kid));
+                        decls.push_str(&format!("pub mod {};\n", kid));
                     }
                 }
             }
             decls
         } else {
-            mod_decls(&children, &[], true).replace("pub mod", "mod")
+            mod_decls(&children, &[], true)
         };
         // The package root's body, as a bin-side module the entry's main
         // initializes first; its items are re-exported at the bin root so
