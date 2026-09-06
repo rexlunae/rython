@@ -11301,8 +11301,62 @@ fn importing_a_name_a_module_imports_and_later_redefines_inside_its_cycle_is_ref
         .expect("the cyclic import of a rebound name is refused");
     let msg = format!("{:#}", err);
     assert!(
-        msg.contains("`from .a import f` is refused: `a` imports `f`, then imports this module, then redefines `f`")
+        msg.contains("`from .a import f` is refused: `a` imports `f`, then imports this module (directly, or through a call), then redefines `f`")
             && msg.contains("move the definition before the import"),
+        "{}",
+        msg
+    );
+    // The cycle's import inside a function a's body CALLS between the two
+    // bindings (`trigger()` imports b): the same shape, the same refusal
+    // (Devin review on #338, round 16). CPython: `a start`, `a end 1`,
+    // `main 2`; the converted module would print `a end 2`.
+    let root = scratch.path().join("rebindcall");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"rebindcall\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = root.join("rebindcall");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("a.py"),
+        concat!(
+            "print(\"a start\")\n",
+            "from .c import f\n",
+            "\n",
+            "\n",
+            "def trigger() -> int:\n",
+            "    from .b import b_value\n",
+            "    return b_value()\n",
+            "\n",
+            "\n",
+            "trigger()\n",
+            "\n",
+            "\n",
+            "def f() -> int:\n",
+            "    return 2\n",
+            "\n",
+            "\n",
+            "print(\"a end\", trigger())\n",
+        ),
+    )
+    .unwrap();
+    fs::write(pkg.join("b.py"), "from .a import f\n\n\ndef b_value() -> int:\n    return f()\n").unwrap();
+    fs::write(pkg.join("c.py"), "def f() -> int:\n    return 1\n").unwrap();
+    fs::write(
+        pkg.join("cli.py"),
+        "from .a import f\n\n\ndef main() -> None:\n    print(\"main\", f())\n\n\nif __name__ == \"__main__\":\n    main()\n",
+    )
+    .unwrap();
+    let discovered = rypip::discover(&root).expect("discover");
+    let err = rypip::convert(&discovered, &root.join("crate"), &ConvertOptions::default())
+        .err()
+        .expect("the cycle through a call is refused too");
+    let msg = format!("{:#}", err);
+    assert!(
+        msg.contains("`from .a import f` is refused: `a` imports `f`, then imports this module (directly, or through a call), then redefines `f`"),
         "{}",
         msg
     );

@@ -973,10 +973,150 @@ fn module_reaches(options: &PythonOptions, from: &[String], to: &[String]) -> bo
     false
 }
 
+/// A module body's local def by name (top-level, or under module-level
+/// control flow).
+fn local_def<'a>(body: &'a [crate::Statement], name: &str) -> Option<&'a crate::FunctionDef> {
+    use crate::ast::tree::visit::{walk_stmts, Descend, Flow};
+    let mut found: Option<&'a crate::FunctionDef> = None;
+    walk_stmts(body, Descend::SkipDefs, &mut |st| match &st.statement {
+        crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f)
+            if f.name == name =>
+        {
+            found = Some(f);
+            Flow::Stop
+        }
+        _ => Flow::Continue,
+    });
+    found
+}
+
+/// The crate modules a statement's own calls can initialize: a call to a
+/// local def whose body (or the local defs it calls, transitively) has
+/// an import statement reaching `to`, or to a function bound by a
+/// module-scope import from a crate module that reaches `to`, or a
+/// `module.function(...)` call on an imported crate module that does. A
+/// builtin or a method call is not a path this can show, and is not
+/// counted (Devin review on #338, round 16).
+fn stmt_calls_reach(
+    options: &PythonOptions,
+    ctx: &PythonOptions,
+    body: &[crate::Statement],
+    s: &crate::Statement,
+    to: &[String],
+) -> bool {
+    use crate::ast::tree::visit::{any_expr_for, stmt_exprs, walk_stmts, Descend, Flow};
+    // Callee expressions of the statement's own calls.
+    let mut callees: Vec<&crate::ExprType> = Vec::new();
+    for e in stmt_exprs(s) {
+        any_expr_for(e, Descend::OwnScope, |x| {
+            if let crate::ExprType::Call(c) = x {
+                callees.push(&c.func);
+            }
+            false
+        });
+    }
+    if callees.is_empty() {
+        return false;
+    }
+    // The crate module a module-scope import binds `name` to: the module
+    // of `from .x import name`, or `x` of `import x`.
+    let imported_from = |name: &str| -> Option<Vec<String>> {
+        let mut found: Option<Vec<String>> = None;
+        walk_stmts(body, Descend::SkipDefs, &mut |st| {
+            match &st.statement {
+                crate::StatementType::ImportFrom(i)
+                    if i.names.iter().any(|a| a.asname.as_deref().unwrap_or(&a.name) == name) =>
+                {
+                    found = crate::module_defs_key(ctx, &i.resolved_module_path(ctx))
+                        .map(<[String]>::to_vec);
+                }
+                crate::StatementType::Import(i) => {
+                    for a in &i.names {
+                        let bound = a
+                            .asname
+                            .as_deref()
+                            .unwrap_or_else(|| a.name.split('.').next().unwrap_or(&a.name));
+                        if bound == name {
+                            let path: Vec<String> =
+                                a.name.split('.').map(str::to_string).collect();
+                            found = crate::module_defs_key(ctx, &path).map(<[String]>::to_vec);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if found.is_some() { Flow::Stop } else { Flow::Continue }
+        });
+        found
+    };
+    // Whether a local def's body reaches `to`: its imports, or the local
+    // defs it calls (a visited set bounds the recursion).
+    fn def_reaches(
+        options: &PythonOptions,
+        ctx: &PythonOptions,
+        body: &[crate::Statement],
+        f: &crate::FunctionDef,
+        to: &[String],
+        visited: &mut Vec<String>,
+    ) -> bool {
+        use crate::ast::tree::visit::{any_expr_for, stmt_exprs, walk_stmts, Descend, Flow};
+        if visited.contains(&f.name) {
+            return false;
+        }
+        visited.push(f.name.clone());
+        let mut reaches = false;
+        walk_stmts(&f.body, Descend::All, &mut |st| {
+            if stmt_import_keys(&st.statement, ctx)
+                .iter()
+                .any(|k| k == to || module_reaches(options, k, to))
+            {
+                reaches = true;
+                return Flow::Stop;
+            }
+            for e in stmt_exprs(st) {
+                any_expr_for(e, Descend::All, |x| {
+                    if let crate::ExprType::Call(c) = x
+                        && let crate::ExprType::Name(n) = c.func.as_ref()
+                        && let Some(callee) = local_def(body, &n.id)
+                        && def_reaches(options, ctx, body, callee, to, visited)
+                    {
+                        reaches = true;
+                    }
+                    reaches
+                });
+                if reaches {
+                    return Flow::Stop;
+                }
+            }
+            Flow::Continue
+        });
+        reaches
+    }
+    let mut visited: Vec<String> = Vec::new();
+    callees.into_iter().any(|callee| match callee {
+        crate::ExprType::Name(n) => {
+            if let Some(f) = local_def(body, &n.id) {
+                def_reaches(options, ctx, body, f, to, &mut visited)
+            } else if let Some(module) = imported_from(&n.id) {
+                module == to || module_reaches(options, &module, to)
+            } else {
+                false
+            }
+        }
+        crate::ExprType::Attribute(a) => match a.value.as_ref() {
+            crate::ExprType::Name(n) => imported_from(&n.id)
+                .is_some_and(|module| module == to || module_reaches(options, &module, to)),
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
 /// Whether the crate module at `key` binds `name` by an import (from
-/// another module), then imports the module at `to` — directly or
-/// through the modules that import runs — and only then rebinds `name`
-/// by a def, a class or a store. The import is dropped (the local
+/// another module), then imports the module at `to` — directly, through
+/// the modules that import runs, or through a call that imports it
+/// (`stmt_calls_reach`) — and only then rebinds `name` by a def, a class
+/// or a store. The import is dropped (the local
 /// definition wins, `ImportFrom::to_rust`), so the converted module
 /// holds one item, the definition; but `to`, initialized while `key`'s
 /// body sits between the two bindings, would read the IMPORTED value in
@@ -1001,9 +1141,12 @@ fn imported_value_exposed_to(
             &s.statement,
             crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
         );
-        if is_import && imported {
-            let keys = stmt_import_keys(&s.statement, &ctx);
-            if keys.iter().any(|k| k == to || module_reaches(options, k, to)) {
+        if imported && !cycle_between {
+            let reaches_by_import = is_import
+                && stmt_import_keys(&s.statement, &ctx)
+                    .iter()
+                    .any(|k| k == to || module_reaches(options, k, to));
+            if reaches_by_import || stmt_calls_reach(options, &ctx, &body, s, to) {
                 cycle_between = true;
             }
         }
@@ -1058,10 +1201,10 @@ pub(crate) fn import_site_init(
                 if imported_value_exposed_to(options, key, &a.name, &options.this_module_path) {
                     return Err(format!(
                         "`from {}{} import {}` is refused: `{}` imports `{}`, then imports \
-                         this module, then redefines `{}`, so Python exposes the imported \
-                         value here where the converted module holds only its definition; \
-                         import the value from the module that defines it, or move the \
-                         definition before the import",
+                         this module (directly, or through a call), then redefines `{}`, \
+                         so Python exposes the imported value here where the converted \
+                         module holds only its definition; import the value from the \
+                         module that defines it, or move the definition before the import",
                         ".".repeat(i.level),
                         i.module,
                         a.name,
