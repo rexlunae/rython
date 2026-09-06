@@ -71,6 +71,14 @@ impl CodeGen for For {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // The statement's own binding mark, recorded at the top of the
+        // body where Python binds the target (Devin review on #338,
+        // round 9); cleared for the body's statements.
+        let mut options = options;
+        let target_bind = options
+            .loop_target_bind
+            .take()
+            .map(|(word, mask)| quote!(__rython_bind__(#word, #mask);));
         // Python's loop variable is function-scoped: when the target name
         // LEAKS (a later statement reads it, unshadowed), the scope analysis
         // hoists it and this loop must STORE into that binding — a fresh
@@ -115,7 +123,10 @@ impl CodeGen for For {
             .into_iter()
             .map(|stmt| stmt.to_rust(body_ctx.clone(), options.clone(), symbols.clone()))
             .collect();
-        let body_stmts = body_stmts?;
+        let mut body_stmts = body_stmts?;
+        if let Some(bind) = target_bind {
+            body_stmts.insert(0, bind);
+        }
 
         // When any target name leaks, the loop element binds to a temp
         // (`__rython_elt`) and the target lowering stores it into the

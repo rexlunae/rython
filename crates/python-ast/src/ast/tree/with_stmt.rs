@@ -126,6 +126,14 @@ impl CodeGen for With {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // The statement's own binding mark, recorded at the top of the
+        // body where Python binds the target (Devin review on #338,
+        // round 9); cleared for the body's statements.
+        let mut options = options;
+        let target_bind = options
+            .loop_target_bind
+            .take()
+            .map(|(word, mask)| quote!(__rython_bind__(#word, #mask);));
         // Evaluate each context manager and bind its `as` target (or a
         // throwaway binding when there is none, so side effects still run).
         // The general __enter__/__exit__ protocol is not modeled yet
@@ -170,7 +178,10 @@ impl CodeGen for With {
         let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.body.into_iter()
             .map(|stmt| stmt.to_rust(ctx.clone(), options.clone(), symbols.clone()))
             .collect();
-        let body_tokens = body_tokens?;
+        let mut body_tokens = body_tokens?;
+        if let Some(bind) = target_bind {
+            body_tokens.insert(0, bind);
+        }
 
         Ok(quote! {
             {

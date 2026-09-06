@@ -75,16 +75,25 @@ impl CodeGen for Statement {
         // its mark where it runs (`__rython_bind__`), so a cyclic importer
         // can ask whether the name is bound yet; the module emission
         // records the top-level ones (Devin review on #338, round 8).
+        // A loop or `with` target binds before the body: the mark goes
+        // through `loop_target_bind` to the top of the body instead.
+        let mut options = options;
+        let target_first = crate::ast::tree::import::binds_target_before_body(&self.statement);
         let bind = match (options.in_module_init_body, lineno, col_offset) {
             (true, Some(line), Some(col)) => options
                 .init_binding_marks
                 .get(&(line, col))
-                .filter(|(_, top_level)| !top_level)
-                .map(|(mark, _)| {
-                    let (word, mask) = crate::ast::tree::import::bound_word_and_mask(*mark);
-                    quote!(__rython_bind__(#word, #mask);)
-                }),
+                .filter(|(_, top_level)| target_first || !top_level)
+                .map(|(mark, _)| crate::ast::tree::import::bound_word_and_mask(*mark)),
             _ => None,
+        };
+        let bind = match (bind, target_first) {
+            (Some(bits), true) => {
+                options.loop_target_bind = Some(bits);
+                None
+            }
+            (Some((word, mask)), false) => Some(quote!(__rython_bind__(#word, #mask);)),
+            (None, _) => None,
         };
         let result = self.statement
             .clone()

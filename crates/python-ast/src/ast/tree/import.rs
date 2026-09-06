@@ -555,54 +555,22 @@ pub(crate) fn imported_crate_modules(
 
 /// Where a crate module binds a name in its own body: the package
 /// attribute a `from package import name` finds before falling back to
-/// the submodule `package.name`, and the mark a cyclic importer asks
+/// the submodule `package.name`, and the marks a cyclic importer asks
 /// about.
 pub(crate) struct ModuleBinding {
-    /// The binding statement's mark (see [`BindingMarks`]).
-    pub mark: usize,
-    /// The binding sits under module-level control flow (an `if`, a
-    /// `try`), so Python binds the name only when that branch runs.
+    /// The marks of EVERY statement that binds the name (see
+    /// [`BindingMarks`]): the name is bound once any of them has run
+    /// (Devin review on #338, round 9).
+    pub marks: Vec<usize>,
+    /// Every binding sits under module-level control flow (an `if`, a
+    /// `try`), so Python binds the name only when a branch runs.
     pub conditional: bool,
 }
 
-/// The module-scope names one statement binds: a def or class name, an
-/// import alias, a store's targets (an assignment, a loop or `with`
-/// target), a walrus in the statement's own expressions (a lambda's body
-/// is its own scope; a comprehension's walrus binds here). A bare
-/// annotation (`name: int`) binds only `__annotations__`, never `name`
-/// (Devin review on #338, rounds 6 and 8).
+/// The module-scope names one statement binds — the visitor's one
+/// enumeration ([`Bindings::Scope`]).
 fn stmt_bound_names(s: &crate::Statement) -> Vec<String> {
-    use crate::ast::tree::visit::{any_expr_for, stmt_exprs, stmt_targets, target_names, Descend};
-    let mut names: Vec<String> = Vec::new();
-    match &s.statement {
-        crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
-            names.push(f.name.clone());
-        }
-        crate::StatementType::ClassDef(c) => names.push(c.name.clone()),
-        crate::StatementType::Import(i) => names.extend(i.names.iter().map(|a| {
-            a.asname
-                .clone()
-                .unwrap_or_else(|| a.name.split('.').next().unwrap_or(&a.name).to_string())
-        })),
-        crate::StatementType::ImportFrom(i) => names.extend(
-            i.names
-                .iter()
-                .map(|a| a.asname.clone().unwrap_or_else(|| a.name.clone())),
-        ),
-        _ => {}
-    }
-    for t in stmt_targets(s) {
-        names.extend(target_names(t).into_iter().map(str::to_string));
-    }
-    for e in stmt_exprs(s) {
-        any_expr_for(e, Descend::OwnScope, |x| {
-            if let crate::ExprType::NamedExpr(ne) = x {
-                names.extend(target_names(&ne.left).into_iter().map(str::to_string));
-            }
-            false
-        });
-    }
-    names
+    crate::ast::tree::visit::stmt_bound_names(s, crate::ast::tree::visit::Bindings::Scope)
 }
 
 /// Whether one statement itself binds `name` at module scope.
@@ -610,14 +578,28 @@ fn stmt_binds(s: &crate::Statement, name: &str) -> bool {
     stmt_bound_names(s).iter().any(|n| n == name)
 }
 
+/// A loop or `with` statement binds its target BEFORE its body runs
+/// (Python binds it at each iteration, or after `__enter__`), so its
+/// mark is recorded at the top of the body by the loop lowering, not
+/// after the statement like a store's (Devin review on #338, round 9).
+pub(crate) fn binds_target_before_body(stmt: &crate::StatementType) -> bool {
+    matches!(
+        stmt,
+        crate::StatementType::For(_)
+            | crate::StatementType::AsyncFor(_)
+            | crate::StatementType::With(_)
+            | crate::StatementType::AsyncWith(_)
+    )
+}
+
 /// A module body's binding statements — every statement that binds a
 /// module-scope name, under module-level control flow too, a def's own
 /// body excluded — in source order, each with whether it is a top-level
 /// statement of the body. A statement's index here is its MARK: one bit
 /// of the module's `__RYTHON_BOUND` words, set where the statement runs
-/// (after its init code), which is what a cyclic importer's bound check
-/// reads (Devin review on #338, round 8). A loop or `with` target counts
-/// as bound when its statement completes.
+/// (after its init code; a loop or `with` target at the top of its body),
+/// which is what a cyclic importer's bound check reads (Devin review on
+/// #338, rounds 8 and 9).
 fn binding_statements(body: &[crate::Statement]) -> Vec<(&crate::Statement, bool)> {
     use crate::ast::tree::visit::{walk_stmts, Descend, Flow};
     let mut out: Vec<(&crate::Statement, bool)> = Vec::new();
@@ -672,12 +654,12 @@ pub(crate) fn bound_word_and_mask(mark: usize) -> (usize, u32) {
     (mark / BOUND_WORD_BITS, 1u32 << (mark % BOUND_WORD_BITS))
 }
 
-/// The first binding of `name` in the body of the crate module at `key`
-/// (a def's locals excluded): its mark, and whether it is unconditional
-/// (a top-level statement) or nested under module-level control flow.
-/// A package's own `from . import name` binds the SUBMODULE — it is the
-/// submodule import, not an attribute the package has before it — so it
-/// never counts (the entry's `from . import helper` in its `__init__`).
+/// The bindings of `name` in the body of the crate module at `key` (a
+/// def's locals excluded): every binding statement's mark, and whether
+/// all of them are nested under module-level control flow. A package's
+/// own `from . import name` binds the SUBMODULE — it is the submodule
+/// import, not an attribute the package has before it — so it never
+/// counts (the entry's `from . import helper` in its `__init__`).
 fn module_binding(options: &PythonOptions, key: &[String], name: &str) -> Option<ModuleBinding> {
     let module = options.module_defs.get(key)?;
     let module: &crate::Module = module;
@@ -689,10 +671,19 @@ fn module_binding(options: &PythonOptions, key: &[String], name: &str) -> Option
         _ => false,
     };
     let stmts = binding_statements(&module.raw.body);
-    let mark = stmts
+    let bindings: Vec<(usize, bool)> = stmts
         .iter()
-        .position(|(s, _)| stmt_binds(s, name) && !imports_own_submodule(s))?;
-    Some(ModuleBinding { mark, conditional: !stmts[mark].1 })
+        .enumerate()
+        .filter(|(_, (s, _))| stmt_binds(s, name) && !imports_own_submodule(s))
+        .map(|(mark, (_, top_level))| (mark, *top_level))
+        .collect();
+    if bindings.is_empty() {
+        return None;
+    }
+    Some(ModuleBinding {
+        conditional: bindings.iter().all(|(_, top_level)| !top_level),
+        marks: bindings.into_iter().map(|(mark, _)| mark).collect(),
+    })
 }
 
 /// The bound checks a `from package import name` makes after the
@@ -729,9 +720,12 @@ pub(crate) fn import_site_bound_checks(
         .join(".");
     let checks = i.names.iter().filter_map(|a| {
         let binding = module_binding(options, key, &a.name)?;
-        let (word, mask) = bound_word_and_mask(binding.mark);
+        let bits = binding.marks.iter().map(|mark| {
+            let (word, mask) = bound_word_and_mask(*mark);
+            quote!((#word, #mask))
+        });
         let name = a.name.as_str();
-        Some(quote!(crate::#(#segs::)*__rython_bound__(#word, #mask, #name, #qualified)?;))
+        Some(quote!(crate::#(#segs::)*__rython_bound__(&[#(#bits),*], #name, #qualified)?;))
     });
     quote!(#(#checks)*)
 }

@@ -999,12 +999,18 @@ impl CodeGen for Module {
         options.init_binding_marks = std::rc::Rc::new(binding_marks.by_pos.clone());
         let mut top_level_binds: Vec<(Option<TokenStream>, usize)> = Vec::new();
         for (stmt_index, s) in self.raw.body.into_iter().enumerate() {
-            top_level_binds.push((
+            // A loop or `with` records its target's mark at the top of its
+            // body (the statement lowering), not at the end of its range.
+            let end_of_range_bind = if crate::ast::tree::import::binds_target_before_body(
+                &s.statement,
+            ) {
+                None
+            } else {
                 s.lineno
                     .zip(s.col_offset)
-                    .and_then(|pos| binding_marks.bind_call(pos)),
-                module_init_stmts.len(),
-            ));
+                    .and_then(|pos| binding_marks.bind_call(pos))
+            };
+            top_level_binds.push((end_of_range_bind, module_init_stmts.len()));
             match &s.statement {
                 crate::StatementType::FunctionDef(f)
                 | crate::StatementType::AsyncFunctionDef(f) => {
@@ -1942,6 +1948,8 @@ impl CodeGen for Module {
                             o
                         };
                         let body_pos = body_stmt.lineno.zip(body_stmt.col_offset);
+                        let body_binds_target_first =
+                            crate::ast::tree::import::binds_target_before_body(&body_stmt.statement);
                         let body_tokens = body_stmt
                             .to_rust(ctx.clone(), body_options, symbols.clone())
                             .map_err(|e| wrap_module_error(&module_filename, e))?;
@@ -1957,7 +1965,9 @@ impl CodeGen for Module {
                         // it: its mark, after its init code (the nested
                         // lowering records marks only under a lowered
                         // control-flow statement).
-                        if let Some(bind) = body_pos.and_then(|pos| binding_marks.bind_call(pos)) {
+                        if !body_binds_target_first
+                            && let Some(bind) = body_pos.and_then(|pos| binding_marks.bind_call(pos))
+                        {
                             module_init_stmts.push(bind);
                         }
                     }
@@ -2238,7 +2248,7 @@ impl CodeGen for Module {
             // The body's bound bitmap: one bit per binding statement
             // (`BindingMarks`), set where the statement ran; a cyclic
             // importer's `from .this import name` asks `__rython_bound__`
-            // whether the statement binding `name` has run, and Python
+            // whether any statement binding `name` has run, and Python
             // raises ImportError for a name the partially initialized
             // module has not bound yet (Devin review on #338, rounds 6
             // and 8). A completed body answers yes for every name.
@@ -2258,15 +2268,17 @@ impl CodeGen for Module {
                 }
                 #[allow(dead_code)]
                 pub(crate) fn __rython_bound__(
-                    __rython_word: usize,
-                    __rython_mask: u32,
+                    __rython_bits: &[(usize, u32)],
                     __rython_name: &str,
                     __rython_module: &str,
                 ) -> Result<(), PyException> {
                     if __RYTHON_INIT_DONE.load(::core::sync::atomic::Ordering::Acquire)
-                        || __RYTHON_BOUND[__rython_word].load(::core::sync::atomic::Ordering::Acquire)
-                            & __rython_mask
-                            != 0
+                        || __rython_bits.iter().any(|(__rython_word, __rython_mask)| {
+                            __RYTHON_BOUND[*__rython_word]
+                                .load(::core::sync::atomic::Ordering::Acquire)
+                                & __rython_mask
+                                != 0
+                        })
                     {
                         Ok(())
                     } else {

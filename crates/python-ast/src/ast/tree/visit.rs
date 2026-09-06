@@ -166,6 +166,115 @@ pub fn target_names(target: &ExprType) -> Vec<&str> {
 /// crate (`__rython_load`, `__rython_recv`, `__rython_exc_arg0`, ...).
 pub const RESERVED_PREFIX: &str = "__rython_";
 
+/// Which of a statement's bindings [`stmt_bound_names`] enumerates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Bindings {
+    /// What the statement binds in the scope it sits in: a def or class
+    /// name, an import alias, a store's targets (an assignment, a loop
+    /// or `with` target), a walrus in its own expressions (a lambda's
+    /// body is its own scope; a comprehension's walrus binds here, its
+    /// `for` targets do not; a def's default or annotation is evaluated
+    /// here). A bare annotation (`name: int`) binds only
+    /// `__annotations__`, never `name`.
+    Scope,
+    /// Every name the statement binds anywhere: the scope bindings plus
+    /// parameters (a def's, a lambda's), comprehension targets, an
+    /// `except ... as` name, `global`/`nonlocal` declarations, and a bare
+    /// annotation — what a name-clash check has to see.
+    Every,
+}
+
+/// The names one statement binds, per `which` — the one enumeration of
+/// binding forms (Devin review on #338, round 9): the reserved-prefix
+/// check, the package-attribute rule, and the import-cycle bound marks
+/// all ask it.
+pub fn stmt_bound_names(s: &Statement, which: Bindings) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let params = |a: &crate::ParameterList| -> Vec<String> {
+        a.posonlyargs
+            .iter()
+            .chain(a.args.iter())
+            .chain(a.kwonlyargs.iter())
+            .chain(a.vararg.iter())
+            .chain(a.kwarg.iter())
+            .map(|p| p.arg.clone())
+            .collect()
+    };
+    for t in stmt_targets(s) {
+        names.extend(target_names(t).into_iter().map(str::to_string));
+    }
+    // An expression's own bindings: a walrus (either mode), plus the
+    // expression-local ones (comprehension targets, lambda parameters)
+    // when every binding is wanted. `Scope` stays out of lambda bodies.
+    let expr_bindings = |e: &ExprType, names: &mut Vec<String>| match which {
+        Bindings::Scope => {
+            any_expr_for(e, Descend::OwnScope, |x| {
+                if let ExprType::NamedExpr(ne) = x {
+                    names.extend(target_names(&ne.left).into_iter().map(str::to_string));
+                }
+                false
+            });
+        }
+        Bindings::Every => walk_expr(e, &mut |x| match x {
+            ExprType::NamedExpr(ne) => {
+                names.extend(target_names(&ne.left).into_iter().map(str::to_string));
+            }
+            ExprType::ListComp(c) => names.extend(
+                c.generators.iter().flat_map(|g| target_names(&g.target)).map(str::to_string),
+            ),
+            ExprType::SetComp(c) => names.extend(
+                c.generators.iter().flat_map(|g| target_names(&g.target)).map(str::to_string),
+            ),
+            ExprType::DictComp(c) => names.extend(
+                c.generators.iter().flat_map(|g| target_names(&g.target)).map(str::to_string),
+            ),
+            ExprType::GeneratorExp(c) => names.extend(
+                c.generators.iter().flat_map(|g| target_names(&g.target)).map(str::to_string),
+            ),
+            ExprType::Lambda(l) => names.extend(params(&l.args)),
+            _ => {}
+        }),
+    };
+    match &s.statement {
+        StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
+            names.push(f.name.clone());
+            if which == Bindings::Every {
+                names.extend(params(&f.args));
+            }
+            // A default value or an annotation is an expression of the
+            // enclosing scope: its walrus or lambda binds there.
+            for e in def_header_exprs(f) {
+                expr_bindings(e, &mut names);
+            }
+        }
+        StatementType::ClassDef(c) => names.push(c.name.clone()),
+        StatementType::Import(im) => names.extend(im.names.iter().map(|a| match &a.asname {
+            Some(asname) => asname.clone(),
+            None => a.name.split('.').next().unwrap_or(&a.name).to_string(),
+        })),
+        StatementType::ImportFrom(im) => names.extend(
+            im.names.iter().map(|a| a.asname.clone().unwrap_or_else(|| a.name.clone())),
+        ),
+        StatementType::Try(t) if which == Bindings::Every => {
+            names.extend(t.handlers.iter().filter_map(|h| h.name.clone()))
+        }
+        StatementType::Global(ns) | StatementType::Nonlocal(ns) if which == Bindings::Every => {
+            names.extend(ns.iter().cloned())
+        }
+        // A bare annotated declaration (`__rython_base: int` — a
+        // dataclass field, a class-level declaration) binds the name for
+        // the class's fields (Devin review on #331).
+        StatementType::AnnotatedName { name, .. } if which == Bindings::Every => {
+            names.push(name.clone())
+        }
+        _ => {}
+    }
+    for e in stmt_exprs(s) {
+        expr_bindings(e, &mut names);
+    }
+    names
+}
+
 /// The first binding in `body` (nested definitions included) of a name
 /// under [`RESERVED_PREFIX`], with its line: a store target, a loop or
 /// `with ... as` target, a walrus, a function or class name, a parameter,
@@ -175,87 +284,12 @@ pub const RESERVED_PREFIX: &str = "__rython_";
 /// loudly.
 pub fn reserved_prefix_binding(body: &[Statement]) -> Option<(String, usize)> {
     let mut found: Option<(String, usize)> = None;
-    let reserved = |n: &str| n.starts_with(RESERVED_PREFIX);
     walk_stmts(body, Descend::All, &mut |s| {
-        let line = s.lineno.unwrap_or(0);
-        let mut names: Vec<String> = Vec::new();
-        let params = |a: &crate::ParameterList| -> Vec<String> {
-            a.posonlyargs
-                .iter()
-                .chain(a.args.iter())
-                .chain(a.kwonlyargs.iter())
-                .chain(a.vararg.iter())
-                .chain(a.kwarg.iter())
-                .map(|p| p.arg.clone())
-                .collect()
-        };
-        for t in stmt_targets(s) {
-            names.extend(target_names(t).into_iter().map(str::to_string));
-        }
-        match &s.statement {
-            StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
-                names.push(f.name.clone());
-                let a = &f.args;
-                names.extend(
-                    a.posonlyargs
-                        .iter()
-                        .chain(a.args.iter())
-                        .chain(a.kwonlyargs.iter())
-                        .chain(a.vararg.iter())
-                        .chain(a.kwarg.iter())
-                        .map(|p| p.arg.clone()),
-                );
-                // A default value or an annotation is an expression of
-                // the enclosing scope: its walrus or lambda binds there.
-                for e in def_header_exprs(f) {
-                    walk_expr(e, &mut |x| {
-                        if let ExprType::Lambda(l) = x {
-                            names.extend(params(&l.args));
-                        }
-                    });
-                }
-            }
-            StatementType::ClassDef(c) => names.push(c.name.clone()),
-            StatementType::Import(im) => names.extend(im.names.iter().map(|a| match &a.asname {
-                Some(asname) => asname.clone(),
-                None => a.name.split('.').next().unwrap_or(&a.name).to_string(),
-            })),
-            StatementType::ImportFrom(im) => names.extend(
-                im.names.iter().map(|a| a.asname.clone().unwrap_or_else(|| a.name.clone())),
-            ),
-            StatementType::Try(t) => names.extend(t.handlers.iter().filter_map(|h| h.name.clone())),
-            StatementType::Global(ns) | StatementType::Nonlocal(ns) => names.extend(ns.iter().cloned()),
-            // A bare annotated declaration (`__rython_base: int` — a
-            // dataclass field, a class-level declaration) binds the name
-            // for the class's fields (Devin review on #331).
-            StatementType::AnnotatedName { name, .. } => names.push(name.clone()),
-            _ => {}
-        }
-        // Expression-local bindings: a walrus, a comprehension's targets,
-        // a lambda's parameters.
-        for e in stmt_exprs(s) {
-            walk_expr(e, &mut |x| match x {
-                ExprType::NamedExpr(ne) => {
-                    names.extend(target_names(&ne.left).into_iter().map(str::to_string));
-                }
-                ExprType::ListComp(c) => names.extend(
-                    c.generators.iter().flat_map(|g| target_names(&g.target)).map(str::to_string),
-                ),
-                ExprType::SetComp(c) => names.extend(
-                    c.generators.iter().flat_map(|g| target_names(&g.target)).map(str::to_string),
-                ),
-                ExprType::DictComp(c) => names.extend(
-                    c.generators.iter().flat_map(|g| target_names(&g.target)).map(str::to_string),
-                ),
-                ExprType::GeneratorExp(c) => names.extend(
-                    c.generators.iter().flat_map(|g| target_names(&g.target)).map(str::to_string),
-                ),
-                ExprType::Lambda(l) => names.extend(params(&l.args)),
-                _ => {}
-            });
-        }
-        if let Some(n) = names.into_iter().find(|n| reserved(n)) {
-            found = Some((n, line));
+        if let Some(n) = stmt_bound_names(s, Bindings::Every)
+            .into_iter()
+            .find(|n| n.starts_with(RESERVED_PREFIX))
+        {
+            found = Some((n, s.lineno.unwrap_or(0)));
             return Flow::Stop;
         }
         Flow::Continue

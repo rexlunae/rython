@@ -80,6 +80,14 @@ impl CodeGen for AsyncFor {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // The statement's own binding mark, recorded at the top of the
+        // body where Python binds the target (Devin review on #338,
+        // round 9); cleared for the body's statements.
+        let mut options = options;
+        let target_bind = options
+            .loop_target_bind
+            .take()
+            .map(|(word, mask)| quote!(__rython_bind__(#word, #mask);));
         // Python's loop variable is function-scoped; a target name whose
         // value LEAKS (a later read, unshadowed) receives a STORE into the
         // hoisted binding, not a fresh `for` binding (same reasoning as the
@@ -101,7 +109,10 @@ impl CodeGen for AsyncFor {
         let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.body.into_iter()
             .map(|stmt| stmt.to_rust(body_ctx.clone(), options.clone(), symbols.clone()))
             .collect();
-        let body_tokens = body_tokens?;
+        let mut body_tokens = body_tokens?;
+        if let Some(bind) = target_bind {
+            body_tokens.insert(0, bind);
+        }
 
         // Full `async for` semantics need an async-stream protocol; until
         // then, iterate the expression synchronously. This preserves the

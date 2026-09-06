@@ -10311,7 +10311,7 @@ fn a_cyclic_import_of_a_name_bound_later_raises_import_error_like_python() {
     );
     let b = fs::read_to_string(krate.root.join("src/b.rs")).unwrap();
     assert!(
-        b.contains("crate::a::__rython_bound__(0usize, 2u32, \"X\", \"fut.a\")?;"),
+        b.contains("crate::a::__rython_bound__(&[(0usize, 2u32)], \"X\", \"fut.a\")?;"),
         "b's import checks a's binding of X: {}",
         b
     );
@@ -10375,7 +10375,7 @@ fn a_root_cycle_of_a_name_bound_later_raises_import_error_like_python() {
     let helper = fs::read_to_string(krate.root.join("src/helper.rs")).unwrap();
     assert!(
         helper.contains("crate::__rython_root::__module_init__()?;")
-            && helper.contains("crate::__rython_root::__rython_bound__(0usize, 2u32, \"NAME\", \"rootcyc\")?;"),
+            && helper.contains("crate::__rython_root::__rython_bound__(&[(0usize, 2u32)], \"NAME\", \"rootcyc\")?;"),
         "helper runs and checks the root: {}",
         helper
     );
@@ -10586,7 +10586,7 @@ fn a_self_import_of_a_name_bound_later_raises_import_error_like_python() {
     );
     let a = fs::read_to_string(krate.root.join("src/a.rs")).unwrap();
     assert!(
-        a.contains("crate::a::__rython_bound__(0usize, 2u32, \"X\", \"selfpkg.a\")?;"),
+        a.contains("crate::a::__rython_bound__(&[(0usize, 2u32)], \"X\", \"selfpkg.a\")?;"),
         "a checks its own binding of X: {}",
         a
     );
@@ -10599,6 +10599,117 @@ fn a_self_import_of_a_name_bound_later_raises_import_error_like_python() {
              (most likely due to a circular import)"
         ]
     );
+}
+
+#[test]
+fn any_binding_statement_of_a_name_answers_a_cyclic_importer() {
+    // a's `c_value` has two binding statements: an untaken conditional
+    // import, then the def that runs. b, imported afterwards, asks a for
+    // c_value during a's initialization: Python finds the def's binding.
+    // The check reads every binding statement's bit, not the first one's
+    // (Devin review on #338, round 9). The import itself drops with the
+    // existing "the module defines c_value locally" warning.
+    let scratch = Scratch::new("laterbind");
+    let krate = package_crate(
+        &scratch,
+        "laterbind",
+        &[
+            (
+                "a.py",
+                concat!(
+                    "print(\"a start\")\n",
+                    "if len(\"x\") == 2:\n",
+                    "    from .c import c_value\n",
+                    "\n",
+                    "\n",
+                    "def c_value() -> int:\n",
+                    "    return 2\n",
+                    "\n",
+                    "\n",
+                    "from .b import b_value\n",
+                    "print(\"a end\", b_value())\n",
+                ),
+            ),
+            (
+                "b.py",
+                "from .a import c_value\n\n\ndef b_value() -> int:\n    return c_value() + 1\n",
+            ),
+            ("c.py", "def c_value() -> int:\n    return 1\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from .a import b_value\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\", b_value())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let b = fs::read_to_string(krate.root.join("src/b.rs")).unwrap();
+    assert!(
+        b.contains("crate::a::__rython_bound__(&[(0usize, 1u32), (0usize, 2u32)], \"c_value\", \"laterbind.a\")?;"),
+        "b asks for either binding of c_value: {}",
+        b
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "laterbind"), vec!["a start", "a end 3", "main 3"]);
+}
+
+#[test]
+fn a_loop_target_is_bound_at_the_top_of_the_loop_body() {
+    // A module-level `for ITEM in [1]:` whose body imports b: Python binds
+    // ITEM before the body runs, so the target's mark is recorded at the
+    // top of the body — before b's init call — not after the loop (Devin
+    // review on #338, round 9). A loop target is a module-init local, so
+    // no sibling can import it back: the generated order is the pin.
+    let scratch = Scratch::new("looptarget");
+    let krate = package_crate(
+        &scratch,
+        "looptarget",
+        &[
+            (
+                "a.py",
+                concat!(
+                    "print(\"a start\")\n",
+                    "for ITEM in [1]:\n",
+                    "    from .b import b_value\n",
+                    "print(\"a end\", b_value())\n",
+                ),
+            ),
+            ("b.py", "def b_value() -> int:\n    return 3\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from .a import b_value\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"main\", b_value())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let a = fs::read_to_string(krate.root.join("src/a.rs")).unwrap();
+    let loop_start = a.find("for _ in vec![1] {").expect("the loop");
+    let target_bound = a.find("__rython_bind__(0usize, 1u32);").expect("ITEM's mark");
+    let b_init = a.find("crate::b::__module_init__()?;").expect("b's init call");
+    assert!(
+        loop_start < target_bound && target_bound < b_init,
+        "ITEM is bound at the top of the body, before b runs: {}",
+        a
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "looptarget"), vec!["a start", "a end 3", "main 3"]);
 }
 
 #[test]

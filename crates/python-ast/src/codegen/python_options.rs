@@ -604,6 +604,13 @@ pub struct PythonOptions {
     /// body has bound (Devin review on #338, round 8).
     pub init_binding_marks: std::rc::Rc<std::collections::HashMap<(usize, usize), (usize, bool)>>,
 
+    /// The `(word, mask)` of the loop or `with` statement about to be
+    /// lowered, when it is a module-scope binding statement: the loop
+    /// lowering records the mark at the top of its body — where Python
+    /// binds the target — and clears the field for the body (Devin
+    /// review on #338, round 9).
+    pub loop_target_bind: Option<(usize, u32)>,
+
     /// Set on the ENTRY module by the converter when the package root
     /// `__init__` has a body the binary must run: the bin-side module that
     /// carries it (`__rython_root`), whose `__module_init__` the entry's
@@ -721,6 +728,7 @@ impl Default for PythonOptions {
             module_defs: std::rc::Rc::new(std::collections::HashMap::new()),
             in_module_init_body: false,
             init_binding_marks: std::rc::Rc::new(std::collections::HashMap::new()),
+            loop_target_bind: None,
             root_init_module: None,
             cross_module_mut_self: std::rc::Rc::new(std::cell::RefCell::new(
                 CrossModuleMutSelf::Uncomputed,
