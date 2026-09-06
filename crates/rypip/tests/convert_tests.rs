@@ -10335,37 +10335,58 @@ fn a_function_local_import_runs_the_module_body_on_first_call_only() {
 }
 
 #[test]
-fn a_later_crate_import_rebinds_a_class_name_for_the_exception_closure() {
-    // errors.py defines the exception `Root`; late.py defines an ordinary
-    // `Root` THEN imports errors' — the import is the name's last binding,
-    // so late's `LateLeaf(Root)` is an exception; early.py imports first
-    // and defines after — its `EarlyLeaf(Root)` is ordinary (Devin review
-    // on #336). Conversion only: a module carrying both a struct and a
-    // `use` of one name is loud in rustc.
+fn a_module_that_defines_a_name_and_later_imports_it_is_refused() {
+    // late.py defines an ordinary `Root`, then imports errors' `Root`:
+    // Python's later binding wins, but a Rust module holds one item per
+    // name, and dropping the definition would lose what ran between them
+    // — the conversion refuses with the fix. The mirror order (import,
+    // then definition) runs end to end below: the dead import is dropped
+    // with a warning and the definition is the class (Devin review on
+    // #336 and #338).
     let scratch = Scratch::new("rebind");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"rebind\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("rebind");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(pkg.join("errors.py"), "class Root(Exception):\n    pass\n").unwrap();
+    fs::write(
+        pkg.join("late.py"),
+        concat!(
+            "class Root:\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "from .errors import Root\n",
+            "\n",
+            "\n",
+            "class LateLeaf(Root):\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("cli.py"),
+        "from .late import LateLeaf\n\n\nif __name__ == \"__main__\":\n    print(\"x\")\n",
+    )
+    .unwrap();
+    let discovered = rypip::discover(scratch.path()).expect("discover");
+    let err = rypip::convert(&discovered, &scratch.path().join("crate"), &ConvertOptions::default())
+        .err()
+        .expect("the rebinding import is refused");
+    let msg = format!("{:#}", err);
+    assert!(msg.contains("rebinds `Root`"), "error: {}", msg);
+    assert!(msg.contains("rename one of the two"), "error: {}", msg);
+
+    let scratch = Scratch::new("rebind2");
     let krate = package_crate(
         &scratch,
-        "rebind",
+        "rebind2",
         &[
             ("errors.py", "class Root(Exception):\n    pass\n"),
-            (
-                "late.py",
-                concat!(
-                    "class Root:\n",
-                    "    pass\n",
-                    "\n",
-                    "\n",
-                    "from .errors import Root\n",
-                    "\n",
-                    "\n",
-                    "class LateLeaf(Root):\n",
-                    "    pass\n",
-                    "\n",
-                    "\n",
-                    "def boom() -> None:\n",
-                    "    raise LateLeaf(\"late\")\n",
-                ),
-            ),
             (
                 "early.py",
                 concat!(
@@ -10388,15 +10409,10 @@ fn a_later_crate_import_rebinds_a_class_name_for_the_exception_closure() {
             (
                 "cli.py",
                 concat!(
-                    "from .late import boom\n",
                     "from .early import make\n",
                     "\n",
                     "\n",
                     "def main() -> None:\n",
-                    "    try:\n",
-                    "        boom()\n",
-                    "    except Exception as e:\n",
-                    "        print(\"caught\", e)\n",
                     "    print(make())\n",
                     "\n",
                     "\n",
@@ -10406,17 +10422,162 @@ fn a_later_crate_import_rebinds_a_class_name_for_the_exception_closure() {
             ),
         ],
     );
-    let late = fs::read_to_string(krate.root.join("src/late.rs")).unwrap();
     assert!(
-        late.contains("\"LateLeaf\"") && late.contains("(\"Root\").to_string(), (\"Exception\").to_string()"),
-        "late's Leaf raises as an exception under errors' Root: {}",
-        late
+        krate.warnings.iter().any(|w| w.contains("import Root` is dropped")),
+        "warnings: {:?}",
+        krate.warnings
     );
-    let early = fs::read_to_string(krate.root.join("src/early.rs")).unwrap();
-    assert!(
-        early.contains("fn tag") && !early.contains("new_with_attrs_and_ancestors"),
-        "early's Leaf is the ordinary class: {}",
-        early
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "rebind2"), vec!["plain"]);
+}
+
+#[test]
+fn an_import_under_module_level_control_flow_runs_the_module_body_when_the_branch_runs() {
+    // `if len(sys.argv) < 100: from .noisy import shout` and a `try: from
+    // .guarded import g / except ImportError: pass` at module level: the
+    // `use` items are hoisted to module scope (a later `shout()` resolves)
+    // and the imported modules' bodies run where Python runs the import
+    // (Devin review on #338).
+    let scratch = Scratch::new("condpkg");
+    let krate = package_crate(
+        &scratch,
+        "condpkg",
+        &[
+            ("noisy.py", "print(\"noisy loaded\")\n\n\ndef shout() -> str:\n    return \"loud\"\n"),
+            ("guarded.py", "print(\"guarded loaded\")\n\n\ndef g() -> str:\n    return \"g\"\n"),
+            (
+                "cli.py",
+                concat!(
+                    "import sys\n",
+                    "\n",
+                    "if len(sys.argv) < 100:\n",
+                    "    from .noisy import shout\n",
+                    "\n",
+                    "try:\n",
+                    "    from .guarded import g\n",
+                    "except ImportError:\n",
+                    "    pass\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(shout(), g())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let main = fs::read_to_string(krate.root.join("src/main.rs")).unwrap();
+    assert!(main.contains("pub use crate::noisy::shout;"), "hoisted use: {}", main);
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "condpkg"),
+        vec!["noisy loaded", "guarded loaded", "loud g"]
+    );
+}
+
+#[test]
+fn a_concurrent_import_waits_for_the_module_body_like_pythons_import_lock() {
+    // Two threads import `slow` (a 200 ms body) 50 ms apart: CPython's
+    // per-module import lock makes the second wait, so `slow loaded`
+    // precedes both threads' prints. The init guard is that lock: the
+    // owning thread re-enters (a cycle) at once, another thread waits
+    // (Devin review on #338).
+    let scratch = Scratch::new("thrpkg");
+    let krate = package_crate(
+        &scratch,
+        "thrpkg",
+        &[
+            (
+                "slow.py",
+                "import time\n\ntime.sleep(0.2)\nprint(\"slow loaded\")\nREADY = True\n",
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "import threading\n",
+                    "import time\n",
+                    "\n",
+                    "\n",
+                    "def worker(tag: str) -> None:\n",
+                    "    from .slow import READY\n",
+                    "    print(tag, READY)\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    a = threading.Thread(target=worker, args=(\"a\",))\n",
+                    "    b = threading.Thread(target=worker, args=(\"b\",))\n",
+                    "    a.start()\n",
+                    "    time.sleep(0.05)\n",
+                    "    b.start()\n",
+                    "    a.join()\n",
+                    "    b.join()\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "thrpkg"), vec!["slow loaded", "a True", "b True"]);
+}
+
+#[test]
+fn a_module_body_that_raises_runs_again_on_the_next_import() {
+    // flaky's body raises on its first run; CPython drops the failed
+    // module, so the next import runs the body again (which succeeds).
+    // The guard leaves a failed module NOT STARTED (Devin review on #338).
+    let scratch = Scratch::new("flaky");
+    let krate = package_crate(
+        &scratch,
+        "flaky",
+        &[
+            (
+                "counter.py",
+                "CALLS = 0\n\n\ndef bump() -> int:\n    global CALLS\n    CALLS += 1\n    return CALLS\n",
+            ),
+            (
+                "flaky.py",
+                concat!(
+                    "from .counter import bump\n",
+                    "\n",
+                    "n = bump()\n",
+                    "print(\"flaky body\", n)\n",
+                    "if n == 1:\n",
+                    "    raise RuntimeError(\"first attempt fails\")\n",
+                    "VALUE = 7\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "def load() -> int:\n",
+                    "    from .flaky import VALUE\n",
+                    "    return VALUE\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    try:\n",
+                    "        load()\n",
+                    "    except RuntimeError as e:\n",
+                    "        print(\"caught\", e)\n",
+                    "    print(load())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "flaky"),
+        vec!["flaky body 1", "caught first attempt fails", "flaky body 2", "7"]
     );
 }
 

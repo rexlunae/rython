@@ -588,6 +588,14 @@ pub struct PythonOptions {
     pub module_defs:
         std::rc::Rc<std::collections::HashMap<Vec<String>, std::rc::Rc<crate::Module>>>,
 
+    /// True while a MODULE-LEVEL control-flow statement (an `if`, a
+    /// `try`, a loop, a `with`) is lowered into `__module_init__`: an
+    /// import nested in it has its `use` hoisted to module scope by the
+    /// module emission, and the statement position carries only the
+    /// imported modules' `__module_init__` calls — Python runs the import
+    /// (the module body) there, conditionally (Devin review on #338).
+    pub in_module_init_body: bool,
+
     /// Lazily-computed merged trait-mut table over ALL modules of the crate
     /// (`module_defs`), shared across every module's conversion: the
     /// cross-module fallback in `method_needs_mut_self` scans each module
@@ -696,6 +704,7 @@ impl Default for PythonOptions {
             rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),
             module_defs: std::rc::Rc::new(std::collections::HashMap::new()),
+            in_module_init_body: false,
             cross_module_mut_self: std::rc::Rc::new(std::cell::RefCell::new(
                 CrossModuleMutSelf::Uncomputed,
             )),

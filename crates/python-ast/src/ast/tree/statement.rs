@@ -602,6 +602,15 @@ impl CodeGen for StatementType {
             // `__module_init__` calls. A module-level import is an item;
             // the module emission adds its init calls to __module_init__
             // in statement order.
+            // An import nested in MODULE-LEVEL control flow: the module
+            // emission hoisted its `use` to module scope; here, where Python
+            // runs the import, only the loaded modules' bodies run.
+            StatementType::Import(_) | StatementType::ImportFrom(_)
+                if options.in_module_init_body =>
+            {
+                let loaded = crate::ast::tree::import::imported_crate_modules(&self, &options);
+                Ok(crate::ast::tree::import::module_init_calls(&loaded))
+            }
             StatementType::Import(_) | StatementType::ImportFrom(_)
                 if !matches!(ctx, CodeGenContext::Module(_)) =>
             {

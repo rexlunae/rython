@@ -973,7 +973,49 @@ impl CodeGen for Module {
         // guard leaves two stores of one name at top level — issue #333).
         let mut emitted_mutable_statics: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // Top-level `def`/`class` names seen so far: a later import that
+        // rebinds one is refused (below) — Rust holds one item per name.
+        let mut defined_above: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // `use` items hoisted from module-level control flow, by text, so
+        // the same import under two branches emits one item (E0252).
+        let mut hoisted_uses: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for (stmt_index, s) in self.raw.body.into_iter().enumerate() {
+            match &s.statement {
+                crate::StatementType::FunctionDef(f)
+                | crate::StatementType::AsyncFunctionDef(f) => {
+                    defined_above.insert(f.name.clone());
+                }
+                crate::StatementType::ClassDef(c) => {
+                    defined_above.insert(c.name.clone());
+                }
+                // A module that defines `Root` and later imports another
+                // `Root`: Python's later binding wins, but a Rust module
+                // cannot hold a struct and a `use` of one name (E0255), and
+                // dropping the definition would lose what ran between them
+                // — refuse with the fix (Devin review on #338). The mirror
+                // (import, then definition) drops the dead import with a
+                // warning in import.rs.
+                crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_) => {
+                    for name in import_bound_names(&s.statement) {
+                        if defined_above.contains(&name) {
+                            return Err(wrap_module_error(
+                                &module_filename,
+                                format!(
+                                    "the import rebinds `{}`, which this module defines above \
+                                     (a def or class): rython holds one item per module \
+                                     name and refuses to silently drop either binding; \
+                                     rename one of the two",
+                                    name
+                                )
+                                .into(),
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
             // Issue #118: module-level argparse. Parser-building statements
             // vanish; the parse_args assignment becomes the typed-namespace
             // destructure inside __module_init__, at its original position.
@@ -1785,6 +1827,22 @@ impl CodeGen for Module {
                         }
                         let body_is_decl =
                             Self::is_declaration_statement(&body_stmt.statement);
+                        // The flattened guard's imports run the loaded
+                        // modules' bodies here, like any module-level import.
+                        if matches!(
+                            &body_stmt.statement,
+                            crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
+                        ) {
+                            let loaded = crate::ast::tree::import::imported_crate_modules(
+                                &body_stmt.statement,
+                                &options,
+                            );
+                            if !loaded.is_empty() {
+                                module_init_stmts
+                                    .push(crate::ast::tree::import::module_init_calls(&loaded));
+                                has_module_init_code = true;
+                            }
+                        }
                         let body_tokens = body_stmt
                             .to_rust(ctx.clone(), init_options.clone(), symbols.clone())
                             .map_err(|e| wrap_module_error(&module_filename, e))?;
@@ -1851,9 +1909,49 @@ impl CodeGen for Module {
                     continue;
                 }
             }
+            // An import nested in module-level control flow (`if cond:
+            // from .x import y`; a non-flattenable `try`; a loop; a `with`):
+            // its `use` is hoisted to module scope here (a `use` inside the
+            // lowered block would be invisible to the rest of the module —
+            // E0425), and the statement position, lowered with
+            // `in_module_init_body`, carries only the loaded modules' init
+            // calls: Python runs the module bodies there, when the branch
+            // runs (Devin review on #338).
+            let stmt_options = if is_declaration {
+                init_options
+            } else {
+                let mut nested_imports: Vec<crate::Statement> = Vec::new();
+                walk_stmts(std::slice::from_ref(&s), Descend::SkipDefs, &mut |inner| {
+                    if let crate::StatementType::If(i) = &inner.statement
+                        && Self::is_type_checking_test(&i.test)
+                    {
+                        return Flow::Skip;
+                    }
+                    if matches!(
+                        &inner.statement,
+                        crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
+                    ) && !std::ptr::eq(inner, &s)
+                    {
+                        nested_imports.push(inner.clone());
+                    }
+                    Flow::Continue
+                });
+                for import in nested_imports {
+                    let use_tokens = import
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                        .map_err(|e| wrap_module_error(&module_filename, e))?;
+                    let text = use_tokens.to_string();
+                    if !text.trim().is_empty() && hoisted_uses.insert(text) {
+                        stream.extend(use_tokens);
+                    }
+                }
+                let mut o = init_options;
+                o.in_module_init_body = true;
+                o
+            };
             let statement = s
                 .clone()
-                .to_rust(ctx.clone(), init_options, symbols.clone())
+                .to_rust(ctx.clone(), stmt_options, symbols.clone())
                 .map_err(|e| wrap_module_error(&module_filename, e))?;
             
             // A module-level import of a crate module runs that module's
@@ -1945,21 +2043,82 @@ impl CodeGen for Module {
         // is taken on entry, so an import cycle (a imports b imports a)
         // finds a's init already running and continues with a's partial
         // state — Python's partially-initialized module.
+        // The guard is Python's per-module import lock (Devin review on
+        // #338): NOT STARTED → RUNNING(owner thread) → DONE. The owning
+        // thread re-entering (an import cycle) returns at once with the
+        // module's partial state; another thread waits until the body has
+        // finished; a body that raises leaves the module NOT STARTED, so a
+        // later import runs it again (CPython drops a failed import from
+        // sys.modules). The no_std tier has one thread: the same states
+        // without an owner. `::core`/`::std` — a crate module named `core`
+        // (textlib/core.py) would shadow the extern crate's path.
         if has_module_init_code || !options.module_defs.is_empty() {
-            stream.extend(quote! {
-                #[allow(dead_code)]
-                pub(crate) fn __module_init__() -> Result<(), PyException> {
-                    // `::core` — a crate module named `core` (textlib/core.py)
-                    // would shadow the extern crate's path otherwise.
-                    static __RYTHON_MODULE_INIT_DONE: ::core::sync::atomic::AtomicBool =
-                        ::core::sync::atomic::AtomicBool::new(false);
-                    if __RYTHON_MODULE_INIT_DONE
-                        .swap(true, ::core::sync::atomic::Ordering::SeqCst)
+            let guard_enter = if options.no_std {
+                quote! {
+                    static __RYTHON_INIT_STATE: ::core::sync::atomic::AtomicU8 =
+                        ::core::sync::atomic::AtomicU8::new(0);
+                    if __RYTHON_INIT_STATE
+                        .compare_exchange(
+                            0,
+                            1,
+                            ::core::sync::atomic::Ordering::SeqCst,
+                            ::core::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_err()
                     {
                         return Ok(());
                     }
-                    #(#module_init_stmts;)*
-                    Ok(())
+                }
+            } else {
+                quote! {
+                    static __RYTHON_INIT_STATE: ::std::sync::Mutex<(u8, Option<::std::thread::ThreadId>)> =
+                        ::std::sync::Mutex::new((0, None));
+                    loop {
+                        let mut __state = __RYTHON_INIT_STATE
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        match *__state {
+                            (2, _) => return Ok(()),
+                            (1, Some(owner)) if owner == ::std::thread::current().id() => {
+                                return Ok(());
+                            }
+                            (1, _) => {
+                                drop(__state);
+                                ::std::thread::yield_now();
+                            }
+                            _ => {
+                                *__state = (1, Some(::std::thread::current().id()));
+                                break;
+                            }
+                        }
+                    }
+                }
+            };
+            let guard_leave = if options.no_std {
+                quote! {
+                    __RYTHON_INIT_STATE.store(
+                        if __rython_init_result.is_ok() { 2 } else { 0 },
+                        ::core::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+            } else {
+                quote! {
+                    *__RYTHON_INIT_STATE
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        if __rython_init_result.is_ok() { (2, None) } else { (0, None) };
+                }
+            };
+            stream.extend(quote! {
+                #[allow(dead_code)]
+                pub(crate) fn __module_init__() -> Result<(), PyException> {
+                    #guard_enter
+                    let __rython_init_result = (|| -> Result<(), PyException> {
+                        #(#module_init_stmts;)*
+                        Ok(())
+                    })();
+                    #guard_leave
+                    __rython_init_result
                 }
             });
         }
@@ -3774,6 +3933,29 @@ fn module_function_free_reads(body: &[crate::Statement]) -> std::collections::Ha
         Flow::Continue
     });
     free
+}
+
+/// The module-level names an import statement binds: `import a.b` binds
+/// `a` (or its `as` name), `from m import x as y` binds `y`.
+fn import_bound_names(stmt: &crate::StatementType) -> Vec<String> {
+    match stmt {
+        crate::StatementType::Import(i) => i
+            .names
+            .iter()
+            .map(|a| {
+                a.asname
+                    .clone()
+                    .unwrap_or_else(|| a.name.split('.').next().unwrap_or(&a.name).to_string())
+            })
+            .collect(),
+        crate::StatementType::ImportFrom(i) => i
+            .names
+            .iter()
+            .filter(|a| a.name != "*")
+            .map(|a| a.asname.clone().unwrap_or_else(|| a.name.clone()))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Is `name` a class the module at `path` defines ONLY under a
