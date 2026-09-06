@@ -6637,6 +6637,101 @@ fn argparse_version_strings_bind_where_add_argument_stood() {
 }
 
 #[test]
+fn issubclass_external_fold_follows_the_alias_that_binds_the_name() {
+    // Round 3 of the review on #339: `import local, ext` binds two names
+    // with one statement; only a value rooted at the EXTERNAL binding
+    // folds to false. The in-crate binding is a class expression the
+    // conversion resolves through the module (or refuses loudly) — never
+    // the fold. Aliases (`import ext as e`) resolve the same way.
+    let local = parse(
+        concat!(
+            "class Base:\n",
+            "    pass\n",
+            "\n",
+            "class Thing(Base):\n",
+            "    pass\n",
+        ),
+        "local.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["local".to_string()], std::rc::Rc::new(local));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    // The external root folds, with the warning.
+    let src = concat!(
+        "import local, importlib\n",
+        "from local import Base\n",
+        "\n",
+        "def probe(name: str) -> bool:\n",
+        "    return issubclass(importlib.import_module(name).Decoder, Base)\n",
+    );
+    let out = compile_with_options(src, "grp1.py", options.clone()).expect("converts");
+    assert!(out.contains("(false)"), "generated: {}", out);
+    assert!(
+        options.definition_warnings.borrow().iter().any(|w| w.contains("statically false")),
+        "warnings: {:?}",
+        options.definition_warnings.borrow()
+    );
+    // The in-crate root of the SAME statement is not external: no fold.
+    let src = concat!(
+        "import local, importlib\n",
+        "from local import Base\n",
+        "\n",
+        "def probe(name: str) -> bool:\n",
+        "    return issubclass(local.Thing(), Base)\n",
+    );
+    let err = compile_with_options(src, "grp2.py", options.clone()).expect_err("loud, not false");
+    assert!(
+        err.contains("issubclass() arg 1 must be a class the conversion can resolve"),
+        "error: {}",
+        err
+    );
+    // An aliased external import folds under its alias.
+    let src = concat!(
+        "import local\n",
+        "from local import Base\n",
+        "import importlib as il\n",
+        "\n",
+        "def probe(name: str) -> bool:\n",
+        "    return issubclass(il.import_module(name).Decoder, Base)\n",
+    );
+    let out = compile_with_options(src, "grp3.py", options.clone()).expect("converts");
+    assert!(out.contains("(false)"), "generated: {}", out);
+}
+
+#[test]
+fn binary_open_text_settings_raise_cpythons_value_error() {
+    // Round 3 of the review on #339: `open(p, "rb", encoding="utf-8")` is
+    // CPython's `ValueError: binary mode doesn't take an encoding
+    // argument`, raised at the open; so is `errors=`, by keyword or by
+    // position (open's fourth and fifth positionals). A literal None is
+    // not given; an expression that may be None is refused at conversion.
+    let out = compile(
+        "def main() -> None:\n    f = open(\"x.bin\", \"rb\", encoding=\"utf-8\")\n",
+        "bo1.py",
+    );
+    assert!(out.contains("open_binary_with (& (\"x.bin\") , \"rb\" , true , false)"), "generated: {}", out);
+    let out = compile(
+        "def main() -> None:\n    f = open(\"x.bin\", \"rb\", -1, None, \"strict\")\n",
+        "bo2.py",
+    );
+    assert!(out.contains("open_binary_with (& (\"x.bin\") , \"rb\" , false , true)"), "generated: {}", out);
+    let out = compile(
+        "def main() -> None:\n    f = open(\"x.bin\", \"rb\", -1, None, errors=None)\n",
+        "bo3.py",
+    );
+    assert!(out.contains("open_binary (& (\"x.bin\") , \"rb\")"), "generated: {}", out);
+    let err = compile_err(
+        "def main(enc: str) -> None:\n    f = open(\"x.bin\", \"rb\", encoding=enc)\n",
+        "bo4.py",
+    );
+    assert!(err.contains("a binary mode takes no encoding"), "error: {}", err);
+}
+
+#[test]
 fn update_file_modes_are_refused_at_conversion() {
     // Round 2 of the review on #339: an update mode (`+`) is valid Python
     // the runtime does not model; a literal one is refused when the

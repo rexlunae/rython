@@ -121,7 +121,9 @@ keyword `replace()` on the datetime family), the core builtins (`print`,
 `map`/`filter`, `zip`, `sum`, `pow`, `repr`, `hash`, `isinstance` on
 annotated locals, …), string/list/dict/set methods, file objects (disk
 handles and `io.StringIO` behind one surface, including `with open(...)
-as f:`), `functools.partial` over statically-known functions,
+as f:`; a literal binary mode is the bytes file, `io.BytesIO`'s type,
+and the mode grammar raises CPython's own `ValueError`s),
+`functools.partial` over statically-known functions,
 `@functools.lru_cache`/`@cache` with CPython's exact LRU discipline,
 conversion-time `argparse` (typed namespace, byte-identical help and
 error output), and a growing stdlib: `math`, `random`, `os`, `sys`,
@@ -238,9 +240,16 @@ line, never a silent behaviour change:
   error. `bytes.decode("utf-8")` etc. work through the stdpython codec
   layer.
 - **`argparse`** supports literal specs only (the parser is evaluated at
-  conversion time): `str`/`int`/`float` positionals, `--long` options
-  with `default=`, `store_true`, `help=`, `prog=`, `description=`.
-  `nargs`, `choices`, subcommands, and short options are loud errors.
+  conversion time, from the body's top-level statements): `str`/`int`/
+  `float`/`FileType(mode)` positionals and `--long` (or `-s`, `--long`)
+  options with `default=`, `store_true`, `action="version"` with
+  `version=`, `help=`, `dest=`, `nargs="+"`/`"*"` on one positional,
+  `prog=`, `description=`, `parse_args(argv)`, with `%(prog)s`/
+  `%(default)s` in help and version text; argument consumption is a port
+  of CPython's, so help, usage and every error message match byte for
+  byte. `choices`, `nargs` on options, `nargs="?"`, subcommands, a
+  FileType default and update modes (`r+`) are loud errors; a parser
+  touched under control flow or in a nested definition is refused.
 - **`csv.writer`** implements the default excel dialect; other dialects
   and `QUOTE_ALL`-style options are not supported yet.
 - **`re`** is backed by the `regex` crate: backreferences and lookarounds

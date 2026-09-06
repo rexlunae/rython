@@ -6944,6 +6944,91 @@ fn argparse_consumes_arguments_in_cpython_order() {
 }
 
 #[test]
+fn argparse_formats_prog_placeholders_and_rejects_negative_flags_and_binary_text_settings() {
+    // Round 3 of the review on #339: `%(prog)s` in a version string and
+    // the description (with `%%` collapsing only when the text mentions
+    // `%(prog)`), `%(default)s`/`%(prog)s` in a help string; an option
+    // string that looks like a negative number (`-1`) makes `-2` and
+    // `-2.5` unrecognized options rather than positionals; and a binary
+    // `open` with `encoding=`/`errors=` (keyword or positional) raises
+    // CPython's ValueError at the open while a literal None does not.
+    // Every transcript below was captured from python3 3.11 verbatim.
+    let scratch = Scratch::new("approg");
+    let file = scratch.path().join("vers.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"mytool\", description=\"%(prog)s reads files\")\n",
+            "    parser.add_argument(\"--version\", action=\"version\", version=\"%(prog)s 2.1 (100%%)\")\n",
+            "    parser.add_argument(\"-1\", \"--one\", action=\"store_true\", help=\"just one\")\n",
+            "    parser.add_argument(\"--num\", type=int, default=3, help=\"a count (default %(default)s) for %(prog)s\")\n",
+            "    parser.add_argument(\"files\", nargs=\"*\")\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(args.one, args.num, args.files)\n",
+            "    try:\n",
+            "        open(\"vers.py\", \"rb\", encoding=\"utf-8\")\n",
+            "    except ValueError as e:\n",
+            "        print(\"caught:\", e)\n",
+            "    try:\n",
+            "        open(\"vers.py\", \"rb\", -1, None, \"strict\")\n",
+            "    except ValueError as e:\n",
+            "        print(\"caught:\", e)\n",
+            "    with open(\"vers.py\", \"rb\", -1, None) as f:\n",
+            "        print(len(f.read()) > 0)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/vers");
+    let usage = "usage: mytool [-h] [--version] [-1] [--num NUM] [files ...]\n";
+    let ok_tail = "caught: binary mode doesn't take an encoding argument\ncaught: binary mode doesn't take an errors argument\nTrue\n";
+    let cases: &[(&[&str], i32, String, &str)] = &[
+        (&["--version"], 0, "mytool 2.1 (100%)\n".to_string(), ""),
+        (
+            &["-h"],
+            0,
+            format!(
+                "{}\nmytool reads files\n\npositional arguments:\n  files\n\noptions:\n  -h, --help  show this help message and exit\n  --version   show program's version number and exit\n  -1, --one   just one\n  --num NUM   a count (default 3) for mytool\n",
+                usage
+            ),
+            "",
+        ),
+        (&["a", "-2"], 2, String::new(), "mytool: error: unrecognized arguments: -2\n"),
+        (&["-1", "a", "-2.5"], 2, String::new(), "mytool: error: unrecognized arguments: -2.5\n"),
+        (&["a", "b"], 0, format!("False 3 ['a', 'b']\n{}", ok_tail), ""),
+        (&[], 0, format!("False 3 []\n{}", ok_tail), ""),
+    ];
+    for (args, code, stdout, stderr) in cases {
+        let output = Command::new(&bin)
+            .args(*args)
+            .current_dir(scratch.path())
+            .output()
+            .expect("run");
+        assert_eq!(output.status.code(), Some(*code), "{:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), *stdout, "{:?}", args);
+        let expected_err = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!("{}{}", usage, stderr)
+        };
+        assert_eq!(String::from_utf8_lossy(&output.stderr), expected_err, "{:?}", args);
+    }
+}
+
+#[test]
 fn binary_filetype_and_binary_open_match_python_at_runtime() {
     // Issue #332: `type=argparse.FileType("rb")` with `nargs="*"` (zero
     // files is an empty list), and `open(p, "wb")` / `open(p, "rb")` —

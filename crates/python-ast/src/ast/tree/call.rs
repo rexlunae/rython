@@ -3553,13 +3553,62 @@ impl<'a> CodeGen for Call {
                         if binary_mode {
                             let p = &rendered[0];
                             let m = &rendered[1];
-                            if rendered.len() > 2 {
+                            // The text-only settings — `encoding` and
+                            // `errors`, by keyword or by position (open's
+                            // third positional is buffering, then
+                            // encoding, then errors) — are CPython's
+                            // ValueError in a binary mode when not None:
+                            // the runtime raises it (Devin review on #339,
+                            // round 3). A literal None is not given; an
+                            // expression that may or may not be None
+                            // cannot be judged here and is loud.
+                            let is_none = |e: &ExprType| {
+                                matches!(e, ExprType::Constant(c) if c.0.is_none())
+                            };
+                            let given = |slot: &str, e: Option<&ExprType>| -> Result<bool, Box<dyn std::error::Error>> {
+                                match e {
+                                    None => Ok(false),
+                                    Some(e) if is_none(e) => Ok(false),
+                                    Some(ExprType::Constant(_)) => Ok(true),
+                                    Some(_) => Err(format!(
+                                        "open(..., '{}', {}=<expr>): a binary mode takes no \
+                                         {} (Python's ValueError when it is not None), and \
+                                         the expression cannot be judged at conversion; \
+                                         pass None or a literal",
+                                        rendered_mode_literal(&self.args[1]),
+                                        slot,
+                                        slot
+                                    )
+                                    .into()),
+                                }
+                            };
+                            let keyword = |name: &str| {
+                                self.keywords
+                                    .iter()
+                                    .find(|k| k.arg.as_deref() == Some(name))
+                                    .map(|k| &k.value)
+                            };
+                            let encoding_given =
+                                given("encoding", keyword("encoding").or(self.args.get(3)))?;
+                            let errors_given =
+                                given("errors", keyword("errors").or(self.args.get(4)))?;
+                            if self.args.len() > 5 {
+                                return Err(
+                                    "open() in a binary mode: newline/closefd/opener positionals \
+                                     are not supported yet"
+                                        .into(),
+                                );
+                            }
+                            if self.args.len() > 2 {
                                 options.definition_warnings.borrow_mut().push(format!(
                                     "open({}, ...) passes only the path and mode: a binary \
                                      file has no encoding, and the buffer is the default \
                                      (the buffering divergence)",
                                     bname
                                 ));
+                            }
+                            if encoding_given || errors_given {
+                                return Ok(quote!(open_binary_with(&(#p), #m, #encoding_given, #errors_given)?));
                             }
                             return Ok(quote!(open_binary(&(#p), #m)?));
                         }
@@ -11574,11 +11623,34 @@ fn external_operand(e: &ExprType, symbols: &SymbolTableScopes, options: &PythonO
             ExprType::Call(c) => cur = &c.func,
             ExprType::Subscript(s) => cur = &s.value,
             ExprType::Name(n) => {
-                return match symbols.get(&n.id) {
-                    Some(crate::SymbolTableNode::Import(im)) => im.names.iter().any(|a| {
-                        let root = a.name.split('.').next().unwrap_or(&a.name);
-                        !options.module_defs.keys().any(|k| k.first().map(String::as_str) == Some(root))
-                    }),
+                // `import ext as e` binds `e` as an alias of the canonical
+                // name; follow it to the import that binds the module.
+                let mut bound = n.id.clone();
+                for _ in 0..8 {
+                    match symbols.get(&bound) {
+                        Some(crate::SymbolTableNode::Alias(canonical)) => bound = canonical.clone(),
+                        _ => break,
+                    }
+                }
+                return match symbols.get(&bound) {
+                    // The alias that binds THIS name (`import local, ext`
+                    // binds two; `import a.b as c` binds `c` to `a`) — not
+                    // any alias of the statement (Devin review on #339,
+                    // round 3).
+                    Some(crate::SymbolTableNode::Import(im)) => im
+                        .names
+                        .iter()
+                        .find(|a| match &a.asname {
+                            Some(named) => named == &bound || named == &n.id,
+                            None => a.name.split('.').next() == Some(bound.as_str()),
+                        })
+                        .is_some_and(|a| {
+                            let root = a.name.split('.').next().unwrap_or(&a.name);
+                            !options
+                                .module_defs
+                                .keys()
+                                .any(|k| k.first().map(String::as_str) == Some(root))
+                        }),
                     Some(crate::SymbolTableNode::ImportFrom(ifm)) => {
                         crate::module_defs_key(options, &ifm.resolved_module_path(options)).is_none()
                     }
@@ -11587,5 +11659,17 @@ fn external_operand(e: &ExprType, symbols: &SymbolTableScopes, options: &PythonO
             }
             _ => return false,
         }
+    }
+}
+
+/// The literal mode of an `open` call, for a message (the caller has
+/// already established it is a string literal).
+fn rendered_mode_literal(e: &ExprType) -> String {
+    match e {
+        ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::String(s)) => s.value().to_string(),
+            _ => String::new(),
+        },
+        _ => String::new(),
     }
 }

@@ -259,7 +259,7 @@ fn help_text(prog: &str, description: Option<&str>, specs: &[ArgSpec]) -> String
     out.push('\n');
     if let Some(d) = description {
         out.push('\n');
-        out.push_str(d);
+        out.push_str(&format_text(d, prog));
         out.push('\n');
     }
     let entry = |out: &mut String, invocation: &str, help: Option<&str>| {
@@ -283,7 +283,7 @@ fn help_text(prog: &str, description: Option<&str>, specs: &[ArgSpec]) -> String
     if specs.iter().any(|s| s.is_positional()) {
         out.push_str("\npositional arguments:\n");
         for s in specs.iter().filter(|s| s.is_positional()) {
-            entry(&mut out, &s.invocation(), s.help);
+            entry(&mut out, &s.invocation(), s.help.map(|h| expand_help(h, prog, s)).as_deref());
         }
     }
     out.push_str("\noptions:\n");
@@ -291,23 +291,118 @@ fn help_text(prog: &str, description: Option<&str>, specs: &[ArgSpec]) -> String
     for s in specs.iter().filter(|s| !s.is_positional()) {
         // Python's default help for action="version".
         let help = match (s.kind, s.help) {
-            (ArgKind::Version, None) => Some("show program's version number and exit"),
-            (_, h) => h,
+            (ArgKind::Version, None) => Some("show program's version number and exit".to_string()),
+            (_, h) => h.map(|h| expand_help(h, prog, s)),
         };
-        entry(&mut out, &s.invocation(), help);
+        entry(&mut out, &s.invocation(), help.as_deref());
     }
     out
 }
 
 /// `action="version"`: Python prints the version string to stdout and
-/// `action="version"`: Python prints the version string to stdout and
-/// exits 0.
-fn print_version_and_exit(spec: &ArgSpec) -> ! {
+/// Python's `text % params` for the `%(name)s` directives argparse
+/// substitutes (`%(prog)s` in a version or description, `%(prog)s`,
+/// `%(default)s`, `%(dest)s`, `%(type)s` in a help string) and `%%`.
+/// Any other directive is what CPython raises for it (a KeyError for an
+/// unknown name, a ValueError for an incomplete format) — loud.
+fn percent_format(text: &str, params: &[(&str, String)]) -> Result<String, PyException> {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => out.push('%'),
+            Some('(') => {
+                let mut name = String::new();
+                loop {
+                    match chars.next() {
+                        Some(')') => break,
+                        Some(ch) => name.push(ch),
+                        None => {
+                            return Err(crate::value_error("incomplete format key"));
+                        }
+                    }
+                }
+                let conversion = chars.next();
+                if conversion != Some('s') {
+                    return Err(crate::value_error(&format!(
+                        "unsupported format character {} in argparse text",
+                        conversion.map(|c| py_repr(&c.to_string())).unwrap_or_else(|| "'(end)'".to_string())
+                    )));
+                }
+                match params.iter().find(|(k, _)| *k == name) {
+                    Some((_, value)) => out.push_str(value),
+                    None => {
+                        return Err(PyException::new("KeyError", py_repr(&name)));
+                    }
+                }
+            }
+            _ => return Err(crate::value_error("incomplete format")),
+        }
+    }
+    Ok(out)
+}
+
+/// The formatter's `_format_text`: `%(prog)s` is substituted (and `%%`
+/// collapsed) only when the text mentions `%(prog)` — a version or a
+/// description without it prints verbatim, `100%` included.
+fn format_text(text: &str, prog: &str) -> String {
+    if !text.contains("%(prog)") {
+        return text.to_string();
+    }
+    percent_format(text, &[("prog", prog.to_string())]).unwrap_or_else(|e| loud_exit(&e))
+}
+
+/// The formatter's `_expand_help`: a help string is ALWAYS formatted
+/// (CPython raises for a stray `%`), with the action's attributes as
+/// parameters — `prog`, `default`, `dest`, `type` here.
+fn expand_help(help: &str, prog: &str, spec: &ArgSpec) -> String {
+    let default = match (&spec.default, spec.kind) {
+        (_, ArgKind::StoreTrue) => "False".to_string(),
+        (Some(ParsedValue::Str(s)), _) => s.clone(),
+        (Some(ParsedValue::Int(i)), _) => i.to_string(),
+        (Some(ParsedValue::Float(f)), _) => crate::py_float_repr(*f),
+        (Some(ParsedValue::Flag(b)), _) => if *b { "True" } else { "False" }.to_string(),
+        (Some(other), _) => format!("{:?}", other),
+        (None, _) => "None".to_string(),
+    };
+    let type_name = match spec.kind {
+        ArgKind::Int => "int",
+        ArgKind::Float => "float",
+        ArgKind::Str | ArgKind::StoreTrue | ArgKind::Version => "None",
+        ArgKind::File(_) | ArgKind::BinaryFile(_) => "FileType",
+    };
+    percent_format(
+        help,
+        &[
+            ("prog", prog.to_string()),
+            ("default", default),
+            ("dest", spec.dest()),
+            ("type", type_name.to_string()),
+        ],
+    )
+    .unwrap_or_else(|e| loud_exit(&e))
+}
+
+/// A Python exception escaping parse_args itself (a bad `%` directive):
+/// the traceback CPython would print, exit 1.
+fn loud_exit(e: &PyException) -> ! {
+    eprintln!("Traceback (most recent call last):");
+    eprintln!("{}: {}", e.exception_type, e.message);
+    std::process::exit(1);
+}
+
+/// `action="version"`: Python prints the version string — through the
+/// formatter, so `%(prog)s` is the parser's name — to stdout and exits 0.
+fn print_version_and_exit(prog: &str, spec: &ArgSpec) -> ! {
     let version = match &spec.default {
         Some(ParsedValue::Str(v)) => v.clone(),
         _ => String::new(),
     };
-    println!("{}", version);
+    println!("{}", format_text(&version, prog));
     std::process::exit(0);
 }
 
@@ -572,6 +667,10 @@ struct Parse<'a> {
     arg_strings: Vec<String>,
     /// Every option string in registration order (`_option_string_actions`).
     options: Vec<(&'static str, OptAction)>,
+    /// `_has_negative_number_optionals`: an option string that looks like
+    /// a negative number (`-1`) makes every unmatched negative-number
+    /// token an option (an unrecognized one), never a positional.
+    has_negative_number_optionals: bool,
     /// Each token's class: `A` an argument, `O` an option, `-` the
     /// `--` marker.
     pattern: Vec<char>,
@@ -682,9 +781,12 @@ impl<'a> Parse<'a> {
         if tuples.len() == 1 {
             return tuples.pop();
         }
-        // A negative number is a positional (no option here looks like
-        // one); so is a token with a space in it.
-        if looks_like_negative_number(token) || token.contains(' ') {
+        // A negative number is a positional unless an option looks like
+        // one; a token with a space in it is a positional.
+        if looks_like_negative_number(token) && !self.has_negative_number_optionals {
+            return None;
+        }
+        if token.contains(' ') {
             return None;
         }
         Some(OptionTuple {
@@ -732,7 +834,7 @@ impl<'a> Parse<'a> {
                     args.remove(at);
                 }
                 let value = match spec.kind {
-                    ArgKind::Version => print_version_and_exit(spec),
+                    ArgKind::Version => print_version_and_exit(&self.prog, spec),
                     ArgKind::StoreTrue => ParsedValue::Flag(true),
                     _ if spec.nargs == Nargs::One => {
                         let raw = args.first().expect("one value matched");
@@ -875,6 +977,9 @@ pub fn run_parser(
         specs,
         arg_strings,
         options: option_strings(specs),
+        has_negative_number_optionals: option_strings(specs)
+            .iter()
+            .any(|(name, _)| looks_like_negative_number(name)),
         pattern: Vec::new(),
         option_at: Vec::new(),
         values: specs.iter().map(|_| None).collect(),

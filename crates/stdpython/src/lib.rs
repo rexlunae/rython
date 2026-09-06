@@ -7264,9 +7264,32 @@ pub fn open<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: Option<M>) -> Resul
 /// Note: Only available with `std` feature - requires OS I/O capabilities
 #[cfg(feature = "std")]
 pub fn open_binary<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: M) -> Result<stdlib::io::PyBytesIO, PyException> {
+    open_binary_with(filename, mode, false, false)
+}
+
+/// `open_binary` with the text-only settings CPython refuses in a binary
+/// mode: an `encoding` or `errors` argument that is not None is
+/// `ValueError: binary mode doesn't take an encoding argument` /
+/// `... an errors argument`, checked in CPython's order — after the mode
+/// grammar, before any file-system effect (Devin review on #339, round
+/// 3). The converter passes whether each was given (a literal None is
+/// not given).
+#[cfg(feature = "std")]
+pub fn open_binary_with<F: AsRef<str>, M: AsRef<str>>(
+    filename: F,
+    mode: M,
+    encoding_given: bool,
+    errors_given: bool,
+) -> Result<stdlib::io::PyBytesIO, PyException> {
     let path = filename.as_ref();
     let mode = mode.as_ref();
     let parsed = parse_open_mode(mode)?;
+    if parsed.binary && encoding_given {
+        return Err(value_error("binary mode doesn't take an encoding argument"));
+    }
+    if parsed.binary && errors_given {
+        return Err(value_error("binary mode doesn't take an errors argument"));
+    }
     if !parsed.binary {
         return Err(value_error(&format!(
             "open_binary(..., '{}'): a text mode reached the binary open (the converter \

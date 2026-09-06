@@ -89,9 +89,9 @@ will need refactoring. Grep for these; each maps to a rewrite in §2.
   their arguments as their contract
 - `match`, `del`, `global`, `nonlocal`
 - Mutable default arguments
-- Binary file I/O, `seek`/`tell`, `json.dump`/`load` on file objects
-- `argparse` beyond literal specs (short options, `nargs`, `choices`,
-  subcommands)
+- `seek`/`tell`, update modes (`r+`), `json.dump`/`load` on file objects
+- `argparse` beyond literal specs (`choices`, `nargs` on options,
+  subcommands, a parser built under control flow)
 - Sets whose contents get printed (set `repr` is deliberately absent)
 
 Estimate honestly: a codebase saturated with the first table is not a
@@ -175,11 +175,14 @@ rustc (fine but confusing), and pathological forms are silent (#79).
 
 - `match` → `if`/`elif` chains. `del d[k]` → `d.pop(k)`.
   `global` for mutation → pass state explicitly or use a class.
-- Text I/O only; do `seek`-dependent logic by reading fully first.
-  `json.dump(obj, f)` → `f.write(json.dumps(obj))`.
-- `argparse`: reduce to literal specs — `str`/`int`/`float` positionals,
-  `--long` options with `default=`, `store_true`, `help=`, `prog=`,
-  `description=`. Give every value-taking option a `default=`.
+- Text and binary I/O with a literal mode; do `seek`-dependent logic by
+  reading fully first. `json.dump(obj, f)` → `f.write(json.dumps(obj))`.
+- `argparse`: reduce to literal specs — `str`/`int`/`float`/
+  `FileType(mode)` positionals (one of them may take `nargs="+"`/`"*"`),
+  `-s`/`--long` options with `default=`, `store_true`, `action="version"`,
+  `help=`, `dest=`, `prog=`, `description=`. Give every value-taking
+  option a `default=`, and build the parser unconditionally at the top
+  level of the function or module.
 - Don't print sets; print `sorted(s)` instead (also better Python).
 - `lru_cache` keys must be `int`/`bool`/`str`-annotated parameters.
 - Avoid `is` on non-`None` operands (it converts as `==` — a listed
