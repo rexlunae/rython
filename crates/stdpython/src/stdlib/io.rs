@@ -60,10 +60,14 @@ pub type PyBinaryFile = PyBytesIO;
 
 enum BytesBackend {
     Buffer { data: Vec<u8>, pos: usize },
+    /// A readable byte stream: a buffered disk file, or the live
+    /// standard input (`FileType("rb")("-")`).
     #[cfg(feature = "std")]
-    DiskRead(std::io::BufReader<std::fs::File>),
+    DiskRead(alloc::boxed::Box<dyn std::io::BufRead>),
+    /// A writable byte stream: a buffered disk file, or the live
+    /// standard output (`FileType("wb")("-")` — Devin review on #339).
     #[cfg(feature = "std")]
-    DiskWrite(std::io::BufWriter<std::fs::File>),
+    DiskWrite(alloc::boxed::Box<dyn std::io::Write>),
     Closed,
 }
 
@@ -92,13 +96,28 @@ impl PyBytesIO {
     }
 
     #[cfg(feature = "std")]
-    pub(crate) fn new_disk_read(reader: std::io::BufReader<std::fs::File>, name: &str) -> Self {
-        Self::from_backend(BytesBackend::DiskRead(reader), name)
+    pub(crate) fn new_disk_read(reader: impl std::io::BufRead + 'static, name: &str) -> Self {
+        Self::from_backend(BytesBackend::DiskRead(alloc::boxed::Box::new(reader)), name)
     }
 
     #[cfg(feature = "std")]
-    pub(crate) fn new_disk_write(writer: std::io::BufWriter<std::fs::File>, name: &str) -> Self {
-        Self::from_backend(BytesBackend::DiskWrite(writer), name)
+    pub(crate) fn new_disk_write(writer: impl std::io::Write + 'static, name: &str) -> Self {
+        Self::from_backend(BytesBackend::DiskWrite(alloc::boxed::Box::new(writer)), name)
+    }
+
+    /// The live standard input as a binary file (`sys.stdin.buffer`;
+    /// argparse's `FileType("rb")("-")`).
+    #[cfg(feature = "std")]
+    pub fn stdin() -> Self {
+        Self::new_disk_read(std::io::BufReader::new(std::io::stdin()), "<stdin>")
+    }
+
+    /// The live standard output as a binary file (`sys.stdout.buffer`;
+    /// argparse's `FileType("wb")("-")`): close() flushes and leaves the
+    /// descriptor open.
+    #[cfg(feature = "std")]
+    pub fn stdout() -> Self {
+        Self::new_disk_write(std::io::stdout(), "<stdout>")
     }
 
     /// Python `f.closed`: whether close() ran on this stream (through
@@ -168,6 +187,21 @@ impl PyBytesIO {
             BytesBackend::Closed => Err(crate::closed_file_error()),
             #[cfg(feature = "std")]
             _ => Err(crate::runtime_error("getvalue() is a BytesIO method; a disk file has none")),
+        }
+    }
+
+    /// Python `b.flush()`: push buffered writes to the stream.
+    pub fn flush(&self) -> Result<(), PyException> {
+        match &mut *self.inner.borrow_mut() {
+            #[cfg(feature = "std")]
+            BytesBackend::DiskWrite(writer) => {
+                use std::io::Write;
+                writer
+                    .flush()
+                    .map_err(|e| crate::runtime_error(&format!("Flush error: {}", e)))
+            }
+            BytesBackend::Closed => Err(crate::closed_file_error()),
+            _ => Ok(()),
         }
     }
 

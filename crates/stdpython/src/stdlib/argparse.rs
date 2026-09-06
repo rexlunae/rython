@@ -47,17 +47,45 @@ pub enum Nargs {
     Star,
 }
 
+/// A FileType argument's file, opened ONCE at parse time — the open that
+/// validates the path (Python's argparse opens it then too, and reports
+/// a failure as an argument error) is the handle the namespace gets, so
+/// nothing is opened twice and a write mode truncates once (Devin review
+/// on #339). `-` is the live standard stream for the mode: stdin for a
+/// read mode, stdout for a write or append mode, text or binary.
+#[derive(Clone)]
+pub struct OpenedFile {
+    pub path: String,
+    pub mode: &'static str,
+    handle: FileHandle,
+}
+
+#[derive(Clone)]
+enum FileHandle {
+    Text(crate::PyFile),
+    Binary(crate::stdlib::io::PyBytesIO),
+}
+
+impl core::fmt::Debug for OpenedFile {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "File({:?}, {:?})", self.path, self.mode)
+    }
+}
+
+impl PartialEq for OpenedFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.mode == other.mode
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ParsedValue {
     Str(String),
     Int(i64),
     Float(f64),
     Flag(bool),
-    /// A FileType value: the PATH the argument named and the mode; the
-    /// parser validated it by opening it (Python opens at parse time and
-    /// reports a failure as an argument error), and `into_file` opens it
-    /// for the namespace.
-    File(String, &'static str),
+    /// A FileType value: the file the parser opened (see [`OpenedFile`]).
+    File(OpenedFile),
     List(Vec<ParsedValue>),
 }
 
@@ -86,44 +114,19 @@ impl ParsedValue {
             other => panic!("argparse internal error: expected flag, got {:?}", other),
         }
     }
-    /// The opened text file of a FileType argument. The path was
-    /// validated at parse time; a failure here (the file vanished in
-    /// between) is the module-level abort every failed initializer is.
+    /// The opened text file of a FileType argument: the handle the
+    /// parse-time open produced (see [`OpenedFile`]).
     pub fn into_file(self) -> crate::PyFile {
         match self {
-            ParsedValue::File(path, mode) if path == "-" => {
-                // Python: "-" is sys.stdin for a read mode.
-                let mut text = String::new();
-                use std::io::Read;
-                std::io::stdin()
-                    .read_to_string(&mut text)
-                    .unwrap_or_else(|e| panic!("argparse: reading stdin for '-': {}", e));
-                let mut file = crate::stdlib::io::StringIO_seeded(&text);
-                file.name = "<stdin>".to_string();
-                let _ = mode;
-                file
-            }
-            ParsedValue::File(path, mode) => crate::open(&path, Some(mode))
-                .unwrap_or_else(|e| panic!("argparse: can't open '{}': {}", path, e)),
-            other => panic!("argparse internal error: expected file, got {:?}", other),
+            ParsedValue::File(OpenedFile { handle: FileHandle::Text(file), .. }) => file,
+            other => panic!("argparse internal error: expected text file, got {:?}", other),
         }
     }
     /// The opened binary file of a FileType argument (a 'b' mode).
     pub fn into_binary_file(self) -> crate::stdlib::io::PyBytesIO {
         match self {
-            ParsedValue::File(path, _) if path == "-" => {
-                let mut bytes = Vec::new();
-                use std::io::Read;
-                std::io::stdin()
-                    .read_to_end(&mut bytes)
-                    .unwrap_or_else(|e| panic!("argparse: reading stdin for '-': {}", e));
-                let mut file = crate::stdlib::io::BytesIO_seeded(bytes);
-                file.name = "<stdin>".to_string();
-                file
-            }
-            ParsedValue::File(path, mode) => crate::open_binary(&path, mode)
-                .unwrap_or_else(|e| panic!("argparse: can't open '{}': {}", path, e)),
-            other => panic!("argparse internal error: expected file, got {:?}", other),
+            ParsedValue::File(OpenedFile { handle: FileHandle::Binary(file), .. }) => file,
+            other => panic!("argparse internal error: expected binary file, got {:?}", other),
         }
     }
     /// The values of a variadic (`nargs`) argument.
@@ -340,27 +343,39 @@ fn convert(
         ArgKind::StoreTrue | ArgKind::Version => ParsedValue::Flag(true),
         // Python opens the file at parse time and reports a failure as an
         // argument error: `argument files: can't open 'x': [Errno 2] No
-        // such file or directory: 'x'`. The handle is dropped here and
-        // reopened for the namespace (into_file), so a write mode
-        // truncates exactly as Python's parse-time open does.
+        // such file or directory: 'x'`. The handle opened here IS the
+        // namespace's (opened once; a write mode truncates once, as
+        // Python's parse-time open does); `-` is the live standard
+        // stream for the mode.
         ArgKind::File(mode) | ArgKind::BinaryFile(mode) => {
-            if raw != "-" {
-                let opened = if matches!(spec.kind, ArgKind::BinaryFile(_)) {
-                    crate::open_binary(raw, mode).map(|_| ())
-                } else {
-                    crate::open(raw, Some(mode)).map(|_| ())
-                };
-                if let Err(e) = opened {
-                    // Python's message: str(e) — the exception's message
-                    // without its type.
-                    exit_error(
-                        prog,
-                        specs,
-                        &format!("argument {}: can't open '{}': {}", spec.name, raw, e.message),
-                    );
+            let binary = matches!(spec.kind, ArgKind::BinaryFile(_));
+            let reads = mode.contains('r');
+            let handle = if raw == "-" {
+                match (binary, reads) {
+                    (false, true) => Ok(FileHandle::Text(crate::PyFile::stdin())),
+                    (false, false) => Ok(FileHandle::Text(crate::PyFile::stdout())),
+                    (true, true) => Ok(FileHandle::Binary(crate::stdlib::io::PyBytesIO::stdin())),
+                    (true, false) => Ok(FileHandle::Binary(crate::stdlib::io::PyBytesIO::stdout())),
                 }
+            } else if binary {
+                crate::open_binary(raw, mode).map(FileHandle::Binary)
+            } else {
+                crate::open(raw, Some(mode)).map(FileHandle::Text)
+            };
+            match handle {
+                Ok(handle) => ParsedValue::File(OpenedFile {
+                    path: raw.to_string(),
+                    mode,
+                    handle,
+                }),
+                // Python's message: str(e) — the exception's message
+                // without its type.
+                Err(e) => exit_error(
+                    prog,
+                    specs,
+                    &format!("argument {}: can't open '{}': {}", spec.name, raw, e.message),
+                ),
             }
-            ParsedValue::File(raw.to_string(), mode)
         }
     }
 }

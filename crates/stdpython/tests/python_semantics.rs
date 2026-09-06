@@ -3911,3 +3911,28 @@ fn an_exceptions_repr_is_its_class_and_its_args() {
     let none = PyException::new("Inner", "");
     assert_eq!(none.py_repr(), "Inner()");
 }
+
+#[test]
+fn open_binary_validates_the_mode_before_touching_the_path() {
+    // CPython: open(p, "rbb") and open(p, "bbr") are `ValueError: invalid
+    // mode: '...'` — raised before the path is looked at — while "rb" and
+    // "br" are the same binary read mode (Devin review on #339).
+    for mode in ["rbb", "bbr", "b", "rwb", "xb"] {
+        let err = stdpython::open_binary("/nonexistent/dir/for/rython/x.bin", mode)
+            .err()
+            .expect("an invalid mode is refused");
+        assert!(err.matches("ValueError"), "{}: {:?}", mode, err);
+        assert_eq!(err.message, format!("invalid mode: '{}'", mode));
+    }
+    let dir = std::env::temp_dir().join(format!("rython-open-binary-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("x.bin");
+    std::fs::write(&path, b"abc").unwrap();
+    for mode in ["rb", "br"] {
+        let f = stdpython::open_binary(path.to_str().unwrap(), mode).expect(mode);
+        assert_eq!(f.read().unwrap(), b"abc");
+    }
+    let err = stdpython::open_binary(path.to_str().unwrap(), "rb+").err().expect("update modes are loud");
+    assert!(err.message.contains("not supported yet"), "{:?}", err);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

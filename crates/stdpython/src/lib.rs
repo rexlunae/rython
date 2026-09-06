@@ -7168,7 +7168,23 @@ pub fn open_binary<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: M) -> Result
     use std::io::{BufReader, BufWriter};
     let path = filename.as_ref();
     let mode = mode.as_ref();
-    // Python accepts the letters in any order ("rb" == "br").
+    // Python accepts the letters in any order ("rb" == "br") but each
+    // at most once: "rbb" and "bbr" are `ValueError: invalid mode`,
+    // checked BEFORE any file-system side effect (Devin review on #339).
+    // An update mode ("rb+") is valid Python the runtime does not model
+    // yet: loud, distinct from the invalid-mode error.
+    if mode.chars().filter(|c| *c == 'b').count() != 1
+        || mode.chars().any(|c| !matches!(c, 'r' | 'w' | 'a' | 'b' | '+'))
+        || mode.chars().filter(|c| matches!(c, 'r' | 'w' | 'a')).count() != 1
+    {
+        return Err(value_error(&format!("invalid mode: '{}'", mode)));
+    }
+    if mode.contains('+') {
+        return Err(value_error(&format!(
+            "file mode '{}' is not supported yet (update modes)",
+            mode
+        )));
+    }
     let letters: alloc::vec::Vec<char> = mode.chars().filter(|c| *c != 'b').collect();
     let file = match letters.as_slice() {
         ['r'] => {
@@ -7215,10 +7231,14 @@ pub struct PyFile {
 }
 
 enum PyFileBackend {
+    /// A readable stream: a buffered disk file, or the live standard
+    /// input (argparse's `FileType("r")("-")`).
     #[cfg(feature = "std")]
-    DiskRead(std::io::BufReader<std::fs::File>),
+    DiskRead(alloc::boxed::Box<dyn std::io::BufRead>),
+    /// A writable stream: a buffered disk file, or the live standard
+    /// output (`FileType("w")("-")` — Devin review on #339).
     #[cfg(feature = "std")]
-    DiskWrite(std::io::BufWriter<std::fs::File>),
+    DiskWrite(alloc::boxed::Box<dyn std::io::Write>),
     /// io.StringIO: contents plus a cursor in CHARACTERS (Python
     /// counts positions in code points). write() OVERWRITES at the
     /// cursor, as in Python — StringIO("seeded").write("!") yields
@@ -7241,13 +7261,30 @@ impl PyFile {
     }
 
     #[cfg(feature = "std")]
-    fn new_read(reader: std::io::BufReader<std::fs::File>, name: &str) -> Self {
-        Self::from_backend(PyFileBackend::DiskRead(reader), name)
+    fn new_read(reader: impl std::io::BufRead + 'static, name: &str) -> Self {
+        Self::from_backend(PyFileBackend::DiskRead(alloc::boxed::Box::new(reader)), name)
     }
 
     #[cfg(feature = "std")]
-    fn new_write(writer: std::io::BufWriter<std::fs::File>, name: &str) -> Self {
-        Self::from_backend(PyFileBackend::DiskWrite(writer), name)
+    fn new_write(writer: impl std::io::Write + 'static, name: &str) -> Self {
+        Self::from_backend(PyFileBackend::DiskWrite(alloc::boxed::Box::new(writer)), name)
+    }
+
+    /// The live standard input as a text file (`sys.stdin`; argparse's
+    /// `FileType("r")("-")`): reads come from the process's stdin as
+    /// they are asked for, never from a copy.
+    #[cfg(feature = "std")]
+    pub fn stdin() -> Self {
+        Self::new_read(std::io::BufReader::new(std::io::stdin()), "<stdin>")
+    }
+
+    /// The live standard output as a text file (`sys.stdout`; argparse's
+    /// `FileType("w")("-")`): every write reaches the process's stdout;
+    /// close() flushes it and leaves the descriptor open, as Python's
+    /// `closefd=False` stream does.
+    #[cfg(feature = "std")]
+    pub fn stdout() -> Self {
+        Self::new_write(std::io::stdout(), "<stdout>")
     }
 
     /// io.StringIO backing constructor.
@@ -7381,6 +7418,20 @@ impl PyFile {
                 "AttributeError",
                 "'_io.TextIOWrapper' object has no attribute 'getvalue'",
             )),
+        }
+    }
+
+    /// Python file.flush(): push buffered writes to the stream (a read
+    /// stream or a buffer has nothing to push).
+    pub fn flush(&self) -> Result<(), PyException> {
+        match &mut *self.inner.borrow_mut() {
+            #[cfg(feature = "std")]
+            PyFileBackend::DiskWrite(writer) => {
+                use std::io::Write;
+                writer.flush().map_err(|e| runtime_error(&format!("Flush error: {}", e)))
+            }
+            PyFileBackend::Closed => Err(closed_file_error()),
+            _ => Ok(()),
         }
     }
 

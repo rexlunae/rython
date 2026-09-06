@@ -6750,6 +6750,76 @@ fn argparse_filetype_positionals_match_python_at_runtime() {
 }
 
 #[test]
+fn argparse_filetype_dash_is_the_live_standard_stream_for_the_mode() {
+    // Round 1 of the review on #339: `FileType("w")("-")` is the live
+    // stdout (Python returns sys.stdout itself), `FileType("wb")("-")`
+    // its binary stream; every write reaches the user. Verified against
+    // python3: `tee2.py - b.bin` prints `text out` then `done <stdout>
+    // b.bin` and b.bin holds `bytes out`; `tee2.py t.txt -` prints
+    // `bytes out` then `done t.txt <stdout>` and t.txt holds `text out`.
+    // Each named path is opened once (the parse-time handle is the
+    // namespace's), and `issubclass(type(x), int)` is isinstance.
+    let scratch = Scratch::new("apdash");
+    let file = scratch.path().join("tee2.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"tee2\")\n",
+            "    parser.add_argument(\"out\", type=argparse.FileType(\"w\"))\n",
+            "    parser.add_argument(\"blob\", type=argparse.FileType(\"wb\"))\n",
+            "    args = parser.parse_args(argv)\n",
+            "    args.out.write(\"text out\\n\")\n",
+            "    args.out.flush()\n",
+            "    args.blob.write(b\"bytes out\\n\")\n",
+            "    args.blob.flush()\n",
+            "    x = 1\n",
+            "    print(\"done\", args.out.name, args.blob.name, issubclass(type(x), int))\n",
+            "    if args.out.name != \"<stdout>\":\n",
+            "        args.out.close()\n",
+            "    if args.blob.name != \"<stdout>\":\n",
+            "        args.blob.close()\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/tee2");
+    let run = |args: &[&str]| {
+        Command::new(&bin)
+            .args(args)
+            .current_dir(scratch.path())
+            .output()
+            .expect("run")
+    };
+    let output = run(&["-", "b.bin"]);
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "text out\ndone <stdout> b.bin True\n"
+    );
+    assert_eq!(fs::read(scratch.path().join("b.bin")).unwrap(), b"bytes out\n");
+    let output = run(&["t.txt", "-"]);
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "bytes out\ndone t.txt <stdout> True\n"
+    );
+    assert_eq!(fs::read_to_string(scratch.path().join("t.txt")).unwrap(), "text out\n");
+}
+
+#[test]
 fn binary_filetype_and_binary_open_match_python_at_runtime() {
     // Issue #332: `type=argparse.FileType("rb")` with `nargs="*"` (zero
     // files is an empty list), and `open(p, "wb")` / `open(p, "rb")` —

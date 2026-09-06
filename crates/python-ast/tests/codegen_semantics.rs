@@ -6457,7 +6457,7 @@ fn issubclass_over_a_dynamic_operand_is_statically_false_and_warned() {
     );
     assert!(out.contains("|| (false)"), "generated: {}", out);
     assert!(
-        warnings.iter().any(|w| w.contains("issubclass(<dynamic value>, cls) is statically false")),
+        warnings.iter().any(|w| w.contains("issubclass(<external module's value>, cls) is statically false")),
         "warnings: {:?}",
         warnings
     );
@@ -6466,6 +6466,141 @@ fn issubclass_over_a_dynamic_operand_is_statically_false_and_warned() {
         "isc2.py",
     );
     assert!(err.contains("classes are not runtime values"), "error: {}", err);
+    // Round 1 of the review on #339: the fold is the external shape ONLY.
+    // `issubclass(type(x), C)` is `isinstance(x, C)` (CPython: True for
+    // type(1), int) and lowers as that, without a warning; any other
+    // computed operand (a value — Python's TypeError — or an unresolved
+    // class expression) is loud.
+    let (out, warnings) = compile_with_warnings(
+        "def probe(x: int) -> bool:\n    return issubclass(type(x), int)\n",
+        "isc3.py",
+    );
+    assert!(!out.contains("(false)"), "generated: {}", out);
+    assert!(
+        !warnings.iter().any(|w| w.contains("statically false")),
+        "warnings: {:?}",
+        warnings
+    );
+    for src in [
+        "def probe(x: int) -> bool:\n    return issubclass(x + 1, int)\n",
+        "def probe(xs: list[int]) -> bool:\n    return issubclass(xs[0], int)\n",
+        "class Local:\n    pass\n\ndef probe() -> bool:\n    return issubclass(Local(), Local)\n",
+    ] {
+        let err = compile_err(src, "isc4.py");
+        assert!(
+            err.contains("issubclass() arg 1 must be a class the conversion can resolve"),
+            "{}: error: {}",
+            src,
+            err
+        );
+    }
+}
+
+#[test]
+fn argparse_resolves_filetype_by_binding_and_the_version_keywords_in_either_order() {
+    // Round 1 of the review on #339: `FileType` is argparse's only through
+    // the symbol table — a def of that name, or another module's
+    // `.FileType`, is a custom type callable (loud); `action="version"`
+    // and `version=` pair up in either keyword order, and `version=` with
+    // another action is Python's TypeError (loud); a parser referenced
+    // under control flow or inside a nested def is refused.
+    for src in [
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    p = argparse.ArgumentParser(prog=\"t\")\n",
+            "    p.add_argument(\"--version\", version=\"1.0\", action=\"version\")\n",
+            "    args = p.parse_args(argv)\n",
+            "    return 0\n",
+        ),
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    p = argparse.ArgumentParser(prog=\"t\")\n",
+            "    p.add_argument(\"--version\", action=\"version\", version=\"1.0\")\n",
+            "    args = p.parse_args(argv)\n",
+            "    return 0\n",
+        ),
+    ] {
+        let out = compile(src, "apv.py");
+        assert!(out.contains("argparse :: ArgKind :: Version"), "generated: {}", out);
+    }
+    for (src, expected) in [
+        (
+            concat!(
+                "import argparse\n",
+                "\n",
+                "def main(argv: list[str] | None = None) -> int:\n",
+                "    p = argparse.ArgumentParser(prog=\"t\")\n",
+                "    p.add_argument(\"--version\", version=\"1.0\")\n",
+                "    args = p.parse_args(argv)\n",
+                "    return 0\n",
+            ),
+            "version= is only valid with action=\"version\"",
+        ),
+        (
+            concat!(
+                "import argparse\n",
+                "\n",
+                "def FileType(mode: str) -> str:\n",
+                "    return mode\n",
+                "\n",
+                "def main(argv: list[str] | None = None) -> int:\n",
+                "    p = argparse.ArgumentParser(prog=\"t\")\n",
+                "    p.add_argument(\"f\", type=FileType(\"r\"))\n",
+                "    args = p.parse_args(argv)\n",
+                "    return 0\n",
+            ),
+            "FileType(mode)",
+        ),
+        (
+            concat!(
+                "import argparse\n",
+                "import other\n",
+                "\n",
+                "def main(argv: list[str] | None = None) -> int:\n",
+                "    p = argparse.ArgumentParser(prog=\"t\")\n",
+                "    p.add_argument(\"f\", type=other.FileType(\"r\"))\n",
+                "    args = p.parse_args(argv)\n",
+                "    return 0\n",
+            ),
+            "FileType(mode)",
+        ),
+        (
+            concat!(
+                "import argparse\n",
+                "\n",
+                "def main(argv: list[str] | None = None, debug: bool = False) -> int:\n",
+                "    p = argparse.ArgumentParser(prog=\"t\")\n",
+                "    p.add_argument(\"f\", type=str)\n",
+                "    if debug:\n",
+                "        p.add_argument(\"--trace\", action=\"store_true\", default=False)\n",
+                "    args = p.parse_args(argv)\n",
+                "    return 0\n",
+            ),
+            "is used under control flow or inside a nested definition",
+        ),
+    ] {
+        let err = compile_err(src, "apbad.py");
+        assert!(err.contains(expected), "{}\nerror: {}", src, err);
+    }
+    // The bare name IS argparse's when imported from argparse under an alias.
+    let out = compile(
+        concat!(
+            "import argparse\n",
+            "from argparse import FileType as FT\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    p = argparse.ArgumentParser(prog=\"t\")\n",
+            "    p.add_argument(\"f\", type=FT(\"r\"))\n",
+            "    args = p.parse_args(argv)\n",
+            "    return 0\n",
+        ),
+        "apft.py",
+    );
+    assert!(out.contains("argparse :: ArgKind :: File (\"r\")"), "generated: {}", out);
 }
 
 #[test]

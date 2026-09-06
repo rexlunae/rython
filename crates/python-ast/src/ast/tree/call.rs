@@ -2620,23 +2620,62 @@ impl<'a> CodeGen for Call {
                         // unmodeled value, through the -W channel (issue
                         // #332). A NAME operand that is not a class stays
                         // the loud refusal below.
-                        let (ExprType::Name(c1), ExprType::Name(c2)) =
-                            (&self.args[0], &self.args[1])
-                        else {
-                            if matches!(&self.args[0], ExprType::Name(_)) {
-                                return Err("issubclass() over non-class values is not supported: \
-                                             classes are not runtime values in rython"
+                        let ExprType::Name(c2) = &self.args[1] else {
+                            return Err("issubclass() arg 2 must be a class name: rython \
+                                        decides issubclass at conversion time"
+                                .to_string()
+                                .into());
+                        };
+                        let c1 = match &self.args[0] {
+                            ExprType::Name(c1) => c1,
+                            // `issubclass(type(x), C)` IS `isinstance(x, C)`:
+                            // the one computed operand shape whose class
+                            // the conversion can resolve — lowered as that
+                            // (Devin review on #339).
+                            ExprType::Call(c)
+                                if matches!(c.func.as_ref(), ExprType::Name(f) if f.id == "type")
+                                    && c.args.len() == 1
+                                    && c.keywords.is_empty() =>
+                            {
+                                let isinstance = Call {
+                                    func: Box::new(ExprType::Name(crate::Name {
+                                        id: "isinstance".to_string(),
+                                    })),
+                                    args: vec![c.args[0].clone(), self.args[1].clone()],
+                                    keywords: Vec::new(),
+                                };
+                                return isinstance.to_rust(ctx.clone(), options.clone(), symbols.clone());
+                            }
+                            // The one shape issue #332 motivated: an
+                            // attribute of an EXTERNAL module's value
+                            // (`importlib.import_module(...).
+                            // IncrementalDecoder`) — classes are not
+                            // runtime values, so nothing is known about
+                            // it: statically false through the -W channel,
+                            // like hasattr over an unmodeled value.
+                            e if external_operand(e, &symbols, &options) => {
+                                options.definition_warnings.borrow_mut().push(
+                                    "issubclass(<external module's value>, cls) is statically \
+                                     false: classes are not runtime values, so nothing is \
+                                     known about a computed operand's class (the \
+                                     external-object divergence)"
+                                        .to_string(),
+                                );
+                                return Ok(quote!(false));
+                            }
+                            // Any other computed operand — a value (Python's
+                            // TypeError `issubclass() arg 1 must be a
+                            // class`) or a class expression the conversion
+                            // cannot resolve — is loud.
+                            _ => {
+                                return Err("issubclass() arg 1 must be a class the conversion \
+                                            can resolve: the name of a class, `type(<value>)`, \
+                                            or an attribute of an external module's value; \
+                                            a computed operand is not (Python raises TypeError \
+                                            for a non-class)"
                                     .to_string()
                                     .into());
                             }
-                            options.definition_warnings.borrow_mut().push(
-                                "issubclass(<dynamic value>, cls) is statically false: \
-                                 classes are not runtime values, so nothing is known \
-                                 about a computed operand's class (the external-object \
-                                 divergence)"
-                                    .to_string(),
-                            );
-                            return Ok(quote!(false));
                         };
                         // A class resolves locally or through its
                         // import, with its defining module's scope (the
@@ -11500,4 +11539,32 @@ fn shared_construction(class_name: &str, construct: TokenStream) -> TokenStream 
         return quote!(#any::from(#shared));
     }
     shared
+}
+
+/// Whether an expression is rooted at a name the module binds by an
+/// import of an EXTERNAL module (not a crate module): `importlib.
+/// import_module(...).X`, `os.path.Y` — a value the conversion does not
+/// model (the external-object divergence).
+fn external_operand(e: &ExprType, symbols: &SymbolTableScopes, options: &PythonOptions) -> bool {
+    let mut cur = e;
+    loop {
+        match cur {
+            ExprType::Attribute(a) => cur = &a.value,
+            ExprType::Call(c) => cur = &c.func,
+            ExprType::Subscript(s) => cur = &s.value,
+            ExprType::Name(n) => {
+                return match symbols.get(&n.id) {
+                    Some(crate::SymbolTableNode::Import(im)) => im.names.iter().any(|a| {
+                        let root = a.name.split('.').next().unwrap_or(&a.name);
+                        !options.module_defs.keys().any(|k| k.first().map(String::as_str) == Some(root))
+                    }),
+                    Some(crate::SymbolTableNode::ImportFrom(ifm)) => {
+                        crate::module_defs_key(options, &ifm.resolved_module_path(options)).is_none()
+                    }
+                    _ => false,
+                };
+            }
+            _ => return false,
+        }
+    }
 }

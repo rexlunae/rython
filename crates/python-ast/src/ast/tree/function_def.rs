@@ -111,8 +111,46 @@ fn literal_str(e: &ExprType) -> Option<String> {
     }
 }
 
+/// Whether a `type=` callee is argparse's FileType: `argparse.FileType`
+/// (the module by its name or an alias of it), or a bare name the module
+/// binds by `from argparse import FileType [as name]` — through the
+/// symbol table, never by the final identifier alone: a user-defined
+/// `FileType` converts values, it does not open paths (Devin review on
+/// #339).
+fn is_argparse_filetype(func: &ExprType, symbols: &SymbolTableScopes) -> bool {
+    match func {
+        ExprType::Attribute(a) if a.attr == "FileType" => match a.value.as_ref() {
+            ExprType::Name(m) => {
+                crate::StdModule::from_name(&m.id) == Some(crate::StdModule::Argparse)
+                    || matches!(symbols.get(&m.id), Some(crate::SymbolTableNode::Alias(canonical))
+                        if crate::StdModule::from_name(canonical) == Some(crate::StdModule::Argparse))
+            }
+            _ => false,
+        },
+        ExprType::Name(n) => {
+            let mut current = n.id.clone();
+            for _ in 0..8 {
+                match symbols.get(&current) {
+                    Some(crate::SymbolTableNode::Alias(canonical)) => current = canonical.clone(),
+                    Some(crate::SymbolTableNode::ImportFrom(ifm)) => {
+                        return ifm.module == "argparse"
+                            && ifm.names.iter().any(|a| {
+                                a.name == "FileType"
+                                    && a.asname.as_deref().unwrap_or(&a.name) == n.id
+                            });
+                    }
+                    _ => return false,
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn scan_argparse(
     body: &[Statement],
+    symbols: &SymbolTableScopes,
 ) -> Result<Option<ArgparseRewrite>, Box<dyn std::error::Error>> {
     // Find `<var> = argparse.ArgumentParser(...)`.
     let mut parser: Option<(usize, String, Option<String>, Option<String>)> = None;
@@ -247,6 +285,10 @@ pub(crate) fn scan_argparse(
                 let mut default = None;
                 let mut help = None;
                 let mut store_true = false;
+                // `action="version"` and `version=` are tracked apart:
+                // both are needed, in either keyword order (Devin review
+                // on #339).
+                let mut action_version = false;
                 let mut version: Option<ExprType> = None;
                 let mut dest: Option<String> = None;
                 let mut nargs: Option<char> = None;
@@ -259,16 +301,12 @@ pub(crate) fn scan_argparse(
                                 ExprType::Name(n) if n.id == "float" => ArgparseKind::Float,
                                 ExprType::Name(n) if n.id == "str" => ArgparseKind::Str,
                                 // `type=FileType(mode)` (a literal mode;
-                                // `argparse.FileType` or the imported
-                                // name): the parser opens the named file
-                                // (issue #332 — charset_normalizer's CLI).
-                                ExprType::Call(c)
-                                    if match c.func.as_ref() {
-                                        ExprType::Name(f) => f.id == "FileType",
-                                        ExprType::Attribute(a) => a.attr == "FileType",
-                                        _ => false,
-                                    } =>
-                                {
+                                // `argparse.FileType` or the name imported
+                                // from argparse, resolved through the
+                                // symbol table): the parser opens the
+                                // named file (issue #332 —
+                                // charset_normalizer's CLI).
+                                ExprType::Call(c) if is_argparse_filetype(&c.func, symbols) => {
                                     if !c.keywords.is_empty() || c.args.len() > 1 {
                                         return Err(format!(
                                             "add_argument('{}'): FileType takes the mode \
@@ -317,9 +355,7 @@ pub(crate) fn scan_argparse(
                             Some("store_true") => store_true = true,
                             // Python's default action.
                             Some("store") => {}
-                            Some("version") => version = Some(ExprType::Name(crate::Name {
-                                id: String::new(),
-                            })),
+                            Some("version") => action_version = true,
                             _ => {
                                 return Err(format!(
                                     "add_argument('{}'): only action=\"store\", \
@@ -383,12 +419,22 @@ pub(crate) fn scan_argparse(
                         }
                     }
                 }
-                // `action="version"` needs its `version=` string; the
-                // action marker alone (an empty Name) is the missing case.
-                let kind = if let Some(v) = version {
-                    if matches!(&v, ExprType::Name(n) if n.id.is_empty()) {
+                // `action="version"` needs its `version=` string, and
+                // `version=` is only valid with that action (Python:
+                // TypeError for any other action), whatever the keyword
+                // order.
+                let kind = if action_version || version.is_some() {
+                    let Some(v) = version else {
                         return Err(format!(
                             "add_argument('{}'): action=\"version\" needs version=",
+                            name
+                        )
+                        .into());
+                    };
+                    if !action_version {
+                        return Err(format!(
+                            "add_argument('{}'): version= is only valid with \
+                             action=\"version\" (Python raises TypeError)",
                             name
                         )
                         .into());
@@ -511,6 +557,39 @@ pub(crate) fn scan_argparse(
     let Some((parse_index, args_var)) = parse else {
         return Err("argparse.ArgumentParser built but parse_args() never assigned".into());
     };
+    // The parser is evaluated at conversion time from the body's
+    // top-level statements. Any reference to it elsewhere — under
+    // module-level control flow, inside a nested def or class, in a
+    // lambda — is a parser operation the rewrite cannot see (`if
+    // debug: parser.add_argument(...)`): refused, through the one
+    // statement visitor (Devin review on #339).
+    {
+        use crate::ast::tree::visit::{any_expr_for, stmt_exprs, walk_stmts, Descend, Flow};
+        let mut nested_use: Option<usize> = None;
+        walk_stmts(body, Descend::All, &mut |st| {
+            if body.iter().any(|top| std::ptr::eq(top, st)) {
+                return Flow::Continue;
+            }
+            let mentions = stmt_exprs(st).into_iter().any(|e| {
+                any_expr_for(e, Descend::All, |x| matches!(x, ExprType::Name(n) if n.id == pvar))
+            });
+            if mentions {
+                nested_use = Some(st.lineno.unwrap_or(0));
+                return Flow::Stop;
+            }
+            Flow::Continue
+        });
+        if let Some(line) = nested_use {
+            return Err(format!(
+                "argparse parser `{}` is used under control flow or inside a nested \
+                 definition (line {}): the parser is evaluated at conversion time from \
+                 the top-level statements, so a parser operation there cannot be \
+                 represented; build the parser unconditionally at the top level",
+                pvar, line
+            )
+            .into());
+        }
+    }
     Ok(Some(ArgparseRewrite {
         skip,
         parse_index,
@@ -1294,7 +1373,7 @@ impl FunctionDef {
 
         // An argparse parser in the body is evaluated at conversion time:
         // its statements vanish and parse_args becomes a typed struct.
-        let argparse_rewrite = scan_argparse(&self.body)?;
+        let argparse_rewrite = scan_argparse(&self.body, &symbols)?;
         let mut effective_body: Vec<Statement> = match &argparse_rewrite {
             None => self.body.clone(),
             Some(rw) => self
