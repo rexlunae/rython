@@ -108,7 +108,7 @@ impl CodeGen for Module {
     fn to_rust(
         mut self,
         ctx: Self::Context,
-        mut options: Self::Options,
+        options: Self::Options,
         mut symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut stream = TokenStream::new();
@@ -142,11 +142,18 @@ impl CodeGen for Module {
         // one `isinstance`-dispatching function that expresses it, before
         // any body analysis below — the shape the monomorphizing
         // specialization pass already lowers (ast::tree::singledispatch).
-        self.raw.body = crate::ast::tree::singledispatch::desugar_module(self.raw.body)
+        // The body every pass below sees (`normalize_module_body`): the
+        // one sequence the binding marks number, which an importer's
+        // bound check numbers too.
+        let NormalizedBody {
+            body,
+            newly_live,
+            folded_imports,
+        } = normalize_module_body(self.raw.body, &options)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-
-        let (folded_body, newly_live) = fold_static_import_trys(&self.raw.body, &options);
-        self.raw.body = folded_body;
+        self.raw.body = body;
+        let mut options = options;
+        options.folded_guard_imports = std::rc::Rc::new(folded_imports);
         // Handler statements the fold made live were invisible to
         // find_symbols (Try::find_symbols skips ImportError-handler
         // bodies, correctly, for the resolvable case): register them now
@@ -155,17 +162,6 @@ impl CodeGen for Module {
         for s in &newly_live {
             symbols = s.clone().find_symbols(symbols);
         }
-
-        // Issue #137: module-level VERSION-GATED blocks (`if
-        // sys.version_info >= (3, 11):` — certifi's core.py) and
-        // static-name gates (`if brotli is not None:` where the module
-        // folded the import to `brotli = None`): rython's target version
-        // is fixed (3.11.0), so the taken branch is decided at conversion
-        // time and its statements are spliced into the module body BEFORE
-        // every pass below — a version-gated `def` is a module ITEM, not
-        // a nested function inside __module_init__ (which rustc rejects
-        // and the module re-exports cannot see).
-        self.raw.body = splice_gated_branches(self.raw.body, &options);
 
         // Capture the module's source filename before fields of `self` are
         // moved, so statement errors can point at the user's Python file.
@@ -973,7 +969,154 @@ impl CodeGen for Module {
         // guard leaves two stores of one name at top level — issue #333).
         let mut emitted_mutable_statics: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // Top-level `def`/`class` names seen so far: a later import that
+        // rebinds one is refused (below) — Rust holds one item per name.
+        let mut defined_above: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // The names an unconditional top-level statement STORED (a value
+        // binding the one binding enumeration recognizes) before a
+        // definition of the same name: that definition is refused (below).
+        let mut stored_above: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // The names a top-level walrus that MAY NOT run stored above
+        // (`flag and (X := 1)`): Python binds them only when it runs,
+        // but the store needs the name's value slot either way.
+        let mut walrus_above: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // `use` items hoisted from module-level control flow, by text, so
+        // the same import under two branches emits one item (E0252).
+        let mut hoisted_uses: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // Whether the module holds a static the process cannot
+        // re-initialize: a promoted value the body initializes, or a
+        // mutable global (which a function the body calls may write). A
+        // body that raises in such a module cannot run again faithfully —
+        // the module stays failed (Devin review on #338).
+        let mut init_touches_statics = false;
+        // The body's binding marks: each binding statement records its
+        // mark (`__rython_bind__`) right after its init code, so a cyclic
+        // importer can ask which names the body has bound so far
+        // (`__rython_bound__`; Devin review on #338, rounds 6 and 8). A
+        // nested statement records its own where it runs (statement.rs,
+        // with `in_module_init_body`); a top-level one's call is inserted
+        // at the end of its init range below.
+        let binding_marks = crate::ast::tree::import::BindingMarks::of(&self.raw.body);
+        let mut options = options;
+        options.init_binding_marks = std::rc::Rc::new(binding_marks.by_pos.clone());
+        let mut top_level_binds: Vec<(Option<TokenStream>, usize)> = Vec::new();
         for (stmt_index, s) in self.raw.body.into_iter().enumerate() {
+            // The names the statement binds after its init code (a loop or
+            // `with` target's mark is recorded at the top of the body, a
+            // walrus's at its store — by the statement lowering).
+            let end_of_range_bind = s
+                .lineno
+                .zip(s.col_offset)
+                .and_then(|pos| binding_marks.after_binds(pos));
+            top_level_binds.push((end_of_range_bind, module_init_stmts.len()));
+            // A definition (a def, a class) of a name an unconditional
+            // store bound above (`Root = 1` then `class Root(Exception)`):
+            // Python's later binding wins, but a Rust module cannot hold
+            // the value's static and the definition under one name (a
+            // struct or fn beside a static of the name — E0428 for an
+            // exception class's constructor, a silently stale value for
+            // a struct), and dropping the store would lose what read it
+            // between the two — refuse with the fix, as the def-then-
+            // import rule does (Devin review on #338, round 18).
+            let definition_name = match &s.statement {
+                crate::StatementType::FunctionDef(f)
+                | crate::StatementType::AsyncFunctionDef(f) => Some(&f.name),
+                crate::StatementType::ClassDef(c) => Some(&c.name),
+                _ => None,
+            };
+            match definition_name {
+                Some(name) if stored_above.contains(name) => {
+                    return Err(wrap_module_error(
+                        &module_filename,
+                        format!(
+                            "the definition of `{}` rebinds a value this module stores \
+                             above (`{} = ...`): rython holds one item per module name \
+                             and refuses to silently drop either binding; rename one of \
+                             the two",
+                            name, name
+                        )
+                        .into(),
+                    ));
+                }
+                Some(name) if walrus_above.contains(name) => {
+                    return Err(wrap_module_error(
+                        &module_filename,
+                        format!(
+                            "the definition of `{}` follows a walrus `({} := ...)` above \
+                             that may or may not run (a short-circuited operand, a \
+                             conditional branch, a comprehension): Python binds the value \
+                             only when it runs, but the store needs the name's one value \
+                             slot beside the definition, which rython cannot give it; \
+                             rename one of the two",
+                            name, name
+                        )
+                        .into(),
+                    ));
+                }
+                Some(_) => {}
+                None if !matches!(
+                    &s.statement,
+                    crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
+                ) =>
+                {
+                    // A walrus that may not run (a short-circuited
+                    // operand, a conditional branch, a comprehension) is
+                    // a binding under control flow — recorded apart, so
+                    // the refusal says what it is: its store still needs
+                    // the name's one value slot (Devin review on #338,
+                    // round 21).
+                    let conditional = crate::ast::tree::visit::conditional_walrus_names(&s);
+                    for n in crate::ast::tree::visit::stmt_bound_names(
+                        &s,
+                        crate::ast::tree::visit::Bindings::Scope,
+                    ) {
+                        if conditional.contains(&n) {
+                            walrus_above.insert(n);
+                        } else {
+                            stored_above.insert(n);
+                        }
+                    }
+                }
+                None => {}
+            }
+            match &s.statement {
+                crate::StatementType::FunctionDef(f)
+                | crate::StatementType::AsyncFunctionDef(f) => {
+                    defined_above.insert(f.name.clone());
+                }
+                crate::StatementType::ClassDef(c) => {
+                    defined_above.insert(c.name.clone());
+                }
+                // A module that defines `Root` and later imports another
+                // `Root`: Python's later binding wins, but a Rust module
+                // cannot hold a struct and a `use` of one name (E0255), and
+                // dropping the definition would lose what ran between them
+                // — refuse with the fix (Devin review on #338). The mirror
+                // (import, then definition) drops the dead import with a
+                // warning in import.rs.
+                crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_) => {
+                    for name in import_bound_names(&s.statement) {
+                        if defined_above.contains(&name) {
+                            return Err(wrap_module_error(
+                                &module_filename,
+                                format!(
+                                    "the import rebinds `{}`, which this module defines above \
+                                     (a def or class): rython holds one item per module \
+                                     name and refuses to silently drop either binding; \
+                                     rename one of the two",
+                                    name
+                                )
+                                .into(),
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
             // Issue #118: module-level argparse. Parser-building statements
             // vanish; the parse_args assignment becomes the typed-namespace
             // destructure inside __module_init__, at its original position.
@@ -1033,6 +1176,21 @@ impl CodeGen for Module {
                         // Don't collect the main body statements - we'll use user's main directly
                     } else {
                         // This is a complex __name__ == "__main__" block - collect its body for main function
+                        // The block's imports (direct or nested) are
+                        // module-level imports that run when the block
+                        // does: `use` hoisted to module scope, the loaded
+                        // modules' init calls at the statement position
+                        // (Devin review on #338). The block always runs
+                        // in the binary, so no conditional-binding warning.
+                        for import in nested_import_stmts(std::slice::from_ref(&s)) {
+                            let use_tokens = import
+                                .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                                .map_err(|e| wrap_module_error(&module_filename, e))?;
+                            let text = use_tokens.to_string();
+                            if !text.trim().is_empty() && hoisted_uses.insert(text) {
+                                stream.extend(use_tokens);
+                            }
+                        }
                         let main_options = {
                             let mut o = options.clone();
                             o.hoisted_names = std::rc::Rc::new(main_hoisted.clone());
@@ -1040,6 +1198,7 @@ impl CodeGen for Module {
                             o.use_counts = std::rc::Rc::new(main_info.use_counts.clone());
                             o.name_types = std::rc::Rc::new(main_info.name_types.clone());
                             o.empty_pinned = std::rc::Rc::new(main_info.empty_pinned.clone());
+                            o.in_module_init_body = true;
                             o
                         };
                         for body_stmt in &if_stmt.body {
@@ -1359,6 +1518,15 @@ impl CodeGen for Module {
                             has_module_init_code = true;
                         }
                     }
+                    // Every mutable global is state the body can leave
+                    // behind: a function the body calls may write it
+                    // (`global COUNT; COUNT += 1`) before the body raises,
+                    // and a re-run would read the written value where
+                    // CPython's fresh module reads the initializer — so a
+                    // body that raises in a module holding one stays
+                    // failed, whatever the initializer's shape (Devin
+                    // review on #338, round 6).
+                    init_touches_statics = true;
                     continue;
                 }
                 if let Some(names) = assign_name_targets(a) {
@@ -1507,6 +1675,7 @@ impl CodeGen for Module {
                             std::sync::LazyLock::new(|| stdpython::PyValue::from(#value_tokens));
                     });
                     module_init_stmts.push(quote!(let _ = &*#ident;));
+                    init_touches_statics = true;
                     ident
                 });
                 for n in promoted {
@@ -1596,6 +1765,7 @@ impl CodeGen for Module {
                             std::sync::LazyLock::new(|| #wrapped);
                     });
                     module_init_stmts.push(quote!(let _ = &*#ident;));
+                    init_touches_statics = true;
                 }
                 has_module_init_code = true;
                 continue;
@@ -1671,6 +1841,7 @@ impl CodeGen for Module {
                     });
                 }
                 module_init_stmts.push(quote!(let _ = &*#ident;));
+                init_touches_statics = true;
                 has_module_init_code = true;
                 continue;
             }
@@ -1689,8 +1860,10 @@ impl CodeGen for Module {
             // requests' adapters.py; `from .ssltransport import
             // SSLTransport` — urllib3's ssl_.py): rython's imports are
             // STATIC, so the try body always succeeds and the ImportError
-            // fallback (dropped in try_stmt.rs) never runs. The try wrapper
-            // is meaningless — flatten its body to MODULE level so import
+            // fallback (dropped in try_stmt.rs) never runs — a crate
+            // module's body raising ImportError at runtime is the loud
+            // exception (`folded_guard_site`). The try wrapper is
+            // meaningless — flatten its body to MODULE level so import
             // statements emit their `use` at module scope (where call sites
             // outside the wrapper can see them) instead of inside the
             // lowered try closure.
@@ -1744,6 +1917,37 @@ impl CodeGen for Module {
                         // `use`s (dropping the whole import left them
                         // unresolved, E0425).
                         let mut body_stmt = body_stmt.clone();
+                        // The guard's imports run the loaded modules' bodies
+                        // here, like any module-level import — from the
+                        // statement as WRITTEN, before the name filtering
+                        // below (a handler that stores every imported name
+                        // still leaves the import executed in Python; Devin
+                        // review on #338).
+                        if matches!(
+                            &body_stmt.statement,
+                            crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
+                        ) {
+                            // A crate module's body can raise ImportError
+                            // at runtime (a cycle, a failed module), where
+                            // Python would run the folded fallback: loud.
+                            let site = crate::ast::tree::import::folded_guard_site(
+                                crate::ast::tree::import::import_site_init(
+                                    &body_stmt.statement,
+                                    &options,
+                                )
+                                .map_err(|e| wrap_module_error(&module_filename, e))?,
+                                &import_spelling(&body_stmt.statement),
+                                if t.handlers[0].exception_type.is_none() {
+                                    FoldedGuard::Bare
+                                } else {
+                                    FoldedGuard::ImportError
+                                },
+                            );
+                            if !site.is_empty() {
+                                module_init_stmts.push(site);
+                                has_module_init_code = true;
+                            }
+                        }
                         if let crate::StatementType::ImportFrom(i) = &mut body_stmt.statement
                         {
                             let root = i.module.split('.').next().unwrap_or("").to_string();
@@ -1779,14 +1983,59 @@ impl CodeGen for Module {
                                     }
                                 }
                             }
+                            // A dropped CRATE name has no item to carry into
+                            // the hoisted local: the name is the handler's
+                            // store (None) where Python's is the imported
+                            // value — said through -W, never silent.
+                            if !crate::ast::tree::import::is_stdpython_module(&root) {
+                                for (name, bound) in &dropped {
+                                    options.definition_warnings.borrow_mut().push(format!(
+                                        "`from {}{} import {}` is dropped: the ImportError \
+                                         handler stores `{}` too, so the name is the \
+                                         handler's value (None) where Python's is the \
+                                         imported item (the import-guard divergence)",
+                                        ".".repeat(i.level),
+                                        i.module,
+                                        name,
+                                        bound
+                                    ));
+                                }
+                            }
                             if i.names.is_empty() {
                                 continue;
                             }
                         }
                         let body_is_decl =
                             Self::is_declaration_statement(&body_stmt.statement);
+                        // A statement nested in the guard's body (an `if`
+                        // around an import) lowers like module-level control
+                        // flow: its imports' `use`s hoisted, the init calls
+                        // at the runtime position.
+                        let body_options = if body_is_decl {
+                            init_options.clone()
+                        } else {
+                            for import in nested_import_stmts(std::slice::from_ref(&body_stmt)) {
+                                options.definition_warnings.borrow_mut().push(format!(
+                                    "`{}` under a module-level condition: the imported name is \
+                                     bound whether or not the branch runs (Python would raise \
+                                     NameError on the untaken path — the static-import divergence)",
+                                    import_spelling(&import.statement)
+                                ));
+                                let use_tokens = import
+                                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                                    .map_err(|e| wrap_module_error(&module_filename, e))?;
+                                let text = use_tokens.to_string();
+                                if !text.trim().is_empty() && hoisted_uses.insert(text) {
+                                    stream.extend(use_tokens);
+                                }
+                            }
+                            let mut o = init_options.clone();
+                            o.in_module_init_body = true;
+                            o
+                        };
+                        let body_pos = body_stmt.lineno.zip(body_stmt.col_offset);
                         let body_tokens = body_stmt
-                            .to_rust(ctx.clone(), init_options.clone(), symbols.clone())
+                            .to_rust(ctx.clone(), body_options, symbols.clone())
                             .map_err(|e| wrap_module_error(&module_filename, e))?;
                         if body_tokens.to_string() != "" {
                             if body_is_decl {
@@ -1795,6 +2044,13 @@ impl CodeGen for Module {
                                 module_init_stmts.push(body_tokens);
                                 has_module_init_code = true;
                             }
+                        }
+                        // The flattened statement binds where Python runs
+                        // it: the names bound after its init code (the
+                        // nested lowering records marks only under a
+                        // lowered control-flow statement).
+                        if let Some(bind) = body_pos.and_then(|pos| binding_marks.after_binds(pos)) {
+                            module_init_stmts.push(bind);
                         }
                     }
                     continue;
@@ -1847,15 +2103,81 @@ impl CodeGen for Module {
                             });
                     });
                     module_init_stmts.push(quote!(let _ = &*#ident;));
+                    init_touches_statics = true;
                     has_module_init_code = true;
                     continue;
                 }
             }
+            // An import nested in module-level control flow (`if cond:
+            // from .x import y`; a non-flattenable `try`; a loop; a `with`):
+            // its `use` is hoisted to module scope here (a `use` inside the
+            // lowered block would be invisible to the rest of the module —
+            // E0425), and the statement position, lowered with
+            // `in_module_init_body`, carries only the loaded modules' init
+            // calls: Python runs the module bodies there, when the branch
+            // runs (Devin review on #338).
+            let stmt_options = if is_declaration {
+                init_options
+            } else {
+                for import in nested_import_stmts(std::slice::from_ref(&s)) {
+                    // Python binds the name only when the branch runs; the
+                    // hoisted `use` binds it either way (a NameError on the
+                    // untaken path becomes a resolved name): -W channel.
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "`{}` under a module-level condition: the imported name is \
+                         bound whether or not the branch runs (Python would raise \
+                         NameError on the untaken path — the static-import divergence)",
+                        import_spelling(&import.statement)
+                    ));
+                    let use_tokens = import
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                        .map_err(|e| wrap_module_error(&module_filename, e))?;
+                    let text = use_tokens.to_string();
+                    if !text.trim().is_empty() && hoisted_uses.insert(text) {
+                        stream.extend(use_tokens);
+                    }
+                }
+                let mut o = init_options;
+                o.in_module_init_body = true;
+                o
+            };
             let statement = s
                 .clone()
-                .to_rust(ctx.clone(), init_options, symbols.clone())
+                .to_rust(ctx.clone(), stmt_options, symbols.clone())
                 .map_err(|e| wrap_module_error(&module_filename, e))?;
             
+            // A module-level import of a crate module runs that module's
+            // body at the import site, once (Python's import-time
+            // semantics; a cycle sees the importer's partial state —
+            // issue #333, Devin review on #336): the `use` is an item,
+            // the once-guarded `__module_init__` calls go into this
+            // module's init in statement order.
+            if matches!(
+                &s.statement,
+                crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
+            ) {
+                let site = crate::ast::tree::import::import_site_init(&s.statement, &options)
+                    .map_err(|e| wrap_module_error(&module_filename, e))?;
+                // An import a folded guard spliced in: loud when a crate
+                // module raises ImportError at runtime (Python would run
+                // the folded fallback).
+                let site = match s
+                    .lineno
+                    .zip(s.col_offset)
+                    .and_then(|pos| options.folded_guard_imports.get(&pos).copied())
+                {
+                    Some(guard) => crate::ast::tree::import::folded_guard_site(
+                        site,
+                        &import_spelling(&s.statement),
+                        guard,
+                    ),
+                    None => site,
+                };
+                if !site.is_empty() {
+                    module_init_stmts.push(site);
+                    has_module_init_code = true;
+                }
+            }
             if statement.to_string() != "" {
                 if is_declaration {
                     // Declarations go at module level (functions, classes, imports)
@@ -1865,6 +2187,26 @@ impl CodeGen for Module {
                     module_init_stmts.push(statement);
                     has_module_init_code = true;
                 }
+            }
+        }
+
+        // Each top-level statement's after-marks (`__rython_bind__`), at
+        // the end of its init range (a def or class has none: the calls
+        // sit at its position, where Python binds the name).
+        {
+            let ends: Vec<usize> = top_level_binds
+                .iter()
+                .skip(1)
+                .map(|(_, at)| *at)
+                .chain(std::iter::once(module_init_stmts.len()))
+                .collect();
+            let binds: Vec<(TokenStream, usize)> = top_level_binds
+                .into_iter()
+                .zip(ends)
+                .filter_map(|((bind, _), end)| bind.map(|b| (b, end)))
+                .collect();
+            for (bind, at) in binds.into_iter().rev() {
+                module_init_stmts.insert(at, bind);
             }
         }
 
@@ -1878,11 +2220,50 @@ impl CodeGen for Module {
         // sys.version_info` — requests' compat.py) emits a `pub use ... as
         // name` item: the same name hoisted as an init local would shadow
         // the static (E0530; issue #333).
+        // A walrus inside a PROMOTED static's initializer (`Y = (X := 1)
+        // + g()`) stores X in the static's closure, where an init local
+        // cannot be reached: when nothing else binds X, the closure's own
+        // `let` is its binding and the init declares nothing (an unassigned
+        // `let X;` has no type — E0282; Devin review on #338, round 12).
+        let promoted_walrus_targets: Vec<String> = {
+            use crate::ast::tree::visit::{
+                any_expr_for, stmt_bound_names, target_names, Bindings, Descend,
+            };
+            let mut out: Vec<String> = Vec::new();
+            for (index, s) in module_init_raw.iter().enumerate() {
+                let crate::StatementType::Assign(a) = &s.statement else { continue };
+                let [crate::ExprType::Name(n)] = a.targets.as_slice() else { continue };
+                if !(promoted_statics.contains(&n.id) || promoted_conditional.contains_key(&n.id)) {
+                    continue;
+                }
+                any_expr_for(&a.value, Descend::OwnScope, |x| {
+                    if let crate::ExprType::NamedExpr(ne) = x {
+                        for name in target_names(&ne.left) {
+                            let bound_elsewhere = module_init_raw
+                                .iter()
+                                .enumerate()
+                                .any(|(other, o)| {
+                                    other != index
+                                        && stmt_bound_names(o, Bindings::Scope)
+                                            .iter()
+                                            .any(|b| b == name)
+                                });
+                            if !bound_elsewhere {
+                                out.push(name.to_string());
+                            }
+                        }
+                    }
+                    false
+                });
+            }
+            out
+        };
         let init_hoist_skip: std::collections::HashSet<String> = promoted_statics
             .iter()
             .cloned()
             .chain(global_mutables.keys().cloned())
             .chain(stdlib_aliases.into_iter())
+            .chain(promoted_walrus_targets.into_iter())
             .collect();
         let init_decls = hoisted_declarations(
             &module_init_raw,
@@ -1921,36 +2302,170 @@ impl CodeGen for Module {
         // Generate module initialization function if needed. Like all
         // generated functions it returns Result so module-level raises and
         // calls propagate.
-        // In a multi-module crate every module has one, empty or not: the
-        // entry module's `main` calls each sibling's at startup (see
-        // `startup_module_inits`) without knowing which siblings have
-        // module-level statements.
+        // In a multi-module crate every module has one, empty or not: an
+        // importer calls it at the import site without knowing whether
+        // the module has module-level statements. It runs ONCE: the guard
+        // is taken on entry, so an import cycle (a imports b imports a)
+        // finds a's init already running and continues with a's partial
+        // state — Python's partially-initialized module.
+        // The guard is Python's per-module import lock (Devin review on
+        // #338): NOT STARTED → RUNNING(owner thread) → DONE, the runtime's
+        // `ModuleInitLock` (see stdpython's module_init). The owning thread
+        // re-entering (an import cycle) returns at once with the module's
+        // partial state; another thread blocks until the body has finished;
+        // a wait cycle across threads lets the later importer proceed with
+        // the partial module; a body that raises (or unwinds) leaves the
+        // module NOT STARTED, so a later import runs it again (CPython drops
+        // a failed import from sys.modules). The no_std tier has one
+        // thread: the same states on an atomic, without an owner. `::core`
+        // — a crate module named `core` (textlib/core.py) would shadow the
+        // extern crate's path.
         if has_module_init_code || !options.module_defs.is_empty() {
+            let guard_enter = if options.no_std {
+                quote! {
+                    static __RYTHON_INIT_STATE: ::core::sync::atomic::AtomicU8 =
+                        ::core::sync::atomic::AtomicU8::new(0);
+                    match __RYTHON_INIT_STATE.compare_exchange(
+                        0,
+                        1,
+                        ::core::sync::atomic::Ordering::SeqCst,
+                        ::core::sync::atomic::Ordering::SeqCst,
+                    ) {
+                        Ok(_) => {}
+                        // 3: failed after touching a static — loud again.
+                        Err(3) => {
+                            return Err(PyException::new(
+                                "ImportError",
+                                "the module body raised on its first import after \
+                                 initializing a module value; it cannot run again",
+                            ));
+                        }
+                        Err(_) => return Ok(()),
+                    }
+                }
+            } else {
+                // The runtime's lock: condvar waiters, cross-thread
+                // deadlock detection (the later importer proceeds with
+                // the partial module, CPython's _DeadlockError path), and
+                // an RAII guard that resets an unwound body to NOT STARTED.
+                let retry = !init_touches_statics;
+                quote! {
+                    static __RYTHON_INIT_LOCK: stdpython::ModuleInitLock =
+                        stdpython::ModuleInitLock::new();
+                    let __rython_init_guard = match __RYTHON_INIT_LOCK.enter(#retry) {
+                        stdpython::ModuleInitEntry::Done | stdpython::ModuleInitEntry::Cycle => {
+                            return Ok(());
+                        }
+                        stdpython::ModuleInitEntry::Failed(e) => return Err(e),
+                        stdpython::ModuleInitEntry::Run(guard) => guard,
+                    };
+                }
+            };
+            // A body that raised (or unwound) in a module holding a static
+            // — one it initialized, or a mutable global a called function
+            // may have written — cannot run again faithfully (the static
+            // keeps the first attempt's value): the module stays failed
+            // and later imports raise the same exception. A body with no
+            // such statics runs again, as CPython's fresh re-import does.
+            // The lock holds that policy (`enter(retry)`), so a raise and
+            // an unwind settle the same way.
+            let failed_state: u8 = if init_touches_statics { 3 } else { 0 };
+            let guard_leave = if options.no_std {
+                quote! {
+                    __RYTHON_INIT_STATE.store(
+                        if __rython_init_result.is_ok() { 2 } else { #failed_state },
+                        ::core::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+            } else {
+                quote! {
+                    __rython_init_guard.finish(__rython_init_result.clone());
+                }
+            };
+            // The body's bound bitmap: one bit per binding statement
+            // (`BindingMarks`), set where the statement ran; a cyclic
+            // importer's `from .this import name` asks `__rython_bound__`
+            // whether any statement binding `name` has run, and Python
+            // raises ImportError for a name the partially initialized
+            // module has not bound yet (Devin review on #338, rounds 6
+            // and 8). A completed body answers yes for every name.
+            let words = binding_marks.count.div_ceil(crate::ast::tree::import::BOUND_WORD_BITS).max(1);
+            let word_inits = (0..words).map(|_| quote!(::core::sync::atomic::AtomicU32::new(0)));
             stream.extend(quote! {
                 #[allow(dead_code)]
+                pub(crate) static __RYTHON_BOUND: [::core::sync::atomic::AtomicU32; #words] =
+                    [#(#word_inits),*];
+                #[allow(dead_code)]
+                pub(crate) static __RYTHON_INIT_DONE: ::core::sync::atomic::AtomicBool =
+                    ::core::sync::atomic::AtomicBool::new(false);
+                #[allow(dead_code)]
+                fn __rython_bind__(__rython_word: usize, __rython_mask: u32) {
+                    __RYTHON_BOUND[__rython_word]
+                        .fetch_or(__rython_mask, ::core::sync::atomic::Ordering::Release);
+                }
+                #[allow(dead_code)]
+                pub(crate) fn __rython_bound__(
+                    __rython_bits: &[(usize, u32)],
+                    __rython_name: &str,
+                    __rython_module: &str,
+                ) -> Result<(), PyException> {
+                    if __RYTHON_INIT_DONE.load(::core::sync::atomic::Ordering::Acquire)
+                        || __rython_bits.iter().any(|(__rython_word, __rython_mask)| {
+                            __RYTHON_BOUND[*__rython_word]
+                                .load(::core::sync::atomic::Ordering::Acquire)
+                                & __rython_mask
+                                != 0
+                        })
+                    {
+                        Ok(())
+                    } else {
+                        Err(PyException::new(
+                            "ImportError",
+                            format!(
+                                "cannot import name '{}' from partially initialized module \
+                                 '{}' (most likely due to a circular import)",
+                                __rython_name, __rython_module
+                            ),
+                        ))
+                    }
+                }
+                #[allow(dead_code)]
                 pub(crate) fn __module_init__() -> Result<(), PyException> {
-                    #(#module_init_stmts;)*
-                    Ok(())
+                    #guard_enter
+                    // A retried body starts from no bound names: the
+                    // previous attempt's bits must not answer for it.
+                    __RYTHON_INIT_DONE.store(false, ::core::sync::atomic::Ordering::Release);
+                    for __rython_word in __RYTHON_BOUND.iter() {
+                        __rython_word.store(0, ::core::sync::atomic::Ordering::Release);
+                    }
+                    let __rython_init_result = (|| -> Result<(), PyException> {
+                        #(#module_init_stmts;)*
+                        __RYTHON_INIT_DONE.store(true, ::core::sync::atomic::Ordering::Release);
+                        Ok(())
+                    })();
+                    #guard_leave
+                    __rython_init_result
                 }
             });
         }
-        // The startup sequence of the entry module: the sibling modules'
-        // bodies in dependency order, then this module's own.
-        let sibling_inits: Vec<TokenStream> = options
-            .startup_module_inits
-            .iter()
-            .map(|path| {
-                let segs: Vec<_> = path.iter().map(|s| crate::safe_ident(s)).collect();
-                quote!(crate::#(#segs::)*__module_init__()?;)
-            })
-            .collect();
+        // The entry's startup: the package root's body first (`python -m
+        // pkg.cli` runs pkg/__init__.py before cli — the converter names
+        // the bin-side module carrying it), then its own body (whose
+        // import sites run the sibling modules' bodies in Python's order).
+        let root_init = match &options.root_init_module {
+            Some(root) => {
+                let root = crate::safe_ident(root);
+                quote!(crate::#root::__module_init__()?;)
+            }
+            None => quote!(),
+        };
         let own_init = if has_module_init_code {
             quote!(__module_init__()?;)
         } else {
             quote!()
         };
-        let startup_init = quote!(#(#sibling_inits)* #own_init);
-        let needs_init_wrapper = has_module_init_code || !sibling_inits.is_empty();
+        let startup_init = quote!(#root_init #own_init);
+        let needs_init_wrapper = has_module_init_code || options.root_init_module.is_some();
         
         // A `__main__` block wants a process entry point, and a no_std
         // target has no OS to enter from: refuse loudly instead of emitting
@@ -2356,7 +2871,20 @@ fn sibling_imported_names(options: &PythonOptions) -> std::collections::HashSet<
             if let ST::ImportFrom(ifm) = &stmt.statement {
                 if ifm.resolved_module_path(&sibling_options) == *this_path {
                     for alias in &ifm.names {
-                        names.insert(alias.name.clone());
+                        // A sibling's `from m import *` imports every
+                        // name m exports (a package root re-exporting a
+                        // submodule's names — Devin review on #338,
+                        // round 21).
+                        if alias.name == "*" {
+                            let key = crate::module_defs_key(options, this_path)
+                                .map(<[String]>::to_vec)
+                                .unwrap_or_else(|| this_path.clone());
+                            names.extend(crate::ast::tree::import::sibling_star_names(
+                                options, &key,
+                            ));
+                        } else {
+                            names.insert(alias.name.clone());
+                        }
                     }
                 }
             }
@@ -2389,7 +2917,7 @@ pub(crate) fn module_promoted_static_names(
     // resolvable `try: import ssl; CTX = build() ... except ImportError:`
     // is its try body at top level — requests' adapters.py), so the store
     // counts here and there agree (issue #333).
-    let (body, _) = fold_static_import_trys(&module.raw.body, &target);
+    let (body, _, _) = fold_static_import_trys(&module.raw.body, &target);
     let mut counts = std::collections::HashMap::new();
     count_module_stores(&body, &mut counts);
     let free_reads = module_function_free_reads(&body);
@@ -3033,6 +3561,86 @@ pub(crate) fn static_gate_names(
 /// (`sys.version_info` gates and single-store-name gates) with the taken
 /// branch's statements, recursively. Defs and class bodies inside the
 /// taken branch then lower as ordinary module items.
+/// A module body after the rewrites the emission applies before any
+/// analysis: the singledispatch desugar (issue #181), the failed-import
+/// try fold, and the version/static gate splice (issue #137) — in that
+/// order. `body` is the one statement sequence the emission lowers, so
+/// the binding marks (`BindingMarks::of`) number it; an importer's bound
+/// check (`import::module_binding`) numbers the target module's
+/// normalized body too, or the two would count different statements
+/// (Devin review on #338, round 11). `newly_live` are the handler
+/// statements a failed guard's fold made live; `folded_imports` the
+/// positions of the imports a resolvable guard's fold spliced in.
+pub(crate) struct NormalizedBody {
+    pub body: Vec<crate::Statement>,
+    pub newly_live: Vec<crate::Statement>,
+    pub folded_imports: std::collections::HashMap<(usize, usize), FoldedGuard>,
+}
+
+/// The handler a resolvable import guard folded away — what its import
+/// site must be loud about when a crate module's body raises at runtime
+/// (Devin review on #338, rounds 10 and 19).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FoldedGuard {
+    /// `except ImportError:` — only an ImportError would have run the
+    /// fallback; any other exception propagates in Python too.
+    ImportError,
+    /// A bare `except:` — every exception would have run the fallback.
+    Bare,
+}
+
+pub(crate) fn normalize_module_body(
+    body: Vec<crate::Statement>,
+    options: &PythonOptions,
+) -> Result<NormalizedBody, String> {
+    // Issue #181: fuse each `@functools.singledispatch` family into the
+    // one `isinstance`-dispatching function that expresses it, before
+    // any body analysis — the shape the monomorphizing specialization
+    // pass already lowers (ast::tree::singledispatch).
+    let body = crate::ast::tree::singledispatch::desugar_module(body)?;
+    let (body, newly_live, folded_imports) = fold_static_import_trys(&body, options);
+    // Issue #137: module-level VERSION-GATED blocks (`if
+    // sys.version_info >= (3, 11):` — certifi's core.py) and static-name
+    // gates (`if brotli is not None:` where the module folded the import
+    // to `brotli = None`): rython's target version is fixed (3.11.0), so
+    // the taken branch is decided at conversion time and its statements
+    // are spliced into the module body BEFORE every pass — a
+    // version-gated `def` is a module ITEM, not a nested function inside
+    // __module_init__ (which rustc rejects and the module re-exports
+    // cannot see).
+    let body = splice_gated_branches(body, options);
+    Ok(NormalizedBody {
+        body,
+        newly_live,
+        folded_imports,
+    })
+}
+
+/// The normalized body of the crate module at `key`, as its own emission
+/// sees it (the module's package context; the static-gate name sets a
+/// module computes for itself are not yet known at that point, so they
+/// are empty here too), cached on the options.
+pub(crate) fn normalized_body_of(
+    options: &PythonOptions,
+    key: &[String],
+) -> Option<std::rc::Rc<Vec<crate::Statement>>> {
+    if let Some(body) = options.normalized_bodies.borrow().get(key) {
+        return Some(body.clone());
+    }
+    let module = options.module_defs.get(key)?;
+    let module: &crate::Module = module;
+    let mut ctx = defining_module_context(options, key);
+    ctx.statically_none_names = std::rc::Rc::default();
+    ctx.statically_false_names = std::rc::Rc::default();
+    ctx.statically_module_names = std::rc::Rc::default();
+    let body = std::rc::Rc::new(normalize_module_body(module.raw.body.clone(), &ctx).ok()?.body);
+    options
+        .normalized_bodies
+        .borrow_mut()
+        .insert(key.to_vec(), body.clone());
+    Some(body)
+}
+
 pub(crate) fn splice_gated_branches(
     body: Vec<crate::Statement>,
     options: &PythonOptions,
@@ -3059,22 +3667,31 @@ pub(crate) fn splice_gated_branches(
 pub(crate) fn fold_static_import_trys(
     body: &[crate::Statement],
     options: &crate::PythonOptions,
-) -> (Vec<crate::Statement>, Vec<crate::Statement>) {
+) -> (
+    Vec<crate::Statement>,
+    Vec<crate::Statement>,
+    std::collections::HashMap<(usize, usize), FoldedGuard>,
+) {
     // The imports a try body runs at module init: nested control flow
     // included, a def's own imports excluded (they run when it is called).
     fn collect_imports<'a>(
         stmts: &'a [crate::Statement],
-        out: &mut Vec<&'a crate::StatementType>,
+        out: &mut Vec<&'a crate::Statement>,
     ) {
         walk_stmts(stmts, Descend::SkipDefs, &mut |s| {
-            if let st @ (crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)) =
-                &s.statement
-            {
-                out.push(st);
+            if matches!(
+                &s.statement,
+                crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
+            ) {
+                out.push(s);
             }
             Flow::Continue
         });
     }
+    // The positions of the imports spliced out of a folded guard: their
+    // sites are loud when a crate module raises ImportError at runtime.
+    let mut folded_imports: std::collections::HashMap<(usize, usize), FoldedGuard> =
+        std::collections::HashMap::new();
     let root_resolvable = |root: &str| -> bool {
         crate::ast::tree::import::is_stdpython_module(root)
             || options.python_modules.contains(&root.to_string())
@@ -3150,7 +3767,7 @@ pub(crate) fn fold_static_import_trys(
             // must assume an unknown absolute import is a crate sibling.
             if options.module_defs.len() > 1
                 && !imports.is_empty()
-                && imports.iter().all(|st| unresolvable(st))
+                && imports.iter().all(|st| unresolvable(&st.statement))
             {
                 out.extend(t.handlers[0].body.iter().cloned());
                 newly_live.extend(t.handlers[0].body.iter().cloned());
@@ -3162,7 +3779,15 @@ pub(crate) fn fold_static_import_trys(
             // otherwise hoist module-init locals that collide with the
             // imports' `use` bindings (urllib3's ssl_.py redefines
             // OP_NO_COMPRESSION and friends in its handler).
-            if !imports.is_empty() && imports.iter().all(|st| resolvable(st)) {
+            if !imports.is_empty() && imports.iter().all(|st| resolvable(&st.statement)) {
+                let guard = if t.handlers[0].exception_type.is_none() {
+                    FoldedGuard::Bare
+                } else {
+                    FoldedGuard::ImportError
+                };
+                folded_imports.extend(
+                    imports.iter().filter_map(|st| st.lineno.zip(st.col_offset)).map(|pos| (pos, guard)),
+                );
                 out.extend(t.body.iter().cloned());
                 out.extend(t.orelse.iter().cloned());
                 continue;
@@ -3170,7 +3795,7 @@ pub(crate) fn fold_static_import_trys(
         }
         out.push(stmt.clone());
     }
-    (out, newly_live)
+    (out, newly_live, folded_imports)
 }
 
 pub(crate) fn module_global_mutable_names(
@@ -3756,6 +4381,71 @@ fn module_function_free_reads(body: &[crate::Statement]) -> std::collections::Ha
     free
 }
 
+/// The import statements nested in module-level control flow (`if cond:
+/// from .x import y`, a guard, a loop, a `with`, the `__main__` block),
+/// through the shared visitor — control-flow bodies only, a def's imports
+/// are its own; a `TYPE_CHECKING` block never runs. The statements
+/// themselves are excluded (a top-level import is an item already).
+fn nested_import_stmts(stmts: &[crate::Statement]) -> Vec<crate::Statement> {
+    let mut out: Vec<crate::Statement> = Vec::new();
+    walk_stmts(stmts, Descend::SkipDefs, &mut |inner| {
+        if let crate::StatementType::If(i) = &inner.statement
+            && Module::is_type_checking_test(&i.test)
+        {
+            return Flow::Skip;
+        }
+        if matches!(
+            &inner.statement,
+            crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
+        ) && !stmts.iter().any(|top| std::ptr::eq(top, inner))
+        {
+            out.push(inner.clone());
+        }
+        Flow::Continue
+    });
+    out
+}
+
+/// An import statement as the user wrote it, for messages.
+pub(crate) fn import_spelling(stmt: &crate::StatementType) -> String {
+    match stmt {
+        crate::StatementType::Import(i) => format!(
+            "import {}",
+            i.names.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ")
+        ),
+        crate::StatementType::ImportFrom(i) => format!(
+            "from {}{} import {}",
+            ".".repeat(i.level),
+            i.module,
+            i.names.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ")
+        ),
+        _ => String::new(),
+    }
+}
+
+/// The module-level names an import statement binds: `import a.b` binds
+/// `a` (or its `as` name), `from m import x as y` binds `y`.
+fn import_bound_names(stmt: &crate::StatementType) -> Vec<String> {
+    match stmt {
+        crate::StatementType::Import(i) => i
+            .names
+            .iter()
+            .map(|a| {
+                a.asname
+                    .clone()
+                    .unwrap_or_else(|| a.name.split('.').next().unwrap_or(&a.name).to_string())
+            })
+            .collect(),
+        crate::StatementType::ImportFrom(i) => i
+            .names
+            .iter()
+            .filter(|a| a.name != "*")
+            .map(|a| a.asname.clone().unwrap_or_else(|| a.name.clone()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Is `name` a class the module at `path` defines ONLY under a
 /// `TYPE_CHECKING` block (`if TYPE_CHECKING: class BaseHTTPConnection
 /// (Protocol)` — urllib3's _base_connection)? Such a class is never
@@ -4076,7 +4766,7 @@ pub(crate) fn module_def_has_path_item(
     let mut target = options.clone();
     target.this_module_path = path.to_vec();
     target.module_path = module_package_path_from_defs(path, options);
-    let (body, _) = fold_static_import_trys(&module.raw.body, &target);
+    let (body, _, _) = fold_static_import_trys(&module.raw.body, &target);
     let mut counts = std::collections::HashMap::new();
     count_module_stores(&body, &mut counts);
     if counts.get(name) == Some(&1) && body.iter().any(|s| {
@@ -4122,7 +4812,24 @@ fn module_reexports_item(
     };
     let module: &crate::Module = module;
     use crate::StatementType as ST;
-    for s in &module.raw.body {
+    // Every module-scope import, the ones under module-level control flow
+    // included: the module emission hoists a nested import's `use` to
+    // module scope, so it is a re-export like a top-level one (a
+    // TYPE_CHECKING block is compile-time only; Devin review on #338,
+    // round 8).
+    let mut imports: Vec<&crate::Statement> = Vec::new();
+    walk_stmts(&module.raw.body, Descend::SkipDefs, &mut |s| {
+        if let ST::If(i) = &s.statement
+            && Module::is_type_checking_test(&i.test)
+        {
+            return Flow::Skip;
+        }
+        if matches!(&s.statement, ST::Import(_) | ST::ImportFrom(_)) {
+            imports.push(s);
+        }
+        Flow::Continue
+    });
+    for s in imports {
         // A plain `import json` binding the name (requests' compat.py
         // re-exports stdlib json): the name resolves through the
         // stdpython glob, so the re-export has a runtime item.
@@ -4141,10 +4848,16 @@ fn module_reexports_item(
             continue;
         }
         let ST::ImportFrom(i) = &s.statement else { continue };
-        // The import must bind OUR name (as itself or with an asname).
+        // The import must bind OUR name (as itself or with an asname) —
+        // or be a `from m import *` of a crate module whose exports
+        // (`import::star_exports`: m's literal `__all__`, else its
+        // public names) include it, the glob the emission re-exports
+        // honouring that `__all__` (Devin review on #338, round 21).
+        let star = i.names.iter().any(|a| a.name == "*");
         if !i.names.iter().any(|a| {
             a.asname.as_deref() == Some(name) || (a.asname.is_none() && a.name == name)
-        }) {
+        }) && !star
+        {
             continue;
         }
         // Resolve the re-export's defining module in THIS module's package
@@ -4172,6 +4885,20 @@ fn module_reexports_item(
             .map(|a| a.name.clone())
             .unwrap_or_else(|| name.to_string());
         if !target.is_empty() && options.module_defs.contains_key(&target) {
+            if star && defining == name {
+                // The exports when the conversion can enumerate them,
+                // else every public name — what the glob re-exports
+                // (Devin review on #338, round 23).
+                let exported = crate::module_defs_key(options, &target)
+                    .is_some_and(|key| {
+                        crate::ast::tree::import::sibling_star_names(options, key)
+                            .iter()
+                            .any(|n| n == name)
+                    });
+                if !exported {
+                    continue;
+                }
+            }
             let mut sub = target.clone();
             sub.push(defining.clone());
             if options.module_defs.contains_key(&sub)
@@ -4183,6 +4910,84 @@ fn module_reexports_item(
         }
     }
     false
+}
+
+/// Where a name the module at `path` RE-EXPORTS is defined: the leaf of
+/// its re-export chain — through `from .core import C` (an asname
+/// followed to its canonical name) and through `from .core import *`
+/// when core exports the name — as (the defining module's key, the name
+/// there). None when the module defines the name itself, does not bind
+/// it, or the chain cycles. What an importing module's read lowering
+/// asks to learn whether the name is a promoted static of its defining
+/// module (`(*C).clone()` — Devin review on #338, round 21).
+pub(crate) fn reexport_origin(
+    options: &crate::PythonOptions,
+    path: &[String],
+    name: &str,
+    visited: &mut std::collections::HashSet<Vec<String>>,
+) -> Option<(Vec<String>, String)> {
+    if !visited.insert(path.to_vec()) {
+        return None;
+    }
+    let module: &crate::Module = options.module_defs.get(path)?;
+    use crate::StatementType as ST;
+    let mut imports: Vec<&crate::Statement> = Vec::new();
+    walk_stmts(&module.raw.body, Descend::SkipDefs, &mut |s| {
+        if let ST::If(i) = &s.statement
+            && Module::is_type_checking_test(&i.test)
+        {
+            return Flow::Skip;
+        }
+        if matches!(&s.statement, ST::ImportFrom(_)) {
+            imports.push(s);
+        }
+        Flow::Continue
+    });
+    let is_package = options
+        .module_defs
+        .keys()
+        .any(|k| k.len() > path.len() && k[..path.len()] == path[..]);
+    let mut ctx = options.clone();
+    ctx.module_path = if is_package {
+        path.to_vec()
+    } else {
+        path[..path.len().saturating_sub(1)].to_vec()
+    };
+    for s in imports {
+        let ST::ImportFrom(i) = &s.statement else { continue };
+        let star = i.names.iter().any(|a| a.name == "*");
+        let explicit = i
+            .names
+            .iter()
+            .find(|a| a.asname.as_deref() == Some(name) || (a.asname.is_none() && a.name == name))
+            .map(|a| a.name.clone());
+        if explicit.is_none() && !star {
+            continue;
+        }
+        let target = i.resolved_module_path(&ctx);
+        let Some(key) = crate::module_defs_key(options, &target).map(<[String]>::to_vec) else {
+            continue;
+        };
+        let defining = match explicit {
+            Some(defining) => defining,
+            None => {
+                let exported = crate::ast::tree::import::sibling_star_names(options, &key)
+                    .iter()
+                    .any(|n| n == name);
+                if !exported {
+                    continue;
+                }
+                name.to_string()
+            }
+        };
+        if scan_module_body_for_item(options, &key, &defining) {
+            return Some((key, defining));
+        }
+        if let Some(origin) = reexport_origin(options, &key, &defining, visited) {
+            return Some(origin);
+        }
+    }
+    None
 }
 
 /// Whether the module at `path` directly defines `name` (a function, class,
@@ -4511,7 +5316,7 @@ impl Module {
     /// the compile-time-only guard that never runs at runtime — its block
     /// (imports, type-only class definitions) must be skipped entirely
     /// (requests' _types.py).
-    fn is_type_checking_test(test: &crate::ExprType) -> bool {
+    pub(crate) fn is_type_checking_test(test: &crate::ExprType) -> bool {
         match test {
             crate::ExprType::Name(n) => n.id == "TYPE_CHECKING",
             crate::ExprType::Attribute(a) => {
@@ -4881,8 +5686,9 @@ pub(crate) fn emitted_class_defs(
         top_level_class_defs(&module.raw.body, &mut out);
         return out;
     }
-    let (body, _) = fold_static_import_trys(&module.raw.body, options);
-    let body = splice_gated_branches(body, options);
+    let body = normalize_module_body(module.raw.body.clone(), options)
+        .map(|n| n.body)
+        .unwrap_or_else(|_| module.raw.body.clone());
     let mut counts = std::collections::HashMap::new();
     count_module_stores(&body, &mut counts);
     let symbols = module.clone().find_symbols(SymbolTableScopes::new());

@@ -71,9 +71,49 @@ impl CodeGen for Statement {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let (lineno, col_offset) = (self.lineno, self.col_offset);
         let (end_lineno, end_col_offset) = (self.end_lineno, self.end_col_offset);
+        // The statement's binding marks (Devin review on #338, rounds 8 to
+        // 12): its names' bits go to the lowerings that bind before the
+        // statement completes (`stmt_binds` — a loop or `with` target, a
+        // walrus); the names bound after its init code are recorded here
+        // for a nested statement, and by the module emission at the end
+        // of a top-level one's init range.
+        let mut options = options;
+        let marks = match (options.in_module_init_body, lineno, col_offset) {
+            (true, Some(line), Some(col)) => options.init_binding_marks.get(&(line, col)).cloned(),
+            _ => None,
+        };
+        options.stmt_binds = marks.as_ref().map(|m| std::rc::Rc::new(m.bits()));
+        let bind = marks
+            .as_ref()
+            .filter(|m| !m.top_level)
+            .and_then(|m| m.after_binds());
+        // An import a folded guard spliced in, nested in module-level
+        // control flow: its site (the init calls) is loud when a crate
+        // module raises ImportError at runtime.
+        let folded_guard = if options.in_module_init_body
+            && matches!(self.statement, StatementType::Import(_) | StatementType::ImportFrom(_))
+        {
+            lineno
+                .zip(col_offset)
+                .and_then(|pos| options.folded_guard_imports.get(&pos).copied())
+        } else {
+            None
+        };
+        let spelling = folded_guard
+            .map(|guard| (crate::ast::tree::module::import_spelling(&self.statement), guard));
         let result = self.statement
             .clone()
             .to_rust(ctx, options, symbols)
+            .map(|tokens| match &spelling {
+                Some((spelling, guard)) => {
+                    crate::ast::tree::import::folded_guard_site(tokens, spelling, *guard)
+                }
+                None => tokens,
+            })
+            .map(|tokens| match bind {
+                Some(bind) => quote!(#tokens #bind),
+                None => tokens,
+            })
             .map_err(|e| {
                 let location = crate::SourceLocation::with_span(
                     "<module>",
@@ -595,6 +635,31 @@ impl CodeGen for StatementType {
                 } else {
                     s.to_rust(ctx, options, symbols)
                 }
+            }
+            // An import INSIDE a function or method runs the imported
+            // module's body on first execution (Python's import-time
+            // semantics; issue #333): the `use` plus the once-guarded
+            // `__module_init__` calls. A module-level import is an item;
+            // the module emission adds its init calls to __module_init__
+            // in statement order.
+            // An import nested in MODULE-LEVEL control flow: the module
+            // emission hoisted its `use` to module scope; here, where Python
+            // runs the import, only the loaded modules' bodies run.
+            StatementType::Import(_) | StatementType::ImportFrom(_)
+                if options.in_module_init_body =>
+            {
+                crate::ast::tree::import::import_site_init(&self, &options)
+            }
+            StatementType::Import(_) | StatementType::ImportFrom(_)
+                if !matches!(ctx, CodeGenContext::Module(_)) =>
+            {
+                let calls = crate::ast::tree::import::import_site_init(&self, &options)?;
+                let uses = match self {
+                    StatementType::Import(s) => s.to_rust(ctx, options, symbols)?,
+                    StatementType::ImportFrom(s) => s.to_rust(ctx, options, symbols)?,
+                    _ => unreachable!("matched an import"),
+                };
+                Ok(quote!(#uses #calls))
             }
             StatementType::Import(s) => s.to_rust(ctx, options, symbols),
             StatementType::ImportFrom(s) => s.to_rust(ctx, options, symbols),

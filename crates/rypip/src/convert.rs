@@ -17,6 +17,10 @@ use rust_format::{Formatter, RustFmt};
 
 use crate::package::{PyModule, PyPackage, sanitize_name};
 
+/// The bin-side module carrying the package root `__init__`'s body (the
+/// lib root, which the bin crate does not otherwise contain).
+const ROOT_BIN_MODULE: &str = python_ast::ROOT_INIT_MODULE;
+
 /// Lint allowances for generated code: transpiled Python legitimately
 /// produces unused imports/variables and similar noise, and the generated
 /// crate must still build under a consumer's `-D warnings`. `deprecated` is
@@ -1993,16 +1997,20 @@ pub fn convert(
             transpiled.push((module, code));
         }
     }
-    // The entry module's `main` runs every sibling's module body at
-    // startup, in dependency order (issue #333): Python runs a module's
-    // top-level statements when it is first imported; the crate has no
-    // import step.
-    let by_path = modules_by_path(package, &python_deps);
+    // The package root `__init__` is the lib root, which the bin crate does
+    // not contain (it compiles the sibling modules as its own): its body
+    // joins the binary as the `__rython_root` module, whose init the
+    // entry's `main` runs first — `python -m pkg.cli` runs pkg/__init__.py
+    // before cli (Devin review on #338).
+    let root_module = package
+        .modules
+        .iter()
+        .find(|m| m.path.is_empty() && reachable.contains(&m.path));
     let mut entry_options = base_options.clone();
-    if let Some(entry) = package.entry_module() {
-        entry_options.startup_module_inits =
-            std::rc::Rc::new(startup_module_inits(entry, &by_path, &reachable));
-        warn_root_init_statements(package, entry, &mut warnings);
+    if let (Some(entry), Some(root)) = (package.entry_module(), root_module)
+        && root.file != entry.file
+    {
+        entry_options.root_init_module = Some(ROOT_BIN_MODULE.to_string());
     }
     for module in &package.modules {
         if !reachable.contains(&module.path) {
@@ -2134,7 +2142,15 @@ pub fn convert(
             continue; // handled as the binary below
         }
         let is_root = module.path.is_empty();
-        let decls = mod_decls(&children, &module.path, module.is_init || is_root);
+        let mut decls = mod_decls(&children, &module.path, module.is_init || is_root);
+        // Every import site reaches the root's init and bound check as
+        // `crate::__rython_root::...` (the entry's startup too), which
+        // the lib root answers with this shim onto its own items (the
+        // bin has the real module, or the same shim when the entry is
+        // the root).
+        if is_root {
+            decls.push_str(&root_shim());
+        }
         let allows = if is_root {
             format!(
                 "{}{}",
@@ -2191,20 +2207,48 @@ pub fn convert(
         // module's `use crate::...` imports resolve within the bin crate.
         // Order: lint allowances, entry code (may start with inner doc
         // attributes), then the sibling mod declarations.
+        // The modules are `pub` in the bin too: a sibling's `from .
+        // import helper` is a `pub use crate::helper;` (a relative import
+        // re-exports), which a private `mod helper;` refuses (E0365;
+        // Devin review on #338, round 11).
         let decls = if !is_dunder_main(entry) && entry.path.len() == 1 {
             // Exclude the entry module's own name from the bin-side decls.
             let mut decls = String::new();
             if let Some(kids) = children.get(&Vec::new()) {
                 for kid in kids {
                     if Some(kid) != entry.path.first() {
-                        decls.push_str(&format!("mod {};\n", kid));
+                        decls.push_str(&format!("pub mod {};\n", kid));
                     }
                 }
             }
             decls
         } else {
-            mod_decls(&children, &[], true).replace("pub mod", "mod")
+            mod_decls(&children, &[], true)
         };
+        // The package root's body, as a bin-side module the entry's main
+        // initializes first; its items are re-exported at the bin root so
+        // a sibling's `use crate::name` of a root item resolves as in the
+        // lib.
+        let mut decls = decls;
+        if let Some((root, root_code)) = transpiled
+            .iter()
+            .find(|(m, _)| m.path.is_empty() && &m.file != entry_file)
+        {
+            let _ = root;
+            fs::write(
+                src_dir.join(format!("{}.rs", ROOT_BIN_MODULE)),
+                format_rust(root_code),
+            )?;
+            decls.push_str(&format!(
+                "mod {};\npub use {}::*;\n",
+                ROOT_BIN_MODULE, ROOT_BIN_MODULE
+            ));
+        } else if entry.path.is_empty() {
+            // The entry IS the root: its body is the bin crate root, and
+            // the siblings' `crate::__rython_root::...` paths take the
+            // lib's shim.
+            decls.push_str(&root_shim());
+        }
         let main_contents = format!("{}{}\n{}", generated_lint_attrs(opts.warnings), code, decls);
         fs::write(src_dir.join("main.rs"), format_rust(&main_contents))?;
         has_binary = true;
@@ -3125,6 +3169,17 @@ fn conversion_base_options(
     }
 }
 
+/// The shim a crate root emits so the package root's init and bound
+/// check answer at `crate::__rython_root::...` — the path every import
+/// site and the entry's startup use for the root (see
+/// `python_ast::ROOT_INIT_MODULE`).
+fn root_shim() -> String {
+    format!(
+        "pub(crate) mod {} {{\n    pub(crate) use crate::{{__module_init__, __rython_bound__}};\n}}\n",
+        ROOT_BIN_MODULE
+    )
+}
+
 /// `pub mod child;` declarations for a container module.
 fn mod_decls(
     children: &BTreeMap<Vec<String>, Vec<String>>,
@@ -3812,98 +3867,25 @@ fn crate_imports_of(
         return Vec::new();
     };
     let mut queue: VecDeque<Vec<String>> = VecDeque::new();
-    for stmt in &ast.raw.body {
-        reachable_walk_imports(stmt, module, &module.path, by_path, &mut queue);
-    }
+    python_ast::ast::tree::visit::walk_stmts(
+        &ast.raw.body,
+        python_ast::ast::tree::visit::Descend::All,
+        &mut |stmt| {
+            reachable_walk_imports(stmt, module, &module.path, by_path, &mut queue);
+            python_ast::ast::tree::visit::Flow::Continue
+        },
+    );
     let mut seen: HashSet<Vec<String>> = HashSet::new();
     queue.into_iter().filter(|p| seen.insert(p.clone())).collect()
 }
 
-/// The modules whose bodies the entry binary runs at startup, in the
-/// order Python would run them when importing the entry: a depth-first
-/// post-order over crate imports from the entry (a module's imports before
-/// the module, each module once, an import cycle broken at the module
-/// already being entered — Python's partially-initialized module). The
-/// entry itself runs last (its own `__module_init__`), and the package root
-/// `__init__` is excluded: the bin crate compiles the sibling modules as
-/// its own and does not contain the lib root at all (see
-/// `warn_root_init_statements`).
-fn startup_module_inits(
-    entry: &PyModule,
-    by_path: &HashMap<Vec<String>, &PyModule>,
-    reachable: &HashSet<Vec<String>>,
-) -> Vec<Vec<String>> {
-    fn visit(
-        path: &[String],
-        by_path: &HashMap<Vec<String>, &PyModule>,
-        reachable: &HashSet<Vec<String>>,
-        visiting: &mut HashSet<Vec<String>>,
-        order: &mut Vec<Vec<String>>,
-    ) {
-        if !visiting.insert(path.to_vec()) {
-            return;
-        }
-        let Some(module) = by_path.get(path) else { return };
-        for dep in crate_imports_of(module, by_path) {
-            visit(&dep, by_path, reachable, visiting, order);
-        }
-        if !path.is_empty() && reachable.contains(path) {
-            order.push(path.to_vec());
-        }
-    }
-    let mut visiting = HashSet::new();
-    let mut order = Vec::new();
-    visit(&entry.path, by_path, reachable, &mut visiting, &mut order);
-    order.retain(|p| p != &entry.path);
-    order
-}
 
-/// The package root `__init__` (path `[]`) becomes the lib root, which the
-/// bin crate does not compile (it declares the sibling modules itself), so
-/// its module-level STATEMENTS never run for the binary: say so instead of
-/// silently skipping them. Imports, defs, classes, docstrings and plain
-/// assignments (which lower to items and statics) are not statements the
-/// startup sequence would run.
-fn warn_root_init_statements(package: &PyPackage, entry: &PyModule, warnings: &mut Vec<String>) {
-    use python_ast::ast::tree::{ExprType, StatementType};
-    let Some(root) = package.modules.iter().find(|m| m.path.is_empty()) else {
-        return;
-    };
-    if root.file == entry.file {
-        return;
-    }
-    let Ok(ast) = python_ast::parse_enhanced(&root.source, parse_filename(root)) else {
-        return;
-    };
-    let runs_at_import = ast.raw.body.iter().any(|s| match &s.statement {
-        StatementType::Import(_)
-        | StatementType::ImportFrom(_)
-        | StatementType::FunctionDef(_)
-        | StatementType::AsyncFunctionDef(_)
-        | StatementType::ClassDef(_)
-        | StatementType::Assign(_)
-        | StatementType::AnnotatedName { .. }
-        | StatementType::Pass => false,
-        StatementType::Expr(e) => !matches!(e.value, ExprType::Constant(_)),
-        _ => true,
-    });
-    if runs_at_import {
-        warnings.push(format!(
-            "{}: module-level statements in the package `__init__` do not run when the \
-             binary starts (the binary compiles the package's modules as its own and does \
-             not contain the package root); move startup side effects into the entry module",
-            parse_filename(root),
-        ));
-    }
-}
-
-/// Walk one statement for imports to enqueue, recursing into nested
-/// statement lists (if/while/for/with/try bodies) AND function bodies:
-/// `from pip._internal.utils.entrypoints import _wrapper` inside `main()`
-/// (a function-local import) still makes `pip._internal...` reachable.
-/// Function bodies are walked with the function's own package path — a
-/// function-local import is relative to the module's package, not to the
-/// function.
+/// Enqueue the crate modules one statement's import loads — the one
+/// import walk; `crate_imports_of` drives it through the shared statement
+/// visitor over EVERY body (control flow and function bodies alike: `from
+/// pip._internal.utils.entrypoints import _wrapper` inside `main()` still
+/// makes `pip._internal...` reachable). A relative import is relative to
+/// the module's package, wherever the statement sits.
 fn reachable_walk_imports(
     stmt: &python_ast::ast::tree::Statement,
     module: &PyModule,
@@ -3977,50 +3959,6 @@ fn reachable_walk_imports(
                         queue.push_back(cand);
                     }
                 }
-            }
-        }
-        _ => {}
-    }
-    // Recurse into nested statement lists and function bodies.
-    match &stmt.statement {
-        StatementType::FunctionDef(f) => {
-            for b in &f.body {
-                reachable_walk_imports(b, module, path, by_path, queue);
-            }
-        }
-        StatementType::If(s) => {
-            for b in s.body.iter().chain(s.orelse.iter()) {
-                reachable_walk_imports(b, module, path, by_path, queue);
-            }
-        }
-        StatementType::While(s) => {
-            for b in s.body.iter().chain(s.orelse.iter()) {
-                reachable_walk_imports(b, module, path, by_path, queue);
-            }
-        }
-        StatementType::For(s) => {
-            for b in s.body.iter().chain(s.orelse.iter()) {
-                reachable_walk_imports(b, module, path, by_path, queue);
-            }
-        }
-        StatementType::With(s) => {
-            for b in &s.body {
-                reachable_walk_imports(b, module, path, by_path, queue);
-            }
-        }
-        StatementType::Try(s) => {
-            for b in s.body.iter().chain(s.orelse.iter()).chain(s.finalbody.iter()) {
-                reachable_walk_imports(b, module, path, by_path, queue);
-            }
-            for h in &s.handlers {
-                for b in &h.body {
-                    reachable_walk_imports(b, module, path, by_path, queue);
-                }
-            }
-        }
-        StatementType::ClassDef(c) => {
-            for b in &c.body {
-                reachable_walk_imports(b, module, path, by_path, queue);
             }
         }
         _ => {}

@@ -184,7 +184,7 @@ impl CodeGen for If {
             .map(|stmt| stmt.to_rust(ctx.clone(), body_options.clone(), symbols.clone()))
             .collect();
         let body_stmts = body_stmts?;
-        
+
         if self.orelse.is_empty() {
             Ok(quote! {
                 if #test {
@@ -197,7 +197,7 @@ impl CodeGen for If {
                 .map(|stmt| stmt.to_rust(ctx.clone(), else_options.clone(), symbols.clone()))
                 .collect();
             let else_stmts = else_stmts?;
-            
+
             Ok(quote! {
                 if #test {
                     #(#body_stmts;)*

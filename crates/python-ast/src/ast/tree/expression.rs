@@ -880,13 +880,12 @@ mod tests {
             .clone()
             .to_rust(CodeGenContext::Module("test".to_string()), options, symbols)
             .unwrap();
-        assert_eq!(
-            tokens.to_string(),
-            "# [allow (dead_code)] pub (crate) fn __module_init__ () -> Result < () , PyException > \
-             { test () ; Ok (()) } fn main () { let __rython_result = (|| -> Result < () , \
-             PyException > { __module_init__ () ? ; Ok (()) }) () ; if let Err (e) = \
-             __rython_result { eprintln ! (\"{}\" , e) ; std :: process :: exit (1) ; } }"
-        );
+        // The module statement runs inside the once-guarded init, which
+        // main calls (the exact guard text is the module emission's).
+        let out = tokens.to_string();
+        assert!(out.contains("pub (crate) fn __module_init__ () -> Result < () , PyException >"), "{}", out);
+        assert!(out.contains("test () ;"), "{}", out);
+        assert!(out.contains("fn main () { let __rython_result = (|| -> Result < () , PyException > { __module_init__ () ? ; Ok (()) }) () ;"), "{}", out);
     }
 }
 

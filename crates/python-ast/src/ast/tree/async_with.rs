@@ -116,8 +116,15 @@ impl CodeGen for AsyncWith {
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             match item.optional_vars {
                 Some(vars) => {
+                    // The item's target is bound right after its context
+                    // expression, before the next item's runs: its marks go
+                    // there (Devin review on #338, round 12).
+                    let bind = crate::ast::tree::import::binds_for(
+                        options.stmt_binds.as_deref(),
+                        crate::ast::tree::visit::target_names(&vars).into_iter(),
+                    );
                     let target = vars.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    item_tokens.push(quote! { let mut #target = #context_expr; });
+                    item_tokens.push(quote! { let mut #target = #context_expr; #bind });
                 }
                 None => {
                     item_tokens.push(quote! { let _ = #context_expr; });

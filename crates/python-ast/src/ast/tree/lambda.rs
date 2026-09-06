@@ -60,6 +60,10 @@ impl CodeGen for Lambda {
             .iter()
             .map(|param| crate::safe_ident(&param.arg))
             .collect();
+        // A lambda's body is its own scope: a walrus there binds the
+        // lambda's local, never the enclosing statement's module name.
+        let mut options = options;
+        options.stmt_binds = None;
         let body = wrap_fallible_body(self.body.to_rust(ctx, options, symbols)?);
 
         Ok(quote! {

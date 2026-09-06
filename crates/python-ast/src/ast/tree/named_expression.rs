@@ -56,11 +56,19 @@ impl CodeGen for NamedExpr {
             ExprType::Name(n) => options.hoisted_names.contains(&n.id),
             _ => false,
         };
+        // A module-scope walrus records its own name's binding mark right
+        // after the store — where Python binds the name, inside a boolean
+        // chain or a header alike; the statement's other names keep their
+        // own marks (Devin review on #338, rounds 11 and 12).
+        let bind = crate::ast::tree::import::binds_for(
+            options.stmt_binds.as_deref(),
+            crate::ast::tree::visit::target_names(&self.left).into_iter(),
+        );
         let right = self.right.clone().to_rust(ctx, options, symbols)?;
         Ok(if hoisted {
-            quote!({ #target = #right; #target })
+            quote!({ #target = #right; #bind #target })
         } else {
-            quote!({ let #target = #right; #target })
+            quote!({ let #target = #right; #bind #target })
         })
     }
 }

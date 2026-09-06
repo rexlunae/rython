@@ -462,6 +462,1504 @@ pub struct Import {
 /// 1. Declares the imported object within the existing scope.
 /// 2. Causes the referenced module to be compiled into the program (only once).
 
+/// The crate modules an import statement LOADS, in Python's order — the
+/// modules whose bodies run at the import site (issue #333, Devin review
+/// on #336): for `import a.b.c`, each package on the path that is a crate
+/// module, then the module; for `from .a import x, y`, the resolved
+/// module (its crate packages first) and each imported name that is a
+/// submodule. The package root (`from . import x`) is listed as the
+/// [`ROOT_INIT_MODULE`] path, which both crates answer: the lib root
+/// through a shim, the binary through the root's body as that module.
+/// Modules outside the crate are never listed; a single-module
+/// conversion (no `module_defs`) lists nothing.
+pub(crate) fn imported_crate_modules(
+    stmt: &crate::StatementType,
+    options: &PythonOptions,
+) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let push_chain = |path: &[String], out: &mut Vec<Vec<String>>| {
+        for len in 1..=path.len() {
+            if let Some(key) = crate::module_defs_key(options, &path[..len]) {
+                if key == options.this_module_path.as_slice() {
+                    continue;
+                }
+                let key = init_module_path(key);
+                if !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+        }
+    };
+    match stmt {
+        crate::StatementType::Import(i) => {
+            for a in &i.names {
+                let path: Vec<String> = a.name.split('.').map(|s| s.to_string()).collect();
+                push_chain(&path, &mut out);
+            }
+        }
+        crate::StatementType::ImportFrom(i) => {
+            let base = i.resolved_module_path(options);
+            if base.is_empty() {
+                // `from . import x` at the package's top level: the root
+                // itself, whose empty path no chain prefix names.
+                if let Some(key) = crate::module_defs_key(options, &base)
+                    && key != options.this_module_path.as_slice()
+                {
+                    out.push(init_module_path(key));
+                }
+            } else {
+                push_chain(&base, &mut out);
+            }
+            // A from-list name is the package's own attribute when the
+            // package binds it; only otherwise does Python import the
+            // submodule of that name (Devin review on #338).
+            let package_key = crate::module_defs_key(options, &base).map(<[String]>::to_vec);
+            for a in i.names.iter().filter(|a| a.name != "*") {
+                let mut sub = base.clone();
+                sub.push(a.name.clone());
+                let binding = package_key
+                    .as_deref()
+                    .and_then(|key| module_binding(options, key, &a.name));
+                if let Some(binding) = binding {
+                    // The package binds the name: the attribute, unless
+                    // the binding has not happened yet when the import
+                    // runs (a cycle) — then Python imports the submodule
+                    // of that name, and so does the import site, at
+                    // runtime, when one exists (`import_site_name_checks`;
+                    // Devin review on #338, round 10). A binding under
+                    // module-level control flow may not run at all: the
+                    // converter says so (-W) when the submodule exists
+                    // (round 6).
+                    if binding.conditional && crate::module_defs_key(options, &sub).is_some() {
+                        let warning = format!(
+                            "`from {} import {}`: the package binds `{}` under a \
+                             module-level condition and also has a submodule `{}`; \
+                             Python decides at runtime which one the import finds, \
+                             the converted program always takes the package's binding \
+                             and never runs the submodule's body",
+                            base.join("."),
+                            a.name,
+                            a.name,
+                            sub.join(".")
+                        );
+                        let mut warnings = options.definition_warnings.borrow_mut();
+                        if !warnings.contains(&warning) {
+                            warnings.push(warning);
+                        }
+                    }
+                    continue;
+                }
+                push_chain(&sub, &mut out);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Where a crate module binds a name in its own body: the package
+/// attribute a `from package import name` finds before falling back to
+/// the submodule `package.name`, and the marks a cyclic importer asks
+/// about.
+pub(crate) struct ModuleBinding {
+    /// The marks of EVERY statement that binds the name (see
+    /// [`BindingMarks`]): the name is bound once any of them has run
+    /// (Devin review on #338, round 9).
+    pub marks: Vec<usize>,
+    /// Every binding sits under module-level control flow (an `if`, a
+    /// `try`), so Python binds the name only when a branch runs.
+    pub conditional: bool,
+}
+
+/// The module-scope names one statement binds — the visitor's one
+/// enumeration ([`Bindings::Scope`]).
+fn stmt_bound_names(s: &crate::Statement) -> Vec<String> {
+    crate::ast::tree::visit::stmt_bound_names(s, crate::ast::tree::visit::Bindings::Scope)
+}
+
+/// One binding of a module body: a statement, one name it binds, and
+/// where that binding happens — the statement's index in the walk is
+/// not the mark; each (statement, name) pair has its own bit (Devin
+/// review on #338, round 12), since a statement binds its names at
+/// different times (`Y = (X := f()) + g()` binds X at the walrus and Y
+/// after; `with a() as X, b() as Y:` binds X before b() runs).
+/// Where a name's mark is recorded: after the statement's init code for
+/// a def or class name, an import alias, or a store's target (`after`);
+/// otherwise by the lowering that binds it — a loop target at the top of
+/// the body, a `with` item's target right after its context expression,
+/// a walrus right after its store — each looking its own names up in
+/// the statement's bits (`options.stmt_binds`).
+#[derive(Clone, Debug)]
+pub struct NameMark {
+    pub name: String,
+    /// The bit's index in the module's `__RYTHON_BOUND` words.
+    pub mark: usize,
+    /// Bound after the statement's init code: a def or class name, an
+    /// import alias, a store's target (an assignment, an augmented one).
+    pub after: bool,
+}
+
+/// One statement's marks (see [`NameMark`]) and whether it is a
+/// top-level statement of the body (whose after-marks the module
+/// emission records at the end of its init range; a nested one records
+/// its own where it runs).
+#[derive(Clone, Debug)]
+pub struct StmtMarks {
+    pub names: Vec<NameMark>,
+    pub top_level: bool,
+}
+
+impl StmtMarks {
+    /// The `__rython_bind__` calls for the names bound after the
+    /// statement's init code, if any.
+    pub(crate) fn after_binds(&self) -> Option<TokenStream> {
+        bind_calls(self.names.iter().filter(|n| n.after).map(|n| n.mark))
+    }
+
+    /// `name -> (word, mask)` for the statement's lowering.
+    pub(crate) fn bits(&self) -> std::collections::HashMap<String, (usize, u32)> {
+        self.names
+            .iter()
+            .map(|n| (n.name.clone(), bound_word_and_mask(n.mark)))
+            .collect()
+    }
+}
+
+/// The `__rython_bind__` calls setting the given marks; None for none.
+pub(crate) fn bind_calls(marks: impl Iterator<Item = usize>) -> Option<TokenStream> {
+    let calls: Vec<TokenStream> = marks
+        .map(|mark| {
+            let (word, mask) = bound_word_and_mask(mark);
+            quote!(__rython_bind__(#word, #mask);)
+        })
+        .collect();
+    (!calls.is_empty()).then(|| quote!(#(#calls)*))
+}
+
+/// The `__rython_bind__` calls for `names` in a statement's bits map
+/// (`options.stmt_binds`): what a loop, `with` or walrus lowering emits
+/// for the names it has just bound.
+pub(crate) fn binds_for<'a>(
+    bits: Option<&std::collections::HashMap<String, (usize, u32)>>,
+    names: impl Iterator<Item = &'a str>,
+) -> Option<TokenStream> {
+    let bits = bits?;
+    let calls: Vec<TokenStream> = names
+        .filter_map(|name| bits.get(name))
+        .map(|(word, mask)| quote!(__rython_bind__(#word, #mask);))
+        .collect();
+    (!calls.is_empty()).then(|| quote!(#(#calls)*))
+}
+
+/// A module body's bindings — every (statement, name) pair for a
+/// statement that binds a module-scope name, under module-level control
+/// flow too, a def's own body and a TYPE_CHECKING block excluded — in
+/// source order, each with
+/// where the binding happens and whether the statement is top-level. A
+/// pair's index here is its MARK: one bit of the module's
+/// `__RYTHON_BOUND` words, set where the binding happens (after the
+/// statement's init code; at the top of a loop body or after a `with`
+/// item; right after a walrus's store), which is what a cyclic
+/// importer's bound check reads (Devin review on #338, rounds 8 to 12).
+/// The body is the module's NORMALIZED one
+/// (`module::normalize_module_body`), on both sides.
+fn binding_entries(body: &[crate::Statement]) -> Vec<(&crate::Statement, NameMark, bool)> {
+    use crate::ast::tree::visit::{stmt_targets, target_names, walk_stmts, Descend, Flow};
+    let mut out: Vec<(&crate::Statement, NameMark, bool)> = Vec::new();
+    walk_stmts(body, Descend::SkipDefs, &mut |s| {
+        // A TYPE_CHECKING block is compile-time only: nothing under it
+        // binds at runtime, as the emission and the runtime-item check
+        // already hold (Devin review on #338, round 14).
+        if let crate::StatementType::If(i) = &s.statement
+            && crate::ast::tree::module::Module::is_type_checking_test(&i.test)
+        {
+            return Flow::Skip;
+        }
+        let names = stmt_bound_names(s);
+        if names.is_empty() {
+            return Flow::Continue;
+        }
+        let is_loop = matches!(
+            &s.statement,
+            crate::StatementType::For(_)
+                | crate::StatementType::AsyncFor(_)
+                | crate::StatementType::With(_)
+                | crate::StatementType::AsyncWith(_)
+        );
+        let stored: Vec<String> = stmt_targets(s)
+            .into_iter()
+            .flat_map(target_names)
+            .map(str::to_string)
+            .collect();
+        let declared: Vec<String> = match &s.statement {
+            crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
+                vec![f.name.clone()]
+            }
+            crate::StatementType::ClassDef(c) => vec![c.name.clone()],
+            crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_) => {
+                names.clone()
+            }
+            _ => Vec::new(),
+        };
+        let top_level = body.iter().any(|top| std::ptr::eq(top, s));
+        let mut seen: Vec<String> = Vec::new();
+        for name in names {
+            if seen.contains(&name) {
+                continue;
+            }
+            let after = declared.contains(&name) || (!is_loop && stored.contains(&name));
+            let mark = NameMark {
+                mark: out.len(),
+                after,
+                name: name.clone(),
+            };
+            out.push((s, mark, top_level));
+            seen.push(name);
+        }
+        Flow::Continue
+    });
+    out
+}
+
+/// The marks of a module body by source position (see
+/// [`binding_entries`]): what the module emission and the statement
+/// lowering consult to record each binding where it happens.
+pub(crate) struct BindingMarks {
+    pub by_pos: std::collections::HashMap<(usize, usize), StmtMarks>,
+    /// How many marks the body has (the size of the bound bitmap).
+    pub count: usize,
+}
+
+/// The bits of one `__RYTHON_BOUND` word: `AtomicU32`, which every
+/// target with atomics has (the no_std tier included).
+pub(crate) const BOUND_WORD_BITS: usize = 32;
+
+impl BindingMarks {
+    pub(crate) fn of(body: &[crate::Statement]) -> Self {
+        let entries = binding_entries(body);
+        let count = entries.len();
+        let mut by_pos: std::collections::HashMap<(usize, usize), StmtMarks> =
+            std::collections::HashMap::new();
+        for (s, mark, top_level) in entries {
+            let (Some(line), Some(col)) = (s.lineno, s.col_offset) else {
+                continue;
+            };
+            by_pos
+                .entry((line, col))
+                .or_insert_with(|| StmtMarks { names: Vec::new(), top_level })
+                .names
+                .push(mark);
+        }
+        Self { by_pos, count }
+    }
+
+    /// The `__rython_bind__` calls for the names the statement at `pos`
+    /// binds after its init code, if any.
+    pub(crate) fn after_binds(&self, pos: (usize, usize)) -> Option<TokenStream> {
+        self.by_pos.get(&pos)?.after_binds()
+    }
+}
+
+/// The word index and bit mask of a mark in the bound bitmap.
+pub(crate) fn bound_word_and_mask(mark: usize) -> (usize, u32) {
+    (mark / BOUND_WORD_BITS, 1u32 << (mark % BOUND_WORD_BITS))
+}
+
+/// A list method that keeps the list's membership: `__all__.copy()`,
+/// `.count(x)`, `.index(x)`, `.sort()`, `.reverse()` leave the export
+/// set as it was. Any other method (`append`, `extend`, `insert`,
+/// `remove`, `pop`, `clear`, one the analysis does not know) may not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ListReadMethod {
+    Copy,
+    Count,
+    Index,
+    Sort,
+    Reverse,
+}
+
+impl ListReadMethod {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "copy" => Self::Copy,
+            "count" => Self::Count,
+            "index" => Self::Index,
+            "sort" => Self::Sort,
+            "reverse" => Self::Reverse,
+            _ => return None,
+        })
+    }
+}
+
+/// A builtin that reads a list handed to it without mutating it
+/// (`len(__all__)`, `sorted(__all__)`, `print(__all__)`, ...). Any
+/// other callee may mutate what it is handed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NonMutatingBuiltin {
+    Len, Sorted, List, Tuple, Set, FrozenSet, Print, Iter, Enumerate, Reversed, Any, All, Min,
+    Max, Sum, Str, Repr, Bool, IsInstance, Map, Filter, Zip, Dict, Id, Type,
+}
+
+impl NonMutatingBuiltin {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "len" => Self::Len, "sorted" => Self::Sorted, "list" => Self::List,
+            "tuple" => Self::Tuple, "set" => Self::Set, "frozenset" => Self::FrozenSet,
+            "print" => Self::Print, "iter" => Self::Iter, "enumerate" => Self::Enumerate,
+            "reversed" => Self::Reversed, "any" => Self::Any, "all" => Self::All,
+            "min" => Self::Min, "max" => Self::Max, "sum" => Self::Sum, "str" => Self::Str,
+            "repr" => Self::Repr, "bool" => Self::Bool, "isinstance" => Self::IsInstance,
+            "map" => Self::Map, "filter" => Self::Filter, "zip" => Self::Zip,
+            "dict" => Self::Dict, "id" => Self::Id, "type" => Self::Type,
+            _ => return None,
+        })
+    }
+}
+
+/// The crate module's `__all__` as a list of names: `Ok(Some(names))`
+/// for a literal list or tuple of string constants bound at the top
+/// level (the last one), `Ok(None)` when the module binds no `__all__`,
+/// `Err(())` when it binds one any other way (computed, augmented, under
+/// control flow) — then its star exports are unknown.
+pub(crate) fn literal_all(
+    options: &PythonOptions,
+    key: &[String],
+) -> Result<Option<Vec<String>>, ()> {
+    let Some(body) = crate::ast::tree::module::normalized_body_of(options, key) else {
+        return Ok(None);
+    };
+    let string_items = |e: &crate::ExprType| -> Option<Vec<String>> {
+        let items: &[crate::ExprType] = match e {
+            crate::ExprType::List(items) => items,
+            crate::ExprType::Tuple(t) => &t.elts,
+            _ => return None,
+        };
+        items
+            .iter()
+            .map(|item| match item {
+                crate::ExprType::Constant(c) => match &c.0 {
+                    Some(litrs::Literal::String(lit)) => Some(lit.value().to_string()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    };
+    // The LATEST effective binding in source order: a top-level literal
+    // replaces whatever came before (a computed or conditional one
+    // included); a later unknown binding, or a mutation of the list
+    // (`__all__.append(...)`, `__all__ += [...]`, `__all__[0] = ...`)
+    // anywhere the module runs, makes the exports unknown again (Devin
+    // review on #338, round 21).
+    // What MAY change the list's membership, or let something else
+    // change it: a store through it (`__all__[i] = ...`), a method that
+    // changes membership or one the analysis does not know, the list
+    // handed to a callee that is not a known non-mutating builtin (by
+    // position or by keyword), and — Devin review on #338, round 24 —
+    // any other use of the name that could ALIAS the list (`exports =
+    // __all__`, a tuple or list holding it, a walrus, a return): after
+    // an alias escapes, a mutation through it is invisible here, so the
+    // exports are unknown from then on. Only the reads the analysis can
+    // see through leave the literal in force: a membership-keeping
+    // method, a known builtin that is not shadowed by a module binding,
+    // an `in` test, a subscript read, a loop over it. A def or class
+    // body naming `__all__` at all (a `global __all__` mutator a
+    // module-level call may run) makes the exports unknown too.
+    let ctx = crate::ast::tree::module::defining_module_context(options, key);
+    let mutates_all = |st: &crate::Statement| -> bool {
+        use crate::ast::tree::visit::{any_expr_for, stmt_exprs, stmt_targets, Descend};
+        let is_all = |e: &crate::ExprType| matches!(e, crate::ExprType::Name(n) if n.id == "__all__");
+        let through_all = |e: &crate::ExprType| -> bool {
+            match e {
+                crate::ExprType::Attribute(a) => is_all(&a.value),
+                crate::ExprType::Subscript(sub) => is_all(&sub.value),
+                _ => false,
+            }
+        };
+        if stmt_targets(st).into_iter().any(through_all) {
+            return true;
+        }
+        // A builtin's name the module binds itself is not the builtin.
+        let unshadowed_builtin =
+            |name: &str| NonMutatingBuiltin::from_name(name).is_some() && callee_bindings(&body, &ctx, name).is_empty();
+        for e in stmt_exprs(st) {
+            // The occurrences of `__all__` the analysis can see through.
+            let mut safe: Vec<*const crate::ExprType> = Vec::new();
+            any_expr_for(e, Descend::OwnScope, |x| {
+                match x {
+                    crate::ExprType::Call(c) => match c.func.as_ref() {
+                        crate::ExprType::Attribute(a)
+                            if is_all(&a.value) && ListReadMethod::from_name(&a.attr).is_some() =>
+                        {
+                            safe.push(a.value.as_ref() as *const _);
+                        }
+                        crate::ExprType::Name(f) if unshadowed_builtin(&f.id) => {
+                            safe.extend(c.args.iter().filter(|a| is_all(a)).map(|a| a as *const _));
+                            safe.extend(
+                                c.keywords.iter().filter(|k| is_all(&k.value)).map(|k| &k.value as *const _),
+                            );
+                        }
+                        _ => {}
+                    },
+                    crate::ExprType::Compare(cmp) => {
+                        if is_all(&cmp.left) {
+                            safe.push(cmp.left.as_ref() as *const _);
+                        }
+                        safe.extend(cmp.comparators.iter().filter(|a| is_all(a)).map(|a| a as *const _));
+                    }
+                    crate::ExprType::Subscript(sub) if is_all(&sub.value) => {
+                        safe.push(sub.value.as_ref() as *const _);
+                    }
+                    _ => {}
+                }
+                false
+            });
+            // A loop over the list reads it.
+            if let crate::StatementType::For(f) = &st.statement
+                && is_all(&f.iter)
+            {
+                safe.push(&f.iter as *const _);
+            }
+            let mut escapes = false;
+            any_expr_for(e, Descend::OwnScope, |x| {
+                if is_all(x) && !safe.iter().any(|p| std::ptr::eq(*p, x)) {
+                    escapes = true;
+                }
+                escapes
+            });
+            if escapes {
+                return true;
+            }
+        }
+        false
+    };
+    // A def or class body naming `__all__`: a mutator a module-level
+    // call may run during initialization.
+    let named_in_a_def = {
+        use crate::ast::tree::visit::{any_expr_for, stmt_exprs, walk_stmts, Descend, Flow};
+        let mut named = false;
+        walk_stmts(&body, Descend::All, &mut |st| {
+            let in_def = !body.iter().any(|top| std::ptr::eq(top, st));
+            if in_def
+                && (matches!(&st.statement, crate::StatementType::Global(ns) if ns.iter().any(|n| n == "__all__"))
+                    || stmt_exprs(st).into_iter().any(|e| {
+                        any_expr_for(e, Descend::All, |x| {
+                            matches!(x, crate::ExprType::Name(n) if n.id == "__all__")
+                        })
+                    }))
+            {
+                named = true;
+                return Flow::Stop;
+            }
+            Flow::Continue
+        });
+        named
+    };
+    if named_in_a_def {
+        return Err(());
+    }
+    let mut all: Result<Option<Vec<String>>, ()> = Ok(None);
+    let mut all_by_stmt: std::collections::HashMap<(usize, usize), Option<Vec<String>>> =
+        std::collections::HashMap::new();
+    for (st, mark, top_level) in binding_entries(&body) {
+        if mark.name != "__all__" {
+            continue;
+        }
+        let literal = match &st.statement {
+            crate::StatementType::Assign(a) if top_level => match a.targets.as_slice() {
+                [crate::ExprType::Name(t)] if t.id == "__all__" => string_items(&a.value),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let (Some(line), Some(col)) = (st.lineno, st.col_offset) {
+            all_by_stmt.insert((line, col), literal);
+        }
+    }
+    // Source order over the body's statements (the entries are in walk
+    // order too, but a mutation is not a binding entry).
+    crate::ast::tree::visit::walk_stmts(
+        &body,
+        crate::ast::tree::visit::Descend::SkipDefs,
+        &mut |st| {
+            if let (Some(line), Some(col)) = (st.lineno, st.col_offset)
+                && let Some(literal) = all_by_stmt.get(&(line, col))
+            {
+                all = match literal {
+                    Some(names) => Ok(Some(names.clone())),
+                    None => Err(()),
+                };
+            } else if let crate::StatementType::Delete(targets) = &st.statement
+                && targets.iter().any(|t| matches!(t, crate::ExprType::Name(n) if n.id == "__all__"))
+            {
+                // `del __all__` unbinds it: the star import is back to
+                // the public names (at the top level), or unknown
+                // (under control flow).
+                all = if body.iter().any(|top| std::ptr::eq(top, st)) {
+                    Ok(None)
+                } else {
+                    Err(())
+                };
+            } else if mutates_all(st) {
+                all = Err(());
+            }
+            crate::ast::tree::visit::Flow::Continue
+        },
+    );
+    all
+}
+
+/// The names `from m import *` binds from the crate module at `key`, as
+/// Python takes them: the module's `__all__` when its body binds one as
+/// a list or tuple of string literals at the top level (the last such
+/// binding); otherwise every name its normalized body binds at module
+/// scope (a def's locals excluded) that does not start with `_`, plus
+/// the exports of its own crate-module star imports (depth-bounded).
+/// None when the exports are UNKNOWN: an `__all__` bound any other way
+/// (computed, augmented, under control flow), a star import of an
+/// external module, or a chain deeper than the bound (Devin review on
+/// #338, round 20).
+pub(crate) fn star_exports(
+    options: &PythonOptions,
+    key: &[String],
+    depth: usize,
+) -> Option<Vec<String>> {
+    if depth > 8 {
+        return None;
+    }
+    let body = crate::ast::tree::module::normalized_body_of(options, key)?;
+    let ctx = crate::ast::tree::module::defining_module_context(options, key);
+    match literal_all(options, key) {
+        Ok(Some(all)) => return Some(all),
+        Ok(None) => {}
+        Err(()) => return None,
+    }
+    // Source order, so a later `del x` at the top level removes x (a
+    // module-level `del` is a no-op in the emission, so the static
+    // outlives the name — the export list must not) and a later store
+    // rebinds it; a `del` of a public name under control flow leaves the
+    // exports UNKNOWN (Python decides at runtime) — a star import of the
+    // module is then refused (Devin review on #338, round 22).
+    if !module_conditional_deletes(options, key).is_empty() {
+        return None;
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut unknown = false;
+    crate::ast::tree::visit::walk_stmts(
+        &body,
+        crate::ast::tree::visit::Descend::SkipDefs,
+        &mut |st| {
+            if let crate::StatementType::If(i) = &st.statement
+                && crate::ast::tree::module::Module::is_type_checking_test(&i.test)
+            {
+                return crate::ast::tree::visit::Flow::Skip;
+            }
+            if let crate::StatementType::Delete(targets) = &st.statement {
+                for t in targets {
+                    if let crate::ExprType::Name(n) = t {
+                        names.retain(|m| m != &n.id);
+                    }
+                }
+                return crate::ast::tree::visit::Flow::Continue;
+            }
+            for name in stmt_bound_names(st) {
+                if name == "*" {
+                    let crate::StatementType::ImportFrom(i) = &st.statement else {
+                        continue;
+                    };
+                    let path = i.resolved_module_path(&ctx);
+                    match crate::module_defs_key(options, &path)
+                        .and_then(|source| star_exports(options, source, depth + 1))
+                    {
+                        Some(exports) => {
+                            for n in exports {
+                                if !names.contains(&n) {
+                                    names.push(n);
+                                }
+                            }
+                        }
+                        None => unknown = true,
+                    }
+                } else if !name.starts_with('_') && !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            crate::ast::tree::visit::Flow::Continue
+        },
+    );
+    if unknown {
+        return None;
+    }
+    Some(names)
+}
+
+/// The public names the crate module at `key` deletes under module-level
+/// control flow (`if flag: del x`): whether the name is bound when the
+/// body has run is decided at runtime.
+pub(crate) fn module_conditional_deletes(options: &PythonOptions, key: &[String]) -> Vec<String> {
+    let Some(body) = crate::ast::tree::module::normalized_body_of(options, key) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    crate::ast::tree::visit::walk_stmts(
+        &body,
+        crate::ast::tree::visit::Descend::SkipDefs,
+        &mut |st| {
+            if let crate::StatementType::Delete(targets) = &st.statement
+                && !body.iter().any(|top| std::ptr::eq(top, st))
+            {
+                for t in targets {
+                    if let crate::ExprType::Name(n) = t
+                        && !n.id.starts_with('_')
+                        && !names.contains(&n.id)
+                    {
+                        names.push(n.id.clone());
+                    }
+                }
+            }
+            crate::ast::tree::visit::Flow::Continue
+        },
+    );
+    names
+}
+
+/// The names a `from m import *` of the crate module at `key` must
+/// re-export EXPLICITLY (`use m::{a, b}`) rather than by glob: when `m`
+/// has a literal `__all__` (the glob would expose a name it leaves out),
+/// or deletes a public name at the top level (the glob would expose the
+/// deleted name's static). None when the glob is right.
+pub(crate) fn star_reexport_list(options: &PythonOptions, key: &[String]) -> Option<Vec<String>> {
+    if let Ok(Some(all)) = literal_all(options, key) {
+        return Some(all);
+    }
+    let body = crate::ast::tree::module::normalized_body_of(options, key)?;
+    let deletes_public = body.iter().any(|st| match &st.statement {
+        crate::StatementType::Delete(targets) => targets
+            .iter()
+            .any(|t| matches!(t, crate::ExprType::Name(n) if !n.id.starts_with('_'))),
+        _ => false,
+    });
+    if deletes_public {
+        return star_exports(options, key, 0);
+    }
+    None
+}
+
+/// The names a sibling's `from m import *` takes from the crate module
+/// at `key`: its star exports when the conversion can enumerate them,
+/// otherwise every public module-scope name (the conservative superset
+/// — what the glob re-export exposes), so each gets its runtime item
+/// (Devin review on #338, round 21).
+pub(crate) fn sibling_star_names(options: &PythonOptions, key: &[String]) -> Vec<String> {
+    if let Some(names) = star_exports(options, key, 0) {
+        return names;
+    }
+    let Some(body) = crate::ast::tree::module::normalized_body_of(options, key) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    for (_, mark, _) in binding_entries(&body) {
+        if mark.name != "*" && !mark.name.starts_with('_') && !names.contains(&mark.name) {
+            names.push(mark.name.clone());
+        }
+    }
+    names
+}
+
+/// What a `from X import *` statement of the module in `ctx` binds:
+/// `Some(Some(names))` for a crate module's exports, `Some(None)` when
+/// they are unknown (an external module, an unresolvable `__all__`), and
+/// None for any other statement.
+fn star_import_exports(
+    options: &PythonOptions,
+    ctx: &PythonOptions,
+    s: &crate::Statement,
+) -> Option<Option<Vec<String>>> {
+    let crate::StatementType::ImportFrom(i) = &s.statement else {
+        return None;
+    };
+    if !i.names.iter().any(|a| a.name == "*") {
+        return None;
+    }
+    Some(
+        crate::module_defs_key(options, &i.resolved_module_path(ctx))
+            .and_then(|source| star_exports(options, source, 0)),
+    )
+}
+
+/// Whether the crate module at `key` star-imports a module whose exports
+/// the conversion cannot enumerate (see [`star_exports`]): then whether
+/// it binds a given name is unknown.
+fn module_star_imports_unknown(options: &PythonOptions, key: &[String]) -> bool {
+    let Some(body) = crate::ast::tree::module::normalized_body_of(options, key) else {
+        return false;
+    };
+    let ctx = crate::ast::tree::module::defining_module_context(options, key);
+    binding_entries(&body)
+        .into_iter()
+        .any(|(s, mark, _)| mark.name == "*" && star_import_exports(options, &ctx, s) == Some(None))
+}
+
+/// The bindings of `name` in the body of the crate module at `key` (a
+/// def's locals excluded): every binding's mark, and whether all of them
+/// are nested under module-level control flow. A package's
+/// own `from . import name` binds the SUBMODULE — it is the submodule
+/// import, not an attribute the package has before it — so it never
+/// counts (the entry's `from . import helper` in its `__init__`).
+fn module_binding(options: &PythonOptions, key: &[String], name: &str) -> Option<ModuleBinding> {
+    // The target module's NORMALIZED body — the sequence its own emission
+    // numbers (Devin review on #338, round 11).
+    let body = crate::ast::tree::module::normalized_body_of(options, key)?;
+    let ctx = crate::ast::tree::module::defining_module_context(options, key);
+    let imports_own_submodule = |s: &crate::Statement| match &s.statement {
+        crate::StatementType::ImportFrom(i) => {
+            crate::module_defs_key(options, &i.resolved_module_path(&ctx)) == Some(key)
+        }
+        _ => false,
+    };
+    // A `from m import *` binds every name `m` exports under the star
+    // statement's one mark (the bit is set when the statement has run,
+    // for all of them at once — Devin review on #338, round 20).
+    let star_binds = |s: &crate::Statement| -> bool {
+        matches!(star_import_exports(options, &ctx, s), Some(Some(names)) if names.iter().any(|n| n == name))
+    };
+    let bindings: Vec<(usize, bool)> = binding_entries(&body)
+        .into_iter()
+        .filter(|(s, mark, _)| {
+            (mark.name == name || (mark.name == "*" && star_binds(s))) && !imports_own_submodule(s)
+        })
+        .map(|(_, mark, top_level)| (mark.mark, top_level))
+        .collect();
+    if bindings.is_empty() {
+        return None;
+    }
+    Some(ModuleBinding {
+        conditional: bindings.iter().all(|(_, top_level)| !top_level),
+        marks: bindings.into_iter().map(|(mark, _)| mark).collect(),
+    })
+}
+
+/// What a `from package import name` does for each name the package
+/// binds, after the package's body ran (Devin review on #338, rounds 6,
+/// 8 and 10). While that body is still running on this thread (an
+/// import cycle; a self-import included), the binding may not have
+/// happened yet — each module's `__rython_bound__` answers from its
+/// bound bitmap (the binding statements' bits, set where they ran; a
+/// completed body answers yes):
+/// - when a submodule `package.name` exists, Python imports it in that
+///   case, so the site runs its body then and only then;
+/// - otherwise Python raises ImportError (`cannot import name ... from
+///   partially initialized module ...`), and so does the check, rather
+///   than handing out the static's eventual value.
+/// The package root (`from . import name`) is checked through
+/// [`ROOT_INIT_MODULE`] like any module.
+pub(crate) fn import_site_name_checks(
+    stmt: &crate::StatementType,
+    options: &PythonOptions,
+) -> TokenStream {
+    let crate::StatementType::ImportFrom(i) = stmt else {
+        return quote!();
+    };
+    let base = i.resolved_module_path(options);
+    let Some(key) = crate::module_defs_key(options, &base) else {
+        return quote!();
+    };
+    let segs: Vec<_> = init_module_path(key)
+        .iter()
+        .map(|s| crate::safe_ident(s))
+        .collect();
+    let qualified = std::iter::once(options.python_namespace.as_str())
+        .filter(|ns| !ns.is_empty())
+        .chain(key.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(".");
+    let checks = i.names.iter().filter_map(|a| {
+        // `from package import *` asks for no one name; a cyclic star
+        // import is refused at conversion (`import_site_init`).
+        if a.name == "*" {
+            return None;
+        }
+        let binding = module_binding(options, key, &a.name)?;
+        let bits = binding.marks.iter().map(|mark| {
+            let (word, mask) = bound_word_and_mask(*mark);
+            quote!((#word, #mask))
+        });
+        let name = a.name.as_str();
+        let bound = quote!(crate::#(#segs::)*__rython_bound__(&[#(#bits),*], #name, #qualified));
+        let mut sub = key.to_vec();
+        sub.push(a.name.clone());
+        Some(match crate::module_defs_key(options, &sub) {
+            Some(sub_key) => {
+                let sub_segs: Vec<_> = sub_key.iter().map(|s| crate::safe_ident(s)).collect();
+                quote! {
+                    if #bound.is_err() {
+                        crate::#(#sub_segs::)*__module_init__()?;
+                    }
+                }
+            }
+            None => quote!(#bound?;),
+        })
+    });
+    quote!(#(#checks)*)
+}
+
+/// The module through which every crate reaches the package root's
+/// init and bound check: the binary carries the root's body under this
+/// name (rypip writes it beside the sibling modules), and the lib root
+/// answers the same path with a shim onto its own items.
+pub const ROOT_INIT_MODULE: &str = "__rython_root";
+
+/// The crate path an init call or bound check for the module at `key`
+/// takes: the module's own path, or [`ROOT_INIT_MODULE`] for the root.
+fn init_module_path(key: &[String]) -> Vec<String> {
+    if key.is_empty() {
+        vec![ROOT_INIT_MODULE.to_string()]
+    } else {
+        key.to_vec()
+    }
+}
+
+/// The `__module_init__` calls for the modules an import loads, in
+/// order: each module's body runs once (the function is once-guarded),
+/// exactly where Python runs it — the import site.
+pub(crate) fn module_init_calls(paths: &[Vec<String>]) -> TokenStream {
+    let calls = paths.iter().map(|path| {
+        let segs: Vec<_> = path.iter().map(|s| crate::safe_ident(s)).collect();
+        quote!(crate::#(#segs::)*__module_init__()?;)
+    });
+    quote!(#(#calls)*)
+}
+
+/// Whether the crate module at `key` deletes `name` at module scope
+/// (`del name`, under module-level control flow too). A module-level
+/// `del` lowers to a no-op (issue #112), so the static outlives the
+/// binding: what a later `from package import name` finds — the
+/// attribute, the submodule, or an ImportError — depends on the order
+/// at runtime, which the converted program cannot represent.
+fn module_deletes(options: &PythonOptions, key: &[String], name: &str) -> bool {
+    use crate::ast::tree::visit::{any_stmt, Descend};
+    let Some(body) = crate::ast::tree::module::normalized_body_of(options, key) else {
+        return false;
+    };
+    any_stmt(&body, Descend::SkipDefs, |s| match &s.statement {
+        crate::StatementType::Delete(targets) => targets
+            .iter()
+            .any(|t| matches!(t, crate::ExprType::Name(n) if n.id == name)),
+        _ => false,
+    })
+}
+
+/// Whether module `key`'s body binds `name` as a module-scope `except
+/// ... as name` handler alias (nested definitions aside). Python binds
+/// the alias for the handler's body and DELETES it when the handler
+/// ends, so the name exists only while the handler runs: an import of it
+/// from inside that window (the handler imports a sibling, which imports
+/// the alias back — a cycle) sees the exception, and one from outside
+/// finds nothing (Devin review on #338, round 17).
+fn module_handler_alias(options: &PythonOptions, key: &[String], name: &str) -> bool {
+    use crate::ast::tree::visit::{any_stmt, Descend};
+    let Some(body) = crate::ast::tree::module::normalized_body_of(options, key) else {
+        return false;
+    };
+    any_stmt(&body, Descend::SkipDefs, |s| match &s.statement {
+        crate::StatementType::Try(t) => t.handlers.iter().any(|h| h.name.as_deref() == Some(name)),
+        _ => false,
+    })
+}
+
+/// The crate modules one import statement loads (every package on a
+/// dotted path, the resolved module, each from-list name that is a
+/// submodule), as module_defs keys, in `ctx` (the importing module's
+/// package context).
+fn stmt_import_keys(stmt: &crate::StatementType, ctx: &PythonOptions) -> Vec<Vec<String>> {
+    let mut paths: Vec<Vec<String>> = Vec::new();
+    match stmt {
+        crate::StatementType::Import(i) => {
+            for a in &i.names {
+                let path: Vec<String> = a.name.split('.').map(str::to_string).collect();
+                for len in 1..=path.len() {
+                    paths.push(path[..len].to_vec());
+                }
+            }
+        }
+        crate::StatementType::ImportFrom(i) => {
+            let base = i.resolved_module_path(ctx);
+            for len in 0..=base.len() {
+                paths.push(base[..len].to_vec());
+            }
+            for a in &i.names {
+                let mut sub = base.clone();
+                sub.push(a.name.clone());
+                paths.push(sub);
+            }
+        }
+        _ => {}
+    }
+    paths
+        .iter()
+        .filter_map(|p| crate::module_defs_key(ctx, p).map(<[String]>::to_vec))
+        .collect()
+}
+
+/// Whether the crate module at `from` imports the module at `to`,
+/// directly or through other crate modules — function-local imports
+/// included, since a function `from`'s body calls may import it — so
+/// `to` can be initialized WHILE `from`'s body runs (a cycle).
+fn module_reaches(options: &PythonOptions, from: &[String], to: &[String]) -> bool {
+    use crate::ast::tree::visit::{walk_stmts, Descend, Flow};
+    if from == to {
+        return true;
+    }
+    let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+    let mut queue: Vec<Vec<String>> = vec![from.to_vec()];
+    while let Some(current) = queue.pop() {
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        let Some(module) = options.module_defs.get(&current) else {
+            continue;
+        };
+        let module: &crate::Module = module;
+        let ctx = crate::ast::tree::module::defining_module_context(options, &current);
+        let mut found = false;
+        walk_stmts(&module.raw.body, Descend::All, &mut |s| {
+            for key in stmt_import_keys(&s.statement, &ctx) {
+                if key == to {
+                    found = true;
+                    return Flow::Stop;
+                }
+                queue.push(key);
+            }
+            Flow::Continue
+        });
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
+/// A module body's local def by name (top-level, or under module-level
+/// control flow).
+
+/// What a module-level name a call may resolve to, by the module's own
+/// bindings of it: a local def (its body is traced), a crate module (the
+/// module's import chain is traced), an external module (a stdlib or
+/// third-party import: its calls load no crate module), or something
+/// the tracing cannot see into (a stored value, a class — its
+/// constructor may import; a loop or `with` target; a handler alias).
+enum CalleeBinding<'a> {
+    Def(&'a crate::FunctionDef),
+    Module(Vec<String>),
+    External,
+    Opaque,
+}
+
+/// The bindings of `name` that may be in force when a module-level call
+/// of it runs, in source order, by Python's later-binding-wins rule: the
+/// last UNCONDITIONAL (top-level) binding replaces everything before it,
+/// and every binding under module-level control flow after it is an
+/// alternative beside it (Devin review on #338, round 23 — the first
+/// binding was taken before, missing a later `from .d import f` that
+/// replaced `from .c import f`).
+fn callee_bindings<'a>(
+    body: &'a [crate::Statement],
+    ctx: &PythonOptions,
+    name: &str,
+) -> Vec<CalleeBinding<'a>> {
+    use crate::ast::tree::visit::{walk_stmts, Descend, Flow};
+    let mut bindings: Vec<CalleeBinding<'a>> = Vec::new();
+    walk_stmts(body, Descend::SkipDefs, &mut |st| {
+        if let crate::StatementType::If(i) = &st.statement
+            && crate::ast::tree::module::Module::is_type_checking_test(&i.test)
+        {
+            return Flow::Skip;
+        }
+        if !stmt_bound_names(st).iter().any(|n| n == name) {
+            return Flow::Continue;
+        }
+        let binding = match &st.statement {
+            crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f)
+                if f.name == name =>
+            {
+                CalleeBinding::Def(f)
+            }
+            crate::StatementType::ImportFrom(i)
+                if i.names.iter().any(|a| a.asname.as_deref().unwrap_or(&a.name) == name) =>
+            {
+                match crate::module_defs_key(ctx, &i.resolved_module_path(ctx)) {
+                    Some(key) => CalleeBinding::Module(key.to_vec()),
+                    None => CalleeBinding::External,
+                }
+            }
+            crate::StatementType::Import(i) => {
+                let alias = i.names.iter().find(|a| {
+                    a.asname
+                        .as_deref()
+                        .unwrap_or_else(|| a.name.split('.').next().unwrap_or(&a.name))
+                        == name
+                });
+                match alias {
+                    Some(a) => {
+                        let path: Vec<String> = a.name.split('.').map(str::to_string).collect();
+                        match crate::module_defs_key(ctx, &path) {
+                            Some(key) => CalleeBinding::Module(key.to_vec()),
+                            None => CalleeBinding::External,
+                        }
+                    }
+                    None => CalleeBinding::Opaque,
+                }
+            }
+            _ => CalleeBinding::Opaque,
+        };
+        if body.iter().any(|top| std::ptr::eq(top, st)) {
+            bindings.clear();
+        }
+        bindings.push(binding);
+        Flow::Continue
+    });
+    bindings
+}
+
+/// A builtin a module-level call may name without binding it: none of
+/// these loads a crate module, except the ones that run code the tracing
+/// cannot see (`exec`, `eval`, `__import__`, `getattr` — treated as
+/// reaching).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InertBuiltin {
+    Print, Len, Str, Int, Float, Bool, List, Dict, Set, Tuple, FrozenSet, Range, Enumerate, Zip,
+    Map, Filter, Sorted, Reversed, IsInstance, IsSubclass, HasAttr, Min, Max, Sum, Abs, Repr,
+    Type, Id, Hash, Iter, Next, Format, Round, DivMod, Pow, Chr, Ord, Any, All, Callable, Bytes,
+    ByteArray, Slice, Open, Input, Vars, Dir, Object, Super, Property, StaticMethod, ClassMethod,
+}
+
+impl InertBuiltin {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "print" => Self::Print, "len" => Self::Len, "str" => Self::Str, "int" => Self::Int,
+            "float" => Self::Float, "bool" => Self::Bool, "list" => Self::List, "dict" => Self::Dict,
+            "set" => Self::Set, "tuple" => Self::Tuple, "frozenset" => Self::FrozenSet,
+            "range" => Self::Range, "enumerate" => Self::Enumerate, "zip" => Self::Zip,
+            "map" => Self::Map, "filter" => Self::Filter, "sorted" => Self::Sorted,
+            "reversed" => Self::Reversed, "isinstance" => Self::IsInstance,
+            "issubclass" => Self::IsSubclass, "hasattr" => Self::HasAttr, "min" => Self::Min,
+            "max" => Self::Max, "sum" => Self::Sum, "abs" => Self::Abs, "repr" => Self::Repr,
+            "type" => Self::Type, "id" => Self::Id, "hash" => Self::Hash, "iter" => Self::Iter,
+            "next" => Self::Next, "format" => Self::Format, "round" => Self::Round,
+            "divmod" => Self::DivMod, "pow" => Self::Pow, "chr" => Self::Chr, "ord" => Self::Ord,
+            "any" => Self::Any, "all" => Self::All, "callable" => Self::Callable,
+            "bytes" => Self::Bytes, "bytearray" => Self::ByteArray, "slice" => Self::Slice,
+            "open" => Self::Open, "input" => Self::Input, "vars" => Self::Vars, "dir" => Self::Dir,
+            "object" => Self::Object, "super" => Self::Super, "property" => Self::Property,
+            "staticmethod" => Self::StaticMethod, "classmethod" => Self::ClassMethod,
+            _ => return None,
+        })
+    }
+}
+
+/// Whether a module-level statement's calls can load the crate module at
+/// `to` (its own imports are handled by the caller): a call of a local
+/// def whose body imports it or calls a local def that does, or of a
+/// function imported from a crate module that reaches `to`, or a method
+/// called through such a module (`mod.f()`). Each called name resolves
+/// by the module's bindings in force at the call (`callee_bindings`).
+/// What the tracing cannot see into COUNTS AS REACHING — correct or
+/// loud (Devin review on #338, round 23): a call of a stored value or a
+/// class (its constructor may import), a method on an object, a call of
+/// a call or a subscript, a free name that is no inert builtin
+/// (`exec`, `eval`, `__import__`, `getattr`, a name bound by a function
+/// through `global`). A builtin that runs no user code, and a function
+/// or method of an external module, load no crate module.
+fn stmt_calls_reach(
+    options: &PythonOptions,
+    ctx: &PythonOptions,
+    body: &[crate::Statement],
+    s: &crate::Statement,
+    to: &[String],
+) -> bool {
+    use crate::ast::tree::visit::{any_expr_for, stmt_exprs, Descend};
+    // Callee expressions of the statement's own calls.
+    let mut callees: Vec<&crate::ExprType> = Vec::new();
+    for e in stmt_exprs(s) {
+        any_expr_for(e, Descend::OwnScope, |x| {
+            if let crate::ExprType::Call(c) = x {
+                callees.push(&c.func);
+            }
+            false
+        });
+    }
+    if callees.is_empty() {
+        return false;
+    }
+    // Whether a local def's body reaches `to`: its imports, or the local
+    // defs it calls (a visited set bounds the recursion); what it calls
+    // that the tracing cannot see into counts as reaching.
+    fn def_reaches(
+        options: &PythonOptions,
+        ctx: &PythonOptions,
+        body: &[crate::Statement],
+        f: &crate::FunctionDef,
+        to: &[String],
+        visited: &mut Vec<String>,
+    ) -> bool {
+        use crate::ast::tree::visit::{any_expr_for, stmt_exprs, walk_stmts, Descend, Flow};
+        if visited.contains(&f.name) {
+            return false;
+        }
+        visited.push(f.name.clone());
+        let mut reaches = false;
+        walk_stmts(&f.body, Descend::All, &mut |st| {
+            if stmt_import_keys(&st.statement, ctx)
+                .iter()
+                .any(|k| k == to || module_reaches(options, k, to))
+            {
+                reaches = true;
+                return Flow::Stop;
+            }
+            for e in stmt_exprs(st) {
+                any_expr_for(e, Descend::All, |x| {
+                    if let crate::ExprType::Call(c) = x
+                        && callee_reaches(options, ctx, body, &c.func, to, visited)
+                    {
+                        reaches = true;
+                    }
+                    reaches
+                });
+                if reaches {
+                    return Flow::Stop;
+                }
+            }
+            Flow::Continue
+        });
+        reaches
+    }
+    fn callee_reaches(
+        options: &PythonOptions,
+        ctx: &PythonOptions,
+        body: &[crate::Statement],
+        callee: &crate::ExprType,
+        to: &[String],
+        visited: &mut Vec<String>,
+    ) -> bool {
+        match callee {
+            crate::ExprType::Name(n) => {
+                let bindings = callee_bindings(body, ctx, &n.id);
+                if bindings.is_empty() {
+                    // A free name: an inert builtin loads nothing; any
+                    // other (`exec`, `getattr`, a `global`-written name)
+                    // may.
+                    return InertBuiltin::from_name(&n.id).is_none();
+                }
+                bindings.into_iter().any(|b| match b {
+                    CalleeBinding::Def(f) => def_reaches(options, ctx, body, f, to, visited),
+                    CalleeBinding::Module(m) => m == to || module_reaches(options, &m, to),
+                    CalleeBinding::External => false,
+                    CalleeBinding::Opaque => true,
+                })
+            }
+            crate::ExprType::Attribute(a) => match a.value.as_ref() {
+                crate::ExprType::Name(n) => {
+                    let bindings = callee_bindings(body, ctx, &n.id);
+                    if bindings.is_empty() {
+                        // `self.x()` inside a def, a free object: opaque.
+                        return true;
+                    }
+                    bindings.into_iter().any(|b| match b {
+                        CalleeBinding::Module(m) => m == to || module_reaches(options, &m, to),
+                        CalleeBinding::External => false,
+                        CalleeBinding::Def(_) | CalleeBinding::Opaque => true,
+                    })
+                }
+                _ => true,
+            },
+            _ => true,
+        }
+    }
+    let mut visited: Vec<String> = Vec::new();
+    callees
+        .into_iter()
+        .any(|callee| callee_reaches(options, ctx, body, callee, to, &mut visited))
+}
+
+/// Whether the crate module at `key` binds `name` by an import (from
+/// another module), then imports the module at `to` — directly, through
+/// the modules that import runs, or through a call that imports it
+/// (`stmt_calls_reach`) — and only then rebinds `name` by a def, a class
+/// or a store. The import is dropped (the local
+/// definition wins, `ImportFrom::to_rust`), so the converted module
+/// holds one item, the definition; but `to`, initialized while `key`'s
+/// body sits between the two bindings, would read the IMPORTED value in
+/// Python (Devin review on #338, round 15). A rebinding that runs before
+/// the cycle's import is the definition on both sides.
+fn imported_value_exposed_to(
+    options: &PythonOptions,
+    key: &[String],
+    name: &str,
+    to: &[String],
+) -> bool {
+    use crate::ast::tree::visit::{walk_stmts, Descend, Flow};
+    let Some(body) = crate::ast::tree::module::normalized_body_of(options, key) else {
+        return false;
+    };
+    let ctx = crate::ast::tree::module::defining_module_context(options, key);
+    let mut imported = false;
+    let mut cycle_between = false;
+    let mut exposed = false;
+    walk_stmts(&body, Descend::SkipDefs, &mut |s| {
+        let is_import = matches!(
+            &s.statement,
+            crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
+        );
+        if imported && !cycle_between {
+            let reaches_by_import = is_import
+                && stmt_import_keys(&s.statement, &ctx)
+                    .iter()
+                    .any(|k| k == to || module_reaches(options, k, to));
+            if reaches_by_import || stmt_calls_reach(options, &ctx, &body, s, to) {
+                cycle_between = true;
+            }
+        }
+        if !stmt_bound_names(s).iter().any(|n| n == name) {
+            return Flow::Continue;
+        }
+        if is_import {
+            // A self-import (`from .a import x` inside a) imports nothing
+            // from elsewhere: the value Python would expose is this
+            // module's own binding.
+            let from_elsewhere = !stmt_import_keys(&s.statement, &ctx)
+                .iter()
+                .any(|k| k == key);
+            if from_elsewhere {
+                imported = true;
+                cycle_between = false;
+            }
+        } else if imported && cycle_between {
+            exposed = true;
+            return Flow::Stop;
+        } else {
+            imported = false;
+        }
+        Flow::Continue
+    });
+    exposed
+}
+
+/// What an import statement runs at its site: the loaded modules' init
+/// calls, then the checks of the from-list names the package binds —
+/// the one lowering every import site (module level, nested,
+/// function-local) shares. Empty when the statement loads no crate
+/// module. A from-list name the package binds AND deletes is refused
+/// (Devin review on #338, round 13): Python decides at runtime whether
+/// the attribute, the submodule, or an ImportError answers, and the
+/// static layout would hand out the deleted value.
+pub(crate) fn import_site_init(
+    stmt: &crate::StatementType,
+    options: &PythonOptions,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    if let crate::StatementType::ImportFrom(i) = stmt {
+        let base = i.resolved_module_path(options);
+        if let Some(key) = crate::module_defs_key(options, &base) {
+            // `from m import *` while `m` is partially initialized (m
+            // starts first, reaches this module, which star-imports m
+            // back): Python copies only the names m has bound by then;
+            // the static glob binds every export, whenever. Refused
+            // (Devin review on #338, round 21) — unless this module is
+            // an ancestor package of m: Python initializes a package
+            // before any of its submodules, so m cannot be running when
+            // its package star-imports it (`__init__`'s `from .core
+            // import *` over core's `from . import utils`, the idiom).
+            if i.names.iter().any(|a| a.name == "*")
+                && !key.starts_with(&options.this_module_path)
+                && module_reaches(options, key, &options.this_module_path)
+            {
+                return Err(format!(
+                    "`from {}{} import *` is refused: `{}` imports this module (directly, \
+                     or through a call), so when `{}` starts first the star import runs \
+                     while it is partially initialized and Python copies only the names \
+                     bound by then, which the static glob cannot represent; import the \
+                     names explicitly, or break the import cycle",
+                    ".".repeat(i.level),
+                    i.module,
+                    key.join("."),
+                    key.join(".")
+                )
+                .into());
+            }
+            if i.names.iter().any(|a| a.name == "*") {
+                let conditional = module_conditional_deletes(options, key);
+                if !conditional.is_empty() {
+                    return Err(format!(
+                        "`from {}{} import *` is refused: `{}` deletes `{}` under a \
+                         module-level condition, so whether the star import binds it is \
+                         decided at runtime, which the static re-export cannot represent; \
+                         import the names explicitly, or delete unconditionally",
+                        ".".repeat(i.level),
+                        i.module,
+                        key.join("."),
+                        conditional.join("`, `")
+                    )
+                    .into());
+                }
+            }
+            for a in i.names.iter().filter(|a| a.name != "*") {
+                // The module imports the name, then imports THIS module
+                // (a cycle), then redefines the name: Python exposes the
+                // imported value here, which the converted module (one
+                // item, the definition) cannot (Devin review on #338,
+                // round 15). A rebinding before the cycle's import, or a
+                // sibling outside the cycle, gets the definition on both
+                // sides.
+                if imported_value_exposed_to(options, key, &a.name, &options.this_module_path) {
+                    return Err(format!(
+                        "`from {}{} import {}` is refused: `{}` imports `{}`, then imports \
+                         this module (directly, or through a call), then redefines `{}`, \
+                         so Python exposes the imported value here where the converted \
+                         module holds only its definition; import the value from the \
+                         module that defines it, or move the definition before the import",
+                        ".".repeat(i.level),
+                        i.module,
+                        a.name,
+                        key.join("."),
+                        a.name,
+                        a.name
+                    )
+                    .into());
+                }
+                // The module binds the name as an `except ... as` alias —
+                // bound for the handler's body, deleted at its end — and
+                // reaches this module (the handler imports a sibling that
+                // imports the alias back): Python hands out the exception
+                // in that window and nothing after it, a bind-then-unbind
+                // the bound bitmap (bits only set) cannot time; with a
+                // same-named submodule the after-window answer is that
+                // submodule instead (Devin review on #338, round 17).
+                if module_handler_alias(options, key, &a.name)
+                    && module_reaches(options, key, &options.this_module_path)
+                {
+                    return Err(format!(
+                        "`from {}{} import {}` is refused: `{}` binds `{}` only as an \
+                         `except ... as {}` alias, which Python deletes when the handler \
+                         ends, and that module imports this one (directly, or through a \
+                         call), so the import finds the exception while the handler runs \
+                         and nothing (or a submodule of that name) after it, a timing the \
+                         converted program cannot represent; bind the exception to a name \
+                         the module keeps, or break the import cycle",
+                        ".".repeat(i.level),
+                        i.module,
+                        a.name,
+                        key.join("."),
+                        a.name,
+                        a.name
+                    )
+                    .into());
+                }
+                // The package star-imports a module whose exports the
+                // conversion cannot enumerate, binds the name no other
+                // way, and has a submodule of that name: whether Python
+                // finds the attribute or imports the submodule depends on
+                // what the star import bound — refused (Devin review on
+                // #338, round 20).
+                if a.name != "*"
+                    && module_binding(options, key, &a.name).is_none()
+                    && module_star_imports_unknown(options, key)
+                    && {
+                        let mut sub = key.to_vec();
+                        sub.push(a.name.clone());
+                        crate::module_defs_key(options, &sub).is_some()
+                    }
+                {
+                    return Err(format!(
+                        "`from {}{} import {}` is refused: {} star-imports a module whose \
+                         exported names the conversion cannot enumerate (an external module, \
+                         or an `__all__` that is not a literal list of strings) and also has \
+                         a submodule `{}`, so whether Python finds an attribute or imports \
+                         the submodule depends on what the star import bound; import the \
+                         names explicitly, or give the module a literal `__all__`",
+                        ".".repeat(i.level),
+                        i.module,
+                        a.name,
+                        if key.is_empty() {
+                            "the package".to_string()
+                        } else {
+                            format!("`{}`", key.join("."))
+                        },
+                        a.name
+                    )
+                    .into());
+                }
+                if module_binding(options, key, &a.name).is_some()
+                    && module_deletes(options, key, &a.name)
+                {
+                    return Err(format!(
+                        "`from {}{} import {}` is refused: the package binds `{}` and \
+                         deletes it (`del {}`), so whether the import finds the attribute, \
+                         a submodule of that name, or nothing depends on the order at \
+                         runtime, which the converted program cannot represent; import \
+                         the value under a name the package keeps, or drop the `del`",
+                        ".".repeat(i.level),
+                        i.module,
+                        a.name,
+                        a.name,
+                        a.name
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    let calls = module_init_calls(&imported_crate_modules(stmt, options));
+    let checks = import_site_name_checks(stmt, options);
+    Ok(quote!(#calls #checks))
+}
+
+/// The import site of a folded `try: <imports> except ImportError:` (or
+/// bare `except:`) guard. The guard folds because rython's imports are
+/// static — but a crate module's body can raise at runtime (an
+/// ImportError from a cycle asking for a name bound later or a module
+/// that stays failed; anything at all from its own statements), where
+/// Python would run the fallback the fold discarded. That case is loud:
+/// the exceptions the handler would have caught — ImportError for a
+/// typed guard, every exception for a bare one — leave the site as an
+/// ImportError naming the guard, the folded fallback and the original
+/// error, instead of a bare error (Devin review on #338, rounds 10 and
+/// 19). What the handler would not have caught propagates as in Python.
+pub(crate) fn folded_guard_site(
+    site: TokenStream,
+    spelling: &str,
+    guard: crate::ast::tree::module::FoldedGuard,
+) -> TokenStream {
+    use crate::ast::tree::module::FoldedGuard;
+    if site.is_empty() {
+        return site;
+    }
+    let (raised, handler) = match guard {
+        FoldedGuard::ImportError => ("ImportError", "`except ImportError:`"),
+        FoldedGuard::Bare => ("an exception", "bare `except:`"),
+    };
+    let message = format!(
+        "`{}` raised {} at import time; its {} fallback was folded away (rython's \
+         imports are static), so the program cannot run the fallback as Python would",
+        spelling, raised, handler
+    );
+    let caught = match guard {
+        FoldedGuard::ImportError => quote!(if __rython_import_error.matches("ImportError")),
+        FoldedGuard::Bare => quote!(),
+    };
+    quote! {
+        match (|| -> Result<(), PyException> { #site Ok(()) })() {
+            Ok(()) => {}
+            Err(__rython_import_error) #caught => {
+                return Err(PyException::new(
+                    "ImportError",
+                    format!("{}: {}", #message, __rython_import_error),
+                ));
+            }
+            #[allow(unreachable_patterns)]
+            Err(__rython_import_error) => return Err(__rython_import_error),
+        }
+    }
+}
+
 impl CodeGen for Import {
     type Context = CodeGenContext;
     type Options = PythonOptions;
@@ -1193,6 +2691,21 @@ impl CodeGen for ImportFrom {
             }
             if alias.name == "*" {
                 let visibility = if self.level > 0 { quote!(pub) } else { quote!() };
+                // A crate source with a literal `__all__` exports THOSE
+                // names, not every public item: the glob would re-export
+                // a name `__all__` leaves out, and a sibling's `from pkg
+                // import name` would take it where Python imports the
+                // submodule of that name (Devin review on #338, round 20).
+                let source = self.resolved_module_path(&options);
+                let listed = crate::module_defs_key(&options, &source)
+                    .and_then(|key| star_reexport_list(&options, key));
+                if let Some(names) = listed {
+                    if !names.is_empty() {
+                        let idents: Vec<_> = names.iter().map(|n| crate::safe_ident(n)).collect();
+                        tokens.extend(quote! { #visibility use #root #(::#base_parts)* #(::#module_path)*::{#(#idents),*}; });
+                    }
+                    continue;
+                }
                 tokens.extend(quote! { #visibility use #root #(::#base_parts)* #(::#module_path)*::*; });
                 continue;
             }

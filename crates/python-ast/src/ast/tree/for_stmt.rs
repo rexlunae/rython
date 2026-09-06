@@ -71,6 +71,13 @@ impl CodeGen for For {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // The target's binding marks, recorded at the top of the body,
+        // where Python has bound it (Devin review on #338, rounds 9 to
+        // 12); the iterable's own walrus records itself.
+        let body_bind = crate::ast::tree::import::binds_for(
+            options.stmt_binds.as_deref(),
+            crate::ast::tree::visit::target_names(&self.target).into_iter(),
+        );
         // Python's loop variable is function-scoped: when the target name
         // LEAKS (a later statement reads it, unshadowed), the scope analysis
         // hoists it and this loop must STORE into that binding — a fresh
@@ -115,7 +122,10 @@ impl CodeGen for For {
             .into_iter()
             .map(|stmt| stmt.to_rust(body_ctx.clone(), options.clone(), symbols.clone()))
             .collect();
-        let body_stmts = body_stmts?;
+        let mut body_stmts = body_stmts?;
+        if let Some(bind) = body_bind {
+            body_stmts.insert(0, bind);
+        }
 
         // When any target name leaks, the loop element binds to a temp
         // (`__rython_elt`) and the target lowering stores it into the

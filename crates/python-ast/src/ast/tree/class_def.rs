@@ -247,6 +247,16 @@ pub fn crate_import_in_defining_module(class: &str, name: &str) -> Option<(Vec<S
     })
 }
 
+/// Whether `name`, in the module defining `class`, is a crate import a
+/// later unconditional module-level binding rebound (the symbol table
+/// still holds the import; the flow says the name is a value now).
+pub fn is_rebound_crate_import_in_defining_module(class: &str, name: &str) -> bool {
+    CLASS_BINDINGS.with(|r| match r.borrow().get(class) {
+        Some(bindings) => bindings.rebound_imports.contains(name),
+        None => THIS_BINDINGS.with(|t| t.borrow().rebound_imports.contains(name)),
+    })
+}
+
 /// What a module's import statements say about its names, beside the
 /// alias flow of [`module_name_aliases`]: the names bound by an EXTERNAL
 /// import, and the `as` bindings of CRATE imports with their source
@@ -258,8 +268,20 @@ pub fn crate_import_in_defining_module(class: &str, name: &str) -> Option<(Vec<S
 pub struct ModuleBindings {
     pub externals: std::collections::HashSet<String>,
     /// Every crate import's local name → (the source module's key, the
-    /// name there), `as` binding or not.
+    /// name there), `as` binding or not. A class definition AFTER the
+    /// import rebinds the name (Python's later binding wins; the import
+    /// is dropped here as in import.rs); an import after a definition is
+    /// refused at the module (Devin review on #336/#338).
     pub crate_imports: std::collections::HashMap<String, (Vec<String>, String)>,
+    /// The names a crate import bound whose LATEST unconditional
+    /// module-level binding is one the symbol table does not record
+    /// (`Root += 1`, a `with` target, a walrus, a tuple store — the
+    /// table would still answer with the import): the name is a value,
+    /// never the imported class (Devin review on #338, round 17). A
+    /// later binding the table records — a crate import, a single-name
+    /// store, a def, a class — clears it: the table answers for that
+    /// one (round 18).
+    pub rebound_imports: std::collections::HashSet<String>,
 }
 
 thread_local! {
@@ -412,9 +434,21 @@ pub(crate) fn module_name_aliases_depth(
         nested: bool,
         bindings: &mut Vec<(String, Vec<String>)>,
         crate_imports: &mut std::collections::HashMap<String, (Vec<String>, String)>,
+        rebound: &mut std::collections::HashSet<String>,
         options: &crate::PythonOptions,
         depth: usize,
     ) {
+        // A crate import the flow rebinds: out of the map, into the
+        // rebound set.
+        fn rebind(
+            crate_imports: &mut std::collections::HashMap<String, (Vec<String>, String)>,
+            rebound: &mut std::collections::HashSet<String>,
+            name: &str,
+        ) {
+            if crate_imports.remove(name).is_some() {
+                rebound.insert(name.to_string());
+            }
+        }
         for s in stmts {
             match &s.statement {
                 // A crate module by the one lookup that admits a
@@ -429,6 +463,9 @@ pub(crate) fn module_name_aliases_depth(
                     for a in &i.names {
                         let name = a.asname.clone().unwrap_or_else(|| a.name.clone());
                         bind(bindings, &name, EXTERNAL_ALTERNATIVE, nested);
+                        if !nested {
+                            rebind(crate_imports, rebound, &name);
+                        }
                     }
                 }
                 crate::StatementType::Import(i) => {
@@ -437,22 +474,22 @@ pub(crate) fn module_name_aliases_depth(
                             a.name.split('.').next().unwrap_or(&a.name).to_string()
                         });
                         bind(bindings, &name, EXTERNAL_ALTERNATIVE, nested);
-                    }
-                }
-                crate::StatementType::Assign(a) => {
-                    if let [ExprType::Name(t)] = a.targets.as_slice() {
-                        match &a.value {
-                            ExprType::Name(v) => bind(bindings, &t.id, &v.id, nested),
-                            _ => bind(bindings, &t.id, VALUE_ALTERNATIVE, nested),
+                        if !nested {
+                            rebind(crate_imports, rebound, &name);
                         }
                     }
                 }
-                crate::StatementType::ClassDef(c) => {
-                    bind(bindings, &c.name, CLASS_ALTERNATIVE, nested);
-                }
-                crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
-                    bind(bindings, &f.name, LOCAL_ALTERNATIVE, nested);
-                }
+                // An UNCONDITIONAL binding after a crate import of the name
+                // is the name's latest binding: the import is rebound and
+                // no longer resolves a base (Devin review on #338). EVERY
+                // form the one statement visitor recognizes counts — a
+                // store (a tuple pattern too), an augmented assignment, a
+                // `with` target, a walrus in the statement's own
+                // expressions, a def, a class (round 17). A binding under
+                // control flow is one of the name's alternatives —
+                // runtime-ambiguous — and leaves the import in place; a
+                // loop target is one such binding (the loop over nothing
+                // leaves the import bound), never an invalidation.
                 // An import alias names a class of a CRATE module only:
                 // an external package's `Root as R` is not the crate's
                 // `Root` (the index is keyed by bare name — Devin review
@@ -483,25 +520,82 @@ pub(crate) fn module_name_aliases_depth(
                             options, &source_key, &a.name, depth,
                         ) {
                             bind(bindings, local, EXTERNAL_ALTERNATIVE, nested);
-                        } else if local != a.name {
-                            bind(bindings, local, &a.name, nested);
-                            crate_imports
-                                .insert(local.to_string(), (source_key.clone(), a.name.clone()));
+                            if !nested {
+                                rebind(crate_imports, rebound, local);
+                            }
                         } else {
-                            bind(bindings, local, LOCAL_ALTERNATIVE, nested);
+                            if local != a.name {
+                                bind(bindings, local, &a.name, nested);
+                            } else {
+                                bind(bindings, local, LOCAL_ALTERNATIVE, nested);
+                            }
                             crate_imports
                                 .insert(local.to_string(), (source_key.clone(), a.name.clone()));
+                            rebound.remove(local);
                         }
                     }
                 }
-                _ => {}
+                _ => {
+                    let stmt_conditional = nested
+                        || matches!(
+                            &s.statement,
+                            crate::StatementType::For(_) | crate::StatementType::AsyncFor(_)
+                        );
+                    // A walrus that may not run (`flag and (X := 1)`, a
+                    // conditional branch, a comprehension) binds under
+                    // control flow: an alternative, never an
+                    // invalidation (Devin review on #338, round 21).
+                    let conditional_walruses =
+                        crate::ast::tree::visit::conditional_walrus_names(s);
+                    for n in crate::ast::tree::visit::stmt_bound_names(
+                        s,
+                        crate::ast::tree::visit::Bindings::Scope,
+                    ) {
+                        let conditional = stmt_conditional || conditional_walruses.contains(&n);
+                        let target: &str = match &s.statement {
+                            crate::StatementType::Assign(a) => match (a.targets.as_slice(), &a.value) {
+                                ([ExprType::Name(t)], ExprType::Name(v)) if t.id == n => &v.id,
+                                _ => VALUE_ALTERNATIVE,
+                            },
+                            crate::StatementType::ClassDef(_) => CLASS_ALTERNATIVE,
+                            crate::StatementType::FunctionDef(_)
+                            | crate::StatementType::AsyncFunctionDef(_) => LOCAL_ALTERNATIVE,
+                            _ => VALUE_ALTERNATIVE,
+                        };
+                        bind(bindings, &n, target, conditional);
+                        if !conditional {
+                            rebind(crate_imports, rebound, &n);
+                            // A binding the symbol table records (a
+                            // single-name store, a def, a class) is the
+                            // name's latest binding THERE too, so the
+                            // symbol table answers for it: the marker
+                            // stands only while the latest binding is
+                            // one the table does not record (Devin
+                            // review on #338, round 18 — `Root = 1` then
+                            // `class Root(Exception)` is that class).
+                            let recorded = match &s.statement {
+                                crate::StatementType::Assign(a) => {
+                                    matches!(a.targets.as_slice(), [ExprType::Name(t)] if t.id == n)
+                                }
+                                crate::StatementType::ClassDef(_)
+                                | crate::StatementType::FunctionDef(_)
+                                | crate::StatementType::AsyncFunctionDef(_) => true,
+                                _ => false,
+                            };
+                            if recorded {
+                                rebound.remove(&n);
+                            }
+                        }
+                    }
+                }
             }
             for body in stmt_bodies_for(s, Descend::SkipDefs) {
-                collect(body, true, bindings, crate_imports, options, depth);
+                collect(body, true, bindings, crate_imports, rebound, options, depth);
             }
         }
     }
-    collect(body, false, &mut bindings, &mut crate_imports, options, depth);
+    let mut rebound: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect(body, false, &mut bindings, &mut crate_imports, &mut rebound, options, depth);
     let externals: std::collections::HashSet<String> = bindings
         .iter()
         .filter(|(_, alts)| alts.iter().any(|t| t == EXTERNAL_ALTERNATIVE))
@@ -512,7 +606,7 @@ pub(crate) fn module_name_aliases_depth(
             .into_iter()
             .flat_map(|(n, alts)| alts.into_iter().map(move |t| (n.clone(), t)))
             .collect(),
-        ModuleBindings { externals, crate_imports },
+        ModuleBindings { externals, crate_imports, rebound_imports: rebound },
     )
 }
 
@@ -774,6 +868,9 @@ pub fn compute_exception_classes(
             if f.bindings.externals.contains(&cur) {
                 return None;
             }
+            // The module's own class (an import that rebinds it after the
+            // definition is refused at the module; one before it is
+            // dropped from crate_imports by the collector).
             if f.defs.contains(&cur) {
                 return Some((key, cur));
             }

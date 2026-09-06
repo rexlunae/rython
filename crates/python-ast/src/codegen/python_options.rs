@@ -588,16 +588,55 @@ pub struct PythonOptions {
     pub module_defs:
         std::rc::Rc<std::collections::HashMap<Vec<String>, std::rc::Rc<crate::Module>>>,
 
-    /// Module paths whose `__module_init__` the ENTRY module's `main` runs
-    /// at startup, before its own, in dependency order (a module's imports
-    /// before the module — the order Python runs module bodies when the
-    /// entry is imported). Python runs a module's top-level statements when
-    /// the module is first imported; the generated crate has no import
-    /// step, so the entry binary runs them all at startup instead
-    /// (function-local imports are hoisted to startup too — the same eager
-    /// model as the crate's lazily-initialized statics). Set by the
-    /// converter on the entry module only; empty otherwise (issue #333).
-    pub startup_module_inits: std::rc::Rc<Vec<Vec<String>>>,
+    /// True while a MODULE-LEVEL control-flow statement (an `if`, a
+    /// `try`, a loop, a `with`) is lowered into `__module_init__`: an
+    /// import nested in it has its `use` hoisted to module scope by the
+    /// module emission, and the statement position carries only the
+    /// imported modules' `__module_init__` calls — Python runs the import
+    /// (the module body) there, conditionally (Devin review on #338).
+    pub in_module_init_body: bool,
+
+    /// The current module's binding marks (see `import::BindingMarks`):
+    /// each module-scope binding statement's per-name marks by its source
+    /// position. A nested statement lowered with `in_module_init_body`
+    /// records its marks where its bindings happen (`__rython_bind__`),
+    /// so a cyclic importer can ask which names the body has bound
+    /// (Devin review on #338, rounds 8 to 12).
+    pub init_binding_marks:
+        std::rc::Rc<std::collections::HashMap<(usize, usize), crate::ast::tree::import::StmtMarks>>,
+
+    /// The module-scope statement being lowered: its bound names' bits
+    /// (`name -> (word, mask)`). The lowerings that bind a name before the
+    /// statement completes record it there and then: a loop or `with`
+    /// target at the top of the body, each `with` item's target after its
+    /// context expression, a walrus right after its store (Devin review on
+    /// #338, rounds 9 to 12). A lambda's body is its own scope and clears
+    /// it; every statement sets its own.
+    pub stmt_binds: Option<std::rc::Rc<std::collections::HashMap<String, (usize, u32)>>>,
+
+    /// The normalized bodies of the crate's modules (see
+    /// `module::normalize_module_body`), cached per module path: an
+    /// importer's bound check numbers a target module's binding
+    /// statements over the same sequence the target's emission numbers.
+    pub normalized_bodies:
+        std::rc::Rc<std::cell::RefCell<std::collections::HashMap<Vec<String>, std::rc::Rc<Vec<crate::Statement>>>>>,
+
+    /// The source positions of the imports a folded `try: <imports>
+    /// except ImportError:` guard spliced into the module body (the fold
+    /// decided statically that every import resolves): their import
+    /// sites are loud when a crate module's body raises ImportError at
+    /// runtime, where Python would run the folded fallback (Devin review
+    /// on #338, round 10).
+    pub folded_guard_imports: std::rc::Rc<
+        std::collections::HashMap<(usize, usize), crate::ast::tree::module::FoldedGuard>,
+    >,
+
+    /// Set on the ENTRY module by the converter when the package root
+    /// `__init__` has a body the binary must run: the bin-side module that
+    /// carries it (`__rython_root`), whose `__module_init__` the entry's
+    /// `main` runs first — `python -m pkg.cli` runs `pkg/__init__.py`
+    /// before `cli` (Devin review on #338).
+    pub root_init_module: Option<String>,
 
     /// Lazily-computed merged trait-mut table over ALL modules of the crate
     /// (`module_defs`), shared across every module's conversion: the
@@ -707,7 +746,14 @@ impl Default for PythonOptions {
             rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),
             module_defs: std::rc::Rc::new(std::collections::HashMap::new()),
-            startup_module_inits: std::rc::Rc::new(Vec::new()),
+            in_module_init_body: false,
+            init_binding_marks: std::rc::Rc::new(std::collections::HashMap::new()),
+            stmt_binds: None,
+            normalized_bodies: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            )),
+            folded_guard_imports: std::rc::Rc::new(std::collections::HashMap::new()),
+            root_init_module: None,
             cross_module_mut_self: std::rc::Rc::new(std::cell::RefCell::new(
                 CrossModuleMutSelf::Uncomputed,
             )),

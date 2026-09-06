@@ -8843,6 +8843,326 @@ fn imported_class_constant_default_resolves_through_import() {
 }
 
 #[test]
+fn a_star_import_of_a_crate_module_honours_its_literal_all() {
+    // `from .values import *` re-exports what Python binds: values'
+    // literal `__all__` when it has one (an explicit `use` list, so a
+    // name `__all__` leaves out is not silently re-exported), the glob
+    // otherwise (Devin review on #338, round 20).
+    let glob = |values_src: &str| -> String {
+        let src = "from .values import *\n";
+        let mut defs = std::collections::HashMap::new();
+        defs.insert(
+            vec!["pkg".to_string(), "values".to_string()],
+            std::rc::Rc::new(parse(values_src, "values.py").unwrap()),
+        );
+        defs.insert(
+            vec!["pkg".to_string(), "star".to_string()],
+            std::rc::Rc::new(parse(src, "star.py").unwrap()),
+        );
+        let options = PythonOptions {
+            module_defs: std::rc::Rc::new(defs),
+            module_path: vec!["pkg".to_string()],
+            this_module_path: vec!["pkg".to_string(), "star".to_string()],
+            python_namespace: "pkg".to_string(),
+            ..Default::default()
+        };
+        compile_with_options(src, "star.py", options).expect("the star import converts")
+    };
+    let listed = glob("__all__ = [\"other\"]\nthing = 1\nother = 2\n");
+    assert!(
+        listed.contains("values :: { other }") && !listed.contains("values :: *"),
+        "generated: {}",
+        listed
+    );
+    let all = glob("thing = 1\nother = 2\n");
+    assert!(all.contains("values :: *"), "generated: {}", all);
+}
+
+#[test]
+fn a_star_import_follows_the_latest_effective_all() {
+    // `__all__` is what it is when the module's body has run: a later
+    // top-level literal replaces a computed or conditional one (known
+    // again), a later mutation (`.append`, `+=`, a subscript store) or
+    // conditional binding makes the exports unknown (the glob) — Devin
+    // review on #338, round 21.
+    let glob = |values_src: &str| -> String {
+        let src = "from .values import *\n";
+        let mut defs = std::collections::HashMap::new();
+        defs.insert(
+            vec!["pkg".to_string(), "values".to_string()],
+            std::rc::Rc::new(parse(values_src, "values.py").unwrap()),
+        );
+        defs.insert(
+            vec!["pkg".to_string(), "star".to_string()],
+            std::rc::Rc::new(parse(src, "star.py").unwrap()),
+        );
+        let options = PythonOptions {
+            module_defs: std::rc::Rc::new(defs),
+            module_path: vec!["pkg".to_string()],
+            this_module_path: vec!["pkg".to_string(), "star".to_string()],
+            python_namespace: "pkg".to_string(),
+            ..Default::default()
+        };
+        compile_with_options(src, "star.py", options).expect("the star import converts")
+    };
+    // Round 22: a read of the list (`__all__.copy()`, `len(__all__)`, a
+    // membership-keeping method) leaves the literal in force; a top-level
+    // `del __all__` unbinds it (the public names again — the glob, or
+    // the explicit list when a public name was deleted).
+    for (src, listed) in [
+        ("names = [\"thing\"]\n__all__ = list(names)\n__all__ = [\"other\"]\nthing = 1\nother = 2\n", true),
+        ("flag = True\nif flag:\n    __all__ = [\"thing\"]\n__all__ = [\"other\"]\nthing = 1\nother = 2\n", true),
+        ("__all__ = [\"other\"]\n__all__.append(\"thing\")\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\n__all__ += [\"thing\"]\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\nflag = True\nif flag:\n    __all__ = [\"thing\"]\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\nnames = __all__.copy()\nn = len(__all__)\n__all__.sort()\nthing = 1\nother = 2\n", true),
+        ("__all__ = [\"other\"]\nregister(__all__)\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\nregister(exports=__all__)\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\nprint(names=__all__)\nthing = 1\nother = 2\n", true),
+        // Round 24: an alias of the list escapes the analysis (a mutation
+        // through it is invisible), a builtin the module shadows is not
+        // the builtin, a def naming the list may mutate it when called;
+        // a loop over it, an `in` test and a subscript read see through.
+        ("__all__ = [\"other\"]\nexports = __all__\nexports.append(\"thing\")\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\npair = (__all__, 1)\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\n\n\ndef len(items: list[str]) -> int:\n    items.append(\"thing\")\n    return 0\n\n\nlen(__all__)\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\n\n\ndef grow() -> None:\n    __all__.append(\"thing\")\n\n\ngrow()\nthing = 1\nother = 2\n", false),
+        ("__all__ = [\"other\"]\nfor n in __all__:\n    print(n)\nok = \"other\" in __all__\nfirst = __all__[0]\nthing = 1\nother = 2\n", true),
+        ("__all__ = [\"other\"]\ndel __all__\nthing = 1\nother = 2\n", false),
+    ] {
+        let out = glob(src);
+        if listed {
+            assert!(
+                out.contains("values :: { other }") && !out.contains("values :: *"),
+                "{}: generated: {}",
+                src,
+                out
+            );
+        } else {
+            assert!(out.contains("values :: *"), "{}: generated: {}", src, out);
+        }
+    }
+}
+
+#[test]
+fn a_star_import_re_exports_explicitly_when_the_source_deleted_a_public_name() {
+    // `x = 1; del x; y = 2` star-imported: the glob would re-export x's
+    // static (a module-level `del` is a no-op in the emission), so the
+    // re-export lists the surviving names (Devin review on #338, round
+    // 22); after `del __all__` the public names are the list too.
+    let glob = |values_src: &str| -> String {
+        let src = "from .values import *\n";
+        let mut defs = std::collections::HashMap::new();
+        defs.insert(
+            vec!["pkg".to_string(), "values".to_string()],
+            std::rc::Rc::new(parse(values_src, "values.py").unwrap()),
+        );
+        defs.insert(
+            vec!["pkg".to_string(), "star".to_string()],
+            std::rc::Rc::new(parse(src, "star.py").unwrap()),
+        );
+        let options = PythonOptions {
+            module_defs: std::rc::Rc::new(defs),
+            module_path: vec!["pkg".to_string()],
+            this_module_path: vec!["pkg".to_string(), "star".to_string()],
+            python_namespace: "pkg".to_string(),
+            ..Default::default()
+        };
+        compile_with_options(src, "star.py", options).expect("the star import converts")
+    };
+    let out = glob("x = 1\ndel x\ny = 2\n");
+    assert!(
+        out.contains("values :: { y }") && !out.contains("values :: *"),
+        "generated: {}",
+        out
+    );
+    let out = glob("__all__ = [\"x\"]\ndel __all__\nx = 1\ndel x\ny = 2\n");
+    assert!(
+        out.contains("values :: { y }") && !out.contains("values :: *"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn a_walrus_that_may_not_run_is_a_runtime_alternative_of_an_imported_class() {
+    // `from .errors import Root` then `flag and (Root := 1)`: the walrus
+    // may not run, so Root is the imported class or a value at runtime —
+    // an alternative, never an invalidation of the import: a class
+    // deriving from it is refused as runtime-ambiguous, with the
+    // definition warning saying so (Devin review on #338, round 21).
+    let src = "from .errors import Root\nflag = False\nflag and (Root := 1)\n\n\nclass Leaf(Root):\n    pass\n";
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(
+        vec!["pkg".to_string(), "errors".to_string()],
+        std::rc::Rc::new(parse("class Root(Exception):\n    pass\n", "errors.py").unwrap()),
+    );
+    defs.insert(
+        vec!["pkg".to_string(), "m".to_string()],
+        std::rc::Rc::new(parse(src, "m.py").unwrap()),
+    );
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        module_path: vec!["pkg".to_string()],
+        this_module_path: vec!["pkg".to_string(), "m".to_string()],
+        python_namespace: "pkg".to_string(),
+        ..Default::default()
+    };
+    let warnings = options.definition_warnings.clone();
+    let msg = compile_with_options(src, "m.py", options).expect_err("the ambiguous base is refused");
+    assert!(
+        msg.contains("class `Leaf` inherits from `Root`, which is not an exception class"),
+        "{}",
+        msg
+    );
+    let warnings = warnings.borrow();
+    assert!(
+        warnings.iter().any(|w| w.contains("`Root` is bound more than one way at module level")),
+        "the walrus is an alternative, not a rebinding: {:?}",
+        *warnings
+    );
+}
+
+#[test]
+fn a_folded_guard_site_is_loud_for_what_its_handler_would_have_caught() {
+    // A resolvable import guard folds; its import site is loud when the
+    // crate module raises at runtime — for an ImportError under `except
+    // ImportError:`, for EVERY exception under a bare `except:` (Devin
+    // review on #338, rounds 10 and 19).
+    // The site exists only for a CRATE module (its body runs there), so
+    // the guard's module is a sibling in module_defs.
+    let guarded = |handler: &str| -> String {
+        let src = format!("try:\n    from .m import x\n{}\n    pass\n", handler);
+        let mut defs = std::collections::HashMap::new();
+        defs.insert(
+            vec!["pkg".to_string(), "m".to_string()],
+            std::rc::Rc::new(parse("x = 1\n", "m.py").unwrap()),
+        );
+        defs.insert(
+            vec!["pkg".to_string(), "guard".to_string()],
+            std::rc::Rc::new(parse(&src, "guard.py").unwrap()),
+        );
+        let options = PythonOptions {
+            module_defs: std::rc::Rc::new(defs),
+            module_path: vec!["pkg".to_string()],
+            this_module_path: vec!["pkg".to_string(), "guard".to_string()],
+            python_namespace: "pkg".to_string(),
+            ..Default::default()
+        };
+        compile_with_options(&src, "guard.py", options).expect("the guard converts")
+    };
+    let typed = guarded("except ImportError:");
+    assert!(
+        typed.contains("its `except ImportError:` fallback was folded away")
+            && typed.contains("matches (\"ImportError\")"),
+        "generated: {}",
+        typed
+    );
+    let bare = guarded("except:");
+    assert!(
+        bare.contains("its bare `except:` fallback was folded away")
+            && !bare.contains("matches (\"ImportError\")"),
+        "generated: {}",
+        bare
+    );
+}
+
+#[test]
+fn a_definition_rebinding_a_stored_value_is_refused() {
+    // `X = 1` then `class X` (or `def X`): Python's later binding wins,
+    // but a Rust module cannot hold the value's static and the definition
+    // under one name — refused with the fix named (Devin review on #338,
+    // round 18), the mirror of the def-then-import refusal.
+    for src in [
+        "X = 1\n\n\nclass X(Exception):\n    pass\n",
+        "X = 1\n\n\ndef X() -> int:\n    return 2\n",
+        "X, y = 1, 2\n\n\nclass X:\n    pass\n",
+    ] {
+        let msg = compile_err(src, "storedef.py");
+        assert!(
+            msg.contains("the definition of `X` rebinds a value this module stores above (`X = ...`)")
+                && msg.contains("rename one of the two"),
+            "{}: {}",
+            src,
+            msg
+        );
+    }
+    // A store AFTER the definition is a different shape (Python's
+    // later binding is the value; a decorator idiom) and is not this
+    // refusal's.
+    let out = compile("def f() -> int:\n    return 1\n\n\ng = f\n", "defstore.py");
+    assert!(out.contains("fn f"), "generated: {}", out);
+}
+
+#[test]
+fn import_site_refusals_are_codegen_errors_of_the_importing_module() {
+    // The three import-site refusals (Devin review on #338, rounds 14, 15
+    // and 17) are decided by the importing module's own conversion from
+    // the module_defs it is handed — pinned here at the codegen level, one
+    // two-module package each, the importing module converted with its
+    // package path set (rypip's convert_tests run the same shapes end to
+    // end).
+    let refusal = |modules: &[(&str, &str)], importer: &str, src: &str| -> String {
+        let mut defs = std::collections::HashMap::new();
+        for (name, source) in modules {
+            defs.insert(
+                vec!["pkg".to_string(), name.to_string()],
+                std::rc::Rc::new(parse(source, &format!("{}.py", name)).unwrap()),
+            );
+        }
+        defs.insert(
+            vec!["pkg".to_string(), importer.to_string()],
+            std::rc::Rc::new(parse(src, &format!("{}.py", importer)).unwrap()),
+        );
+        let options = PythonOptions {
+            module_defs: std::rc::Rc::new(defs),
+            module_path: vec!["pkg".to_string()],
+            this_module_path: vec!["pkg".to_string(), importer.to_string()],
+            python_namespace: "pkg".to_string(),
+            ..Default::default()
+        };
+        compile_with_options(src, &format!("{}.py", importer), options)
+            .expect_err("the import is refused")
+    };
+    // A handler alias imported back through the handler's own cycle.
+    let msg = refusal(
+        &[(
+            "a",
+            "try:\n    raise ValueError(\"boom\")\nexcept ValueError as err:\n    from .b import b_value\n    print(b_value())\n",
+        )],
+        "b",
+        "from .a import err\n\n\ndef b_value() -> str:\n    return str(err)\n",
+    );
+    assert!(
+        msg.contains("`from .a import err` is refused: `pkg.a` binds `err` only as an `except ... as err` alias"),
+        "{}",
+        msg
+    );
+    // A name the module imports, exposes through a cycle, then redefines.
+    let msg = refusal(
+        &[("a", "from .c import f\nfrom .b import b_value\n\n\ndef f() -> int:\n    return 2\n"), ("c", "def f() -> int:\n    return 1\n")],
+        "b",
+        "from .a import f\n\n\ndef b_value() -> int:\n    return f()\n",
+    );
+    assert!(
+        msg.contains("`from .a import f` is refused: `pkg.a` imports `f`, then imports this module (directly, or through a call), then redefines `f`"),
+        "{}",
+        msg
+    );
+    // A name the module binds and deletes.
+    let msg = refusal(
+        &[("a", "helper = 1\ndel helper\n")],
+        "b",
+        "from .a import helper\n\n\ndef b_value() -> int:\n    return helper\n",
+    );
+    assert!(
+        msg.contains("`from .a import helper` is refused: the package binds `helper` and deletes it (`del helper`)"),
+        "{}",
+        msg
+    );
+}
+
+#[test]
 fn itertools_takewhile_swaps_predicate_and_iterable() {
     // urllib3's retry.get_backoff_time: `takewhile(lambda x: ..., reversed(
     // self.history))` — Python (predicate, iterable) maps to the runtime
