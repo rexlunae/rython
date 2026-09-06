@@ -8843,6 +8843,42 @@ fn imported_class_constant_default_resolves_through_import() {
 }
 
 #[test]
+fn a_star_import_of_a_crate_module_honours_its_literal_all() {
+    // `from .values import *` re-exports what Python binds: values'
+    // literal `__all__` when it has one (an explicit `use` list, so a
+    // name `__all__` leaves out is not silently re-exported), the glob
+    // otherwise (Devin review on #338, round 20).
+    let glob = |values_src: &str| -> String {
+        let src = "from .values import *\n";
+        let mut defs = std::collections::HashMap::new();
+        defs.insert(
+            vec!["pkg".to_string(), "values".to_string()],
+            std::rc::Rc::new(parse(values_src, "values.py").unwrap()),
+        );
+        defs.insert(
+            vec!["pkg".to_string(), "star".to_string()],
+            std::rc::Rc::new(parse(src, "star.py").unwrap()),
+        );
+        let options = PythonOptions {
+            module_defs: std::rc::Rc::new(defs),
+            module_path: vec!["pkg".to_string()],
+            this_module_path: vec!["pkg".to_string(), "star".to_string()],
+            python_namespace: "pkg".to_string(),
+            ..Default::default()
+        };
+        compile_with_options(src, "star.py", options).expect("the star import converts")
+    };
+    let listed = glob("__all__ = [\"other\"]\nthing = 1\nother = 2\n");
+    assert!(
+        listed.contains("values :: { other }") && !listed.contains("values :: *"),
+        "generated: {}",
+        listed
+    );
+    let all = glob("thing = 1\nother = 2\n");
+    assert!(all.contains("values :: *"), "generated: {}", all);
+}
+
+#[test]
 fn a_folded_guard_site_is_loud_for_what_its_handler_would_have_caught() {
     // A resolvable import guard folds; its import site is loud when the
     // crate module raises at runtime — for an ImportError under `except

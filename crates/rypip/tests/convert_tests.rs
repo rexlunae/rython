@@ -11956,6 +11956,84 @@ fn a_cyclic_import_of_an_except_alias_is_refused() {
 }
 
 #[test]
+fn a_star_import_binds_the_source_exports_for_the_from_list_rule() {
+    // The package's `__init__` does `from .values import *`; values binds
+    // `thing`; thing.py prints when it loads; helper does `from . import
+    // thing`. CPython: the star import bound `thing` as a package
+    // attribute, so the from-list takes it and thing.py never runs —
+    // `main attr`. The binding enumeration records the star statement
+    // as `*`; the from-list rule resolves the source's exports under
+    // that statement's one mark (Devin review on #338, round 20).
+    // With `__all__ = ["other"]` in values, the star import does NOT
+    // bind `thing`, so Python imports the submodule: `thing loaded`,
+    // then `main sub` through `thing.thing` — and the glob re-export
+    // honours the literal `__all__`, so the Rust `thing` is the module
+    // too. A star import of a module whose exports the conversion
+    // cannot enumerate (`from os.path import *`) beside a submodule of
+    // the requested name is refused.
+    let values = |all: &str| format!("{}thing = \"attr\"\nother = \"o\"\n", all);
+    let helper = |read: &str| {
+        format!("from . import thing\n\n\ndef helper_value() -> str:\n    return str({})\n", read)
+    };
+    let cli = concat!(
+        "from .helper import helper_value\n",
+        "\n",
+        "\n",
+        "def main() -> None:\n",
+        "    print(\"main\", helper_value())\n",
+        "\n",
+        "\n",
+        "if __name__ == \"__main__\":\n",
+        "    main()\n",
+    );
+    let plain_values = values("");
+    let all_values = values("__all__ = [\"other\"]\n");
+    let helper_plain = helper("thing");
+    let helper_attr = helper("thing.thing");
+    for (tag, init, values, helper, expected) in [
+        ("starattr", "from .values import *\n", plain_values.as_str(), helper_plain.as_str(), vec!["main attr"]),
+        ("starall", "from .values import *\n", all_values.as_str(), helper_attr.as_str(), vec!["thing loaded", "main sub"]),
+    ] {
+        let scratch = Scratch::new(tag);
+        let krate = package_crate(
+            &scratch,
+            tag,
+            &[
+                ("__init__.py", init),
+                ("values.py", values),
+                ("thing.py", "print(\"thing loaded\")\nthing = \"sub\"\n"),
+                ("helper.py", helper),
+                ("cli.py", cli),
+            ],
+        );
+        assert_eq!(run_package(&krate, tag), expected, "{}", tag);
+    }
+    let scratch = Scratch::new("starext");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"starext\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("starext");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "from os.path import *\n").unwrap();
+    fs::write(pkg.join("thing.py"), "print(\"thing loaded\")\nthing = \"sub\"\n").unwrap();
+    fs::write(pkg.join("helper.py"), helper_plain.as_str()).unwrap();
+    fs::write(pkg.join("cli.py"), cli).unwrap();
+    let discovered = rypip::discover(scratch.path()).expect("discover");
+    let err = rypip::convert(&discovered, &scratch.path().join("crate"), &ConvertOptions::default())
+        .err()
+        .expect("an unknown star import beside a same-named submodule is refused");
+    let msg = format!("{:#}", err);
+    assert!(
+        msg.contains("`from . import thing` is refused: the package star-imports a module whose exported names the conversion cannot enumerate")
+            && msg.contains("also has a submodule `thing`"),
+        "{}",
+        msg
+    );
+}
+
+#[test]
 fn a_from_import_of_a_package_attribute_does_not_load_the_same_named_submodule() {
     // `from . import name` where the package binds `name` and also has a
     // name.py: Python takes the attribute and never runs name.py (Devin

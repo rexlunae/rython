@@ -765,6 +765,130 @@ pub(crate) fn bound_word_and_mask(mark: usize) -> (usize, u32) {
     (mark / BOUND_WORD_BITS, 1u32 << (mark % BOUND_WORD_BITS))
 }
 
+/// The crate module's `__all__` as a list of names: `Ok(Some(names))`
+/// for a literal list or tuple of string constants bound at the top
+/// level (the last one), `Ok(None)` when the module binds no `__all__`,
+/// `Err(())` when it binds one any other way (computed, augmented, under
+/// control flow) — then its star exports are unknown.
+pub(crate) fn literal_all(
+    options: &PythonOptions,
+    key: &[String],
+) -> Result<Option<Vec<String>>, ()> {
+    let Some(body) = crate::ast::tree::module::normalized_body_of(options, key) else {
+        return Ok(None);
+    };
+    let string_items = |e: &crate::ExprType| -> Option<Vec<String>> {
+        let items: &[crate::ExprType] = match e {
+            crate::ExprType::List(items) => items,
+            crate::ExprType::Tuple(t) => &t.elts,
+            _ => return None,
+        };
+        items
+            .iter()
+            .map(|item| match item {
+                crate::ExprType::Constant(c) => match &c.0 {
+                    Some(litrs::Literal::String(lit)) => Some(lit.value().to_string()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    };
+    let mut all: Option<Vec<String>> = None;
+    for (st, mark, top_level) in binding_entries(&body) {
+        if mark.name != "__all__" {
+            continue;
+        }
+        let literal = match &st.statement {
+            crate::StatementType::Assign(a) if top_level => match a.targets.as_slice() {
+                [crate::ExprType::Name(t)] if t.id == "__all__" => string_items(&a.value),
+                _ => None,
+            },
+            _ => None,
+        };
+        match literal {
+            Some(names) => all = Some(names),
+            None => return Err(()),
+        }
+    }
+    Ok(all)
+}
+
+/// The names `from m import *` binds from the crate module at `key`, as
+/// Python takes them: the module's `__all__` when its body binds one as
+/// a list or tuple of string literals at the top level (the last such
+/// binding); otherwise every name its normalized body binds at module
+/// scope (a def's locals excluded) that does not start with `_`, plus
+/// the exports of its own crate-module star imports (depth-bounded).
+/// None when the exports are UNKNOWN: an `__all__` bound any other way
+/// (computed, augmented, under control flow), a star import of an
+/// external module, or a chain deeper than the bound (Devin review on
+/// #338, round 20).
+fn star_exports(options: &PythonOptions, key: &[String], depth: usize) -> Option<Vec<String>> {
+    if depth > 8 {
+        return None;
+    }
+    let body = crate::ast::tree::module::normalized_body_of(options, key)?;
+    let ctx = crate::ast::tree::module::defining_module_context(options, key);
+    match literal_all(options, key) {
+        Ok(Some(all)) => return Some(all),
+        Ok(None) => {}
+        Err(()) => return None,
+    }
+    let mut names: Vec<String> = Vec::new();
+    for (st, mark, _) in binding_entries(&body) {
+        if mark.name == "*" {
+            let crate::StatementType::ImportFrom(i) = &st.statement else {
+                continue;
+            };
+            let path = i.resolved_module_path(&ctx);
+            let source = crate::module_defs_key(options, &path)?;
+            for n in star_exports(options, source, depth + 1)? {
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+        } else if !mark.name.starts_with('_') && !names.contains(&mark.name) {
+            names.push(mark.name.clone());
+        }
+    }
+    Some(names)
+}
+
+/// What a `from X import *` statement of the module in `ctx` binds:
+/// `Some(Some(names))` for a crate module's exports, `Some(None)` when
+/// they are unknown (an external module, an unresolvable `__all__`), and
+/// None for any other statement.
+fn star_import_exports(
+    options: &PythonOptions,
+    ctx: &PythonOptions,
+    s: &crate::Statement,
+) -> Option<Option<Vec<String>>> {
+    let crate::StatementType::ImportFrom(i) = &s.statement else {
+        return None;
+    };
+    if !i.names.iter().any(|a| a.name == "*") {
+        return None;
+    }
+    Some(
+        crate::module_defs_key(options, &i.resolved_module_path(ctx))
+            .and_then(|source| star_exports(options, source, 0)),
+    )
+}
+
+/// Whether the crate module at `key` star-imports a module whose exports
+/// the conversion cannot enumerate (see [`star_exports`]): then whether
+/// it binds a given name is unknown.
+fn module_star_imports_unknown(options: &PythonOptions, key: &[String]) -> bool {
+    let Some(body) = crate::ast::tree::module::normalized_body_of(options, key) else {
+        return false;
+    };
+    let ctx = crate::ast::tree::module::defining_module_context(options, key);
+    binding_entries(&body)
+        .into_iter()
+        .any(|(s, mark, _)| mark.name == "*" && star_import_exports(options, &ctx, s) == Some(None))
+}
+
 /// The bindings of `name` in the body of the crate module at `key` (a
 /// def's locals excluded): every binding's mark, and whether all of them
 /// are nested under module-level control flow. A package's
@@ -782,9 +906,17 @@ fn module_binding(options: &PythonOptions, key: &[String], name: &str) -> Option
         }
         _ => false,
     };
+    // A `from m import *` binds every name `m` exports under the star
+    // statement's one mark (the bit is set when the statement has run,
+    // for all of them at once — Devin review on #338, round 20).
+    let star_binds = |s: &crate::Statement| -> bool {
+        matches!(star_import_exports(options, &ctx, s), Some(Some(names)) if names.iter().any(|n| n == name))
+    };
     let bindings: Vec<(usize, bool)> = binding_entries(&body)
         .into_iter()
-        .filter(|(s, mark, _)| mark.name == name && !imports_own_submodule(s))
+        .filter(|(s, mark, _)| {
+            (mark.name == name || (mark.name == "*" && star_binds(s))) && !imports_own_submodule(s)
+        })
         .map(|(_, mark, top_level)| (mark.mark, top_level))
         .collect();
     if bindings.is_empty() {
@@ -1256,6 +1388,40 @@ pub(crate) fn import_site_init(
                         a.name,
                         key.join("."),
                         a.name,
+                        a.name
+                    )
+                    .into());
+                }
+                // The package star-imports a module whose exports the
+                // conversion cannot enumerate, binds the name no other
+                // way, and has a submodule of that name: whether Python
+                // finds the attribute or imports the submodule depends on
+                // what the star import bound — refused (Devin review on
+                // #338, round 20).
+                if a.name != "*"
+                    && module_binding(options, key, &a.name).is_none()
+                    && module_star_imports_unknown(options, key)
+                    && {
+                        let mut sub = key.to_vec();
+                        sub.push(a.name.clone());
+                        crate::module_defs_key(options, &sub).is_some()
+                    }
+                {
+                    return Err(format!(
+                        "`from {}{} import {}` is refused: {} star-imports a module whose \
+                         exported names the conversion cannot enumerate (an external module, \
+                         or an `__all__` that is not a literal list of strings) and also has \
+                         a submodule `{}`, so whether Python finds an attribute or imports \
+                         the submodule depends on what the star import bound; import the \
+                         names explicitly, or give the module a literal `__all__`",
+                        ".".repeat(i.level),
+                        i.module,
+                        a.name,
+                        if key.is_empty() {
+                            "the package".to_string()
+                        } else {
+                            format!("`{}`", key.join("."))
+                        },
                         a.name
                     )
                     .into());
@@ -2064,6 +2230,21 @@ impl CodeGen for ImportFrom {
             }
             if alias.name == "*" {
                 let visibility = if self.level > 0 { quote!(pub) } else { quote!() };
+                // A crate source with a literal `__all__` exports THOSE
+                // names, not every public item: the glob would re-export
+                // a name `__all__` leaves out, and a sibling's `from pkg
+                // import name` would take it where Python imports the
+                // submodule of that name (Devin review on #338, round 20).
+                let source = self.resolved_module_path(&options);
+                let listed = crate::module_defs_key(&options, &source)
+                    .and_then(|key| literal_all(&options, key).ok().flatten());
+                if let Some(names) = listed {
+                    if !names.is_empty() {
+                        let idents: Vec<_> = names.iter().map(|n| crate::safe_ident(n)).collect();
+                        tokens.extend(quote! { #visibility use #root #(::#base_parts)* #(::#module_path)*::{#(#idents),*}; });
+                    }
+                    continue;
+                }
                 tokens.extend(quote! { #visibility use #root #(::#base_parts)* #(::#module_path)*::*; });
                 continue;
             }
