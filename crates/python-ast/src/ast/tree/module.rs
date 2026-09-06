@@ -981,13 +981,20 @@ impl CodeGen for Module {
         // the same import under two branches emits one item (E0252).
         let mut hoisted_uses: std::collections::HashSet<String> =
             std::collections::HashSet::new();
-        // Whether the module body initializes a static (a promoted value,
-        // a mutable global): such a value cannot be re-initialized by the
-        // process, so a body that raises after touching one cannot run
-        // again faithfully — the module stays failed (Devin review on
-        // #338).
+        // Whether the module holds a static the process cannot
+        // re-initialize: a promoted value the body initializes, or a
+        // mutable global (which a function the body calls may write). A
+        // body that raises in such a module cannot run again faithfully —
+        // the module stays failed (Devin review on #338).
         let mut init_touches_statics = false;
+        // Where each body statement's init code starts: the init records
+        // its progress (the index of the statement about to run) before
+        // that code, so a cyclic importer can tell which names the body
+        // has bound so far (`__rython_bound__`; Devin review on #338,
+        // round 6).
+        let mut progress_marks: Vec<(usize, usize)> = Vec::new();
         for (stmt_index, s) in self.raw.body.into_iter().enumerate() {
+            progress_marks.push((stmt_index, module_init_stmts.len()));
             match &s.statement {
                 crate::StatementType::FunctionDef(f)
                 | crate::StatementType::AsyncFunctionDef(f) => {
@@ -1420,10 +1427,18 @@ impl CodeGen for Module {
                                     });
                             });
                             module_init_stmts.push(quote!(let _ = &*#ident;));
-                            init_touches_statics = true;
                             has_module_init_code = true;
                         }
                     }
+                    // Every mutable global is state the body can leave
+                    // behind: a function the body calls may write it
+                    // (`global COUNT; COUNT += 1`) before the body raises,
+                    // and a re-run would read the written value where
+                    // CPython's fresh module reads the initializer — so a
+                    // body that raises in a module holding one stays
+                    // failed, whatever the initializer's shape (Devin
+                    // review on #338, round 6).
+                    init_touches_statics = true;
                     continue;
                 }
                 if let Some(names) = assign_name_targets(a) {
@@ -1822,13 +1837,12 @@ impl CodeGen for Module {
                             &body_stmt.statement,
                             crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
                         ) {
-                            let loaded = crate::ast::tree::import::imported_crate_modules(
+                            let site = crate::ast::tree::import::import_site_init(
                                 &body_stmt.statement,
                                 &options,
                             );
-                            if !loaded.is_empty() {
-                                module_init_stmts
-                                    .push(crate::ast::tree::import::module_init_calls(&loaded));
+                            if !site.is_empty() {
+                                module_init_stmts.push(site);
                                 has_module_init_code = true;
                             }
                         }
@@ -2032,11 +2046,9 @@ impl CodeGen for Module {
                 &s.statement,
                 crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
             ) {
-                let loaded =
-                    crate::ast::tree::import::imported_crate_modules(&s.statement, &options);
-                if !loaded.is_empty() {
-                    module_init_stmts
-                        .push(crate::ast::tree::import::module_init_calls(&loaded));
+                let site = crate::ast::tree::import::import_site_init(&s.statement, &options);
+                if !site.is_empty() {
+                    module_init_stmts.push(site);
                     has_module_init_code = true;
                 }
             }
@@ -2049,6 +2061,34 @@ impl CodeGen for Module {
                     module_init_stmts.push(statement);
                     has_module_init_code = true;
                 }
+            }
+        }
+
+        // The progress stores, before each statement's init code (a
+        // statement with none — a def, a class — needs no store: the next
+        // one's index counts it as done).
+        {
+            let ends = progress_marks
+                .iter()
+                .skip(1)
+                .map(|(_, at)| *at)
+                .chain(std::iter::once(module_init_stmts.len()));
+            let stores: Vec<(usize, usize)> = progress_marks
+                .iter()
+                .zip(ends)
+                .filter(|((_, start), end)| end > start)
+                .map(|((index, start), _)| (*index, *start))
+                .collect();
+            for (index, at) in stores.into_iter().rev() {
+                module_init_stmts.insert(
+                    at,
+                    quote! {
+                        __RYTHON_INIT_PROGRESS.store(
+                            #index,
+                            ::core::sync::atomic::Ordering::Release,
+                        )
+                    },
+                );
             }
         }
 
@@ -2163,11 +2203,12 @@ impl CodeGen for Module {
                     };
                 }
             };
-            // A body that raised AFTER initializing a static cannot run
-            // again faithfully (the static keeps the first attempt's
-            // value): the module stays failed and later imports raise the
-            // same exception. A body with no statics runs again, as
-            // CPython's fresh re-import does.
+            // A body that raised in a module holding a static — one it
+            // initialized, or a mutable global a called function may have
+            // written — cannot run again faithfully (the static keeps the
+            // first attempt's value): the module stays failed and later
+            // imports raise the same exception. A body with no such
+            // statics runs again, as CPython's fresh re-import does.
             let failed_state: u8 = if init_touches_statics { 3 } else { 0 };
             let guard_leave = if options.no_std {
                 quote! {
@@ -2188,12 +2229,46 @@ impl CodeGen for Module {
                     __rython_init_guard.finish(__rython_init_result.is_ok());
                 }
             };
+            // The body's progress: the index of the statement it is about
+            // to run, `usize::MAX` once done. A cyclic importer's `from
+            // .this import name` asks `__rython_bound__` whether the
+            // statement binding `name` has run; Python raises ImportError
+            // for a name the partially initialized module has not bound
+            // yet (Devin review on #338, round 6).
             stream.extend(quote! {
+                #[allow(dead_code)]
+                pub(crate) static __RYTHON_INIT_PROGRESS: ::core::sync::atomic::AtomicUsize =
+                    ::core::sync::atomic::AtomicUsize::new(0);
+                #[allow(dead_code)]
+                pub(crate) fn __rython_bound__(
+                    __rython_stmt: usize,
+                    __rython_name: &str,
+                    __rython_module: &str,
+                ) -> Result<(), PyException> {
+                    if __RYTHON_INIT_PROGRESS.load(::core::sync::atomic::Ordering::Acquire)
+                        > __rython_stmt
+                    {
+                        Ok(())
+                    } else {
+                        Err(PyException::new(
+                            "ImportError",
+                            format!(
+                                "cannot import name '{}' from partially initialized module \
+                                 '{}' (most likely due to a circular import)",
+                                __rython_name, __rython_module
+                            ),
+                        ))
+                    }
+                }
                 #[allow(dead_code)]
                 pub(crate) fn __module_init__() -> Result<(), PyException> {
                     #guard_enter
                     let __rython_init_result = (|| -> Result<(), PyException> {
                         #(#module_init_stmts;)*
+                        __RYTHON_INIT_PROGRESS.store(
+                            usize::MAX,
+                            ::core::sync::atomic::Ordering::Release,
+                        );
                         Ok(())
                     })();
                     #guard_leave

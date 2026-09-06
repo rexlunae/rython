@@ -500,14 +500,36 @@ pub(crate) fn imported_crate_modules(
             // submodule of that name (Devin review on #338).
             let package_key = crate::module_defs_key(options, &base).map(<[String]>::to_vec);
             for a in &i.names {
-                if package_key
-                    .as_deref()
-                    .is_some_and(|key| module_binds_name(options, key, &a.name))
-                {
-                    continue;
-                }
                 let mut sub = base.clone();
                 sub.push(a.name.clone());
+                let binding = package_key
+                    .as_deref()
+                    .and_then(|key| module_binding(options, key, &a.name));
+                if let Some(binding) = binding {
+                    // A binding under module-level control flow may not
+                    // run, and then Python would import the submodule of
+                    // that name instead: the converter takes the
+                    // attribute either way and says so (-W) when the
+                    // submodule exists (Devin review on #338, round 6).
+                    if binding.conditional && crate::module_defs_key(options, &sub).is_some() {
+                        let warning = format!(
+                            "`from {} import {}`: the package binds `{}` under a \
+                             module-level condition and also has a submodule `{}`; \
+                             Python decides at runtime which one the import finds, \
+                             the converted program always takes the package's binding \
+                             and never runs the submodule's body",
+                            base.join("."),
+                            a.name,
+                            a.name,
+                            sub.join(".")
+                        );
+                        let mut warnings = options.definition_warnings.borrow_mut();
+                        if !warnings.contains(&warning) {
+                            warnings.push(warning);
+                        }
+                    }
+                    continue;
+                }
                 push_chain(&sub, &mut out);
             }
         }
@@ -516,22 +538,29 @@ pub(crate) fn imported_crate_modules(
     out
 }
 
-/// Whether the crate module at `key` binds `name` in its own body (a
-/// def, a class, a store, an import alias — under control flow too, a
-/// def's locals excluded): the package attribute a `from package import
-/// name` finds before falling back to the submodule `package.name`.
-fn module_binds_name(options: &PythonOptions, key: &[String], name: &str) -> bool {
-    use crate::ast::tree::visit::{any_stmt, stmt_targets, target_names, Descend};
-    let Some(module) = options.module_defs.get(key) else {
-        return false;
-    };
-    let module: &crate::Module = module;
-    any_stmt(&module.raw.body, Descend::SkipDefs, |s| match &s.statement {
+/// Where a crate module binds a name in its own body: the package
+/// attribute a `from package import name` finds before falling back to
+/// the submodule `package.name`, and the point in the body at which a
+/// cyclic importer may read it.
+pub(crate) struct ModuleBinding {
+    /// The index of the first top-level statement that binds the name.
+    pub index: usize,
+    /// The binding sits under module-level control flow (an `if`, a
+    /// `try`), so Python binds the name only when that branch runs.
+    pub conditional: bool,
+}
+
+/// Whether one statement itself binds `name`: a def, a class, a store,
+/// an import alias. A bare annotation (`name: int`) binds only
+/// `__annotations__`, never `name` (Devin review on #338, round 6).
+fn stmt_binds(s: &crate::Statement, name: &str) -> bool {
+    use crate::ast::tree::visit::{stmt_targets, target_names};
+    match &s.statement {
         crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
             f.name == name
         }
         crate::StatementType::ClassDef(c) => c.name == name,
-        crate::StatementType::AnnotatedName { name: n, .. } => n == name,
+        crate::StatementType::AnnotatedName { .. } => false,
         crate::StatementType::Import(i) => i.names.iter().any(|a| {
             a.asname.as_deref().unwrap_or_else(|| a.name.split('.').next().unwrap_or(&a.name))
                 == name
@@ -543,7 +572,63 @@ fn module_binds_name(options: &PythonOptions, key: &[String], name: &str) -> boo
         _ => stmt_targets(s)
             .into_iter()
             .any(|t| target_names(t).contains(&name)),
+    }
+}
+
+/// The first binding of `name` in the body of the crate module at `key`
+/// (a def's locals excluded): its top-level statement, and whether it is
+/// unconditional there or nested under module-level control flow.
+fn module_binding(options: &PythonOptions, key: &[String], name: &str) -> Option<ModuleBinding> {
+    use crate::ast::tree::visit::{any_stmt, Descend};
+    let module = options.module_defs.get(key)?;
+    let module: &crate::Module = module;
+    module.raw.body.iter().enumerate().find_map(|(index, s)| {
+        if stmt_binds(s, name) {
+            Some(ModuleBinding { index, conditional: false })
+        } else if any_stmt(std::slice::from_ref(s), Descend::SkipDefs, |n| stmt_binds(n, name)) {
+            Some(ModuleBinding { index, conditional: true })
+        } else {
+            None
+        }
     })
+}
+
+/// The bound checks a `from package import name` makes after the
+/// package's body ran: when that body is still running on this thread
+/// (an import cycle), the name is readable only once the statement
+/// binding it has executed — otherwise Python raises ImportError
+/// (`cannot import name ... from partially initialized module ...`)
+/// where the generated static would hand out its eventual value (Devin
+/// review on #338, round 6). Each module's `__rython_bound__` answers
+/// from its init progress; a fully initialized module answers yes. The
+/// package root is never checked (its body runs before the entry).
+pub(crate) fn import_site_bound_checks(
+    stmt: &crate::StatementType,
+    options: &PythonOptions,
+) -> TokenStream {
+    let crate::StatementType::ImportFrom(i) = stmt else {
+        return quote!();
+    };
+    let base = i.resolved_module_path(options);
+    let Some(key) = crate::module_defs_key(options, &base) else {
+        return quote!();
+    };
+    if key.is_empty() || key == options.this_module_path.as_slice() {
+        return quote!();
+    }
+    let segs: Vec<_> = key.iter().map(|s| crate::safe_ident(s)).collect();
+    let qualified = std::iter::once(options.python_namespace.as_str())
+        .filter(|ns| !ns.is_empty())
+        .chain(key.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(".");
+    let checks = i.names.iter().filter_map(|a| {
+        let binding = module_binding(options, key, &a.name)?;
+        let index = binding.index;
+        let name = a.name.as_str();
+        Some(quote!(crate::#(#segs::)*__rython_bound__(#index, #name, #qualified)?;))
+    });
+    quote!(#(#checks)*)
 }
 
 /// The `__module_init__` calls for the modules an import loads, in
@@ -555,6 +640,23 @@ pub(crate) fn module_init_calls(paths: &[Vec<String>]) -> TokenStream {
         quote!(crate::#(#segs::)*__module_init__()?;)
     });
     quote!(#(#calls)*)
+}
+
+/// What an import statement runs at its site: the loaded modules' init
+/// calls, then the bound checks of its from-list names — the one
+/// lowering every import site (module level, nested, function-local)
+/// shares. Empty when the statement loads no crate module.
+pub(crate) fn import_site_init(
+    stmt: &crate::StatementType,
+    options: &PythonOptions,
+) -> TokenStream {
+    let loaded = imported_crate_modules(stmt, options);
+    if loaded.is_empty() {
+        return quote!();
+    }
+    let calls = module_init_calls(&loaded);
+    let checks = import_site_bound_checks(stmt, options);
+    quote!(#calls #checks)
 }
 
 impl CodeGen for Import {

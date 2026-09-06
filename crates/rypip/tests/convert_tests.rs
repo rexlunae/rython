@@ -10265,6 +10265,111 @@ fn a_cyclic_import_continues_with_the_partial_module_like_python() {
 }
 
 #[test]
+fn a_cyclic_import_of_a_name_bound_later_raises_import_error_like_python() {
+    // `a` imports `b` before binding `X`; `b` imports `X` from `a`:
+    // CPython finds a partially initialized `a` without `X` and raises
+    // ImportError (`cannot import name 'X' from partially initialized
+    // module 'fut.a' (most likely due to a circular import)`). The
+    // generated static would hand out X's eventual value; the import
+    // site asks a's init progress instead (Devin review on #338, round
+    // 6). The message drops CPython's trailing source path. The handler
+    // catches Exception: an `except ImportError:` handler is the static
+    // import-guard idiom, which the converter drops with a warning.
+    let scratch = Scratch::new("fut");
+    let krate = package_crate(
+        &scratch,
+        "fut",
+        &[
+            (
+                "a.py",
+                "from .b import helper\nX = 1\nprint(\"a end\", helper())\n",
+            ),
+            (
+                "b.py",
+                "from .a import X\n\n\ndef helper() -> int:\n    return X\n",
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "def load() -> int:\n",
+                    "    from .a import X\n",
+                    "    return X\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    try:\n",
+                    "        print(load())\n",
+                    "    except Exception as e:\n",
+                    "        print(\"caught\", e)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let b = fs::read_to_string(krate.root.join("src/b.rs")).unwrap();
+    assert!(
+        b.contains("crate::a::__rython_bound__(1usize, \"X\", \"fut.a\")?;"),
+        "b's import checks a's binding of X: {}",
+        b
+    );
+    // Verified against python3 (the message there ends with a's path).
+    assert_eq!(
+        run_package(&krate, "fut"),
+        vec![
+            "caught cannot import name 'X' from partially initialized module 'fut.a' \
+             (most likely due to a circular import)"
+        ]
+    );
+}
+
+#[test]
+fn a_bare_annotation_in_the_package_does_not_hide_the_submodule() {
+    // `settings: dict` in conf/__init__.py binds only `__annotations__`:
+    // `from .conf import settings` therefore imports the submodule
+    // `conf.settings` and runs its body (Devin review on #338, round 6).
+    // A binding under a module-level condition wins over the submodule,
+    // as before, and the converter says so through -W.
+    let scratch = Scratch::new("annpkg");
+    fs::create_dir_all(scratch.path().join("annpkg").join("conf")).unwrap();
+    let krate = package_crate(
+        &scratch,
+        "annpkg",
+        &[
+            ("conf/__init__.py", "settings: dict\nprint(\"conf loaded\")\n"),
+            ("conf/settings.py", "print(\"settings loaded\")\nLEVEL = 3\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from .conf import settings\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"level\", settings.LEVEL)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let cli = fs::read_to_string(krate.root.join("src/cli.rs")).unwrap();
+    assert!(
+        cli.contains("crate::conf::settings::__module_init__()?;"),
+        "the submodule loads: {}",
+        cli
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "annpkg"),
+        vec!["conf loaded", "settings loaded", "level 3"]
+    );
+}
+
+#[test]
 fn a_function_local_import_runs_the_module_body_on_first_call_only() {
     // `from .noisy import shout` inside a function that is never called:
     // noisy's body never runs (Python imports lazily). `from .quiet
@@ -10728,6 +10833,70 @@ fn a_concurrent_import_waits_for_the_module_body_like_pythons_import_lock() {
     );
     // Verified against python3.
     assert_eq!(run_package(&krate, "thrpkg"), vec!["slow loaded", "a True", "b True"]);
+}
+
+#[test]
+fn a_module_body_that_raises_while_holding_a_mutable_global_stays_failed() {
+    // tally's `COUNT` is a mutable global (written by `bump`, which the
+    // body calls before raising). CPython's re-import starts from a
+    // fresh `COUNT = 0`, so every attempt prints `tally body 1` and
+    // raises; a re-run here would read the written value (`tally body
+    // 2`, then succeed — silently different). The module stays failed:
+    // the later import raises the same exception (Devin review on #338,
+    // round 6).
+    let scratch = Scratch::new("tally");
+    let krate = package_crate(
+        &scratch,
+        "tally",
+        &[
+            (
+                "tally.py",
+                concat!(
+                    "COUNT = 0\n",
+                    "\n",
+                    "\n",
+                    "def bump() -> int:\n",
+                    "    global COUNT\n",
+                    "    COUNT += 1\n",
+                    "    return COUNT\n",
+                    "\n",
+                    "\n",
+                    "bump()\n",
+                    "print(\"tally body\", COUNT)\n",
+                    "if COUNT < 2:\n",
+                    "    raise RuntimeError(\"count too low\")\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "def load() -> int:\n",
+                    "    from .tally import bump\n",
+                    "    return bump()\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    for _ in range(2):\n",
+                    "        try:\n",
+                    "            print(load())\n",
+                    "        except RuntimeError as e:\n",
+                    "            print(\"caught\", e)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let tally = fs::read_to_string(krate.root.join("src/tally.rs")).unwrap();
+    assert!(tally.contains(".poison(e.clone())"), "a mutable global poisons: {}", tally);
+    // CPython: `tally body 1`, `caught count too low`, `tally body 1`,
+    // `caught count too low` (a fresh module each attempt).
+    assert_eq!(
+        run_package(&krate, "tally"),
+        vec!["tally body 1", "caught count too low", "caught count too low"]
+    );
 }
 
 #[test]

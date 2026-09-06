@@ -608,14 +608,12 @@ impl CodeGen for StatementType {
             StatementType::Import(_) | StatementType::ImportFrom(_)
                 if options.in_module_init_body =>
             {
-                let loaded = crate::ast::tree::import::imported_crate_modules(&self, &options);
-                Ok(crate::ast::tree::import::module_init_calls(&loaded))
+                Ok(crate::ast::tree::import::import_site_init(&self, &options))
             }
             StatementType::Import(_) | StatementType::ImportFrom(_)
                 if !matches!(ctx, CodeGenContext::Module(_)) =>
             {
-                let loaded = crate::ast::tree::import::imported_crate_modules(&self, &options);
-                let calls = crate::ast::tree::import::module_init_calls(&loaded);
+                let calls = crate::ast::tree::import::import_site_init(&self, &options);
                 let uses = match self {
                     StatementType::Import(s) => s.to_rust(ctx, options, symbols)?,
                     StatementType::ImportFrom(s) => s.to_rust(ctx, options, symbols)?,
