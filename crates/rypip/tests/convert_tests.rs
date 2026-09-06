@@ -10486,6 +10486,94 @@ fn an_import_under_module_level_control_flow_runs_the_module_body_when_the_branc
 }
 
 #[test]
+fn a_flattened_import_guard_runs_the_loaded_bodies_even_when_its_names_are_filtered() {
+    // `try: from .cfg import LEVEL / except ImportError: LEVEL = None`: the
+    // handler stores the imported name, which drops the import's `use` —
+    // but Python ran cfg's body (its print), so the init call stays. A
+    // conditional import nested inside a flattened guard hoists its `use`
+    // and runs noisy's body where the branch runs (Devin review on #338).
+    let scratch = Scratch::new("guardpkg");
+    let krate = package_crate(
+        &scratch,
+        "guardpkg",
+        &[
+            ("cfg.py", "print(\"cfg loaded\")\nLEVEL = 3\n"),
+            ("noisy.py", "print(\"noisy loaded\")\n\n\ndef shout() -> str:\n    return \"loud\"\n"),
+            (
+                "cli.py",
+                concat!(
+                    "import sys\n",
+                    "\n",
+                    "try:\n",
+                    "    from .cfg import LEVEL\n",
+                    "except ImportError:\n",
+                    "    LEVEL = None\n",
+                    "\n",
+                    "try:\n",
+                    "    if len(sys.argv) < 100:\n",
+                    "        from .noisy import shout\n",
+                    "except ImportError:\n",
+                    "    pass\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(\"run\", shout())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "guardpkg"), vec!["cfg loaded", "noisy loaded", "run loud"]);
+}
+
+#[test]
+fn an_imported_class_rebound_by_a_store_or_a_def_is_no_longer_a_base() {
+    // `from .errors import Root` then `Root = 5` (or `def Root()`), then
+    // `class Leaf(Root)`: Python raises TypeError at the class statement
+    // (the base is not a class). The rebinding invalidates the crate
+    // import in the closure's bindings, so Leaf does not inherit the
+    // stale exception hierarchy — the base is refused loudly (Devin
+    // review on #338).
+    for (tag, rebinding) in [("byvalue", "Root = 5\n"), ("byfunc", "def Root() -> int:\n    return 1\n")] {
+        let scratch = Scratch::new(tag);
+        fs::write(
+            scratch.path().join("pyproject.toml"),
+            "[project]\nname = \"rebound\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let pkg = scratch.path().join("rebound");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("__init__.py"), "").unwrap();
+        fs::write(pkg.join("errors.py"), "class Root(Exception):\n    pass\n").unwrap();
+        fs::write(
+            pkg.join("shadow.py"),
+            format!("from .errors import Root\n\n{}\n\nclass Leaf(Root):\n    pass\n", rebinding),
+        )
+        .unwrap();
+        fs::write(
+            pkg.join("cli.py"),
+            "from .shadow import Leaf\n\n\nif __name__ == \"__main__\":\n    print(\"x\")\n",
+        )
+        .unwrap();
+        let discovered = rypip::discover(scratch.path()).expect("discover");
+        let err = rypip::convert(&discovered, &scratch.path().join("crate"), &ConvertOptions::default())
+            .err()
+            .expect("a non-class base is refused");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("class `Leaf` inherits from `Root`, which is not an exception class"),
+            "{}: {}",
+            tag,
+            msg
+        );
+    }
+}
+
+#[test]
 fn a_concurrent_import_waits_for_the_module_body_like_pythons_import_lock() {
     // Two threads import `slow` (a 200 ms body) 50 ms apart: CPython's
     // per-module import lock makes the second wait, so `slow loaded`

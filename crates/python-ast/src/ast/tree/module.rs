@@ -1802,6 +1802,26 @@ impl CodeGen for Module {
                         // `use`s (dropping the whole import left them
                         // unresolved, E0425).
                         let mut body_stmt = body_stmt.clone();
+                        // The guard's imports run the loaded modules' bodies
+                        // here, like any module-level import — from the
+                        // statement as WRITTEN, before the name filtering
+                        // below (a handler that stores every imported name
+                        // still leaves the import executed in Python; Devin
+                        // review on #338).
+                        if matches!(
+                            &body_stmt.statement,
+                            crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
+                        ) {
+                            let loaded = crate::ast::tree::import::imported_crate_modules(
+                                &body_stmt.statement,
+                                &options,
+                            );
+                            if !loaded.is_empty() {
+                                module_init_stmts
+                                    .push(crate::ast::tree::import::module_init_calls(&loaded));
+                                has_module_init_code = true;
+                            }
+                        }
                         if let crate::StatementType::ImportFrom(i) = &mut body_stmt.statement
                         {
                             let root = i.module.split('.').next().unwrap_or("").to_string();
@@ -1837,30 +1857,58 @@ impl CodeGen for Module {
                                     }
                                 }
                             }
+                            // A dropped CRATE name has no item to carry into
+                            // the hoisted local: the name is the handler's
+                            // store (None) where Python's is the imported
+                            // value — said through -W, never silent.
+                            if !crate::ast::tree::import::is_stdpython_module(&root) {
+                                for (name, bound) in &dropped {
+                                    options.definition_warnings.borrow_mut().push(format!(
+                                        "`from {}{} import {}` is dropped: the ImportError \
+                                         handler stores `{}` too, so the name is the \
+                                         handler's value (None) where Python's is the \
+                                         imported item (the import-guard divergence)",
+                                        ".".repeat(i.level),
+                                        i.module,
+                                        name,
+                                        bound
+                                    ));
+                                }
+                            }
                             if i.names.is_empty() {
                                 continue;
                             }
                         }
                         let body_is_decl =
                             Self::is_declaration_statement(&body_stmt.statement);
-                        // The flattened guard's imports run the loaded
-                        // modules' bodies here, like any module-level import.
-                        if matches!(
-                            &body_stmt.statement,
-                            crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
-                        ) {
-                            let loaded = crate::ast::tree::import::imported_crate_modules(
-                                &body_stmt.statement,
-                                &options,
-                            );
-                            if !loaded.is_empty() {
-                                module_init_stmts
-                                    .push(crate::ast::tree::import::module_init_calls(&loaded));
-                                has_module_init_code = true;
+                        // A statement nested in the guard's body (an `if`
+                        // around an import) lowers like module-level control
+                        // flow: its imports' `use`s hoisted, the init calls
+                        // at the runtime position.
+                        let body_options = if body_is_decl {
+                            init_options.clone()
+                        } else {
+                            for import in nested_import_stmts(std::slice::from_ref(&body_stmt)) {
+                                options.definition_warnings.borrow_mut().push(format!(
+                                    "`{}` under a module-level condition: the imported name is \
+                                     bound whether or not the branch runs (Python would raise \
+                                     NameError on the untaken path — the static-import divergence)",
+                                    import_spelling(&import.statement)
+                                ));
+                                let use_tokens = import
+                                    .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                                    .map_err(|e| wrap_module_error(&module_filename, e))?;
+                                let text = use_tokens.to_string();
+                                if !text.trim().is_empty() && hoisted_uses.insert(text) {
+                                    stream.extend(use_tokens);
+                                }
                             }
-                        }
+                            let mut o = init_options.clone();
+                            o.in_module_init_body = true;
+                            o
+                        };
                         let body_tokens = body_stmt
-                            .to_rust(ctx.clone(), init_options.clone(), symbols.clone())
+                            .to_rust(ctx.clone(), body_options, symbols.clone())
                             .map_err(|e| wrap_module_error(&module_filename, e))?;
                         if body_tokens.to_string() != "" {
                             if body_is_decl {

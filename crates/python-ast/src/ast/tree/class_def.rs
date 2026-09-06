@@ -442,22 +442,34 @@ pub(crate) fn module_name_aliases_depth(
                         bind(bindings, &name, EXTERNAL_ALTERNATIVE, nested);
                     }
                 }
+                // An UNCONDITIONAL binding (a store, a def, a class) after
+                // a crate import of the name is the name's latest binding:
+                // the import is rebound and no longer resolves a base (Devin
+                // review on #338). A binding under control flow is one of
+                // the name's alternatives — runtime-ambiguous — and leaves
+                // the import in place.
                 crate::StatementType::Assign(a) => {
                     if let [ExprType::Name(t)] = a.targets.as_slice() {
                         match &a.value {
                             ExprType::Name(v) => bind(bindings, &t.id, &v.id, nested),
                             _ => bind(bindings, &t.id, VALUE_ALTERNATIVE, nested),
                         }
+                        if !nested {
+                            crate_imports.remove(&t.id);
+                        }
                     }
                 }
                 crate::StatementType::ClassDef(c) => {
                     bind(bindings, &c.name, CLASS_ALTERNATIVE, nested);
-                    // The definition is the name's latest binding: an
-                    // earlier crate import of the name is rebound.
-                    crate_imports.remove(&c.name);
+                    if !nested {
+                        crate_imports.remove(&c.name);
+                    }
                 }
                 crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
                     bind(bindings, &f.name, LOCAL_ALTERNATIVE, nested);
+                    if !nested {
+                        crate_imports.remove(&f.name);
+                    }
                 }
                 // An import alias names a class of a CRATE module only:
                 // an external package's `Root as R` is not the crate's
