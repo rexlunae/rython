@@ -7029,6 +7029,100 @@ fn argparse_formats_prog_placeholders_and_rejects_negative_flags_and_binary_text
 }
 
 #[test]
+fn dash_aliases_share_one_stream_and_wrong_direction_io_is_unsupported_operation() {
+    // Round 4 of the review on #339: two `FileType("r")("-")` values are
+    // two aliases of ONE stdin object (the second read sees the cursor
+    // the first left, and closing one closes both — a read through the
+    // other alias is the closed-file ValueError); `%(type)s` in help
+    // is None without type=, `FileType('rb')` for a FileType; an
+    // OSError's filename is Python's repr (an apostrophe switches to
+    // double quotes) while argparse's own "can't open" wrapper keeps its
+    // literal quotes; a write on a read-only stream is
+    // io.UnsupportedOperation, caught as itself, as OSError and as
+    // ValueError, with CPython's messages. Transcripts captured from
+    // python3 3.11 verbatim.
+    let scratch = Scratch::new("apdash2");
+    let file = scratch.path().join("r4.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "import io\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"r4\")\n",
+            "    parser.add_argument(\"name\", help=\"a %(type)s\")\n",
+            "    parser.add_argument(\"blob\", type=argparse.FileType(\"rb\"), help=\"a %(type)s\")\n",
+            "    parser.add_argument(\"src\", type=argparse.FileType(\"r\"), help=\"a %(type)s\")\n",
+            "    parser.add_argument(\"alias\", type=argparse.FileType(\"r\"), help=\"a %(type)s\")\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(\"first read:\", repr(args.src.read()))\n",
+            "    print(\"alias read:\", repr(args.alias.read()))\n",
+            "    args.src.close()\n",
+            "    try:\n",
+            "        args.alias.read()\n",
+            "    except ValueError as e:\n",
+            "        print(\"caught closed:\", e)\n",
+            "    try:\n",
+            "        args.blob.write(b\"x\")\n",
+            "    except io.UnsupportedOperation as e:\n",
+            "        print(\"caught:\", e)\n",
+            "    with open(\"w.bin\", \"wb\") as g:\n",
+            "        try:\n",
+            "            g.read()\n",
+            "        except OSError as e:\n",
+            "            print(\"caught os:\", e)\n",
+            "    with open(\"r4.py\", \"r\") as h:\n",
+            "        try:\n",
+            "            h.write(\"x\")\n",
+            "        except ValueError as e:\n",
+            "            print(\"caught text:\", e)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(scratch.path().join("it's.bin"), "data\n").unwrap();
+    fs::write(scratch.path().join("input.txt"), "line one\nline two\n").unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/r4");
+    let run = |args: &[&str]| {
+        Command::new(&bin)
+            .args(args)
+            .current_dir(scratch.path())
+            .stdin(fs::File::open(scratch.path().join("input.txt")).unwrap())
+            .output()
+            .expect("run")
+    };
+    let output = run(&["-h"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "usage: r4 [-h] name blob src alias\n\npositional arguments:\n  name        a None\n  blob        a FileType('rb')\n  src         a FileType('r')\n  alias       a FileType('r')\n\noptions:\n  -h, --help  show this help message and exit\n"
+    );
+    let output = run(&["n", "it's.bin", "-", "-"]);
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "first read: 'line one\\nline two\\n'\nalias read: ''\ncaught closed: I/O operation on closed file.\ncaught: write\ncaught os: read\ncaught text: not writable\n"
+    );
+    let output = run(&["n", "missing'x.bin", "-", "-"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "usage: r4 [-h] name blob src alias\nr4: error: argument blob: can't open 'missing'x.bin': [Errno 2] No such file or directory: \"missing'x.bin\"\n"
+    );
+}
+
+#[test]
 fn binary_filetype_and_binary_open_match_python_at_runtime() {
     // Issue #332: `type=argparse.FileType("rb")` with `nargs="*"` (zero
     // files is an empty list), and `open(p, "wb")` / `open(p, "rb")` —

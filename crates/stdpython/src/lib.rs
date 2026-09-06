@@ -6624,6 +6624,15 @@ impl PyRepr for PyException {
 impl std::error::Error for PyException {}
 
 /// Python ValueError
+/// `io.UnsupportedOperation` — the exception a stream raises for an
+/// operation its mode does not allow (a write on a read-only file, a
+/// read on a write-only one). Its MRO (OSError and ValueError) comes
+/// from the interpreter-derived table, so `except OSError:` catches it
+/// as in CPython (Devin review on #339, round 4).
+pub fn unsupported_operation<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("UnsupportedOperation", message.as_ref().to_string())
+}
+
 pub fn value_error<M: AsRef<str>>(message: M) -> PyException {
     PyException::new("ValueError", message.as_ref())
 }
@@ -7114,9 +7123,12 @@ fn os_error(e: &std::io::Error, path: &str) -> PyException {
         .split_once(" (os error ")
         .map(|(t, _)| t.to_string())
         .unwrap_or(text);
+    // The path is Python's repr (`"it's.txt"` switches quotes, as
+    // CPython's `filename` rendering does — Devin review on #339,
+    // round 4).
     let message = match e.raw_os_error() {
-        Some(code) => format!("[Errno {}] {}: '{}'", code, text, path),
-        None => format!("{}: '{}'", text, path),
+        Some(code) => format!("[Errno {}] {}: {}", code, text, py_str_repr(path)),
+        None => format!("{}: {}", text, py_str_repr(path)),
     };
     PyException::new(kind, message)
 }
@@ -7370,7 +7382,10 @@ impl PyFile {
     /// they are asked for, never from a copy.
     #[cfg(feature = "std")]
     pub fn stdin() -> Self {
-        Self::new_read(std::io::BufReader::new(std::io::stdin()), "<stdin>")
+        thread_local! {
+            static STDIN: PyFile = PyFile::new_read(std::io::BufReader::new(std::io::stdin()), "<stdin>");
+        }
+        STDIN.with(|f| f.clone())
     }
 
     /// The live standard output as a text file (`sys.stdout`; argparse's
@@ -7379,7 +7394,10 @@ impl PyFile {
     /// `closefd=False` stream does.
     #[cfg(feature = "std")]
     pub fn stdout() -> Self {
-        Self::new_write(std::io::stdout(), "<stdout>")
+        thread_local! {
+            static STDOUT: PyFile = PyFile::new_write(std::io::stdout(), "<stdout>");
+        }
+        STDOUT.with(|f| f.clone())
     }
 
     /// io.StringIO backing constructor.
@@ -7416,7 +7434,7 @@ impl PyFile {
                 Ok(out)
             }
             #[cfg(feature = "std")]
-            PyFileBackend::DiskWrite(_) => Err(runtime_error("File not opened for reading")),
+            PyFileBackend::DiskWrite(_) => Err(unsupported_operation("not readable")),
             PyFileBackend::Closed => Err(closed_file_error()),
         }
     }
@@ -7445,7 +7463,7 @@ impl PyFile {
                 Ok(line)
             }
             #[cfg(feature = "std")]
-            PyFileBackend::DiskWrite(_) => Err(runtime_error("File not opened for reading")),
+            PyFileBackend::DiskWrite(_) => Err(unsupported_operation("not readable")),
             PyFileBackend::Closed => Err(closed_file_error()),
         }
     }
@@ -7487,7 +7505,7 @@ impl PyFile {
                 Ok(written as i64)
             }
             #[cfg(feature = "std")]
-            PyFileBackend::DiskRead(_) => Err(runtime_error("File not opened for writing")),
+            PyFileBackend::DiskRead(_) => Err(unsupported_operation("not writable")),
             PyFileBackend::Closed => Err(closed_file_error()),
         }
     }

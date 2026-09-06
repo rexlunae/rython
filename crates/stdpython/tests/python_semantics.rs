@@ -3913,6 +3913,51 @@ fn an_exceptions_repr_is_its_class_and_its_args() {
 }
 
 #[test]
+fn file_errors_quote_paths_as_python_does_and_wrong_direction_io_is_unsupported_operation() {
+    // Round 4 of the review on #339: an OSError's filename is Python's
+    // repr (an apostrophe switches to double quotes); a write on a
+    // read-only stream or a read on a write-only one is
+    // io.UnsupportedOperation — an OSError AND a ValueError in CPython's
+    // tree — with CPython's messages (`write`/`read` for a binary file,
+    // `not writable`/`not readable` for a text file); the standard
+    // streams are one shared object each, so closing one alias closes
+    // the other.
+    let err = stdpython::open("/nonexistent/dir/it's.txt", Some("r")).err().expect("missing");
+    assert!(err.matches("FileNotFoundError"), "{:?}", err);
+    assert_eq!(
+        err.message,
+        "[Errno 2] No such file or directory: \"/nonexistent/dir/it's.txt\""
+    );
+    let dir = std::env::temp_dir().join(format!("rython-uo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("x.bin");
+    std::fs::write(&path, b"abc").unwrap();
+    let p = path.to_str().unwrap();
+    let err = stdpython::open_binary(p, "rb").unwrap().write(b"x").err().expect("read-only");
+    assert!(err.matches("UnsupportedOperation") && err.matches("OSError") && err.matches("ValueError"), "{:?}", err);
+    assert_eq!(err.message, "write");
+    let err = stdpython::open_binary(p, "wb").unwrap().read().err().expect("write-only");
+    assert!(err.matches("OSError"), "{:?}", err);
+    assert_eq!(err.message, "read");
+    let err = stdpython::open(p, Some("r")).unwrap().write("x").err().expect("read-only text");
+    assert!(err.matches("UnsupportedOperation"), "{:?}", err);
+    assert_eq!(err.message, "not writable");
+    let err = stdpython::open(p, Some("w")).unwrap().read().err().expect("write-only text");
+    assert_eq!(err.message, "not readable");
+    std::fs::remove_dir_all(&dir).unwrap();
+    // One stdout object: `FileType("w")("-")` twice is two aliases of it.
+    let a = stdpython::PyFile::stdout();
+    let b = stdpython::PyFile::stdout();
+    assert!(!a.closed() && !b.closed());
+    a.close().unwrap();
+    assert!(b.closed(), "the aliases share one state");
+    let c = stdpython::io::PyBytesIO::stdout();
+    let d = stdpython::io::PyBytesIO::stdout();
+    c.close().unwrap();
+    assert!(d.closed(), "the binary aliases share one state");
+}
+
+#[test]
 fn open_binary_validates_the_mode_before_touching_the_path() {
     // CPython's mode grammar, in its order, before the path is looked
     // at (Devin review on #339, rounds 1 and 2): a letter outside

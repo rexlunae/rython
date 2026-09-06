@@ -21,6 +21,10 @@ pub struct FileType(pub String);
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum ArgKind {
+    /// No `type=`: the raw string (CPython's `type=None`, which help's
+    /// `%(type)s` renders as None).
+    Untyped,
+    /// An explicit `type=str`.
     Str,
     Int,
     Float,
@@ -369,11 +373,15 @@ fn expand_help(help: &str, prog: &str, spec: &ArgSpec) -> String {
         (Some(other), _) => format!("{:?}", other),
         (None, _) => "None".to_string(),
     };
+    // `%(type)s`: the type callable's `__name__` (int, float, str), the
+    // FileType instance's repr (`FileType('rb')`), or None when no
+    // type= was given (store_true, version) — CPython's `_expand_help`.
     let type_name = match spec.kind {
-        ArgKind::Int => "int",
-        ArgKind::Float => "float",
-        ArgKind::Str | ArgKind::StoreTrue | ArgKind::Version => "None",
-        ArgKind::File(_) | ArgKind::BinaryFile(_) => "FileType",
+        ArgKind::Int => "int".to_string(),
+        ArgKind::Float => "float".to_string(),
+        ArgKind::Str => "str".to_string(),
+        ArgKind::Untyped | ArgKind::StoreTrue | ArgKind::Version => "None".to_string(),
+        ArgKind::File(mode) | ArgKind::BinaryFile(mode) => format!("FileType({})", py_repr(mode)),
     };
     percent_format(
         help,
@@ -381,7 +389,7 @@ fn expand_help(help: &str, prog: &str, spec: &ArgSpec) -> String {
             ("prog", prog.to_string()),
             ("default", default),
             ("dest", spec.dest()),
-            ("type", type_name.to_string()),
+            ("type", type_name),
         ],
     )
     .unwrap_or_else(|e| loud_exit(&e))
@@ -424,14 +432,10 @@ impl ArgSpec {
     }
 }
 
-/// Python's repr of a string with no quote inside — what a FileType
-/// error prints for a mode or a value.
+/// Python's repr of a string — the one string-repr the runtime has
+/// (`py_str_repr`), so a mode or a value quotes as CPython quotes it.
 fn py_repr(s: &str) -> String {
-    if s.contains('\'') && !s.contains('"') {
-        format!("\"{}\"", s)
-    } else {
-        format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
-    }
+    crate::py_str_repr(s)
 }
 
 fn convert(
@@ -441,7 +445,7 @@ fn convert(
     raw: &str,
 ) -> ParsedValue {
     match spec.kind {
-        ArgKind::Str => ParsedValue::Str(raw.to_string()),
+        ArgKind::Untyped | ArgKind::Str => ParsedValue::Str(raw.to_string()),
         ArgKind::Int => match raw.parse::<i64>() {
             Ok(i) => ParsedValue::Int(i),
             Err(_) => exit_error(

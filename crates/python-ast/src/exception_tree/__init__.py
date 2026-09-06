@@ -3,7 +3,7 @@
 # The interpreter is the source of truth for the builtin exception
 # hierarchy: every BaseException subclass in `builtins` plus the stdlib
 # modules whose exceptions the rython runtime models (urllib.error,
-# socket, ssl, codeop) is recorded with its real `__mro__`, as name →
+# socket, ssl, codeop, io) is recorded with its real `__mro__`, as name →
 # [itself, then each ancestor]. Aliases fall out of the data
 # (EnvironmentError IS OSError, socket.timeout IS TimeoutError,
 # ssl.CertificateError IS SSLCertVerificationError — each is a name
@@ -13,12 +13,13 @@
 # hand-copied tree.
 import builtins
 import codeop
+import io
 import socket
 import ssl
 import sys
 import urllib.error
 
-_MODULES = (builtins, urllib.error, socket, ssl, codeop)
+_MODULES = (builtins, urllib.error, socket, ssl, codeop, io)
 
 
 def collect(mod):

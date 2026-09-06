@@ -3523,6 +3523,23 @@ impl<'a> CodeGen for Call {
                         {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
+                        // The same parameter by name AND by position is
+                        // Python's TypeError (`argument for open() given by
+                        // name ('encoding') and position (4)`), whatever the
+                        // values — refused here (Devin review on #339,
+                        // round 4).
+                        for (name, position) in [("encoding", 4usize), ("errors", 5usize)] {
+                            if self.keywords.iter().any(|k| k.arg.as_deref() == Some(name))
+                                && self.args.len() >= position
+                            {
+                                return Err(format!(
+                                    "open(): argument for open() given by name ('{}') and \
+                                     position ({}) — Python's TypeError",
+                                    name, position
+                                )
+                                .into());
+                            }
+                        }
                         // A LITERAL update mode (`r+`, `rb+`) is valid Python
                         // the runtime does not model yet: refused at
                         // conversion, not at the first open (Devin review

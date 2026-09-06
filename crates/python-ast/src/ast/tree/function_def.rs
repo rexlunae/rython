@@ -178,6 +178,9 @@ impl ArgparseNargs {
 /// or a binary mode; `action="version"` prints and exits).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ArgparseKind {
+    /// No `type=` (values are str; CPython's type=None).
+    Untyped,
+    /// An explicit `type=str`.
     Str,
     Int,
     Float,
@@ -610,7 +613,7 @@ pub(crate) fn scan_argparse(
                     default = None;
                     ArgparseKind::StoreTrue
                 } else {
-                    kind.unwrap_or(ArgparseKind::Str)
+                    kind.unwrap_or(ArgparseKind::Untyped)
                 };
                 if is_positional && default.is_some() {
                     return Err(format!(
@@ -756,10 +759,30 @@ pub(crate) fn lower_argparse_bindings(
     let mut out = TokenStream::new();
     for (_, local, expr) in rw.version_bindings.iter().filter(|(at, _, _)| *at == index) {
         let ident = quote::format_ident!("{}", local);
+        // `version=` must be a str: CPython's formatter raises TypeError
+        // (`argument of type 'int' is not iterable`) when `--version`
+        // runs with anything else, so a program whose version action can
+        // never print is refused here; a value the inference cannot type
+        // is bound through `String::from`, which rustc rejects for a
+        // non-string (Devin review on #339, round 4).
+        let inferred = crate::ast::tree::type_ctx::infer_type(Some(ctx), expr, options, symbols);
         let value = expr
             .clone()
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        out.extend(quote!(let #ident: String = (#value).to_string();));
+        let bound = match inferred {
+            crate::TypeInfo::String | crate::TypeInfo::StrRef => quote!((#value).to_string()),
+            crate::TypeInfo::PyObject => quote!(String::from(#value)),
+            other => {
+                return Err(format!(
+                    "add_argument(version=...): the version must be a str (CPython raises \
+                     TypeError when --version runs with anything else); this expression is \
+                     a {:?}",
+                    other
+                )
+                .into());
+            }
+        };
+        out.extend(quote!(let #ident: String = #bound;));
     }
     Ok((!out.is_empty()).then_some(out))
 }
@@ -802,6 +825,7 @@ pub(crate) fn lower_parse_args(
             ArgparseKind::Float => (quote!(f64), quote!(Float), quote!(into_float())),
             ArgparseKind::StoreTrue => (quote!(bool), quote!(StoreTrue), quote!(into_flag())),
             ArgparseKind::Str => (quote!(String), quote!(Str), quote!(into_str())),
+            ArgparseKind::Untyped => (quote!(String), quote!(Untyped), quote!(into_str())),
             ArgparseKind::File(mode) => {
                 (quote!(PyFile), quote!(File(#mode)), quote!(into_file()))
             }

@@ -109,7 +109,10 @@ impl PyBytesIO {
     /// argparse's `FileType("rb")("-")`).
     #[cfg(feature = "std")]
     pub fn stdin() -> Self {
-        Self::new_disk_read(std::io::BufReader::new(std::io::stdin()), "<stdin>")
+        thread_local! {
+            static STDIN: PyBytesIO = PyBytesIO::new_disk_read(std::io::BufReader::new(std::io::stdin()), "<stdin>");
+        }
+        STDIN.with(|f| f.clone())
     }
 
     /// The live standard output as a binary file (`sys.stdout.buffer`;
@@ -117,7 +120,10 @@ impl PyBytesIO {
     /// descriptor open.
     #[cfg(feature = "std")]
     pub fn stdout() -> Self {
-        Self::new_disk_write(std::io::stdout(), "<stdout>")
+        thread_local! {
+            static STDOUT: PyBytesIO = PyBytesIO::new_disk_write(std::io::stdout(), "<stdout>");
+        }
+        STDOUT.with(|f| f.clone())
     }
 
     /// Python `f.closed`: whether close() ran on this stream (through
@@ -145,7 +151,7 @@ impl PyBytesIO {
                 Ok(out)
             }
             #[cfg(feature = "std")]
-            BytesBackend::DiskWrite(_) => Err(crate::runtime_error("File not opened for reading")),
+            BytesBackend::DiskWrite(_) => Err(crate::unsupported_operation("read")),
             BytesBackend::Closed => Err(crate::closed_file_error()),
         }
     }
@@ -173,7 +179,7 @@ impl PyBytesIO {
                 Ok(bytes.len() as i64)
             }
             #[cfg(feature = "std")]
-            BytesBackend::DiskRead(_) => Err(crate::runtime_error("File not opened for writing")),
+            BytesBackend::DiskRead(_) => Err(crate::unsupported_operation("write")),
             BytesBackend::Closed => Err(crate::closed_file_error()),
         }
     }

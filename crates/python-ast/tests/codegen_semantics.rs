@@ -6732,6 +6732,55 @@ fn binary_open_text_settings_raise_cpythons_value_error() {
 }
 
 #[test]
+fn duplicate_open_arguments_and_non_str_versions_are_refused() {
+    // Round 4 of the review on #339: the same open() parameter by name
+    // AND by position is Python's TypeError whatever the values — refused
+    // at conversion, in a binary or a text mode; and `version=` must be a
+    // str (CPython's formatter raises TypeError when --version runs with
+    // an int), so a version action that can never print is refused.
+    for (src, expected) in [
+        (
+            "def main() -> None:\n    f = open(\"x.bin\", \"rb\", -1, \"utf-8\", encoding=\"utf-8\")\n",
+            "given by name ('encoding') and position (4)",
+        ),
+        (
+            "def main() -> None:\n    f = open(\"x.txt\", \"r\", -1, None, \"strict\", errors=\"strict\")\n",
+            "given by name ('errors') and position (5)",
+        ),
+        (
+            concat!(
+                "import argparse\n",
+                "\n",
+                "def main(argv: list[str] | None = None) -> int:\n",
+                "    p = argparse.ArgumentParser(prog=\"t\")\n",
+                "    p.add_argument(\"--version\", action=\"version\", version=123)\n",
+                "    args = p.parse_args(argv)\n",
+                "    return 0\n",
+            ),
+            "the version must be a str",
+        ),
+    ] {
+        let err = compile_err(src, "dup.py");
+        assert!(err.contains(expected), "{}\nerror: {}", src, err);
+    }
+    // A str-typed version expression binds as before.
+    let out = compile(
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    v = \"1.0\"\n",
+            "    p = argparse.ArgumentParser(prog=\"t\")\n",
+            "    p.add_argument(\"--version\", action=\"version\", version=\"t \" + v)\n",
+            "    args = p.parse_args(argv)\n",
+            "    return 0\n",
+        ),
+        "ver.py",
+    );
+    assert!(out.contains("let __argparse_version_0 : String ="), "generated: {}", out);
+}
+
+#[test]
 fn update_file_modes_are_refused_at_conversion() {
     // Round 2 of the review on #339: an update mode (`+`) is valid Python
     // the runtime does not model; a literal one is refused when the
