@@ -10471,6 +10471,13 @@ fn an_import_under_module_level_control_flow_runs_the_module_body_when_the_branc
     );
     let main = fs::read_to_string(krate.root.join("src/main.rs")).unwrap();
     assert!(main.contains("pub use crate::noisy::shout;"), "hoisted use: {}", main);
+    // The hoisted binding is unconditional where Python's is not: said
+    // through the -W channel.
+    assert!(
+        krate.warnings.iter().any(|w| w.contains("`from .noisy import shout` under a module-level condition")),
+        "warnings: {:?}",
+        krate.warnings
+    );
     // Verified against python3.
     assert_eq!(
         run_package(&krate, "condpkg"),
@@ -10582,13 +10589,12 @@ fn a_module_body_that_raises_runs_again_on_the_next_import() {
 }
 
 #[test]
-fn a_package_root_init_with_statements_warns_that_they_do_not_run() {
-    // The package root `__init__` is the lib root, which the binary does
-    // not contain (it compiles the sibling modules as its own): what it
-    // runs at import time — a computed assignment (`SETTINGS =
-    // configure()`), the body of a crate module its import loads — never
-    // runs for the binary. That is said, not silently skipped (issue
-    // #333, Devin review on #336).
+fn the_package_roots_body_runs_before_the_entry_like_python_m() {
+    // `python -m pkg.cli` runs pkg/__init__.py first: its import loads
+    // cfg (which prints), its statement prints, its computed assignment
+    // calls configure. The bin crate does not contain the lib root, so
+    // the root's body joins the binary as the `__rython_root` module,
+    // whose init the entry's main runs first (Devin review on #338).
     let scratch = Scratch::new("rootinit");
     let krate = package_crate(
         &scratch,
@@ -10596,13 +10602,7 @@ fn a_package_root_init_with_statements_warns_that_they_do_not_run() {
         &[
             (
                 "__init__.py",
-                concat!(
-                    "\"\"\"A package.\"\"\"\n",
-                    "from .cfg import configure\n",
-                    "\n",
-                    "VERSION = \"1\"\n",
-                    "SETTINGS = configure()\n",
-                ),
+                "from .cfg import configure\nprint(\"pkg init\")\nSETTINGS = configure()\n",
             ),
             (
                 "cfg.py",
@@ -10615,11 +10615,116 @@ fn a_package_root_init_with_statements_warns_that_they_do_not_run() {
                     "    return \"ok\"\n",
                 ),
             ),
+            ("cli.py", "def main() -> None:\n    print(\"run\")\n\n\nif __name__ == \"__main__\":\n    main()\n"),
+        ],
+    );
+    let main = fs::read_to_string(krate.root.join("src/main.rs")).unwrap();
+    assert!(main.contains("crate::__rython_root::__module_init__()?"), "root init first: {}", main);
+    assert!(krate.root.join("src/__rython_root.rs").is_file(), "the root body is a bin module");
+    // Verified against python3 (-m).
+    assert_eq!(
+        run_package(&krate, "rootinit"),
+        vec!["cfg loaded", "pkg init", "configured", "run"]
+    );
+}
+
+#[test]
+fn an_import_inside_the_main_block_runs_the_module_body_there() {
+    // A direct import inside a complex `if __name__ == "__main__":` block:
+    // the `use` is hoisted, the module body runs at the statement's
+    // position in main (Devin review on #338).
+    let scratch = Scratch::new("mainblk");
+    let krate = package_crate(
+        &scratch,
+        "mainblk",
+        &[
+            ("noisy.py", "print(\"noisy loaded\")\n\n\ndef shout() -> str:\n    return \"loud\"\n"),
             (
                 "cli.py",
                 concat!(
+                    "def main(tag: str) -> None:\n",
+                    "    print(\"main\", tag)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    print(\"start\")\n",
+                    "    from .noisy import shout\n",
+                    "    print(shout())\n",
+                    "    main(\"done\")\n",
+                ),
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "mainblk"),
+        vec!["start", "noisy loaded", "loud", "main done"]
+    );
+}
+
+#[test]
+fn a_wait_cycle_across_threads_continues_with_the_partial_module_like_python() {
+    // Thread A imports `a` (whose body sleeps, then imports `b`); thread B,
+    // 20 ms later, imports `b` (whose body sleeps, then imports `a`): each
+    // thread owns one module and asks for the other. CPython detects the
+    // cross-thread cycle (_DeadlockError) and lets the later importer
+    // proceed with the partial module; so does the runtime's lock — the
+    // order is a start, b start, b end, thread b, a end, thread a (Devin
+    // review on #338).
+    let scratch = Scratch::new("xcyc");
+    let krate = package_crate(
+        &scratch,
+        "xcyc",
+        &[
+            (
+                "a.py",
+                concat!(
+                    "import time\n",
+                    "\n",
+                    "print(\"a start\")\n",
+                    "A_READY = True\n",
+                    "time.sleep(0.1)\n",
+                    "from .b import B_READY\n",
+                    "print(\"a end\", B_READY)\n",
+                ),
+            ),
+            (
+                "b.py",
+                concat!(
+                    "import time\n",
+                    "\n",
+                    "print(\"b start\")\n",
+                    "B_READY = True\n",
+                    "time.sleep(0.1)\n",
+                    "from .a import A_READY\n",
+                    "print(\"b end\", A_READY)\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "import threading\n",
+                    "import time\n",
+                    "\n",
+                    "\n",
+                    "def load_a() -> None:\n",
+                    "    from .a import A_READY\n",
+                    "    print(\"thread a\", A_READY)\n",
+                    "\n",
+                    "\n",
+                    "def load_b() -> None:\n",
+                    "    from .b import B_READY\n",
+                    "    print(\"thread b\", B_READY)\n",
+                    "\n",
+                    "\n",
                     "def main() -> None:\n",
-                    "    print(\"run\")\n",
+                    "    ta = threading.Thread(target=load_a)\n",
+                    "    tb = threading.Thread(target=load_b)\n",
+                    "    ta.start()\n",
+                    "    time.sleep(0.02)\n",
+                    "    tb.start()\n",
+                    "    ta.join()\n",
+                    "    tb.join()\n",
                     "\n",
                     "\n",
                     "if __name__ == \"__main__\":\n",
@@ -10628,30 +10733,72 @@ fn a_package_root_init_with_statements_warns_that_they_do_not_run() {
             ),
         ],
     );
-    assert!(
-        krate.warnings.iter().any(|w| w.contains("what the package `__init__` runs at import time")),
-        "warnings: {:?}",
-        krate.warnings
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "xcyc"),
+        vec!["a start", "b start", "b end True", "thread b True", "a end True", "thread a True"]
     );
-    assert_eq!(run_package(&krate, "rootinit"), vec!["run"]);
+}
 
-    // An import of a crate module alone warns too: Python would run
-    // cfg's body (its print) when the package loads.
-    let scratch = Scratch::new("rootimp");
+#[test]
+fn a_module_body_that_panics_runs_again_on_the_next_import() {
+    // panicky's body panics on its first run (a lambda's ZeroDivisionError
+    // — the documented panic path) in a thread; the guard's drop resets
+    // the module, so the main thread's import runs the body again, as
+    // CPython reruns a module whose first import raised (Devin review on
+    // #338). The thread's panic goes to stderr; stdout is the transcript.
+    let scratch = Scratch::new("panicky");
     let krate = package_crate(
         &scratch,
-        "rootimp",
+        "panicky",
         &[
-            ("__init__.py", "from .cfg import configure\n"),
-            ("cfg.py", "print(\"cfg loaded\")\n\n\ndef configure() -> None:\n    pass\n"),
-            ("cli.py", "def main() -> None:\n    print(\"run\")\n\n\nif __name__ == \"__main__\":\n    main()\n"),
+            (
+                "counter.py",
+                "CALLS = 0\n\n\ndef bump() -> int:\n    global CALLS\n    CALLS += 1\n    return CALLS\n",
+            ),
+            (
+                "panicky.py",
+                concat!(
+                    "from .counter import bump\n",
+                    "\n",
+                    "n = bump()\n",
+                    "print(\"panicky body\", n)\n",
+                    "if n == 1:\n",
+                    "    sizes = list(map(lambda k: 10 // k, [1, 0]))\n",
+                    "VALUE = 7\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "import threading\n",
+                    "\n",
+                    "\n",
+                    "def first() -> None:\n",
+                    "    from .panicky import VALUE\n",
+                    "    print(\"thread\", VALUE)\n",
+                    "\n",
+                    "\n",
+                    "def load() -> int:\n",
+                    "    from .panicky import VALUE\n",
+                    "    return VALUE\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    t = threading.Thread(target=first)\n",
+                    "    t.start()\n",
+                    "    t.join()\n",
+                    "    print(load())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
         ],
     );
-    assert!(
-        krate.warnings.iter().any(|w| w.contains("what the package `__init__` runs at import time")),
-        "warnings: {:?}",
-        krate.warnings
-    );
+    // Verified against python3 (stdout; the first attempt's error is on stderr in both).
+    assert_eq!(run_package(&krate, "panicky"), vec!["panicky body 1", "panicky body 2", "7"]);
 }
 
 #[test]

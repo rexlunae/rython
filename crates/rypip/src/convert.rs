@@ -17,6 +17,10 @@ use rust_format::{Formatter, RustFmt};
 
 use crate::package::{PyModule, PyPackage, sanitize_name};
 
+/// The bin-side module carrying the package root `__init__`'s body (the
+/// lib root, which the bin crate does not otherwise contain).
+const ROOT_BIN_MODULE: &str = "__rython_root";
+
 /// Lint allowances for generated code: transpiled Python legitimately
 /// produces unused imports/variables and similar noise, and the generated
 /// crate must still build under a consumer's `-D warnings`. `deprecated` is
@@ -1993,16 +1997,31 @@ pub fn convert(
             transpiled.push((module, code));
         }
     }
-    // The package root `__init__` is the lib root, which the binary does
-    // not contain: say so when it has statements the binary would skip.
-    if let Some(entry) = package.entry_module() {
-        warn_root_init_statements(package, entry, &mut warnings);
+    // The package root `__init__` is the lib root, which the bin crate does
+    // not contain (it compiles the sibling modules as its own): its body
+    // joins the binary as the `__rython_root` module, whose init the
+    // entry's `main` runs first — `python -m pkg.cli` runs pkg/__init__.py
+    // before cli (Devin review on #338).
+    let root_module = package
+        .modules
+        .iter()
+        .find(|m| m.path.is_empty() && reachable.contains(&m.path));
+    let mut entry_options = base_options.clone();
+    if let (Some(entry), Some(root)) = (package.entry_module(), root_module)
+        && root.file != entry.file
+    {
+        entry_options.root_init_module = Some(ROOT_BIN_MODULE.to_string());
     }
     for module in &package.modules {
         if !reachable.contains(&module.path) {
             continue;
         }
-        let code = transpile(module, &mut warnings, &base_options)?;
+        let options = if entry_file.as_ref() == Some(&module.file) {
+            &entry_options
+        } else {
+            &base_options
+        };
+        let code = transpile(module, &mut warnings, options)?;
         transpiled.push((module, code));
     }
     // An entry module named `main` (path ["main"]) is bin-only: its module
@@ -2123,7 +2142,17 @@ pub fn convert(
             continue; // handled as the binary below
         }
         let is_root = module.path.is_empty();
-        let decls = mod_decls(&children, &module.path, module.is_init || is_root);
+        let mut decls = mod_decls(&children, &module.path, module.is_init || is_root);
+        // The entry module is also a lib-side module; its startup names
+        // the root's body as `crate::__rython_root::__module_init__`,
+        // which the lib root answers with this shim (the bin has the real
+        // module).
+        if is_root && entry_options.root_init_module.is_some() {
+            decls.push_str(&format!(
+                "pub(crate) mod {} {{\n    pub(crate) use crate::__module_init__;\n}}\n",
+                ROOT_BIN_MODULE
+            ));
+        }
         let allows = if is_root {
             format!(
                 "{}{}",
@@ -2194,6 +2223,25 @@ pub fn convert(
         } else {
             mod_decls(&children, &[], true).replace("pub mod", "mod")
         };
+        // The package root's body, as a bin-side module the entry's main
+        // initializes first; its items are re-exported at the bin root so
+        // a sibling's `use crate::name` of a root item resolves as in the
+        // lib.
+        let mut decls = decls;
+        if let Some((root, root_code)) = transpiled
+            .iter()
+            .find(|(m, _)| m.path.is_empty() && &m.file != entry_file)
+        {
+            let _ = root;
+            fs::write(
+                src_dir.join(format!("{}.rs", ROOT_BIN_MODULE)),
+                format_rust(root_code),
+            )?;
+            decls.push_str(&format!(
+                "mod {};\npub use {}::*;\n",
+                ROOT_BIN_MODULE, ROOT_BIN_MODULE
+            ));
+        }
         let main_contents = format!("{}{}\n{}", generated_lint_attrs(opts.warnings), code, decls);
         fs::write(src_dir.join("main.rs"), format_rust(&main_contents))?;
         has_binary = true;
@@ -3813,63 +3861,6 @@ fn crate_imports_of(
     queue.into_iter().filter(|p| seen.insert(p.clone())).collect()
 }
 
-/// The package root `__init__` (path `[]`) becomes the lib root, which the
-/// bin crate does not compile (it declares the sibling modules itself), so
-/// what the root runs at import time never runs for the binary: its
-/// STATEMENTS, the bodies of the crate modules its IMPORTS load, and the
-/// code a computed ASSIGNMENT's right-hand side executes. Say so instead
-/// of silently skipping them (Devin review on #336). Defs, classes,
-/// docstrings and constant assignments are items the binary never needed
-/// to run.
-fn warn_root_init_statements(package: &PyPackage, entry: &PyModule, warnings: &mut Vec<String>) {
-    use python_ast::ast::tree::{ExprType, StatementType};
-    let Some(root) = package.modules.iter().find(|m| m.path.is_empty()) else {
-        return;
-    };
-    if root.file == entry.file {
-        return;
-    }
-    let Ok(ast) = python_ast::parse_enhanced(&root.source, parse_filename(root)) else {
-        return;
-    };
-    let crate_roots: HashSet<String> = package
-        .modules
-        .iter()
-        .filter_map(|m| m.path.first().cloned())
-        .collect();
-    let loads_crate_module = |s: &StatementType| match s {
-        StatementType::Import(i) => i
-            .names
-            .iter()
-            .any(|a| crate_roots.contains(a.name.split('.').next().unwrap_or(""))),
-        StatementType::ImportFrom(i) => {
-            i.level > 0
-                || crate_roots.contains(i.module.split('.').next().unwrap_or(""))
-        }
-        _ => false,
-    };
-    let is_constant = |e: &ExprType| matches!(e, ExprType::Constant(_));
-    let runs_at_import = ast.raw.body.iter().any(|s| match &s.statement {
-        StatementType::Import(_) | StatementType::ImportFrom(_) => loads_crate_module(&s.statement),
-        StatementType::FunctionDef(_)
-        | StatementType::AsyncFunctionDef(_)
-        | StatementType::ClassDef(_)
-        | StatementType::AnnotatedName { .. }
-        | StatementType::Pass => false,
-        StatementType::Assign(a) => !is_constant(&a.value),
-        StatementType::Expr(e) => !is_constant(&e.value),
-        _ => true,
-    });
-    if runs_at_import {
-        warnings.push(format!(
-            "{}: what the package `__init__` runs at import time (its statements, the \
-             crate modules its imports load, computed assignments) does not run when the \
-             binary starts (the binary compiles the package's modules as its own and does \
-             not contain the package root); move startup side effects into the entry module",
-            parse_filename(root),
-        ));
-    }
-}
 
 /// Enqueue the crate modules one statement's import loads — the one
 /// import walk; `crate_imports_of` drives it through the shared statement

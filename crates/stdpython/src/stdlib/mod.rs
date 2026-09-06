@@ -105,6 +105,10 @@ pub mod io;
 #[cfg(feature = "std")]
 pub mod argparse;
 
+/// Python's per-module import lock, for the generated `__module_init__`.
+#[cfg(feature = "std")]
+pub mod module_init;
+
 /// Python hashlib module - message digests
 pub mod hashlib;
 

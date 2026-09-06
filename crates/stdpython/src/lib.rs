@@ -6870,6 +6870,8 @@ pub use stdlib::io;
 #[cfg(feature = "std")]
 pub use stdlib::argparse;
 #[cfg(feature = "std")]
+pub use stdlib::module_init::{ModuleInitEntry, ModuleInitGuard, ModuleInitLock};
+#[cfg(feature = "std")]
 pub use stdlib::threading;
 #[cfg(feature = "std")]
 pub use stdlib::socket;

@@ -1075,6 +1075,21 @@ impl CodeGen for Module {
                         // Don't collect the main body statements - we'll use user's main directly
                     } else {
                         // This is a complex __name__ == "__main__" block - collect its body for main function
+                        // The block's imports (direct or nested) are
+                        // module-level imports that run when the block
+                        // does: `use` hoisted to module scope, the loaded
+                        // modules' init calls at the statement position
+                        // (Devin review on #338). The block always runs
+                        // in the binary, so no conditional-binding warning.
+                        for import in nested_import_stmts(std::slice::from_ref(&s)) {
+                            let use_tokens = import
+                                .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                                .map_err(|e| wrap_module_error(&module_filename, e))?;
+                            let text = use_tokens.to_string();
+                            if !text.trim().is_empty() && hoisted_uses.insert(text) {
+                                stream.extend(use_tokens);
+                            }
+                        }
                         let main_options = {
                             let mut o = options.clone();
                             o.hoisted_names = std::rc::Rc::new(main_hoisted.clone());
@@ -1082,6 +1097,7 @@ impl CodeGen for Module {
                             o.use_counts = std::rc::Rc::new(main_info.use_counts.clone());
                             o.name_types = std::rc::Rc::new(main_info.name_types.clone());
                             o.empty_pinned = std::rc::Rc::new(main_info.empty_pinned.clone());
+                            o.in_module_init_body = true;
                             o
                         };
                         for body_stmt in &if_stmt.body {
@@ -1920,23 +1936,16 @@ impl CodeGen for Module {
             let stmt_options = if is_declaration {
                 init_options
             } else {
-                let mut nested_imports: Vec<crate::Statement> = Vec::new();
-                walk_stmts(std::slice::from_ref(&s), Descend::SkipDefs, &mut |inner| {
-                    if let crate::StatementType::If(i) = &inner.statement
-                        && Self::is_type_checking_test(&i.test)
-                    {
-                        return Flow::Skip;
-                    }
-                    if matches!(
-                        &inner.statement,
-                        crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
-                    ) && !std::ptr::eq(inner, &s)
-                    {
-                        nested_imports.push(inner.clone());
-                    }
-                    Flow::Continue
-                });
-                for import in nested_imports {
+                for import in nested_import_stmts(std::slice::from_ref(&s)) {
+                    // Python binds the name only when the branch runs; the
+                    // hoisted `use` binds it either way (a NameError on the
+                    // untaken path becomes a resolved name): -W channel.
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "`{}` under a module-level condition: the imported name is \
+                         bound whether or not the branch runs (Python would raise \
+                         NameError on the untaken path — the static-import divergence)",
+                        import_spelling(&import.statement)
+                    ));
                     let use_tokens = import
                         .to_rust(ctx.clone(), options.clone(), symbols.clone())
                         .map_err(|e| wrap_module_error(&module_filename, e))?;
@@ -2044,14 +2053,17 @@ impl CodeGen for Module {
         // finds a's init already running and continues with a's partial
         // state — Python's partially-initialized module.
         // The guard is Python's per-module import lock (Devin review on
-        // #338): NOT STARTED → RUNNING(owner thread) → DONE. The owning
-        // thread re-entering (an import cycle) returns at once with the
-        // module's partial state; another thread waits until the body has
-        // finished; a body that raises leaves the module NOT STARTED, so a
-        // later import runs it again (CPython drops a failed import from
-        // sys.modules). The no_std tier has one thread: the same states
-        // without an owner. `::core`/`::std` — a crate module named `core`
-        // (textlib/core.py) would shadow the extern crate's path.
+        // #338): NOT STARTED → RUNNING(owner thread) → DONE, the runtime's
+        // `ModuleInitLock` (see stdpython's module_init). The owning thread
+        // re-entering (an import cycle) returns at once with the module's
+        // partial state; another thread blocks until the body has finished;
+        // a wait cycle across threads lets the later importer proceed with
+        // the partial module; a body that raises (or unwinds) leaves the
+        // module NOT STARTED, so a later import runs it again (CPython drops
+        // a failed import from sys.modules). The no_std tier has one
+        // thread: the same states on an atomic, without an owner. `::core`
+        // — a crate module named `core` (textlib/core.py) would shadow the
+        // extern crate's path.
         if has_module_init_code || !options.module_defs.is_empty() {
             let guard_enter = if options.no_std {
                 quote! {
@@ -2070,28 +2082,19 @@ impl CodeGen for Module {
                     }
                 }
             } else {
+                // The runtime's lock: condvar waiters, cross-thread
+                // deadlock detection (the later importer proceeds with
+                // the partial module, CPython's _DeadlockError path), and
+                // an RAII guard that resets an unwound body to NOT STARTED.
                 quote! {
-                    static __RYTHON_INIT_STATE: ::std::sync::Mutex<(u8, Option<::std::thread::ThreadId>)> =
-                        ::std::sync::Mutex::new((0, None));
-                    loop {
-                        let mut __state = __RYTHON_INIT_STATE
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        match *__state {
-                            (2, _) => return Ok(()),
-                            (1, Some(owner)) if owner == ::std::thread::current().id() => {
-                                return Ok(());
-                            }
-                            (1, _) => {
-                                drop(__state);
-                                ::std::thread::yield_now();
-                            }
-                            _ => {
-                                *__state = (1, Some(::std::thread::current().id()));
-                                break;
-                            }
+                    static __RYTHON_INIT_LOCK: stdpython::ModuleInitLock =
+                        stdpython::ModuleInitLock::new();
+                    let __rython_init_guard = match __RYTHON_INIT_LOCK.enter() {
+                        stdpython::ModuleInitEntry::Done | stdpython::ModuleInitEntry::Cycle => {
+                            return Ok(());
                         }
-                    }
+                        stdpython::ModuleInitEntry::Run(guard) => guard,
+                    };
                 }
             };
             let guard_leave = if options.no_std {
@@ -2103,10 +2106,7 @@ impl CodeGen for Module {
                 }
             } else {
                 quote! {
-                    *__RYTHON_INIT_STATE
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                        if __rython_init_result.is_ok() { (2, None) } else { (0, None) };
+                    __rython_init_guard.finish(__rython_init_result.is_ok());
                 }
             };
             stream.extend(quote! {
@@ -2122,14 +2122,24 @@ impl CodeGen for Module {
                 }
             });
         }
-        // The entry's startup: its own body (whose import sites run the
-        // sibling modules' bodies in Python's order).
-        let startup_init = if has_module_init_code {
+        // The entry's startup: the package root's body first (`python -m
+        // pkg.cli` runs pkg/__init__.py before cli — the converter names
+        // the bin-side module carrying it), then its own body (whose
+        // import sites run the sibling modules' bodies in Python's order).
+        let root_init = match &options.root_init_module {
+            Some(root) => {
+                let root = crate::safe_ident(root);
+                quote!(crate::#root::__module_init__()?;)
+            }
+            None => quote!(),
+        };
+        let own_init = if has_module_init_code {
             quote!(__module_init__()?;)
         } else {
             quote!()
         };
-        let needs_init_wrapper = has_module_init_code;
+        let startup_init = quote!(#root_init #own_init);
+        let needs_init_wrapper = has_module_init_code || options.root_init_module.is_some();
         
         // A `__main__` block wants a process entry point, and a no_std
         // target has no OS to enter from: refuse loudly instead of emitting
@@ -3933,6 +3943,48 @@ fn module_function_free_reads(body: &[crate::Statement]) -> std::collections::Ha
         Flow::Continue
     });
     free
+}
+
+/// The import statements nested in module-level control flow (`if cond:
+/// from .x import y`, a guard, a loop, a `with`, the `__main__` block),
+/// through the shared visitor — control-flow bodies only, a def's imports
+/// are its own; a `TYPE_CHECKING` block never runs. The statements
+/// themselves are excluded (a top-level import is an item already).
+fn nested_import_stmts(stmts: &[crate::Statement]) -> Vec<crate::Statement> {
+    let mut out: Vec<crate::Statement> = Vec::new();
+    walk_stmts(stmts, Descend::SkipDefs, &mut |inner| {
+        if let crate::StatementType::If(i) = &inner.statement
+            && Module::is_type_checking_test(&i.test)
+        {
+            return Flow::Skip;
+        }
+        if matches!(
+            &inner.statement,
+            crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
+        ) && !stmts.iter().any(|top| std::ptr::eq(top, inner))
+        {
+            out.push(inner.clone());
+        }
+        Flow::Continue
+    });
+    out
+}
+
+/// An import statement as the user wrote it, for messages.
+fn import_spelling(stmt: &crate::StatementType) -> String {
+    match stmt {
+        crate::StatementType::Import(i) => format!(
+            "import {}",
+            i.names.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ")
+        ),
+        crate::StatementType::ImportFrom(i) => format!(
+            "from {}{} import {}",
+            ".".repeat(i.level),
+            i.module,
+            i.names.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ")
+        ),
+        _ => String::new(),
+    }
 }
 
 /// The module-level names an import statement binds: `import a.b` binds

@@ -596,6 +596,13 @@ pub struct PythonOptions {
     /// (the module body) there, conditionally (Devin review on #338).
     pub in_module_init_body: bool,
 
+    /// Set on the ENTRY module by the converter when the package root
+    /// `__init__` has a body the binary must run: the bin-side module that
+    /// carries it (`__rython_root`), whose `__module_init__` the entry's
+    /// `main` runs first — `python -m pkg.cli` runs `pkg/__init__.py`
+    /// before `cli` (Devin review on #338).
+    pub root_init_module: Option<String>,
+
     /// Lazily-computed merged trait-mut table over ALL modules of the crate
     /// (`module_defs`), shared across every module's conversion: the
     /// cross-module fallback in `method_needs_mut_self` scans each module
@@ -705,6 +712,7 @@ impl Default for PythonOptions {
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),
             module_defs: std::rc::Rc::new(std::collections::HashMap::new()),
             in_module_init_body: false,
+            root_init_module: None,
             cross_module_mut_self: std::rc::Rc::new(std::cell::RefCell::new(
                 CrossModuleMutSelf::Uncomputed,
             )),
