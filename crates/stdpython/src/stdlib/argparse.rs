@@ -300,6 +300,7 @@ fn help_text(prog: &str, description: Option<&str>, specs: &[ArgSpec]) -> String
 }
 
 /// `action="version"`: Python prints the version string to stdout and
+/// `action="version"`: Python prints the version string to stdout and
 /// exits 0.
 fn print_version_and_exit(spec: &ArgSpec) -> ! {
     let version = match &spec.default {
@@ -316,6 +317,28 @@ fn exit_error(prog: &str, specs: &[ArgSpec], message: &str) -> ! {
     std::process::exit(2);
 }
 
+impl ArgSpec {
+    /// How an argument is named in error messages — CPython's
+    /// `_get_action_name`: the option strings joined by `/` (`-n/--num`),
+    /// a positional by its name.
+    fn action_name(&self) -> String {
+        match self.short {
+            Some(short) if !self.is_positional() => format!("{}/{}", short, self.name),
+            _ => self.name.to_string(),
+        }
+    }
+}
+
+/// Python's repr of a string with no quote inside — what a FileType
+/// error prints for a mode or a value.
+fn py_repr(s: &str) -> String {
+    if s.contains('\'') && !s.contains('"') {
+        format!("\"{}\"", s)
+    } else {
+        format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+    }
+}
+
 fn convert(
     prog: &str,
     specs: &[ArgSpec],
@@ -329,7 +352,7 @@ fn convert(
             Err(_) => exit_error(
                 prog,
                 specs,
-                &format!("argument {}: invalid int value: '{}'", spec.name, raw),
+                &format!("argument {}: invalid int value: '{}'", spec.action_name(), raw),
             ),
         },
         ArgKind::Float => match raw.parse::<f64>() {
@@ -337,7 +360,7 @@ fn convert(
             Err(_) => exit_error(
                 prog,
                 specs,
-                &format!("argument {}: invalid float value: '{}'", spec.name, raw),
+                &format!("argument {}: invalid float value: '{}'", spec.action_name(), raw),
             ),
         },
         ArgKind::StoreTrue | ArgKind::Version => ParsedValue::Flag(true),
@@ -345,17 +368,31 @@ fn convert(
         // argument error: `argument files: can't open 'x': [Errno 2] No
         // such file or directory: 'x'`. The handle opened here IS the
         // namespace's (opened once; a write mode truncates once, as
-        // Python's parse-time open does); `-` is the live standard
-        // stream for the mode.
+        // Python's parse-time open does). `-` follows FileType.__call__
+        // exactly: the standard input for a mode containing 'r', the
+        // standard output for one containing 'w', 'a' or 'x', and for any
+        // other mode the ValueError that `_get_value` reports as an
+        // invalid value (Devin review on #339, round 2).
         ArgKind::File(mode) | ArgKind::BinaryFile(mode) => {
             let binary = matches!(spec.kind, ArgKind::BinaryFile(_));
-            let reads = mode.contains('r');
             let handle = if raw == "-" {
-                match (binary, reads) {
-                    (false, true) => Ok(FileHandle::Text(crate::PyFile::stdin())),
-                    (false, false) => Ok(FileHandle::Text(crate::PyFile::stdout())),
-                    (true, true) => Ok(FileHandle::Binary(crate::stdlib::io::PyBytesIO::stdin())),
-                    (true, false) => Ok(FileHandle::Binary(crate::stdlib::io::PyBytesIO::stdout())),
+                if mode.contains('r') {
+                    Ok(if binary {
+                        FileHandle::Binary(crate::stdlib::io::PyBytesIO::stdin())
+                    } else {
+                        FileHandle::Text(crate::PyFile::stdin())
+                    })
+                } else if mode.contains(['w', 'a', 'x']) {
+                    Ok(if binary {
+                        FileHandle::Binary(crate::stdlib::io::PyBytesIO::stdout())
+                    } else {
+                        FileHandle::Text(crate::PyFile::stdout())
+                    })
+                } else {
+                    Err(crate::value_error(&format!(
+                        "argument \"-\" with mode {}",
+                        py_repr(mode)
+                    )))
                 }
             } else if binary {
                 crate::open_binary(raw, mode).map(FileHandle::Binary)
@@ -368,15 +405,444 @@ fn convert(
                     mode,
                     handle,
                 }),
-                // Python's message: str(e) — the exception's message
-                // without its type.
+                // FileType.__call__ turns an OSError into "can't open
+                // '<path>': <str(e)>"; a ValueError (an invalid mode, or
+                // `-` with a mode that opens nothing) reaches _get_value
+                // and is reported as an invalid value of the type's repr.
+                Err(e) if e.exception_type == "ValueError" => exit_error(
+                    prog,
+                    specs,
+                    &format!(
+                        "argument {}: invalid FileType({}) value: {}",
+                        spec.action_name(),
+                        py_repr(mode),
+                        py_repr(raw)
+                    ),
+                ),
                 Err(e) => exit_error(
                     prog,
                     specs,
-                    &format!("argument {}: can't open '{}': {}", spec.name, raw, e.message),
+                    &format!(
+                        "argument {}: can't open '{}': {}",
+                        spec.action_name(),
+                        raw,
+                        e.message
+                    ),
                 ),
             }
         }
+    }
+}
+
+/// What an option string names: the parser's own `-h`/`--help`, or one
+/// of the specs.
+#[derive(Clone, Copy, PartialEq)]
+enum OptAction {
+    Help,
+    Spec(usize),
+}
+
+/// CPython's option tuple — `_parse_optional`'s answer for a token that
+/// looks like an option: the action (None for an option string the
+/// parser does not know), the option string it matched, the separator
+/// (`=`, or the empty string for `-s2.5`'s attached value) and the
+/// explicit argument.
+struct OptionTuple {
+    action: Option<OptAction>,
+    option_string: String,
+    sep: Option<String>,
+    explicit_arg: Option<String>,
+}
+
+/// The parser's option strings in registration order — `-h`, `--help`,
+/// then each option's -short and --long (CPython's
+/// `_option_string_actions`, whose order the ambiguity message shows).
+fn option_strings(specs: &[ArgSpec]) -> Vec<(&'static str, OptAction)> {
+    let mut out = vec![("-h", OptAction::Help), ("--help", OptAction::Help)];
+    for (i, s) in specs.iter().enumerate().filter(|(_, s)| !s.is_positional()) {
+        if let Some(short) = s.short {
+            out.push((short, OptAction::Spec(i)));
+        }
+        out.push((s.name, OptAction::Spec(i)));
+    }
+    out
+}
+
+/// CPython's `_negative_number_matcher`: `^-\d+$|^-\d*\.\d+$`.
+fn looks_like_negative_number(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix('-') else {
+        return false;
+    };
+    let digits = |t: &str| t.chars().all(|c| c.is_ascii_digit());
+    match rest.split_once('.') {
+        None => !rest.is_empty() && digits(rest),
+        Some((int, frac)) => digits(int) && !frac.is_empty() && digits(frac),
+    }
+}
+
+/// One element of a nargs pattern over the token classes: a greedy run
+/// of any of the given classes, or exactly one.
+enum Atom {
+    Many(&'static [char]),
+    One(char),
+}
+
+/// A positional's nargs pattern (`_get_nargs_pattern`, with the `-*`
+/// kept — positionals absorb the `--` marker): `(-*A-*)` for one value,
+/// `(-*[A-]*)` for `*`, `(-*A[A-]*)` for `+`.
+fn positional_pattern(nargs: Nargs) -> Vec<Atom> {
+    match nargs {
+        Nargs::One => vec![Atom::Many(&['-']), Atom::One('A'), Atom::Many(&['-'])],
+        Nargs::Star => vec![Atom::Many(&['-']), Atom::Many(&['A', '-'])],
+        Nargs::Plus => vec![Atom::Many(&['-']), Atom::One('A'), Atom::Many(&['A', '-'])],
+    }
+}
+
+/// `re.match` of the concatenated groups against the token-class string
+/// (anchored at the start only), in the regex engine's greedy-then-
+/// backtrack order; the length each group matched.
+fn match_groups(groups: &[Vec<Atom>], pattern: &[char]) -> Option<Vec<usize>> {
+    fn go(
+        groups: &[Vec<Atom>],
+        gi: usize,
+        ai: usize,
+        pos: usize,
+        pattern: &[char],
+        ends: &mut Vec<usize>,
+    ) -> bool {
+        if gi == groups.len() {
+            return true;
+        }
+        let atoms = &groups[gi];
+        if ai == atoms.len() {
+            ends.push(pos);
+            if go(groups, gi + 1, 0, pos, pattern, ends) {
+                return true;
+            }
+            ends.pop();
+            return false;
+        }
+        match &atoms[ai] {
+            Atom::One(c) => {
+                pattern.get(pos) == Some(c) && go(groups, gi, ai + 1, pos + 1, pattern, ends)
+            }
+            Atom::Many(set) => {
+                let run = pattern[pos..].iter().take_while(|c| set.contains(c)).count();
+                (0..=run)
+                    .rev()
+                    .any(|n| go(groups, gi, ai + 1, pos + n, pattern, ends))
+            }
+        }
+    }
+    let mut ends = Vec::new();
+    if !go(groups, 0, 0, 0, pattern, &mut ends) {
+        return None;
+    }
+    let mut lengths = Vec::with_capacity(ends.len());
+    let mut previous = 0;
+    for end in ends {
+        lengths.push(end - previous);
+        previous = end;
+    }
+    Some(lengths)
+}
+
+/// `_match_arguments_partial`: the longest prefix of the remaining
+/// positionals whose combined pattern matches, and each one's count.
+fn match_arguments_partial(specs: &[ArgSpec], positionals: &[usize], pattern: &[char]) -> Vec<usize> {
+    for take in (1..=positionals.len()).rev() {
+        let groups: Vec<Vec<Atom>> = positionals[..take]
+            .iter()
+            .map(|&i| positional_pattern(specs[i].nargs))
+            .collect();
+        if let Some(lengths) = match_groups(&groups, pattern) {
+            return lengths;
+        }
+    }
+    Vec::new()
+}
+
+/// The state of one `parse_args` run: CPython's `_parse_known_args`
+/// locals, with `take_action`, `consume_optional` and
+/// `consume_positionals` as methods.
+struct Parse<'a> {
+    prog: String,
+    description: Option<&'a str>,
+    specs: &'a [ArgSpec],
+    arg_strings: Vec<String>,
+    /// Every option string in registration order (`_option_string_actions`).
+    options: Vec<(&'static str, OptAction)>,
+    /// Each token's class: `A` an argument, `O` an option, `-` the
+    /// `--` marker.
+    pattern: Vec<char>,
+    /// The option tuple at each `O` index.
+    option_at: Vec<Option<OptionTuple>>,
+    values: Vec<Option<ParsedValue>>,
+    seen: Vec<bool>,
+    extras: Vec<String>,
+    /// The positionals still to be consumed (spec indices).
+    positionals: Vec<usize>,
+}
+
+impl<'a> Parse<'a> {
+    fn lookup(&self, s: &str) -> Option<OptAction> {
+        self.options.iter().find(|(name, _)| *name == s).map(|(_, a)| *a)
+    }
+
+    fn error(&self, message: &str) -> ! {
+        exit_error(&self.prog, self.specs, message)
+    }
+
+    fn action_name(&self, action: OptAction) -> String {
+        match action {
+            OptAction::Help => "-h/--help".to_string(),
+            OptAction::Spec(i) => self.specs[i].action_name(),
+        }
+    }
+
+    /// `_get_option_tuples`: the interpretations of an option-looking
+    /// token by prefix — a `--long` abbreviation, or a `-s` with its
+    /// value attached (`-s2.5`).
+    fn option_tuples(&self, token: &str) -> Vec<OptionTuple> {
+        let mut result = Vec::new();
+        if token.chars().nth(1) == Some('-') {
+            let (prefix, sep, explicit) = match token.split_once('=') {
+                Some((p, e)) => (p, Some("=".to_string()), Some(e.to_string())),
+                None => (token, None, None),
+            };
+            for (name, action) in &self.options {
+                if name.starts_with(prefix) {
+                    result.push(OptionTuple {
+                        action: Some(*action),
+                        option_string: name.to_string(),
+                        sep: sep.clone(),
+                        explicit_arg: explicit.clone(),
+                    });
+                }
+            }
+        } else {
+            let short_prefix: String = token.chars().take(2).collect();
+            let short_explicit: String = token.chars().skip(2).collect();
+            for (name, action) in &self.options {
+                if *name == short_prefix {
+                    result.push(OptionTuple {
+                        action: Some(*action),
+                        option_string: name.to_string(),
+                        sep: Some(String::new()),
+                        explicit_arg: Some(short_explicit.clone()),
+                    });
+                } else if name.starts_with(token) {
+                    result.push(OptionTuple {
+                        action: Some(*action),
+                        option_string: name.to_string(),
+                        sep: None,
+                        explicit_arg: None,
+                    });
+                }
+            }
+        }
+        result
+    }
+
+    /// `_parse_optional`: None for a token meant as a positional.
+    fn parse_optional(&self, token: &str) -> Option<OptionTuple> {
+        if !token.starts_with('-') {
+            return None;
+        }
+        if let Some(action) = self.lookup(token) {
+            return Some(OptionTuple {
+                action: Some(action),
+                option_string: token.to_string(),
+                sep: None,
+                explicit_arg: None,
+            });
+        }
+        if token.chars().count() == 1 {
+            return None;
+        }
+        if let Some((name, explicit)) = token.split_once('=')
+            && let Some(action) = self.lookup(name)
+        {
+            return Some(OptionTuple {
+                action: Some(action),
+                option_string: name.to_string(),
+                sep: Some("=".to_string()),
+                explicit_arg: Some(explicit.to_string()),
+            });
+        }
+        let mut tuples = self.option_tuples(token);
+        if tuples.len() > 1 {
+            let matches: Vec<&str> = tuples.iter().map(|t| t.option_string.as_str()).collect();
+            self.error(&format!(
+                "ambiguous option: {} could match {}",
+                token,
+                matches.join(", ")
+            ));
+        }
+        if tuples.len() == 1 {
+            return tuples.pop();
+        }
+        // A negative number is a positional (no option here looks like
+        // one); so is a token with a space in it.
+        if looks_like_negative_number(token) || token.contains(' ') {
+            return None;
+        }
+        Some(OptionTuple {
+            action: None,
+            option_string: token.to_string(),
+            sep: None,
+            explicit_arg: None,
+        })
+    }
+
+    /// `_match_argument` for an option: the count of following tokens it
+    /// takes — none for a flag, one argument (`A`) for a value-taking
+    /// option, else CPython's error.
+    fn match_argument(&self, action: OptAction, following: &[char]) -> usize {
+        match action {
+            OptAction::Help => 0,
+            OptAction::Spec(i) if !self.specs[i].takes_value() => 0,
+            OptAction::Spec(i) => {
+                if following.first() == Some(&'A') {
+                    1
+                } else {
+                    self.error(&format!(
+                        "argument {}: expected one argument",
+                        self.specs[i].action_name()
+                    ))
+                }
+            }
+        }
+    }
+
+    /// `take_action`: convert the values (opening files, reporting the
+    /// first failure) and store them — or, for help and version, print
+    /// and exit right here, in argv order.
+    fn take_action(&mut self, action: OptAction, mut args: Vec<String>) {
+        match action {
+            OptAction::Help => {
+                print!("{}", help_text(&self.prog, self.description, self.specs));
+                std::process::exit(0);
+            }
+            OptAction::Spec(i) => {
+                let spec = &self.specs[i];
+                self.seen[i] = true;
+                // `_get_values` drops one `--` marker from the values.
+                if let Some(at) = args.iter().position(|a| a == "--") {
+                    args.remove(at);
+                }
+                let value = match spec.kind {
+                    ArgKind::Version => print_version_and_exit(spec),
+                    ArgKind::StoreTrue => ParsedValue::Flag(true),
+                    _ if spec.nargs == Nargs::One => {
+                        let raw = args.first().expect("one value matched");
+                        convert(&self.prog, self.specs, spec, raw)
+                    }
+                    _ => ParsedValue::List(
+                        args.iter()
+                            .map(|a| convert(&self.prog, self.specs, spec, a))
+                            .collect(),
+                    ),
+                };
+                self.values[i] = Some(value);
+            }
+        }
+    }
+
+    /// `consume_optional`: the option at this index, its explicit or
+    /// following argument, and — for a single-dash flag with more
+    /// letters attached (`-vn 3`) — the flags packed after it.
+    fn consume_optional(&mut self, start_index: usize) -> usize {
+        let tuple = self.option_at[start_index].as_ref().expect("an option index");
+        let mut action = tuple.action;
+        let mut option_string = tuple.option_string.clone();
+        let mut sep = tuple.sep.clone();
+        let mut explicit_arg = tuple.explicit_arg.clone();
+        let mut action_tuples: Vec<(OptAction, Vec<String>)> = Vec::new();
+        let stop;
+        loop {
+            let Some(current) = action else {
+                self.extras.push(self.arg_strings[start_index].clone());
+                return start_index + 1;
+            };
+            match explicit_arg.take() {
+                Some(explicit) => {
+                    let arg_count = self.match_argument(current, &['A']);
+                    let single_dash = option_string.chars().nth(1) != Some('-');
+                    if arg_count == 0 && single_dash && !explicit.is_empty() {
+                        if sep.as_deref().is_some_and(|s| !s.is_empty())
+                            || explicit.starts_with('-')
+                        {
+                            self.error(&format!(
+                                "argument {}: ignored explicit argument {}",
+                                self.action_name(current),
+                                py_repr(&explicit)
+                            ));
+                        }
+                        action_tuples.push((current, Vec::new()));
+                        let mut chars = explicit.chars();
+                        let next_letter = chars.next().expect("non-empty");
+                        let rest: String = chars.collect();
+                        option_string = format!("-{}", next_letter);
+                        match self.lookup(&option_string) {
+                            Some(next) => {
+                                action = Some(next);
+                                if rest.is_empty() {
+                                    sep = None;
+                                    explicit_arg = None;
+                                } else if let Some(after_eq) = rest.strip_prefix('=') {
+                                    sep = Some("=".to_string());
+                                    explicit_arg = Some(after_eq.to_string());
+                                } else {
+                                    sep = Some(String::new());
+                                    explicit_arg = Some(rest);
+                                }
+                            }
+                            None => {
+                                self.extras.push(format!("-{}", explicit));
+                                stop = start_index + 1;
+                                break;
+                            }
+                        }
+                    } else if arg_count == 1 {
+                        stop = start_index + 1;
+                        action_tuples.push((current, vec![explicit]));
+                        break;
+                    } else {
+                        self.error(&format!(
+                            "argument {}: ignored explicit argument {}",
+                            self.action_name(current),
+                            py_repr(&explicit)
+                        ));
+                    }
+                }
+                None => {
+                    let start = start_index + 1;
+                    let arg_count = self.match_argument(current, &self.pattern[start..]);
+                    stop = start + arg_count;
+                    action_tuples.push((current, self.arg_strings[start..stop].to_vec()));
+                    break;
+                }
+            }
+        }
+        for (action, args) in action_tuples {
+            self.take_action(action, args);
+        }
+        stop
+    }
+
+    /// `consume_positionals`: as many of the remaining positionals as the
+    /// token classes from here allow, each taking its matched slice.
+    fn consume_positionals(&mut self, mut start_index: usize) -> usize {
+        let counts =
+            match_arguments_partial(self.specs, &self.positionals, &self.pattern[start_index..]);
+        let taken: Vec<usize> = self.positionals.drain(..counts.len()).collect();
+        for (spec_index, count) in taken.into_iter().zip(counts) {
+            let args = self.arg_strings[start_index..start_index + count].to_vec();
+            start_index += count;
+            self.take_action(OptAction::Spec(spec_index), args);
+        }
+        start_index
     }
 }
 
@@ -385,222 +851,117 @@ fn convert(
 /// prints help (exit 0) / usage + error (exit 2) like CPython. The
 /// PyException in the signature keeps the call-site shape uniform;
 /// errors exit instead, as Python's SystemExit reaching the top does.
+///
+/// This is a port of `ArgumentParser._parse_known_args` (CPython 3.11):
+/// every token is classified as an argument (`A`), an option (`O`) or
+/// the `--` marker; positionals are consumed at each option boundary
+/// through the partial pattern match, options through
+/// `consume_optional`, and every action is taken — converted, opened,
+/// printed — in ARGV ORDER, so the error a bad positional raises comes
+/// before a later option's, `--version` after a positional that cannot
+/// open never prints, and the arguments a variadic positional takes are
+/// exactly CPython's (Devin review on #339, round 2).
 pub fn run_parser(
     prog: Option<&str>,
     description: Option<&str>,
     specs: &[ArgSpec],
     argv: Option<Vec<String>>,
 ) -> Result<Vec<ParsedValue>, PyException> {
-    let prog = prog_name(prog);
     // parse_args(argv): an explicit argument list; None is sys.argv[1:].
-    let argv: Vec<String> = argv.unwrap_or_else(|| std::env::args().skip(1).collect());
+    let arg_strings: Vec<String> = argv.unwrap_or_else(|| std::env::args().skip(1).collect());
+    let mut parse = Parse {
+        prog: prog_name(prog),
+        description,
+        specs,
+        arg_strings,
+        options: option_strings(specs),
+        pattern: Vec::new(),
+        option_at: Vec::new(),
+        values: specs.iter().map(|_| None).collect(),
+        seen: specs.iter().map(|_| false).collect(),
+        extras: Vec::new(),
+        positionals: specs
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_positional())
+            .map(|(i, _)| i)
+            .collect(),
+    };
 
-    let mut values: Vec<Option<ParsedValue>> = specs.iter().map(|_| None).collect();
-    let mut extras: Vec<String> = Vec::new();
-    let positional_indices: Vec<usize> = specs
+    // Classify every token; everything after `--` is an argument.
+    let mut after_marker = false;
+    for token in parse.arg_strings.clone() {
+        let (class, tuple) = if after_marker {
+            ('A', None)
+        } else if token == "--" {
+            after_marker = true;
+            ('-', None)
+        } else {
+            match parse.parse_optional(&token) {
+                None => ('A', None),
+                Some(tuple) => ('O', Some(tuple)),
+            }
+        };
+        parse.pattern.push(class);
+        parse.option_at.push(tuple);
+    }
+
+    // Consume positionals and options alternately up to the last option.
+    let option_indices: Vec<usize> = parse
+        .pattern
         .iter()
         .enumerate()
-        .filter(|(_, s)| s.is_positional())
+        .filter(|(_, c)| **c == 'O')
         .map(|(i, _)| i)
         .collect();
-    let mut positional_tokens: Vec<String> = Vec::new();
-
-    let mut i = 0;
-    while i < argv.len() {
-        let token = &argv[i];
-        if token == "-h" || token == "--help" {
-            print!("{}", help_text(&prog, description, specs));
-            std::process::exit(0);
-        }
-        if token.starts_with("--") {
-            // --opt=value splits; prefix abbreviation resolves like
-            // Python (unique prefix ok, ambiguous is an error).
-            let (name, inline) = match token.split_once('=') {
-                Some((n, v)) => (n.to_string(), Some(v.to_string())),
-                None => (token.clone(), None),
-            };
-            let matches: Vec<usize> = specs
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| !s.is_positional() && s.name.starts_with(name.as_str()))
-                .map(|(i, _)| i)
-                .collect();
-            let exact: Option<usize> = specs
-                .iter()
-                .position(|s| !s.is_positional() && s.name == name);
-            let idx = match (exact, matches.as_slice()) {
-                (Some(i), _) => i,
-                (None, [single]) => *single,
-                (None, []) => {
-                    extras.push(token.clone());
-                    i += 1;
-                    continue;
-                }
-                (None, many) => {
-                    let options: Vec<&str> =
-                        many.iter().map(|&i| specs[i].name).collect();
-                    exit_error(
-                        &prog,
-                        specs,
-                        &format!(
-                            "ambiguous option: {} could match {}",
-                            name,
-                            options.join(", ")
-                        ),
-                    );
-                }
-            };
-            let spec = &specs[idx];
-            if spec.kind == ArgKind::Version {
-                print_version_and_exit(spec);
+    let mut start_index = 0;
+    let max_option_index = option_indices.last().copied();
+    while max_option_index.is_some_and(|max| start_index <= max) {
+        let next_option_index = option_indices
+            .iter()
+            .copied()
+            .find(|&i| i >= start_index)
+            .expect("an option index at or after start");
+        if start_index != next_option_index {
+            let positionals_end = parse.consume_positionals(start_index);
+            if positionals_end > start_index {
+                start_index = positionals_end;
+                continue;
             }
-            let value = if spec.kind == ArgKind::StoreTrue {
-                if inline.is_some() {
-                    exit_error(
-                        &prog,
-                        specs,
-                        &format!("argument {}: ignored explicit argument", spec.name),
-                    );
-                }
-                ParsedValue::Flag(true)
-            } else {
-                let raw = match inline {
-                    Some(v) => v,
-                    None => {
-                        i += 1;
-                        match argv.get(i) {
-                            Some(v) => v.clone(),
-                            None => exit_error(
-                                &prog,
-                                specs,
-                                &format!("argument {}: expected one argument", spec.name),
-                            ),
-                        }
-                    }
-                };
-                convert(&prog, specs, spec, &raw)
-            };
-            values[idx] = Some(value);
-        } else if token.starts_with('-')
-            && token.len() > 1
-            && token.parse::<f64>().is_err()
-        {
-            // A SHORT option (-c, -s 2.5, -s2.5). Like Python, a token
-            // that looks like an option (leading '-', not a negative
-            // number) never fills a positional — an unknown one is an
-            // "unrecognized arguments" error.
-            let exact = specs
-                .iter()
-                .position(|s| s.short == Some(token.as_str()));
-            if let Some(idx) = exact {
-                let spec = &specs[idx];
-                if spec.kind == ArgKind::Version {
-                    print_version_and_exit(spec);
-                }
-                let value = if spec.kind == ArgKind::StoreTrue {
-                    ParsedValue::Flag(true)
-                } else {
-                    i += 1;
-                    match argv.get(i) {
-                        Some(v) => convert(&prog, specs, spec, v),
-                        None => exit_error(
-                            &prog,
-                            specs,
-                            &format!("argument {}: expected one argument", spec.name),
-                        ),
-                    }
-                };
-                values[idx] = Some(value);
-            } else {
-                // Attached-value form (-s2.5) for value-taking shorts.
-                let head: String = token.chars().take(2).collect();
-                let attached = specs.iter().position(|s| {
-                    s.short.as_deref() == Some(head.as_str()) && s.takes_value()
-                });
-                match attached {
-                    Some(idx) => {
-                        let raw: String = token.chars().skip(2).collect();
-                        values[idx] = Some(convert(&prog, specs, &specs[idx], &raw));
-                    }
-                    None => extras.push(token.clone()),
-                }
-            }
-        } else {
-            // Positional tokens are distributed after the loop (a
-            // variadic positional takes what the fixed ones leave).
-            positional_tokens.push(token.clone());
+            start_index = positionals_end;
         }
-        i += 1;
+        if !option_indices.contains(&start_index) {
+            let skipped = parse.arg_strings[start_index..next_option_index].to_vec();
+            parse.extras.extend(skipped);
+            start_index = next_option_index;
+        }
+        start_index = parse.consume_optional(start_index);
     }
+    let stop_index = parse.consume_positionals(start_index);
+    let leftovers = parse.arg_strings[stop_index..].to_vec();
+    parse.extras.extend(leftovers);
 
-    // Distribute the positional tokens: fixed positionals before the
-    // variadic one take one each from the front, fixed ones after it one
-    // each from the back, the variadic takes the middle (Python's
-    // pattern match over the positional sequence, for one variadic);
-    // leftovers with no variadic are "unrecognized arguments".
-    let variadic = positional_indices
+    // Required arguments first (`_parse_known_args`), then the leftovers
+    // (`parse_args`): a positional that takes zero or more is never
+    // required.
+    let missing: Vec<String> = specs
         .iter()
-        .position(|&i| specs[i].nargs != Nargs::One);
-    let fixed = positional_indices.len() - usize::from(variadic.is_some());
-    let mut tokens = positional_tokens.into_iter();
-    let before = variadic.unwrap_or(positional_indices.len());
-    let mut assigned = 0usize;
-    for &idx in &positional_indices[..before] {
-        match tokens.next() {
-            Some(t) => {
-                values[idx] = Some(convert(&prog, specs, &specs[idx], &t));
-                assigned += 1;
-            }
-            None => break,
-        }
-    }
-    let mut rest: Vec<String> = tokens.collect();
-    if let Some(v) = variadic {
-        let after = &positional_indices[v + 1..];
-        let keep_for_after = after.len().min(rest.len());
-        let tail: Vec<String> = rest.split_off(rest.len() - keep_for_after);
-        let vidx = positional_indices[v];
-        if assigned == before {
-            let items: Vec<ParsedValue> = rest
-                .iter()
-                .map(|t| convert(&prog, specs, &specs[vidx], t))
-                .collect();
-            if !(items.is_empty() && specs[vidx].nargs == Nargs::Plus) {
-                values[vidx] = Some(ParsedValue::List(items));
-            }
-        }
-        for (&idx, t) in after.iter().zip(tail.iter()) {
-            values[idx] = Some(convert(&prog, specs, &specs[idx], t));
-        }
-        rest = Vec::new();
-    }
-    let _ = fixed;
-    extras.extend(rest);
-
-    if !extras.is_empty() {
-        exit_error(
-            &prog,
-            specs,
-            &format!("unrecognized arguments: {}", extras.join(" ")),
-        );
-    }
-    let missing: Vec<&str> = positional_indices
-        .iter()
-        .filter(|&&i| values[i].is_none() && specs[i].nargs != Nargs::Star)
-        .map(|&i| specs[i].name)
+        .enumerate()
+        .filter(|(i, s)| !parse.seen[*i] && s.is_positional() && s.nargs != Nargs::Star)
+        .map(|(_, s)| s.action_name())
         .collect();
     if !missing.is_empty() {
-        exit_error(
-            &prog,
-            specs,
-            &format!(
-                "the following arguments are required: {}",
-                missing.join(", ")
-            ),
-        );
+        parse.error(&format!(
+            "the following arguments are required: {}",
+            missing.join(", ")
+        ));
+    }
+    if !parse.extras.is_empty() {
+        parse.error(&format!("unrecognized arguments: {}", parse.extras.join(" ")));
     }
 
-    Ok(values
+    Ok(parse
+        .values
         .into_iter()
         .enumerate()
         .map(|(i, v)| {

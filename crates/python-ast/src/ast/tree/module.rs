@@ -1123,6 +1123,15 @@ impl CodeGen for Module {
             // destructure inside __module_init__, at its original position.
             if let Some(rw) = &module_argparse {
                 if rw.skip.contains(&stmt_index) {
+                    // A version string is bound where its add_argument
+                    // stood; every other parser statement vanishes.
+                    if let Some(tokens) = crate::ast::tree::function_def::lower_argparse_bindings(
+                        rw, stmt_index, &ctx, &options, &symbols,
+                    )
+                    .map_err(|e| wrap_module_error(&module_filename, e))?
+                    {
+                        module_init_stmts.push(tokens);
+                    }
                     continue;
                 }
                 if stmt_index == rw.parse_index {

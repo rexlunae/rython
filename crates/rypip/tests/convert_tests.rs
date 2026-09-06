@@ -6820,6 +6820,130 @@ fn argparse_filetype_dash_is_the_live_standard_stream_for_the_mode() {
 }
 
 #[test]
+fn argparse_consumes_arguments_in_cpython_order() {
+    // Round 2 of the review on #339: the runtime parser is a port of
+    // CPython's `_parse_known_args` — positionals are consumed at each
+    // option boundary through the partial pattern match and every action
+    // is taken in argv order. So a positional that cannot open fails
+    // before a later option's bad value; `--version` after it never
+    // prints; `--version=1` is the explicit-argument error; `-vn 3`
+    // unpacks; `-n/--num` is the option's name in errors; a token after
+    // the last option that no positional can take is "unrecognized",
+    // and required positionals are reported before leftovers. The
+    // version string is the one add_argument saw (`tool 1.0`, not the
+    // rebound `2.0`). Every transcript below was captured from python3
+    // 3.11 verbatim (a.txt and b.txt exist, missing.txt does not).
+    let scratch = Scratch::new("aporder");
+    let file = scratch.path().join("order.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    v = \"1.0\"\n",
+            "    parser = argparse.ArgumentParser(prog=\"tool\")\n",
+            "    parser.add_argument(\"-n\", \"--num\", type=int, default=0)\n",
+            "    parser.add_argument(\"-v\", \"--verbose\", action=\"store_true\")\n",
+            "    parser.add_argument(\"--version\", action=\"version\", version=\"tool \" + v)\n",
+            "    parser.add_argument(\"files\", type=argparse.FileType(\"r\"), nargs=\"+\")\n",
+            "    parser.add_argument(\"out\")\n",
+            "    v = \"2.0\"\n",
+            "    args = parser.parse_args(argv)\n",
+            "    for f in args.files:\n",
+            "        print(f.name)\n",
+            "    print(args.num, args.verbose, args.out)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(scratch.path().join("a.txt"), "a\n").unwrap();
+    fs::write(scratch.path().join("b.txt"), "b\n").unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/order");
+    let usage = "usage: tool [-h] [-n NUM] [-v] [--version] files [files ...] out\n";
+    let cases: &[(&[&str], i32, &str, &str)] = &[
+        (&["a.txt", "b.txt", "o"], 0, "a.txt\nb.txt\n0 False o\n", ""),
+        (&["a.txt", "--num", "1", "b.txt"], 0, "a.txt\n1 False b.txt\n", ""),
+        (
+            &["missing.txt", "o", "--num", "x"],
+            2,
+            "",
+            "tool: error: argument files: can't open 'missing.txt': [Errno 2] No such file or directory: 'missing.txt'\n",
+        ),
+        (&["a.txt", "o", "--version"], 0, "tool 1.0\n", ""),
+        (
+            &["--version=1"],
+            2,
+            "",
+            "tool: error: argument --version: ignored explicit argument '1'\n",
+        ),
+        (
+            &["a.txt", "o", "-n", "x"],
+            2,
+            "",
+            "tool: error: argument -n/--num: invalid int value: 'x'\n",
+        ),
+        (&["a.txt", "o", "-vn", "3"], 0, "a.txt\n3 True o\n", ""),
+        (
+            &["a.txt", "b.txt", "o", "--num", "1", "c.txt"],
+            2,
+            "",
+            "tool: error: unrecognized arguments: c.txt\n",
+        ),
+        (
+            &["-n", "1"],
+            2,
+            "",
+            "tool: error: the following arguments are required: files, out\n",
+        ),
+        (
+            &["a.txt"],
+            2,
+            "",
+            "tool: error: the following arguments are required: out\n",
+        ),
+        (&["a.txt", "--", "-o"], 0, "a.txt\n0 False -o\n", ""),
+        (
+            &["a.txt", "o", "--verbose=x"],
+            2,
+            "",
+            "tool: error: argument -v/--verbose: ignored explicit argument 'x'\n",
+        ),
+        (
+            &["a.txt", "o", "-vx"],
+            2,
+            "",
+            "tool: error: unrecognized arguments: -x\n",
+        ),
+    ];
+    for (args, code, stdout, stderr) in cases {
+        let output = Command::new(&bin)
+            .args(*args)
+            .current_dir(scratch.path())
+            .output()
+            .expect("run");
+        assert_eq!(output.status.code(), Some(*code), "{:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), *stdout, "{:?}", args);
+        let expected_err = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!("{}{}", usage, stderr)
+        };
+        assert_eq!(String::from_utf8_lossy(&output.stderr), expected_err, "{:?}", args);
+    }
+}
+
+#[test]
 fn binary_filetype_and_binary_open_match_python_at_runtime() {
     // Issue #332: `type=argparse.FileType("rb")` with `nargs="*"` (zero
     // files is an empty list), and `open(p, "wb")` / `open(p, "rb")` —

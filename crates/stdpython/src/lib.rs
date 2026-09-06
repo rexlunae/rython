@@ -7121,91 +7121,163 @@ fn os_error(e: &std::io::Error, path: &str) -> PyException {
     PyException::new(kind, message)
 }
 
-/// Python open() function - opens a file
-/// 
-/// Note: Only available with `std` feature - requires OS I/O capabilities
-#[cfg(feature = "std")]
-pub fn open<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: Option<M>) -> Result<PyFile, PyException> {
-    use std::fs::{File, OpenOptions};
-    use std::io::{BufReader, BufWriter};
-    
-    let mode = mode.as_ref().map(|m| m.as_ref()).unwrap_or("r");
-    
-    let file = match mode {
-        "r" => {
-            let f = File::open(filename.as_ref())
-                .map_err(|e| os_error(&e, filename.as_ref()))?;
-            PyFile::new_read(BufReader::new(f), filename.as_ref())
-        },
-        "w" => {
-            let f = File::create(filename.as_ref())
-                .map_err(|e| os_error(&e, filename.as_ref()))?;
-            PyFile::new_write(BufWriter::new(f), filename.as_ref())
-        },
-        "a" => {
-            let f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(filename.as_ref())
-                .map_err(|e| os_error(&e, filename.as_ref()))?;
-            PyFile::new_write(BufWriter::new(f), filename.as_ref())
-        },
-        _ => return Err(value_error(&format!("Invalid file mode: '{}'", mode))),
-    };
-    
-    Ok(file)
+/// The access a validated Python open() mode asks for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OpenAccess {
+    Read,
+    Write,
+    Append,
+    /// `x`: exclusive creation — FileExistsError when the path exists.
+    Create,
 }
 
-/// Python open() in a BINARY mode ("rb", "wb", "ab"): the binary file
-/// type — the same type as io.BytesIO, over a disk backend — whose
-/// read() yields bytes and write() takes them. The converter routes a
-/// literal mode containing 'b' here; text modes go to `open()`.
-///
-/// Note: Only available with `std` feature - requires OS I/O capabilities
-#[cfg(feature = "std")]
-pub fn open_binary<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: M) -> Result<stdlib::io::PyBytesIO, PyException> {
-    use std::fs::{File, OpenOptions};
-    use std::io::{BufReader, BufWriter};
-    let path = filename.as_ref();
-    let mode = mode.as_ref();
-    // Python accepts the letters in any order ("rb" == "br") but each
-    // at most once: "rbb" and "bbr" are `ValueError: invalid mode`,
-    // checked BEFORE any file-system side effect (Devin review on #339).
-    // An update mode ("rb+") is valid Python the runtime does not model
-    // yet: loud, distinct from the invalid-mode error.
-    if mode.chars().filter(|c| *c == 'b').count() != 1
-        || mode.chars().any(|c| !matches!(c, 'r' | 'w' | 'a' | 'b' | '+'))
-        || mode.chars().filter(|c| matches!(c, 'r' | 'w' | 'a')).count() != 1
-    {
-        return Err(value_error(&format!("invalid mode: '{}'", mode)));
+/// A Python open() mode after CPython's grammar check: the access and
+/// whether the file is binary.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OpenMode {
+    pub access: OpenAccess,
+    pub binary: bool,
+}
+
+/// CPython's mode grammar (`io.open`), checked in ITS order and before
+/// any file-system side effect (Devin review on #339): a letter outside
+/// `axrwb+t` or a repeated letter is `invalid mode: '<mode>'`; `t` with
+/// `b` is `can't have text and binary mode at once`; more than one of
+/// `a`/`x`/`r`/`w` is `must have exactly one of create/read/write/append
+/// mode`; none of them is CPython's capitalised `Must have exactly one of
+/// create/read/write/append mode and at most one plus`. An update mode
+/// (`+`) is valid Python the runtime does not model yet: loud, distinct
+/// from every CPython error.
+pub fn parse_open_mode(mode: &str) -> Result<OpenMode, PyException> {
+    let mut seen: alloc::vec::Vec<char> = alloc::vec::Vec::new();
+    for c in mode.chars() {
+        if !matches!(c, 'a' | 'x' | 'r' | 'w' | 'b' | '+' | 't') || seen.contains(&c) {
+            return Err(value_error(&format!("invalid mode: '{}'", mode)));
+        }
+        seen.push(c);
     }
-    if mode.contains('+') {
+    let binary = seen.contains(&'b');
+    if binary && seen.contains(&'t') {
+        return Err(value_error("can't have text and binary mode at once"));
+    }
+    let accesses: alloc::vec::Vec<OpenAccess> = seen
+        .iter()
+        .filter_map(|c| match c {
+            'r' => Some(OpenAccess::Read),
+            'w' => Some(OpenAccess::Write),
+            'a' => Some(OpenAccess::Append),
+            'x' => Some(OpenAccess::Create),
+            _ => None,
+        })
+        .collect();
+    let access = match accesses.as_slice() {
+        [one] => *one,
+        [] => {
+            return Err(value_error(
+                "Must have exactly one of create/read/write/append mode and at most one plus",
+            ))
+        }
+        _ => {
+            return Err(value_error(
+                "must have exactly one of create/read/write/append mode",
+            ))
+        }
+    };
+    if seen.contains(&'+') {
         return Err(value_error(&format!(
             "file mode '{}' is not supported yet (update modes)",
             mode
         )));
     }
-    let letters: alloc::vec::Vec<char> = mode.chars().filter(|c| *c != 'b').collect();
-    let file = match letters.as_slice() {
-        ['r'] => {
-            let f = File::open(path).map_err(|e| os_error(&e, path))?;
-            stdlib::io::PyBytesIO::new_disk_read(BufReader::new(f), path)
-        }
-        ['w'] => {
-            let f = File::create(path).map_err(|e| os_error(&e, path))?;
-            stdlib::io::PyBytesIO::new_disk_write(BufWriter::new(f), path)
-        }
-        ['a'] => {
-            let f = OpenOptions::new()
+    Ok(OpenMode { access, binary })
+}
+
+/// The OS handle for a validated mode: the read side as a buffered
+/// reader, any writing mode as a buffered writer.
+#[cfg(feature = "std")]
+enum DiskHandle {
+    Read(std::io::BufReader<std::fs::File>),
+    Write(std::io::BufWriter<std::fs::File>),
+}
+
+#[cfg(feature = "std")]
+fn open_disk(path: &str, access: OpenAccess) -> Result<DiskHandle, PyException> {
+    use std::fs::{File, OpenOptions};
+    use std::io::{BufReader, BufWriter};
+    let handle = match access {
+        OpenAccess::Read => DiskHandle::Read(BufReader::new(
+            File::open(path).map_err(|e| os_error(&e, path))?,
+        )),
+        OpenAccess::Write => DiskHandle::Write(BufWriter::new(
+            File::create(path).map_err(|e| os_error(&e, path))?,
+        )),
+        OpenAccess::Append => DiskHandle::Write(BufWriter::new(
+            OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
-                .map_err(|e| os_error(&e, path))?;
-            stdlib::io::PyBytesIO::new_disk_write(BufWriter::new(f), path)
-        }
-        _ => return Err(value_error(&format!("Invalid file mode: '{}'", mode))),
+                .map_err(|e| os_error(&e, path))?,
+        )),
+        OpenAccess::Create => DiskHandle::Write(BufWriter::new(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|e| os_error(&e, path))?,
+        )),
     };
-    Ok(file)
+    Ok(handle)
+}
+
+/// Python open() function - opens a file in a TEXT mode (the default
+/// `r`; `t` is accepted as Python's explicit text marker). A binary
+/// mode reaching this function is loud: the converter routes a LITERAL
+/// mode containing 'b' to `open_binary`, and a computed binary mode
+/// cannot choose the bytes file type at runtime.
+///
+/// Note: Only available with `std` feature - requires OS I/O capabilities
+#[cfg(feature = "std")]
+pub fn open<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: Option<M>) -> Result<PyFile, PyException> {
+    let path = filename.as_ref();
+    let mode = mode.as_ref().map(|m| m.as_ref()).unwrap_or("r");
+    let parsed = parse_open_mode(mode)?;
+    if parsed.binary {
+        return Err(value_error(&format!(
+            "open(..., '{}'): a binary mode must be a literal in the source for the \
+             bytes file type to be chosen (a computed binary mode is not supported yet)",
+            mode
+        )));
+    }
+    Ok(match open_disk(path, parsed.access)? {
+        DiskHandle::Read(f) => PyFile::new_read(f, path),
+        DiskHandle::Write(f) => PyFile::new_write(f, path),
+    })
+}
+
+/// Python open() in a BINARY mode ("rb", "wb", "ab", "xb"): the binary
+/// file type — the same type as io.BytesIO, over a disk backend — whose
+/// read() yields bytes and write() takes them. The converter routes a
+/// literal mode containing 'b' here; text modes go to `open()`. The
+/// mode grammar (`parse_open_mode`) is checked before any file-system
+/// side effect.
+///
+/// Note: Only available with `std` feature - requires OS I/O capabilities
+#[cfg(feature = "std")]
+pub fn open_binary<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: M) -> Result<stdlib::io::PyBytesIO, PyException> {
+    let path = filename.as_ref();
+    let mode = mode.as_ref();
+    let parsed = parse_open_mode(mode)?;
+    if !parsed.binary {
+        return Err(value_error(&format!(
+            "open_binary(..., '{}'): a text mode reached the binary open (the converter \
+             routes literal 'b' modes here)",
+            mode
+        )));
+    }
+    Ok(match open_disk(path, parsed.access)? {
+        DiskHandle::Read(f) => stdlib::io::PyBytesIO::new_disk_read(f, path),
+        DiskHandle::Write(f) => stdlib::io::PyBytesIO::new_disk_write(f, path),
+    })
 }
 
 /// Python file object: one type over every backend — disk handles from

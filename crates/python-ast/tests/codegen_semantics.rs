@@ -6389,8 +6389,14 @@ fn argparse_filetype_nargs_dest_and_version_shape_the_namespace() {
     assert!(out.contains("dest : Some (\"numbered\")"), "generated: {}", out);
     assert!(out.contains("into_list ()"), "generated: {}", out);
     assert!(out.contains("into_binary_file ()"), "generated: {}", out);
-    // The version string is the spec's default, rendered at the parse site.
-    assert!(out.contains("ParsedValue :: Str (("), "generated: {}", out);
+    // The version string is bound where the add_argument stood (Python
+    // evaluates it then) and is the spec's default at the parse site.
+    assert!(out.contains("let __argparse_version_0 : String = "), "generated: {}", out);
+    assert!(
+        out.contains("ParsedValue :: Str (__argparse_version_0 . clone ())"),
+        "generated: {}",
+        out
+    );
     // The Option-typed argv passes through unchanged.
     assert!(out.contains("] , argv ,)"), "generated: {}", out);
 
@@ -6601,6 +6607,106 @@ fn argparse_resolves_filetype_by_binding_and_the_version_keywords_in_either_orde
         "apft.py",
     );
     assert!(out.contains("argparse :: ArgKind :: File (\"r\")"), "generated: {}", out);
+}
+
+#[test]
+fn argparse_version_strings_bind_where_add_argument_stood() {
+    // Round 2 of the review on #339: Python evaluates `version=` when
+    // add_argument runs, so a name rebound before parse_args does not
+    // change it. The string is bound at the statement's position, before
+    // the rebinding, and the rebinding still happens.
+    let out = compile(
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    v = \"1.0\"\n",
+            "    p = argparse.ArgumentParser(prog=\"tool\")\n",
+            "    p.add_argument(\"--version\", action=\"version\", version=\"tool \" + v)\n",
+            "    v = \"2.0\"\n",
+            "    args = p.parse_args(argv)\n",
+            "    print(v)\n",
+            "    return 0\n",
+        ),
+        "apver.py",
+    );
+    let bind = out.find("let __argparse_version_0 : String = ").expect("the binding is emitted");
+    let rebind = out.find("v = \"2.0\"").expect("the rebinding survives");
+    let parse = out.find("argparse :: run_parser").expect("the parse site");
+    assert!(bind < rebind && rebind < parse, "order: {}", out);
+}
+
+#[test]
+fn update_file_modes_are_refused_at_conversion() {
+    // Round 2 of the review on #339: an update mode (`+`) is valid Python
+    // the runtime does not model; a literal one is refused when the
+    // program is converted, not at its first open — for `open()` and for
+    // `FileType`. Text and binary spellings alike.
+    for (src, expected) in [
+        (
+            concat!(
+                "def main() -> None:\n",
+                "    with open(\"x.bin\", \"rb+\") as f:\n",
+                "        f.read()\n",
+            ),
+            "open(..., 'rb+'): update modes ('+') are not supported yet",
+        ),
+        (
+            concat!(
+                "def main() -> None:\n",
+                "    with open(\"x.txt\", \"r+\") as f:\n",
+                "        f.read()\n",
+            ),
+            "open(..., 'r+'): update modes ('+') are not supported yet",
+        ),
+        (
+            concat!(
+                "import argparse\n",
+                "\n",
+                "def main(argv: list[str] | None = None) -> int:\n",
+                "    p = argparse.ArgumentParser(prog=\"t\")\n",
+                "    p.add_argument(\"f\", type=argparse.FileType(\"rb+\"))\n",
+                "    args = p.parse_args(argv)\n",
+                "    return 0\n",
+            ),
+            "FileType('rb+') is an update mode, which is not supported yet",
+        ),
+    ] {
+        let err = compile_err(src, "plus.py");
+        assert!(err.contains(expected), "{}\nerror: {}", src, err);
+    }
+    // Every argparse spelling the converter reads goes through a typed
+    // enum: an unknown parser keyword, action, type name or nargs is one
+    // loud error naming it.
+    for (line, expected) in [
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\", epilog=\"bye\")\n    p.add_argument(\"f\")\n",
+            "keyword 'epilog' is not supported yet",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"f\", action=\"append\")\n",
+            "only action=\"store\", \"store_true\" and \"version\" are supported",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"f\", type=bool)\n",
+            "type must be int, float, str, or FileType(mode)",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"f\", nargs=\"?\")\n",
+            "only nargs=\"+\" and nargs=\"*\" are supported yet",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"f\", choices=[\"a\"])\n",
+            "keyword 'choices' is not supported yet",
+        ),
+    ] {
+        let src = format!(
+            "import argparse\n\ndef main(argv: list[str] | None = None) -> int:\n{}    args = p.parse_args(argv)\n    return 0\n",
+            line
+        );
+        let err = compile_err(&src, "apenum.py");
+        assert!(err.contains(expected), "{}\nerror: {}", src, err);
+    }
 }
 
 #[test]

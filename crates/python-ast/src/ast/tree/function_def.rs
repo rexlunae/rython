@@ -63,9 +63,114 @@ pub(crate) struct ArgparseSpec {
     /// positional's dest is its name in Python too).
     dest: Option<String>,
     /// `nargs="+"` / `"*"` on a positional: a list-valued field.
-    nargs: Option<char>,
+    nargs: Option<ArgparseNargs>,
     default: Option<ExprType>,
     help: Option<String>,
+}
+
+/// The keywords `argparse.ArgumentParser(...)` may take here. Every
+/// argparse surface the converter knows is a typed enum with a
+/// `from_name` (Devin review on #339, round 2): an unknown spelling is
+/// one loud error, never a silently ignored keyword.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ParserKeyword {
+    Prog,
+    Description,
+}
+
+impl ParserKeyword {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "prog" => Some(Self::Prog),
+            "description" => Some(Self::Description),
+            _ => None,
+        }
+    }
+}
+
+/// The keywords `add_argument(...)` may take here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ArgparseKeyword {
+    Type,
+    Default,
+    Help,
+    Action,
+    Version,
+    Dest,
+    Nargs,
+}
+
+impl ArgparseKeyword {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "type" => Some(Self::Type),
+            "default" => Some(Self::Default),
+            "help" => Some(Self::Help),
+            "action" => Some(Self::Action),
+            "version" => Some(Self::Version),
+            "dest" => Some(Self::Dest),
+            "nargs" => Some(Self::Nargs),
+            _ => None,
+        }
+    }
+}
+
+/// The `action=` spellings the converter models.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ArgparseAction {
+    /// Python's default action.
+    Store,
+    StoreTrue,
+    Version,
+}
+
+impl ArgparseAction {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "store" => Some(Self::Store),
+            "store_true" => Some(Self::StoreTrue),
+            "version" => Some(Self::Version),
+            _ => None,
+        }
+    }
+}
+
+/// The builtin `type=` callables the converter models (FileType is
+/// resolved apart, through the symbol table).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ArgparseTypeName {
+    Int,
+    Float,
+    Str,
+}
+
+impl ArgparseTypeName {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "int" => Some(Self::Int),
+            "float" => Some(Self::Float),
+            "str" => Some(Self::Str),
+            _ => None,
+        }
+    }
+}
+
+/// The `nargs=` spellings the converter models: one or more, zero or
+/// more (a `Vec` field).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ArgparseNargs {
+    Plus,
+    Star,
+}
+
+impl ArgparseNargs {
+    fn from_spelling(spelling: &str) -> Option<Self> {
+        match spelling {
+            "+" => Some(Self::Plus),
+            "*" => Some(Self::Star),
+            _ => None,
+        }
+    }
 }
 
 /// The typed coercion of one argument — Python's `type=` / `action=`
@@ -79,9 +184,11 @@ pub(crate) enum ArgparseKind {
     StoreTrue,
     File(String),
     BinaryFile(String),
-    /// The version string expression (`version=`), rendered at the parse
-    /// site and carried as the spec's default.
-    Version(ExprType),
+    /// `action="version"`: the Rust local holding the version string,
+    /// bound where the add_argument statement stood (see
+    /// [`ArgparseRewrite::version_bindings`]) and carried as the spec's
+    /// default at the parse site.
+    Version(String),
 }
 
 /// The argparse rewrite plan for a function body: parser-building
@@ -99,6 +206,14 @@ pub(crate) struct ArgparseRewrite {
     /// `parse_args(argv)`: the explicit argument list (a `list[str]` or
     /// `list[str] | None` expression); None is sys.argv[1:].
     argv: Option<ExprType>,
+    /// `version=` expressions, each evaluated WHERE ITS add_argument
+    /// STATEMENT STOOD: Python evaluates the string when add_argument
+    /// runs, so a name rebound before parse_args does not change it
+    /// (Devin review on #339, round 2). Each entry is the statement
+    /// index, the Rust local's name and the expression; the callers emit
+    /// `let <name>: String = <expr>` at that index through
+    /// [`lower_argparse_bindings`].
+    version_bindings: Vec<(usize, String, ExprType)>,
 }
 
 fn literal_str(e: &ExprType) -> Option<String> {
@@ -188,13 +303,13 @@ pub(crate) fn scan_argparse(
                     kw.arg.as_deref().unwrap_or("argument")
                 )
             })?;
-            match kw.arg.as_deref() {
-                Some("prog") => prog = Some(value),
-                Some("description") => description = Some(value),
-                other => {
+            match kw.arg.as_deref().and_then(ParserKeyword::from_name) {
+                Some(ParserKeyword::Prog) => prog = Some(value),
+                Some(ParserKeyword::Description) => description = Some(value),
+                None => {
                     return Err(format!(
                         "argparse.ArgumentParser keyword '{}' is not supported yet",
-                        other.unwrap_or("**kwargs")
+                        kw.arg.as_deref().unwrap_or("**kwargs")
                     )
                     .into())
                 }
@@ -213,6 +328,7 @@ pub(crate) fn scan_argparse(
     let mut specs = Vec::new();
     let mut parse: Option<(usize, String)> = None;
     let mut argv: Option<ExprType> = None;
+    let mut version_bindings: Vec<(usize, String, ExprType)> = Vec::new();
     for (i, stmt) in body.iter().enumerate().skip(ctor_index + 1) {
         let call_on_parser = |call: &crate::Call| -> Option<String> {
             let ExprType::Attribute(attr) = call.func.as_ref() else {
@@ -291,15 +407,20 @@ pub(crate) fn scan_argparse(
                 let mut action_version = false;
                 let mut version: Option<ExprType> = None;
                 let mut dest: Option<String> = None;
-                let mut nargs: Option<char> = None;
+                let mut nargs: Option<ArgparseNargs> = None;
                 let is_positional = !name.starts_with('-');
                 for kw in &call.keywords {
-                    match kw.arg.as_deref() {
-                        Some("type") => {
+                    let keyword = kw.arg.as_deref().and_then(ArgparseKeyword::from_name);
+                    match keyword {
+                        Some(ArgparseKeyword::Type) => {
                             kind = Some(match &kw.value {
-                                ExprType::Name(n) if n.id == "int" => ArgparseKind::Int,
-                                ExprType::Name(n) if n.id == "float" => ArgparseKind::Float,
-                                ExprType::Name(n) if n.id == "str" => ArgparseKind::Str,
+                                ExprType::Name(n) if ArgparseTypeName::from_name(&n.id).is_some() => {
+                                    match ArgparseTypeName::from_name(&n.id).expect("checked") {
+                                        ArgparseTypeName::Int => ArgparseKind::Int,
+                                        ArgparseTypeName::Float => ArgparseKind::Float,
+                                        ArgparseTypeName::Str => ArgparseKind::Str,
+                                    }
+                                }
                                 // `type=FileType(mode)` (a literal mode;
                                 // `argparse.FileType` or the name imported
                                 // from argparse, resolved through the
@@ -326,6 +447,21 @@ pub(crate) fn scan_argparse(
                                             )
                                         })?,
                                     };
+                                    // An update mode is valid Python the
+                                    // runtime does not model: refused here,
+                                    // so `-` cannot quietly accept what a
+                                    // path would fail on (Devin review on
+                                    // #339, round 2). The rest of the mode
+                                    // grammar is the runtime's
+                                    // (`parse_open_mode`, CPython's errors).
+                                    if mode.contains('+') {
+                                        return Err(format!(
+                                            "add_argument('{}'): FileType('{}') is an \
+                                             update mode, which is not supported yet",
+                                            name, mode
+                                        )
+                                        .into());
+                                    }
                                     if mode.contains('b') {
                                         ArgparseKind::BinaryFile(mode)
                                     } else {
@@ -342,8 +478,8 @@ pub(crate) fn scan_argparse(
                                 }
                             });
                         }
-                        Some("default") => default = Some(kw.value.clone()),
-                        Some("help") => {
+                        Some(ArgparseKeyword::Default) => default = Some(kw.value.clone()),
+                        Some(ArgparseKeyword::Help) => {
                             help = Some(literal_str(&kw.value).ok_or_else(|| {
                                 format!(
                                     "add_argument('{}'): help must be a string literal",
@@ -351,12 +487,14 @@ pub(crate) fn scan_argparse(
                                 )
                             })?)
                         }
-                        Some("action") => match literal_str(&kw.value).as_deref() {
-                            Some("store_true") => store_true = true,
-                            // Python's default action.
-                            Some("store") => {}
-                            Some("version") => action_version = true,
-                            _ => {
+                        Some(ArgparseKeyword::Action) => match literal_str(&kw.value)
+                            .as_deref()
+                            .and_then(ArgparseAction::from_name)
+                        {
+                            Some(ArgparseAction::StoreTrue) => store_true = true,
+                            Some(ArgparseAction::Store) => {}
+                            Some(ArgparseAction::Version) => action_version = true,
+                            None => {
                                 return Err(format!(
                                     "add_argument('{}'): only action=\"store\", \
                                      \"store_true\" and \"version\" are supported",
@@ -365,12 +503,13 @@ pub(crate) fn scan_argparse(
                                 .into())
                             }
                         },
-                        Some("version") => {
-                            // Any str expression: rendered at the parse site
-                            // (it may format runtime values).
+                        Some(ArgparseKeyword::Version) => {
+                            // Any str expression, evaluated where this
+                            // statement stands (it may read runtime
+                            // values, which Python reads NOW).
                             version = Some(kw.value.clone());
                         }
-                        Some("dest") => {
+                        Some(ArgparseKeyword::Dest) => {
                             if is_positional {
                                 return Err(format!(
                                     "add_argument('{}'): dest is supplied by the \
@@ -386,12 +525,11 @@ pub(crate) fn scan_argparse(
                                 )
                             })?);
                         }
-                        Some("nargs") => {
+                        Some(ArgparseKeyword::Nargs) => {
                             let spelled = literal_str(&kw.value);
-                            nargs = Some(match spelled.as_deref() {
-                                Some("+") => '+',
-                                Some("*") => '*',
-                                _ => {
+                            nargs = Some(match spelled.as_deref().and_then(ArgparseNargs::from_spelling) {
+                                Some(n) => n,
+                                None => {
                                     return Err(format!(
                                         "add_argument('{}'): only nargs=\"+\" and \
                                          nargs=\"*\" are supported yet",
@@ -409,11 +547,11 @@ pub(crate) fn scan_argparse(
                                 .into());
                             }
                         }
-                        other => {
+                        None => {
                             return Err(format!(
                                 "add_argument('{}'): keyword '{}' is not supported yet",
                                 name,
-                                other.unwrap_or("**kwargs")
+                                kw.arg.as_deref().unwrap_or("**kwargs")
                             )
                             .into())
                         }
@@ -447,7 +585,9 @@ pub(crate) fn scan_argparse(
                         )
                         .into());
                     }
-                    ArgparseKind::Version(v)
+                    let local = format!("__argparse_version_{}", version_bindings.len());
+                    version_bindings.push((i, local.clone(), v));
+                    ArgparseKind::Version(local)
                 } else if store_true {
                     // `default=False` is store_true's own default (Python
                     // allows spelling it); anything else is a divergent
@@ -598,7 +738,43 @@ pub(crate) fn scan_argparse(
         description,
         specs,
         argv,
+        version_bindings,
     }))
+}
+
+/// The Rust binding a skipped parser statement leaves behind, if any:
+/// `let <local>: String = <version expr>` for an `action="version"`
+/// add_argument, evaluated at that statement's position. None for every
+/// other skipped statement (they vanish).
+pub(crate) fn lower_argparse_bindings(
+    rw: &ArgparseRewrite,
+    index: usize,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+    let mut out = TokenStream::new();
+    for (_, local, expr) in rw.version_bindings.iter().filter(|(at, _, _)| *at == index) {
+        let ident = quote::format_ident!("{}", local);
+        let value = expr
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        out.extend(quote!(let #ident: String = (#value).to_string();));
+    }
+    Ok((!out.is_empty()).then_some(out))
+}
+
+/// The skipped statement indices of a rewrite that leave a binding
+/// behind, keyed by the index of the NEXT statement the body keeps: the
+/// function path emits the bindings right before that statement, so
+/// they sit where the add_argument stood.
+pub(crate) fn argparse_bindings_before(rw: &ArgparseRewrite) -> std::collections::HashMap<usize, Vec<usize>> {
+    let mut before: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for (at, _, _) in &rw.version_bindings {
+        let effective = (0..*at).filter(|i| !rw.skip.contains(i)).count();
+        before.entry(effective).or_default().push(*at);
+    }
+    before
 }
 
 /// Emit the parse_args replacement: a namespace struct typed from the
@@ -637,9 +813,9 @@ pub(crate) fn lower_parse_args(
             ArgparseKind::Version(_) => (quote!(()), quote!(Version), quote!()),
         };
         let default = match (&spec.kind, &spec.default) {
-            (ArgparseKind::Version(v), _) => {
-                let v = v.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                quote!(Some(argparse::ParsedValue::Str((#v).to_string())))
+            (ArgparseKind::Version(local), _) => {
+                let local = quote::format_ident!("{}", local);
+                quote!(Some(argparse::ParsedValue::Str(#local.clone())))
             }
             (_, None) => quote!(None),
             (kind, Some(e)) => {
@@ -671,9 +847,9 @@ pub(crate) fn lower_parse_args(
             None => quote!(None),
         };
         let nargs = match spec.nargs {
-            Some('+') => quote!(Plus),
-            Some('*') => quote!(Star),
-            _ => quote!(One),
+            Some(ArgparseNargs::Plus) => quote!(Plus),
+            Some(ArgparseNargs::Star) => quote!(Star),
+            None => quote!(One),
         };
         spec_tokens.push(quote!(argparse::ArgSpec {
             name: #name,
@@ -2733,7 +2909,23 @@ impl FunctionDef {
         // drops out of the narrowed set again.
         let mut narrowed: std::collections::HashMap<String, crate::TypeInfo> =
             std::collections::HashMap::new();
+        let argparse_bindings = argparse_rewrite
+            .as_ref()
+            .map(argparse_bindings_before)
+            .unwrap_or_default();
         for (i, s) in effective_body.iter().enumerate().skip(body_start) {
+            // A version string is bound where its add_argument stood.
+            if let Some(rw) = &argparse_rewrite
+                && let Some(originals) = argparse_bindings.get(&i)
+            {
+                for &at in originals {
+                    if let Some(tokens) =
+                        lower_argparse_bindings(rw, at, &body_ctx, &options, &symbols)?
+                    {
+                        streams.extend(tokens);
+                    }
+                }
+            }
             if Some(i) == argparse_parse_at {
                 let rw = argparse_rewrite.as_ref().expect("index implies rewrite");
                 streams.extend(lower_parse_args(

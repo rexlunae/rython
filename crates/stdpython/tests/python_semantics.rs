@@ -3914,15 +3914,36 @@ fn an_exceptions_repr_is_its_class_and_its_args() {
 
 #[test]
 fn open_binary_validates_the_mode_before_touching_the_path() {
-    // CPython: open(p, "rbb") and open(p, "bbr") are `ValueError: invalid
-    // mode: '...'` — raised before the path is looked at — while "rb" and
-    // "br" are the same binary read mode (Devin review on #339).
-    for mode in ["rbb", "bbr", "b", "rwb", "xb"] {
-        let err = stdpython::open_binary("/nonexistent/dir/for/rython/x.bin", mode)
-            .err()
-            .expect("an invalid mode is refused");
+    // CPython's mode grammar, in its order, before the path is looked
+    // at (Devin review on #339, rounds 1 and 2): a letter outside
+    // `axrwb+t` or a repeated letter is `invalid mode`; `t` with `b` is
+    // "can't have text and binary mode at once" (`rbt` is NOT a valid
+    // Python mode); more than one access letter, or none, are the two
+    // "exactly one of create/read/write/append" errors; an update mode
+    // is rython's own loud refusal. "rb" and "br" are the same read.
+    let missing = "/nonexistent/dir/for/rython/x.bin";
+    for (mode, expected) in [
+        ("rbb", "invalid mode: 'rbb'"),
+        ("bbr", "invalid mode: 'bbr'"),
+        ("rbq", "invalid mode: 'rbq'"),
+        ("rbt", "can't have text and binary mode at once"),
+        ("rwb", "must have exactly one of create/read/write/append mode"),
+        ("b", "Must have exactly one of create/read/write/append mode and at most one plus"),
+        ("rb+", "file mode 'rb+' is not supported yet (update modes)"),
+    ] {
+        let err = stdpython::open_binary(missing, mode).err().expect("refused");
         assert!(err.matches("ValueError"), "{}: {:?}", mode, err);
-        assert_eq!(err.message, format!("invalid mode: '{}'", mode));
+        assert_eq!(err.message, expected, "{}", mode);
+    }
+    for (mode, expected) in [
+        ("rt", "[Errno 2] No such file or directory: '/nonexistent/dir/for/rython/x.bin'"),
+        ("rr", "invalid mode: 'rr'"),
+        ("rw", "must have exactly one of create/read/write/append mode"),
+        ("t", "Must have exactly one of create/read/write/append mode and at most one plus"),
+        ("r+", "file mode 'r+' is not supported yet (update modes)"),
+    ] {
+        let err = stdpython::open(missing, Some(mode)).err().expect("refused");
+        assert_eq!(err.message, expected, "{}", mode);
     }
     let dir = std::env::temp_dir().join(format!("rython-open-binary-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -3932,7 +3953,14 @@ fn open_binary_validates_the_mode_before_touching_the_path() {
         let f = stdpython::open_binary(path.to_str().unwrap(), mode).expect(mode);
         assert_eq!(f.read().unwrap(), b"abc");
     }
-    let err = stdpython::open_binary(path.to_str().unwrap(), "rb+").err().expect("update modes are loud");
-    assert!(err.message.contains("not supported yet"), "{:?}", err);
+    // `x` creates exclusively: FileExistsError the second time.
+    let fresh = dir.join("fresh.bin");
+    let f = stdpython::open_binary(fresh.to_str().unwrap(), "xb").expect("xb creates");
+    f.write(b"new").unwrap();
+    f.close().unwrap();
+    assert_eq!(std::fs::read(&fresh).unwrap(), b"new");
+    let err = stdpython::open_binary(fresh.to_str().unwrap(), "xb").err().expect("exists");
+    assert!(err.matches("FileExistsError"), "{:?}", err);
+    assert!(err.message.starts_with("[Errno 17] File exists: "), "{:?}", err);
     std::fs::remove_dir_all(&dir).unwrap();
 }

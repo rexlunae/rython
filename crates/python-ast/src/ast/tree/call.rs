@@ -3523,6 +3523,27 @@ impl<'a> CodeGen for Call {
                         {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
+                        // A LITERAL update mode (`r+`, `rb+`) is valid Python
+                        // the runtime does not model yet: refused at
+                        // conversion, not at the first open (Devin review
+                        // on #339, round 2). The rest of the mode grammar is
+                        // the runtime's (`parse_open_mode`, CPython's own
+                        // errors, raised before any file-system effect).
+                        if let Some(mode) = self.args.get(1).and_then(|m| match m {
+                            ExprType::Constant(c) => match &c.0 {
+                                Some(litrs::Literal::String(s)) => Some(s.value().to_string()),
+                                _ => None,
+                            },
+                            _ => None,
+                        }) && mode.contains('+')
+                        {
+                            return Err(format!(
+                                "open(..., '{}'): update modes ('+') are not supported yet \
+                                 (issue #332)",
+                                mode
+                            )
+                            .into());
+                        }
                         // A LITERAL mode containing 'b' is the binary file
                         // (read() yields bytes): `open_binary` (issue #332).
                         let binary_mode = self.args.get(1).is_some_and(|m| {
