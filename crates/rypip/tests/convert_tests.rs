@@ -11144,6 +11144,54 @@ fn a_walrus_marks_only_its_own_name_not_the_statements_store_target() {
     );
 }
 
+/// A package that binds and deletes a name, and a sibling that imports
+/// it: the conversion is refused (see the tests below).
+fn deleted_attribute_conversion_error(pkg_name: &str, with_submodule: bool) -> String {
+    let scratch = Scratch::new(pkg_name);
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        format!("[project]\nname = \"{pkg_name}\"\nversion = \"0.1.0\"\n"),
+    )
+    .unwrap();
+    let pkg = scratch.path().join(pkg_name);
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "helper = 1\ndel helper\n").unwrap();
+    if with_submodule {
+        fs::write(pkg.join("helper.py"), "print(\"submodule helper loaded\")\n").unwrap();
+    }
+    fs::write(
+        pkg.join("cli.py"),
+        "from . import helper\n\n\ndef main() -> None:\n    print(\"main\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+    )
+    .unwrap();
+    let discovered = rypip::discover(scratch.path()).expect("discover");
+    let err = rypip::convert(&discovered, &scratch.path().join("crate"), &ConvertOptions::default())
+        .err()
+        .expect("the import of a deleted attribute is refused");
+    format!("{:#}", err)
+}
+
+#[test]
+fn importing_a_package_attribute_the_package_deletes_is_refused() {
+    // `helper = 1; del helper` in the package, `from . import helper` in a
+    // sibling: CPython finds no attribute and, with a submodule helper.py,
+    // imports it (`submodule helper loaded`, `main`); without one, raises
+    // ImportError. A module-level `del` lowers to a no-op (issue #112), so
+    // the static would outlive the binding and answer the import: the
+    // conversion is refused, naming the fix (Devin review on #338, round
+    // 13).
+    for (pkg_name, with_submodule) in [("delsub", true), ("delplain", false)] {
+        let msg = deleted_attribute_conversion_error(pkg_name, with_submodule);
+        assert!(
+            msg.contains("`from . import helper` is refused: the package binds `helper` and deletes it (`del helper`)")
+                && msg.contains("drop the `del`"),
+            "{}: {}",
+            pkg_name,
+            msg
+        );
+    }
+}
+
 #[test]
 fn a_bare_annotation_in_the_package_does_not_hide_the_submodule() {
     // `settings: dict` in conf/__init__.py binds only `__annotations__`:

@@ -873,18 +873,64 @@ pub(crate) fn module_init_calls(paths: &[Vec<String>]) -> TokenStream {
     quote!(#(#calls)*)
 }
 
+/// Whether the crate module at `key` deletes `name` at module scope
+/// (`del name`, under module-level control flow too). A module-level
+/// `del` lowers to a no-op (issue #112), so the static outlives the
+/// binding: what a later `from package import name` finds — the
+/// attribute, the submodule, or an ImportError — depends on the order
+/// at runtime, which the converted program cannot represent.
+fn module_deletes(options: &PythonOptions, key: &[String], name: &str) -> bool {
+    use crate::ast::tree::visit::{any_stmt, Descend};
+    let Some(body) = crate::ast::tree::module::normalized_body_of(options, key) else {
+        return false;
+    };
+    any_stmt(&body, Descend::SkipDefs, |s| match &s.statement {
+        crate::StatementType::Delete(targets) => targets
+            .iter()
+            .any(|t| matches!(t, crate::ExprType::Name(n) if n.id == name)),
+        _ => false,
+    })
+}
+
 /// What an import statement runs at its site: the loaded modules' init
 /// calls, then the checks of the from-list names the package binds —
 /// the one lowering every import site (module level, nested,
 /// function-local) shares. Empty when the statement loads no crate
-/// module.
+/// module. A from-list name the package binds AND deletes is refused
+/// (Devin review on #338, round 13): Python decides at runtime whether
+/// the attribute, the submodule, or an ImportError answers, and the
+/// static layout would hand out the deleted value.
 pub(crate) fn import_site_init(
     stmt: &crate::StatementType,
     options: &PythonOptions,
-) -> TokenStream {
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    if let crate::StatementType::ImportFrom(i) = stmt {
+        let base = i.resolved_module_path(options);
+        if let Some(key) = crate::module_defs_key(options, &base) {
+            for a in &i.names {
+                if module_binding(options, key, &a.name).is_some()
+                    && module_deletes(options, key, &a.name)
+                {
+                    return Err(format!(
+                        "`from {}{} import {}` is refused: the package binds `{}` and \
+                         deletes it (`del {}`), so whether the import finds the attribute, \
+                         a submodule of that name, or nothing depends on the order at \
+                         runtime, which the converted program cannot represent; import \
+                         the value under a name the package keeps, or drop the `del`",
+                        ".".repeat(i.level),
+                        i.module,
+                        a.name,
+                        a.name,
+                        a.name
+                    )
+                    .into());
+                }
+            }
+        }
+    }
     let calls = module_init_calls(&imported_crate_modules(stmt, options));
     let checks = import_site_name_checks(stmt, options);
-    quote!(#calls #checks)
+    Ok(quote!(#calls #checks))
 }
 
 /// The import site of a folded `try: <imports> except ImportError:`

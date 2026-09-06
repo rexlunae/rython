@@ -1854,7 +1854,8 @@ impl CodeGen for Module {
                                 crate::ast::tree::import::import_site_init(
                                     &body_stmt.statement,
                                     &options,
-                                ),
+                                )
+                                .map_err(|e| wrap_module_error(&module_filename, e))?,
                                 &import_spelling(&body_stmt.statement),
                             );
                             if !site.is_empty() {
@@ -2070,7 +2071,8 @@ impl CodeGen for Module {
                 &s.statement,
                 crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
             ) {
-                let site = crate::ast::tree::import::import_site_init(&s.statement, &options);
+                let site = crate::ast::tree::import::import_site_init(&s.statement, &options)
+                    .map_err(|e| wrap_module_error(&module_filename, e))?;
                 // An import a folded guard spliced in: loud when a crate
                 // module raises ImportError at runtime (Python would run
                 // the folded fallback).
