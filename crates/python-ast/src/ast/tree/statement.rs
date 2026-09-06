@@ -90,18 +90,24 @@ impl CodeGen for Statement {
         // An import a folded guard spliced in, nested in module-level
         // control flow: its site (the init calls) is loud when a crate
         // module raises ImportError at runtime.
-        let folded_guard = options.in_module_init_body
+        let folded_guard = if options.in_module_init_body
             && matches!(self.statement, StatementType::Import(_) | StatementType::ImportFrom(_))
-            && lineno
+        {
+            lineno
                 .zip(col_offset)
-                .is_some_and(|pos| options.folded_guard_imports.contains(&pos));
+                .and_then(|pos| options.folded_guard_imports.get(&pos).copied())
+        } else {
+            None
+        };
         let spelling = folded_guard
-            .then(|| crate::ast::tree::module::import_spelling(&self.statement));
+            .map(|guard| (crate::ast::tree::module::import_spelling(&self.statement), guard));
         let result = self.statement
             .clone()
             .to_rust(ctx, options, symbols)
             .map(|tokens| match &spelling {
-                Some(spelling) => crate::ast::tree::import::folded_guard_site(tokens, spelling),
+                Some((spelling, guard)) => {
+                    crate::ast::tree::import::folded_guard_site(tokens, spelling, *guard)
+                }
                 None => tokens,
             })
             .map(|tokens| match bind {

@@ -627,7 +627,9 @@ pub struct PythonOptions {
     /// sites are loud when a crate module's body raises ImportError at
     /// runtime, where Python would run the folded fallback (Devin review
     /// on #338, round 10).
-    pub folded_guard_imports: std::rc::Rc<std::collections::HashSet<(usize, usize)>>,
+    pub folded_guard_imports: std::rc::Rc<
+        std::collections::HashMap<(usize, usize), crate::ast::tree::module::FoldedGuard>,
+    >,
 
     /// Set on the ENTRY module by the converter when the package root
     /// `__init__` has a body the binary must run: the bin-side module that
@@ -750,7 +752,7 @@ impl Default for PythonOptions {
             normalized_bodies: std::rc::Rc::new(std::cell::RefCell::new(
                 std::collections::HashMap::new(),
             )),
-            folded_guard_imports: std::rc::Rc::new(std::collections::HashSet::new()),
+            folded_guard_imports: std::rc::Rc::new(std::collections::HashMap::new()),
             root_init_module: None,
             cross_module_mut_self: std::rc::Rc::new(std::cell::RefCell::new(
                 CrossModuleMutSelf::Uncomputed,

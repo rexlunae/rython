@@ -10795,6 +10795,76 @@ fn a_walrus_in_an_if_header_is_bound_at_the_top_of_its_body() {
 }
 
 #[test]
+fn a_folded_bare_except_guard_is_loud_for_every_exception() {
+    // a guards `from .m import setup` with a bare `except:`; m's body
+    // raises RuntimeError. CPython runs the fallback (a bare handler
+    // catches everything): `m start`, `no setup`, `a end`, `main 1`.
+    // rython folds the guard, so the fallback cannot run — and a bare
+    // handler would have caught ANY exception, so the site is loud for
+    // every one, naming the guard, the folded fallback and the cause
+    // (Devin review on #338, round 19). The typed `except ImportError:`
+    // guard beside it keeps its rule: a RuntimeError passes through it in
+    // Python too, so it propagates as itself.
+    for (tag, handler, folded) in [("bareguard", "except:", true), ("typedguard", "except ImportError:", false)] {
+        let scratch = Scratch::new(tag);
+        let a_source = format!(
+            "try:\n    from .m import setup\n{}\n    print(\"no setup\")\nprint(\"a end\")\nmarker = 1\n",
+            handler
+        );
+        let krate = package_crate(
+            &scratch,
+            tag,
+            &[
+                (
+                    "m.py",
+                    "print(\"m start\")\nraise RuntimeError(\"m broke\")\n\n\ndef setup() -> str:\n    return \"m\"\n",
+                ),
+                ("a.py", a_source.as_str()),
+                (
+                    "cli.py",
+                    concat!(
+                        "from .a import marker\n",
+                        "\n",
+                        "\n",
+                        "def main() -> None:\n",
+                        "    print(\"main\", marker)\n",
+                        "\n",
+                        "\n",
+                        "if __name__ == \"__main__\":\n",
+                        "    main()\n",
+                    ),
+                ),
+            ],
+        );
+        let status = build_generated(&krate.root);
+        assert!(status.success(), "{}: generated crate failed to compile", tag);
+        let output = Command::new(krate.root.join(format!("target/debug/{tag}")))
+            .output()
+            .expect("running generated binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{}: the folded fallback cannot run: {}", tag, stderr);
+        assert_eq!(stdout.lines().collect::<Vec<_>>(), vec!["m start"], "{}", tag);
+        if folded {
+            assert!(
+                stderr.contains("`from .m import setup` raised an exception at import time; its bare `except:` fallback was folded away")
+                    && stderr.contains("RuntimeError: m broke"),
+                "{}: the error names the guard, the fallback and the cause: {}",
+                tag,
+                stderr
+            );
+        } else {
+            assert!(
+                stderr.contains("RuntimeError: m broke") && !stderr.contains("folded away"),
+                "{}: a typed guard passes a RuntimeError through as Python does: {}",
+                tag,
+                stderr
+            );
+        }
+    }
+}
+
+#[test]
 fn a_folded_import_guard_whose_module_raises_import_error_fails_loudly() {
     // b guards `from .a import X` with `except ImportError: pass`; a
     // imports b before binding X, so Python's guarded import raises

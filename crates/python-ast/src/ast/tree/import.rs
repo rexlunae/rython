@@ -1285,32 +1285,49 @@ pub(crate) fn import_site_init(
     Ok(quote!(#calls #checks))
 }
 
-/// The import site of a folded `try: <imports> except ImportError:`
-/// guard. The guard folds because rython's imports are static — but a
-/// crate module's body can raise ImportError at runtime (a cycle asking
-/// for a name bound later, a module that stays failed), where Python
-/// would run the fallback the fold discarded. That case is loud: an
-/// ImportError from the site names the guard and the folded fallback
-/// instead of leaving a bare error (Devin review on #338, round 10).
-pub(crate) fn folded_guard_site(site: TokenStream, spelling: &str) -> TokenStream {
+/// The import site of a folded `try: <imports> except ImportError:` (or
+/// bare `except:`) guard. The guard folds because rython's imports are
+/// static — but a crate module's body can raise at runtime (an
+/// ImportError from a cycle asking for a name bound later or a module
+/// that stays failed; anything at all from its own statements), where
+/// Python would run the fallback the fold discarded. That case is loud:
+/// the exceptions the handler would have caught — ImportError for a
+/// typed guard, every exception for a bare one — leave the site as an
+/// ImportError naming the guard, the folded fallback and the original
+/// error, instead of a bare error (Devin review on #338, rounds 10 and
+/// 19). What the handler would not have caught propagates as in Python.
+pub(crate) fn folded_guard_site(
+    site: TokenStream,
+    spelling: &str,
+    guard: crate::ast::tree::module::FoldedGuard,
+) -> TokenStream {
+    use crate::ast::tree::module::FoldedGuard;
     if site.is_empty() {
         return site;
     }
+    let (raised, handler) = match guard {
+        FoldedGuard::ImportError => ("ImportError", "`except ImportError:`"),
+        FoldedGuard::Bare => ("an exception", "bare `except:`"),
+    };
     let message = format!(
-        "`{}` raised ImportError at import time; its `except ImportError:` fallback \
-         was folded away (rython's imports are static), so the program cannot run \
-         the fallback as Python would",
-        spelling
+        "`{}` raised {} at import time; its {} fallback was folded away (rython's \
+         imports are static), so the program cannot run the fallback as Python would",
+        spelling, raised, handler
     );
+    let caught = match guard {
+        FoldedGuard::ImportError => quote!(if __rython_import_error.matches("ImportError")),
+        FoldedGuard::Bare => quote!(),
+    };
     quote! {
         match (|| -> Result<(), PyException> { #site Ok(()) })() {
             Ok(()) => {}
-            Err(__rython_import_error) if __rython_import_error.matches("ImportError") => {
+            Err(__rython_import_error) #caught => {
                 return Err(PyException::new(
                     "ImportError",
                     format!("{}: {}", #message, __rython_import_error),
                 ));
             }
+            #[allow(unreachable_patterns)]
             Err(__rython_import_error) => return Err(__rython_import_error),
         }
     }

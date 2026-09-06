@@ -8843,6 +8843,50 @@ fn imported_class_constant_default_resolves_through_import() {
 }
 
 #[test]
+fn a_folded_guard_site_is_loud_for_what_its_handler_would_have_caught() {
+    // A resolvable import guard folds; its import site is loud when the
+    // crate module raises at runtime — for an ImportError under `except
+    // ImportError:`, for EVERY exception under a bare `except:` (Devin
+    // review on #338, rounds 10 and 19).
+    // The site exists only for a CRATE module (its body runs there), so
+    // the guard's module is a sibling in module_defs.
+    let guarded = |handler: &str| -> String {
+        let src = format!("try:\n    from .m import x\n{}\n    pass\n", handler);
+        let mut defs = std::collections::HashMap::new();
+        defs.insert(
+            vec!["pkg".to_string(), "m".to_string()],
+            std::rc::Rc::new(parse("x = 1\n", "m.py").unwrap()),
+        );
+        defs.insert(
+            vec!["pkg".to_string(), "guard".to_string()],
+            std::rc::Rc::new(parse(&src, "guard.py").unwrap()),
+        );
+        let options = PythonOptions {
+            module_defs: std::rc::Rc::new(defs),
+            module_path: vec!["pkg".to_string()],
+            this_module_path: vec!["pkg".to_string(), "guard".to_string()],
+            python_namespace: "pkg".to_string(),
+            ..Default::default()
+        };
+        compile_with_options(&src, "guard.py", options).expect("the guard converts")
+    };
+    let typed = guarded("except ImportError:");
+    assert!(
+        typed.contains("its `except ImportError:` fallback was folded away")
+            && typed.contains("matches (\"ImportError\")"),
+        "generated: {}",
+        typed
+    );
+    let bare = guarded("except:");
+    assert!(
+        bare.contains("its bare `except:` fallback was folded away")
+            && !bare.contains("matches (\"ImportError\")"),
+        "generated: {}",
+        bare
+    );
+}
+
+#[test]
 fn a_definition_rebinding_a_stored_value_is_refused() {
     // `X = 1` then `class X` (or `def X`): Python's later binding wins,
     // but a Rust module cannot hold the value's static and the definition

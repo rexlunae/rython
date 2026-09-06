@@ -1904,6 +1904,11 @@ impl CodeGen for Module {
                                 )
                                 .map_err(|e| wrap_module_error(&module_filename, e))?,
                                 &import_spelling(&body_stmt.statement),
+                                if t.handlers[0].exception_type.is_none() {
+                                    FoldedGuard::Bare
+                                } else {
+                                    FoldedGuard::ImportError
+                                },
                             );
                             if !site.is_empty() {
                                 module_init_stmts.push(site);
@@ -2123,14 +2128,17 @@ impl CodeGen for Module {
                 // An import a folded guard spliced in: loud when a crate
                 // module raises ImportError at runtime (Python would run
                 // the folded fallback).
-                let site = if s
+                let site = match s
                     .lineno
                     .zip(s.col_offset)
-                    .is_some_and(|pos| options.folded_guard_imports.contains(&pos))
+                    .and_then(|pos| options.folded_guard_imports.get(&pos).copied())
                 {
-                    crate::ast::tree::import::folded_guard_site(site, &import_spelling(&s.statement))
-                } else {
-                    site
+                    Some(guard) => crate::ast::tree::import::folded_guard_site(
+                        site,
+                        &import_spelling(&s.statement),
+                        guard,
+                    ),
+                    None => site,
                 };
                 if !site.is_empty() {
                     module_init_stmts.push(site);
@@ -3520,7 +3528,19 @@ pub(crate) fn static_gate_names(
 pub(crate) struct NormalizedBody {
     pub body: Vec<crate::Statement>,
     pub newly_live: Vec<crate::Statement>,
-    pub folded_imports: std::collections::HashSet<(usize, usize)>,
+    pub folded_imports: std::collections::HashMap<(usize, usize), FoldedGuard>,
+}
+
+/// The handler a resolvable import guard folded away — what its import
+/// site must be loud about when a crate module's body raises at runtime
+/// (Devin review on #338, rounds 10 and 19).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FoldedGuard {
+    /// `except ImportError:` — only an ImportError would have run the
+    /// fallback; any other exception propagates in Python too.
+    ImportError,
+    /// A bare `except:` — every exception would have run the fallback.
+    Bare,
 }
 
 pub(crate) fn normalize_module_body(
@@ -3604,7 +3624,7 @@ pub(crate) fn fold_static_import_trys(
 ) -> (
     Vec<crate::Statement>,
     Vec<crate::Statement>,
-    std::collections::HashSet<(usize, usize)>,
+    std::collections::HashMap<(usize, usize), FoldedGuard>,
 ) {
     // The imports a try body runs at module init: nested control flow
     // included, a def's own imports excluded (they run when it is called).
@@ -3624,8 +3644,8 @@ pub(crate) fn fold_static_import_trys(
     }
     // The positions of the imports spliced out of a folded guard: their
     // sites are loud when a crate module raises ImportError at runtime.
-    let mut folded_imports: std::collections::HashSet<(usize, usize)> =
-        std::collections::HashSet::new();
+    let mut folded_imports: std::collections::HashMap<(usize, usize), FoldedGuard> =
+        std::collections::HashMap::new();
     let root_resolvable = |root: &str| -> bool {
         crate::ast::tree::import::is_stdpython_module(root)
             || options.python_modules.contains(&root.to_string())
@@ -3714,7 +3734,14 @@ pub(crate) fn fold_static_import_trys(
             // imports' `use` bindings (urllib3's ssl_.py redefines
             // OP_NO_COMPRESSION and friends in its handler).
             if !imports.is_empty() && imports.iter().all(|st| resolvable(&st.statement)) {
-                folded_imports.extend(imports.iter().filter_map(|st| st.lineno.zip(st.col_offset)));
+                let guard = if t.handlers[0].exception_type.is_none() {
+                    FoldedGuard::Bare
+                } else {
+                    FoldedGuard::ImportError
+                };
+                folded_imports.extend(
+                    imports.iter().filter_map(|st| st.lineno.zip(st.col_offset)).map(|pos| (pos, guard)),
+                );
                 out.extend(t.body.iter().cloned());
                 out.extend(t.orelse.iter().cloned());
                 continue;
