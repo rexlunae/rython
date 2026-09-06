@@ -12,12 +12,39 @@
 
 use crate::PyException;
 
+/// `argparse.FileType(mode)` — the file-opening coercion `type=` may
+/// name. The converter reads the mode at conversion time (an ArgKind::
+/// File / BinaryFile spec) and never constructs this; the item exists so
+/// `from argparse import FileType` resolves. The field is the Python
+/// mode string.
+pub struct FileType(pub String);
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum ArgKind {
     Str,
     Int,
     Float,
     StoreTrue,
+    /// `type=FileType(mode)` in a TEXT mode: the value is the opened
+    /// PyFile ("-" is stdin, read into a buffer, for a read mode).
+    File(&'static str),
+    /// `type=FileType(mode)` in a BINARY mode ('b' in the mode): the
+    /// opened binary file.
+    BinaryFile(&'static str),
+    /// `action="version"`: `--version` prints the spec's default (the
+    /// version string) and exits 0; the namespace has no field for it.
+    Version,
+}
+
+/// How many values an argument takes (`nargs`): one (the default), one
+/// or more (`"+"`), zero or more (`"*"`). Only positionals may be
+/// variadic here, and at most one per parser (the converter refuses the
+/// rest); the values are a ParsedValue::List.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Nargs {
+    One,
+    Plus,
+    Star,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -26,6 +53,12 @@ pub enum ParsedValue {
     Int(i64),
     Float(f64),
     Flag(bool),
+    /// A FileType value: the PATH the argument named and the mode; the
+    /// parser validated it by opening it (Python opens at parse time and
+    /// reports a failure as an argument error), and `into_file` opens it
+    /// for the namespace.
+    File(String, &'static str),
+    List(Vec<ParsedValue>),
 }
 
 impl ParsedValue {
@@ -53,6 +86,53 @@ impl ParsedValue {
             other => panic!("argparse internal error: expected flag, got {:?}", other),
         }
     }
+    /// The opened text file of a FileType argument. The path was
+    /// validated at parse time; a failure here (the file vanished in
+    /// between) is the module-level abort every failed initializer is.
+    pub fn into_file(self) -> crate::PyFile {
+        match self {
+            ParsedValue::File(path, mode) if path == "-" => {
+                // Python: "-" is sys.stdin for a read mode.
+                let mut text = String::new();
+                use std::io::Read;
+                std::io::stdin()
+                    .read_to_string(&mut text)
+                    .unwrap_or_else(|e| panic!("argparse: reading stdin for '-': {}", e));
+                let mut file = crate::stdlib::io::StringIO_seeded(&text);
+                file.name = "<stdin>".to_string();
+                let _ = mode;
+                file
+            }
+            ParsedValue::File(path, mode) => crate::open(&path, Some(mode))
+                .unwrap_or_else(|e| panic!("argparse: can't open '{}': {}", path, e)),
+            other => panic!("argparse internal error: expected file, got {:?}", other),
+        }
+    }
+    /// The opened binary file of a FileType argument (a 'b' mode).
+    pub fn into_binary_file(self) -> crate::stdlib::io::PyBytesIO {
+        match self {
+            ParsedValue::File(path, _) if path == "-" => {
+                let mut bytes = Vec::new();
+                use std::io::Read;
+                std::io::stdin()
+                    .read_to_end(&mut bytes)
+                    .unwrap_or_else(|e| panic!("argparse: reading stdin for '-': {}", e));
+                let mut file = crate::stdlib::io::BytesIO_seeded(bytes);
+                file.name = "<stdin>".to_string();
+                file
+            }
+            ParsedValue::File(path, mode) => crate::open_binary(&path, mode)
+                .unwrap_or_else(|e| panic!("argparse: can't open '{}': {}", path, e)),
+            other => panic!("argparse internal error: expected file, got {:?}", other),
+        }
+    }
+    /// The values of a variadic (`nargs`) argument.
+    pub fn into_list(self) -> Vec<ParsedValue> {
+        match self {
+            ParsedValue::List(items) => items,
+            other => panic!("argparse internal error: expected list, got {:?}", other),
+        }
+    }
 }
 
 pub struct ArgSpec {
@@ -62,6 +142,10 @@ pub struct ArgSpec {
     /// "--contents")`); None for positionals and long-only options.
     pub short: Option<&'static str>,
     pub kind: ArgKind,
+    /// `dest=` — the namespace attribute when it is not derived from the
+    /// name (Python's metavar derives from it too); None otherwise.
+    pub dest: Option<&'static str>,
+    pub nargs: Nargs,
     /// Required for value-taking options (Python's None default cannot
     /// inhabit a typed field); positionals and store_true have implied
     /// handling.
@@ -73,9 +157,25 @@ impl ArgSpec {
     fn is_positional(&self) -> bool {
         !self.name.starts_with('-')
     }
-    /// The attribute name on the namespace ("--scale" -> scale).
+    /// The attribute name on the namespace ("--scale" -> scale, or the
+    /// explicit dest=).
     fn dest(&self) -> String {
-        self.name.trim_start_matches('-').replace('-', "_")
+        match self.dest {
+            Some(d) => d.to_string(),
+            None => self.name.trim_start_matches('-').replace('-', "_"),
+        }
+    }
+    fn takes_value(&self) -> bool {
+        !matches!(self.kind, ArgKind::StoreTrue | ArgKind::Version)
+    }
+    /// A positional's usage/help spelling by nargs: `files [files ...]`
+    /// for "+", `[files ...]` for "*" (Python's formatter).
+    fn positional_spelling(&self) -> String {
+        match self.nargs {
+            Nargs::One => self.name.to_string(),
+            Nargs::Plus => format!("{} [{} ...]", self.name, self.name),
+            Nargs::Star => format!("[{} ...]", self.name),
+        }
     }
     /// The uppercase metavar of a value-taking option.
     fn metavar(&self) -> String {
@@ -86,10 +186,10 @@ impl ArgSpec {
     /// formatter uses the first option string).
     fn usage_invocation(&self) -> String {
         if self.is_positional() {
-            self.name.to_string()
+            self.positional_spelling()
         } else {
             let lead = self.short.unwrap_or(self.name);
-            if self.kind == ArgKind::StoreTrue {
+            if !self.takes_value() {
                 lead.to_string()
             } else {
                 format!("{} {}", lead, self.metavar())
@@ -105,7 +205,7 @@ impl ArgSpec {
         }
         let mut parts = Vec::new();
         for alias in self.short.iter().chain([&self.name]) {
-            if self.kind == ArgKind::StoreTrue {
+            if !self.takes_value() {
                 parts.push(alias.to_string());
             } else {
                 parts.push(format!("{} {}", alias, self.metavar()));
@@ -132,7 +232,7 @@ fn usage_line(prog: &str, specs: &[ArgSpec]) -> String {
         parts.push(format!("[{}]", s.usage_invocation()));
     }
     for s in specs.iter().filter(|s| s.is_positional()) {
-        parts.push(s.name.to_string());
+        parts.push(s.positional_spelling());
     }
     parts.join(" ")
 }
@@ -186,9 +286,25 @@ fn help_text(prog: &str, description: Option<&str>, specs: &[ArgSpec]) -> String
     out.push_str("\noptions:\n");
     entry(&mut out, &help_spec, Some("show this help message and exit"));
     for s in specs.iter().filter(|s| !s.is_positional()) {
-        entry(&mut out, &s.invocation(), s.help);
+        // Python's default help for action="version".
+        let help = match (s.kind, s.help) {
+            (ArgKind::Version, None) => Some("show program's version number and exit"),
+            (_, h) => h,
+        };
+        entry(&mut out, &s.invocation(), help);
     }
     out
+}
+
+/// `action="version"`: Python prints the version string to stdout and
+/// exits 0.
+fn print_version_and_exit(spec: &ArgSpec) -> ! {
+    let version = match &spec.default {
+        Some(ParsedValue::Str(v)) => v.clone(),
+        _ => String::new(),
+    };
+    println!("{}", version);
+    std::process::exit(0);
 }
 
 fn exit_error(prog: &str, specs: &[ArgSpec], message: &str) -> ! {
@@ -221,7 +337,31 @@ fn convert(
                 &format!("argument {}: invalid float value: '{}'", spec.name, raw),
             ),
         },
-        ArgKind::StoreTrue => ParsedValue::Flag(true),
+        ArgKind::StoreTrue | ArgKind::Version => ParsedValue::Flag(true),
+        // Python opens the file at parse time and reports a failure as an
+        // argument error: `argument files: can't open 'x': [Errno 2] No
+        // such file or directory: 'x'`. The handle is dropped here and
+        // reopened for the namespace (into_file), so a write mode
+        // truncates exactly as Python's parse-time open does.
+        ArgKind::File(mode) | ArgKind::BinaryFile(mode) => {
+            if raw != "-" {
+                let opened = if matches!(spec.kind, ArgKind::BinaryFile(_)) {
+                    crate::open_binary(raw, mode).map(|_| ())
+                } else {
+                    crate::open(raw, Some(mode)).map(|_| ())
+                };
+                if let Err(e) = opened {
+                    // Python's message: str(e) — the exception's message
+                    // without its type.
+                    exit_error(
+                        prog,
+                        specs,
+                        &format!("argument {}: can't open '{}': {}", spec.name, raw, e.message),
+                    );
+                }
+            }
+            ParsedValue::File(raw.to_string(), mode)
+        }
     }
 }
 
@@ -234,9 +374,11 @@ pub fn run_parser(
     prog: Option<&str>,
     description: Option<&str>,
     specs: &[ArgSpec],
+    argv: Option<Vec<String>>,
 ) -> Result<Vec<ParsedValue>, PyException> {
     let prog = prog_name(prog);
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // parse_args(argv): an explicit argument list; None is sys.argv[1:].
+    let argv: Vec<String> = argv.unwrap_or_else(|| std::env::args().skip(1).collect());
 
     let mut values: Vec<Option<ParsedValue>> = specs.iter().map(|_| None).collect();
     let mut extras: Vec<String> = Vec::new();
@@ -246,7 +388,7 @@ pub fn run_parser(
         .filter(|(_, s)| s.is_positional())
         .map(|(i, _)| i)
         .collect();
-    let mut next_positional = 0usize;
+    let mut positional_tokens: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < argv.len() {
@@ -294,6 +436,9 @@ pub fn run_parser(
                 }
             };
             let spec = &specs[idx];
+            if spec.kind == ArgKind::Version {
+                print_version_and_exit(spec);
+            }
             let value = if spec.kind == ArgKind::StoreTrue {
                 if inline.is_some() {
                     exit_error(
@@ -334,6 +479,9 @@ pub fn run_parser(
                 .position(|s| s.short == Some(token.as_str()));
             if let Some(idx) = exact {
                 let spec = &specs[idx];
+                if spec.kind == ArgKind::Version {
+                    print_version_and_exit(spec);
+                }
                 let value = if spec.kind == ArgKind::StoreTrue {
                     ParsedValue::Flag(true)
                 } else {
@@ -352,8 +500,7 @@ pub fn run_parser(
                 // Attached-value form (-s2.5) for value-taking shorts.
                 let head: String = token.chars().take(2).collect();
                 let attached = specs.iter().position(|s| {
-                    s.short.as_deref() == Some(head.as_str())
-                        && s.kind != ArgKind::StoreTrue
+                    s.short.as_deref() == Some(head.as_str()) && s.takes_value()
                 });
                 match attached {
                     Some(idx) => {
@@ -363,15 +510,57 @@ pub fn run_parser(
                     None => extras.push(token.clone()),
                 }
             }
-        } else if next_positional < positional_indices.len() {
-            let idx = positional_indices[next_positional];
-            values[idx] = Some(convert(&prog, specs, &specs[idx], token));
-            next_positional += 1;
         } else {
-            extras.push(token.clone());
+            // Positional tokens are distributed after the loop (a
+            // variadic positional takes what the fixed ones leave).
+            positional_tokens.push(token.clone());
         }
         i += 1;
     }
+
+    // Distribute the positional tokens: fixed positionals before the
+    // variadic one take one each from the front, fixed ones after it one
+    // each from the back, the variadic takes the middle (Python's
+    // pattern match over the positional sequence, for one variadic);
+    // leftovers with no variadic are "unrecognized arguments".
+    let variadic = positional_indices
+        .iter()
+        .position(|&i| specs[i].nargs != Nargs::One);
+    let fixed = positional_indices.len() - usize::from(variadic.is_some());
+    let mut tokens = positional_tokens.into_iter();
+    let before = variadic.unwrap_or(positional_indices.len());
+    let mut assigned = 0usize;
+    for &idx in &positional_indices[..before] {
+        match tokens.next() {
+            Some(t) => {
+                values[idx] = Some(convert(&prog, specs, &specs[idx], &t));
+                assigned += 1;
+            }
+            None => break,
+        }
+    }
+    let mut rest: Vec<String> = tokens.collect();
+    if let Some(v) = variadic {
+        let after = &positional_indices[v + 1..];
+        let keep_for_after = after.len().min(rest.len());
+        let tail: Vec<String> = rest.split_off(rest.len() - keep_for_after);
+        let vidx = positional_indices[v];
+        if assigned == before {
+            let items: Vec<ParsedValue> = rest
+                .iter()
+                .map(|t| convert(&prog, specs, &specs[vidx], t))
+                .collect();
+            if !(items.is_empty() && specs[vidx].nargs == Nargs::Plus) {
+                values[vidx] = Some(ParsedValue::List(items));
+            }
+        }
+        for (&idx, t) in after.iter().zip(tail.iter()) {
+            values[idx] = Some(convert(&prog, specs, &specs[idx], t));
+        }
+        rest = Vec::new();
+    }
+    let _ = fixed;
+    extras.extend(rest);
 
     if !extras.is_empty() {
         exit_error(
@@ -380,8 +569,9 @@ pub fn run_parser(
             &format!("unrecognized arguments: {}", extras.join(" ")),
         );
     }
-    let missing: Vec<&str> = positional_indices[next_positional..]
+    let missing: Vec<&str> = positional_indices
         .iter()
+        .filter(|&&i| values[i].is_none() && specs[i].nargs != Nargs::Star)
         .map(|&i| specs[i].name)
         .collect();
     if !missing.is_empty() {
@@ -401,7 +591,8 @@ pub fn run_parser(
         .map(|(i, v)| {
             v.or_else(|| specs[i].default.clone()).unwrap_or_else(|| {
                 match specs[i].kind {
-                    ArgKind::StoreTrue => ParsedValue::Flag(false),
+                    ArgKind::StoreTrue | ArgKind::Version => ParsedValue::Flag(false),
+                    _ if specs[i].nargs == Nargs::Star => ParsedValue::List(Vec::new()),
                     // The converter requires default= on value-taking
                     // options, so this is unreachable for valid specs.
                     _ => panic!(

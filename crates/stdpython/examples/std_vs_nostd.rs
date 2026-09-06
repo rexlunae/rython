@@ -11,7 +11,7 @@ fn main() {
     
     // File operations available
     match open("example.txt", Some("w")) {
-        Ok(mut file) => {
+        Ok(file) => {
             let _ = file.write("Hello, file system!");
             let _ = file.close();
             println!("File operations work in std mode");

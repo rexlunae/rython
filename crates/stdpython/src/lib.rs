@@ -7106,7 +7106,19 @@ fn os_error(e: &std::io::Error, path: &str) -> PyException {
         ErrorKind::NotADirectory => "NotADirectoryError",
         _ => "OSError",
     };
-    PyException::new(kind, format!("{}: '{}'", e, path))
+    // CPython's str(OSError): `[Errno 2] No such file or directory:
+    // 'path'` — the errno and the OS's own text (Rust's Display appends
+    // " (os error N)", which Python never shows).
+    let text = e.to_string();
+    let text = text
+        .split_once(" (os error ")
+        .map(|(t, _)| t.to_string())
+        .unwrap_or(text);
+    let message = match e.raw_os_error() {
+        Some(code) => format!("[Errno {}] {}: '{}'", code, text, path),
+        None => format!("{}: '{}'", text, path),
+    };
+    PyException::new(kind, message)
 }
 
 /// Python open() function - opens a file
@@ -7123,12 +7135,12 @@ pub fn open<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: Option<M>) -> Resul
         "r" => {
             let f = File::open(filename.as_ref())
                 .map_err(|e| os_error(&e, filename.as_ref()))?;
-            PyFile::new_read(BufReader::new(f))
+            PyFile::new_read(BufReader::new(f), filename.as_ref())
         },
         "w" => {
             let f = File::create(filename.as_ref())
                 .map_err(|e| os_error(&e, filename.as_ref()))?;
-            PyFile::new_write(BufWriter::new(f))
+            PyFile::new_write(BufWriter::new(f), filename.as_ref())
         },
         "a" => {
             let f = OpenOptions::new()
@@ -7136,11 +7148,47 @@ pub fn open<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: Option<M>) -> Resul
                 .append(true)
                 .open(filename.as_ref())
                 .map_err(|e| os_error(&e, filename.as_ref()))?;
-            PyFile::new_write(BufWriter::new(f))
+            PyFile::new_write(BufWriter::new(f), filename.as_ref())
         },
         _ => return Err(value_error(&format!("Invalid file mode: '{}'", mode))),
     };
     
+    Ok(file)
+}
+
+/// Python open() in a BINARY mode ("rb", "wb", "ab"): the binary file
+/// type — the same type as io.BytesIO, over a disk backend — whose
+/// read() yields bytes and write() takes them. The converter routes a
+/// literal mode containing 'b' here; text modes go to `open()`.
+///
+/// Note: Only available with `std` feature - requires OS I/O capabilities
+#[cfg(feature = "std")]
+pub fn open_binary<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: M) -> Result<stdlib::io::PyBytesIO, PyException> {
+    use std::fs::{File, OpenOptions};
+    use std::io::{BufReader, BufWriter};
+    let path = filename.as_ref();
+    let mode = mode.as_ref();
+    // Python accepts the letters in any order ("rb" == "br").
+    let letters: alloc::vec::Vec<char> = mode.chars().filter(|c| *c != 'b').collect();
+    let file = match letters.as_slice() {
+        ['r'] => {
+            let f = File::open(path).map_err(|e| os_error(&e, path))?;
+            stdlib::io::PyBytesIO::new_disk_read(BufReader::new(f), path)
+        }
+        ['w'] => {
+            let f = File::create(path).map_err(|e| os_error(&e, path))?;
+            stdlib::io::PyBytesIO::new_disk_write(BufWriter::new(f), path)
+        }
+        ['a'] => {
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| os_error(&e, path))?;
+            stdlib::io::PyBytesIO::new_disk_write(BufWriter::new(f), path)
+        }
+        _ => return Err(value_error(&format!("Invalid file mode: '{}'", mode))),
+    };
     Ok(file)
 }
 
@@ -7152,8 +7200,18 @@ pub fn open<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: Option<M>) -> Resul
 /// The in-memory Buffer backend is pure alloc, so the type lives on every
 /// tier (no_std file I/O = io.StringIO/io.BytesIO); the DISK backends and
 /// `open()` are std-gated.
+///
+/// A file object is a REFERENCE in Python (`g = f` aliases the same
+/// stream; `for f in files:` reads and closes the caller's files), so the
+/// handle is a cheap clone over one shared backend — `Rc<RefCell>`, the
+/// scheme shared class instances use (PyRef) — and every method takes
+/// `&self`.
+#[derive(Clone)]
 pub struct PyFile {
-    backend: PyFileBackend,
+    inner: alloc::rc::Rc<core::cell::RefCell<PyFileBackend>>,
+    /// Python `f.name`: the path a disk file was opened from (an
+    /// in-memory StringIO has no name in Python; here it is "").
+    pub name: String,
 }
 
 enum PyFileBackend {
@@ -7175,33 +7233,43 @@ pub(crate) fn closed_file_error() -> PyException {
 }
 
 impl PyFile {
-    #[cfg(feature = "std")]
-    fn new_read(reader: std::io::BufReader<std::fs::File>) -> Self {
+    fn from_backend(backend: PyFileBackend, name: &str) -> Self {
         Self {
-            backend: PyFileBackend::DiskRead(reader),
+            inner: alloc::rc::Rc::new(core::cell::RefCell::new(backend)),
+            name: name.to_string(),
         }
     }
 
     #[cfg(feature = "std")]
-    fn new_write(writer: std::io::BufWriter<std::fs::File>) -> Self {
-        Self {
-            backend: PyFileBackend::DiskWrite(writer),
-        }
+    fn new_read(reader: std::io::BufReader<std::fs::File>, name: &str) -> Self {
+        Self::from_backend(PyFileBackend::DiskRead(reader), name)
+    }
+
+    #[cfg(feature = "std")]
+    fn new_write(writer: std::io::BufWriter<std::fs::File>, name: &str) -> Self {
+        Self::from_backend(PyFileBackend::DiskWrite(writer), name)
     }
 
     /// io.StringIO backing constructor.
     pub(crate) fn new_buffer(initial: &str) -> Self {
-        Self {
-            backend: PyFileBackend::Buffer {
+        Self::from_backend(
+            PyFileBackend::Buffer {
                 data: initial.to_string(),
                 pos: 0,
             },
-        }
+            "",
+        )
+    }
+
+    /// Python `f.closed`: whether close() ran on this stream (through
+    /// any alias of it).
+    pub fn closed(&self) -> bool {
+        matches!(*self.inner.borrow(), PyFileBackend::Closed)
     }
 
     /// Python file.read() method
-    pub fn read(&mut self) -> Result<String, PyException> {
-        match &mut self.backend {
+    pub fn read(&self) -> Result<String, PyException> {
+        match &mut *self.inner.borrow_mut() {
             #[cfg(feature = "std")]
             PyFileBackend::DiskRead(reader) => {
                 use std::io::Read;
@@ -7223,8 +7291,8 @@ impl PyFile {
 
     /// Python file.readline() method: the line INCLUDES its
     /// terminator, as in Python; empty means end of file.
-    pub fn readline(&mut self) -> Result<String, PyException> {
-        match &mut self.backend {
+    pub fn readline(&self) -> Result<String, PyException> {
+        match &mut *self.inner.borrow_mut() {
             #[cfg(feature = "std")]
             PyFileBackend::DiskRead(reader) => {
                 use std::io::BufRead;
@@ -7254,7 +7322,7 @@ impl PyFile {
     /// ("x\n", "y\n"), exactly as Python's readlines does — stripping
     /// them silently diverges (and breaks csv.reader's newline
     /// handling).
-    pub fn readlines(&mut self) -> Result<Vec<String>, PyException> {
+    pub fn readlines(&self) -> Result<Vec<String>, PyException> {
         let mut lines = Vec::new();
         loop {
             let line = self.readline()?;
@@ -7268,9 +7336,9 @@ impl PyFile {
     /// Python file.write() method: returns the number of CHARACTERS
     /// written, as Python does. On a StringIO buffer this overwrites at
     /// the cursor (Python semantics), not appends.
-    pub fn write<D: AsRef<str>>(&mut self, data: D) -> Result<i64, PyException> {
+    pub fn write<D: AsRef<str>>(&self, data: D) -> Result<i64, PyException> {
         let text = data.as_ref();
-        match &mut self.backend {
+        match &mut *self.inner.borrow_mut() {
             #[cfg(feature = "std")]
             PyFileBackend::DiskWrite(writer) => {
                 use std::io::Write;
@@ -7293,7 +7361,7 @@ impl PyFile {
     }
 
     /// Python file.writelines() method
-    pub fn writelines<S: AsRef<str>>(&mut self, lines: &[S]) -> Result<(), PyException> {
+    pub fn writelines<S: AsRef<str>>(&self, lines: &[S]) -> Result<(), PyException> {
         for line in lines {
             self.write(line.as_ref())?;
         }
@@ -7305,7 +7373,7 @@ impl PyFile {
     /// the typed lowering cannot know the backend at conversion time,
     /// so this fails loudly at runtime instead.
     pub fn getvalue(&self) -> Result<String, PyException> {
-        match &self.backend {
+        match &*self.inner.borrow() {
             PyFileBackend::Buffer { data, .. } => Ok(data.clone()),
             PyFileBackend::Closed => Err(closed_file_error()),
             #[cfg(feature = "std")]
@@ -7317,8 +7385,8 @@ impl PyFile {
     }
 
     /// Python file.close() method
-    pub fn close(&mut self) -> Result<(), PyException> {
-        let old = core::mem::replace(&mut self.backend, PyFileBackend::Closed);
+    pub fn close(&self) -> Result<(), PyException> {
+        let old = core::mem::replace(&mut *self.inner.borrow_mut(), PyFileBackend::Closed);
         #[cfg(feature = "std")]
         if let PyFileBackend::DiskWrite(mut writer) = old {
             use std::io::Write;

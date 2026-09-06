@@ -58,9 +58,30 @@ pub(crate) struct ArgparseSpec {
     /// The short alias of `add_argument("-c", "--contents", ...)`
     /// (issue #118 — certifi's __main__); None otherwise.
     short: Option<String>,
-    kind: &'static str, // "Str" | "Int" | "Float" | "StoreTrue"
+    kind: ArgparseKind,
+    /// `dest=` — the namespace attribute when given (options only; a
+    /// positional's dest is its name in Python too).
+    dest: Option<String>,
+    /// `nargs="+"` / `"*"` on a positional: a list-valued field.
+    nargs: Option<char>,
     default: Option<ExprType>,
     help: Option<String>,
+}
+
+/// The typed coercion of one argument — Python's `type=` / `action=`
+/// (issue #332: `type=FileType(mode)` opens the named file, in a text
+/// or a binary mode; `action="version"` prints and exits).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ArgparseKind {
+    Str,
+    Int,
+    Float,
+    StoreTrue,
+    File(String),
+    BinaryFile(String),
+    /// The version string expression (`version=`), rendered at the parse
+    /// site and carried as the spec's default.
+    Version(ExprType),
 }
 
 /// The argparse rewrite plan for a function body: parser-building
@@ -75,6 +96,9 @@ pub(crate) struct ArgparseRewrite {
     prog: Option<String>,
     description: Option<String>,
     specs: Vec<ArgparseSpec>,
+    /// `parse_args(argv)`: the explicit argument list (a `list[str]` or
+    /// `list[str] | None` expression); None is sys.argv[1:].
+    argv: Option<ExprType>,
 }
 
 fn literal_str(e: &ExprType) -> Option<String> {
@@ -150,6 +174,7 @@ pub(crate) fn scan_argparse(
     let mut skip = std::collections::HashSet::from([ctor_index]);
     let mut specs = Vec::new();
     let mut parse: Option<(usize, String)> = None;
+    let mut argv: Option<ExprType> = None;
     for (i, stmt) in body.iter().enumerate().skip(ctor_index + 1) {
         let call_on_parser = |call: &crate::Call| -> Option<String> {
             let ExprType::Attribute(attr) = call.func.as_ref() else {
@@ -218,21 +243,61 @@ pub(crate) fn scan_argparse(
                         );
                     }
                 };
-                let mut kind: Option<&'static str> = None;
+                let mut kind: Option<ArgparseKind> = None;
                 let mut default = None;
                 let mut help = None;
                 let mut store_true = false;
+                let mut version: Option<ExprType> = None;
+                let mut dest: Option<String> = None;
+                let mut nargs: Option<char> = None;
+                let is_positional = !name.starts_with('-');
                 for kw in &call.keywords {
                     match kw.arg.as_deref() {
                         Some("type") => {
                             kind = Some(match &kw.value {
-                                ExprType::Name(n) if n.id == "int" => "Int",
-                                ExprType::Name(n) if n.id == "float" => "Float",
-                                ExprType::Name(n) if n.id == "str" => "Str",
+                                ExprType::Name(n) if n.id == "int" => ArgparseKind::Int,
+                                ExprType::Name(n) if n.id == "float" => ArgparseKind::Float,
+                                ExprType::Name(n) if n.id == "str" => ArgparseKind::Str,
+                                // `type=FileType(mode)` (a literal mode;
+                                // `argparse.FileType` or the imported
+                                // name): the parser opens the named file
+                                // (issue #332 — charset_normalizer's CLI).
+                                ExprType::Call(c)
+                                    if match c.func.as_ref() {
+                                        ExprType::Name(f) => f.id == "FileType",
+                                        ExprType::Attribute(a) => a.attr == "FileType",
+                                        _ => false,
+                                    } =>
+                                {
+                                    if !c.keywords.is_empty() || c.args.len() > 1 {
+                                        return Err(format!(
+                                            "add_argument('{}'): FileType takes the mode \
+                                             only (bufsize/encoding/errors are not \
+                                             supported yet)",
+                                            name
+                                        )
+                                        .into());
+                                    }
+                                    let mode = match c.args.first() {
+                                        None => "r".to_string(),
+                                        Some(m) => literal_str(m).ok_or_else(|| {
+                                            format!(
+                                                "add_argument('{}'): FileType's mode must \
+                                                 be a string literal",
+                                                name
+                                            )
+                                        })?,
+                                    };
+                                    if mode.contains('b') {
+                                        ArgparseKind::BinaryFile(mode)
+                                    } else {
+                                        ArgparseKind::File(mode)
+                                    }
+                                }
                                 _ => {
                                     return Err(format!(
                                         "add_argument('{}'): type must be int, float, \
-                                         or str",
+                                         str, or FileType(mode)",
                                         name
                                     )
                                     .into())
@@ -250,15 +315,64 @@ pub(crate) fn scan_argparse(
                         }
                         Some("action") => match literal_str(&kw.value).as_deref() {
                             Some("store_true") => store_true = true,
+                            // Python's default action.
+                            Some("store") => {}
+                            Some("version") => version = Some(ExprType::Name(crate::Name {
+                                id: String::new(),
+                            })),
                             _ => {
                                 return Err(format!(
-                                    "add_argument('{}'): only action=\"store_true\" is \
-                                     supported",
+                                    "add_argument('{}'): only action=\"store\", \
+                                     \"store_true\" and \"version\" are supported",
                                     name
                                 )
                                 .into())
                             }
                         },
+                        Some("version") => {
+                            // Any str expression: rendered at the parse site
+                            // (it may format runtime values).
+                            version = Some(kw.value.clone());
+                        }
+                        Some("dest") => {
+                            if is_positional {
+                                return Err(format!(
+                                    "add_argument('{}'): dest is supplied by the \
+                                     positional's name (Python refuses it too)",
+                                    name
+                                )
+                                .into());
+                            }
+                            dest = Some(literal_str(&kw.value).ok_or_else(|| {
+                                format!(
+                                    "add_argument('{}'): dest must be a string literal",
+                                    name
+                                )
+                            })?);
+                        }
+                        Some("nargs") => {
+                            let spelled = literal_str(&kw.value);
+                            nargs = Some(match spelled.as_deref() {
+                                Some("+") => '+',
+                                Some("*") => '*',
+                                _ => {
+                                    return Err(format!(
+                                        "add_argument('{}'): only nargs=\"+\" and \
+                                         nargs=\"*\" are supported yet",
+                                        name
+                                    )
+                                    .into())
+                                }
+                            });
+                            if !is_positional {
+                                return Err(format!(
+                                    "add_argument('{}'): nargs on an option is not \
+                                     supported yet",
+                                    name
+                                )
+                                .into());
+                            }
+                        }
                         other => {
                             return Err(format!(
                                 "add_argument('{}'): keyword '{}' is not supported yet",
@@ -269,20 +383,49 @@ pub(crate) fn scan_argparse(
                         }
                     }
                 }
-                let kind = if store_true {
-                    if kind.is_some() || default.is_some() {
+                // `action="version"` needs its `version=` string; the
+                // action marker alone (an empty Name) is the missing case.
+                let kind = if let Some(v) = version {
+                    if matches!(&v, ExprType::Name(n) if n.id.is_empty()) {
                         return Err(format!(
-                            "add_argument('{}'): store_true takes neither type nor \
-                             default",
+                            "add_argument('{}'): action=\"version\" needs version=",
                             name
                         )
                         .into());
                     }
-                    "StoreTrue"
+                    if kind.is_some() || default.is_some() || store_true || is_positional {
+                        return Err(format!(
+                            "add_argument('{}'): action=\"version\" is an option that \
+                             takes neither type nor default",
+                            name
+                        )
+                        .into());
+                    }
+                    ArgparseKind::Version(v)
+                } else if store_true {
+                    // `default=False` is store_true's own default (Python
+                    // allows spelling it); anything else is a divergent
+                    // flag.
+                    let default_is_false = match &default {
+                        None => true,
+                        Some(ExprType::Constant(c)) => {
+                            matches!(&c.0, Some(litrs::Literal::Bool(b)) if !b.value())
+                        }
+                        Some(_) => false,
+                    };
+                    if kind.is_some() || !default_is_false {
+                        return Err(format!(
+                            "add_argument('{}'): store_true takes neither type nor a \
+                             default other than False",
+                            name
+                        )
+                        .into());
+                    }
+                    default = None;
+                    ArgparseKind::StoreTrue
                 } else {
-                    kind.unwrap_or("Str")
+                    kind.unwrap_or(ArgparseKind::Str)
                 };
-                let is_positional = !name.starts_with('-');
                 if is_positional && default.is_some() {
                     return Err(format!(
                         "add_argument('{}'): defaults on positionals are not supported",
@@ -290,10 +433,31 @@ pub(crate) fn scan_argparse(
                     )
                     .into());
                 }
-                if !is_positional && !store_true && default.is_none() {
+                if !is_positional
+                    && !matches!(kind, ArgparseKind::StoreTrue | ArgparseKind::Version(_))
+                    && default.is_none()
+                {
                     return Err(format!(
                         "add_argument('{}'): a value-taking option needs default= (its \
                          Python default None cannot inhabit a typed field)",
+                        name
+                    )
+                    .into());
+                }
+                if matches!(kind, ArgparseKind::File(_) | ArgparseKind::BinaryFile(_))
+                    && default.is_some()
+                {
+                    return Err(format!(
+                        "add_argument('{}'): a FileType option with a default is not \
+                         supported yet (the default would need opening too)",
+                        name
+                    )
+                    .into());
+                }
+                if nargs.is_some() && specs.iter().any(|s: &ArgparseSpec| s.nargs.is_some()) {
+                    return Err(format!(
+                        "add_argument('{}'): only one variadic (nargs) positional is \
+                         supported yet",
                         name
                     )
                     .into());
@@ -302,6 +466,8 @@ pub(crate) fn scan_argparse(
                     name,
                     short,
                     kind,
+                    dest,
+                    nargs,
                     default,
                     help,
                 });
@@ -310,12 +476,16 @@ pub(crate) fn scan_argparse(
             StatementType::Assign(assign) => {
                 if let ExprType::Call(call) = &assign.value {
                     if call_on_parser(call) == Some("parse_args".into()) {
-                        if !call.args.is_empty() || !call.keywords.is_empty() {
-                            return Err("parse_args with arguments is not supported".into());
+                        if !call.keywords.is_empty() || call.args.len() > 1 {
+                            return Err(
+                                "parse_args takes at most the argument list (parse_args(argv))"
+                                    .into(),
+                            );
                         }
                         let [ExprType::Name(t)] = assign.targets.as_slice() else {
                             return Err("parse_args must be assigned to a plain name".into());
                         };
+                        argv = call.args.first().cloned();
                         parse = Some((i, t.id.clone()));
                     } else if call_on_parser(call).is_some() {
                         return Err(format!(
@@ -348,6 +518,7 @@ pub(crate) fn scan_argparse(
         prog,
         description,
         specs,
+        argv,
     }))
 }
 
@@ -360,33 +531,49 @@ pub(crate) fn lower_parse_args(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-    use quote::format_ident;
     let mut fields = Vec::new();
     let mut field_types = Vec::new();
     let mut spec_tokens = Vec::new();
-    let mut accessors = Vec::new();
+    // Every spec yields one parsed value, in spec order; the namespace
+    // takes a field per value-bearing spec (a version action has none).
+    let mut takes: Vec<TokenStream> = Vec::new();
     for spec in &rw.specs {
-        let dest = spec.name.trim_start_matches('-').replace('-', "_");
-        fields.push(crate::safe_ident(&dest));
-        let (fty, kind, accessor) = match spec.kind {
-            "Int" => (quote!(i64), quote!(Int), format_ident!("into_int")),
-            "Float" => (quote!(f64), quote!(Float), format_ident!("into_float")),
-            "StoreTrue" => (quote!(bool), quote!(StoreTrue), format_ident!("into_flag")),
-            _ => (quote!(String), quote!(Str), format_ident!("into_str")),
+        let dest = spec
+            .dest
+            .clone()
+            .unwrap_or_else(|| spec.name.trim_start_matches('-').replace('-', "_"));
+        let (fty, kind, accessor): (TokenStream, TokenStream, TokenStream) = match &spec.kind {
+            ArgparseKind::Int => (quote!(i64), quote!(Int), quote!(into_int())),
+            ArgparseKind::Float => (quote!(f64), quote!(Float), quote!(into_float())),
+            ArgparseKind::StoreTrue => (quote!(bool), quote!(StoreTrue), quote!(into_flag())),
+            ArgparseKind::Str => (quote!(String), quote!(Str), quote!(into_str())),
+            ArgparseKind::File(mode) => {
+                (quote!(PyFile), quote!(File(#mode)), quote!(into_file()))
+            }
+            ArgparseKind::BinaryFile(mode) => (
+                quote!(stdpython::io::PyBytesIO),
+                quote!(BinaryFile(#mode)),
+                quote!(into_binary_file()),
+            ),
+            ArgparseKind::Version(_) => (quote!(()), quote!(Version), quote!()),
         };
-        field_types.push(fty);
-        accessors.push(accessor);
-        let default = match &spec.default {
-            None => quote!(None),
-            Some(e) => {
+        let default = match (&spec.kind, &spec.default) {
+            (ArgparseKind::Version(v), _) => {
+                let v = v.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                quote!(Some(argparse::ParsedValue::Str((#v).to_string())))
+            }
+            (_, None) => quote!(None),
+            (kind, Some(e)) => {
                 let d = e
                     .clone()
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                 // Coerce literal defaults onto the declared type
                 // (default=1 with type=float is valid Python).
-                match spec.kind {
-                    "Int" => quote!(Some(argparse::ParsedValue::Int((#d) as i64))),
-                    "Float" => quote!(Some(argparse::ParsedValue::Float((#d) as f64))),
+                match kind {
+                    ArgparseKind::Int => quote!(Some(argparse::ParsedValue::Int((#d) as i64))),
+                    ArgparseKind::Float => {
+                        quote!(Some(argparse::ParsedValue::Float((#d) as f64)))
+                    }
                     _ => quote!(Some(argparse::ParsedValue::Str((#d).to_string()))),
                 }
             }
@@ -400,14 +587,57 @@ pub(crate) fn lower_parse_args(
             Some(s) => quote!(Some(#s)),
             None => quote!(None),
         };
+        let dest_tokens = match &spec.dest {
+            Some(d) => quote!(Some(#d)),
+            None => quote!(None),
+        };
+        let nargs = match spec.nargs {
+            Some('+') => quote!(Plus),
+            Some('*') => quote!(Star),
+            _ => quote!(One),
+        };
         spec_tokens.push(quote!(argparse::ArgSpec {
             name: #name,
             short: #short,
             kind: argparse::ArgKind::#kind,
+            dest: #dest_tokens,
+            nargs: argparse::Nargs::#nargs,
             default: #default,
             help: #help,
         }));
+        if matches!(spec.kind, ArgparseKind::Version(_)) {
+            takes.push(quote!(let _ = __parsed.next();));
+            continue;
+        }
+        let field = crate::safe_ident(&dest);
+        let take = quote!(__parsed.next().expect("one value per spec"));
+        if spec.nargs.is_some() {
+            field_types.push(quote!(Vec<#fty>));
+            takes.push(quote! {
+                let #field: Vec<#fty> = #take
+                    .into_list()
+                    .into_iter()
+                    .map(|__v| __v.#accessor)
+                    .collect();
+            });
+        } else {
+            field_types.push(fty);
+            takes.push(quote!(let #field = #take.#accessor;));
+        }
+        fields.push(field);
     }
+    let argv = match &rw.argv {
+        None => quote!(None),
+        Some(e) => {
+            let a = e.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            // `list[str] | None` passes through; a plain list is Some.
+            if expr_yields_option(e, options, symbols) {
+                quote!(#a)
+            } else {
+                quote!(Some((#a).into_iter().map(|__s| __s.to_string()).collect()))
+            }
+        }
+    };
     let prog = match &rw.prog {
         Some(p) => quote!(Some(#p)),
         None => quote!(None),
@@ -426,10 +656,12 @@ pub(crate) fn lower_parse_args(
             #prog,
             #description,
             &[#(#spec_tokens),*],
+            #argv,
         )?
         .into_iter();
+        #(#takes)*
         #args_var = __ArgparseArgs {
-            #(#fields: __parsed.next().expect("one value per spec").#accessors(),)*
+            #(#fields,)*
         }
     })
 }

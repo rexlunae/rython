@@ -2730,7 +2730,7 @@ mod file_objects {
     fn stringio_cursor_semantics_match_python() {
         // python3: StringIO("seeded").write("!") OVERWRITES at the
         // cursor: buffer becomes "!eeded", cursor 1, read() -> "eeded".
-        let mut b = io::StringIO_seeded("seeded");
+        let b = io::StringIO_seeded("seeded");
         assert_eq!(b.write("!").unwrap(), 1);
         assert_eq!(b.getvalue().unwrap(), "!eeded");
         assert_eq!(b.read().unwrap(), "eeded");
@@ -2739,7 +2739,7 @@ mod file_objects {
         assert_eq!(b.getvalue().unwrap(), "!eededaprès");
 
         // readline/readlines keep terminators, as Python.
-        let mut two = io::StringIO_seeded("x\ny\nz");
+        let two = io::StringIO_seeded("x\ny\nz");
         assert_eq!(two.readline().unwrap(), "x\n");
         assert_eq!(two.readlines().unwrap(), vec!["y\n", "z"]);
         // Exhausted: empty line, empty list.
@@ -2748,7 +2748,7 @@ mod file_objects {
 
     #[test]
     fn closed_files_raise_pythons_value_error() {
-        let mut b = io::StringIO();
+        let b = io::StringIO();
         b.close().unwrap();
         let e = b.read().unwrap_err();
         assert_eq!(format!("{}", e), "ValueError: I/O operation on closed file.");
@@ -3303,7 +3303,7 @@ mod bytesio {
     fn bytesio_cursor_semantics_match_python() {
         // python3: BytesIO(b"seeded").write(b"!") OVERWRITES at the
         // cursor: buffer b'!eeded', write returns 1, read() -> b'eeded'.
-        let mut b = io::BytesIO_seeded(b"seeded");
+        let b = io::BytesIO_seeded(b"seeded");
         assert_eq!(b.write(b"!").unwrap(), 1);
         assert_eq!(b.getvalue().unwrap(), b"!eeded");
         assert_eq!(b.read().unwrap(), b"eeded");
@@ -3315,7 +3315,7 @@ mod bytesio {
     #[test]
     fn closed_bytesio_raises_pythons_value_error() {
         // Verified against python3: ValueError('I/O operation on closed file.')
-        let mut b = io::BytesIO();
+        let b = io::BytesIO();
         b.close().unwrap();
         let e = b.read().unwrap_err();
         assert_eq!(format!("{}", e), "ValueError: I/O operation on closed file.");

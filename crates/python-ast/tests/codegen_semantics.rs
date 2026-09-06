@@ -6340,16 +6340,154 @@ fn argparse_dynamic_or_unsupported_specs_are_loud() {
             "\n",
             "def main() -> None:\n",
             "    p = argparse.ArgumentParser()\n",
-            "    p.add_argument(\"xs\", nargs=\"+\")\n",
+            "    p.add_argument(\"xs\", nargs=\"?\")\n",
             "    args = p.parse_args()\n",
         ),
         "ap4.py",
     );
     assert!(
-        err.contains("'nargs' is not supported yet"),
+        err.contains("only nargs=\"+\" and nargs=\"*\" are supported yet"),
         "error: {}",
         err
     );
+}
+
+#[test]
+fn argparse_filetype_nargs_dest_and_version_shape_the_namespace() {
+    // Issue #332 (charset_normalizer's CLI): `type=FileType(mode)` opens
+    // the named file — a PyFile field (a binary mode: the bytes file);
+    // `nargs="+"` makes the positional a Vec; `dest=` names the field;
+    // `action="version"` takes no field and prints `version=`;
+    // `parse_args(argv)` passes the explicit list (an Option passes
+    // through, a plain list is Some).
+    let out = compile(
+        concat!(
+            "import argparse\n",
+            "from argparse import FileType\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> None:\n",
+            "    p = argparse.ArgumentParser(prog=\"tool\")\n",
+            "    p.add_argument(\"files\", type=FileType(\"r\"), nargs=\"+\")\n",
+            "    p.add_argument(\"blob\", type=argparse.FileType(\"rb\"))\n",
+            "    p.add_argument(\"-n\", \"--number\", action=\"store_true\", default=False, dest=\"numbered\")\n",
+            "    p.add_argument(\"-t\", \"--threshold\", action=\"store\", type=float, default=0.5, dest=\"limit\")\n",
+            "    p.add_argument(\"--version\", action=\"version\", version=\"tool \" + \"1.0\")\n",
+            "    args = p.parse_args(argv)\n",
+            "    print(len(args.files), args.numbered, args.limit)\n",
+        ),
+        "ap5.py",
+    );
+    assert!(out.contains("files : Vec < PyFile >"), "generated: {}", out);
+    assert!(out.contains("blob : stdpython :: io :: PyBytesIO"), "generated: {}", out);
+    assert!(out.contains("numbered : bool"), "generated: {}", out);
+    assert!(out.contains("limit : f64"), "generated: {}", out);
+    assert!(!out.contains("version :"), "a version action has no field: {}", out);
+    assert!(out.contains("argparse :: ArgKind :: File (\"r\")"), "generated: {}", out);
+    assert!(out.contains("argparse :: ArgKind :: BinaryFile (\"rb\")"), "generated: {}", out);
+    assert!(out.contains("argparse :: ArgKind :: Version"), "generated: {}", out);
+    assert!(out.contains("nargs : argparse :: Nargs :: Plus"), "generated: {}", out);
+    assert!(out.contains("dest : Some (\"numbered\")"), "generated: {}", out);
+    assert!(out.contains("into_list ()"), "generated: {}", out);
+    assert!(out.contains("into_binary_file ()"), "generated: {}", out);
+    // The version string is the spec's default, rendered at the parse site.
+    assert!(out.contains("ParsedValue :: Str (("), "generated: {}", out);
+    // The Option-typed argv passes through unchanged.
+    assert!(out.contains("] , argv ,)"), "generated: {}", out);
+
+    // A plain list argv is wrapped in Some.
+    let out = compile(
+        concat!(
+            "import argparse\n",
+            "import sys\n",
+            "\n",
+            "def main() -> None:\n",
+            "    p = argparse.ArgumentParser()\n",
+            "    p.add_argument(\"name\")\n",
+            "    args = p.parse_args(sys.argv[1:])\n",
+            "    print(args.name)\n",
+        ),
+        "ap6.py",
+    );
+    assert!(out.contains("Some ((") && out.contains("to_string ()) . collect ())"), "generated: {}", out);
+
+    // Unsupported shapes stay loud: nargs on an option, a second variadic
+    // positional, a FileType default, a version action without version=.
+    for (src, needle) in [
+        ("    p.add_argument(\"--xs\", nargs=\"+\", default=\"a\")\n", "nargs on an option"),
+        (
+            "    p.add_argument(\"a\", nargs=\"+\")\n    p.add_argument(\"b\", nargs=\"*\")\n",
+            "only one variadic",
+        ),
+        (
+            "    p.add_argument(\"--log\", type=FileType(\"w\"), default=\"x\")\n",
+            "FileType option with a default",
+        ),
+        ("    p.add_argument(\"--version\", action=\"version\")\n", "needs version="),
+        ("    p.add_argument(\"f\", type=FileType(\"r\", -1))\n", "FileType takes the mode only"),
+    ] {
+        let err = compile_err(
+            &format!(
+                "import argparse\nfrom argparse import FileType\n\ndef main() -> None:\n    p = argparse.ArgumentParser()\n{}    args = p.parse_args()\n",
+                src
+            ),
+            "ap7.py",
+        );
+        assert!(err.contains(needle), "error for {:?}: {}", src, err);
+    }
+}
+
+#[test]
+fn issubclass_over_a_dynamic_operand_is_statically_false_and_warned() {
+    // `issubclass(importlib.import_module(...).IncrementalDecoder, Base)`
+    // (charset_normalizer's utils, issue #332): classes are not runtime
+    // values, so a computed first operand has no class to judge — false,
+    // through the -W channel like hasattr over an unmodeled value. A NAME
+    // that is not a class keeps the loud refusal.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "import importlib\n",
+            "\n",
+            "class Base:\n",
+            "    pass\n",
+            "\n",
+            "def probe(name: str) -> bool:\n",
+            "    return name in {\"utf_8\"} or issubclass(importlib.import_module(name).Decoder, Base)\n",
+        ),
+        "isc1.py",
+    );
+    assert!(out.contains("|| (false)"), "generated: {}", out);
+    assert!(
+        warnings.iter().any(|w| w.contains("issubclass(<dynamic value>, cls) is statically false")),
+        "warnings: {:?}",
+        warnings
+    );
+    let err = compile_err(
+        "def probe(x: int) -> bool:\n    return issubclass(x, int)\n",
+        "isc2.py",
+    );
+    assert!(err.contains("classes are not runtime values"), "error: {}", err);
+}
+
+#[test]
+fn a_binary_open_mode_is_the_bytes_file() {
+    // `open(p, "rb")` / `open(p, "wb")`: the binary file (io.BytesIO's
+    // type over a disk backend) whose read() yields bytes and write()
+    // takes them — never the text `open()` (issue #332).
+    let out = compile(
+        concat!(
+            "def copy(src: str, dst: str) -> int:\n",
+            "    with open(src, \"rb\") as f:\n",
+            "        data = f.read()\n",
+            "    with open(dst, \"wb\") as g:\n",
+            "        g.write(data)\n",
+            "    with open(dst) as h:\n",
+            "        return len(h.read())\n",
+        ),
+        "binopen.py",
+    );
+    assert!(out.contains("open_binary (& (src) , \"rb\") ?"), "generated: {}", out);
+    assert!(out.contains("open_binary (& (dst) , \"wb\") ?"), "generated: {}", out);
+    assert!(out.contains("open (& (dst) , None :: < & str >) ?"), "generated: {}", out);
 }
 
 // ---- chained comparisons and loop control through try ----

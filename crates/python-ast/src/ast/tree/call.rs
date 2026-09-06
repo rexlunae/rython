@@ -2610,13 +2610,33 @@ impl<'a> CodeGen for Call {
                                 .to_string()
                                 .into());
                         }
+                        // issubclass over a DYNAMIC first operand (an
+                        // attribute of an external module's value —
+                        // `issubclass(importlib.import_module(...).
+                        // IncrementalDecoder, MultibyteIncrementalDecoder)`,
+                        // charset_normalizer's utils): classes are not
+                        // runtime values, so nothing is known about the
+                        // operand — statically false, like hasattr over an
+                        // unmodeled value, through the -W channel (issue
+                        // #332). A NAME operand that is not a class stays
+                        // the loud refusal below.
                         let (ExprType::Name(c1), ExprType::Name(c2)) =
                             (&self.args[0], &self.args[1])
                         else {
-                            return Err("issubclass() over non-class values is not supported: \
-                                         classes are not runtime values in rython"
-                                .to_string()
-                                .into());
+                            if matches!(&self.args[0], ExprType::Name(_)) {
+                                return Err("issubclass() over non-class values is not supported: \
+                                             classes are not runtime values in rython"
+                                    .to_string()
+                                    .into());
+                            }
+                            options.definition_warnings.borrow_mut().push(
+                                "issubclass(<dynamic value>, cls) is statically false: \
+                                 classes are not runtime values, so nothing is known \
+                                 about a computed operand's class (the external-object \
+                                 divergence)"
+                                    .to_string(),
+                            );
+                            return Ok(quote!(false));
                         };
                         // A class resolves locally or through its
                         // import, with its defining module's scope (the
@@ -3463,6 +3483,25 @@ impl<'a> CodeGen for Call {
                             })
                         {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        // A LITERAL mode containing 'b' is the binary file
+                        // (read() yields bytes): `open_binary` (issue #332).
+                        let binary_mode = self.args.get(1).is_some_and(|m| {
+                            matches!(m, ExprType::Constant(c)
+                                if matches!(&c.0, Some(litrs::Literal::String(s)) if s.value().contains('b')))
+                        });
+                        if binary_mode {
+                            let p = &rendered[0];
+                            let m = &rendered[1];
+                            if rendered.len() > 2 {
+                                options.definition_warnings.borrow_mut().push(format!(
+                                    "open({}, ...) passes only the path and mode: a binary \
+                                     file has no encoding, and the buffer is the default \
+                                     (the buffering divergence)",
+                                    bname
+                                ));
+                            }
+                            return Ok(quote!(open_binary(&(#p), #m)?));
                         }
                         return Ok(match rendered.as_slice() {
                             [p] => quote!(open(&(#p), None::<&str>)?),

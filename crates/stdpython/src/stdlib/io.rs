@@ -14,6 +14,7 @@
 //! with no OS has no disk files — `open()` and the disk-backed PyFile
 //! constructors stay std-only).
 
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::{PyException, PyFile};
@@ -34,75 +35,154 @@ pub fn StringIO_seeded<S: AsRef<str> + ?Sized>(initial: &S) -> PyFile {
     PyFile::new_buffer(initial.as_ref())
 }
 
-/// io.BytesIO — an in-memory BINARY buffer. Python's cursor semantics:
-/// read() returns from the cursor and advances it, write() OVERWRITES at
-/// the cursor (BytesIO(b"seeded").write(b"!") yields b"!eeded"), and
-/// getvalue() returns the whole buffer regardless of the cursor.
+/// io.BytesIO — a BINARY stream: the in-memory buffer io.BytesIO() gives,
+/// and the disk handle a binary-mode `open()` gives (`open(p, "rb")`),
+/// one type over both backends exactly as PyFile is for text (so
+/// bytes-consuming code works against either). Python's cursor semantics
+/// for the buffer: read() returns from the cursor and advances it,
+/// write() OVERWRITES at the cursor (BytesIO(b"seeded").write(b"!")
+/// yields b"!eeded"), and getvalue() returns the whole buffer regardless
+/// of the cursor.
+///
+/// Like PyFile, a cheap-clone handle over one shared backend (a file
+/// object is a reference in Python).
+#[derive(Clone)]
 pub struct PyBytesIO {
-    data: Vec<u8>,
-    pos: usize,
-    closed: bool,
+    inner: alloc::rc::Rc<core::cell::RefCell<BytesBackend>>,
+    /// Python `f.name`: the path a disk file was opened from (a BytesIO
+    /// has no name in Python; here it is "").
+    pub name: String,
+}
+
+/// The binary file type of a binary-mode `open()` — the same type as
+/// io.BytesIO (see [`PyBytesIO`]).
+pub type PyBinaryFile = PyBytesIO;
+
+enum BytesBackend {
+    Buffer { data: Vec<u8>, pos: usize },
+    #[cfg(feature = "std")]
+    DiskRead(std::io::BufReader<std::fs::File>),
+    #[cfg(feature = "std")]
+    DiskWrite(std::io::BufWriter<std::fs::File>),
+    Closed,
 }
 
 /// io.BytesIO(): an empty in-memory binary buffer.
 #[allow(non_snake_case)]
 pub fn BytesIO() -> PyBytesIO {
-    PyBytesIO {
-        data: Vec::new(),
-        pos: 0,
-        closed: false,
-    }
+    PyBytesIO::new_buffer(Vec::new())
 }
 
 /// io.BytesIO(initial): seeded with bytes, cursor at the START.
 #[allow(non_snake_case)]
 pub fn BytesIO_seeded<B: AsRef<[u8]>>(initial: B) -> PyBytesIO {
-    PyBytesIO {
-        data: initial.as_ref().to_vec(),
-        pos: 0,
-        closed: false,
-    }
+    PyBytesIO::new_buffer(initial.as_ref().to_vec())
 }
 
 impl PyBytesIO {
-    fn check_open(&self) -> Result<(), PyException> {
-        if self.closed {
-            return Err(crate::closed_file_error());
+    fn from_backend(backend: BytesBackend, name: &str) -> Self {
+        Self {
+            inner: alloc::rc::Rc::new(core::cell::RefCell::new(backend)),
+            name: name.to_string(),
         }
-        Ok(())
     }
 
-    /// Python `b.read()`: the remaining bytes from the cursor.
-    pub fn read(&mut self) -> Result<Vec<u8>, PyException> {
-        self.check_open()?;
-        let out = self.data[self.pos..].to_vec();
-        self.pos = self.data.len();
-        Ok(out)
+    fn new_buffer(data: Vec<u8>) -> Self {
+        Self::from_backend(BytesBackend::Buffer { data, pos: 0 }, "")
     }
 
-    /// Python `b.write(data)`: overwrite at the cursor, return the byte
-    /// count written.
-    pub fn write<B: AsRef<[u8]>>(&mut self, data: B) -> Result<i64, PyException> {
-        self.check_open()?;
+    #[cfg(feature = "std")]
+    pub(crate) fn new_disk_read(reader: std::io::BufReader<std::fs::File>, name: &str) -> Self {
+        Self::from_backend(BytesBackend::DiskRead(reader), name)
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn new_disk_write(writer: std::io::BufWriter<std::fs::File>, name: &str) -> Self {
+        Self::from_backend(BytesBackend::DiskWrite(writer), name)
+    }
+
+    /// Python `f.closed`: whether close() ran on this stream (through
+    /// any alias of it).
+    pub fn closed(&self) -> bool {
+        matches!(*self.inner.borrow(), BytesBackend::Closed)
+    }
+
+    /// Python `b.read()`: the remaining bytes from the cursor (a disk
+    /// handle: the rest of the file).
+    pub fn read(&self) -> Result<Vec<u8>, PyException> {
+        match &mut *self.inner.borrow_mut() {
+            BytesBackend::Buffer { data, pos } => {
+                let out = data[*pos..].to_vec();
+                *pos = data.len();
+                Ok(out)
+            }
+            #[cfg(feature = "std")]
+            BytesBackend::DiskRead(reader) => {
+                use std::io::Read;
+                let mut out = Vec::new();
+                reader
+                    .read_to_end(&mut out)
+                    .map_err(|e| crate::runtime_error(&format!("Read error: {}", e)))?;
+                Ok(out)
+            }
+            #[cfg(feature = "std")]
+            BytesBackend::DiskWrite(_) => Err(crate::runtime_error("File not opened for reading")),
+            BytesBackend::Closed => Err(crate::closed_file_error()),
+        }
+    }
+
+    /// Python `b.write(data)`: overwrite at the cursor (a disk handle:
+    /// append to the stream), return the byte count written.
+    pub fn write<B: AsRef<[u8]>>(&self, data: B) -> Result<i64, PyException> {
         let bytes = data.as_ref();
-        let end = self.pos + bytes.len();
-        if end > self.data.len() {
-            self.data.resize(end, 0);
+        match &mut *self.inner.borrow_mut() {
+            BytesBackend::Buffer { data, pos } => {
+                let end = *pos + bytes.len();
+                if end > data.len() {
+                    data.resize(end, 0);
+                }
+                data[*pos..end].copy_from_slice(bytes);
+                *pos = end;
+                Ok(bytes.len() as i64)
+            }
+            #[cfg(feature = "std")]
+            BytesBackend::DiskWrite(writer) => {
+                use std::io::Write;
+                writer
+                    .write_all(bytes)
+                    .map_err(|e| crate::runtime_error(&format!("Write error: {}", e)))?;
+                Ok(bytes.len() as i64)
+            }
+            #[cfg(feature = "std")]
+            BytesBackend::DiskRead(_) => Err(crate::runtime_error("File not opened for writing")),
+            BytesBackend::Closed => Err(crate::closed_file_error()),
         }
-        self.data[self.pos..end].copy_from_slice(bytes);
-        self.pos = end;
-        Ok(bytes.len() as i64)
     }
 
-    /// Python `b.getvalue()`: the whole buffer regardless of the cursor.
+    /// Python `b.getvalue()`: the whole buffer regardless of the cursor
+    /// (a BytesIO method; a disk handle has none — Python raises
+    /// AttributeError).
     pub fn getvalue(&self) -> Result<Vec<u8>, PyException> {
-        self.check_open()?;
-        Ok(self.data.clone())
+        match &*self.inner.borrow() {
+            BytesBackend::Buffer { data, .. } => Ok(data.clone()),
+            BytesBackend::Closed => Err(crate::closed_file_error()),
+            #[cfg(feature = "std")]
+            _ => Err(crate::runtime_error("getvalue() is a BytesIO method; a disk file has none")),
+        }
     }
 
     /// Python `b.close()`.
-    pub fn close(&mut self) -> Result<(), PyException> {
-        self.closed = true;
+    pub fn close(&self) -> Result<(), PyException> {
+        let old = core::mem::replace(&mut *self.inner.borrow_mut(), BytesBackend::Closed);
+        #[cfg(feature = "std")]
+        if let BytesBackend::DiskWrite(mut writer) = old {
+            use std::io::Write;
+            writer
+                .flush()
+                .map_err(|e| crate::runtime_error(&format!("Flush error: {}", e)))?;
+        }
+        #[cfg(not(feature = "std"))]
+        let _ = old;
         Ok(())
     }
 }

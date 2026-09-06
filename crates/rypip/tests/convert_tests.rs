@@ -6634,6 +6634,175 @@ fn field_from_cross_module_call_result_attribute() {
 }
 
 #[test]
+fn argparse_filetype_positionals_match_python_at_runtime() {
+    // Issue #332: `type=FileType("r")` with `nargs="+"` opens every named
+    // file (a Vec<PyFile>), `dest=` names the fields, `store_true` with
+    // `default=False`, `action="store"`, `action="version"`, and
+    // `parse_args(argv)`. The help/usage spelling of a variadic positional
+    // (`files [files ...]`), the version action's default help, the
+    // missing-positional error and the can't-open error are CPython's
+    // verbatim (python3 3.11).
+    let scratch = Scratch::new("apfiles");
+    let file = scratch.path().join("ap_files.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "from argparse import FileType\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"cat2\", description=\"Concatenate files.\")\n",
+            "    parser.add_argument(\"files\", type=FileType(\"r\"), nargs=\"+\", help=\"File(s) to read\")\n",
+            "    parser.add_argument(\n",
+            "        \"-n\", \"--number\", action=\"store_true\", default=False, dest=\"number\", help=\"Number lines\"\n",
+            "    )\n",
+            "    parser.add_argument(\n",
+            "        \"-t\", \"--threshold\", action=\"store\", default=0.5, type=float, dest=\"limit\", help=\"A limit\"\n",
+            "    )\n",
+            "    parser.add_argument(\"--version\", action=\"version\", version=\"cat2 \" + \"1.0\")\n",
+            "    args = parser.parse_args(argv)\n",
+            "    total = 0\n",
+            "    for f in args.files:\n",
+            "        text = f.read()\n",
+            "        print(f.name, len(text), args.number, args.limit)\n",
+            "        total += len(text)\n",
+            "        f.close()\n",
+            "    print(\"total\", total)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(scratch.path().join("a.txt"), "hello\nworld\n").unwrap();
+    fs::write(scratch.path().join("b.txt"), "xyz").unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/ap_files");
+    let run = |args: &[&str]| {
+        Command::new(&bin)
+            .args(args)
+            .current_dir(scratch.path())
+            .output()
+            .expect("run")
+    };
+
+    // Verified against python3.
+    let output = run(&["a.txt", "b.txt", "-n", "--threshold", "0.25"]);
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "a.txt 12 True 0.25\nb.txt 3 True 0.25\ntotal 15\n"
+    );
+
+    let output = run(&["--version"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "cat2 1.0\n");
+
+    let output = run(&["--help"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        concat!(
+            "usage: cat2 [-h] [-n] [-t LIMIT] [--version] files [files ...]\n",
+            "\n",
+            "Concatenate files.\n",
+            "\n",
+            "positional arguments:\n",
+            "  files                 File(s) to read\n",
+            "\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -n, --number          Number lines\n",
+            "  -t LIMIT, --threshold LIMIT\n",
+            "                        A limit\n",
+            "  --version             show program's version number and exit\n",
+        ),
+        "help text diverged from CPython"
+    );
+
+    let output = run(&[]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        concat!(
+            "usage: cat2 [-h] [-n] [-t LIMIT] [--version] files [files ...]\n",
+            "cat2: error: the following arguments are required: files\n",
+        )
+    );
+
+    let output = run(&["nope.txt"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        concat!(
+            "usage: cat2 [-h] [-n] [-t LIMIT] [--version] files [files ...]\n",
+            "cat2: error: argument files: can't open 'nope.txt': [Errno 2] No such file or directory: 'nope.txt'\n",
+        )
+    );
+}
+
+#[test]
+fn binary_filetype_and_binary_open_match_python_at_runtime() {
+    // Issue #332: `type=argparse.FileType("rb")` with `nargs="*"` (zero
+    // files is an empty list), and `open(p, "wb")` / `open(p, "rb")` —
+    // the bytes file: read() yields bytes, write() takes them.
+    let scratch = Scratch::new("apbin");
+    let file = scratch.path().join("ap_bin.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    parser = argparse.ArgumentParser(prog=\"sizes\")\n",
+            "    parser.add_argument(\"blobs\", type=argparse.FileType(\"rb\"), nargs=\"*\")\n",
+            "    args = parser.parse_args()\n",
+            "    for blob in args.blobs:\n",
+            "        data = blob.read()\n",
+            "        print(blob.name, len(data))\n",
+            "    with open(\"out.bin\", \"wb\") as sink:\n",
+            "        sink.write(b\"\\x00\\x01\\x02\")\n",
+            "    with open(\"out.bin\", \"rb\") as src:\n",
+            "        print(len(src.read()))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(scratch.path().join("a.bin"), b"hello").unwrap();
+    fs::write(scratch.path().join("b.bin"), [1u8, 2, 3, 4]).unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/ap_bin");
+
+    // Verified against python3.
+    let output = Command::new(&bin)
+        .args(["a.bin", "b.bin"])
+        .current_dir(scratch.path())
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "a.bin 5\nb.bin 4\n3\n");
+    let output = Command::new(&bin).current_dir(scratch.path()).output().expect("run");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "3\n");
+}
+
+#[test]
 fn module_level_argparse_with_short_aliases_matches_python() {
     // Issue #118: certifi's __main__.py shape — the parser built at
     // MODULE level (not inside a function), with -short/--long alias
