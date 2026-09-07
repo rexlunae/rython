@@ -93,6 +93,7 @@ enum Cmd {
     /// Convert, build and run a Python program, like `python program.py`:
     /// the arguments after the package path (or after `--`) are the
     /// program's, its output is yours, and its exit status is rypip's.
+    /// Unix only for now (sys.argv[0] is set through the exec).
     Run {
         /// Path to a Python package directory or a single .py file.
         package: PathBuf,
@@ -100,8 +101,9 @@ enum Cmd {
         /// the system temp dir keyed by the package name and the source
         /// path, reused across runs of that source so rebuilds are
         /// incremental). An explicit directory is one crate you own, as
-        /// with `convert --out`: two different programs given the same one
-        /// take turns in it and replace each other's sources.
+        /// with `convert --out`: its `src/` is regenerated from scratch on
+        /// every run, and two different programs given the same one take
+        /// turns in it and replace each other's sources.
         #[arg(long, short)]
         out: Option<PathBuf>,
         #[arg(long)]

@@ -19,7 +19,8 @@ a permanent port — readable Rust you can refactor, not an opaque bundle.
 command-line shape: it converts into a scratch crate (reused across runs),
 builds it quietly, and executes the binary with your arguments, streams
 and working directory, exiting with the program's status — no new
-semantics, just `python program.py` without the interpreter.
+semantics, just `python program.py` without the interpreter (Unix only for
+now: `sys.argv[0]` is set through the exec).
 
 **2. Using Python inside Rust projects.**
 The `python-mod` proc-macros (`python_module!`, `python_module_nostd!`)

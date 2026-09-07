@@ -183,11 +183,89 @@ fn rypip_run_keeps_same_named_programs_apart_and_serializes_a_shared_work_dir() 
     let (o1, o2) = (r1.wait_with_output().unwrap(), r2.wait_with_output().unwrap());
     assert_eq!(String::from_utf8_lossy(&o1.stdout), "alpha\n", "stderr: {}", String::from_utf8_lossy(&o1.stderr));
     assert_eq!(String::from_utf8_lossy(&o2.stdout), "alpha\n", "stderr: {}", String::from_utf8_lossy(&o2.stderr));
-    assert!(dir_a.with_extension("lock").is_file(), "the work dir's lock file sits beside it");
+    let lock_of = |dir: &std::path::Path| std::path::PathBuf::from(format!("{}.lock", dir.display()));
+    assert!(lock_of(&dir_a).is_file(), "the work dir's lock file sits beside it");
     for dir in [&dir_a, &dir_b] {
         let _ = fs::remove_dir_all(dir);
-        let _ = fs::remove_file(dir.with_extension("lock"));
+        let _ = fs::remove_file(lock_of(dir));
     }
+}
+
+#[test]
+fn the_work_dir_lock_is_appended_and_the_executable_is_staged_per_invocation() {
+    // Round 3 of the review on #340: the lock file is `<dir>.lock` by
+    // APPENDING, so an output named `x.lock` locks `x.lock.lock` and can
+    // still be created as a directory (`with_extension` would have made the
+    // lock file the directory's own path); and the executable an invocation
+    // runs is its own hard link under `<dir>/.run/`, distinct per
+    // invocation and removed when the run is over.
+    let scratch = Scratch::new("runlock");
+    let out = scratch.path().join("x.lock");
+    let lock = rypip::lock_work_dir(&out).expect("lock");
+    assert!(scratch.path().join("x.lock.lock").is_file());
+    assert!(!out.exists(), "the lock file did not take the output's path");
+    fs::create_dir_all(&out).expect("the output directory can be created beside its lock");
+    drop(lock);
+
+    let exe = scratch.path().join("program");
+    fs::write(&exe, b"#!/bin/sh\necho staged\n").unwrap();
+    let first = rypip::stage_executable(&out, &exe).expect("stage");
+    let second = rypip::stage_executable(&out, &exe).expect("stage");
+    assert_ne!(first.path(), second.path());
+    assert!(first.path().starts_with(out.join(".run")));
+    assert_eq!(fs::read(first.path()).unwrap(), fs::read(&exe).unwrap());
+    let first_path = first.path().to_path_buf();
+    drop(first);
+    assert!(!first_path.exists(), "a staged executable is removed with its run");
+    assert!(second.path().exists());
+}
+
+#[test]
+fn a_reused_work_dir_regenerates_its_sources_from_scratch() {
+    // Round 3 of the review on #340: a run regenerates the crate's `src/`
+    // from scratch, so a module the previous conversion into the same work
+    // dir wrote — here a different program given the same explicit `--out`
+    // — leaves no stale source behind, while cargo's `target/` survives for
+    // incremental rebuilds.
+    let scratch = Scratch::new("runreuse");
+    let out = scratch.path().join("crate");
+    for (name, word) in [("first.py", "first"), ("second.py", "second")] {
+        fs::write(
+            scratch.path().join(name),
+            format!(
+                concat!(
+                    "def main() -> None:\n",
+                    "    print(\"{}\")\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+                word
+            ),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_rypip"))
+            .arg("run")
+            .arg(name)
+            .arg("--no-deps")
+            .arg("--out")
+            .arg(&out)
+            .current_dir(scratch.path())
+            .env_remove("RUSTFLAGS")
+            .output()
+            .expect("running rypip");
+        // Verified against python3.
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("{}\n", word),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(out.join("src").join("second.rs").is_file());
+    assert!(!out.join("src").join("first.rs").exists(), "the previous program's module is gone");
+    assert!(out.join("target").is_dir(), "cargo's target dir survives");
 }
 
 #[test]

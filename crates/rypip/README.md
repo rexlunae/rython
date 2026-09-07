@@ -25,8 +25,10 @@ rypip build path/to/package
 # Convert, build and run a program like `python program.py args`: the
 # program's stdout/stderr/stdin, working directory, sys.argv and exit
 # status are yours (a scratch crate under the temp dir, keyed by the
-# package name and the source path, is reused across runs; an explicit
-# --out is one crate you own, shared by whatever you point at it):
+# package name and the source path, is reused across runs with its src/
+# regenerated each time; an explicit --out is one crate you own, shared by
+# whatever you point at it). Unix only for now: sys.argv[0] is set through
+# the exec, and a platform that cannot do that is refused loudly.
 rypip run program.py -- args
 ```
 

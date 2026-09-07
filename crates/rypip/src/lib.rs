@@ -67,10 +67,11 @@ pub fn run_work_dir(package: &Path, name: &str) -> Result<PathBuf> {
 }
 
 /// An exclusive advisory lock on a run work dir (a sibling `<dir>.lock`
-/// file), held from source generation through the build so two `rypip
-/// run` invocations of one source never interleave a conversion with a
-/// build; dropped before the program executes, since concurrent
-/// executions are the user's business, as under CPython.
+/// file), held from source generation through the build and the staging
+/// of the executable, so two `rypip run` invocations of one work dir
+/// never interleave a conversion with a build; dropped before the program
+/// executes, since concurrent executions are the user's business, as
+/// under CPython.
 pub struct WorkDirLock {
     file: std::fs::File,
 }
@@ -87,7 +88,12 @@ pub fn lock_work_dir(dir: &Path) -> Result<WorkDirLock> {
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let path = dir.with_extension("lock");
+    // Appended, never substituted: `--out foo.lock` locks `foo.lock.lock`,
+    // and `foo.bar` never shares a lock with a sibling `foo.lock` (Devin
+    // review on #340, round 3).
+    let mut lock_name = dir.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let path = PathBuf::from(lock_name);
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -143,7 +149,10 @@ pub fn cargo_build_executable(krate: &ConvertedCrate) -> Result<PathBuf> {
 /// is `program` exactly as the user typed it (CPython keeps the script
 /// path as given: `hello.py`, `./hello.py`, `pkgdir/`), the arguments
 /// follow, and the streams and the working directory are inherited. The
-/// exit status is returned for the caller to propagate.
+/// exit status is returned for the caller to propagate. Unix only: argv[0]
+/// is set through the exec (`CommandExt::arg0`); a platform that cannot
+/// set it independently of the executable is refused loudly rather than
+/// running with the binary's path in `sys.argv[0]`.
 pub fn run_program(binary: &Path, program: &OsStr, args: &[OsString]) -> Result<ExitStatus> {
     let mut cmd = Command::new(binary);
     #[cfg(unix)]
@@ -155,9 +164,9 @@ pub fn run_program(binary: &Path, program: &OsStr, args: &[OsString]) -> Result<
     {
         let _ = program;
         bail!(
-            "rypip run cannot set sys.argv[0] to the program path on this platform yet \
-             (CPython's sys.argv[0] is the script path as given; the binary's path would \
-             differ silently)"
+            "rypip run is Unix-only for now: it cannot set sys.argv[0] to the program path on \
+             this platform (CPython's sys.argv[0] is the script path as given; the binary's \
+             path would differ silently)"
         );
     }
     cmd.args(args)
@@ -165,12 +174,59 @@ pub fn run_program(binary: &Path, program: &OsStr, args: &[OsString]) -> Result<
         .with_context(|| format!("running {}", binary.display()))
 }
 
+/// An invocation's private copy of the built executable — a hard link
+/// (or a copy across file systems) under `<work dir>/.run/`, made while
+/// the work dir's lock is held — so a concurrent rebuild in the same work
+/// dir, or in another work dir whose cargo configuration maps the same
+/// package name to the same artifact path, can never swap the program
+/// between artifact discovery and the exec (Devin review on #340, round
+/// 3). Removed when dropped, after the program has exited.
+pub struct StagedExecutable {
+    path: PathBuf,
+}
+
+impl StagedExecutable {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StagedExecutable {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+pub fn stage_executable(work_dir: &Path, executable: &Path) -> Result<StagedExecutable> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let dir = work_dir.join(".run");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let file_name = executable
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| OsString::from("program"));
+    let mut staged_name = file_name;
+    staged_name.push(format!("-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)));
+    let path = dir.join(staged_name);
+    let _ = std::fs::remove_file(&path);
+    if std::fs::hard_link(executable, &path).is_err() {
+        std::fs::copy(executable, &path)
+            .with_context(|| format!("staging {} as {}", executable.display(), path.display()))?;
+    }
+    Ok(StagedExecutable { path })
+}
+
 /// `rypip run` in one call (issue #166: CPython's command-line shape over
 /// the convert/build pipeline, with no new semantics): take the work
-/// dir's lock, convert, hand the crate to `on_converted` (the CLI reports
-/// its warnings there), build, release the lock, then execute with
-/// `program` as `sys.argv[0]` and `args`. The one workflow the CLI and a
-/// library caller share (Devin review on #340, round 2).
+/// dir's lock, regenerate the crate's sources from scratch (`src/` is
+/// removed first, so a module the program no longer has leaves no stale
+/// file behind; cargo's `target/` stays for incremental rebuilds), hand
+/// the crate to `on_converted` (the CLI reports its warnings there),
+/// build, stage the executable for this invocation, release the lock,
+/// then execute with `program` as `sys.argv[0]` and `args`. The one
+/// workflow the CLI and a library caller share (Devin review on #340,
+/// rounds 2 and 3).
 pub fn run(
     pkg: &PyPackage,
     out: &Path,
@@ -180,11 +236,16 @@ pub fn run(
     on_converted: impl FnOnce(&ConvertedCrate),
 ) -> Result<ExitStatus> {
     let lock = lock_work_dir(out)?;
+    let src = out.join("src");
+    if src.exists() {
+        std::fs::remove_dir_all(&src).with_context(|| format!("clearing {}", src.display()))?;
+    }
     let krate = convert(pkg, out, options)?;
     on_converted(&krate);
     let binary = cargo_build_executable(&krate)?;
+    let staged = stage_executable(out, &binary)?;
     drop(lock);
-    run_program(&binary, program, args)
+    run_program(staged.path(), program, args)
 }
 
 /// Install a converted crate's binary the same way `cargo install` would
