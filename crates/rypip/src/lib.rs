@@ -373,8 +373,10 @@ pub fn run(
     let lock = lock_work_dir(&out)?;
     refuse_foreign_output(pkg, &out)?;
     remove_generated_files(&out)?;
+    let before = files_under(&out.join("src"))?;
+    let started = std::time::SystemTime::now();
     let krate = convert(pkg, &out, options)?;
-    record_generated_files(&out)?;
+    record_generated_files(&out, &before, started)?;
     on_converted(&krate);
     let binary = cargo_build_executable(&krate)?;
     let staged = stage_executable(&out, &binary)?;
@@ -414,27 +416,51 @@ fn remove_generated_files(out: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Record every file now under `src/` as this run's own (the guard above
-/// admitted only a directory that is `run`'s, so after a conversion the
-/// tree is rypip's).
-fn record_generated_files(out: &Path) -> Result<()> {
-    fn walk(dir: &Path, base: &Path, into: &mut Vec<String>) -> Result<()> {
+/// Every regular file under `dir`, recursively (empty when it does not
+/// exist).
+fn files_under(dir: &Path) -> Result<std::collections::HashSet<PathBuf>> {
+    fn walk(dir: &Path, into: &mut std::collections::HashSet<PathBuf>) -> Result<()> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             if entry.file_type()?.is_dir() {
-                walk(&path, base, into)?;
-            } else if let Ok(relative) = path.strip_prefix(base) {
-                into.push(relative.to_string_lossy().into_owned());
+                walk(&path, into)?;
+            } else {
+                into.insert(path);
             }
         }
         Ok(())
     }
-    let mut files = Vec::new();
-    let src = out.join("src");
-    if src.is_dir() {
-        walk(&src, out, &mut files)?;
+    let mut files = std::collections::HashSet::new();
+    if dir.is_dir() {
+        walk(dir, &mut files)?;
     }
+    Ok(files)
+}
+
+/// Record the files THIS conversion wrote under `src/`: those that did
+/// not exist before it, plus those it rewrote (modified at or after
+/// `started`). A file that was there before and untouched — a user's
+/// file in an admitted crate — is never recorded, so the next run never
+/// deletes it (Devin review on #340, round 6). A coarse file-system
+/// timestamp can only under-record (a stale file left behind), never
+/// claim a file rypip did not write.
+fn record_generated_files(
+    out: &Path,
+    before: &std::collections::HashSet<PathBuf>,
+    started: std::time::SystemTime,
+) -> Result<()> {
+    let mut files: Vec<String> = files_under(&out.join("src"))?
+        .into_iter()
+        .filter(|path| {
+            !before.contains(path)
+                || std::fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .map(|modified| modified >= started)
+                    .unwrap_or(false)
+        })
+        .filter_map(|path| path.strip_prefix(out).ok().map(|r| r.to_string_lossy().into_owned()))
+        .collect();
     files.sort();
     let list = generated_list_path(out);
     if let Some(parent) = list.parent() {

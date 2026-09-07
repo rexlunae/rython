@@ -460,10 +460,17 @@ fn rypip_run_refuses_an_output_that_is_not_its_own() {
     fs::create_dir_all(forged.join("src")).unwrap();
     fs::write(forged.join("Cargo.toml"), format!("{}\n[package]\nname = \"x\"\n", rypip::convert::GENERATED_MANIFEST_HEADER)).unwrap();
     fs::write(forged.join("src").join("precious.rs"), "// mine\n").unwrap();
-    let output = run("proj", &forged, scratch.path());
-    // Verified against python3.
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "proj\n", "stderr: {}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(fs::read_to_string(forged.join("src").join("precious.rs")).unwrap(), "// mine\n");
+    // Twice: the first run must not claim the pre-existing file as its
+    // own, or the second would delete it (round 6).
+    for _ in 0..2 {
+        let output = run("proj", &forged, scratch.path());
+        // Verified against python3.
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "proj\n", "stderr: {}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(fs::read_to_string(forged.join("src").join("precious.rs")).unwrap(), "// mine\n");
+    }
+    let recorded = fs::read_to_string(forged.join(".run").join("generated")).unwrap();
+    assert!(!recorded.contains("precious.rs"), "recorded as rypip's: {}", recorded);
+    assert!(recorded.contains("src/"), "the conversion's own files are recorded: {}", recorded);
     // A separate directory: the src-layout project runs.
     let output = run("proj", &scratch.path().join("crate"), scratch.path());
     // Verified against python3.
