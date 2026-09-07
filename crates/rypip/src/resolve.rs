@@ -742,6 +742,25 @@ fn extracted_artifact_name(dir: &Path) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// The sha256 digest of the artifact an extraction was built from (the
+/// completion marker's second line): an extraction is COMPLETE only for
+/// that artifact — a replaced artifact (same file name, another verified
+/// digest) rebuilds it (Devin review on #342, round 5). A marker without
+/// a digest (an older layout) matches nothing.
+fn extracted_artifact_digest(dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(dir.join(COMPLETE_MARKER)).ok()?;
+    let digest = text.lines().nth(1)?.trim().to_ascii_lowercase();
+    (!digest.is_empty()).then_some(digest)
+}
+
+/// The digest recorded beside an artifact (its sidecar), lowercase.
+fn recorded_digest(artifact: &Path) -> Result<String> {
+    let sidecar = digest_sidecar(artifact);
+    let recorded = fs::read_to_string(&sidecar)
+        .with_context(|| format!("reading the recorded digest {}", sidecar.display()))?;
+    Ok(recorded.trim().to_ascii_lowercase())
+}
+
 /// What a cache candidate is: a complete extraction (its root), or a
 /// verified artifact still to extract.
 enum Cached {
@@ -774,6 +793,18 @@ fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDep
                 continue;
             };
             if !version_satisfies(&version, &req.specifiers) {
+                continue;
+            }
+            // The extraction is tied to its ARTIFACT: the artifact must
+            // be present and verified, and the marker's digest must be
+            // the artifact's — an extraction of a missing, unverified or
+            // replaced artifact is not a candidate (the artifact, if
+            // verified, extracts anew below).
+            let artifact = dist_dir.join(&artifact_name);
+            if !artifact.is_file() || !cached_artifact_verified(&artifact)? {
+                continue;
+            }
+            if extracted_artifact_digest(&path) != Some(recorded_digest(&artifact)?) {
                 continue;
             }
             let Ok(root) = locate_extracted_root(&path) else {
@@ -887,10 +918,12 @@ fn version_str_of(v: &Version) -> String {
     s
 }
 
-/// Whether an extraction directory is COMPLETE: it carries the marker
-/// and its distribution root is locatable.
-fn extraction_complete(dir: &Path) -> bool {
-    dir.join(COMPLETE_MARKER).is_file() && locate_extracted_root(dir).is_ok()
+/// Whether an extraction directory is COMPLETE for the artifact with
+/// `digest`: its marker records that digest and its distribution root
+/// is locatable. An extraction of another digest — the artifact was
+/// replaced — is incomplete for this one and rebuilds.
+fn extraction_complete(dir: &Path, digest: &str) -> bool {
+    extracted_artifact_digest(dir).as_deref() == Some(digest) && locate_extracted_root(dir).is_ok()
 }
 
 /// Extract a wheel or sdist into its own directory under
@@ -920,21 +953,27 @@ fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Re
     let extract_dir = extraction_dir(dist_dir, file_name);
     let extracted = dist_dir.join("extracted");
     let stem = artifact_stem(file_name).unwrap_or(file_name);
-    if extraction_complete(&extract_dir) {
+    // The artifact's verified digest (its sidecar — written before any
+    // extraction, checked by the offline lookup): what the extraction is
+    // complete FOR.
+    let digest = recorded_digest(artifact)?;
+    if extraction_complete(&extract_dir, &digest) {
         return locate_extracted_root(&extract_dir);
     }
-    // Anything else at that path (a partial extraction, an older cache
-    // layout) is set aside and removed — unless it became complete
-    // meanwhile, in which case it is the answer.
-    set_aside_incomplete(&extract_dir, &extracted, stem)?;
-    if extraction_complete(&extract_dir) {
+    // Anything else at that path (a partial extraction, an extraction
+    // of a replaced artifact, an older cache layout) is set aside and
+    // removed — unless it became complete for this artifact meanwhile,
+    // in which case it is the answer.
+    set_aside_incomplete(&extract_dir, &extracted, stem, &digest)?;
+    if extraction_complete(&extract_dir, &digest) {
         return locate_extracted_root(&extract_dir);
     }
     remove_dead_temporaries(&extracted, stem);
     fs::create_dir_all(&extracted)?;
     let partial = extracted.join(format!("{stem}{PARTIAL_INFIX}{}", temporary_suffix()));
     fs::create_dir_all(&partial)?;
-    let published = publish_extraction(artifact, file_name, dist_name, &partial, &extract_dir);
+    let published =
+        publish_extraction(artifact, file_name, dist_name, &digest, &partial, &extract_dir);
     // Whatever happened, this invocation's sibling is gone: on success it
     // was renamed away (or the other resolver's tree won), on failure
     // its unpacked files are not left for the cache to skip forever.
@@ -951,7 +990,12 @@ fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Re
 /// it between the caller's check and the rename), it is renamed back —
 /// or, when the path was filled again meanwhile by another complete
 /// tree, the duplicate is dropped. A path that vanished is fine.
-fn set_aside_incomplete(extract_dir: &Path, extracted: &Path, stem: &str) -> Result<()> {
+fn set_aside_incomplete(
+    extract_dir: &Path,
+    extracted: &Path,
+    stem: &str,
+    digest: &str,
+) -> Result<()> {
     if !extract_dir.exists() {
         return Ok(());
     }
@@ -963,7 +1007,7 @@ fn set_aside_incomplete(extract_dir: &Path, extracted: &Path, stem: &str) -> Res
             extract_dir.display()
         ))),
         Ok(()) => {
-            if extraction_complete(&aside) {
+            if extraction_complete(&aside, digest) {
                 if fs::rename(&aside, extract_dir).is_err() {
                     let _ = fs::remove_dir_all(&aside);
                 }
@@ -982,6 +1026,7 @@ fn publish_extraction(
     artifact: &Path,
     file_name: &str,
     dist_name: &str,
+    digest: &str,
     partial: &Path,
     extract_dir: &Path,
 ) -> Result<()> {
@@ -1025,14 +1070,14 @@ fn publish_extraction(
         )
     })?;
     let marker = partial.join(COMPLETE_MARKER);
-    fs::write(&marker, format!("{file_name}\n"))
+    fs::write(&marker, format!("{file_name}\n{digest}\n"))
         .with_context(|| format!("writing {}", marker.display()))?;
     match fs::rename(partial, extract_dir) {
         Ok(()) => Ok(()),
         Err(e) => {
             // Another resolver published the same artifact between our
             // check and our rename: its complete tree is the cache entry.
-            if extract_dir.join(COMPLETE_MARKER).is_file()
+            if extraction_complete(extract_dir, digest)
                 && locate_extracted_root(extract_dir).is_ok()
             {
                 return Ok(());
@@ -1309,8 +1354,10 @@ mod extraction_tests {
         fs::create_dir_all(dir.join("idna")).unwrap();
         fs::write(dir.join("idna/__init__.py"), "").unwrap();
         fs::create_dir_all(dir.join("idna-1.0.dist-info")).unwrap();
-        fs::write(dir.join(COMPLETE_MARKER), "idna-1.0-py3-none-any.whl\n").unwrap();
+        fs::write(dir.join(COMPLETE_MARKER), format!("idna-1.0-py3-none-any.whl\n{DIGEST}\n")).unwrap();
     }
+
+    const DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000abc";
 
     #[test]
     fn a_complete_tree_is_never_removed_when_set_aside() {
@@ -1320,8 +1367,8 @@ mod extraction_tests {
         let extracted = scratch("complete");
         let target = extracted.join("idna-1.0-py3-none-any");
         complete_tree(&target);
-        set_aside_incomplete(&target, &extracted, "idna-1.0-py3-none-any").unwrap();
-        assert!(extraction_complete(&target), "the complete tree stays at its path");
+        set_aside_incomplete(&target, &extracted, "idna-1.0-py3-none-any", DIGEST).unwrap();
+        assert!(extraction_complete(&target, DIGEST), "the complete tree stays at its path");
         assert!(target.join("idna/__init__.py").is_file());
         let leftovers: Vec<String> = fs::read_dir(&extracted)
             .unwrap()
@@ -1338,7 +1385,7 @@ mod extraction_tests {
         let extracted = scratch("incomplete");
         let target = extracted.join("idna-1.0-py3-none-any");
         fs::create_dir_all(target.join("idna-1.0.dist-info")).unwrap();
-        set_aside_incomplete(&target, &extracted, "idna-1.0-py3-none-any").unwrap();
+        set_aside_incomplete(&target, &extracted, "idna-1.0-py3-none-any", DIGEST).unwrap();
         assert!(!target.exists());
         let leftovers: Vec<String> = fs::read_dir(&extracted)
             .unwrap()
@@ -1347,7 +1394,13 @@ mod extraction_tests {
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
         // A vanished path is fine.
-        set_aside_incomplete(&target, &extracted, "idna-1.0-py3-none-any").unwrap();
+        set_aside_incomplete(&target, &extracted, "idna-1.0-py3-none-any", DIGEST).unwrap();
+        // A complete tree of ANOTHER digest (a replaced artifact) is
+        // incomplete for this one: set aside and removed.
+        complete_tree(&target);
+        let other = "1111111111111111111111111111111111111111111111111111111111111111";
+        set_aside_incomplete(&target, &extracted, "idna-1.0-py3-none-any", other).unwrap();
+        assert!(!target.exists(), "an extraction of a replaced artifact is rebuilt");
         let _ = fs::remove_dir_all(&extracted);
     }
 

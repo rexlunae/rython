@@ -476,12 +476,12 @@ fn cached_versions_of_one_distribution_extract_apart() {
         assert_eq!(newest.version, "2.0");
         assert_eq!(newest.path, newer.path);
     }
-    // A complete extraction carries its marker, naming the artifact.
+    // A complete extraction carries its marker, naming the artifact and
+    // its digest.
     let marker = dist_dir.join("extracted/idna-2.0-py3-none-any/.rypip-complete");
-    assert_eq!(
-        fs::read_to_string(&marker).unwrap().trim(),
-        "idna-2.0-py3-none-any.whl"
-    );
+    let marker_text = fs::read_to_string(&marker).unwrap();
+    assert_eq!(marker_text.lines().next(), Some("idna-2.0-py3-none-any.whl"));
+    assert_eq!(marker_text.lines().nth(1).map(str::len), Some(64), "{marker_text:?}");
 }
 
 #[test]
@@ -572,6 +572,41 @@ fn a_failed_extraction_leaves_no_partial_directory_and_dead_owners_are_cleared()
     }
     assert!(live.exists(), "a live process's sibling is left alone, however old");
     assert!(extracted.join("idna-1.0-py3-none-any/.rypip-complete").is_file());
+}
+
+#[test]
+fn a_replaced_artifact_rebuilds_its_extraction() {
+    // The completion marker records the artifact's digest: after the
+    // same file name is replaced by other verified contents, the next
+    // resolution rebuilds the extraction and returns the replacement
+    // (Devin review on #342, round 5).
+    let scratch = Scratch::new("cache-replaced");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("idna");
+    write_wheel(&dist_dir, "idna", "1.0", &[("idna/__init__.py", "VERSION = 'first'\n")]);
+    let req = parse_requirement("idna==1.0").unwrap();
+    let first = rypip::resolve::resolve_dependency_in(&cache, &req, true).unwrap();
+    assert!(fs::read_to_string(first.path.join("__init__.py")).unwrap().contains("first"));
+    let marker = dist_dir.join("extracted/idna-1.0-py3-none-any/.rypip-complete");
+    let recorded = fs::read_to_string(&marker).unwrap();
+    assert_eq!(recorded.lines().count(), 2, "file name and digest: {recorded:?}");
+
+    // The same file name, other verified contents.
+    write_wheel(&dist_dir, "idna", "1.0", &[("idna/__init__.py", "VERSION = 'second'\n")]);
+    let second = rypip::resolve::resolve_dependency_in(&cache, &req, true).unwrap();
+    assert_eq!(second.version, "1.0");
+    assert!(
+        fs::read_to_string(second.path.join("__init__.py")).unwrap().contains("second"),
+        "the replacement's contents"
+    );
+    assert_ne!(fs::read_to_string(&marker).unwrap(), recorded, "the marker carries the new digest");
+
+    // An extraction whose artifact is gone is no candidate: nothing to
+    // verify it against.
+    fs::remove_file(dist_dir.join("idna-1.0-py3-none-any.whl")).unwrap();
+    let err = rypip::resolve::resolve_dependency_in(&cache, &req, true)
+        .expect_err("an extraction without its artifact is not trusted");
+    assert!(err.to_string().contains("offline"), "{err:?}");
 }
 
 #[test]
