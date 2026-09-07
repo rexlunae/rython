@@ -1,7 +1,7 @@
 {
-  "rypip_commit": "6555609",
+  "rypip_commit": "9d247fa",
   "rypip_path": "/Users/tserica/rython/target/debug/rypip",
-  "elapsed_seconds": 597.4,
+  "elapsed_seconds": 749.9,
   "packages": {
     "urllib3": {
       "total": 728,
@@ -242,12 +242,12 @@
       "build_status": 101
     },
     "requests": {
-      "total": 2448,
+      "total": 2407,
       "histogram": {
-        "E0308": 950,
-        "E0599": 491,
+        "E0308": 912,
+        "E0599": 489,
         "E0609": 435,
-        "E0277": 334,
+        "E0277": 333,
         "E0615": 80,
         "E0061": 58,
         "E0618": 19,
@@ -384,6 +384,7 @@
         "String | bool": 2,
         "() | &Self": 2,
         "PyValue | HTTPAdapter": 2,
+        "&str | (&str, &str)": 2,
         "Vec<PyValue> | (_, _)": 2,
         "PyValue | Result<(), PyException>": 2,
         "PyValue | &Self": 2,
@@ -508,7 +509,6 @@
         "Option<f64> | PyValue": 1,
         "&str | &PyValue": 1,
         "&Url | (_, _, _, _, _, _, _)": 1,
-        "&str | (&str, &str)": 1,
         "Vec<String> | (_, _, _, _, _)": 1,
         "Result<(), PyException> | Result<(), PyValue>": 1,
         "bool | Result<bool, PyException>": 1
