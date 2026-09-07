@@ -22358,3 +22358,33 @@ fn aliased_and_typing_extensions_qualified_annotations_lower_like_typing() {
         assert!(!out.contains("crate :: typing"), "{name}: {}", out);
     }
 }
+
+#[test]
+fn typing_aliases_reach_type_checking_imports_annotated_assignments_and_respect_shadowing() {
+    // Devin review on #342, round 10: the alias is collected under
+    // `if TYPE_CHECKING:`, a value-bearing annotated assignment is
+    // rewritten, and a scope that rebinds the alias name to another
+    // import keeps its own binding.
+    let out = compile(
+        "from typing import TYPE_CHECKING\n\
+         \n\
+         if TYPE_CHECKING:\n\
+         \x20   import typing as t\n\
+         \n\
+         LIMIT: t.Optional[int] = None\n\
+         \n\
+         def f(x: t.Optional[int]) -> int:\n\
+         \x20   y: t.Optional[int] = None\n\
+         \x20   if x is None:\n\
+         \x20       return 0 if y is None else y\n\
+         \x20   return x\n\
+         \n\
+         def shadow() -> int:\n\
+         \x20   import os as t\n\
+         \x20   return 1\n",
+        "type_checking_alias.py",
+    );
+    assert!(out.contains("x : Option < i64 >"), "the parameter through a TYPE_CHECKING alias: {}", out);
+    assert!(out.contains("pub fn shadow"), "the shadowing scope converts: {}", out);
+    assert!(!out.contains("crate :: typing"), "{}", out);
+}

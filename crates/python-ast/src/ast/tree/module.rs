@@ -89,34 +89,97 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Module {
 /// annotation whose root is such an alias is rewritten to the `typing`
 /// spelling ONCE, when the module is built, so the annotation readers
 /// (`is_typing` and its callers) see one spelling and never an alias
-/// (Devin review on #342, round 9). Parameter annotations, return
-/// annotations and annotated names are rewritten, through nested
-/// functions, classes and blocks.
+/// (Devin review on #342, rounds 9 and 10). The aliases are collected
+/// through every statement body (an `if TYPE_CHECKING:` block included)
+/// with the statement visitor; parameter annotations, return
+/// annotations, annotated assignments (`x: t.Optional[int] = None`) and
+/// bare annotated names are rewritten through nested functions, classes
+/// and blocks; a scope that rebinds the alias name to anything but a
+/// typing import (a parameter, an assignment, another import) keeps the
+/// name as its own — lexical shadowing.
 pub(crate) fn normalize_typing_aliases(body: &mut Vec<Statement>) {
-    let mut aliases: Vec<String> = Vec::new();
-    for stmt in body.iter() {
-        if let StatementType::Import(imp) = &stmt.statement {
+    let mut declared: Vec<String> = Vec::new();
+    crate::ast::tree::visit::walk_stmts(body, crate::ast::tree::visit::Descend::All, &mut |s| {
+        if let StatementType::Import(imp) = &s.statement {
             for alias in &imp.names {
-                let module = alias.name.split('.').next().unwrap_or(&alias.name);
-                if matches!(
-                    crate::AnnotationModule::from_name(module),
-                    Some(crate::AnnotationModule::Typing)
-                        | Some(crate::AnnotationModule::TypingExtensions)
-                ) && let Some(asname) = &alias.asname
-                    && asname != "typing"
-                {
-                    aliases.push(asname.clone());
+                if let Some(asname) = typing_alias_of(alias) {
+                    declared.push(asname);
                 }
             }
         }
-    }
-    if aliases.is_empty() {
+        crate::ast::tree::visit::Flow::Continue
+    });
+    if declared.is_empty() {
         return;
     }
-    rewrite_typing_aliases_in(body, &aliases);
+    declared.sort();
+    declared.dedup();
+    rewrite_typing_aliases_in_scope(body, &declared, &[]);
+}
+
+/// The alias an import statement's entry declares for a typing module
+/// (`import typing as t` → `t`), if any; `import typing as typing` is no
+/// alias.
+fn typing_alias_of(alias: &crate::Alias) -> Option<String> {
+    let module = alias.name.split('.').next().unwrap_or(&alias.name);
+    let typing_module = matches!(
+        crate::AnnotationModule::from_name(module),
+        Some(crate::AnnotationModule::Typing) | Some(crate::AnnotationModule::TypingExtensions)
+    );
+    match &alias.asname {
+        Some(asname) if typing_module && asname != "typing" => Some(asname.clone()),
+        _ => None,
+    }
+}
+
+/// Whether a statement is an import that (re)declares `alias` as a
+/// typing alias — the one binding of the name that keeps it an alias.
+fn declares_typing_alias(s: &Statement, alias: &str) -> bool {
+    matches!(&s.statement, StatementType::Import(imp)
+        if imp.names.iter().any(|a| typing_alias_of(a).as_deref() == Some(alias)))
+}
+
+/// Whether the statements of one SCOPE (nested scopes excluded — a def
+/// or class binds only its name here) bind `alias` to something other
+/// than a typing import.
+fn scope_rebinds(body: &[Statement], alias: &str) -> bool {
+    let mut rebinds = false;
+    crate::ast::tree::visit::walk_stmts(body, crate::ast::tree::visit::Descend::All, &mut |s| {
+        let binds = crate::ast::tree::visit::stmt_bound_names(s, crate::ast::tree::visit::Bindings::Scope)
+            .iter()
+            .any(|n| n == alias);
+        if crate::ast::tree::visit::opens_scope(s) {
+            if binds {
+                rebinds = true;
+                return crate::ast::tree::visit::Flow::Stop;
+            }
+            return crate::ast::tree::visit::Flow::Skip;
+        }
+        if binds && !declares_typing_alias(s, alias) {
+            rebinds = true;
+            return crate::ast::tree::visit::Flow::Stop;
+        }
+        crate::ast::tree::visit::Flow::Continue
+    });
+    rebinds
+}
+
+/// Rewrite one scope: the aliases active in it are the declared ones the
+/// scope does not rebind (and none of `shadowed_by` — a def's own
+/// parameters), then its statements, nested scopes recomputing.
+fn rewrite_typing_aliases_in_scope(body: &mut Vec<Statement>, declared: &[String], shadowed_by: &[String]) {
+    let active: Vec<String> = declared
+        .iter()
+        .filter(|alias| !shadowed_by.contains(alias) && !scope_rebinds(body, alias))
+        .cloned()
+        .collect();
+    rewrite_typing_aliases_in(body, &active, declared);
 }
 
 fn rewrite_typing_alias_roots(ann: &mut ExprType, aliases: &[String]) {
+    if aliases.is_empty() {
+        return;
+    }
     crate::ast::tree::visit::walk_expr_mut(ann, &mut |e| {
         if let ExprType::Attribute(a) = e
             && let ExprType::Name(n) = a.value.as_mut()
@@ -127,10 +190,15 @@ fn rewrite_typing_alias_roots(ann: &mut ExprType, aliases: &[String]) {
     });
 }
 
-fn rewrite_typing_aliases_in(body: &mut Vec<Statement>, aliases: &[String]) {
+/// The statements of one scope, `active` being the aliases live in it;
+/// a nested def's header (parameter and return annotations) is read in
+/// THIS scope, its body is a new scope shadowed by its parameters; a
+/// class body is a new scope; blocks stay in this scope.
+fn rewrite_typing_aliases_in(body: &mut Vec<Statement>, active: &[String], declared: &[String]) {
     for stmt in body.iter_mut() {
         match &mut stmt.statement {
             StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
+                let mut params: Vec<String> = Vec::new();
                 for p in f
                     .args
                     .posonlyargs
@@ -140,44 +208,50 @@ fn rewrite_typing_aliases_in(body: &mut Vec<Statement>, aliases: &[String]) {
                     .chain(f.args.vararg.iter_mut())
                     .chain(f.args.kwarg.iter_mut())
                 {
+                    params.push(p.arg.clone());
                     if let Some(ann) = p.annotation.as_mut() {
-                        rewrite_typing_alias_roots(ann, aliases);
+                        rewrite_typing_alias_roots(ann, active);
                     }
                 }
                 if let Some(ret) = f.returns.as_mut() {
-                    rewrite_typing_alias_roots(ret, aliases);
+                    rewrite_typing_alias_roots(ret, active);
                 }
-                rewrite_typing_aliases_in(&mut f.body, aliases);
+                rewrite_typing_aliases_in_scope(&mut f.body, declared, &params);
             }
-            StatementType::ClassDef(c) => rewrite_typing_aliases_in(&mut c.body, aliases),
-            StatementType::If(i) => {
-                rewrite_typing_aliases_in(&mut i.body, aliases);
-                rewrite_typing_aliases_in(&mut i.orelse, aliases);
-            }
-            StatementType::For(f) => {
-                rewrite_typing_aliases_in(&mut f.body, aliases);
-                rewrite_typing_aliases_in(&mut f.orelse, aliases);
-            }
-            StatementType::AsyncFor(f) => {
-                rewrite_typing_aliases_in(&mut f.body, aliases);
-                rewrite_typing_aliases_in(&mut f.orelse, aliases);
-            }
-            StatementType::While(w) => {
-                rewrite_typing_aliases_in(&mut w.body, aliases);
-                rewrite_typing_aliases_in(&mut w.orelse, aliases);
-            }
-            StatementType::With(w) => rewrite_typing_aliases_in(&mut w.body, aliases),
-            StatementType::AsyncWith(w) => rewrite_typing_aliases_in(&mut w.body, aliases),
-            StatementType::Try(t) => {
-                rewrite_typing_aliases_in(&mut t.body, aliases);
-                for h in t.handlers.iter_mut() {
-                    rewrite_typing_aliases_in(&mut h.body, aliases);
+            StatementType::ClassDef(c) => rewrite_typing_aliases_in_scope(&mut c.body, declared, &[]),
+            StatementType::Assign(a) => {
+                if let Some(ann) = a.annotation.as_mut() {
+                    rewrite_typing_alias_roots(ann, active);
                 }
-                rewrite_typing_aliases_in(&mut t.orelse, aliases);
-                rewrite_typing_aliases_in(&mut t.finalbody, aliases);
             }
             StatementType::AnnotatedName { annotation, .. } => {
-                rewrite_typing_alias_roots(annotation, aliases);
+                rewrite_typing_alias_roots(annotation, active);
+            }
+            StatementType::If(i) => {
+                rewrite_typing_aliases_in(&mut i.body, active, declared);
+                rewrite_typing_aliases_in(&mut i.orelse, active, declared);
+            }
+            StatementType::For(f) => {
+                rewrite_typing_aliases_in(&mut f.body, active, declared);
+                rewrite_typing_aliases_in(&mut f.orelse, active, declared);
+            }
+            StatementType::AsyncFor(f) => {
+                rewrite_typing_aliases_in(&mut f.body, active, declared);
+                rewrite_typing_aliases_in(&mut f.orelse, active, declared);
+            }
+            StatementType::While(w) => {
+                rewrite_typing_aliases_in(&mut w.body, active, declared);
+                rewrite_typing_aliases_in(&mut w.orelse, active, declared);
+            }
+            StatementType::With(w) => rewrite_typing_aliases_in(&mut w.body, active, declared),
+            StatementType::AsyncWith(w) => rewrite_typing_aliases_in(&mut w.body, active, declared),
+            StatementType::Try(t) => {
+                rewrite_typing_aliases_in(&mut t.body, active, declared);
+                for h in t.handlers.iter_mut() {
+                    rewrite_typing_aliases_in(&mut h.body, active, declared);
+                }
+                rewrite_typing_aliases_in(&mut t.orelse, active, declared);
+                rewrite_typing_aliases_in(&mut t.finalbody, active, declared);
             }
             _ => {}
         }

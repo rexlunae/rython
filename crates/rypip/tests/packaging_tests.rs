@@ -692,6 +692,34 @@ fn cached_local_versions_keep_their_label_and_match_their_public_version() {
 }
 
 #[test]
+fn a_corrupt_cached_candidate_does_not_block_a_valid_one() {
+    // A cached artifact whose bytes no longer hash to its sidecar is
+    // skipped when another candidate satisfies the requirement, and
+    // is the loud error when it is the only one (Devin review on #342,
+    // round 10).
+    let scratch = Scratch::new("cache-corrupt-fallback");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("idna");
+    write_wheel(&dist_dir, "idna", "1.0", &[("idna/__init__.py", "")]);
+    let newer = write_wheel(&dist_dir, "idna", "2.0", &[("idna/__init__.py", "")]);
+    fs::write(&newer, b"altered after its digest was recorded").unwrap();
+    let dep = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("idna>=1.0").unwrap(),
+        true,
+    )
+    .expect("the valid older candidate resolves");
+    assert_eq!(dep.version, "1.0");
+    let err = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("idna==2.0").unwrap(),
+        true,
+    )
+    .expect_err("the corrupt candidate alone is loud");
+    assert!(err.to_string().contains("sha256 mismatch"), "{err:?}");
+}
+
+#[test]
 fn cached_epoch_versions_keep_their_epoch() {
     // An epoch-qualified artifact (`1!2.0`) resolves offline under the
     // same version spelling the online path records (Devin review on

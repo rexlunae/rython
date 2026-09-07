@@ -870,10 +870,15 @@ enum Cached {
 /// unpinned requirement resolves the same version from the cache in any
 /// directory order); an artifact is extracted now. An extraction without
 /// its completion marker and an artifact without its recorded digest are
-/// not candidates; an artifact whose digest no longer matches is a loud
-/// error.
+/// not candidates; an artifact whose digest no longer matches is skipped
+/// — a loud error only when no valid candidate remains.
 fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDependency>> {
     let mut candidates: Vec<(Version, Cached)> = Vec::new();
+    // A candidate whose artifact no longer hashes to its sidecar is
+    // CORRUPT: it is skipped so a valid alternative still resolves, and
+    // its error surfaces only when nothing valid remains (Devin review
+    // on #342, round 10) — loud where it blocks, silent where it does not.
+    let mut corrupt: Vec<anyhow::Error> = Vec::new();
     if let Ok(entries) = fs::read_dir(dist_dir.join("extracted")) {
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
@@ -896,8 +901,16 @@ fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDep
             // replaced artifact is not a candidate (the artifact, if
             // verified, extracts anew below).
             let artifact = dist_dir.join(&artifact_name);
-            if !artifact.is_file() || !cached_artifact_verified(&artifact)? {
+            if !artifact.is_file() {
                 continue;
+            }
+            match cached_artifact_verified(&artifact) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    corrupt.push(e);
+                    continue;
+                }
             }
             if extracted_artifact_digest(&path) != Some(recorded_digest(&artifact)?) {
                 continue;
@@ -922,8 +935,13 @@ fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDep
             if !version_satisfies(&version, &req.specifiers) {
                 continue;
             }
-            if !cached_artifact_verified(&path)? {
-                continue;
+            match cached_artifact_verified(&path) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    corrupt.push(e);
+                    continue;
+                }
             }
             candidates.push((version, Cached::Artifact(path)));
         }
@@ -946,6 +964,9 @@ fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDep
         })
     });
     let Some((version, cached)) = candidates.pop() else {
+        if let Some(e) = corrupt.into_iter().next() {
+            return Err(e);
+        }
         return Ok(None);
     };
     let root = match cached {
