@@ -15,6 +15,11 @@ into a standalone Rust crate you own from then on: each module becomes a
 Rust module, the `__main__` block becomes `fn main`, and the generated code
 depends only on the `stdpython` runtime. The output is a starting point for
 a permanent port — readable Rust you can refactor, not an opaque bundle.
+`rypip run program.py -- args` is the same pipeline behind CPython's
+command-line shape: it converts into a scratch crate (reused across runs),
+builds it quietly, and executes the binary with your arguments, streams
+and working directory, exiting with the program's status — no new
+semantics, just `python program.py` without the interpreter.
 
 **2. Using Python inside Rust projects.**
 The `python-mod` proc-macros (`python_module!`, `python_module_nostd!`)
