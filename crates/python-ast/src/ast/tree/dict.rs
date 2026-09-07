@@ -102,28 +102,29 @@ impl CodeGen for Dict {
             k_expected = crate::TypeInfo::PyValue;
         }
         // Whether the distinct value types share a CONCRETE unifiable
-        // family (all-stringy → String, all-numeric → Float, all-Option →
-        // the unified Option). Anything else mixed has no single concrete
-        // Rust type: it must box (or refuse). The old gate keyed off
-        // `v_expected == PyObject`, but `unify` never returns PyObject for
-        // a mixed set (it absorbs the last non-PyObject), so the gate only
-        // ever fired by accident of order — a `{Option<String>, String,
-        // Option<f64>}` dict (charset_normalizer's legacy.detect return)
-        // sailed past it and rendered a raw `PyDict::from` whose V type
-        // rustc inferred from the first pair (E0308, round 100).
+        // family: EVERY pair must unify to a type with no unknown
+        // (PyObject) anywhere inside — all-stringy → String, all-numeric →
+        // Float, sibling classes of one hierarchy → their common root,
+        // Option<T> pairs whose inners join. Anything else mixed has no
+        // single concrete Rust type: it must box (or refuse). The old gate
+        // keyed off `v_expected == PyObject`, but `unify` never returns
+        // PyObject for a mixed set (it absorbs the last non-PyObject), so
+        // the gate only ever fired by accident of order — a {Option<String>,
+        // String, Option<f64>} dict (charset_normalizer's legacy.detect
+        // return) sailed past it and rendered a raw `PyDict::from` whose V
+        // type rustc inferred from the first pair (E0308, round 100). The
+        // ALL-PAIRS form is order-independent (a fold is not: unify absorbs
+        // whichever non-PyObject came last).
+        let pairwise_concrete = |a: &crate::TypeInfo, b: &crate::TypeInfo| {
+            let joined = crate::unify(a.clone(), b.clone());
+            !crate::type_mentions_pyobject(&joined)
+        };
         let v_unifiable = v_distinct.len() == 1
-            || v_distinct.iter().all(|t| {
-                matches!(
-                    t,
-                    crate::TypeInfo::String
-                        | crate::TypeInfo::StrRef
-                        | crate::TypeInfo::StrOrBytes
-                )
-            })
-            || v_distinct.iter().all(|t| {
-                matches!(t, crate::TypeInfo::Int | crate::TypeInfo::Float)
-            })
-            || v_distinct.iter().all(|t| matches!(t, crate::TypeInfo::Option(_)));
+            || (0..v_distinct.len()).all(|i| {
+                (i + 1..v_distinct.len()).all(|j| {
+                    pairwise_concrete(&v_distinct[i], &v_distinct[j])
+                })
+            });
         if forced_kv.is_none() && v_distinct.len() > 1 && !v_unifiable
         {
             // All values are TUPLES of strings of different lengths

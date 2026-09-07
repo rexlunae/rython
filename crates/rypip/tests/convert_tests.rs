@@ -5961,6 +5961,59 @@ fn factory_chain_ternary_narrowing_keeps_option_transcript() {
 
 
 #[test]
+fn mixed_option_dict_literal_boxes_and_prints_like_python() {
+    // Round 100: a dict literal whose values mix Option and concrete
+    // types (`{"encoding": Option<String>, "language": String,
+    // "confidence": Option<f64>}`) has no single concrete Rust type, so
+    // the values box into the heterogeneous PyValue and the None-else
+    // Options go through the Some/None match. Transcript pinned against
+    // python3.
+    let scratch = Scratch::new("mixdict");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> None:\n",
+            "    enc: str | None = \"utf_8\"\n",
+            "    language: str = \"English\"\n",
+            "    conf: float | None = 0.75\n",
+            "    d = {\"encoding\": enc, \"language\": language, \"confidence\": conf}\n",
+            "    print(d)\n",
+            "\n",
+            "\n",
+            "def show(none_enc: str | None) -> None:\n",
+            "    print({\"encoding\": none_enc, \"confidence\": 0.5})\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+            "    show(None)\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "{'encoding': 'utf_8', 'language': 'English', 'confidence': 0.75}",
+            "{'encoding': None, 'confidence': 0.5}",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {
     // Round 41: a trait-DEFAULT body that formats `self` in an exception
     // message (`raise PoolError(self)` — urllib3's _get_conn raises

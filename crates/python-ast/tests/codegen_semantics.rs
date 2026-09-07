@@ -2517,6 +2517,66 @@ fn mixed_option_dict_values_box_into_pyvalue() {
 }
 
 #[test]
+fn sibling_class_dict_values_keep_the_hierarchy_root() {
+    // Two values of sibling classes in ONE dict literal (`{"a": Cat(...),
+    // "b": Dog(...)}` where both derive Animal): the pair unifies to the
+    // common ROOT (Devin review on the round-100 dict gate — the old gate
+    // never fired for them, so boxing or refusal would be a regression;
+    // the gate's pairwise check recognizes the shared root and each value
+    // converts into the sum type).
+    let out = compile(
+        concat!(
+            "class Animal:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "class Cat(Animal):\n",
+            "    pass\n",
+            "\n",
+            "class Dog(Animal):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> object:\n",
+            "    return {\"a\": Cat(\"c\"), \"b\": Dog(\"d\")}\n",
+        ),
+        "siblingdict.py",
+    );
+    assert!(
+        out.contains("Cat :: new") && out.contains("Dog :: new"),
+        "both sibling constructions must survive: {}",
+        out
+    );
+    assert!(
+        !out.contains("mixes incompatible"),
+        "sibling classes of one hierarchy must not be refused: {}",
+        out
+    );
+}
+
+#[test]
+fn string_union_and_option_inner_mixes_box() {
+    // A `str | bytes` union member next to a String, and Option values
+    // with different inner types (`Option<String>` + `Option<i64>`): no
+    // pair joins to a concrete type, so the values box into PyValue —
+    // never a raw PyDict::from with an unresolved V (Devin review on the
+    // round-100 dict gate).
+    let out = compile(
+        concat!(
+            "def f(sb: str | bytes, s: str, oa: str | None, ob: int | None) -> dict[str, object]:\n",
+            "    return {\"u\": sb, \"s\": s, \"a\": oa, \"b\": ob}\n",
+        ),
+        "mixedbox.py",
+    );
+    let pairs = out.matches("PyValue :: from").count();
+    assert!(pairs >= 2, "union/plain members must box: {}", out);
+    assert!(
+        out.contains("None => stdpython :: PyValue :: None_"),
+        "None-literal Options must box through the Some/None match: {}",
+        out
+    );
+}
+
+#[test]
 fn python_list_methods_map_to_correct_rust() {
     let src = concat!(
         "def f() -> int:\n",
