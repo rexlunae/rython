@@ -5853,6 +5853,112 @@ fn boxed_union_param_accepts_none_like_python() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+#[test]
+fn factory_chain_ternary_narrowing_keeps_option_transcript() {
+    // Round 99 (charset_normalizer's legacy.detect shape): a local bound
+    // to a factory-call chain (`r = from_bytes(byte_str).best()` whose
+    // `best() -> Match | None` resolves through the returned class), then
+    // field reads through `is not None` ternaries and and-chains, an
+    // aug-assign inside a guard, and Option values round-tripped through
+    // the string labels — the true branches unwrap, the None-literal else
+    // keeps the value Option, and the guard-narrowed aug-assign stores
+    // Some-wrapped. Transcript pinned against python3.
+    let scratch = Scratch::new("detect-shape");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "\"\"\"charset_normalizer's legacy.detect shape (round 99): a MODULE-level\n",
+            "function whose local is bound to a factory-call chain \u{2014} `r =\n",
+            "from_bytes(byte_str).best()` where `best() -> Match | None` \u{2014} then field\n",
+            "reads through `is not None` ternaries and and-chains. The Option binding\n",
+            "must seed the local (`optional_names`), the ternary TRUE branch must\n",
+            "narrow (reads unwrap), and the ternary's Option-ness must survive the\n",
+            "narrowing (`r.encoding if r is not None else None` is Option<String>,\n",
+            "not a String-vs-None if/else).\n",
+            "\"\"\"\n",
+            "\n",
+            "\n",
+            "class Match:\n",
+            "    def __init__(self, enc: str):\n",
+            "        self._e = enc\n",
+            "        self._l = \"English\"\n",
+            "        self._c = 0.05\n",
+            "\n",
+            "    @property\n",
+            "    def encoding(self) -> str:\n",
+            "        return self._e\n",
+            "\n",
+            "    @property\n",
+            "    def language(self) -> str:\n",
+            "        return self._l\n",
+            "\n",
+            "    @property\n",
+            "    def chaos(self) -> float:\n",
+            "        return self._c\n",
+            "\n",
+            "\n",
+            "class Matches:\n",
+            "    def __init__(self, ms: list[Match]):\n",
+            "        self._ms: list[Match] = ms\n",
+            "\n",
+            "    def best(self) -> Match | None:\n",
+            "        if len(self._ms):\n",
+            "            return self._ms[0]\n",
+            "        return None\n",
+            "\n",
+            "\n",
+            "def from_bytes(data: bytes) -> Matches:\n",
+            "    return Matches([Match(\"utf_8\")])\n",
+            "\n",
+            "\n",
+            "def detect(byte_str: bytes) -> str:\n",
+            "    r = from_bytes(byte_str).best()\n",
+            "    encoding = r.encoding if r is not None else None\n",
+            "    language = r.language if r is not None and r.language != \"Unknown\" else \"\"\n",
+            "    confidence = 1.0 - r.chaos if r is not None else None\n",
+            "    if confidence is not None and confidence >= 0.9:\n",
+            "        confidence -= 0.2\n",
+            "    # The mutations stay observable through STRING rendering: the\n",
+            "    # `encoding`/`confidence` locals are Option bindings, so the ternary\n",
+            "    # forms render Some-wrapped values; the string concatenation forces\n",
+            "    # the String branch types.\n",
+            "    label = (encoding if encoding is not None else \"none\") + \"/\" + language\n",
+            "    if confidence is not None:\n",
+            "        label += \"/\" + str(confidence)\n",
+            "    print(label)\n",
+            "    return label\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    result = detect(b\"sample bytes\")\n",
+            "    print(\"done:\", result)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n"
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["utf_8/English/0.75", "done: utf_8/English/0.75"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
 
 #[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {

@@ -230,6 +230,32 @@ impl CodeGen for AugAssign {
                 #recv.#setter(#combined)?;
             }});
         }
+        // A NAME target narrowed by a guard (`if confidence is not None
+        // and ...: confidence -= 0.2` — charset_normalizer's
+        // legacy.detect, round 99): the Option binding is hoisted and the
+        // guard proved non-None, so the aug reads the UNWRAPPED inner
+        // (narrowed_names) and stores it back SOME-wrapped into the bare
+        // local — the generic arms below assign through the narrowed
+        // tokens (`(x).clone().unwrap() -= v` is E0067) and key their
+        // Option handling off name_types, which the narrowed inner
+        // shadows. Non-optional narrowed names (an isinstance-narrowed
+        // union) keep the pre-existing path.
+        if let ExprType::Name(n) = &self.target
+            && options.narrowed_names.contains_key(&n.id)
+            && options.optional_names.contains(&n.id)
+        {
+            let ident = crate::safe_ident(&n.id);
+            // The narrowed READ of the name (the unwrap) is the operand's
+            // base: the guard guarantees the Some.
+            let load = self
+                .target
+                .clone()
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let value = self.value.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let combined = combine_op(&self.op, &load, &value)?;
+            return Ok(quote!(#ident = Some(#combined);));
+        }
+
         // The `self.<field>` target's Rust type, captured before the moves
         // below: an Option or boxed field changes the aug-op (the inner
         // arithmetic).
@@ -281,6 +307,12 @@ impl CodeGen for AugAssign {
             crate::infer_type(Some(&ctx), &self.value, &options, &symbols),
             crate::TypeInfo::Option(_)
         );
+        // A NARROWED RHS read is already the INNER value (a guard-body
+        // operand: `x -= amt` inside `if ... and amt is not None:` — round
+        // 99): the Option arms' unwrap match below would wrap the unwrapped
+        // read again.
+        let value_narrowed = matches!(&self.value, crate::ExprType::Name(n)
+            if options.narrowed_names.contains_key(&n.id));
 
         // A shared store binds the target's CURRENT value first — Python
         // evaluates the target once, then the operand, then stores — so
@@ -336,8 +368,9 @@ impl CodeGen for AugAssign {
                         "unsupported operand type(s) for +=: 'NoneType' and '{}'",
                         type_name
                     );
-                    // The RHS may itself be Option-typed: unwrap both.
-                    let value = if value_is_option {
+                    // The RHS may itself be Option-typed: unwrap both. A
+                    // NARROWED RHS is already the inner value (round 99).
+                    let value = if value_is_option && !value_narrowed {
                         quote! {
                             match (#value).clone() {
                                 Some(__rython_w) => __rython_w,
@@ -376,7 +409,7 @@ impl CodeGen for AugAssign {
                         // The RHS may itself be Option-typed
                         // (`self.chunk_left -= amt` where amt is
                         // `int | None` — urllib3's _fp_read): unwrap both.
-                        let value = if value_is_option {
+                        let value = if value_is_option && !value_narrowed {
                             quote! {
                                 match (#value).clone() {
                                     Some(__rython_w) => __rython_w,

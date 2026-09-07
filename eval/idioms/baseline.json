@@ -6,6 +6,9 @@
     "clauses": {
       "status": "pass"
     },
+    "detect": {
+      "status": "pass"
+    },
     "handoff": {
       "status": "pass"
     },

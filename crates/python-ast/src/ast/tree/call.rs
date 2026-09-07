@@ -9823,7 +9823,9 @@ fn render_lambda_over(
 }
 
 /// Resolve a class NAME to its ClassDef (and the defining module's symbol
-/// table): same-module, or an imported class through its defining module.
+/// table): same-module, an imported class through its defining module, or
+/// — when the scope does not bind the name at all — any crate module that
+/// defines it.
 pub(crate) fn receiver_class_tail(
     class_name: &str,
     class_symbols: SymbolTableScopes,
@@ -9843,7 +9845,31 @@ pub(crate) fn receiver_class_tail(
                 None
             }
         }
-        _ => None,
+        _ => {
+            // A class NAME the caller's scope does not bind AT ALL: the
+            // type side reached it through another module's scope
+            // (`r = from_bytes(...).best()` — charset_normalizer's
+            // legacy.detect, whose `best() -> CharsetMatch | None` names a
+            // class legacy.py never imports, round 99). A local binding
+            // that is NOT the class (a shadowing function/alias) stays
+            // unresolved; a class the crate defines in exactly ONE module
+            // resolves by name, mirroring the type renderer. Ambiguous
+            // names (two modules define them) stay unresolved, as the
+            // shared-class registry treats them.
+            if class_symbols.get(class_name).is_some() {
+                return None;
+            }
+            let mut found: Option<(crate::ClassDef, SymbolTableScopes)> = None;
+            for path in options.module_defs.keys() {
+                if let Some((c, s)) = crate::module_class_def(options, path, class_name) {
+                    if found.is_some() {
+                        return None; // ambiguous — resolved by no one
+                    }
+                    found = Some((c, s));
+                }
+            }
+            found
+        }
     }
 }
 
