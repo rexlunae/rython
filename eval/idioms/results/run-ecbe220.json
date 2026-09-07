@@ -1,6 +1,6 @@
 {
-  "converter_commit": "8299f5c",
-  "repo_head": "8299f5c",
+  "converter_commit": "ecbe220",
+  "repo_head": "ecbe220",
   "rypip_path": "target/debug/rypip",
   "oracle": "CPython 3.11.15",
   "passed": 13,
