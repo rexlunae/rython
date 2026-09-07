@@ -77,7 +77,34 @@ fn rypip_run_executes_the_program_with_its_arguments_and_exit_status() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.status.code(), Some(3));
-    assert!(scratch.path().join("elsewhere").join("release").exists());
+    assert!(
+        scratch.path().join("elsewhere").join(rypip::host_triple().unwrap()).join("release").exists(),
+        "the build is for the host, under CARGO_TARGET_DIR"
+    );
+
+    // The build is FOR THE HOST: a `CARGO_BUILD_TARGET` selecting a cross
+    // target (not installed here — cargo fails with "can't find crate for
+    // core" when it is honored) does not stop `rypip run`, which runs
+    // programs on this machine as `python` does.
+    let output = Command::new(env!("CARGO_BIN_EXE_rypip"))
+        .arg("run")
+        .arg("hello.py")
+        .arg("--no-deps")
+        .arg("--out")
+        .arg(&out)
+        .current_dir(scratch.path())
+        .env_remove("RUSTFLAGS")
+        .env("CARGO_BUILD_TARGET", "aarch64-unknown-linux-gnu")
+        .output()
+        .expect("running rypip");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "args ['hello.py']\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(3));
 
     // A non-UTF-8 argument is loud: CPython keeps it as surrogate escapes
     // (`['-c', '\\udcff']`), which the runtime's str does not model, so the
@@ -419,6 +446,24 @@ fn rypip_run_refuses_an_output_that_is_not_its_own() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("not a crate rypip generated"), "stderr: {}", stderr);
     assert_eq!(fs::read_to_string(stray.join("src").join("notes.txt")).unwrap(), "mine");
+    // `..` through a component that does not exist yet resolves to the
+    // project itself: refused the same way, sources intact (round 5).
+    let output = run("proj", &proj.join("nonexistent").join(".."), scratch.path());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("holds the program's sources"), "stderr: {}", stderr);
+    assert!(pkg.join("__main__.py").is_file());
+    assert!(!proj.join("nonexistent").exists());
+    // A forged marker admits the directory, but a run deletes only the
+    // files it wrote last time — a file rypip did not write survives.
+    let forged = scratch.path().join("forged");
+    fs::create_dir_all(forged.join("src")).unwrap();
+    fs::write(forged.join("Cargo.toml"), format!("{}\n[package]\nname = \"x\"\n", rypip::convert::GENERATED_MANIFEST_HEADER)).unwrap();
+    fs::write(forged.join("src").join("precious.rs"), "// mine\n").unwrap();
+    let output = run("proj", &forged, scratch.path());
+    // Verified against python3.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "proj\n", "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fs::read_to_string(forged.join("src").join("precious.rs")).unwrap(), "// mine\n");
     // A separate directory: the src-layout project runs.
     let output = run("proj", &scratch.path().join("crate"), scratch.path());
     // Verified against python3.

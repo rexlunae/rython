@@ -89,29 +89,71 @@ impl Drop for WorkDirLock {
 /// spellings of one directory (a symlinked parent, `./x`, `a/../x`) name
 /// the same thing (Devin review on #340, round 4).
 fn physical_path(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()?.join(path)
     };
-    let mut existing = absolute.clone();
-    let mut pending: Vec<OsString> = Vec::new();
-    while !existing.exists() {
-        let Some(name) = existing.file_name().map(|n| n.to_os_string()) else {
-            break;
-        };
-        pending.push(name);
-        if !existing.pop() {
+    // The longest prefix that exists, component by component (a `..` after
+    // a component that does not exist cannot make a longer prefix exist:
+    // the file system resolves the missing component first).
+    let components: Vec<Component> = absolute.components().collect();
+    let mut existing = PathBuf::new();
+    let mut existing_len = 0;
+    let mut probe = PathBuf::new();
+    for (i, component) in components.iter().enumerate() {
+        probe.push(component);
+        if probe.exists() {
+            existing = probe.clone();
+            existing_len = i + 1;
+        } else {
             break;
         }
+    }
+    if existing_len == 0 {
+        bail!("resolving {}: no existing ancestor", path.display());
     }
     let mut physical = existing
         .canonicalize()
         .with_context(|| format!("resolving {}", existing.display()))?;
-    for name in pending.iter().rev() {
-        physical.push(name);
+    // The components still to be created are normalized lexically, which
+    // is exact on a canonical prefix (no symlink can turn `..` elsewhere):
+    // `proj/nonexistent/..` IS `proj`, so a guard comparing physical paths
+    // sees the destination the file system will use (Devin review on
+    // #340, round 5).
+    for component in &components[existing_len..] {
+        match component {
+            Component::Normal(name) => physical.push(name),
+            Component::ParentDir => {
+                physical.pop();
+            }
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => {}
+        }
     }
     Ok(physical)
+}
+
+/// The host target triple, from `rustc -vV`: `rypip run` builds for the
+/// host explicitly, so a `build.target` / `CARGO_BUILD_TARGET` selecting
+/// a cross target never produces an artifact this machine cannot run —
+/// `python program.py` runs here, and so does this (Devin review on
+/// #340, round 5).
+pub fn host_triple() -> Result<&'static str> {
+    static HOST: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    let host = HOST.get_or_init(|| {
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+        let output = Command::new(rustc).arg("-vV").output().map_err(|e| e.to_string())?;
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("host: ").map(|h| h.trim().to_string()))
+            .ok_or_else(|| "rustc -vV reported no host".to_string())
+    });
+    match host {
+        Ok(h) => Ok(h.as_str()),
+        Err(e) => bail!("determining the host target: {}", e),
+    }
 }
 
 /// The lock file guarding a work dir: the dir's PHYSICAL path with
@@ -142,16 +184,20 @@ pub fn lock_work_dir(dir: &Path) -> Result<WorkDirLock> {
 }
 
 /// Build the converted crate quietly (`--release --quiet`, the program's
-/// own output is what the user came for) and return the executable cargo
+/// own output is what the user came for) FOR THE HOST (`--target` the
+/// triple `rustc -vV` reports, so a configured cross target never yields
+/// an artifact this machine cannot run) and return the executable cargo
 /// reports for its binary target — wherever cargo put it: a
-/// `CARGO_TARGET_DIR`, a configured target, a platform suffix (Devin
-/// review on #340). The compiler's diagnostics still reach stderr
+/// `CARGO_TARGET_DIR`, the target's own subdirectory, a platform suffix
+/// (Devin review on #340). The compiler's diagnostics still reach stderr
 /// (`json-render-diagnostics`); the artifact messages are read from
 /// stdout.
 pub fn cargo_build_executable(krate: &ConvertedCrate) -> Result<PathBuf> {
     require_binary(krate, "run")?;
     let output = Command::new("cargo")
         .args(["build", "--release", "--quiet", "--message-format=json-render-diagnostics"])
+        .arg("--target")
+        .arg(host_triple()?)
         .current_dir(&krate.root)
         .stderr(Stdio::inherit())
         .output()
@@ -253,21 +299,23 @@ pub fn stage_executable(work_dir: &Path, executable: &Path) -> Result<StagedExec
     Ok(StagedExecutable { path })
 }
 
-/// `run` regenerates its work dir's `src/` from scratch, so the work dir
-/// must be its own: never a directory holding the program's sources
-/// (`rypip run . --out .` in a src-layout project would erase them), never
-/// one whose `src/` holds a discovered module, and never a non-empty
-/// directory that is not a crate rypip generated (its manifest starts
-/// with [`convert::GENERATED_MANIFEST_HEADER`]). Refused loudly, naming a
-/// separate directory as the fix (Devin review on #340, round 4).
+/// `run` rewrites its work dir's `src/`, so the work dir must be its own:
+/// never a directory holding the program's sources (`rypip run . --out .`
+/// in a src-layout project would overwrite them), never one whose `src/`
+/// holds a discovered module, and never a non-empty directory that is not
+/// a crate rypip generated (its manifest starts with
+/// [`convert::GENERATED_MANIFEST_HEADER`]). Refused loudly, naming a
+/// separate directory as the fix (Devin review on #340, round 4). `out`
+/// is a physical path here (see [`physical_path`]), so `..` through a
+/// component that does not exist yet cannot slip past the comparison.
 fn refuse_foreign_output(pkg: &PyPackage, out: &Path) -> Result<()> {
     let physical = |p: &Path| physical_path(p).unwrap_or_else(|_| p.to_path_buf());
     let out_physical = physical(out);
     let root = physical(&pkg.root);
     if root.starts_with(&out_physical) {
         bail!(
-            "rypip run regenerates `{}`'s src/ from scratch, but that directory holds the \
-             program's sources ({}); give --out a separate directory",
+            "rypip run rewrites `{}`'s src/, but that directory holds the program's \
+             sources ({}); give --out a separate directory",
             out.display(),
             pkg.root.display()
         );
@@ -276,8 +324,8 @@ fn refuse_foreign_output(pkg: &PyPackage, out: &Path) -> Result<()> {
     for module in &pkg.modules {
         if physical(&module.file).starts_with(&out_src) {
             bail!(
-                "rypip run regenerates `{}`'s src/ from scratch, but it holds the program's \
-                 module {}; give --out a separate directory",
+                "rypip run rewrites `{}`'s src/, but it holds the program's module {}; \
+                 give --out a separate directory",
                 out.display(),
                 module.file.display()
             );
@@ -291,8 +339,8 @@ fn refuse_foreign_output(pkg: &PyPackage, out: &Path) -> Result<()> {
             .unwrap_or(false);
         if !generated {
             bail!(
-                "rypip run regenerates `{}` from scratch, but it is not empty and not a crate \
-                 rypip generated (no {} starting with `{}`); give --out a fresh directory",
+                "rypip run rewrites `{}`, but it is not empty and not a crate rypip generated \
+                 (no {} starting with `{}`); give --out a fresh directory",
                 out.display(),
                 manifest.display(),
                 convert::GENERATED_MANIFEST_HEADER
@@ -304,14 +352,15 @@ fn refuse_foreign_output(pkg: &PyPackage, out: &Path) -> Result<()> {
 
 /// `rypip run` in one call (issue #166: CPython's command-line shape over
 /// the convert/build pipeline, with no new semantics): take the work
-/// dir's lock, regenerate the crate's sources from scratch (`src/` is
-/// removed first, so a module the program no longer has leaves no stale
-/// file behind; cargo's `target/` stays for incremental rebuilds), hand
-/// the crate to `on_converted` (the CLI reports its warnings there),
-/// build, stage the executable for this invocation, release the lock,
+/// dir's lock, remove the files the previous run wrote under `src/` (so a
+/// module the program no longer has leaves no stale file behind, while
+/// nothing rypip did not write is ever deleted; cargo's `target/` stays
+/// for incremental rebuilds), convert, record the files written, hand the
+/// crate to `on_converted` (the CLI reports its warnings there), build for
+/// the host, stage the executable for this invocation, release the lock,
 /// then execute with `program` as `sys.argv[0]` and `args`. The one
 /// workflow the CLI and a library caller share (Devin review on #340,
-/// rounds 2 and 3).
+/// rounds 2 to 5).
 pub fn run(
     pkg: &PyPackage,
     out: &Path,
@@ -320,18 +369,78 @@ pub fn run(
     args: &[OsString],
     on_converted: impl FnOnce(&ConvertedCrate),
 ) -> Result<ExitStatus> {
-    let lock = lock_work_dir(out)?;
-    refuse_foreign_output(pkg, out)?;
-    let src = out.join("src");
-    if src.exists() {
-        std::fs::remove_dir_all(&src).with_context(|| format!("clearing {}", src.display()))?;
-    }
-    let krate = convert(pkg, out, options)?;
+    let out = physical_path(out)?;
+    let lock = lock_work_dir(&out)?;
+    refuse_foreign_output(pkg, &out)?;
+    remove_generated_files(&out)?;
+    let krate = convert(pkg, &out, options)?;
+    record_generated_files(&out)?;
     on_converted(&krate);
     let binary = cargo_build_executable(&krate)?;
-    let staged = stage_executable(out, &binary)?;
+    let staged = stage_executable(&out, &binary)?;
     drop(lock);
     run_program(staged.path(), program, args)
+}
+
+/// Where a run records the files it wrote under `src/`, relative to the
+/// work dir, one per line.
+fn generated_list_path(out: &Path) -> PathBuf {
+    out.join(".run").join("generated")
+}
+
+/// Remove exactly the files the previous run recorded as its own under
+/// `src/` — never a whole tree, never a file rypip did not write — so a
+/// module the program no longer has leaves nothing behind while a forged
+/// manifest marker cannot turn a run into `rm -rf src` (Devin review on
+/// #340, round 5). Each recorded path must be a plain relative path
+/// under `src/` (no `..`, no absolute component) naming a regular file;
+/// anything else is ignored.
+fn remove_generated_files(out: &Path) -> Result<()> {
+    let list = generated_list_path(out);
+    let Ok(text) = std::fs::read_to_string(&list) else {
+        return Ok(());
+    };
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        let relative = Path::new(line);
+        let plain = relative.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !plain || !relative.starts_with("src") {
+            continue;
+        }
+        let file = out.join(relative);
+        if std::fs::symlink_metadata(&file).map(|m| m.is_file()).unwrap_or(false) {
+            std::fs::remove_file(&file).with_context(|| format!("removing {}", file.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Record every file now under `src/` as this run's own (the guard above
+/// admitted only a directory that is `run`'s, so after a conversion the
+/// tree is rypip's).
+fn record_generated_files(out: &Path) -> Result<()> {
+    fn walk(dir: &Path, base: &Path, into: &mut Vec<String>) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                walk(&path, base, into)?;
+            } else if let Ok(relative) = path.strip_prefix(base) {
+                into.push(relative.to_string_lossy().into_owned());
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    let src = out.join("src");
+    if src.is_dir() {
+        walk(&src, out, &mut files)?;
+    }
+    files.sort();
+    let list = generated_list_path(out);
+    if let Some(parent) = list.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&list, files.join("\n") + "\n").with_context(|| format!("writing {}", list.display()))
 }
 
 /// Install a converted crate's binary the same way `cargo install` would

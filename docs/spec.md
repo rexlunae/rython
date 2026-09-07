@@ -1774,10 +1774,16 @@ exception escaping a lambda (§4.5).
 - `rypip run program.py -- args` is CPython's command-line shape over the
   convert/build pipeline with no new semantics (issue #166): a scratch
   crate under the temp dir keyed by the package name and a hash of the
-  canonical source path (its `src/` regenerated from scratch on every
-  run, cargo's `target/` kept), built quietly under an exclusive lock
-  held through the build and the staging of an invocation-private hard
-  link of the executable, then run with `sys.argv[0]` set to the program
+  canonical source path (the files rypip wrote into its `src/` last time
+  replaced on every run — nothing rypip did not write is ever deleted —
+  cargo's `target/` kept; a directory holding the program's sources, or
+  a non-empty one that is not a crate rypip generated, is refused before
+  anything is touched, with `..` through not-yet-existing components
+  normalized first), built quietly FOR THE HOST (a configured cross
+  target never yields an artifact this machine cannot run) under an
+  exclusive lock held through the build and the staging of an
+  invocation-private hard link of the executable, then run with
+  `sys.argv[0]` set to the program
   path as typed (as CPython keeps it), the caller's streams and working
   directory, and its exit status propagated (a signal death as `128 +
   signal`, the shell's encoding). Unix only for now: `sys.argv[0]` is set

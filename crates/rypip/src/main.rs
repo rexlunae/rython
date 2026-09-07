@@ -101,9 +101,11 @@ enum Cmd {
         /// the system temp dir keyed by the package name and the source
         /// path, reused across runs of that source so rebuilds are
         /// incremental). An explicit directory is one crate you own, as
-        /// with `convert --out`: its `src/` is regenerated from scratch on
-        /// every run, and two different programs given the same one take
-        /// turns in it and replace each other's sources.
+        /// with `convert --out`: the files rypip wrote into its `src/` last
+        /// time are replaced on every run (nothing rypip did not write is
+        /// deleted), and two different programs given the same one take
+        /// turns in it. A directory holding the program's sources, or one
+        /// that is not a crate rypip generated, is refused.
         #[arg(long, short)]
         out: Option<PathBuf>,
         #[arg(long)]
