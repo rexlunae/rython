@@ -460,6 +460,14 @@ fn rypip_run_refuses_an_output_that_is_not_its_own() {
     fs::create_dir_all(forged.join("src")).unwrap();
     fs::write(forged.join("Cargo.toml"), format!("{}\n[package]\nname = \"x\"\n", rypip::convert::GENERATED_MANIFEST_HEADER)).unwrap();
     fs::write(forged.join("src").join("precious.rs"), "// mine\n").unwrap();
+    // Dated a day into the future: ownership is the converter's own report
+    // of what it wrote, never a timestamp inference (round 7).
+    fs::File::options()
+        .write(true)
+        .open(forged.join("src").join("precious.rs"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(86_400))
+        .unwrap();
     // Twice: the first run must not claim the pre-existing file as its
     // own, or the second would delete it (round 6).
     for _ in 0..2 {

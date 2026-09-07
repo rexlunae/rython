@@ -373,10 +373,8 @@ pub fn run(
     let lock = lock_work_dir(&out)?;
     refuse_foreign_output(pkg, &out)?;
     remove_generated_files(&out)?;
-    let before = files_under(&out.join("src"))?;
-    let started = std::time::SystemTime::now();
     let krate = convert(pkg, &out, options)?;
-    record_generated_files(&out, &before, started)?;
+    record_generated_files(&out, &krate.written)?;
     on_converted(&krate);
     let binary = cargo_build_executable(&krate)?;
     let staged = stage_executable(&out, &binary)?;
@@ -416,52 +414,20 @@ fn remove_generated_files(out: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Every regular file under `dir`, recursively (empty when it does not
-/// exist).
-fn files_under(dir: &Path) -> Result<std::collections::HashSet<PathBuf>> {
-    fn walk(dir: &Path, into: &mut std::collections::HashSet<PathBuf>) -> Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if entry.file_type()?.is_dir() {
-                walk(&path, into)?;
-            } else {
-                into.insert(path);
-            }
-        }
-        Ok(())
-    }
-    let mut files = std::collections::HashSet::new();
-    if dir.is_dir() {
-        walk(dir, &mut files)?;
-    }
-    Ok(files)
-}
-
-/// Record the files THIS conversion wrote under `src/`: those that did
-/// not exist before it, plus those it rewrote (modified at or after
-/// `started`). A file that was there before and untouched — a user's
-/// file in an admitted crate — is never recorded, so the next run never
-/// deletes it (Devin review on #340, round 6). A coarse file-system
-/// timestamp can only under-record (a stale file left behind), never
-/// claim a file rypip did not write.
-fn record_generated_files(
-    out: &Path,
-    before: &std::collections::HashSet<PathBuf>,
-    started: std::time::SystemTime,
-) -> Result<()> {
-    let mut files: Vec<String> = files_under(&out.join("src"))?
-        .into_iter()
-        .filter(|path| {
-            !before.contains(path)
-                || std::fs::metadata(path)
-                    .and_then(|m| m.modified())
-                    .map(|modified| modified >= started)
-                    .unwrap_or(false)
-        })
+/// Record the files THIS conversion wrote under `src/` — the converter's
+/// own report ([`ConvertedCrate::written`]), never an inference from
+/// timestamps or directory contents (Devin review on #340, rounds 6 and
+/// 7) — so a pre-existing file it did not write, whatever its mtime, is
+/// never recorded and never deleted by the next run.
+fn record_generated_files(out: &Path, written: &[PathBuf]) -> Result<()> {
+    let src = out.join("src");
+    let mut files: Vec<String> = written
+        .iter()
+        .filter(|path| path.starts_with(&src))
         .filter_map(|path| path.strip_prefix(out).ok().map(|r| r.to_string_lossy().into_owned()))
         .collect();
     files.sort();
+    files.dedup();
     let list = generated_list_path(out);
     if let Some(parent) = list.parent() {
         std::fs::create_dir_all(parent)?;
