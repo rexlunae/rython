@@ -2541,7 +2541,14 @@ impl FunctionDef {
                 .chain(self.args.posonlyargs.iter())
                 .chain(self.args.kwonlyargs.iter())
             {
-                if let Some(ann) = p.annotation.as_deref() {
+                // A QUOTED annotation (`err: "Optional[MyError]"`) is
+                // the annotation it spells — evaluated here exactly as
+                // the signature evaluates it (arguments.rs
+                // unquote_annotation), so the body's name types and the
+                // parameter's declared type never disagree (Devin review
+                // on #342, round 4).
+                let unquoted = p.evaluated_annotation();
+                if let Some(ann) = unquoted.as_ref() {
                     // Scalar annotations map directly; container
                     // annotations (`list[float]`, `dict[str, int]`,
                     // `Optional[str]`) arrive as Subscript expressions.
@@ -5218,7 +5225,17 @@ pub(crate) fn lower_optional_value(
         };
         return Ok(read);
     }
-    let tokens = expr.clone().to_rust(ctx, options, symbols)?;
+    // The plain value read takes the reuse-clone (render_reused): a
+    // non-Copy NAME read again later (`maybe(e) + either(e)` — the
+    // caught exception into an `Optional[MyError]` slot) is cloned
+    // INSIDE the Some wrap; the wrap of a plain read would move it
+    // (Devin review on #342, round 4). A literal and the boxed slot
+    // below keep their own spellings.
+    let tokens = if matches!(expr, ExprType::Name(_)) && !boxed {
+        crate::render_reused(expr, ctx, options, symbols)?
+    } else {
+        expr.clone().to_rust(ctx, options, symbols)?
+    };
     // A string LITERAL lowers to `&'static str`; an Option<String> slot
     // owns it (`pick("x")` where the parameter is `str | None`) — the
     // same ownership the `-> str` return path applies (issue #137's

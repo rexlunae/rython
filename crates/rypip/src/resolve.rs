@@ -604,14 +604,12 @@ pub fn resolve_dependency_in(cache: &Path, req: &Requirement, offline: bool) -> 
                 actual
             ));
         }
-        fs::write(&artifact_path, bytes)
-            .with_context(|| format!("writing {}", artifact_path.display()))?;
+        publish_file(&artifact_path, &bytes)?;
     }
     // The verified digest, beside the artifact: the offline path reuses
     // the artifact only through it.
     let sidecar = digest_sidecar(&artifact_path);
-    fs::write(&sidecar, format!("{expected}\n"))
-        .with_context(|| format!("writing {}", sidecar.display()))?;
+    publish_file(&sidecar, format!("{expected}\n").as_bytes())?;
 
     // Extract (wheels are zips, sdists are gzipped tarballs).
     let package_dir = extract_distribution(&artifact_path, &dist_dir, &req.name)?;
@@ -868,7 +866,12 @@ fn cached_version_of(file_name: &str, dist_name: &str) -> Option<Version> {
 }
 
 fn version_str_of(v: &Version) -> String {
-    let mut s = v.release.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(".");
+    let mut s = String::new();
+    if v.epoch > 0 {
+        s.push_str(&v.epoch.to_string());
+        s.push('!');
+    }
+    s.push_str(&v.release.iter().map(|n| n.to_string()).collect::<Vec<_>>().join("."));
     if let Some((kind, n)) = &v.pre {
         s.push_str(kind);
         s.push_str(&n.to_string());
@@ -883,11 +886,6 @@ fn version_str_of(v: &Version) -> String {
     }
     s
 }
-
-/// A temporary extraction directory older than this is a crashed run's
-/// leftover (unpacking one artifact never takes an hour): removed before
-/// the next extraction of the same artifact.
-const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Whether an extraction directory is COMPLETE: it carries the marker
 /// and its distribution root is locatable.
@@ -911,8 +909,9 @@ fn extraction_complete(dir: &Path) -> bool {
 /// set aside by rename first (`set_aside_incomplete`), so a tree another
 /// resolver publishes between the check and the replacement survives
 /// and is used; a concurrent resolver that wins the final rename wins.
-/// Every failure after the sibling was created removes it; a stale
-/// sibling of a crashed run is cleared first.
+/// Every failure after the sibling was created removes it; a sibling
+/// whose owning process is provably dead (a crashed run's) is cleared
+/// first — never one whose owner may still be extracting.
 fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Result<PathBuf> {
     let file_name = artifact
         .file_name()
@@ -931,7 +930,7 @@ fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Re
     if extraction_complete(&extract_dir) {
         return locate_extracted_root(&extract_dir);
     }
-    remove_stale_temporaries(&extracted, stem);
+    remove_dead_temporaries(&extracted, stem);
     fs::create_dir_all(&extracted)?;
     let partial = extracted.join(format!("{stem}{PARTIAL_INFIX}{}", temporary_suffix()));
     fs::create_dir_all(&partial)?;
@@ -1047,30 +1046,92 @@ fn publish_extraction(
     }
 }
 
-/// Remove `<stem>.partial-*` and `<stem>.stale-*` siblings whose last
-/// modification is older than STALE_PARTIAL: a crashed run's leftovers
-/// (a live extraction of one artifact never takes that long). Best
+/// Remove `<stem>.partial-*` and `<stem>.stale-*` siblings whose OWNING
+/// PROCESS is provably dead (a crashed run's leftovers): the owner's pid
+/// is in the name (`temporary_suffix`), and a sibling is removed only
+/// when that pid is not this process and the platform can say it is not
+/// running. Age is no evidence of liveness (Devin review on #342, round
+/// 4: a long extraction is not a crashed one), so a sibling whose owner
+/// is alive, or whose liveness cannot be determined, is left alone; it
+/// costs disk, never correctness — the cache lookup skips it. Best
 /// effort — a failure to remove one only leaves it for the next run.
-fn remove_stale_temporaries(extracted: &Path, stem: &str) {
+fn remove_dead_temporaries(extracted: &Path, stem: &str) {
     let Ok(entries) = fs::read_dir(extracted) else {
         return;
     };
     let prefixes = [format!("{stem}{PARTIAL_INFIX}"), format!("{stem}{STALE_INFIX}")];
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !prefixes.iter().any(|p| name.starts_with(p)) {
+        let Some(suffix) = prefixes.iter().find_map(|p| name.strip_prefix(p.as_str())) else {
+            continue;
+        };
+        let Some(owner) = owner_pid(suffix) else {
+            continue;
+        };
+        if owner == std::process::id() || process_alive(owner) != Some(false) {
             continue;
         }
-        let stale = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|m| m.elapsed().ok())
-            .is_some_and(|age| age > STALE_PARTIAL);
-        if stale {
-            let _ = fs::remove_dir_all(entry.path());
-        }
+        let _ = fs::remove_dir_all(entry.path());
     }
+}
+
+/// The owning pid of a temporary suffix (`<pid>-<n>`, or the older
+/// `<pid>` spelling).
+fn owner_pid(suffix: &str) -> Option<u32> {
+    suffix.split('-').next()?.parse().ok()
+}
+
+/// Whether a process is running: `Some(true)`/`Some(false)` when the
+/// platform can tell, `None` when it cannot (then nothing is removed).
+/// Unix: procfs where it exists, else `kill -0` (a permission error is a
+/// live process of another user).
+#[cfg(unix)]
+fn process_alive(pid: u32) -> Option<bool> {
+    if Path::new("/proc/self").exists() {
+        return Some(Path::new(&format!("/proc/{pid}")).exists());
+    }
+    let output = std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        return Some(true);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Some(stderr.contains("permitted") || stderr.contains("Operation not"))
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> Option<bool> {
+    None
+}
+
+/// Publish a whole file at `path` atomically: the bytes go to a unique
+/// sibling (`<name>.tmp-<pid>-<n>`) first and are renamed into place, so
+/// a concurrent reader — another resolver's digest check or extraction —
+/// sees either no file or the complete one, never a truncated one (Devin
+/// review on #342, round 4). A rename another resolver's publish of the
+/// same path beat is not an error: the path holds their complete file.
+fn publish_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("cache path has no parent")?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("cache path has no file name")?;
+    fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!("{name}.tmp-{}", temporary_suffix()));
+    let written = fs::write(&tmp, bytes)
+        .with_context(|| format!("writing {}", tmp.display()))
+        .and_then(|()| match fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(_) if path.is_file() => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e)
+                .context(format!("publishing {}", path.display()))),
+        });
+    if tmp.exists() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// The distribution root inside an extraction directory: the directory
@@ -1288,6 +1349,62 @@ mod extraction_tests {
         // A vanished path is fine.
         set_aside_incomplete(&target, &extracted, "idna-1.0-py3-none-any").unwrap();
         let _ = fs::remove_dir_all(&extracted);
+    }
+
+    #[test]
+    fn dead_owners_temporaries_are_removed_and_live_ones_kept() {
+        // Devin review on #342, round 4: liveness, not age, decides.
+        let extracted = scratch("liveness");
+        let stem = "idna-1.0-py3-none-any";
+        let dead = extracted.join(format!("{stem}{PARTIAL_INFIX}{}-0", u32::MAX));
+        let live = extracted.join(format!("{stem}{PARTIAL_INFIX}{}-999999", std::process::id()));
+        let stale_dead = extracted.join(format!("{stem}{STALE_INFIX}{}-1", u32::MAX));
+        for d in [&dead, &live, &stale_dead] {
+            fs::create_dir_all(d.join("idna")).unwrap();
+        }
+        remove_dead_temporaries(&extracted, stem);
+        if cfg!(unix) {
+            assert!(!dead.exists(), "a dead owner's partial is removed");
+            assert!(!stale_dead.exists(), "a dead owner's set-aside tree is removed");
+        }
+        assert!(live.exists(), "this process's live temporary stays");
+        let _ = fs::remove_dir_all(&extracted);
+    }
+
+    #[test]
+    fn a_file_publishes_whole_under_concurrent_publishers() {
+        // Devin review on #342, round 4: N publishers of one cache path
+        // never expose a truncated file — every observation is the whole
+        // content, and no temporary is left behind.
+        let dir = scratch("publish");
+        let path = dir.join("pkg-1.0-py3-none-any.whl");
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let bytes = std::sync::Arc::new(bytes);
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (path, bytes) = (path.clone(), bytes.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..5 {
+                        publish_file(&path, &bytes).unwrap();
+                        if let Ok(seen) = fs::read(&path) {
+                            assert_eq!(seen.len(), bytes.len(), "a reader saw a partial file");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(fs::read(&path).unwrap(), *bytes);
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

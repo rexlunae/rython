@@ -285,6 +285,19 @@ pub(crate) fn is_type_annotation(annotation: &ExprType) -> bool {
 /// `annotation_type_info`, Parameter::to_rust) see the real union instead
 /// of a bare string Constant. Returns None when the annotation is not a
 /// string literal or the content cannot be parsed (round 56).
+impl Parameter {
+    /// The parameter's annotation as EVALUATED: a quoted annotation
+    /// (`err: "Optional[MyError]"`) is the expression it spells. Every
+    /// reader of a parameter's annotation — the signature, the body's
+    /// name types, a call site's argument coercion — goes through this
+    /// one evaluation, so they never disagree (Devin review on #342,
+    /// round 4).
+    pub(crate) fn evaluated_annotation(&self) -> Option<ExprType> {
+        let ann = self.annotation.as_deref()?;
+        Some(unquote_annotation(ann).unwrap_or_else(|| ann.clone()))
+    }
+}
+
 pub(crate) fn unquote_annotation(annotation: &ExprType) -> Option<ExprType> {
     let ExprType::Constant(c) = annotation else {
         return None;

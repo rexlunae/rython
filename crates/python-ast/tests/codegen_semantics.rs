@@ -22171,3 +22171,58 @@ fn comprehension_fields_type_their_elements_through_the_generator_targets() {
     assert!(out.contains("_lens : Vec < i64 >"), "len element over a list[str] target: {}", out);
     assert!(out.contains("_decoders : Vec < Decoder >"), "class element: {}", out);
 }
+
+
+#[test]
+fn quoted_exception_union_annotations_type_the_parameter_and_its_calls_alike() {
+    // Devin review on #342, round 4: a QUOTED union of user exception
+    // classes is evaluated before the body's name types derive, so the
+    // signature (`Option<PyException>` / `PyException`) and a call site
+    // passing a caught exception agree.
+    let out = compile(
+        "from typing import Optional, Union\n\
+         \n\
+         class MyError(Exception):\n\
+         \x20   pass\n\
+         \n\
+         def maybe(err: \"Optional[MyError]\") -> str:\n\
+         \x20   if err is None:\n\
+         \x20       return \"nothing\"\n\
+         \x20   return \"got \" + str(err)\n\
+         \n\
+         def either(err: \"Union[MyError, ValueError]\") -> str:\n\
+         \x20   return \"got \" + str(err)\n\
+         \n\
+         def go() -> str:\n\
+         \x20   try:\n\
+         \x20       raise MyError(\"x\")\n\
+         \x20   except MyError as e:\n\
+         \x20       return maybe(e) + either(e)\n",
+        "quoted.py",
+    );
+    assert!(out.contains("err : Option < PyException >"), "quoted Optional: {}", out);
+    assert!(
+        out.contains("maybe (Some ((e) . clone ()))"),
+        "the caught exception Some-wraps, cloned inside the wrap (it is reused): {}",
+        out
+    );
+    assert!(out.contains("either ((e) . clone ())"), "the union takes it bare: {}", out);
+}
+
+#[test]
+fn bare_imports_of_typing_are_silent_and_of_runtime_annotation_modules_are_loud() {
+    // Devin review on #342, round 4: `import typing` emits nothing
+    // (annotation-only); `import abc`/`contextlib`/`dataclasses` emit
+    // nothing TOO but warn — their items are modeled under from-import
+    // names only, so a module-qualified use is not silently accepted.
+    let (out, warnings) = compile_with_warnings(
+        "import typing\nimport abc\nimport contextlib\n\ndef f(x: typing.Optional[int]) -> int:\n    return 0 if x is None else x\n",
+        "bare.py",
+    );
+    assert!(!out.contains("crate :: typing"), "{}", out);
+    assert!(!out.contains("crate :: abc"), "{}", out);
+    assert!(!out.contains("crate :: contextlib"), "{}", out);
+    assert!(warnings.iter().any(|w| w.contains("import `abc` is dropped")), "{warnings:?}");
+    assert!(warnings.iter().any(|w| w.contains("import `contextlib` is dropped")), "{warnings:?}");
+    assert!(!warnings.iter().any(|w| w.contains("import `typing` is dropped")), "{warnings:?}");
+}

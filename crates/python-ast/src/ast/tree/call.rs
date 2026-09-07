@@ -8589,9 +8589,7 @@ let mutating_self_field = boxed_self_ref_receiver
                 // cannot CALL through it (the callable-as-value drop at
                 // the callee's own call sites), but the string is the
                 // class object's runtime value (round 33 design).
-                if param
-                    .annotation
-                    .as_deref()
+                if param.evaluated_annotation().as_ref()
                     .is_some_and(crate::ast::tree::arguments::is_type_annotation)
                 {
                     if crate::is_class_value_expr(&arg, &symbols) {
@@ -8604,7 +8602,7 @@ let mutating_self_field = boxed_self_ref_receiver
                         quote!(stdpython::PyValue::None_)
                     }
                 } else if crate::is_class_value_expr(&arg, &symbols)
-                    && param.annotation.as_deref().and_then(crate::call_arg_expected_type)
+                    && param.evaluated_annotation().as_ref().and_then(crate::call_arg_expected_type)
                         .is_some_and(|t| {
                             let s = t.to_rust_type().to_string();
                             s == "stdpython :: PyValue" || s == "PyValue"
@@ -8622,9 +8620,11 @@ let mutating_self_field = boxed_self_ref_receiver
                     quote!(stdpython::PyValue::from(#name.to_string()))
                 } else {
                     let expected = param
-                        .annotation
-                        .as_deref()
-                        .and_then(crate::call_arg_expected_type)
+                        .evaluated_annotation()
+                        .as_ref()
+                        .and_then(|ann| {
+                            crate::ast::tree::type_ctx::call_arg_expected_type_in(ann, &symbols, &options)
+                        })
                         // Round 86: the same symbols-aware fallback the
                         // mapped-call fill uses — an annotation the
                         // syntax-only mapping cannot see (a module-level
@@ -10538,7 +10538,8 @@ fn arg_expected_fallback(
     symbols: &SymbolTableScopes,
     options: &crate::PythonOptions,
 ) -> Option<crate::TypeInfo> {
-    let ann = param.annotation.as_deref()?;
+    let ann_owned = param.evaluated_annotation();
+    let ann = ann_owned.as_ref()?;
     if crate::annotation_type_info(ann).is_some() {
         return None;
     }
@@ -10702,7 +10703,7 @@ fn map_call_arguments_inner(
         // empty Vec, `set[T]` → the empty set. The factory semantics (fresh
         // container per call) match rython's inline-empty exactly.
         if crate::is_field_factory_call(expr) {
-            if let Some(ann) = param.annotation.as_deref() {
+            if let Some(ann) = param.evaluated_annotation().as_ref() {
                 if let Some(t) = crate::annotation_type_info(ann) {
                     match t {
                         crate::TypeInfo::Dict(k, v)
@@ -10726,8 +10727,8 @@ fn map_call_arguments_inner(
             return Ok(quote!(Default::default()));
         }
         let optional = param
-            .annotation
-            .as_deref()
+            .evaluated_annotation()
+            .as_ref()
             .is_some_and(crate::is_optional_annotation);
         // A cross-module constant name used as a dropped DEFAULT
         // (`HTTPAdapter()` — sessions.py, whose __init__ defaults reference
@@ -10803,9 +10804,7 @@ fn map_call_arguments_inner(
         // round 33); any other callable (a function) cannot be a runtime
         // value and lowers to the boxed None (the callable-as-value
         // divergence).
-        if param
-            .annotation
-            .as_deref()
+        if param.evaluated_annotation().as_ref()
             .is_some_and(crate::ast::tree::arguments::is_type_annotation)
         {            if crate::is_class_value_expr(expr, symbols) {
                 if let ExprType::Name(n) = expr {
@@ -10868,7 +10867,7 @@ fn map_call_arguments_inner(
             // signature (Parameter::to_rust) resolves the same way, so an
             // `Optional[...]` that boxes takes a boxed argument, never a
             // Some-wrapped one.
-            if param.annotation.as_deref().is_some_and(|ann| {
+            if param.evaluated_annotation().as_ref().is_some_and(|ann| {
                 crate::is_optional_annotation(ann) && matches!(
                     // The annotation's alias lives in the CALLEE's module
                     // (`headers: ValidHTTPHeaderSource | None` where
@@ -10942,7 +10941,7 @@ fn map_call_arguments_inner(
             // and the conversion happen in one pass (lower_optional_value
             // would Some-wrap the raw PyValue, leaving `Some(PyValue)`
             // against `Option<i64>`).
-            let inner_expected = param.annotation.as_deref().and_then(|ann| {
+            let inner_expected = param.evaluated_annotation().as_ref().and_then(|ann| {
                 match crate::call_arg_expected_type(ann) {
                     Some(crate::TypeInfo::Option(inner))
                         if crate::ast::tree::type_ctx::is_boxable_value_type(&inner) =>
@@ -11055,16 +11054,23 @@ fn map_call_arguments_inner(
             // names that are reused later (Python shares by reference;
             // Rust moves).
             let expected = param
-                .annotation
-                .as_deref()
-                .and_then(crate::call_arg_expected_type)
+                .evaluated_annotation()
+                .as_ref()
+                .and_then(|ann| {
+                    crate::ast::tree::type_ctx::call_arg_expected_type_in(
+                        ann,
+                        default_symbols.unwrap_or(symbols),
+                        &options,
+                    )
+                })
                 // A bare CLASS-ANNOTATED parameter (`item: Item` —
                 // annotation_type_info answers None for class names):
                 // the slot is the class, so a DERIVED argument coerces
                 // through the generated `From<Derived> for Base` (round
                 // 99 — the idiom corpus's `add(perishable)`).
                 .or_else(|| {
-                    let ann = param.annotation.as_deref()?;
+                    let ann_owned = param.evaluated_annotation();
+                    let ann = ann_owned.as_ref()?;
                     let crate::ExprType::Name(cn) = ann else {
                         return None;
                     };
@@ -11089,7 +11095,8 @@ fn map_call_arguments_inner(
                 // `str` alias stays untyped like a bare `str` (the
                 // `impl Into<String>` parameter takes anything).
                 .or_else(|| {
-                    let ann = param.annotation.as_deref()?;
+                    let ann_owned = param.evaluated_annotation();
+                    let ann = ann_owned.as_ref()?;
                     let t = crate::resolve_alias_typeinfo(
                         ann,
                         default_symbols.unwrap_or(symbols),

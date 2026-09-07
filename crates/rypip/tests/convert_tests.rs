@@ -14793,7 +14793,9 @@ fn typing_spelled_exception_unions_take_a_caught_exception() {
     // `typing.Union[...]` and `Optional[OSError]` are the same
     // exception-union rule as `OSError | TimeoutError` — a caught
     // exception passes into each, `isinstance` tests its kind, and the
-    // Optional one takes None.
+    // Optional one takes None. A QUOTED `"Optional[MyError]"` over a
+    // crate exception class is the same rule (round 4), and the caught
+    // exception reused twice clones inside its Some.
     let scratch = Scratch::new("typing_unions");
     let file = scratch.path().join("typing_unions.py");
     fs::write(
@@ -14830,10 +14832,31 @@ fn typing_spelled_exception_unions_take_a_caught_exception() {
             "        return describe(e, \"attempt\") + \" / \" + note(e) + \" / \" + maybe(e)\n",
             "\n",
             "\n",
+            "class MyError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def quoted(err: \"Optional[MyError]\") -> str:\n",
+            "    if err is None:\n",
+            "        return \"quoted nothing\"\n",
+            "    return \"quoted \" + str(err)\n",
+            "\n",
+            "\n",
+            "def user(fail: bool) -> str:\n",
+            "    try:\n",
+            "        if fail:\n",
+            "            raise MyError(\"bad\")\n",
+            "        return quoted(None)\n",
+            "    except MyError as e:\n",
+            "        return quoted(e) + \" / \" + quoted(e)\n",
+            "\n",
+            "\n",
             "if __name__ == \"__main__\":\n",
             "    for fail in range(3):\n",
             "        print(attempt(fail))\n",
-            "    print(maybe(None))\n"
+            "    print(maybe(None))\n",
+            "    print(user(False))\n",
+            "    print(user(True))\n"
         ),
     )
     .unwrap();
@@ -14850,7 +14873,14 @@ fn typing_spelled_exception_unions_take_a_caught_exception() {
     // Verified against python3.
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
-        vec!["ok", "timeout at attempt / noted slow / got slow", "os error at attempt: refused / noted refused / got refused", "nothing"],
+        vec![
+            "ok",
+            "timeout at attempt / noted slow / got slow",
+            "os error at attempt: refused / noted refused / got refused",
+            "nothing",
+            "quoted nothing",
+            "quoted bad / quoted bad",
+        ],
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );

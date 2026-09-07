@@ -523,13 +523,13 @@ fn an_interrupted_extraction_is_never_a_cache_hit() {
 }
 
 #[test]
-fn a_failed_extraction_leaves_no_partial_directory_and_stale_ones_are_cleared() {
+fn a_failed_extraction_leaves_no_partial_directory_and_dead_owners_are_cleared() {
     // A corrupt archive (its digest recorded, so the cache trusts it)
     // fails to extract: the error is loud and the `.partial-` sibling is
-    // removed; a crashed run's stale sibling (older than an hour) is
-    // cleared before the next extraction of that artifact; a fresh
-    // sibling of another live process is left alone (Devin review on
-    // #342).
+    // removed; a crashed run's sibling (its owning pid provably dead) is
+    // cleared before the next extraction of that artifact; a sibling of
+    // a LIVE process is left alone whatever its age (Devin review on
+    // #342, rounds 2 and 4).
     let scratch = Scratch::new("cache-partial-cleanup");
     let cache = scratch.path().join("cache");
     let dist_dir = cache.join("idna");
@@ -554,20 +554,49 @@ fn a_failed_extraction_leaves_no_partial_directory_and_stale_ones_are_cleared() 
     };
     assert!(partials(&dist_dir.join("extracted")).is_empty(), "{:?}", partials(&dist_dir.join("extracted")));
 
-    // A real wheel now, beside two leftovers: a stale one and a live one.
+    // A real wheel now, beside two leftovers: a dead process's and a
+    // live (this) process's, the live one made old to show age is not
+    // the rule.
     write_wheel(&dist_dir, "idna", "1.0", &[("idna/__init__.py", "")]);
     let extracted = dist_dir.join("extracted");
-    let stale = extracted.join("idna-1.0-py3-none-any.partial-4242");
-    fs::create_dir_all(stale.join("idna")).unwrap();
-    let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
-    fs::File::open(&stale).unwrap().set_modified(two_hours_ago).unwrap();
-    let live = extracted.join("idna-1.0-py3-none-any.partial-4343");
+    let dead = extracted.join(format!("idna-1.0-py3-none-any.partial-{}-0", u32::MAX));
+    fs::create_dir_all(dead.join("idna")).unwrap();
+    let live = extracted.join(format!("idna-1.0-py3-none-any.partial-{}-999999", std::process::id()));
     fs::create_dir_all(live.join("idna")).unwrap();
+    let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+    fs::File::open(&live).unwrap().set_modified(two_hours_ago).unwrap();
     let dep = rypip::resolve::resolve_dependency_in(&cache, &req, true).unwrap();
     assert_eq!(dep.version, "1.0");
-    assert!(!stale.exists(), "the stale sibling is cleared");
-    assert!(live.exists(), "a fresh sibling of another process is left alone");
+    if cfg!(unix) {
+        assert!(!dead.exists(), "a dead owner's sibling is cleared");
+    }
+    assert!(live.exists(), "a live process's sibling is left alone, however old");
     assert!(extracted.join("idna-1.0-py3-none-any/.rypip-complete").is_file());
+}
+
+#[test]
+fn cached_epoch_versions_keep_their_epoch() {
+    // An epoch-qualified artifact (`1!2.0`) resolves offline under the
+    // same version spelling the online path records (Devin review on
+    // #342, round 4): the epoch is part of the version.
+    let scratch = Scratch::new("cache-epoch");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("ep");
+    write_wheel(&dist_dir, "ep", "1!2.0", &[("ep/__init__.py", "")]);
+    let dep = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("ep==1!2.0").unwrap(),
+        true,
+    )
+    .expect("the epoch-qualified artifact resolves");
+    assert_eq!(dep.version, "1!2.0");
+    let err = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("ep==2.0").unwrap(),
+        true,
+    )
+    .expect_err("2.0 without the epoch is a different version");
+    assert!(err.to_string().contains("offline"), "{err:?}");
 }
 
 #[test]

@@ -1709,6 +1709,12 @@ pub fn render_typed_reused(
     // round-92 boxing (`PyValue::from((x))` → the box is a fresh value)
     // NEEDS the clone or the move returns.
     let adapted_is_into = adapted && tokens.to_string().contains("into");
+    // A `Some(x)` wrap (a present value into an Option slot — the
+    // exception-union rule's `Optional[MyError]`): the clone belongs to
+    // the READ inside the wrap — `Some((x).clone())` — a clone of the
+    // wrapped Option would move x into it first (Devin review on #342,
+    // round 4).
+    let some_wrapped = adapted && tokens.to_string() == format!("Some ({})", raw);
     // A MODULE-attribute read (`socket.AF_INET` — a constant) never
     // clones: the root is a module, not a class instance, so the read
     // cannot move anything a later read needs (round 99).
@@ -1738,6 +1744,12 @@ pub fn render_typed_reused(
                 // See render_reused: a CLASS-typed name's reuse-clone must
                 // be the trait-qualified std Clone (`Clone::clone(&x)`),
                 // never the class's own `clone` method (round 88).
+                if some_wrapped {
+                    if matches!(t, TypeInfo::Class(_)) {
+                        return Ok(quote!(Some(Clone::clone(&(#raw)))));
+                    }
+                    return Ok(quote!(Some((#raw).clone())));
+                }
                 if matches!(t, TypeInfo::Class(_)) {
                     return Ok(quote!(Clone::clone(&(#tokens))));
                 }
@@ -1806,6 +1818,24 @@ pub fn is_boxable_value_type(t: &TypeInfo) -> bool {
             | TypeInfo::StrOrBytes
             | TypeInfo::PyValue
     )
+}
+
+/// `call_arg_expected_type` with the SYMBOLS-AWARE exception-union rule
+/// first (`Optional[MyError]` where MyError is a crate exception class —
+/// the syntax-only mapping cannot see it): the parameter's declared type
+/// (arguments.rs) is what the argument coerces to (Devin review on
+/// #342, round 4). The annotation is evaluated (unquoted) first.
+pub fn call_arg_expected_type_in(
+    ann: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<TypeInfo> {
+    let unquoted = crate::ast::tree::arguments::unquote_annotation(ann);
+    let ann: &ExprType = unquoted.as_ref().unwrap_or(ann);
+    if let Some(t) = crate::ast::tree::arguments::exception_union_typeinfo(ann, symbols, options) {
+        return Some(t);
+    }
+    call_arg_expected_type(ann)
 }
 
 pub fn call_arg_expected_type(ann: &ExprType) -> Option<TypeInfo> {
