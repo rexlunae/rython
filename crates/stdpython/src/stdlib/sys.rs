@@ -53,7 +53,24 @@ pub static base_prefix: std::sync::LazyLock<String> = std::sync::LazyLock::new(|
 /// 
 /// Note: This uses lazy evaluation to get the actual command line arguments at runtime.
 pub static argv: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
-    std::env::args().collect()
+    // CPython decodes a non-UTF-8 argument with surrogateescape
+    // (`'\udcff'`), which this runtime's `str` does not model: such an
+    // argument is a loud exit naming it, never a panic and never a
+    // different string (Devin review on #340).
+    std::env::args_os()
+        .enumerate()
+        .map(|(i, arg)| match arg.into_string() {
+            Ok(s) => s,
+            Err(raw) => {
+                eprintln!(
+                    "rython: sys.argv[{}] is not valid UTF-8 ({:?}); CPython would keep it as \
+                     surrogate escapes, which this runtime does not model",
+                    i, raw
+                );
+                std::process::exit(1)
+            }
+        })
+        .collect()
 });
 
 #[cfg(feature = "std")]

@@ -97,7 +97,8 @@ enum Cmd {
         /// Path to a Python package directory or a single .py file.
         package: PathBuf,
         /// Where to write the generated crate (defaults to a directory under
-        /// the system temp dir, reused across runs so rebuilds are
+        /// the system temp dir keyed by the package name and the source
+        /// path, reused across runs of that source so rebuilds are
         /// incremental).
         #[arg(long, short)]
         out: Option<PathBuf>,
@@ -110,7 +111,8 @@ enum Cmd {
         /// PyPI.
         #[arg(long)]
         no_deps: bool,
-        /// The program's own arguments (sys.argv[1:]).
+        /// The program's own arguments (sys.argv[1:]; sys.argv[0] is the
+        /// package path as given, as under CPython).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<std::ffi::OsString>,
     },
@@ -211,7 +213,13 @@ fn main() -> Result<()> {
             args,
         } => {
             let pkg = rypip::discover(&package)?;
-            let out = out.unwrap_or_else(|| work_dir(&pkg.name));
+            let out = match out {
+                Some(out) => out,
+                None => rypip::run_work_dir(&package, &pkg.name)?,
+            };
+            // Held from source generation through the build, released
+            // before the program runs.
+            let lock = rypip::lock_work_dir(&out)?;
             let krate = rypip::convert(
                 &pkg,
                 &out,
@@ -227,7 +235,9 @@ fn main() -> Result<()> {
                 },
             )?;
             report_warnings(&krate);
-            let status = rypip::cargo_run(&krate, &args)?;
+            let binary = rypip::cargo_build_executable(&krate)?;
+            drop(lock);
+            let status = rypip::run_program(&binary, package.as_os_str(), &args)?;
             // The program's exit status is ours: the code as is; a signal
             // death as the shell reports it (128 + the signal number).
             let code = status.code().unwrap_or_else(|| {
