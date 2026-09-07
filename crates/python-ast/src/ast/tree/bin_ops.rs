@@ -246,6 +246,13 @@ impl CodeGen for BinOp {
             // §12.2 panic (the `is not None` guard in real code prevents
             // it). Computed before the operand renders move ctx/options.
             let option_rhs = is_option_expr(&self.right, &ctx, &options, &symbols);
+            // A NARROWED RHS read is already the INNER value (a guard-body
+            // operand: `self.count - amt` inside `if ... and amt is not
+            // None:` — round 99): the Option-unwrap match below would wrap
+            // the unwrapped read again (`match (x).clone().unwrap()` on an
+            // i64 is E0308).
+            let rhs_narrowed = matches!(&*self.right, ExprType::Name(n)
+                if options.narrowed_names.contains_key(&n.id));
             let lhs_name = if option_rhs {
                 py_operand_name(&self.left, &ctx, &options, &symbols)
             } else {
@@ -255,7 +262,7 @@ impl CodeGen for BinOp {
             let right = self.right.clone().to_rust(ctx, options, symbols)?;
             let left = anchor_numeric_literal(&self.left, left);
             let right = anchor_numeric_literal(&self.right, right);
-            let right = if option_rhs {
+            let right = if option_rhs && !rhs_narrowed {
                 let msg = format!(
                     "unsupported operand type(s) for -: '{}' and 'NoneType'",
                     lhs_name

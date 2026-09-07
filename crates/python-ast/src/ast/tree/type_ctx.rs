@@ -786,7 +786,26 @@ fn infer_type_inner(
         ExprType::Compare(_) => TypeInfo::Bool,
         ExprType::IfExp(i) => {
             // The branches must agree for a useful inference.
-            let a = infer_type_inner(ctx, &i.body, options, symbols);
+            // The TRUE branch infers in the narrowed scope the codegen
+            // lowers it in (`r.encoding if r is not None else None` —
+            // charset_normalizer's legacy.detect, round 99): the body
+            // reads the UNWRAPPED receiver, so `1.0 - r.chaos` is f64,
+            // not PyObject — without the narrowed view every Option-else
+            // ternary stays PyObject and the local never seeds
+            // optional_names, so the later guard narrowing cannot fire.
+            let mut body_options = options.clone();
+            for (narrowed, inner) in crate::narrowings_from_test(&i.test, options) {
+                let mut narrowed_names = body_options.narrowed_names.as_ref().clone();
+                let target = inner.clone().unwrap_or(crate::TypeInfo::StrOrBytes);
+                narrowed_names.insert(narrowed.clone(), target);
+                body_options.narrowed_names = std::rc::Rc::new(narrowed_names);
+                if let Some(inner) = inner {
+                    let mut name_types = body_options.name_types.as_ref().clone();
+                    name_types.insert(narrowed, inner);
+                    body_options.name_types = std::rc::Rc::new(name_types);
+                }
+            }
+            let a = infer_type_inner(ctx, &i.body, &body_options, symbols);
             let b = infer_type_inner(ctx, &i.orelse, options, symbols);
             if a == b {
                 a
@@ -794,6 +813,19 @@ fn infer_type_inner(
                 TypeInfo::Float
             } else if is_stringy(&a) && is_stringy(&b) {
                 TypeInfo::String
+            } else if crate::is_none_expr(&i.orelse)
+                && !matches!(a, TypeInfo::PyObject | TypeInfo::Option(_))
+            {
+                // `<value> if <test> else None` — the value or None: an
+                // Option binding (the `encoding`/`confidence` locals of
+                // charset_normalizer's legacy.detect), so the analysis
+                // seeds optional_names and guard narrowing fires on the
+                // local itself.
+                TypeInfo::Option(Box::new(a))
+            } else if crate::is_none_expr(&i.body)
+                && !matches!(b, TypeInfo::PyObject | TypeInfo::Option(_))
+            {
+                TypeInfo::Option(Box::new(b))
             } else {
                 TypeInfo::PyObject
             }
@@ -999,11 +1031,52 @@ fn infer_type_inner(
                 } else {
                     None
                 };
+                // Resolve through the SAME tail the codegen uses — a class
+                // name the local scope does not bind resolves across the
+                // crate's modules (`r.encoding` where `r` came from
+                // `from_bytes(...).best()`, whose `best() -> CharsetMatch |
+                // None` names a class legacy.py never imports —
+                // charset_normalizer, round 99).
                 if let Some(cname) = class_name
-                    && let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(&cname)
+                    && let Some((class, class_symbols)) =
+                        crate::ast::tree::call::receiver_class_tail(
+                            &cname,
+                            symbols.clone(),
+                            options,
+                        )
                 {
-                    for c in class.base_chain(symbols) {
-                        if let Ok(fields) = c.infer_fields(symbols, options)
+                    // A PROPERTY read (`r.encoding` where encoding is
+                    // `@property def encoding(self) -> str`): the getter's
+                    // return annotation is the read's type — the codegen
+                    // routes the read through the getter CALL, so the type
+                    // side must agree (the narrowing on the read then sees
+                    // String, not the class itself). A same-named FIELD
+                    // wins (a genuine field read is untouched).
+                    let own_property = class
+                        .method_on_mro(&attr.attr, &class_symbols)
+                        .filter(|m| {
+                            m.decorator_list.iter().any(|d| match d {
+                                crate::ExprType::Name(n) => n.id == "property",
+                                crate::ExprType::Attribute(a) => a.attr == "property",
+                                _ => false,
+                            })
+                        })
+                        .and_then(|m| m.returns.clone());
+                    if let Some(ann) = own_property {
+                        // A stored field SHADOWING the property name is
+                        // impossible in the same class (Python forbids it);
+                        // a field of a BASE is what the walk below sees, and
+                        // the property is the more derived answer.
+                        if let Some(t) = crate::resolve_alias_typeinfo(
+                            &ann,
+                            &class_symbols,
+                            options,
+                        ) {
+                            return t;
+                        }
+                    }
+                    for c in class.base_chain(&class_symbols) {
+                        if let Ok(fields) = c.infer_fields(&class_symbols, options)
                             && let Some((_, ty)) =
                                 fields.iter().find(|(name, _)| *name == attr.attr)
                         {
@@ -2657,7 +2730,7 @@ fn expr_walrus_writes(expr: &ExprType, name: &str) -> bool {
 }
 
 fn analysis_view(options: &PythonOptions, info: &FunctionTypeInfo) -> PythonOptions {
-    if info.name_types.is_empty() {
+    if info.name_types.is_empty() && info.optional_names.is_empty() {
         return options.clone();
     }
     let mut view = options.clone();
@@ -2666,6 +2739,21 @@ fn analysis_view(options: &PythonOptions, info: &FunctionTypeInfo) -> PythonOpti
         names.insert(n.clone(), t.clone());
     }
     view.name_types = std::rc::Rc::new(names);
+    // The Option bindings the analysis has recorded SO FAR join the view
+    // too: a LATER statement's inference narrows through the same
+    // `is not None` authority the codegen uses, whose optional set is the
+    // whole function (`encoding = r.encoding if r is not None else None`
+    // after `r = from_bytes(...).best()` — charset_normalizer's
+    // legacy.detect, round 99: without r in the view's optional_names the
+    // ternary's true branch infers un-narrowed and the local never seeds
+    // optional_names itself).
+    if !info.optional_names.is_empty() {
+        let mut optional = view.optional_names.as_ref().clone();
+        for n in &info.optional_names {
+            optional.insert(n.clone());
+        }
+        view.optional_names = std::rc::Rc::new(optional);
+    }
     view
 }
 
@@ -2796,6 +2884,21 @@ fn analyze_statement_types(
                         // everywhere else; this is the one shape where
                         // only infer_type has the operand types.
                         ExprType::BinOp(_) => match (options, symbols) {
+                            (Some(options), Some(symbols)) => {
+                                infer_type(None, &assign.value, &analysis_view(options, info), symbols)
+                            }
+                            _ => syntactic_type(&assign.value),
+                        },
+                        // A TERNARY value needs the context-aware inferrer
+                        // for the same reason (`confidence = 1.0 - r.chaos
+                        // if r is not None else None` — charset_normalizer's
+                        // legacy.detect, round 99): infer_type's IfExp arm
+                        // infers the true branch in the test's narrowed
+                        // scope and types a None-literal else as Option, so
+                        // the local seeds optional_names and the guard
+                        // narrowing on IT fires (the syntactic path sees
+                        // neither the narrowing nor the Option-ness).
+                        ExprType::IfExp(_) => match (options, symbols) {
                             (Some(options), Some(symbols)) => {
                                 infer_type(None, &assign.value, &analysis_view(options, info), symbols)
                             }
@@ -4058,19 +4161,22 @@ pub fn call_return_typeinfo(
             return None;
         };
         let (symbols, options) = (symbols?, options?);
-        let ExprType::Name(recv) = attr.value.as_ref() else {
-            return None;
-        };
-        let Some(crate::TypeInfo::Class(cname)) = options.name_types.get(&recv.id) else {
-            return None;
-        };
-        // The class WITH its defining scope: a cross-module receiver's
-        // method names its return class in ITS module (`conn.urlopen(url)
-        // -> BaseHTTPResponse` in urllib3's poolmanager, which never
-        // imports the response class), so the annotation resolves there,
-        // not in the caller's scope where the name is unbound.
-        let (class, class_symbols) =
-            crate::ast::tree::call::receiver_class_tail(cname, symbols.clone(), options)?;
+        // The receiver's class, through the same authority the call
+        // LOWERING uses for attribute-READ receivers. The receiver need
+        // not be a NAME the analysis typed: a FACTORY CALL
+        // (`from_bytes(byte_str).best()` — charset_normalizer's
+        // legacy.detect, where from_bytes returns CharsetMatches, whose
+        // best() returns `CharsetMatch | None`) and a container element
+        // (`ms[0].best()`) resolve their class the same way — without
+        // them the Option<Class> return never reaches the local: it stays
+        // unseeded, the is-None narrowing cannot fire, and the field
+        // reads lower raw against the Option (round 99).
+        let (class, class_symbols) = crate::ast::tree::call::receiver_class(
+            &attr.value,
+            &crate::CodeGenContext::Module(String::new()),
+            symbols,
+            options,
+        )?;
         let method = class.method_on_mro(&attr.attr, &class_symbols)?;
         let ann = method.returns.as_deref()?;
         return resolve_alias_typeinfo(ann, &class_symbols, options);

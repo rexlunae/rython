@@ -111,11 +111,13 @@ impl CodeGen for If {
         // Issue #125: `if x is not None:` narrows x to its inner type inside
         // the body — reads unwrap (Name::to_rust consults narrowed_names),
         // and the comprehension/iteration over x sees the inner element
-        // type. Any other test narrows nothing.
+        // type. A compound test narrows every `is not None` conjunct it
+        // contains (`if r is not None and r.bom:` — charset_normalizer's
+        // legacy.detect, round 99). Any other test narrows nothing.
         let mut body_options = options.clone();
         let mut else_options = options.clone();
-        if let Some((narrowed, inner)) = crate::narrowing_from_test(&self.test, &options) {
-            let mut narrowed_names = options.narrowed_names.as_ref().clone();
+        for (narrowed, inner) in crate::narrowings_from_test(&self.test, &options) {
+            let mut narrowed_names = body_options.narrowed_names.as_ref().clone();
             // The narrowed type: the Option's inner type, or for a
             // str|bytes union narrowed by isinstance, the concrete branch
             // type carried in the map value (String/Bytes).
@@ -123,8 +125,8 @@ impl CodeGen for If {
             narrowed_names.insert(narrowed.clone(), target);
             body_options.narrowed_names = std::rc::Rc::new(narrowed_names);
             if let Some(inner) = inner {
-                let mut name_types = options.name_types.as_ref().clone();
-                name_types.insert(narrowed.clone(), inner);
+                let mut name_types = body_options.name_types.as_ref().clone();
+                name_types.insert(narrowed.clone(), inner.clone());
                 body_options.name_types = std::rc::Rc::new(name_types);
             }
         }

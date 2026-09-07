@@ -956,6 +956,26 @@ pub fn condition_to_rust(    expr: &ExprType,
                         );
                         chain_options.narrowed_names = std::rc::Rc::new(narrowed.clone());
                     }
+                    // The `x is not None` COMPARE shape (`r is not None and
+                    // r.language != "Unknown"` — charset_normalizer's
+                    // legacy.detect, round 99): the compare passing proves
+                    // x non-None for the later operands exactly like the
+                    // truthiness shape above (the later conjunct reads x's
+                    // field, which needs x unwrapped). Same predicate
+                    // authority as the if/ternary narrowing.
+                    if let Some((narrowed_name, inner)) =
+                        crate::narrowing_from_test(value, &chain_options)
+                    {
+                        let inner = match inner {
+                            Some(inner) => inner,
+                            _ => crate::TypeInfo::PyObject,
+                        };
+                        narrowed.insert(
+                            narrowed_name,
+                            crate::TypeInfo::Option(Box::new(inner)),
+                        );
+                        chain_options.narrowed_names = std::rc::Rc::new(narrowed.clone());
+                    }
                 }
             }
             Ok(match op.op {
@@ -1042,6 +1062,28 @@ pub fn narrowing_from_test(
             _ => None,
         });
     Some((n.id.clone(), inner))
+}
+
+/// [`narrowing_from_test`] lifted through an `and`-CHAIN: when the test
+/// holds, EVERY `x is not None` conjunct holds, so the TRUE scope narrows
+/// each such name (`r.language if r is not None and r.language != "Unknown"
+/// else ""` — charset_normalizer's legacy.detect, round 99: the second
+/// conjunct reads `r`'s field, so `r` must already be unwrapped there).
+/// An `or` chain narrows nothing (any one conjunct may have made the whole
+/// test true — no single name is proven non-None). Returns every narrowed
+/// (name, inner) pair; empty for any other test shape.
+pub fn narrowings_from_test(
+    test: &ExprType,
+    options: &PythonOptions,
+) -> Vec<(String, Option<crate::TypeInfo>)> {
+    match test {
+        ExprType::BoolOp(op) if matches!(op.op, crate::BoolOps::And) => op
+            .values
+            .iter()
+            .filter_map(|v| narrowing_from_test(v, options))
+            .collect(),
+        _ => narrowing_from_test(test, options).into_iter().collect(),
+    }
 }
 
 /// Issue #121: `if isinstance(x, (bytes, bytearray)):` (or

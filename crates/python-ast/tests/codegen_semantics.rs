@@ -2382,6 +2382,81 @@ fn is_none_lowers_to_py_is_none() {
 }
 
 #[test]
+fn is_not_none_ternary_narrows_and_keeps_option() {
+    // charset_normalizer's legacy.detect shape (round 99): a local bound
+    // to a FACTORY-CALL chain (`from_bytes(...).best()` whose
+    // `best() -> Match | None` resolves through the receiver's returned
+    // class), then field reads through `is not None` ternaries and
+    // and-chains. The ternary's TRUE branch is the narrowed scope (reads
+    // unwrap), and a None-literal else keeps the value Option (the true
+    // branch Some-wraps) — `r.encoding if r is not None else None` is
+    // Option<String>, never a String-vs-None if/else. An aug-assign
+    // inside an `is not None` guard stores back Some-wrapped.
+    let src = concat!(
+        "class Match:\n",
+        "    def __init__(self):\n",
+        "        self._e = \"utf_8\"\n",
+        "        self._l = \"English\"\n",
+        "        self._c = 0.05\n",
+        "    @property\n",
+        "    def encoding(self) -> str:\n",
+        "        return self._e\n",
+        "    @property\n",
+        "    def language(self) -> str:\n",
+        "        return self._l\n",
+        "    @property\n",
+        "    def chaos(self) -> float:\n",
+        "        return self._c\n",
+        "\n",
+        "class Matches:\n",
+        "    def __init__(self, ms: list[Match]):\n",
+        "        self._ms: list[Match] = ms\n",
+        "    def best(self) -> Match | None:\n",
+        "        if len(self._ms):\n",
+        "            return self._ms[0]\n",
+        "        return None\n",
+        "\n",
+        "def from_bytes(data: bytes) -> Matches:\n",
+        "    return Matches([Match()])\n",
+        "\n",
+        "def detect(byte_str: bytes) -> str:\n",
+        "    r = from_bytes(byte_str).best()\n",
+        "    encoding = r.encoding if r is not None else None\n",
+        "    language = r.language if r is not None and r.language != \"Unknown\" else \"\"\n",
+        "    confidence = 1.0 - r.chaos if r is not None else None\n",
+        "    if confidence is not None and confidence >= 0.9:\n",
+        "        confidence -= 0.2\n",
+        "    label = (encoding if encoding is not None else \"none\") + \"/\" + language\n",
+        "    if confidence is not None:\n",
+        "        label += \"/\" + str(confidence)\n",
+        "    return label\n",
+    );
+    let out = compile(src, "detect.py");
+    // The ternary's true branch reads the UNWRAPPED receiver through the
+    // property getter, Some-wrapped into the Option the None else keeps.
+    assert!(
+        out.contains("if ! (r) . py_is_none () { Some ((r) . clone ()")
+            && out.contains(". encoding () ?) } else { None }"),
+        "no Some-wrapped narrowed property read: {}",
+        out
+    );
+    // The compound test narrows the SECOND conjunct's read too
+    // (`r.language` in `r is not None and r.language != "Unknown"`).
+    assert!(
+        out.contains("language () ?) . py_ne"),
+        "and-chain operand did not narrow: {}",
+        out
+    );
+    // The confidence aug-assign inside the `is not None` guard stores the
+    // subtracted INNER back Some-wrapped (never `(x).unwrap() -= v`).
+    assert!(
+        out.contains("confidence = Some ((confidence) . clone () . unwrap () - 0.2)"),
+        "aug-assign on the narrowed Option not Some-wrapped: {}",
+        out
+    );
+}
+
+#[test]
 fn python_list_methods_map_to_correct_rust() {
     let src = concat!(
         "def f() -> int:\n",
