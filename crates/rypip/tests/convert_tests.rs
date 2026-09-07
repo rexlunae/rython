@@ -9635,6 +9635,75 @@ fn a_vendored_dependencys_imports_reach_the_surface_feature_list() {
 }
 
 #[test]
+fn a_crate_modules_exception_qualified_in_a_union_takes_a_caught_exception() {
+    // Devin review on #342, round 8: `errors.MyError | OSError` where
+    // errors.py is a module of the crate — the member resolves through
+    // the crate's module authorities and the exception closure, so the
+    // parameter is the exception type and a caught exception passes in.
+    let scratch = Scratch::new("qualified-union");
+    fs::create_dir_all(scratch.path().join("vendor")).unwrap();
+    fs::write(
+        scratch.path().join("vendor/errors.py"),
+        concat!(
+            "class MyError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def boom() -> None:\n",
+            "    raise MyError(\"qualified\")\n",
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(scratch.path().join("qualapp")).unwrap();
+    fs::write(scratch.path().join("qualapp/__init__.py"), "").unwrap();
+    fs::write(
+        scratch.path().join("qualapp/main.py"),
+        concat!(
+            "import errors\n",
+            "\n",
+            "\n",
+            "def handle(err: errors.MyError | OSError) -> str:\n",
+            "    return \"handled \" + str(err)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    try:\n",
+            "        errors.boom()\n",
+            "    except errors.MyError as e:\n",
+            "        print(handle(e))\n",
+            "    try:\n",
+            "        raise OSError(\"os\")\n",
+            "    except OSError as e:\n",
+            "        print(handle(e))\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("rython.toml"),
+        "[python-modules]\nerrors = { path = \"vendor/errors.py\" }\n",
+    )
+    .unwrap();
+
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let main_rs = fs::read_to_string(krate.root.join("src/main.rs")).unwrap();
+    assert!(main_rs.contains("fn handle(err: PyException)"), "{}", main_rs);
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/qualapp"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3 (PYTHONPATH=vendor python3 qualapp/main.py).
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["handled qualified", "handled os"],
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn an_unreachable_vendored_module_does_not_add_a_surface() {
     // `convert` transpiles only import-reachable modules, so a vendored
     // dependency the program never imports contributes no code to the

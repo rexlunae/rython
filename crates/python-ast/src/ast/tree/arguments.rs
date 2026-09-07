@@ -412,10 +412,55 @@ fn is_exception_class_member_within(
                 || crate::ast::tree::raise_stmt::is_exception_class_name(&n.id)
         }
         ExprType::Attribute(a) => {
-            let ExprType::Name(m) = a.value.as_ref() else {
+            // The dotted module path (`errors.MyError`, `pkg.errors.MyError`);
+            // an aliased root (`import errors as e`) is the module it
+            // names.
+            let mut path: Vec<String> = Vec::new();
+            let mut cur = a.value.as_ref();
+            loop {
+                match cur {
+                    ExprType::Name(m) => {
+                        path.push(m.id.clone());
+                        break;
+                    }
+                    ExprType::Attribute(inner) => {
+                        path.push(inner.attr.clone());
+                        cur = inner.value.as_ref();
+                    }
+                    _ => return false,
+                }
+            }
+            path.reverse();
+            if let Some(crate::SymbolTableNode::Alias(target)) = symbols.get(&path[0]) {
+                let mut target: Vec<String> = target.split('.').map(str::to_string).collect();
+                target.extend(path.drain(1..));
+                path = target;
+            }
+            if let [m] = path.as_slice()
+                && crate::ast::tree::raise_stmt::stdlib_exception_canonical(m, &a.attr).is_some()
+            {
+                return true;
+            }
+            // A module the CRATE holds: its class, judged by the one
+            // exception closure (re-export chains followed) — Devin
+            // review on #342, round 8.
+            let key: Vec<String> = crate::ast::tree::module::module_defs_key(options, &path)
+                .map(|k| k.to_vec())
+                .unwrap_or_else(|| path.clone());
+            if let Some((class, _)) =
+                crate::ast::tree::module::module_class_def(options, &key, &a.attr).or_else(|| {
+                    crate::ast::tree::module::resolve_imported_class(options, &key, &a.attr, 0)
+                })
+            {
+                return crate::is_exception_class(&class);
+            }
+            if options.module_defs.contains_key(&key) {
+                // A crate module without that class: not an exception.
                 return false;
-            };
-            crate::ast::tree::raise_stmt::stdlib_exception_canonical(&m.id, &a.attr).is_some()
+            }
+            // A module the crate does not hold (external): the naming
+            // convention, as for an unresolved bare name.
+            crate::ast::tree::raise_stmt::is_exception_class_name(&a.attr)
         }
         _ => false,
     }

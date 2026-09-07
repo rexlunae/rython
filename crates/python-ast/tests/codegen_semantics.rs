@@ -22301,3 +22301,23 @@ fn quoted_scalar_and_optional_annotations_type_the_local_like_the_plain_spelling
     );
     assert_eq!(quoted, plain, "the quoted spelling lowers exactly like the plain one");
 }
+
+#[test]
+fn a_module_qualified_exception_member_takes_the_exception_rule() {
+    // Devin review on #342, round 8: `errors.MyError | OSError` — the
+    // qualified member is judged through the crate's module authorities
+    // when the module is the crate's, and by the naming convention when
+    // it is not (here `errors` is external to this one-module crate).
+    let out = compile(
+        "import errors\n\
+         \n\
+         def handle(err: errors.MyError | OSError) -> str:\n\
+         \x20   return \"handled \" + str(err)\n\
+         \n\
+         def plain(x: errors.Thing | int) -> str:\n\
+         \x20   return str(x)\n",
+        "qualified.py",
+    );
+    assert!(out.contains("handle (err : PyException)"), "{}", out);
+    assert!(!out.contains("plain (x : PyException)"), "a non-exception qualified member: {}", out);
+}

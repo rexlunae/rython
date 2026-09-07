@@ -34,6 +34,10 @@ pub struct Version {
     pub pre: Option<(String, u64)>,
     pub post: Option<u64>,
     pub dev: Option<u64>,
+    /// The PEP 440 local version label (`1.0+cpu` → `cpu`), normalized
+    /// to lowercase with `.` separators; kept through the cache so an
+    /// offline resolution reports the artifact's own version.
+    pub local: Option<String>,
 }
 
 /// Parse `requests>=2.0,<3 ; python_version < "3.10" [extra]`-style
@@ -146,6 +150,18 @@ pub fn parse_version(s: &str) -> Option<Version> {
         Some((e, r)) => (e.trim().parse().ok()?, r),
         None => (0, s),
     };
+    // The local label (`+cpu`, `+ubuntu.1`): after everything else,
+    // normalized like the rest (PEP 440 local versions).
+    let (rest, local) = match rest.split_once('+') {
+        Some((public, label)) => {
+            let label = label.trim().to_ascii_lowercase().replace(['-', '_'], ".");
+            if label.is_empty() {
+                return None;
+            }
+            (public, Some(label))
+        }
+        None => (rest, None),
+    };
     let rest = rest.replace('-', ".");
 
     // Split off pre/post/dev suffixes.
@@ -242,6 +258,7 @@ pub fn parse_version(s: &str) -> Option<Version> {
         pre,
         post,
         dev,
+        local,
     })
 }
 
@@ -262,13 +279,45 @@ fn read_number(chars: &[char], mut i: usize) -> (u64, usize) {
 }
 
 /// Compare two versions per PEP 440 ordering.
+/// The local label's comparison key (PEP 440): no label sorts before
+/// any label; segment-wise, numeric segments compare numerically and
+/// after alphanumeric ones, alphanumeric ones lexically.
+fn local_key(v: &Version) -> Vec<(u8, u64, String)> {
+    v.local
+        .as_deref()
+        .map(|label| {
+            label
+                .split('.')
+                .map(|seg| match seg.parse::<u64>() {
+                    Ok(n) => (1, n, String::new()),
+                    Err(_) => (0, 0, seg.to_string()),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `version_cmp` against a SPECIFIER's version: a specifier without a
+/// local label matches any local variant of that public version (PEP
+/// 440), so the candidate's label is ignored then.
+fn cmp_for_specifier(version: &Version, spec: &Version) -> Ordering {
+    if spec.local.is_none() && version.local.is_some() {
+        let public = Version {
+            local: None,
+            ..version.clone()
+        };
+        return version_cmp(&public, spec);
+    }
+    version_cmp(version, spec)
+}
+
 pub fn version_cmp(a: &Version, b: &Version) -> Ordering {
     let a_key = cmp_key(a);
     let b_key = cmp_key(b);
     a_key.cmp(&b_key)
 }
 
-fn cmp_key(v: &Version) -> (u64, Vec<u64>, (u8, u64, u64), u64, u64) {
+fn cmp_key(v: &Version) -> (u64, Vec<u64>, (u8, u64, u64), u64, u64, Vec<(u8, u64, String)>) {
     let mut release = v.release.clone();
     while release.last() == Some(&0) {
         release.pop();
@@ -301,6 +350,7 @@ fn cmp_key(v: &Version) -> (u64, Vec<u64>, (u8, u64, u64), u64, u64) {
         pre,
         v.post.unwrap_or(0),
         dev_key,
+        local_key(v),
     )
 }
 
@@ -322,27 +372,27 @@ pub fn matches_specifier(version: &Version, op: &str, spec: &str) -> bool {
                 return prefix.iter().zip(release.iter()).all(|(p, r)| p == r);
             }
             match parse_version(spec) {
-                Some(sv) => version_cmp(version, &sv) == Ordering::Equal,
+                Some(sv) => cmp_for_specifier(version, &sv) == Ordering::Equal,
                 None => false,
             }
         }
         "!=" => !matches_specifier(version, "==", spec),
         ">=" => {
             match parse_version(spec) {
-                Some(sv) => version_cmp(version, &sv) != Ordering::Less,
+                Some(sv) => cmp_for_specifier(version, &sv) != Ordering::Less,
                 None => false,
             }
         }
         ">" => match parse_version(spec) {
-            Some(sv) => version_cmp(version, &sv) == Ordering::Greater,
+            Some(sv) => cmp_for_specifier(version, &sv) == Ordering::Greater,
             None => false,
         },
         "<=" => match parse_version(spec) {
-            Some(sv) => version_cmp(version, &sv) != Ordering::Greater,
+            Some(sv) => cmp_for_specifier(version, &sv) != Ordering::Greater,
             None => false,
         },
         "<" => match parse_version(spec) {
-            Some(sv) => version_cmp(version, &sv) == Ordering::Less,
+            Some(sv) => cmp_for_specifier(version, &sv) == Ordering::Less,
             None => false,
         },
         "~=" => {
@@ -939,6 +989,10 @@ fn version_str_of(v: &Version) -> String {
     if let Some(d) = v.dev {
         s.push_str(".dev");
         s.push_str(&d.to_string());
+    }
+    if let Some(local) = &v.local {
+        s.push('+');
+        s.push_str(local);
     }
     s
 }

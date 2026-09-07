@@ -659,6 +659,39 @@ fn a_wheel_arriving_after_the_sdist_was_extracted_wins() {
 }
 
 #[test]
+fn cached_local_versions_keep_their_label_and_match_their_public_version() {
+    // A `+local` label (PEP 440) survives the cache — the offline
+    // resolution reports `1.0+cpu` — and a specifier without a label
+    // (`==1.0`) matches the local variant while `==1.0+gpu` does not
+    // (Devin review on #342, round 8).
+    let scratch = Scratch::new("cache-local");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("loc");
+    write_wheel(&dist_dir, "loc", "1.0+cpu", &[("loc/__init__.py", "")]);
+    let exact = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("loc==1.0+cpu").unwrap(),
+        true,
+    )
+    .expect("the local version resolves under its own spelling");
+    assert_eq!(exact.version, "1.0+cpu");
+    let public = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("loc==1.0").unwrap(),
+        true,
+    )
+    .expect("a public specifier matches the local variant");
+    assert_eq!(public.version, "1.0+cpu");
+    let err = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("loc==1.0+gpu").unwrap(),
+        true,
+    )
+    .expect_err("another label is another version");
+    assert!(err.to_string().contains("offline"), "{err:?}");
+}
+
+#[test]
 fn cached_epoch_versions_keep_their_epoch() {
     // An epoch-qualified artifact (`1!2.0`) resolves offline under the
     // same version spelling the online path records (Devin review on

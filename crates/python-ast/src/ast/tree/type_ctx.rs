@@ -645,6 +645,26 @@ thread_local! {
     static NAME_INFERENCE_PATH: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// One name on the inference path, popped when the hop ends — by
+/// normal return OR by unwinding (Devin review on #342, round 8: a
+/// caught panic must not leave the name behind as a false cycle).
+struct NameInferenceEntry;
+
+impl NameInferenceEntry {
+    fn enter(name: String) -> Self {
+        NAME_INFERENCE_PATH.with(|path| path.borrow_mut().push(name));
+        NameInferenceEntry
+    }
+}
+
+impl Drop for NameInferenceEntry {
+    fn drop(&mut self) {
+        NAME_INFERENCE_PATH.with(|path| {
+            path.borrow_mut().pop();
+        });
+    }
+}
+
 fn infer_type_inner(
     ctx: Option<&CodeGenContext>,
     expr: &ExprType,
@@ -713,12 +733,8 @@ fn infer_type_inner(
                 if on_path {
                     return TypeInfo::PyObject;
                 }
-                NAME_INFERENCE_PATH.with(|path| path.borrow_mut().push(n.id.clone()));
-                let inferred = infer_type_inner(ctx, value, options, symbols);
-                NAME_INFERENCE_PATH.with(|path| {
-                    path.borrow_mut().pop();
-                });
-                return inferred;
+                let _entry = NameInferenceEntry::enter(n.id.clone());
+                return infer_type_inner(ctx, value, options, symbols);
             }
             // A CLASS NAME read as a VALUE (`[ChecksumError]`,
             // `EXCEPTION_MAP['k']` — botocore's retryhandler): classes as
