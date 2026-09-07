@@ -610,6 +610,31 @@ fn a_replaced_artifact_rebuilds_its_extraction() {
 }
 
 #[test]
+fn a_cached_wheel_is_preferred_over_the_sdist_of_the_same_version() {
+    // The offline choice is the online one: at one version a wheel
+    // beats an sdist whatever the directory order (Devin review on
+    // #342, round 6).
+    let scratch = Scratch::new("cache-wheel-vs-sdist");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("both");
+    write_sdist(&dist_dir, "both", "1.0", "both");
+    write_wheel(&dist_dir, "both", "1.0", &[("both/__init__.py", "KIND = 'wheel'\n")]);
+    let dep = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("both==1.0").unwrap(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(dep.version, "1.0");
+    assert!(
+        dep.path.starts_with(dist_dir.join("extracted/both-1.0-py3-none-any")),
+        "the wheel's extraction: {}",
+        dep.path.display()
+    );
+    assert!(fs::read_to_string(dep.path.join("__init__.py")).unwrap().contains("wheel"));
+}
+
+#[test]
 fn cached_epoch_versions_keep_their_epoch() {
     // An epoch-qualified artifact (`1!2.0`) resolves offline under the
     // same version spelling the online path records (Devin review on

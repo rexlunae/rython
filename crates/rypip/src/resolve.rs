@@ -611,8 +611,23 @@ pub fn resolve_dependency_in(cache: &Path, req: &Requirement, offline: bool) -> 
     let sidecar = digest_sidecar(&artifact_path);
     publish_file(&sidecar, format!("{expected}\n").as_bytes())?;
 
-    // Extract (wheels are zips, sdists are gzipped tarballs).
-    let package_dir = extract_distribution(&artifact_path, &dist_dir, &req.name)?;
+    // Extract (wheels are zips, sdists are gzipped tarballs). The
+    // extraction verifies the published artifact against its sidecar; a
+    // torn pair (a concurrent publisher of another download interleaved
+    // with ours) is healed by publishing our verified pair again, once.
+    let package_dir = match extract_distribution(&artifact_path, &dist_dir, &req.name) {
+        Ok(dir) => dir,
+        Err(e) if e.to_string().contains("sha256 mismatch") => {
+            let bytes = fetch_bytes(&url)?;
+            if sha256_hex(&bytes) != expected {
+                return Err(e);
+            }
+            publish_file(&artifact_path, &bytes)?;
+            publish_file(&sidecar, format!("{expected}\n").as_bytes())?;
+            extract_distribution(&artifact_path, &dist_dir, &req.name)?
+        }
+        Err(e) => return Err(e),
+    };
     Ok(finalize_dependency(package_dir, &req.name, &best_version))
 }
 
@@ -832,12 +847,19 @@ fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDep
             candidates.push((version, Cached::Artifact(path)));
         }
     }
-    // Ascending by version; at one version the extraction sorts after the
-    // artifact, so the last element is the newest version, extracted if
-    // it already is.
+    // Ascending by version; at one version a complete extraction sorts
+    // after a wheel, a wheel after an sdist, so the last element is the
+    // newest version in the online preference, extracted if it already
+    // is.
     candidates.sort_by(|(va, ca), (vb, cb)| {
         version_cmp(va, vb).then_with(|| {
-            let rank = |c: &Cached| matches!(c, Cached::Extracted(_)) as u8;
+            // The online preference, in any directory order: a complete
+            // extraction, then a wheel, then an sdist (Devin review on
+            // #342, round 6).
+            let rank = |c: &Cached| match c {
+                Cached::Extracted(_) => 2u8,
+                Cached::Artifact(p) => p.extension().is_some_and(|e| e == "whl") as u8,
+            };
             rank(ca).cmp(&rank(cb))
         })
     });
@@ -953,10 +975,24 @@ fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Re
     let extract_dir = extraction_dir(dist_dir, file_name);
     let extracted = dist_dir.join("extracted");
     let stem = artifact_stem(file_name).unwrap_or(file_name);
-    // The artifact's verified digest (its sidecar — written before any
-    // extraction, checked by the offline lookup): what the extraction is
-    // complete FOR.
+    // The artifact's bytes, read ONCE and verified against its sidecar:
+    // the bytes that unpack are the bytes the marker's digest names,
+    // and a torn artifact/sidecar pair (two publishers of different
+    // downloads interleaving) is a loud mismatch, never an unverified
+    // extraction (Devin review on #342, round 6).
+    let bytes = fs::read(artifact).with_context(|| format!("reading {}", artifact.display()))?;
     let digest = recorded_digest(artifact)?;
+    let actual = sha256_hex(&bytes);
+    if actual != digest {
+        bail!(
+            "sha256 mismatch for the cached artifact {}: its recorded digest is {}, the file \
+             hashes to {} — the artifact and its digest were published apart; resolve again \
+             (a concurrent resolver completes the pair) or delete both to fetch anew",
+            artifact.display(),
+            digest,
+            actual
+        );
+    }
     if extraction_complete(&extract_dir, &digest) {
         return locate_extracted_root(&extract_dir);
     }
@@ -973,7 +1009,7 @@ fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Re
     let partial = extracted.join(format!("{stem}{PARTIAL_INFIX}{}", temporary_suffix()));
     fs::create_dir_all(&partial)?;
     let published =
-        publish_extraction(artifact, file_name, dist_name, &digest, &partial, &extract_dir);
+        publish_extraction(&bytes, file_name, dist_name, &digest, &partial, &extract_dir);
     // Whatever happened, this invocation's sibling is gone: on success it
     // was renamed away (or the other resolver's tree won), on failure
     // its unpacked files are not left for the cache to skip forever.
@@ -1023,7 +1059,7 @@ fn set_aside_incomplete(
 /// into `extract_dir`. A rename that fails because another resolver
 /// published a COMPLETE tree there meanwhile is that tree's success.
 fn publish_extraction(
-    artifact: &Path,
+    bytes: &[u8],
     file_name: &str,
     dist_name: &str,
     digest: &str,
@@ -1031,10 +1067,9 @@ fn publish_extraction(
     extract_dir: &Path,
 ) -> Result<()> {
     if file_name.ends_with(".whl") || file_name.ends_with(".zip") {
-        let file = fs::File::open(artifact)
-            .with_context(|| format!("opening {}", artifact.display()))?;
+        let file = std::io::Cursor::new(bytes);
         let mut archive = zip::ZipArchive::new(file)
-            .with_context(|| format!("reading zip {}", artifact.display()))?;
+            .with_context(|| format!("reading zip {file_name}"))?;
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i).context("reading zip entry")?;
             let out_path = entry
@@ -1054,13 +1089,12 @@ fn publish_extraction(
         }
     } else {
         // gzipped tarball (sdist).
-        let file = fs::File::open(artifact)
-            .with_context(|| format!("opening {}", artifact.display()))?;
+        let file = std::io::Cursor::new(bytes);
         let gz = flate2::read::GzDecoder::new(file);
         let mut archive = tar::Archive::new(gz);
         archive
             .unpack(partial)
-            .with_context(|| format!("extracting {}", artifact.display()))?;
+            .with_context(|| format!("extracting {file_name}"))?;
     }
     locate_extracted_root(partial).with_context(|| {
         format!(
@@ -1458,6 +1492,21 @@ mod extraction_tests {
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_torn_artifact_sidecar_pair_never_extracts() {
+        // Devin review on #342, round 6: an artifact whose bytes do not
+        // hash to its sidecar's digest is a loud mismatch, never an
+        // extraction under a digest it does not have.
+        let dist_dir = scratch("torn");
+        let artifact = dist_dir.join("idna-1.0-py3-none-any.whl");
+        fs::write(&artifact, b"not the bytes the sidecar names").unwrap();
+        fs::write(digest_sidecar(&artifact), format!("{DIGEST}\n")).unwrap();
+        let err = extract_distribution(&artifact, &dist_dir, "idna").unwrap_err();
+        assert!(err.to_string().contains("sha256 mismatch"), "{err:?}");
+        assert!(!dist_dir.join("extracted/idna-1.0-py3-none-any").exists());
+        let _ = fs::remove_dir_all(&dist_dir);
     }
 
     #[test]

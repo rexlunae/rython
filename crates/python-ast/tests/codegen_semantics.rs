@@ -22226,3 +22226,26 @@ fn bare_imports_of_typing_are_silent_and_of_runtime_annotation_modules_are_loud(
     assert!(warnings.iter().any(|w| w.contains("import `contextlib` is dropped")), "{warnings:?}");
     assert!(!warnings.iter().any(|w| w.contains("import `typing` is dropped")), "{warnings:?}");
 }
+
+#[test]
+fn a_convention_named_value_binding_is_not_an_exception_union_member() {
+    // Devin review on #342, round 6: `NetworkError = 1` is a value, so
+    // `NetworkError | ValueError` is a MIXED union (boxed), not the
+    // exception type; an alias to an exception name still is one.
+    let out = compile(
+        "NetworkError = 1\n\
+         Alias = ValueError\n\
+         \n\
+         def mixed(err: NetworkError | ValueError) -> str:\n\
+         \x20   return str(err)\n\
+         \n\
+         def aliased(err: Alias | OSError) -> str:\n\
+         \x20   return str(err)\n",
+        "convention_value.py",
+    );
+    // `1 | ValueError` is not a type at all (Python raises at the
+    // annotation): the only rule is that it is NOT the exception type —
+    // the rendering is the non-type union's, which rustc rejects loudly.
+    assert!(!out.contains("mixed (err : PyException)"), "a bound value is not an exception: {}", out);
+    assert!(out.contains("aliased (err : PyException)"), "an alias to an exception is one: {}", out);
+}

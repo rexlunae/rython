@@ -337,6 +337,24 @@ pub(crate) fn is_exception_class_member(
             {
                 return crate::is_exception_class(&class);
             }
+            // A name BOUND in scope as a value (`NetworkError = 1`) is
+            // that value, whatever its spelling: the naming convention
+            // applies to genuinely unresolved names only (Devin review
+            // on #342, round 6). A binding to another name or attribute
+            // (`NetworkError = requests.ConnectionError`) is judged by
+            // what it names.
+            match symbols.get(&n.id) {
+                Some(crate::SymbolTableNode::Assign { value, .. }) => {
+                    return matches!(value, ExprType::Name(_) | ExprType::Attribute(_))
+                        && !crate::expr_references(value, &n.id)
+                        && is_exception_class_member(value, symbols, options);
+                }
+                Some(crate::SymbolTableNode::Alias(target)) if target != &n.id => {
+                    let target = ExprType::Name(crate::Name { id: target.clone() });
+                    return is_exception_class_member(&target, symbols, options);
+                }
+                _ => {}
+            }
             crate::ast::tree::raise_stmt::is_builtin_exception_name(&n.id)
                 || crate::ast::tree::raise_stmt::imported_exception_alias(
                     &n.id,
