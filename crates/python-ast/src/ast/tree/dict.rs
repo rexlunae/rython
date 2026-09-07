@@ -163,6 +163,18 @@ impl CodeGen for Dict {
                     .into());
                 }
                 v_expected = crate::TypeInfo::PyValue;
+            } else {
+                // All values are string TUPLES of different LENGTHS
+                // (`{100: ("continue",), 102: ("processing",
+                // "early-hints"), ...}` — requests' status codes): every
+                // value renders as its element VEC (the sequence model,
+                // applied in the pairs loop below), so the arities share
+                // one Vec<String> value type instead of heterogeneous
+                // Rust tuples rustc cannot unify (the old code detected
+                // the shape but left v_expected untouched — the raw
+                // PyDict::from then failed to build; Devin review on the
+                // round-100 gate).
+                v_expected = crate::TypeInfo::Vec(Box::new(crate::TypeInfo::String));
             }
         }
         let k_expected = if matches!(k_expected, crate::TypeInfo::PyObject) {
@@ -206,13 +218,34 @@ impl CodeGen for Dict {
                         symbols.clone(),
                         k_expected.clone(),
                     )?;
-                    let value_tokens = crate::render_typed(
-                        value,
-                        ctx.clone(),
-                        options.clone(),
-                        symbols.clone(),
-                        v_expected.clone(),
-                    )?;
+                    let value_tokens = if let Some(crate::TypeInfo::Vec(inner)) = &v_expected
+                        && let crate::ExprType::Tuple(t) = value
+                    {
+                        // A TUPLE value in a Vec-typed slot (the
+                        // mixed-length all-string-tuple dict — requests'
+                        // status codes): render each element against the
+                        // inner type and collect — every arity shares the
+                        // Vec value type.
+                        let elts: Result<Vec<_>, _> = t.elts.iter().map(|e| {
+                            crate::render_typed(
+                                e,
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some((**inner).clone()),
+                            )
+                        }).collect();
+                        let elts = elts?;
+                        quote!(vec![#(#elts),*])
+                    } else {
+                        crate::render_typed(
+                            value,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            v_expected.clone(),
+                        )?
+                    };
                     pairs.push(quote! { (#key_tokens, #value_tokens) });
                 }
                 None => {
