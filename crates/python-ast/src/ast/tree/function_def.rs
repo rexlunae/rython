@@ -2630,6 +2630,15 @@ impl FunctionDef {
                             if crate::is_none_expr(other) {
                                 info.name_types
                                     .insert(p.arg.clone(), crate::TypeInfo::Option(Box::new(crate::TypeInfo::PyObject)));
+                            } else if let Some(t) = crate::ast::tree::arguments::exception_union_typeinfo(
+                                other, &symbols, &options,
+                            ) {
+                                // A union of exception classes only: the
+                                // PyException the signature declares
+                                // (arguments.rs — one rule, decided before
+                                // the syntax-only mapping boxes a builtin
+                                // member).
+                                info.name_types.insert(p.arg.clone(), t);
                             } else if matches!(other, ExprType::Subscript(sub)
                                 if matches!(sub.value.as_ref(), ExprType::Name(n)
                                     if matches!(n.id.as_str(), "type" | "Type")))
@@ -2738,6 +2747,52 @@ impl FunctionDef {
             options.use_counts = std::rc::Rc::new(info.use_counts);
             options.name_types = std::rc::Rc::new(info.name_types);
             options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
+        }
+        // A name bound to the boxed PyValue (a parameter whose union
+        // annotation boxes — `body: _TYPE_BODY | None` — or a value-pinned
+        // parameter) is never an Option slot: the box already contains
+        // None, so its `name = None` store is the boxed None. The analysis
+        // records every None store as an optional name; the codegen's set
+        // is filtered by the final binding types (urllib3's urlopen drops
+        // the body under a 303 redirect: `body = None` on a PyValue local).
+        // A PARAMETER's authority is its signature: the annotation must
+        // itself resolve to the boxed value (a bare `dict | None` renders
+        // an Option parameter while the body analysis records the boxed
+        // fallback — that one stays an Option slot). A local's authority
+        // is the analysis's joined type.
+        let boxed_binding = |n: &String| -> bool {
+            let param = self
+                .args
+                .args
+                .iter()
+                .chain(self.args.posonlyargs.iter())
+                .chain(self.args.kwonlyargs.iter())
+                .find(|p| p.arg == *n);
+            match param {
+                Some(p) => {
+                    options.pyvalue_into_params.contains(n)
+                        || p.annotation.as_deref().is_some_and(|ann| {
+                            matches!(
+                                crate::resolve_alias_typeinfo(ann, &symbols, &options)
+                                    .or_else(|| crate::annotation_type_info(ann)),
+                                Some(crate::TypeInfo::PyValue)
+                            )
+                        })
+                }
+                None => {
+                    matches!(options.name_types.get(n), Some(crate::TypeInfo::PyValue))
+                        || options.pyvalue_into_params.contains(n)
+                }
+            }
+        };
+        if options.optional_names.iter().any(boxed_binding) {
+            let kept: std::collections::HashSet<String> = options
+                .optional_names
+                .iter()
+                .filter(|n| !boxed_binding(n))
+                .cloned()
+                .collect();
+            options.optional_names = std::rc::Rc::new(kept);
         }
         // Empty-container pinning needs the parameter annotations above,
         // so re-run the pin pass now that name_types knows the params

@@ -919,9 +919,31 @@ impl CodeGen for StatementType {
                             )),
                         ));
                     }
-                    let tokens = e
-                        .clone()
-                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                    // A conditional expression returned into a SCALAR
+                    // typed slot (`return "closed" if pool is None else
+                    // "had pool"` in a `-> str` function): each arm
+                    // renders against the return type (a literal arm owns
+                    // itself), through the one typed renderer.
+                    let scalar_return = match options.fn_return_typed.as_ref() {
+                        Some(t @ (crate::TypeInfo::String
+                        | crate::TypeInfo::Bytes
+                        | crate::TypeInfo::Int
+                        | crate::TypeInfo::Float
+                        | crate::TypeInfo::Bool)) => Some(t.clone()),
+                        _ => None,
+                    };
+                    let tokens = if let (ExprType::IfExp(_), Some(slot)) = (&e.value, scalar_return) {
+                        crate::render_typed(
+                            &e.value,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(slot),
+                        )?
+                    } else {
+                        e.clone()
+                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?
+                    };
                     // A `-> List[Union[...]]` return whose element boxes
                     // (idna's `_seg_N` tables): force the RETURNING list
                     // literal's element type so each element boxes

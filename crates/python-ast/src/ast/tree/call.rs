@@ -2827,10 +2827,21 @@ impl<'a> CodeGen for Call {
                         // NAME even though classes aren't values.
                         // The one construction-class resolver (an alias
                         // `R = Root` is Root — Devin review on #330).
+                        // A stdlib exception ALIAS (`isinstance(err,
+                        // SocketTimeout)` under `from socket import timeout
+                        // as SocketTimeout` — urllib3's _raise_timeout)
+                        // canonicalizes to its builtin, as the except
+                        // clause does.
                         let is_exc_class = |name: &str| -> bool {
                             crate::ast::tree::raise_stmt::is_exception_class_name(name)
                                 || resolve_construction_class(name, &symbols, &options)
                                     .is_some_and(|(c, _)| crate::is_exception_class(&c))
+                                || crate::ast::tree::raise_stmt::canonical_exception_class(
+                                    name, &symbols, &options,
+                                )
+                                .is_some_and(|(n, _)| {
+                                    crate::ast::tree::raise_stmt::is_exception_class_name(&n)
+                                })
                         };
                         let first_is_caught_exc = match &self.args[0] {
                             ExprType::Name(_) => true,
@@ -4179,6 +4190,14 @@ impl<'a> CodeGen for Call {
                                             | crate::TypeInfo::PyValue
                                             | crate::TypeInfo::PyValueMember(_)
                                             | crate::TypeInfo::PyObject
+                                            // A PyException-typed parameter
+                                            // (an exception-class union —
+                                            // `str(err)` in urllib3's
+                                            // _raise_timeout): its str() is
+                                            // the exception's display, read
+                                            // through the reference so the
+                                            // name stays usable after.
+                                            | crate::TypeInfo::Custom(_)
                                     )
                                 {
                                     return Ok(quote!(py_display(&(#a))));
@@ -10839,17 +10858,15 @@ fn map_call_arguments_inner(
             // present argument coerces to the boxed value (a PyValue
             // passes through; a class instance cannot be boxed and stays a
             // loud rustc error).
-            // The `X | None` UNION form only (not `Optional[T]` — that
-            // always lowers to a real Option), and only when X resolves to
-            // the boxed PyValue.
+            // Every optional spelling (`X | None`, `Optional[X]`,
+            // `Optional[Alias]` where the alias is a boxing union —
+            // urllib3's `body: _TYPE_BODY | None`), and only when the
+            // whole annotation resolves to the boxed PyValue: the
+            // signature (Parameter::to_rust) resolves the same way, so an
+            // `Optional[...]` that boxes takes a boxed argument, never a
+            // Some-wrapped one.
             if param.annotation.as_deref().is_some_and(|ann| {
-                matches!(
-                    ann,
-                    ExprType::BinOp(op)
-                        if matches!(op.op, crate::BinOps::BitOr)
-                            && (crate::is_none_expr(&op.left)
-                                || crate::is_none_expr(&op.right))
-                ) && matches!(
+                crate::is_optional_annotation(ann) && matches!(
                     // The annotation's alias lives in the CALLEE's module
                     // (`headers: ValidHTTPHeaderSource | None` where
                     // ValidHTTPHeaderSource is defined in _collections.py —
@@ -10886,12 +10903,24 @@ fn map_call_arguments_inner(
                         crate::infer_type(Some(&ctx), expr, &options, &symbols),
                         crate::TypeInfo::Option(_)
                     );
+                // A plain boxable value (a bytes literal into `body:
+                // _TYPE_BODY | None` — the 303-redirect test of urllib3's
+                // urlopen) boxes the same way; an already-boxed value is
+                // the identity, and a class instance is left as is (loud).
+                let arg_infers = crate::ast::tree::type_ctx::infer_type(
+                    Some(&ctx),
+                    expr,
+                    &options,
+                    &symbols,
+                );
+                let arg_is_boxable =
+                    crate::ast::tree::type_ctx::is_boxable_value_type(&arg_infers);
                 return crate::render_typed_reused(
                     expr,
                     ctx.clone(),
                     options.clone(),
                     symbols.clone(),
-                    if arg_is_option {
+                    if arg_is_option || arg_is_boxable {
                         Some(crate::TypeInfo::PyValue)
                     } else {
                         None
@@ -11045,6 +11074,28 @@ fn map_call_arguments_inner(
                         Some(crate::TypeInfo::Class(cn.id.clone()))
                     } else {
                         None
+                    }
+                })
+                // A module-level TYPE ALIAS annotation (`value:
+                // _TYPE_FIELD_VALUE`, `body: _TYPE_BODY` — urllib3's
+                // fields and connectionpool) resolves through the
+                // CALLEE's module (default_symbols) exactly as the
+                // signature does, so the argument coerces to the type the
+                // parameter has (a boxing alias takes `PyValue::from`; an
+                // Option<PyValue> local unwraps to the boxed value). A
+                // `str` alias stays untyped like a bare `str` (the
+                // `impl Into<String>` parameter takes anything).
+                .or_else(|| {
+                    let ann = param.annotation.as_deref()?;
+                    let t = crate::resolve_alias_typeinfo(
+                        ann,
+                        default_symbols.unwrap_or(symbols),
+                        &options,
+                    )?;
+                    if matches!(t, crate::TypeInfo::String) {
+                        None
+                    } else {
+                        Some(t)
                     }
                 })
                 .or_else(|| arg_expected_fallback(param, expr, &ctx, symbols, &options))
@@ -11628,6 +11679,14 @@ pub(crate) fn receiver_is_bytes_like(
                 // (`print(join_sep([...]))` where join_sep -> bytes).
                 || crate::call_return_typeinfo(c, Some(symbols), Some(options))
                     .is_some_and(|t| matches!(t, crate::TypeInfo::Bytes))
+                // A METHOD call whose declared return is bytes
+                // (`print(Response(...)._decode(b"abc", True))`): the
+                // inferrer resolves the receiver's class and the method's
+                // annotation.
+                || matches!(
+                    crate::infer_type(None, receiver, options, symbols),
+                    crate::TypeInfo::Bytes
+                )
         }
         _ => false,
     }

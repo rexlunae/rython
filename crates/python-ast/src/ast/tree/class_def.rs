@@ -5736,10 +5736,18 @@ fn infer_field_type(
         ExprType::Attribute(a) if matches!(a.value.as_ref(), ExprType::Call(_)) => {
             Some(crate::TypeInfo::PyValue)
         }
-        // A list comprehension of foreign objects (`self._decoders =
-        // [_get_decoder(e) for e in ...]` — urllib3's MultiDecoder): the
-        // element type is a boxed PyValue.
-        ExprType::ListComp(_) => Some(crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue))),
+        // A list comprehension (`self._decoders = [_get_decoder(e) for e
+        // in ...]` — urllib3's MultiDecoder): the element type is the
+        // element expression's — a call into a class-returning function
+        // makes a `Vec<Class>` (the hierarchy's slot type for a
+        // polymorphic root, so `d.decompress(data)` over the elements
+        // dispatches), a construction its class; an element the field
+        // inference cannot type (one over the comprehension's own
+        // targets) is the boxed PyValue, as before.
+        ExprType::ListComp(lc) => Some(crate::TypeInfo::Vec(Box::new(
+            infer_field_type(&lc.elt, name_types, symbols, options, class_name)
+                .unwrap_or(crate::TypeInfo::PyValue),
+        ))),
         // Logical combinations (`self.common_cjk = self.is_cjk and
         // character in COMMON_CJK_CHARACTERS`, `not x`) are bool — UNLESS
         // a branch is a boxed value (`excluded_params or frozenset()` —

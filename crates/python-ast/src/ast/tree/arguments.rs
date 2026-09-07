@@ -304,6 +304,72 @@ pub(crate) fn unquote_annotation(annotation: &ExprType) -> Option<ExprType> {
     Some(annotation.clone())
 }
 
+/// Whether a union member names an exception class: a builtin exception
+/// name, an imported stdlib alias (`SocketTimeout`), or a class of the
+/// crate that extends one.
+pub(crate) fn is_exception_class_member(
+    member: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    match member {
+        ExprType::Name(n) => {
+            crate::ast::tree::raise_stmt::is_exception_class_name(&n.id)
+                || crate::ast::tree::raise_stmt::imported_exception_alias(
+                    &n.id,
+                    symbols,
+                    Some(options),
+                )
+                .is_some()
+                || crate::ast::tree::call::resolve_construction_class(&n.id, symbols, options)
+                    .is_some_and(|(c, _)| crate::is_exception_class(&c))
+        }
+        ExprType::Attribute(a) => {
+            let ExprType::Name(m) = a.value.as_ref() else {
+                return false;
+            };
+            crate::ast::tree::raise_stmt::stdlib_exception_canonical(&m.id, &a.attr).is_some()
+        }
+        _ => false,
+    }
+}
+
+/// The type of a `A | B | ...` annotation whose members are ALL exception
+/// classes (optionally with None): the runtime's one exception type,
+/// `PyException`, or `Option<PyException>` with a None member. Any other
+/// union (a boxable or class member, or no exception member) is None.
+/// ONE rule for the signature (Parameter::to_rust) and the body's name
+/// types (function_def.rs), so a parameter's reads see the type its
+/// signature declares.
+pub(crate) fn exception_union_typeinfo(
+    annotation: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<crate::TypeInfo> {
+    let ExprType::BinOp(op) = annotation else {
+        return None;
+    };
+    if !matches!(op.op, crate::BinOps::BitOr) {
+        return None;
+    }
+    let members = crate::union_members(annotation)?;
+    let (none, classes): (Vec<&ExprType>, Vec<&ExprType>) =
+        members.iter().partition(|m| crate::is_none_expr(m));
+    if classes.is_empty()
+        || !classes
+            .iter()
+            .all(|m| is_exception_class_member(m, symbols, options))
+    {
+        return None;
+    }
+    let exception = crate::TypeInfo::Custom(quote!(PyException));
+    Some(if none.is_empty() {
+        exception
+    } else {
+        crate::TypeInfo::Option(Box::new(exception))
+    })
+}
+
 pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStream> {
     // ONE annotation authority (issue #137's systemic review of rounds
     // 38–47): the leaf mapping lives in `annotation_type_info` (with the
@@ -363,6 +429,17 @@ impl CodeGen for Parameter {
             // alias in another module resolves through symbols
             // (charset_normalizer). Anything else falls back to rendering
             // the annotation expression (e.g. a user-defined class name).
+            // A union of exception classes only (`err: BaseSSLError |
+            // OSError | SocketTimeout` — urllib3's _raise_timeout): the
+            // exception model has one runtime type, so the parameter IS a
+            // PyException (an Option of one with a None member) — a caught
+            // exception passes straight in, and `isinstance(err, X)` tests
+            // its kind like an except clause. Decided FIRST: the
+            // syntax-only mapping boxes a builtin exception member.
+            if let Some(t) = exception_union_typeinfo(&annotation, &symbols, &options) {
+                let rust_type = t.to_rust_type();
+                return Ok(quote!(#param_name: #rust_type));
+            }
             let rust_type = match python_annotation_to_rust_type(&annotation) {
                 Some(mapped) => mapped,
                 None => {
@@ -375,24 +452,15 @@ impl CodeGen for Parameter {
                         && !members.is_empty()
                         && members.iter().all(|m| {
                             crate::is_pyvalue_boxable_member(m)
-                                || matches!(m, ExprType::Name(n)
-                                    if crate::ast::tree::raise_stmt::is_exception_class_name(&n.id)
-                                        || crate::ast::tree::raise_stmt::imported_exception_alias(
-                                            &n.id,
-                                            &symbols,
-                                            Some(&options),
-                                        )
-                                        .is_some())
+                                || is_exception_class_member(m, &symbols, &options)
                         })
                     {
-                        // A union with exception-class members (`err:
-                        // BaseSSLError | OSError | SocketTimeout` —
-                        // urllib3's _raise_timeout): exceptions are boxed
-                        // values, so the parameter boxes. Checked only
-                        // AFTER the direct mapping, so `str | bytes` still
-                        // lowers to StrOrBytes. Members resolve through
-                        // the naming convention and the symbol table
-                        // (import aliases like SocketTimeout).
+                        // A union MIXING exception classes with boxable
+                        // members: exceptions have no boxed representation,
+                        // so the parameter boxes and an exception argument
+                        // stays a loud mismatch. Checked only AFTER the
+                        // direct mapping, so `str | bytes` still lowers to
+                        // StrOrBytes.
                         quote!(stdpython::PyValue)
                     } else {
                         annotation.to_rust(ctx, options, symbols)?

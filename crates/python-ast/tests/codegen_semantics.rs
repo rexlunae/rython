@@ -11804,21 +11804,32 @@ fn resolved_import_try_splices_body_and_drops_dead_handler() {
 }
 
 #[test]
-fn exception_union_parameter_boxes_to_pyvalue() {
+fn exception_union_parameter_is_a_pyexception() {
     // `err: BaseSSLError | OSError | SocketTimeout` (urllib3's
     // _raise_timeout): exception members — by naming convention or via
-    // the imported-alias table — box the parameter as PyValue instead of
-    // rendering the union literally (invalid Rust).
+    // the imported-alias table — make the parameter the runtime's one
+    // exception type (issue #335; it used to box as PyValue, which holds
+    // no exception, so a caught exception never fit the slot) instead of
+    // rendering the union literally (invalid Rust). A union MIXING an
+    // exception with a boxable member still boxes.
     let out = compile(
         "from socket import timeout as SocketTimeout\n\
          \n\
          def f(err: BaseSSLError | OSError | SocketTimeout) -> None:\n\
+         \x20   pass\n\
+         \n\
+         def g(err: OSError | str | None) -> None:\n\
          \x20   pass\n",
         "excunion.py",
     );
     assert!(
-        out.contains("err : stdpython :: PyValue"),
-        "an all-exception union parameter must box: {}",
+        out.contains("err : PyException"),
+        "an all-exception union parameter is a PyException: {}",
+        out
+    );
+    assert!(
+        out.contains("g (err : stdpython :: PyValue)"),
+        "a mixed union parameter still boxes: {}",
         out
     );
     assert!(
@@ -14876,9 +14887,22 @@ fn a_none_stored_local_into_a_boxed_class_param_unwraps() {
         ),
         "boxedparam.py",
     );
+    // Issue #335: the local's binding IS the boxed value (its None store
+    // is the boxed None, never an Option slot — the box already contains
+    // None), so the argument passes through unchanged.
     assert!(
-        out.contains("(conn) . unwrap_or (stdpython :: PyValue :: None_)"),
-        "the None-stored local must unwrap to the boxed value with Python's None passing through: {}",
+        out.contains("conn = PyValue :: None_ ;"),
+        "the None store into the boxed local is the boxed None: {}",
+        out
+    );
+    assert!(
+        out.contains("_prepare_proxy (conn) ?"),
+        "the boxed local passes into the boxed slot unchanged: {}",
+        out
+    );
+    assert!(
+        !out.contains("unwrap_or (stdpython :: PyValue :: None_)"),
+        "no Option unwrap remains on a boxed binding: {}",
         out
     );
 }
