@@ -22145,3 +22145,29 @@ fn a_cyclic_exception_chain_is_refused() {
     );
     assert!(err.contains("cyclic inheritance"), "error: {}", err);
 }
+
+#[test]
+fn comprehension_fields_type_their_elements_through_the_generator_targets() {
+    // Issue #335 (Devin review on #342, round 3): a field assigned a list
+    // comprehension types its element through the comprehension scope's
+    // targets — `m` over `modes.split(",")` is a str, so `m.strip()` is a
+    // String element; `len(x)` over a `list[str]` parameter is an int
+    // element; a call into a class-returning function is that class.
+    let out = compile(
+        "class Decoder:\n\
+         \x20   pass\n\
+         \n\
+         def make(name: str) -> Decoder:\n\
+         \x20   return Decoder()\n\
+         \n\
+         class Multi:\n\
+         \x20   def __init__(self, modes: str, xs: list[str]) -> None:\n\
+         \x20       self._names = [m.strip() for m in modes.split(\",\")]\n\
+         \x20       self._lens = [len(x) for x in xs]\n\
+         \x20       self._decoders = [make(m) for m in modes.split(\",\")]\n",
+        "compfields.py",
+    );
+    assert!(out.contains("_names : Vec < String >"), "str element over a str target: {}", out);
+    assert!(out.contains("_lens : Vec < i64 >"), "len element over a list[str] target: {}", out);
+    assert!(out.contains("_decoders : Vec < Decoder >"), "class element: {}", out);
+}

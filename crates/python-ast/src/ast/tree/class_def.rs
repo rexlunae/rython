@@ -5744,10 +5744,33 @@ fn infer_field_type(
         // dispatches), a construction its class; an element the field
         // inference cannot type (one over the comprehension's own
         // targets) is the boxed PyValue, as before.
-        ExprType::ListComp(lc) => Some(crate::TypeInfo::Vec(Box::new(
-            infer_field_type(&lc.elt, name_types, symbols, options, class_name)
-                .unwrap_or(crate::TypeInfo::PyValue),
-        ))),
+        ExprType::ListComp(lc) => {
+            // The generators' targets are typed by the comprehension
+            // scope (the one binder authority — `m` over `modes.split(",")`
+            // is a str), so an element over them types too (Devin review
+            // on #342): the field inference over the scoped names first,
+            // the general inferrer in that scope second.
+            let field_ctx = crate::CodeGenContext::Class(class_name.to_string());
+            let scope = crate::ast::tree::type_ctx::comprehension_scope(
+                &lc.generators,
+                Some(&field_ctx),
+                options,
+                symbols,
+            );
+            let mut scoped_names = name_types.clone();
+            scoped_names.extend(scope.name_types.iter().map(|(k, v)| (k.clone(), v.clone())));
+            // The field inference's boxed fallback for an element it
+            // cannot type (a builtin call over a target) defers to the
+            // scoped inferrer's concrete answer (`len(x)` is an int).
+            let elt = infer_field_type(&lc.elt, &scoped_names, symbols, &scope, class_name)
+                .filter(|t| !matches!(t, crate::TypeInfo::PyValue | crate::TypeInfo::PyObject))
+                .or_else(|| {
+                    let t = crate::infer_type(Some(&field_ctx), &lc.elt, &scope, symbols);
+                    (!matches!(t, crate::TypeInfo::PyObject)).then_some(t)
+                })
+                .unwrap_or(crate::TypeInfo::PyValue);
+            Some(crate::TypeInfo::Vec(Box::new(elt)))
+        }
         // Logical combinations (`self.common_cjk = self.is_cjk and
         // character in COMMON_CJK_CHARACTERS`, `not x`) are bool — UNLESS
         // a branch is a boxed value (`excluded_params or frozenset()` —

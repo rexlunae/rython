@@ -668,8 +668,22 @@ fn is_pure_wheel(file_name: &str) -> bool {
 /// kind derive from it). A directory without it — an interrupted
 /// extraction, an older cache layout — is never a cache hit.
 const COMPLETE_MARKER: &str = ".rypip-complete";
-/// The suffix of an in-progress extraction directory (`<stem>.partial-<pid>`).
+/// The infix of an in-progress extraction directory
+/// (`<stem>.partial-<pid>-<n>`).
 const PARTIAL_INFIX: &str = ".partial-";
+/// The infix of an incomplete tree set aside from the extraction path
+/// before it is removed (`<stem>.stale-<pid>-<n>`).
+const STALE_INFIX: &str = ".stale-";
+/// Distinguishes the temporary directories of one process's threads.
+static EXTRACTION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn temporary_suffix() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        EXTRACTION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -752,7 +766,7 @@ fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDep
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if !path.is_dir() || name.contains(PARTIAL_INFIX) {
+            if !path.is_dir() || name.contains(PARTIAL_INFIX) || name.contains(STALE_INFIX) {
                 continue;
             }
             let Some(artifact_name) = extracted_artifact_name(&path) else {
@@ -870,10 +884,16 @@ fn version_str_of(v: &Version) -> String {
     s
 }
 
-/// An in-progress extraction directory older than this is a crashed
-/// run's leftover (unpacking one artifact never takes an hour): removed
-/// before the next extraction of the same artifact.
+/// A temporary extraction directory older than this is a crashed run's
+/// leftover (unpacking one artifact never takes an hour): removed before
+/// the next extraction of the same artifact.
 const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Whether an extraction directory is COMPLETE: it carries the marker
+/// and its distribution root is locatable.
+fn extraction_complete(dir: &Path) -> bool {
+    dir.join(COMPLETE_MARKER).is_file() && locate_extracted_root(dir).is_ok()
+}
 
 /// Extract a wheel or sdist into its own directory under
 /// `{dist_dir}/extracted/{artifact stem}/`, returning the extracted
@@ -882,42 +902,41 @@ const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(60 * 6
 /// versions of one distribution extracted into a shared directory merge
 /// their files (a module the newer version added survives into the older
 /// version's tree), which is not any version of the package. The
-/// extraction is ATOMIC: the archive unpacks into a `<stem>.partial-<pid>`
-/// sibling, the root is located there, the completion marker is written,
-/// and only then is the directory renamed into place — an interrupted
-/// extraction leaves nothing the cache lookup accepts. Every failure
-/// after the sibling was created removes it; a concurrent resolver that
-/// published the same artifact first wins the rename, and its complete
-/// tree is used. A stale sibling of a crashed run is cleared first.
+/// extraction is ATOMIC: the archive unpacks into a
+/// `<stem>.partial-<pid>-<n>` sibling (unique per invocation, threads of
+/// one process included), the root is located there, the completion
+/// marker is written, and only then is the directory renamed into place
+/// — an interrupted extraction leaves nothing the cache lookup accepts.
+/// A COMPLETE tree at the path is never removed: an incomplete one is
+/// set aside by rename first (`set_aside_incomplete`), so a tree another
+/// resolver publishes between the check and the replacement survives
+/// and is used; a concurrent resolver that wins the final rename wins.
+/// Every failure after the sibling was created removes it; a stale
+/// sibling of a crashed run is cleared first.
 fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Result<PathBuf> {
     let file_name = artifact
         .file_name()
         .and_then(|n| n.to_str())
         .context("artifact has no file name")?;
     let extract_dir = extraction_dir(dist_dir, file_name);
-    if extract_dir.join(COMPLETE_MARKER).is_file()
-        && let Ok(root) = locate_extracted_root(&extract_dir)
-    {
-        return Ok(root);
+    let extracted = dist_dir.join("extracted");
+    let stem = artifact_stem(file_name).unwrap_or(file_name);
+    if extraction_complete(&extract_dir) {
+        return locate_extracted_root(&extract_dir);
     }
     // Anything else at that path (a partial extraction, an older cache
-    // layout) is replaced, never extracted over.
-    if extract_dir.exists() {
-        fs::remove_dir_all(&extract_dir)
-            .with_context(|| format!("clearing {}", extract_dir.display()))?;
+    // layout) is set aside and removed — unless it became complete
+    // meanwhile, in which case it is the answer.
+    set_aside_incomplete(&extract_dir, &extracted, stem)?;
+    if extraction_complete(&extract_dir) {
+        return locate_extracted_root(&extract_dir);
     }
-    let stem = artifact_stem(file_name).unwrap_or(file_name);
-    remove_stale_partials(&dist_dir.join("extracted"), stem);
-    let partial = dist_dir
-        .join("extracted")
-        .join(format!("{stem}{PARTIAL_INFIX}{}", std::process::id()));
-    if partial.exists() {
-        fs::remove_dir_all(&partial)
-            .with_context(|| format!("clearing {}", partial.display()))?;
-    }
+    remove_stale_temporaries(&extracted, stem);
+    fs::create_dir_all(&extracted)?;
+    let partial = extracted.join(format!("{stem}{PARTIAL_INFIX}{}", temporary_suffix()));
     fs::create_dir_all(&partial)?;
     let published = publish_extraction(artifact, file_name, dist_name, &partial, &extract_dir);
-    // Whatever happened, this process's sibling is gone: on success it
+    // Whatever happened, this invocation's sibling is gone: on success it
     // was renamed away (or the other resolver's tree won), on failure
     // its unpacked files are not left for the cache to skip forever.
     if partial.exists() {
@@ -925,6 +944,36 @@ fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Re
     }
     published?;
     locate_extracted_root(&extract_dir)
+}
+
+/// Move an INCOMPLETE tree at `extract_dir` out of the way and remove it.
+/// The move is a rename, so a complete tree is never deleted in place: if
+/// the tree turns out complete once set aside (another resolver published
+/// it between the caller's check and the rename), it is renamed back —
+/// or, when the path was filled again meanwhile by another complete
+/// tree, the duplicate is dropped. A path that vanished is fine.
+fn set_aside_incomplete(extract_dir: &Path, extracted: &Path, stem: &str) -> Result<()> {
+    if !extract_dir.exists() {
+        return Ok(());
+    }
+    let aside = extracted.join(format!("{stem}{STALE_INFIX}{}", temporary_suffix()));
+    match fs::rename(extract_dir, &aside) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e).context(format!(
+            "setting aside the incomplete extraction {}",
+            extract_dir.display()
+        ))),
+        Ok(()) => {
+            if extraction_complete(&aside) {
+                if fs::rename(&aside, extract_dir).is_err() {
+                    let _ = fs::remove_dir_all(&aside);
+                }
+                return Ok(());
+            }
+            fs::remove_dir_all(&aside)
+                .with_context(|| format!("removing the incomplete extraction {}", aside.display()))
+        }
+    }
 }
 
 /// Unpack `artifact` into `partial`, validate, mark complete, and rename
@@ -998,18 +1047,18 @@ fn publish_extraction(
     }
 }
 
-/// Remove `<stem>.partial-*` siblings whose last modification is older
-/// than STALE_PARTIAL: a crashed run's leftovers (a live extraction of
-/// one artifact never takes that long). Best effort — a failure to
-/// remove one only leaves it for the next run.
-fn remove_stale_partials(extracted: &Path, stem: &str) {
+/// Remove `<stem>.partial-*` and `<stem>.stale-*` siblings whose last
+/// modification is older than STALE_PARTIAL: a crashed run's leftovers
+/// (a live extraction of one artifact never takes that long). Best
+/// effort — a failure to remove one only leaves it for the next run.
+fn remove_stale_temporaries(extracted: &Path, stem: &str) {
     let Ok(entries) = fs::read_dir(extracted) else {
         return;
     };
-    let prefix = format!("{stem}{PARTIAL_INFIX}");
+    let prefixes = [format!("{stem}{PARTIAL_INFIX}"), format!("{stem}{STALE_INFIX}")];
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(&prefix) {
+        if !prefixes.iter().any(|p| name.starts_with(p)) {
             continue;
         }
         let stale = entry
@@ -1179,4 +1228,73 @@ pub(crate) fn merge_python_modules(
         });
     }
     merged
+}
+
+#[cfg(test)]
+mod extraction_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rypip-extraction-{tag}-{}-{}",
+            std::process::id(),
+            temporary_suffix()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn complete_tree(dir: &Path) {
+        fs::create_dir_all(dir.join("idna")).unwrap();
+        fs::write(dir.join("idna/__init__.py"), "").unwrap();
+        fs::create_dir_all(dir.join("idna-1.0.dist-info")).unwrap();
+        fs::write(dir.join(COMPLETE_MARKER), "idna-1.0-py3-none-any.whl\n").unwrap();
+    }
+
+    #[test]
+    fn a_complete_tree_is_never_removed_when_set_aside() {
+        // Devin review on #342, round 3: a tree that became complete
+        // between the caller's check and the replacement survives the
+        // set-aside (it is renamed back), intact.
+        let extracted = scratch("complete");
+        let target = extracted.join("idna-1.0-py3-none-any");
+        complete_tree(&target);
+        set_aside_incomplete(&target, &extracted, "idna-1.0-py3-none-any").unwrap();
+        assert!(extraction_complete(&target), "the complete tree stays at its path");
+        assert!(target.join("idna/__init__.py").is_file());
+        let leftovers: Vec<String> = fs::read_dir(&extracted)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(STALE_INFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = fs::remove_dir_all(&extracted);
+    }
+
+    #[test]
+    fn an_incomplete_tree_is_set_aside_and_removed() {
+        let extracted = scratch("incomplete");
+        let target = extracted.join("idna-1.0-py3-none-any");
+        fs::create_dir_all(target.join("idna-1.0.dist-info")).unwrap();
+        set_aside_incomplete(&target, &extracted, "idna-1.0-py3-none-any").unwrap();
+        assert!(!target.exists());
+        let leftovers: Vec<String> = fs::read_dir(&extracted)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        // A vanished path is fine.
+        set_aside_incomplete(&target, &extracted, "idna-1.0-py3-none-any").unwrap();
+        let _ = fs::remove_dir_all(&extracted);
+    }
+
+    #[test]
+    fn temporary_names_are_unique_per_invocation() {
+        let a = temporary_suffix();
+        let b = temporary_suffix();
+        assert_ne!(a, b);
+        assert!(a.starts_with(&format!("{}-", std::process::id())));
+    }
 }
