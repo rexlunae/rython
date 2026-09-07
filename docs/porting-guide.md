@@ -20,7 +20,8 @@ translation.
 │   2. rypip convert
 │   3. conversion error?  → refactor the *Python*, re-verify under CPython, goto 2
 │   4. cargo build error? → usually an aliasing/type shape; refactor the Python, goto 2
-│   5. run the binary, diff its output against the golden output
+│   5. run the binary (or `rypip run program.py -- args`, which does 2–5 in
+│      one step), diff its output against the golden output
 └── 6. differences? → treat as a rython bug (file it) or a §12-listed deviation
     7. clean diff → the port is done; the Rust crate is now the source of truth
 ```

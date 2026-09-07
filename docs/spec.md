@@ -1770,7 +1770,26 @@ exception escaping a lambda (§4.5).
   bin-only; any other entry module appears in both the library and the
   binary.
 - Packages without an entry point convert to library crates and cannot
-  be `rypip install`ed (loud error naming the fix).
+  be `rypip install`ed or `rypip run` (loud error naming the fix).
+- `rypip run program.py -- args` is CPython's command-line shape over the
+  convert/build pipeline with no new semantics (issue #166): a scratch
+  crate under the temp dir keyed by the package name and a hash of the
+  canonical source path (the files rypip wrote into its `src/` last time
+  replaced on every run — nothing rypip did not write is ever deleted —
+  cargo's `target/` kept; a directory holding the program's sources, or
+  a non-empty one that is not a crate rypip generated, is refused before
+  anything is touched, with `..` through not-yet-existing components
+  normalized first), built quietly FOR THE HOST (a configured cross
+  target never yields an artifact this machine cannot run) under an
+  exclusive lock held through the build and the staging of an
+  invocation-private hard link of the executable, then run with
+  `sys.argv[0]` set to the program
+  path as typed (as CPython keeps it), the caller's streams and working
+  directory, and its exit status propagated (a signal death as `128 +
+  signal`, the shell's encoding). Unix only for now: `sys.argv[0]` is set
+  through the exec, and a platform that cannot is refused loudly. A non-UTF-8 argument,
+  which CPython keeps as surrogate escapes the runtime's `str` cannot
+  hold, is a loud exit from `sys.argv` naming it, never a panic.
 - The module attribute protocol (PEP 562) is not supported: a
   module-level `__getattr__` or `__dir__` definition is a loud
   conversion error naming the dunder and the fix (issue #119). Module

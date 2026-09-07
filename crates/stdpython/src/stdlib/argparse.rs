@@ -225,9 +225,12 @@ impl ArgSpec {
 fn prog_name(explicit: Option<&str>) -> String {
     match explicit {
         Some(p) => p.to_string(),
-        None => std::env::args()
-            .next()
-            .as_deref()
+        // `os.path.basename(sys.argv[0])`, from the one process-argument
+        // authority — argv[0] alone, so an explicit `parse_args(list)` never
+        // reads the process arguments it does not use (a non-UTF-8 one is
+        // the authority's loud exit, never a panic here; Devin review on
+        // #340, rounds 2 and 4).
+        None => crate::stdlib::sys::argv_at(0)
             .and_then(|p| p.rsplit('/').next().map(str::to_string))
             .unwrap_or_else(|| "prog".to_string()),
     }
@@ -1131,7 +1134,7 @@ impl<'a> Parse<'a> {
     }
 }
 
-/// Parse std::env::args() against the specs, exactly as Python's
+/// Parse sys.argv[1:] against the specs, exactly as Python's
 /// parse_args(): returns the value for every spec IN SPEC ORDER, or
 /// prints help (exit 0) / usage + error (exit 2) like CPython. The
 /// PyException in the signature keeps the call-site shape uniform;
@@ -1152,8 +1155,10 @@ pub fn run_parser(
     specs: &[ArgSpec],
     argv: Option<Vec<String>>,
 ) -> Result<Vec<ParsedValue>, PyException> {
-    // parse_args(argv): an explicit argument list; None is sys.argv[1:].
-    let arg_strings: Vec<String> = argv.unwrap_or_else(|| std::env::args().skip(1).collect());
+    // parse_args(argv): an explicit argument list; None is sys.argv[1:]
+    // from the one process-argument authority.
+    let arg_strings: Vec<String> =
+        argv.unwrap_or_else(|| crate::stdlib::sys::argv.iter().skip(1).cloned().collect());
     let mut parse = Parse {
         prog: prog_name(prog),
         description,
