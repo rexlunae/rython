@@ -305,8 +305,12 @@ pub(crate) fn unquote_annotation(annotation: &ExprType) -> Option<ExprType> {
 }
 
 /// Whether a union member names an exception class: a builtin exception
-/// name, an imported stdlib alias (`SocketTimeout`), or a class of the
-/// crate that extends one.
+/// name, an imported stdlib alias (`SocketTimeout`), a class of the crate
+/// whose ANCESTRY reaches one (never a crate class by its name alone — a
+/// value class called `ParseError` is a value class), or a name the
+/// conversion cannot resolve at all that follows the exception naming
+/// convention (an external `BaseSSLError` — the raise model's rule for an
+/// unknown name).
 pub(crate) fn is_exception_class_member(
     member: &ExprType,
     symbols: &SymbolTableScopes,
@@ -314,15 +318,19 @@ pub(crate) fn is_exception_class_member(
 ) -> bool {
     match member {
         ExprType::Name(n) => {
-            crate::ast::tree::raise_stmt::is_exception_class_name(&n.id)
+            if let Some((class, class_symbols)) =
+                crate::ast::tree::call::resolve_construction_class(&n.id, symbols, options)
+            {
+                return class_extends_exception(&class, &class_symbols, options, 0);
+            }
+            crate::ast::tree::raise_stmt::is_builtin_exception_name(&n.id)
                 || crate::ast::tree::raise_stmt::imported_exception_alias(
                     &n.id,
                     symbols,
                     Some(options),
                 )
                 .is_some()
-                || crate::ast::tree::call::resolve_construction_class(&n.id, symbols, options)
-                    .is_some_and(|(c, _)| crate::is_exception_class(&c))
+                || crate::ast::tree::raise_stmt::is_exception_class_name(&n.id)
         }
         ExprType::Attribute(a) => {
             let ExprType::Name(m) = a.value.as_ref() else {
@@ -332,6 +340,45 @@ pub(crate) fn is_exception_class_member(
         }
         _ => false,
     }
+}
+
+/// Whether a class of the crate extends an exception: a base that is a
+/// builtin exception, a stdlib alias, or (recursively) a crate class
+/// extending one. The class's own name decides nothing.
+fn class_extends_exception(
+    class: &crate::ClassDef,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+    depth: usize,
+) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    class.bases.iter().any(|base| match base {
+        ExprType::Name(n) => {
+            if let Some((parent, parent_symbols)) =
+                crate::ast::tree::call::resolve_construction_class(&n.id, symbols, options)
+            {
+                if parent.name == class.name {
+                    return false;
+                }
+                return class_extends_exception(&parent, &parent_symbols, options, depth + 1);
+            }
+            crate::ast::tree::raise_stmt::is_builtin_exception_name(&n.id)
+                || crate::ast::tree::raise_stmt::imported_exception_alias(
+                    &n.id,
+                    symbols,
+                    Some(options),
+                )
+                .is_some()
+                || crate::ast::tree::raise_stmt::is_exception_class_name(&n.id)
+        }
+        ExprType::Attribute(a) => {
+            matches!(a.value.as_ref(), ExprType::Name(m)
+                if crate::ast::tree::raise_stmt::stdlib_exception_canonical(&m.id, &a.attr).is_some())
+        }
+        _ => false,
+    })
 }
 
 /// The type of a `A | B | ...` annotation whose members are ALL exception

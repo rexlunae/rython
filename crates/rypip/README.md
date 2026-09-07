@@ -126,7 +126,14 @@ version satisfying the PEP 440 specifiers, downloads the pure-Python wheel
 `~/.cache/rypip`), and transpiles it into the generated crate beside the
 package's own modules. Every downloaded artifact extracts into its own
 directory (`<cache>/<dist>/extracted/<artifact stem>/`), so two cached
-versions of one distribution never share a tree.
+versions of one distribution never share a tree; an extraction is
+complete only once its `.rypip-complete` marker is in place (the archive
+unpacks into a sibling directory that is renamed in), and a verified
+download records its sha256 beside the artifact (`<file>.sha256`). A
+cached artifact is reused only through that digest — one without it is
+fetched again, one that no longer matches is a loud error — and among
+several cached versions satisfying a requirement the newest wins, as it
+does online.
 
 - Explicit `rython.toml` `[python-modules]` entries always win over a
   fetched dependency (pin a local copy by vendoring it).

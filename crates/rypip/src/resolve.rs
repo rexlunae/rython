@@ -476,7 +476,7 @@ pub fn resolve_dependency_in(cache: &Path, req: &Requirement, offline: bool) -> 
 
     // A cached, already-extracted distribution that satisfies the
     // specifiers can be reused (this is what makes offline rebuilds work).
-    if let Some(hit) = cached_match(&dist_dir, req) {
+    if let Some(hit) = cached_match(&dist_dir, req)? {
         return Ok(hit);
     }
     if offline {
@@ -556,33 +556,46 @@ pub fn resolve_dependency_in(cache: &Path, req: &Requirement, offline: bool) -> 
         .context("artifact has no url")?
         .to_string();
 
-    // Download into the cache if not already present.
+    // Integrity: PyPI's JSON metadata carries the sha256 of every
+    // artifact. FAIL CLOSED — a missing digest means the response is not
+    // from real PyPI (mirror/intercepted), and a mismatch means tampering;
+    // either way the artifact is never extracted or transpiled. An
+    // artifact already in the cache is checked against the SAME digest
+    // before it is reused: a cache file that no longer matches the index
+    // is replaced (and its extraction with it).
+    let expected = artifact
+        .get("digests")
+        .and_then(|d| d.get("sha256"))
+        .and_then(|d| d.as_str())
+        .filter(|d| !d.is_empty())
+        .with_context(|| {
+            format!(
+                "`{}` ({}) has no sha256 digest in the index response; \
+                 refusing to extract an unverified artifact",
+                file_name, url
+            )
+        })?
+        .to_ascii_lowercase();
     fs::create_dir_all(&dist_dir)
         .with_context(|| format!("creating cache {}", dist_dir.display()))?;
     let artifact_path = dist_dir.join(&file_name);
-    if !artifact_path.is_file() {
+    let cached_matches = match fs::read(&artifact_path) {
+        Ok(bytes) => sha256_hex(&bytes) == expected,
+        Err(_) => false,
+    };
+    if !cached_matches {
+        if artifact_path.exists() {
+            // A stale or tampered cache file: its extraction (if any) is
+            // as untrusted as the file.
+            let stale = extraction_dir(&dist_dir, &file_name);
+            if stale.exists() {
+                fs::remove_dir_all(&stale)
+                    .with_context(|| format!("clearing {}", stale.display()))?;
+            }
+        }
         let bytes = fetch_bytes(&url)?;
-        // Integrity: PyPI's JSON metadata carries the sha256 of every
-        // artifact. FAIL CLOSED — a missing digest means the response is
-        // not from real PyPI (mirror/intercepted), and a mismatch means
-        // tampering; either way the artifact is never extracted or
-        // transpiled.
-        let expected = artifact
-            .get("digests")
-            .and_then(|d| d.get("sha256"))
-            .and_then(|d| d.as_str())
-            .filter(|d| !d.is_empty())
-            .with_context(|| {
-                format!(
-                    "`{}` ({}) has no sha256 digest in the index response; \
-                     refusing to extract an unverified artifact",
-                    file_name, url
-                )
-            })?;
-        use sha2::{Digest, Sha256};
-        let hash = Sha256::digest(&bytes);
-        let actual: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
-        if actual != expected.to_ascii_lowercase() {
+        let actual = sha256_hex(&bytes);
+        if actual != expected {
             return Err(anyhow::anyhow!(
                 "sha256 mismatch for `{}` ({}): expected {}, got {}",
                 file_name,
@@ -594,6 +607,11 @@ pub fn resolve_dependency_in(cache: &Path, req: &Requirement, offline: bool) -> 
         fs::write(&artifact_path, bytes)
             .with_context(|| format!("writing {}", artifact_path.display()))?;
     }
+    // The verified digest, beside the artifact: the offline path reuses
+    // the artifact only through it.
+    let sidecar = digest_sidecar(&artifact_path);
+    fs::write(&sidecar, format!("{expected}\n"))
+        .with_context(|| format!("writing {}", sidecar.display()))?;
 
     // Extract (wheels are zips, sdists are gzipped tarballs).
     let package_dir = extract_distribution(&artifact_path, &dist_dir, &req.name)?;
@@ -643,27 +661,104 @@ fn is_pure_wheel(file_name: &str) -> bool {
         && tags[n - 1] == "any"
 }
 
-/// Look for a cached distribution satisfying the requirement: one already
-/// extracted under `extracted/`, else a downloaded artifact in the
-/// distribution's cache directory, extracted now. Any satisfying cached
-/// version is reused (the cache is not an index; pinning is the
-/// requirement's job).
-fn cached_match(dist_dir: &Path, req: &Requirement) -> Option<ResolvedDependency> {
-    let extracted = dist_dir.join("extracted");
-    if let Ok(entries) = fs::read_dir(&extracted) {
+/// The file inside an extraction directory that marks it COMPLETE: written
+/// after the whole archive is unpacked and the distribution root was
+/// found, then the directory is renamed into place. It holds the artifact
+/// file name the tree was extracted from (the version and the artifact
+/// kind derive from it). A directory without it — an interrupted
+/// extraction, an older cache layout — is never a cache hit.
+const COMPLETE_MARKER: &str = ".rypip-complete";
+/// The suffix of an in-progress extraction directory (`<stem>.partial-<pid>`).
+const PARTIAL_INFIX: &str = ".partial-";
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
+/// The sidecar recording a cached artifact's VERIFIED sha256: written
+/// beside the artifact once a download was checked against PyPI's digest.
+/// The offline path reuses an artifact only through it.
+fn digest_sidecar(artifact: &Path) -> PathBuf {
+    let mut name = artifact
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".sha256");
+    artifact.with_file_name(name)
+}
+
+/// Whether a cached artifact matches its recorded digest. Ok(false): no
+/// sidecar (an older cache, or a file that was never verified) — the
+/// artifact is not reused offline; a mismatch is a loud error naming the
+/// file, never a silent skip.
+fn cached_artifact_verified(artifact: &Path) -> Result<bool> {
+    let sidecar = digest_sidecar(artifact);
+    let Ok(recorded) = fs::read_to_string(&sidecar) else {
+        return Ok(false);
+    };
+    let recorded = recorded.trim().to_ascii_lowercase();
+    let bytes =
+        fs::read(artifact).with_context(|| format!("reading {}", artifact.display()))?;
+    let actual = sha256_hex(&bytes);
+    if actual != recorded {
+        bail!(
+            "sha256 mismatch for the cached artifact {}: its recorded digest is {}, the file \
+             hashes to {} — the cache file was altered; delete it (and {}) to fetch it again",
+            artifact.display(),
+            recorded,
+            actual,
+            sidecar.display()
+        );
+    }
+    Ok(true)
+}
+
+/// The directory an artifact extracts into: `<dist_dir>/extracted/<stem>`.
+fn extraction_dir(dist_dir: &Path, artifact_file: &str) -> PathBuf {
+    let stem = artifact_stem(artifact_file).unwrap_or(artifact_file);
+    dist_dir.join("extracted").join(stem)
+}
+
+/// The artifact file name a COMPLETE extraction directory records.
+fn extracted_artifact_name(dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(dir.join(COMPLETE_MARKER)).ok()?;
+    let name = text.lines().next()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// What a cache candidate is: a complete extraction (its root), or a
+/// verified artifact still to extract.
+enum Cached {
+    Extracted(PathBuf),
+    Artifact(PathBuf),
+}
+
+/// Look for a cached distribution satisfying the requirement: the NEWEST
+/// satisfying version among the complete extractions under `extracted/`
+/// and the verified artifacts in the distribution's cache directory (the
+/// same choice online resolution makes among the index's releases, so an
+/// unpinned requirement resolves the same version from the cache in any
+/// directory order); an artifact is extracted now. An extraction without
+/// its completion marker and an artifact without its recorded digest are
+/// not candidates; an artifact whose digest no longer matches is a loud
+/// error.
+fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDependency>> {
+    let mut candidates: Vec<(Version, Cached)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(dist_dir.join("extracted")) {
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
             let name = entry.file_name().to_string_lossy().to_string();
-            // The .dist-info metadata directory is not a distribution
-            // root, and neither is the wheel DATA directory
-            // (`{dist}-{version}.data`).
-            if name.ends_with(".dist-info") || name.contains(".data") {
+            if !path.is_dir() || name.contains(PARTIAL_INFIX) {
                 continue;
             }
-            let Some(version) = cached_version_of(&name, &req.name) else {
+            let Some(artifact_name) = extracted_artifact_name(&path) else {
+                continue;
+            };
+            let Some(version) = cached_version_of(&artifact_name, &req.name) else {
                 continue;
             };
             if !version_satisfies(&version, &req.specifiers) {
@@ -672,33 +767,45 @@ fn cached_match(dist_dir: &Path, req: &Requirement) -> Option<ResolvedDependency
             let Ok(root) = locate_extracted_root(&path) else {
                 continue;
             };
-            return Some(finalize_dependency(root, &req.name, &version_str_of(&version)));
+            candidates.push((version, Cached::Extracted(root)));
         }
     }
-    // A downloaded artifact whose extraction is missing (an older cache
-    // layout, or an interrupted run): extract it now.
-    let artifacts = fs::read_dir(dist_dir).ok()?;
-    for entry in artifacts.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
+    if let Ok(entries) = fs::read_dir(dist_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(version) = cached_version_of(&name, &req.name) else {
+                continue;
+            };
+            if !version_satisfies(&version, &req.specifiers) {
+                continue;
+            }
+            if !cached_artifact_verified(&path)? {
+                continue;
+            }
+            candidates.push((version, Cached::Artifact(path)));
         }
-        let name = entry.file_name().to_string_lossy().to_string();
-        let Some(stem) = artifact_stem(&name) else {
-            continue;
-        };
-        let Some(version) = cached_version_of(stem, &req.name) else {
-            continue;
-        };
-        if !version_satisfies(&version, &req.specifiers) {
-            continue;
-        }
-        let Ok(root) = extract_distribution(&path, dist_dir, &req.name) else {
-            continue;
-        };
-        return Some(finalize_dependency(root, &req.name, &version_str_of(&version)));
     }
-    None
+    // Ascending by version; at one version the extraction sorts after the
+    // artifact, so the last element is the newest version, extracted if
+    // it already is.
+    candidates.sort_by(|(va, ca), (vb, cb)| {
+        version_cmp(va, vb).then_with(|| {
+            let rank = |c: &Cached| matches!(c, Cached::Extracted(_)) as u8;
+            rank(ca).cmp(&rank(cb))
+        })
+    });
+    let Some((version, cached)) = candidates.pop() else {
+        return Ok(None);
+    };
+    let root = match cached {
+        Cached::Extracted(root) => root,
+        Cached::Artifact(path) => extract_distribution(&path, dist_dir, &req.name)?,
+    };
+    Ok(Some(finalize_dependency(root, &req.name, &version_str_of(&version))))
 }
 
 /// The artifact file name without its archive extension: the name of the
@@ -711,23 +818,34 @@ fn artifact_stem(file_name: &str) -> Option<&str> {
         .or_else(|| file_name.strip_suffix(".zip"))
 }
 
-/// The version an artifact stem (`idna-3.10-py3-none-any`, `idna-3.10`,
-/// `charset-normalizer-3.4.0`) names for the distribution `dist_name`:
-/// the stem's leading name, compared normalized (`-`/`.` as `_`, lowercase,
-/// as requirement names are stored), followed by the version. A stem of another distribution (or a bare directory name) is
-/// None.
-fn cached_version_of(stem: &str, dist_name: &str) -> Option<Version> {
+/// The version an artifact FILE NAME (`idna-3.10-py3-none-any.whl`,
+/// `charset-normalizer-3.4.0.tar.gz`, `pkg-1.0-rc1.tar.gz`) names for the
+/// distribution `dist_name`. The kind decides the grammar: a wheel is
+/// `{name}-{version}[-{build}]-{python}-{abi}-{platform}`, so the version
+/// is the one component after the name; an sdist is `{name}-{version}`,
+/// so everything after the name is the version, hyphen-separated
+/// pre/post/dev suffixes included (a legacy name may itself contain `-`:
+/// every split whose leading part normalizes to the wanted name is
+/// tried). A file of another distribution, or not an archive, is None.
+fn cached_version_of(file_name: &str, dist_name: &str) -> Option<Version> {
+    let stem = artifact_stem(file_name)?;
+    let is_wheel = file_name.ends_with(".whl");
     let want = normalize_dist_name(dist_name);
-    // A wheel stem is `{name}-{version}-{tags...}`; an sdist stem is
-    // `{name}-{version}`, where a legacy name may itself contain `-`.
-    // Try every `-` split: the leading part that normalizes to the wanted
-    // name, followed by a parseable version.
     for (index, _) in stem.match_indices('-') {
         let (name, rest) = (&stem[..index], &stem[index + 1..]);
         if normalize_dist_name(name) != want {
             continue;
         }
-        let version = rest.split('-').next().unwrap_or(rest);
+        let version = if is_wheel {
+            let parts: Vec<&str> = rest.split('-').collect();
+            // version + three tags, or version + build tag + three tags.
+            if parts.len() != 4 && parts.len() != 5 {
+                continue;
+            }
+            parts[0]
+        } else {
+            rest
+        };
         if let Some(version) = parse_version(version) {
             return Some(version);
         }
@@ -758,24 +876,38 @@ fn version_str_of(v: &Version) -> String {
 /// wheel, its `.dist-info`). Each artifact gets its own directory: two
 /// versions of one distribution extracted into a shared directory merge
 /// their files (a module the newer version added survives into the older
-/// version's tree), which is not any version of the package.
+/// version's tree), which is not any version of the package. The
+/// extraction is ATOMIC: the archive unpacks into a `<stem>.partial-<pid>`
+/// sibling, the root is located there, the completion marker is written,
+/// and only then is the directory renamed into place — an interrupted
+/// extraction leaves nothing the cache lookup accepts, and is replaced
+/// the next time the artifact is needed.
 fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Result<PathBuf> {
     let file_name = artifact
         .file_name()
         .and_then(|n| n.to_str())
         .context("artifact has no file name")?;
-    let stem = artifact_stem(file_name).unwrap_or(file_name);
-    let extract_dir = dist_dir.join("extracted").join(stem);
-    if let Ok(root) = locate_extracted_root(&extract_dir) {
+    let extract_dir = extraction_dir(dist_dir, file_name);
+    if extract_dir.join(COMPLETE_MARKER).is_file()
+        && let Ok(root) = locate_extracted_root(&extract_dir)
+    {
         return Ok(root);
     }
-    // A partial extraction (an interrupted run) is replaced, never
-    // extracted over.
+    // Anything else at that path (a partial extraction, an older cache
+    // layout) is replaced, never extracted over.
     if extract_dir.exists() {
         fs::remove_dir_all(&extract_dir)
             .with_context(|| format!("clearing {}", extract_dir.display()))?;
     }
-    fs::create_dir_all(&extract_dir)?;
+    let stem = artifact_stem(file_name).unwrap_or(file_name);
+    let partial = dist_dir
+        .join("extracted")
+        .join(format!("{stem}{PARTIAL_INFIX}{}", std::process::id()));
+    if partial.exists() {
+        fs::remove_dir_all(&partial)
+            .with_context(|| format!("clearing {}", partial.display()))?;
+    }
+    fs::create_dir_all(&partial)?;
 
     if file_name.ends_with(".whl") || file_name.ends_with(".zip") {
         let file = fs::File::open(artifact)
@@ -787,7 +919,7 @@ fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Re
             let out_path = entry
                 .enclosed_name()
                 .with_context(|| format!("unsafe path in {}", file_name))?;
-            let dest = extract_dir.join(out_path);
+            let dest = partial.join(out_path);
             if entry.is_dir() {
                 fs::create_dir_all(&dest)?;
             } else {
@@ -806,17 +938,28 @@ fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Re
         let gz = flate2::read::GzDecoder::new(file);
         let mut archive = tar::Archive::new(gz);
         archive
-            .unpack(&extract_dir)
+            .unpack(&partial)
             .with_context(|| format!("extracting {}", artifact.display()))?;
     }
 
-    locate_extracted_root(&extract_dir).with_context(|| {
+    locate_extracted_root(&partial).with_context(|| {
         format!(
             "could not locate the extracted package for `{}` under {}",
             dist_name,
+            partial.display()
+        )
+    })?;
+    let marker = partial.join(COMPLETE_MARKER);
+    fs::write(&marker, format!("{file_name}\n"))
+        .with_context(|| format!("writing {}", marker.display()))?;
+    fs::rename(&partial, &extract_dir).with_context(|| {
+        format!(
+            "moving the extraction {} into place at {}",
+            partial.display(),
             extract_dir.display()
         )
-    })
+    })?;
+    locate_extracted_root(&extract_dir)
 }
 
 /// The distribution root inside an extraction directory: the directory

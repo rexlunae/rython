@@ -2151,7 +2151,7 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
 fn builtin_exception_union(members: Option<&[&ExprType]>) -> Option<TypeInfo> {
     let members = members?;
     let is_builtin = |m: &ExprType| match m {
-        ExprType::Name(n) => crate::ast::tree::raise_stmt::is_exception_class_name(&n.id),
+        ExprType::Name(n) => crate::ast::tree::raise_stmt::is_builtin_exception_name(&n.id),
         ExprType::Attribute(a) => matches!(a.value.as_ref(), ExprType::Name(m)
             if crate::ast::tree::raise_stmt::stdlib_exception_canonical(&m.id, &a.attr).is_some()),
         _ => false,

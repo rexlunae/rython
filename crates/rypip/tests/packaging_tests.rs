@@ -337,7 +337,62 @@ fn write_wheel(dir: &Path, dist: &str, version: &str, files: &[(&str, &str)]) ->
     zip.start_file(format!("{info}/top_level.txt"), options).unwrap();
     zip.write_all(format!("{dist}\n").as_bytes()).unwrap();
     zip.finish().unwrap();
+    record_digest(&path);
     path
+}
+
+/// Write the digest sidecar a verified download leaves beside a cached
+/// artifact (the offline path reuses an artifact only through it).
+fn record_digest(artifact: &Path) {
+    use sha2::{Digest, Sha256};
+    let digest: String = Sha256::digest(fs::read(artifact).unwrap())
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    fs::write(sidecar_of(artifact), format!("{digest}\n")).unwrap();
+}
+
+fn sidecar_of(artifact: &Path) -> PathBuf {
+    let mut name = artifact.file_name().unwrap().to_os_string();
+    name.push(".sha256");
+    artifact.with_file_name(name)
+}
+
+/// Write an sdist tarball `{dist}-{version}.tar.gz` whose top directory
+/// holds PKG-INFO, pyproject.toml and the package, plus its digest.
+fn write_sdist(dir: &Path, dist: &str, version: &str, package: &str) -> PathBuf {
+    fs::create_dir_all(dir).unwrap();
+    let artifact = dir.join(format!("{dist}-{version}.tar.gz"));
+    {
+        let gz = flate2::write::GzEncoder::new(
+            fs::File::create(&artifact).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut tar = tar::Builder::new(gz);
+        let mut add = |name: &str, body: &str| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, name, body.as_bytes()).unwrap();
+        };
+        let top = format!("{dist}-{version}");
+        add(
+            &format!("{top}/PKG-INFO"),
+            &format!("Metadata-Version: 2.1\nName: {dist}\nVersion: {version}\n"),
+        );
+        add(
+            &format!("{top}/pyproject.toml"),
+            &format!("[project]\nname = \"{dist}\"\nversion = \"{version}\"\n"),
+        );
+        add(
+            &format!("{top}/{package}/__init__.py"),
+            &format!("VERSION = \"{version}\"\n"),
+        );
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+    record_digest(&artifact);
+    artifact
 }
 
 #[test]
@@ -407,6 +462,133 @@ fn cached_versions_of_one_distribution_extract_apart() {
     )
     .expect_err("idna 3.0 is not cached");
     assert!(err.to_string().contains("offline"), "{err:?}");
+
+    // An UNPINNED requirement resolves the NEWEST satisfying cached
+    // version — the choice online resolution makes — whatever order the
+    // file system lists the cache in (Devin review on #342).
+    for _ in 0..3 {
+        let newest = rypip::resolve::resolve_dependency_in(
+            &cache,
+            &parse_requirement("idna>=1").unwrap(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(newest.version, "2.0");
+        assert_eq!(newest.path, newer.path);
+    }
+    // A complete extraction carries its marker, naming the artifact.
+    let marker = dist_dir.join("extracted/idna-2.0-py3-none-any/.rypip-complete");
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap().trim(),
+        "idna-2.0-py3-none-any.whl"
+    );
+}
+
+#[test]
+fn an_interrupted_extraction_is_never_a_cache_hit() {
+    // A tree at the extraction path WITHOUT the completion marker (an
+    // interrupted run that got as far as the .dist-info) is not reused:
+    // the artifact is extracted again, atomically, and the complete tree
+    // replaces the partial one (Devin review on #342).
+    let scratch = Scratch::new("cache-partial");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("idna");
+    write_wheel(&dist_dir, "idna", "1.0", &[("idna/__init__.py", "VERSION = \"1.0\"\n")]);
+    let partial = dist_dir.join("extracted/idna-1.0-py3-none-any");
+    fs::create_dir_all(partial.join("idna-1.0.dist-info")).unwrap();
+    fs::write(partial.join("idna-1.0.dist-info/METADATA"), "truncated").unwrap();
+    // No package directory, no marker.
+
+    let dep = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("idna==1.0").unwrap(),
+        true,
+    )
+    .expect("the artifact is extracted again");
+    assert_eq!(dep.path, partial.join("idna"));
+    assert!(dep.path.join("__init__.py").is_file(), "{}", dep.path.display());
+    assert!(partial.join(".rypip-complete").is_file());
+    assert_eq!(
+        fs::read_to_string(partial.join("idna-1.0.dist-info/top_level.txt")).unwrap(),
+        "idna\n"
+    );
+    // No in-progress directory is left behind.
+    let leftovers: Vec<String> = fs::read_dir(dist_dir.join("extracted"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains(".partial-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[test]
+fn a_cached_artifact_is_reused_only_through_its_verified_digest() {
+    // The offline path trusts an artifact only through the digest a
+    // verified download recorded beside it: no sidecar (an older cache)
+    // means the artifact is not a cache hit, a mismatch is a loud error
+    // naming the file, never a silent extraction (Devin review on #342).
+    let scratch = Scratch::new("cache-digest");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("idna");
+    let artifact = write_wheel(&dist_dir, "idna", "1.0", &[("idna/__init__.py", "")]);
+    let req = parse_requirement("idna==1.0").unwrap();
+
+    fs::remove_file(sidecar_of(&artifact)).unwrap();
+    let err = rypip::resolve::resolve_dependency_in(&cache, &req, true)
+        .expect_err("an unverified artifact is not reused offline");
+    assert!(err.to_string().contains("offline"), "{err:?}");
+
+    fs::write(sidecar_of(&artifact), format!("{}\n", "0".repeat(64))).unwrap();
+    let err = rypip::resolve::resolve_dependency_in(&cache, &req, true)
+        .expect_err("an altered artifact is loud");
+    let text = err.to_string();
+    assert!(text.contains("sha256 mismatch"), "{text}");
+    assert!(text.contains("idna-1.0-py3-none-any.whl"), "{text}");
+    assert!(!dist_dir.join("extracted/idna-1.0-py3-none-any").exists());
+
+    record_digest(&artifact);
+    let dep = rypip::resolve::resolve_dependency_in(&cache, &req, true).unwrap();
+    assert_eq!(dep.version, "1.0");
+}
+
+#[test]
+fn cached_sdist_prereleases_keep_their_version() {
+    // An sdist stem's version is everything after the distribution name
+    // — a hyphen-separated prerelease included — so `pkg-1.0-rc1` is
+    // 1.0rc1, not the final 1.0 (Devin review on #342); a wheel's version
+    // is the one component before its tags.
+    let scratch = Scratch::new("cache-prerelease");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("pre");
+    write_sdist(&dist_dir, "pre", "1.0-rc1", "pre");
+    write_sdist(&dist_dir, "pre", "0.9", "pre");
+
+    let rc = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("pre==1.0rc1").unwrap(),
+        true,
+    )
+    .expect("the prerelease resolves under its own version");
+    assert_eq!(rc.version, "1.0rc1");
+    assert!(rc.path.join("__init__.py").is_file(), "{}", rc.path.display());
+    assert!(rc.path.starts_with(dist_dir.join("extracted/pre-1.0-rc1")));
+
+    let err = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("pre==1.0").unwrap(),
+        true,
+    )
+    .expect_err("the prerelease is not the final release");
+    assert!(err.to_string().contains("offline"), "{err:?}");
+
+    let stable = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("pre==0.9").unwrap(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(stable.version, "0.9");
 }
 
 #[test]
@@ -416,32 +598,7 @@ fn cached_sdist_resolves_to_its_package_directory() {
     let scratch = Scratch::new("cache-sdist");
     let cache = scratch.path().join("cache");
     let dist_dir = cache.join("charset_normalizer");
-    fs::create_dir_all(&dist_dir).unwrap();
-    let artifact = dist_dir.join("charset-normalizer-3.4.0.tar.gz");
-    {
-        let gz = flate2::write::GzEncoder::new(
-            fs::File::create(&artifact).unwrap(),
-            flate2::Compression::default(),
-        );
-        let mut tar = tar::Builder::new(gz);
-        let mut add = |name: &str, body: &str| {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(body.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            tar.append_data(&mut header, name, body.as_bytes()).unwrap();
-        };
-        add(
-            "charset-normalizer-3.4.0/PKG-INFO",
-            "Metadata-Version: 2.1\nName: charset-normalizer\nVersion: 3.4.0\n",
-        );
-        add(
-            "charset-normalizer-3.4.0/pyproject.toml",
-            "[project]\nname = \"charset-normalizer\"\nversion = \"3.4.0\"\n",
-        );
-        add("charset-normalizer-3.4.0/charset_normalizer/__init__.py", "VERSION = \"3.4.0\"\n");
-        tar.into_inner().unwrap().finish().unwrap();
-    }
+    write_sdist(&dist_dir, "charset-normalizer", "3.4.0", "charset_normalizer");
     let dep = rypip::resolve::resolve_dependency_in(
         &cache,
         &parse_requirement("charset-normalizer>=3").unwrap(),

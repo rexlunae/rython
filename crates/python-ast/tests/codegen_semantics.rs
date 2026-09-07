@@ -11832,6 +11832,41 @@ fn exception_union_parameter_is_a_pyexception() {
         "a mixed union parameter still boxes: {}",
         out
     );
+    // A class OF THE CRATE is judged by its ancestry, never by its name
+    // (Devin review on #342): value classes that happen to end in
+    // `Error` are not exceptions, a class extending one is.
+    let out = compile(
+        "class ParseError:\n\
+         \x20   def __init__(self, line: int) -> None:\n\
+         \x20       self.line = line\n\
+         \n\
+         class LexError:\n\
+         \x20   def __init__(self, col: int) -> None:\n\
+         \x20       self.col = col\n\
+         \n\
+         class Failed(ValueError):\n\
+         \x20   pass\n\
+         \n\
+         class Worse(Failed):\n\
+         \x20   pass\n\
+         \n\
+         def report(e: ParseError | LexError) -> None:\n\
+         \x20   pass\n\
+         \n\
+         def handle(e: Worse | OSError) -> None:\n\
+         \x20   pass\n",
+        "valueclasses.py",
+    );
+    assert!(
+        !out.contains("report (e : PyException)"),
+        "value classes named like exceptions are not exception parameters: {}",
+        out
+    );
+    assert!(
+        out.contains("handle (e : PyException)"),
+        "a crate class extending a builtin exception (through a parent) is: {}",
+        out
+    );
     assert!(
         !out.contains("| (SocketTimeout)"),
         "the union must not render literally: {}",
