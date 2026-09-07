@@ -5961,6 +5961,120 @@ fn factory_chain_ternary_narrowing_keeps_option_transcript() {
 
 
 #[test]
+fn mixed_option_dict_literal_boxes_and_prints_like_python() {
+    // Round 100: a dict literal whose values mix Option and concrete
+    // types (`{"encoding": Option<String>, "language": String,
+    // "confidence": Option<f64>}`) has no single concrete Rust type, so
+    // the values box into the heterogeneous PyValue and the None-else
+    // Options go through the Some/None match. The unused detect()
+    // (a TypedDict-annotated return) still compiles its boxed-return
+    // body. Transcript pinned against python3.
+    let scratch = Scratch::new("mixdict");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "from typing import TypedDict\n",
+            "\n",
+            "\n",
+            "class ResultDict(TypedDict):\n",
+            "    encoding: str | None\n",
+            "    language: str\n",
+            "    confidence: float | None\n",
+            "\n",
+            "\n",
+            "def detect(enc: str | None, lang: str, conf: float | None) -> ResultDict:\n",
+            "    return {\"encoding\": enc, \"language\": lang, \"confidence\": conf}\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    enc: str | None = \"utf_8\"\n",
+            "    language: str = \"English\"\n",
+            "    conf: float | None = 0.75\n",
+            "    d = {\"encoding\": enc, \"language\": language, \"confidence\": conf}\n",
+            "    print(d)\n",
+            "\n",
+            "\n",
+            "def show(none_enc: str | None) -> None:\n",
+            "    print({\"encoding\": none_enc, \"confidence\": 0.5})\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+            "    show(None)\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "{'encoding': 'utf_8', 'language': 'English', 'confidence': 0.75}",
+            "{'encoding': None, 'confidence': 0.5}",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn mixed_length_string_tuple_dict_values_build_and_read() {
+    // A dict whose values are all-string tuples of DIFFERENT lengths
+    // (`{100: ("continue",), 102: ("processing", "early-hints")}` —
+    // requests' status codes): every value lowers as its element VEC, so
+    // the arities share one Vec<String> value type and membership /
+    // indexing / len through the reads work. Transcript pinned against
+    // python3 (the tuple VALUES themselves print as lists — the sequence
+    // model; the pin exercises membership, element index, and length).
+    let scratch = Scratch::new("tupdict");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> None:\n",
+            "    codes = {100: (\"continue\",), 102: (\"processing\", \"early-hints\"), 122: (\"uri_too_long\", \"request_uri_too_long\")}\n",
+            "    print(len(codes), 100 in codes, \"processing\" in codes[102], codes[100][0], codes[122][1])\n",
+            "    print(len(codes[122]), sorted(codes[102]))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "3 True True continue request_uri_too_long",
+            "2 ['early-hints', 'processing']",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {
     // Round 41: a trait-DEFAULT body that formats `self` in an exception
     // message (`raise PoolError(self)` — urllib3's _get_conn raises

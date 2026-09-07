@@ -715,6 +715,17 @@ fn infer_type_inner(
         ExprType::Dict(d) => {
             let mut k = TypeInfo::PyObject;
             let mut v = TypeInfo::PyObject;
+            // Whether every VALUE is a non-empty all-string tuple of a
+            // MIXED arity (`{100: ("continue",), 102: ("processing",
+            // "early-hints")}` — requests' status codes): the lengths do
+            // not unify, but the literal LOWERS each value as its element
+            // VEC (dict.rs's all_str_tuples), so the dict's value type is
+            // Vec<String> — the type side must agree or `codes[102][0]`-
+            // style reads lower as tuple fields on a Vec (E0609, round
+            // 100).
+            let mut v_str_tuple_arity: Option<usize> = None;
+            let mut v_str_tuple_mixed = false;
+            let mut saw_value = false;
             for (key, value) in d.keys.iter().zip(d.values.iter()) {
                 let kt = match key {
                     Some(key) => infer_type_inner(ctx, key, options, symbols),
@@ -724,9 +735,37 @@ fn infer_type_inner(
                 if !matches!(kt, TypeInfo::PyObject) {
                     k = unify(k, kt);
                 }
-                if !matches!(vt, TypeInfo::PyObject) {
+                if matches!(vt, TypeInfo::PyObject) {
                     v = unify(v, vt);
+                } else {
+                    saw_value = true;
+                    v = unify(v, vt.clone());
+                    match vt {
+                        TypeInfo::Tuple(ts)
+                            if !ts.is_empty()
+                                && ts.iter().all(|e| {
+                                    matches!(
+                                        e,
+                                        TypeInfo::StrRef | TypeInfo::String
+                                    )
+                                }) =>
+                        {
+                            let arity = ts.len();
+                            match v_str_tuple_arity {
+                                Some(a) if a != arity => v_str_tuple_mixed = true,
+                                None => v_str_tuple_arity = Some(arity),
+                                _ => {}
+                            }
+                        }
+                        _ => {
+                            v_str_tuple_arity = None;
+                            v_str_tuple_mixed = false;
+                        }
+                    }
                 }
+            }
+            if saw_value && v_str_tuple_mixed {
+                v = TypeInfo::Vec(Box::new(TypeInfo::String));
             }
             TypeInfo::Dict(Box::new(k), Box::new(v))
         }

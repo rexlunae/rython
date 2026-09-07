@@ -2487,6 +2487,96 @@ fn guarded_ternary_does_not_double_wrap_an_option_body() {
 }
 
 #[test]
+fn mixed_option_dict_values_box_into_pyvalue() {
+    // A dict literal whose values are a MIX of Option and plain concrete
+    // types (`{"encoding": Option<String>, "language": String,
+    // "confidence": Option<f64>}` — charset_normalizer's legacy.detect
+    // return, round 100): no single concrete value type unifies, so the
+    // values box into PyValue (the None-else Option values via the
+    // Some/None match). The old gate keyed off `v_expected == PyObject`,
+    // which unify never yields for a mixed set, so the literal rendered a
+    // raw PyDict::from whose V type rustc inferred from the first pair
+    // (E0308).
+    let src = concat!(
+        "from typing import TypedDict\n",
+        "\n",
+        "class ResultDict(TypedDict):\n",
+        "    encoding: str | None\n",
+        "    language: str\n",
+        "    confidence: float | None\n",
+        "\n",
+        "def detect(enc: str | None, lang: str, conf: float | None) -> ResultDict:\n",
+        "    return {\"encoding\": enc, \"language\": lang, \"confidence\": conf}\n",
+    );
+    let out = compile(src, "mixeddict.py");
+    assert!(
+        out.contains("PyValue :: from") && out.contains("None => stdpython :: PyValue :: None_"),
+        "mixed Option/concrete dict values must box into PyValue: {}",
+        out
+    );
+}
+
+#[test]
+fn sibling_class_dict_values_keep_the_hierarchy_root() {
+    // Two values of sibling classes in ONE dict literal (`{"a": Cat(...),
+    // "b": Dog(...)}` where both derive Animal): the pair unifies to the
+    // common ROOT (Devin review on the round-100 dict gate — the old gate
+    // never fired for them, so boxing or refusal would be a regression;
+    // the gate's pairwise check recognizes the shared root and each value
+    // converts into the sum type).
+    let out = compile(
+        concat!(
+            "class Animal:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name = name\n",
+            "\n",
+            "class Cat(Animal):\n",
+            "    pass\n",
+            "\n",
+            "class Dog(Animal):\n",
+            "    pass\n",
+            "\n",
+            "def f() -> object:\n",
+            "    return {\"a\": Cat(\"c\"), \"b\": Dog(\"d\")}\n",
+        ),
+        "siblingdict.py",
+    );
+    assert!(
+        out.contains("Cat :: new") && out.contains("Dog :: new"),
+        "both sibling constructions must survive: {}",
+        out
+    );
+    assert!(
+        !out.contains("mixes incompatible"),
+        "sibling classes of one hierarchy must not be refused: {}",
+        out
+    );
+}
+
+#[test]
+fn string_union_and_option_inner_mixes_box() {
+    // A `str | bytes` union member next to a String, and Option values
+    // with different inner types (`Option<String>` + `Option<i64>`): no
+    // pair joins to a concrete type, so the values box into PyValue —
+    // never a raw PyDict::from with an unresolved V (Devin review on the
+    // round-100 dict gate).
+    let out = compile(
+        concat!(
+            "def f(sb: str | bytes, s: str, oa: str | None, ob: int | None) -> dict[str, object]:\n",
+            "    return {\"u\": sb, \"s\": s, \"a\": oa, \"b\": ob}\n",
+        ),
+        "mixedbox.py",
+    );
+    let pairs = out.matches("PyValue :: from").count();
+    assert!(pairs >= 2, "union/plain members must box: {}", out);
+    assert!(
+        out.contains("None => stdpython :: PyValue :: None_"),
+        "None-literal Options must box through the Some/None match: {}",
+        out
+    );
+}
+
+#[test]
 fn python_list_methods_map_to_correct_rust() {
     let src = concat!(
         "def f() -> int:\n",

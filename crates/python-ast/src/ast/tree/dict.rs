@@ -101,9 +101,31 @@ impl CodeGen for Dict {
             }
             k_expected = crate::TypeInfo::PyValue;
         }
-        if forced_kv.is_none()
-            && v_distinct.len() > 1
-            && matches!(v_expected, crate::TypeInfo::PyObject)
+        // Whether the distinct value types share a CONCRETE unifiable
+        // family: EVERY pair must unify to a type with no unknown
+        // (PyObject) anywhere inside — all-stringy → String, all-numeric →
+        // Float, sibling classes of one hierarchy → their common root,
+        // Option<T> pairs whose inners join. Anything else mixed has no
+        // single concrete Rust type: it must box (or refuse). The old gate
+        // keyed off `v_expected == PyObject`, but `unify` never returns
+        // PyObject for a mixed set (it absorbs the last non-PyObject), so
+        // the gate only ever fired by accident of order — a {Option<String>,
+        // String, Option<f64>} dict (charset_normalizer's legacy.detect
+        // return) sailed past it and rendered a raw `PyDict::from` whose V
+        // type rustc inferred from the first pair (E0308, round 100). The
+        // ALL-PAIRS form is order-independent (a fold is not: unify absorbs
+        // whichever non-PyObject came last).
+        let pairwise_concrete = |a: &crate::TypeInfo, b: &crate::TypeInfo| {
+            let joined = crate::unify(a.clone(), b.clone());
+            !crate::type_mentions_pyobject(&joined)
+        };
+        let v_unifiable = v_distinct.len() == 1
+            || (0..v_distinct.len()).all(|i| {
+                (i + 1..v_distinct.len()).all(|j| {
+                    pairwise_concrete(&v_distinct[i], &v_distinct[j])
+                })
+            });
+        if forced_kv.is_none() && v_distinct.len() > 1 && !v_unifiable
         {
             // All values are TUPLES of strings of different lengths
             // (`{100: ("continue",), 101: ("switching_protocols",), 103:
@@ -141,6 +163,18 @@ impl CodeGen for Dict {
                     .into());
                 }
                 v_expected = crate::TypeInfo::PyValue;
+            } else {
+                // All values are string TUPLES of different LENGTHS
+                // (`{100: ("continue",), 102: ("processing",
+                // "early-hints"), ...}` — requests' status codes): every
+                // value renders as its element VEC (the sequence model,
+                // applied in the pairs loop below), so the arities share
+                // one Vec<String> value type instead of heterogeneous
+                // Rust tuples rustc cannot unify (the old code detected
+                // the shape but left v_expected untouched — the raw
+                // PyDict::from then failed to build; Devin review on the
+                // round-100 gate).
+                v_expected = crate::TypeInfo::Vec(Box::new(crate::TypeInfo::String));
             }
         }
         let k_expected = if matches!(k_expected, crate::TypeInfo::PyObject) {
@@ -184,13 +218,34 @@ impl CodeGen for Dict {
                         symbols.clone(),
                         k_expected.clone(),
                     )?;
-                    let value_tokens = crate::render_typed(
-                        value,
-                        ctx.clone(),
-                        options.clone(),
-                        symbols.clone(),
-                        v_expected.clone(),
-                    )?;
+                    let value_tokens = if let Some(crate::TypeInfo::Vec(inner)) = &v_expected
+                        && let crate::ExprType::Tuple(t) = value
+                    {
+                        // A TUPLE value in a Vec-typed slot (the
+                        // mixed-length all-string-tuple dict — requests'
+                        // status codes): render each element against the
+                        // inner type and collect — every arity shares the
+                        // Vec value type.
+                        let elts: Result<Vec<_>, _> = t.elts.iter().map(|e| {
+                            crate::render_typed(
+                                e,
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some((**inner).clone()),
+                            )
+                        }).collect();
+                        let elts = elts?;
+                        quote!(vec![#(#elts),*])
+                    } else {
+                        crate::render_typed(
+                            value,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            v_expected.clone(),
+                        )?
+                    };
                     pairs.push(quote! { (#key_tokens, #value_tokens) });
                 }
                 None => {
