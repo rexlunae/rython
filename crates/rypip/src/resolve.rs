@@ -779,7 +779,8 @@ fn recorded_digest(artifact: &Path) -> Result<String> {
 /// What a cache candidate is: a complete extraction (its root), or a
 /// verified artifact still to extract.
 enum Cached {
-    Extracted(PathBuf),
+    /// A complete extraction's root, and whether its artifact is a wheel.
+    Extracted { root: PathBuf, wheel: bool },
     Artifact(PathBuf),
 }
 
@@ -825,7 +826,8 @@ fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDep
             let Ok(root) = locate_extracted_root(&path) else {
                 continue;
             };
-            candidates.push((version, Cached::Extracted(root)));
+            let wheel = artifact_name.ends_with(".whl");
+            candidates.push((version, Cached::Extracted { root, wheel }));
         }
     }
     if let Ok(entries) = fs::read_dir(dist_dir) {
@@ -847,18 +849,19 @@ fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDep
             candidates.push((version, Cached::Artifact(path)));
         }
     }
-    // Ascending by version; at one version a complete extraction sorts
-    // after a wheel, a wheel after an sdist, so the last element is the
-    // newest version in the online preference, extracted if it already
-    // is.
+    // Ascending by version; at one version a wheel sorts after an sdist
+    // and, per artifact, its complete extraction after the artifact, so
+    // the last element is the newest version in the online preference,
+    // extracted if it already is.
     candidates.sort_by(|(va, ca), (vb, cb)| {
         version_cmp(va, vb).then_with(|| {
-            // The online preference, in any directory order: a complete
-            // extraction, then a wheel, then an sdist (Devin review on
-            // #342, round 6).
+            // The online preference, in any directory order: a wheel
+            // over an sdist FIRST (whatever was extracted so far), then a
+            // complete extraction over its own unextracted artifact
+            // (Devin review on #342, rounds 6 and 7).
             let rank = |c: &Cached| match c {
-                Cached::Extracted(_) => 2u8,
-                Cached::Artifact(p) => p.extension().is_some_and(|e| e == "whl") as u8,
+                Cached::Extracted { wheel, .. } => (*wheel as u8) * 2 + 1,
+                Cached::Artifact(p) => (p.extension().is_some_and(|e| e == "whl") as u8) * 2,
             };
             rank(ca).cmp(&rank(cb))
         })
@@ -867,7 +870,7 @@ fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDep
         return Ok(None);
     };
     let root = match cached {
-        Cached::Extracted(root) => root,
+        Cached::Extracted { root, .. } => root,
         Cached::Artifact(path) => extract_distribution(&path, dist_dir, &req.name)?,
     };
     Ok(Some(finalize_dependency(root, &req.name, &version_str_of(&version))))
@@ -1507,6 +1510,67 @@ mod extraction_tests {
         assert!(err.to_string().contains("sha256 mismatch"), "{err:?}");
         assert!(!dist_dir.join("extracted/idna-1.0-py3-none-any").exists());
         let _ = fs::remove_dir_all(&dist_dir);
+    }
+
+    #[test]
+    fn concurrent_publishers_of_different_contents_never_yield_a_silent_mismatch() {
+        // Devin review on #342, round 7: publishers of DIFFERENT
+        // downloads for one cache path (each its own consistent
+        // artifact/sidecar pair) race with readers; every read either
+        // verifies a consistent pair, finds no sidecar yet, or fails
+        // LOUDLY on a torn pair — never accepts one silently — and a
+        // final consistent publish heals the path.
+        let dir = scratch("publish-mixed");
+        let path = dir.join("pkg-1.0-py3-none-any.whl");
+        let sidecar = digest_sidecar(&path);
+        let contents: Vec<Vec<u8>> = (0..4u8)
+            .map(|i| (0..50_000u32).map(|k| ((k % 200) as u8).wrapping_add(i)).collect())
+            .collect();
+        let digests: Vec<String> = contents.iter().map(|b| sha256_hex(b)).collect();
+        let contents = std::sync::Arc::new(contents);
+        let digests = std::sync::Arc::new(digests);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (path, stop) = (path.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut verified = 0u32;
+                let mut torn = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    match cached_artifact_verified(&path) {
+                        Ok(true) => verified += 1,
+                        Ok(false) => {}
+                        Err(e) => {
+                            assert!(e.to_string().contains("sha256 mismatch"), "{e:?}");
+                            torn += 1;
+                        }
+                    }
+                }
+                (verified, torn)
+            })
+        };
+        let writers: Vec<_> = (0..4usize)
+            .map(|i| {
+                let (path, sidecar, contents, digests) =
+                    (path.clone(), sidecar.clone(), contents.clone(), digests.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        publish_file(&path, &contents[i]).unwrap();
+                        publish_file(&sidecar, format!("{}\n", digests[i]).as_bytes()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (verified, _torn) = reader.join().unwrap();
+        assert!(verified > 0, "consistent pairs were observed");
+        // Whatever the race left, a consistent publish heals the path.
+        publish_file(&path, &contents[0]).unwrap();
+        publish_file(&sidecar, format!("{}\n", digests[0]).as_bytes()).unwrap();
+        assert!(cached_artifact_verified(&path).unwrap());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

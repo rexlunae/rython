@@ -1166,6 +1166,7 @@ impl ClassDef {
                 params.push(crate::Parameter {
                     arg: name.clone(),
                     annotation: Some(Box::new(ann)),
+                    quoted_source: None,
                     type_comment: None,
                     lineno: None,
                     col_offset: None,
@@ -1181,6 +1182,7 @@ impl ClassDef {
                     params.push(crate::Parameter {
                         arg: name.clone(),
                         annotation: Some(Box::new(annotation.clone())),
+                        quoted_source: None,
                         type_comment: None,
                         lineno: None,
                         col_offset: None,
@@ -1198,6 +1200,7 @@ impl ClassDef {
                         params.push(crate::Parameter {
                             arg: n.id.clone(),
                             annotation: Some(Box::new(ann.clone())),
+                            quoted_source: None,
                             type_comment: None,
                             lineno: None,
                             col_offset: None,
@@ -1251,6 +1254,7 @@ impl ClassDef {
                 args: std::iter::once(crate::Parameter {
                     arg: "self".to_string(),
                     annotation: None,
+                    quoted_source: None,
                     type_comment: None,
                     lineno: None,
                     col_offset: None,

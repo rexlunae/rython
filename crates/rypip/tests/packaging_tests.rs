@@ -635,6 +635,30 @@ fn a_cached_wheel_is_preferred_over_the_sdist_of_the_same_version() {
 }
 
 #[test]
+fn a_wheel_arriving_after_the_sdist_was_extracted_wins() {
+    // An extracted sdist does not outrank a wheel of the same version:
+    // the artifact kind ranks first, extraction readiness second (Devin
+    // review on #342, round 7).
+    let scratch = Scratch::new("cache-sdist-then-wheel");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("late");
+    write_sdist(&dist_dir, "late", "1.0", "late");
+    let req = parse_requirement("late==1.0").unwrap();
+    let from_sdist = rypip::resolve::resolve_dependency_in(&cache, &req, true).unwrap();
+    assert!(from_sdist.path.starts_with(dist_dir.join("extracted/late-1.0")));
+    assert!(!from_sdist.path.starts_with(dist_dir.join("extracted/late-1.0-py3-none-any")));
+
+    write_wheel(&dist_dir, "late", "1.0", &[("late/__init__.py", "KIND = 'wheel'\n")]);
+    let from_wheel = rypip::resolve::resolve_dependency_in(&cache, &req, true).unwrap();
+    assert!(
+        from_wheel.path.starts_with(dist_dir.join("extracted/late-1.0-py3-none-any")),
+        "the wheel is extracted and chosen: {}",
+        from_wheel.path.display()
+    );
+    assert!(fs::read_to_string(from_wheel.path.join("__init__.py")).unwrap().contains("wheel"));
+}
+
+#[test]
 fn cached_epoch_versions_keep_their_epoch() {
     // An epoch-qualified artifact (`1!2.0`) resolves offline under the
     // same version spelling the online path records (Devin review on

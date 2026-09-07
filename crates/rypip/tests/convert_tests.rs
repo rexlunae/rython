@@ -14851,12 +14851,27 @@ fn typing_spelled_exception_unions_take_a_caught_exception() {
             "        return quoted(e) + \" / \" + quoted(e)\n",
             "\n",
             "\n",
+            "def scalar(x: \"str\") -> str:\n",
+            "    if isinstance(x, str):\n",
+            "        return \"str \" + x\n",
+            "    return \"other\"\n",
+            "\n",
+            "\n",
+            "def opt(x: \"Optional[str]\") -> str:\n",
+            "    if x is None:\n",
+            "        return \"none\"\n",
+            "    return x.upper()\n",
+            "\n",
+            "\n",
             "if __name__ == \"__main__\":\n",
             "    for fail in range(3):\n",
             "        print(attempt(fail))\n",
             "    print(maybe(None))\n",
             "    print(user(False))\n",
-            "    print(user(True))\n"
+            "    print(user(True))\n",
+            "    print(scalar(\"s\"))\n",
+            "    print(opt(None))\n",
+            "    print(opt(\"up\"))\n"
         ),
     )
     .unwrap();
@@ -14880,6 +14895,9 @@ fn typing_spelled_exception_unions_take_a_caught_exception() {
             "nothing",
             "quoted nothing",
             "quoted bad / quoted bad",
+            "str s",
+            "none",
+            "UP",
         ],
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)

@@ -22249,3 +22249,55 @@ fn a_convention_named_value_binding_is_not_an_exception_union_member() {
     assert!(!out.contains("mixed (err : PyException)"), "a bound value is not an exception: {}", out);
     assert!(out.contains("aliased (err : PyException)"), "an alias to an exception is one: {}", out);
 }
+
+#[test]
+fn an_exception_alias_cycle_converts_without_overflowing() {
+    // Devin review on #342, round 7: `A = B; B = A` — the member
+    // classifier ends the walk at the name it already followed.
+    let out = compile(
+        "A = B\n\
+         B = A\n\
+         \n\
+         def f(err: A | ValueError) -> str:\n\
+         \x20   return str(err)\n",
+        "alias_cycle.py",
+    );
+    assert!(out.contains("pub fn f ("), "the conversion returns: {}", out);
+}
+
+#[test]
+fn quoted_scalar_and_optional_annotations_type_the_local_like_the_plain_spelling() {
+    // Devin review on #342, round 7: the parser bridge evaluates a
+    // quoted annotation, so the local type pass and optional-name
+    // seeding see `str` / `Optional[str]` — `isinstance(x, str)` folds
+    // like the plain spelling and the Optional narrows as an Option.
+    let quoted = compile(
+        "from typing import Optional\n\
+         \n\
+         def scalar(x: \"str\") -> str:\n\
+         \x20   if isinstance(x, str):\n\
+         \x20       return \"str \" + x\n\
+         \x20   return \"other\"\n\
+         \n\
+         def opt(x: \"Optional[str]\") -> str:\n\
+         \x20   if x is None:\n\
+         \x20       return \"none\"\n\
+         \x20   return x.upper()\n",
+        "quoted_scalar.py",
+    );
+    let plain = compile(
+        "from typing import Optional\n\
+         \n\
+         def scalar(x: str) -> str:\n\
+         \x20   if isinstance(x, str):\n\
+         \x20       return \"str \" + x\n\
+         \x20   return \"other\"\n\
+         \n\
+         def opt(x: Optional[str]) -> str:\n\
+         \x20   if x is None:\n\
+         \x20       return \"none\"\n\
+         \x20   return x.upper()\n",
+        "plain_scalar.py",
+    );
+    assert_eq!(quoted, plain, "the quoted spelling lowers exactly like the plain one");
+}

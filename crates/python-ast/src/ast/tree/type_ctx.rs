@@ -638,6 +638,13 @@ pub fn infer_type(
     )
 }
 
+thread_local! {
+    /// The names whose assigned values are being inferred right now
+    /// (the name → assignment hop of `infer_type_inner`): a name met
+    /// again on its own path is a cycle.
+    static NAME_INFERENCE_PATH: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn infer_type_inner(
     ctx: Option<&CodeGenContext>,
     expr: &ExprType,
@@ -698,7 +705,20 @@ fn infer_type_inner(
             if let Some(SymbolTableNode::Assign { value, .. }) = symbols.get(&n.id)
                 && !crate::expr_references(value, &n.id)
             {
-                return infer_type_inner(ctx, value, options, symbols);
+                // A CYCLE through other names (`A = B; B = A` — Devin
+                // review on #342, round 7) is not a type: the names on
+                // the current inference path end the walk as "no answer"
+                // instead of overflowing the stack.
+                let on_path = NAME_INFERENCE_PATH.with(|path| path.borrow().contains(&n.id));
+                if on_path {
+                    return TypeInfo::PyObject;
+                }
+                NAME_INFERENCE_PATH.with(|path| path.borrow_mut().push(n.id.clone()));
+                let inferred = infer_type_inner(ctx, value, options, symbols);
+                NAME_INFERENCE_PATH.with(|path| {
+                    path.borrow_mut().pop();
+                });
+                return inferred;
             }
             // A CLASS NAME read as a VALUE (`[ChecksumError]`,
             // `EXCEPTION_MAP['k']` — botocore's retryhandler): classes as

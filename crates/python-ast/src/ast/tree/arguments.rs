@@ -30,8 +30,14 @@ pub type Arg = ExprType;
 pub struct Parameter {
     /// Parameter name
     pub arg: String,
-    /// Optional type annotation
+    /// Optional type annotation — EVALUATED: a quoted annotation is the
+    /// expression it spells (the parser bridge evaluates it once).
     pub annotation: Option<Box<ExprType>>,
+    /// The ORIGINAL text of a quoted annotation, for the one reader that
+    /// wants the text rather than the expression: the Rust stub loader
+    /// (`.pyi` stubs spell Rust types as strings — `"&[u8]"`, `"u32"`).
+    #[serde(default)]
+    pub quoted_source: Option<String>,
     /// Optional type comment (deprecated Python feature)
     pub type_comment: Option<String>,
     /// Position information
@@ -108,12 +114,21 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Parameter {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let arg: String = ob.getattr("arg")?.extract()?;
         
-        // Extract optional annotation
+        let mut quoted_source = None;
+        // Extract optional annotation. A QUOTED annotation (`err:
+        // "Optional[MyError]"`, `x: "str"`) is evaluated HERE, at the
+        // parser bridge — the one place every reader of a parameter's
+        // annotation inherits from (the signature, the body's name
+        // types, the local type pass, optional-name seeding, call sites,
+        // field inference, dunder routing), so no consumer can see the
+        // raw string (Devin review on #342, rounds 4 and 7).
         let annotation = if let Ok(ann) = ob.getattr("annotation") {
             if ann.is_none() {
                 None
             } else {
-                Some(Box::new(ann.extract()?))
+                let raw: ExprType = ann.extract()?;
+                quoted_source = quoted_annotation_text(&raw);
+                Some(Box::new(unquote_annotation(&raw).unwrap_or(raw)))
             }
         } else {
             None
@@ -133,6 +148,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Parameter {
         Ok(Self {
             arg,
             annotation,
+            quoted_source,
             type_comment,
             lineno: ob.lineno(),
             col_offset: ob.col_offset(),
@@ -287,15 +303,29 @@ pub(crate) fn is_type_annotation(annotation: &ExprType) -> bool {
 /// string literal or the content cannot be parsed (round 56).
 impl Parameter {
     /// The parameter's annotation as EVALUATED: a quoted annotation
-    /// (`err: "Optional[MyError]"`) is the expression it spells. Every
-    /// reader of a parameter's annotation — the signature, the body's
-    /// name types, a call site's argument coercion — goes through this
-    /// one evaluation, so they never disagree (Devin review on #342,
-    /// round 4).
+    /// (`err: "Optional[MyError]"`) is the expression it spells. The
+    /// parser bridge (`FromPyObject for Parameter`) evaluates it once
+    /// at construction, so `annotation` already holds the expression
+    /// and every reader agrees; this accessor names that contract for
+    /// the readers that want it spelled out, and evaluates again only
+    /// for a Parameter built elsewhere (the class synthesizers) with a
+    /// quoted form (Devin review on #342, rounds 4 and 7).
     pub(crate) fn evaluated_annotation(&self) -> Option<ExprType> {
         let ann = self.annotation.as_deref()?;
         Some(unquote_annotation(ann).unwrap_or_else(|| ann.clone()))
     }
+}
+
+/// The text of a string-literal annotation (`"Optional[MyError]"`), None
+/// for any other annotation.
+pub(crate) fn quoted_annotation_text(annotation: &ExprType) -> Option<String> {
+    let ExprType::Constant(c) = annotation else {
+        return None;
+    };
+    let Some(litrs::Literal::String(s)) = &c.0 else {
+        return None;
+    };
+    Some(s.value().to_string())
 }
 
 pub(crate) fn unquote_annotation(annotation: &ExprType) -> Option<ExprType> {
@@ -330,8 +360,25 @@ pub(crate) fn is_exception_class_member(
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> bool {
+    is_exception_class_member_within(member, symbols, options, &mut Vec::new())
+}
+
+/// `is_exception_class_member` with the names already followed through
+/// `Assign`/`Alias` hops: a cycle (`A = B; B = A` — Devin review on
+/// #342, round 7) ends the walk as "not an exception class" instead of
+/// overflowing the stack, the same closure the alias resolvers keep.
+fn is_exception_class_member_within(
+    member: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+    followed: &mut Vec<String>,
+) -> bool {
     match member {
         ExprType::Name(n) => {
+            if followed.iter().any(|seen| seen == &n.id) {
+                return false;
+            }
+            followed.push(n.id.clone());
             if let Some((class, _)) =
                 crate::ast::tree::call::resolve_construction_class(&n.id, symbols, options)
             {
@@ -347,11 +394,11 @@ pub(crate) fn is_exception_class_member(
                 Some(crate::SymbolTableNode::Assign { value, .. }) => {
                     return matches!(value, ExprType::Name(_) | ExprType::Attribute(_))
                         && !crate::expr_references(value, &n.id)
-                        && is_exception_class_member(value, symbols, options);
+                        && is_exception_class_member_within(value, symbols, options, followed);
                 }
                 Some(crate::SymbolTableNode::Alias(target)) if target != &n.id => {
                     let target = ExprType::Name(crate::Name { id: target.clone() });
-                    return is_exception_class_member(&target, symbols, options);
+                    return is_exception_class_member_within(&target, symbols, options, followed);
                 }
                 _ => {}
             }

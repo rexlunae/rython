@@ -286,8 +286,13 @@ pub fn function_def_to_spec(
     // have no fixed signature to lower against.
     let mut param_types = Vec::new();
     for p in args.posonlyargs.iter().chain(args.args.iter()) {
-        let ty = match p.annotation.as_deref() {
-            Some(ExprType::Constant(c)) => match &c.0 {
+        // The stub spells the Rust type as a STRING: its original text
+        // (`quoted_source` — the bridge evaluates quoted annotations as
+        // Python expressions for everyone else) or, when the text did
+        // not parse as Python (`"&[u8]"`), the string constant itself.
+        let ty = match (p.quoted_source.as_deref(), p.annotation.as_deref()) {
+            (Some(text), _) => text.to_string(),
+            (None, Some(ExprType::Constant(c))) => match &c.0 {
                 Some(litrs::Literal::String(s)) => s.value().to_string(),
                 _ => {
                     return Err(format!(
@@ -297,14 +302,14 @@ pub fn function_def_to_spec(
                     ));
                 }
             },
-            Some(other) => {
+            (None, Some(other)) => {
                 return Err(format!(
                     "stub parameter `{}` in `{}`: annotation must be a string \
                      literal (e.g. \"&[u8]\"), found {:?}",
                     p.arg, name, other
                 ));
             }
-            None => {
+            (None, None) => {
                 return Err(format!(
                     "stub parameter `{}` in `{}`: missing type annotation",
                     p.arg, name
