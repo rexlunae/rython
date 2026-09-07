@@ -320,9 +320,15 @@ fn resolve_requirement_from_cache_requires_network_or_cache() {
 /// Write a pure-Python wheel (a zip) with the given `path -> contents`
 /// entries into `dir`, named `{dist}-{version}-py3-none-any.whl`.
 fn write_wheel(dir: &Path, dist: &str, version: &str, files: &[(&str, &str)]) -> PathBuf {
+    write_wheel_tagged(dir, dist, version, "py3-none-any", files)
+}
+
+/// `write_wheel` with an explicit compatibility tag (a native wheel is
+/// `cp312-cp312-manylinux_2_17_x86_64`).
+fn write_wheel_tagged(dir: &Path, dist: &str, version: &str, tag: &str, files: &[(&str, &str)]) -> PathBuf {
     use std::io::Write;
     fs::create_dir_all(dir).unwrap();
-    let path = dir.join(format!("{dist}-{version}-py3-none-any.whl"));
+    let path = dir.join(format!("{dist}-{version}-{tag}.whl"));
     let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Stored);
@@ -740,6 +746,42 @@ fn a_corrupt_cached_candidate_is_loud_when_it_would_have_won_and_skipped_otherwi
     )
     .expect("a requirement the corrupt candidate does not satisfy resolves");
     assert_eq!(pinned.version, "1.0");
+}
+
+#[test]
+fn a_cached_native_wheel_is_never_a_candidate() {
+    // The offline eligibility is the online one (Devin review on #342,
+    // round 12): a native wheel in the cache is neither chosen over an
+    // sdist of the same version nor over an older pure wheel, and alone
+    // it resolves nothing.
+    let scratch = Scratch::new("cache-native-wheel");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("nat");
+    write_wheel_tagged(&dist_dir, "nat", "2.0", "cp312-cp312-manylinux_2_17_x86_64", &[("nat/__init__.py", "")]);
+    write_sdist(&dist_dir, "nat", "2.0", "nat");
+    let req = parse_requirement("nat>=1.0").unwrap();
+    let dep = rypip::resolve::resolve_dependency_in(&cache, &req, true).unwrap();
+    assert_eq!(dep.version, "2.0");
+    assert!(
+        dep.path.starts_with(dist_dir.join("extracted/nat-2.0")) && !dep.path.to_string_lossy().contains("cp312"),
+        "the sdist, not the native wheel: {}",
+        dep.path.display()
+    );
+
+    let scratch2 = Scratch::new("cache-native-vs-older-pure");
+    let cache2 = scratch2.path().join("cache");
+    let dist_dir2 = cache2.join("nat");
+    write_wheel_tagged(&dist_dir2, "nat", "2.0", "cp312-cp312-manylinux_2_17_x86_64", &[("nat/__init__.py", "")]);
+    write_wheel(&dist_dir2, "nat", "1.0", &[("nat/__init__.py", "")]);
+    let dep = rypip::resolve::resolve_dependency_in(&cache2, &req, true).unwrap();
+    assert_eq!(dep.version, "1.0", "the older pure wheel, never the native one");
+    let err = rypip::resolve::resolve_dependency_in(
+        &cache2,
+        &parse_requirement("nat==2.0").unwrap(),
+        true,
+    )
+    .expect_err("a native wheel alone resolves nothing");
+    assert!(err.to_string().contains("offline"), "{err:?}");
 }
 
 #[test]

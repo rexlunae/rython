@@ -866,9 +866,10 @@ enum Cached {
 /// Look for a cached distribution satisfying the requirement: the NEWEST
 /// satisfying version among the complete extractions under `extracted/`
 /// and the verified artifacts in the distribution's cache directory (the
-/// same choice online resolution makes among the index's releases, so an
-/// unpinned requirement resolves the same version from the cache in any
-/// directory order); an artifact is extracted now. An extraction without
+/// same choice online resolution makes among the index's releases — a
+/// pure-Python wheel or an sdist, never a native wheel — so an unpinned
+/// requirement resolves the same version from the cache in any directory
+/// order); an artifact is extracted now. An extraction without
 /// its completion marker and an artifact without its recorded digest are
 /// not candidates; an artifact whose digest no longer matches is the loud
 /// error when the ranking would have chosen it, and is skipped when a
@@ -897,6 +898,12 @@ fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDep
                 continue;
             };
             if !version_satisfies(&version, &req.specifiers) {
+                continue;
+            }
+            // The online eligibility (Devin review on #342, round 12): a
+            // wheel is a candidate only when it is pure Python — a native
+            // wheel left in the cache is neither chosen nor ranked.
+            if artifact_name.ends_with(".whl") && !is_pure_wheel(&artifact_name) {
                 continue;
             }
             // The extraction is tied to its ARTIFACT: the artifact must
@@ -938,6 +945,9 @@ fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDep
                 continue;
             };
             if !version_satisfies(&version, &req.specifiers) {
+                continue;
+            }
+            if name.ends_with(".whl") && !is_pure_wheel(&name) {
                 continue;
             }
             match cached_artifact_verified(&path) {

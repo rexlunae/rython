@@ -22430,3 +22430,32 @@ fn typing_aliases_are_scoped_and_source_ordered() {
     assert!(!sig("outer").contains("Option"), "a nested-only alias stays nested: {}", sig("outer"));
     assert!(sig("later").contains("x : Option < i64 >"), "a conditional import declares: {}", sig("later"));
 }
+
+#[test]
+fn bound_functions_and_known_module_imports_are_not_exception_union_members() {
+    // Devin review on #342, round 12: the naming convention applies to
+    // genuinely unresolved names only — a local function named
+    // `ParseError`, a stdlib item named `LoadError` are not exception
+    // classes; an import from a module the crate does not hold still is
+    // (the documented rule for an absent external name).
+    let out = compile(
+        "from os import LoadError\n\
+         from helpers import RemoteError\n\
+         \n\
+         def ParseError(text: str) -> int:\n\
+         \x20   return len(text)\n\
+         \n\
+         def local_fn(err: ParseError | ValueError) -> str:\n\
+         \x20   return str(err)\n\
+         \n\
+         def stdlib_item(err: LoadError | ValueError) -> str:\n\
+         \x20   return str(err)\n\
+         \n\
+         def external(err: RemoteError | ValueError) -> str:\n\
+         \x20   return str(err)\n",
+        "convention_bound.py",
+    );
+    assert!(!out.contains("local_fn (err : PyException)"), "a bound function: {}", out);
+    assert!(!out.contains("stdlib_item (err : PyException)"), "a stdlib item: {}", out);
+    assert!(out.contains("external (err : PyException)"), "an absent external name: {}", out);
+}

@@ -400,6 +400,41 @@ fn is_exception_class_member_within(
                     let target = ExprType::Name(crate::Name { id: target.clone() });
                     return is_exception_class_member_within(&target, symbols, options, followed);
                 }
+                // A bound FUNCTION, a module import, an except binding or a
+                // Rust binding is what it is — never an exception class,
+                // whatever its spelling (Devin review on #342, round 12).
+                Some(crate::SymbolTableNode::FunctionDef(_))
+                | Some(crate::SymbolTableNode::Import(_))
+                | Some(crate::SymbolTableNode::ExceptBinding(_))
+                | Some(crate::SymbolTableNode::RustBinding(_))
+                | Some(crate::SymbolTableNode::RustModule(_)) => return false,
+                // A from-import is judged by its MODULE: a recognized
+                // exception alias is one (below); a stdlib or crate
+                // module's other item is not (a class of the crate would
+                // have resolved above); only a module the crate does not
+                // hold falls to the naming convention — the documented
+                // rule for an absent external name.
+                Some(crate::SymbolTableNode::ImportFrom(imp)) => {
+                    if crate::ast::tree::raise_stmt::is_builtin_exception_name(&n.id)
+                        || crate::ast::tree::raise_stmt::imported_exception_alias(
+                            &n.id,
+                            symbols,
+                            Some(options),
+                        )
+                        .is_some()
+                    {
+                        return true;
+                    }
+                    let root = imp.module.split('.').next().unwrap_or(&imp.module);
+                    let path: Vec<String> = imp.module.split('.').map(str::to_string).collect();
+                    let known_module = imp.level > 0
+                        || crate::StdModule::from_name(root).is_some()
+                        || crate::ast::tree::import::is_std_only_module(root)
+                        || crate::AnnotationModule::from_name(root).is_some()
+                        || crate::ast::tree::module::module_defs_key(options, &path).is_some();
+                    return !known_module
+                        && crate::ast::tree::raise_stmt::is_exception_class_name(&n.id);
+                }
                 _ => {}
             }
             crate::ast::tree::raise_stmt::is_builtin_exception_name(&n.id)
