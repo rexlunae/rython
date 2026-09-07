@@ -1,0 +1,22 @@
+{
+  "converter_commit": "9d247fa",
+  "repo_head": "661e6b1",
+  "rypip_path": "target/debug/rypip",
+  "oracle": "CPython 3.14.1 (pins captured under 3.11)",
+  "passed": 0,
+  "total": 1,
+  "passing": [],
+  "programs": {
+    "pipeline": {
+      "program": "pipeline",
+      "warnings": 13,
+      "status": "build-failed",
+      "errors": 5,
+      "histogram": {
+        "E0277": 3,
+        "E0308": 1,
+        "E0282": 1
+      }
+    }
+  }
+}
