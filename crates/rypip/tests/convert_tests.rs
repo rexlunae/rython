@@ -6634,6 +6634,1265 @@ fn field_from_cross_module_call_result_attribute() {
 }
 
 #[test]
+fn argparse_filetype_positionals_match_python_at_runtime() {
+    // Issue #332: `type=FileType("r")` with `nargs="+"` opens every named
+    // file (a Vec<PyFile>), `dest=` names the fields, `store_true` with
+    // `default=False`, `action="store"`, `action="version"`, and
+    // `parse_args(argv)`. The help/usage spelling of a variadic positional
+    // (`files [files ...]`), the version action's default help, the
+    // missing-positional error and the can't-open error are CPython's
+    // verbatim (python3 3.11).
+    let scratch = Scratch::new("apfiles");
+    let file = scratch.path().join("ap_files.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "from argparse import FileType\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"cat2\", description=\"Concatenate files.\")\n",
+            "    parser.add_argument(\"files\", type=FileType(\"r\"), nargs=\"+\", help=\"File(s) to read\")\n",
+            "    parser.add_argument(\n",
+            "        \"-n\", \"--number\", action=\"store_true\", default=False, dest=\"number\", help=\"Number lines\"\n",
+            "    )\n",
+            "    parser.add_argument(\n",
+            "        \"-t\", \"--threshold\", action=\"store\", default=0.5, type=float, dest=\"limit\", help=\"A limit\"\n",
+            "    )\n",
+            "    parser.add_argument(\"--version\", action=\"version\", version=\"cat2 \" + \"1.0\")\n",
+            "    args = parser.parse_args(argv)\n",
+            "    total = 0\n",
+            "    for f in args.files:\n",
+            "        text = f.read()\n",
+            "        print(f.name, len(text), args.number, args.limit)\n",
+            "        total += len(text)\n",
+            "        f.close()\n",
+            "    print(\"total\", total)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(scratch.path().join("a.txt"), "hello\nworld\n").unwrap();
+    fs::write(scratch.path().join("b.txt"), "xyz").unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/ap_files");
+    let run = |args: &[&str]| {
+        Command::new(&bin)
+            .args(args)
+            .current_dir(scratch.path())
+            .output()
+            .expect("run")
+    };
+
+    // Verified against python3.
+    let output = run(&["a.txt", "b.txt", "-n", "--threshold", "0.25"]);
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "a.txt 12 True 0.25\nb.txt 3 True 0.25\ntotal 15\n"
+    );
+
+    let output = run(&["--version"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "cat2 1.0\n");
+
+    let output = run(&["--help"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        concat!(
+            "usage: cat2 [-h] [-n] [-t LIMIT] [--version] files [files ...]\n",
+            "\n",
+            "Concatenate files.\n",
+            "\n",
+            "positional arguments:\n",
+            "  files                 File(s) to read\n",
+            "\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -n, --number          Number lines\n",
+            "  -t LIMIT, --threshold LIMIT\n",
+            "                        A limit\n",
+            "  --version             show program's version number and exit\n",
+        ),
+        "help text diverged from CPython"
+    );
+
+    let output = run(&[]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        concat!(
+            "usage: cat2 [-h] [-n] [-t LIMIT] [--version] files [files ...]\n",
+            "cat2: error: the following arguments are required: files\n",
+        )
+    );
+
+    let output = run(&["nope.txt"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        concat!(
+            "usage: cat2 [-h] [-n] [-t LIMIT] [--version] files [files ...]\n",
+            "cat2: error: argument files: can't open 'nope.txt': [Errno 2] No such file or directory: 'nope.txt'\n",
+        )
+    );
+}
+
+#[test]
+fn argparse_filetype_dash_is_the_live_standard_stream_for_the_mode() {
+    // Round 1 of the review on #339: `FileType("w")("-")` is the live
+    // stdout (Python returns sys.stdout itself), `FileType("wb")("-")`
+    // its binary stream; every write reaches the user. Verified against
+    // python3: `tee2.py - b.bin` prints `text out` then `done <stdout>
+    // b.bin` and b.bin holds `bytes out`; `tee2.py t.txt -` prints
+    // `bytes out` then `done t.txt <stdout>` and t.txt holds `text out`.
+    // Each named path is opened once (the parse-time handle is the
+    // namespace's), and `issubclass(type(x), int)` is isinstance.
+    let scratch = Scratch::new("apdash");
+    let file = scratch.path().join("tee2.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"tee2\")\n",
+            "    parser.add_argument(\"out\", type=argparse.FileType(\"w\"))\n",
+            "    parser.add_argument(\"blob\", type=argparse.FileType(\"wb\"))\n",
+            "    args = parser.parse_args(argv)\n",
+            "    args.out.write(\"text out\\n\")\n",
+            "    args.out.flush()\n",
+            "    args.blob.write(b\"bytes out\\n\")\n",
+            "    args.blob.flush()\n",
+            "    x = 1\n",
+            "    print(\"done\", args.out.name, args.blob.name, issubclass(type(x), int))\n",
+            "    if args.out.name != \"<stdout>\":\n",
+            "        args.out.close()\n",
+            "    if args.blob.name != \"<stdout>\":\n",
+            "        args.blob.close()\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/tee2");
+    let run = |args: &[&str]| {
+        Command::new(&bin)
+            .args(args)
+            .current_dir(scratch.path())
+            .output()
+            .expect("run")
+    };
+    // Verified against python3.
+    let output = run(&["-", "b.bin"]);
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "text out\ndone <stdout> b.bin True\n"
+    );
+    assert_eq!(fs::read(scratch.path().join("b.bin")).unwrap(), b"bytes out\n");
+    let output = run(&["t.txt", "-"]);
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "bytes out\ndone t.txt <stdout> True\n"
+    );
+    assert_eq!(fs::read_to_string(scratch.path().join("t.txt")).unwrap(), "text out\n");
+}
+
+#[test]
+fn argparse_consumes_arguments_in_cpython_order() {
+    // Round 2 of the review on #339: the runtime parser is a port of
+    // CPython's `_parse_known_args` — positionals are consumed at each
+    // option boundary through the partial pattern match and every action
+    // is taken in argv order. So a positional that cannot open fails
+    // before a later option's bad value; `--version` after it never
+    // prints; `--version=1` is the explicit-argument error; `-vn 3`
+    // unpacks; `-n/--num` is the option's name in errors; a token after
+    // the last option that no positional can take is "unrecognized",
+    // and required positionals are reported before leftovers. The
+    // version string is the one add_argument saw (`tool 1.0`, not the
+    // rebound `2.0`). Every transcript below was captured from python3
+    // 3.11 verbatim (a.txt and b.txt exist, missing.txt does not).
+    let scratch = Scratch::new("aporder");
+    let file = scratch.path().join("order.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    v = \"1.0\"\n",
+            "    parser = argparse.ArgumentParser(prog=\"tool\")\n",
+            "    parser.add_argument(\"-n\", \"--num\", type=int, default=0)\n",
+            "    parser.add_argument(\"-v\", \"--verbose\", action=\"store_true\")\n",
+            "    parser.add_argument(\"--version\", action=\"version\", version=\"tool \" + v)\n",
+            "    parser.add_argument(\"files\", type=argparse.FileType(\"r\"), nargs=\"+\")\n",
+            "    parser.add_argument(\"out\")\n",
+            "    v = \"2.0\"\n",
+            "    args = parser.parse_args(argv)\n",
+            "    for f in args.files:\n",
+            "        print(f.name)\n",
+            "    print(args.num, args.verbose, args.out)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(scratch.path().join("a.txt"), "a\n").unwrap();
+    fs::write(scratch.path().join("b.txt"), "b\n").unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/order");
+    let usage = "usage: tool [-h] [-n NUM] [-v] [--version] files [files ...] out\n";
+    // Verified against python3.
+    let cases: &[(&[&str], i32, &str, &str)] = &[
+        (&["a.txt", "b.txt", "o"], 0, "a.txt\nb.txt\n0 False o\n", ""),
+        (&["a.txt", "--num", "1", "b.txt"], 0, "a.txt\n1 False b.txt\n", ""),
+        (
+            &["missing.txt", "o", "--num", "x"],
+            2,
+            "",
+            "tool: error: argument files: can't open 'missing.txt': [Errno 2] No such file or directory: 'missing.txt'\n",
+        ),
+        (&["a.txt", "o", "--version"], 0, "tool 1.0\n", ""),
+        (
+            &["--version=1"],
+            2,
+            "",
+            "tool: error: argument --version: ignored explicit argument '1'\n",
+        ),
+        (
+            &["a.txt", "o", "-n", "x"],
+            2,
+            "",
+            "tool: error: argument -n/--num: invalid int value: 'x'\n",
+        ),
+        (&["a.txt", "o", "-vn", "3"], 0, "a.txt\n3 True o\n", ""),
+        (
+            &["a.txt", "b.txt", "o", "--num", "1", "c.txt"],
+            2,
+            "",
+            "tool: error: unrecognized arguments: c.txt\n",
+        ),
+        (
+            &["-n", "1"],
+            2,
+            "",
+            "tool: error: the following arguments are required: files, out\n",
+        ),
+        (
+            &["a.txt"],
+            2,
+            "",
+            "tool: error: the following arguments are required: out\n",
+        ),
+        (&["a.txt", "--", "-o"], 0, "a.txt\n0 False -o\n", ""),
+        (
+            &["a.txt", "o", "--verbose=x"],
+            2,
+            "",
+            "tool: error: argument -v/--verbose: ignored explicit argument 'x'\n",
+        ),
+        (
+            &["a.txt", "o", "-vx"],
+            2,
+            "",
+            "tool: error: unrecognized arguments: -x\n",
+        ),
+    ];
+    for (args, code, stdout, stderr) in cases {
+        let output = Command::new(&bin)
+            .args(*args)
+            .current_dir(scratch.path())
+            .output()
+            .expect("run");
+        assert_eq!(output.status.code(), Some(*code), "{:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), *stdout, "{:?}", args);
+        let expected_err = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!("{}{}", usage, stderr)
+        };
+        assert_eq!(String::from_utf8_lossy(&output.stderr), expected_err, "{:?}", args);
+    }
+}
+
+#[test]
+fn argparse_formats_prog_placeholders_and_rejects_negative_flags_and_binary_text_settings() {
+    // Round 3 of the review on #339: `%(prog)s` in a version string and
+    // the description (with `%%` collapsing only when the text mentions
+    // `%(prog)`), `%(default)s`/`%(prog)s` in a help string; an option
+    // string that looks like a negative number (`-1`) makes `-2` and
+    // `-2.5` unrecognized options rather than positionals; and a binary
+    // `open` with `encoding=`/`errors=` (keyword or positional) raises
+    // CPython's ValueError at the open while a literal None does not.
+    // Every transcript below was captured from python3 3.11 verbatim.
+    let scratch = Scratch::new("approg");
+    let file = scratch.path().join("vers.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"mytool\", description=\"%(prog)s reads files\")\n",
+            "    parser.add_argument(\"--version\", action=\"version\", version=\"%(prog)s 2.1 (100%%)\")\n",
+            "    parser.add_argument(\"-1\", \"--one\", action=\"store_true\", help=\"just one\")\n",
+            "    parser.add_argument(\"--num\", type=int, default=3, help=\"a count (default %(default)s) for %(prog)s\")\n",
+            "    parser.add_argument(\"files\", nargs=\"*\")\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(args.one, args.num, args.files)\n",
+            "    try:\n",
+            "        open(\"vers.py\", \"rb\", encoding=\"utf-8\")\n",
+            "    except ValueError as e:\n",
+            "        print(\"caught:\", e)\n",
+            "    try:\n",
+            "        open(\"vers.py\", \"rb\", -1, None, \"strict\")\n",
+            "    except ValueError as e:\n",
+            "        print(\"caught:\", e)\n",
+            "    with open(\"vers.py\", \"rb\", -1, None) as f:\n",
+            "        print(len(f.read()) > 0)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/vers");
+    let usage = "usage: mytool [-h] [--version] [-1] [--num NUM] [files ...]\n";
+    let ok_tail = "caught: binary mode doesn't take an encoding argument\ncaught: binary mode doesn't take an errors argument\nTrue\n";
+    // Verified against python3.
+    let cases: &[(&[&str], i32, String, &str)] = &[
+        (&["--version"], 0, "mytool 2.1 (100%)\n".to_string(), ""),
+        (
+            &["-h"],
+            0,
+            format!(
+                "{}\nmytool reads files\n\npositional arguments:\n  files\n\noptions:\n  -h, --help  show this help message and exit\n  --version   show program's version number and exit\n  -1, --one   just one\n  --num NUM   a count (default 3) for mytool\n",
+                usage
+            ),
+            "",
+        ),
+        (&["a", "-2"], 2, String::new(), "mytool: error: unrecognized arguments: -2\n"),
+        (&["-1", "a", "-2.5"], 2, String::new(), "mytool: error: unrecognized arguments: -2.5\n"),
+        (&["a", "b"], 0, format!("False 3 ['a', 'b']\n{}", ok_tail), ""),
+        (&[], 0, format!("False 3 []\n{}", ok_tail), ""),
+    ];
+    for (args, code, stdout, stderr) in cases {
+        let output = Command::new(&bin)
+            .args(*args)
+            .current_dir(scratch.path())
+            .output()
+            .expect("run");
+        assert_eq!(output.status.code(), Some(*code), "{:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), *stdout, "{:?}", args);
+        let expected_err = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!("{}{}", usage, stderr)
+        };
+        assert_eq!(String::from_utf8_lossy(&output.stderr), expected_err, "{:?}", args);
+    }
+}
+
+#[test]
+fn dash_aliases_share_one_stream_and_wrong_direction_io_is_unsupported_operation() {
+    // Round 4 of the review on #339: two `FileType("r")("-")` values are
+    // two aliases of ONE stdin object (the second read sees the cursor
+    // the first left, and closing one closes both — a read through the
+    // other alias is the closed-file ValueError); `%(type)s` in help
+    // is None without type=, `FileType('rb')` for a FileType; an
+    // OSError's filename is Python's repr (an apostrophe switches to
+    // double quotes) while argparse's own "can't open" wrapper keeps its
+    // literal quotes; a write on a read-only stream is
+    // io.UnsupportedOperation, caught as itself, as OSError and as
+    // ValueError, with CPython's messages; `getvalue()` on a disk handle
+    // is CPython's AttributeError naming the receiver's class (round 5).
+    // Transcripts captured from python3 3.11 verbatim.
+    let scratch = Scratch::new("apdash2");
+    let file = scratch.path().join("r4.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "import io\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"r4\")\n",
+            "    parser.add_argument(\"name\", help=\"a %(type)s\")\n",
+            "    parser.add_argument(\"blob\", type=argparse.FileType(\"rb\"), help=\"a %(type)s\")\n",
+            "    parser.add_argument(\"src\", type=argparse.FileType(\"r\"), help=\"a %(type)s\")\n",
+            "    parser.add_argument(\"alias\", type=argparse.FileType(\"r\"), help=\"a %(type)s\")\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(\"first read:\", repr(args.src.read()))\n",
+            "    print(\"alias read:\", repr(args.alias.read()))\n",
+            "    args.src.close()\n",
+            "    try:\n",
+            "        args.alias.read()\n",
+            "    except ValueError as e:\n",
+            "        print(\"caught closed:\", e)\n",
+            "    try:\n",
+            "        args.blob.write(b\"x\")\n",
+            "    except io.UnsupportedOperation as e:\n",
+            "        print(\"caught:\", e)\n",
+            "    with open(\"w.bin\", \"wb\") as g:\n",
+            "        try:\n",
+            "            g.read()\n",
+            "        except OSError as e:\n",
+            "            print(\"caught os:\", e)\n",
+            "    with open(\"r4.py\", \"r\") as h:\n",
+            "        try:\n",
+            "            h.write(\"x\")\n",
+            "        except ValueError as e:\n",
+            "            print(\"caught text:\", e)\n",
+            "    try:\n",
+            "        args.blob.getvalue()\n",
+            "    except AttributeError as e:\n",
+            "        print(\"caught attr:\", e)\n",
+            "    with open(\"w2.bin\", \"wb\") as w:\n",
+            "        try:\n",
+            "            w.getvalue()\n",
+            "        except AttributeError as e:\n",
+            "            print(\"caught attr:\", e)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(scratch.path().join("it's.bin"), "data\n").unwrap();
+    fs::write(scratch.path().join("input.txt"), "line one\nline two\n").unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/r4");
+    let run = |args: &[&str]| {
+        Command::new(&bin)
+            .args(args)
+            .current_dir(scratch.path())
+            .stdin(fs::File::open(scratch.path().join("input.txt")).unwrap())
+            .output()
+            .expect("run")
+    };
+    // Verified against python3.
+    let output = run(&["-h"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "usage: r4 [-h] name blob src alias\n\npositional arguments:\n  name        a None\n  blob        a FileType('rb')\n  src         a FileType('r')\n  alias       a FileType('r')\n\noptions:\n  -h, --help  show this help message and exit\n"
+    );
+    let output = run(&["n", "it's.bin", "-", "-"]);
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "first read: 'line one\\nline two\\n'\nalias read: ''\ncaught closed: I/O operation on closed file.\ncaught: write\ncaught os: read\ncaught text: not writable\ncaught attr: '_io.BufferedReader' object has no attribute 'getvalue'\ncaught attr: '_io.BufferedWriter' object has no attribute 'getvalue'\n"
+    );
+    let output = run(&["n", "missing'x.bin", "-", "-"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "usage: r4 [-h] name blob src alias\nr4: error: argument blob: can't open 'missing'x.bin': [Errno 2] No such file or directory: \"missing'x.bin\"\n"
+    );
+}
+
+#[test]
+fn argparse_differential_coverage_repeated_options_prefixes_and_dash_dash() {
+    // Round 5 of the review on #339: differential coverage of the ported
+    // consumption — repeated options (last wins, `=` and split forms
+    // mixed), overlapping long prefixes (`--nu` ambiguous between --num
+    // and --number, `--n` among three, `--numb` and `--na` unique), `--`
+    // at the start, in the middle, twice, before a value an option
+    // wanted, and alone; an option value that looks like an option
+    // (`--name --num` is "expected one argument", `--name=--num` is the
+    // value); an empty value; packed and repeated flags. Every transcript
+    // captured from python3 3.11 verbatim.
+    let scratch = Scratch::new("apcov");
+    let file = scratch.path().join("cov.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"cov\")\n",
+            "    parser.add_argument(\"--num\", type=int, default=0)\n",
+            "    parser.add_argument(\"--number\", type=int, default=0)\n",
+            "    parser.add_argument(\"--name\", default=\"none\")\n",
+            "    parser.add_argument(\"-v\", \"--verbose\", action=\"store_true\")\n",
+            "    parser.add_argument(\"first\")\n",
+            "    parser.add_argument(\"rest\", nargs=\"*\")\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(args.num, args.number, args.name, args.verbose, args.first, args.rest)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/cov");
+    let usage = "usage: cov [-h] [--num NUM] [--number NUMBER] [--name NAME] [-v]\n           first [rest ...]\n";
+    // Verified against python3.
+    let cases: &[(&[&str], i32, &str, &str)] = &[
+        (&["--num", "1", "--num", "2", "a"], 0, "2 0 none False a []\n", ""),
+        (&["--nu", "1", "a"], 2, "", "cov: error: ambiguous option: --nu could match --num, --number\n"),
+        (&["--numb", "3", "a"], 0, "0 3 none False a []\n", ""),
+        (&["--na", "x", "a"], 0, "0 0 x False a []\n", ""),
+        (&["--n", "1", "a"], 2, "", "cov: error: ambiguous option: --n could match --num, --number, --name\n"),
+        (&["--number=4", "--num=5", "a"], 0, "5 4 none False a []\n", ""),
+        (&["--", "--num", "a"], 0, "0 0 none False --num ['a']\n", ""),
+        (&["a", "--", "--num", "b"], 0, "0 0 none False a ['--num', 'b']\n", ""),
+        (&["a", "b", "--", "c", "--", "d"], 0, "0 0 none False a ['b', 'c', '--', 'd']\n", ""),
+        (&["--num", "1", "--", "-v", "a"], 0, "1 0 none False -v ['a']\n", ""),
+        (&["-v", "--", "--verbose", "a"], 0, "0 0 none True --verbose ['a']\n", ""),
+        (&["a", "--num", "--", "b"], 2, "", "cov: error: argument --num: expected one argument\n"),
+        (&["--", "a"], 0, "0 0 none False a []\n", ""),
+        (&["--"], 2, "", "cov: error: the following arguments are required: first, rest\n"),
+        (&["a", "--num=1", "--num", "2", "-v", "b", "c"], 2, "", "cov: error: unrecognized arguments: b c\n"),
+        (&["--name", "--num", "a"], 2, "", "cov: error: argument --name: expected one argument\n"),
+        (&["--name=--num", "a"], 0, "0 0 --num False a []\n", ""),
+        (&["--name", "", "a"], 0, "0 0  False a []\n", ""),
+        (&["-vv", "a"], 0, "0 0 none True a []\n", ""),
+        (&["--verbose", "--verbose", "a"], 0, "0 0 none True a []\n", ""),
+    ];
+    for (args, code, stdout, stderr) in cases {
+        let output = Command::new(&bin)
+            .args(*args)
+            .current_dir(scratch.path())
+            .output()
+            .expect("run");
+        assert_eq!(output.status.code(), Some(*code), "{:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), *stdout, "{:?}", args);
+        let expected_err = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!("{}{}", usage, stderr)
+        };
+        assert_eq!(String::from_utf8_lossy(&output.stderr), expected_err, "{:?}", args);
+    }
+}
+
+#[test]
+fn argparse_usage_and_help_wrap_at_the_terminal_width() {
+    // Round 5 of the review on #339: CPython's HelpFormatter wraps the
+    // usage line (its `_format_usage` part algorithm), the description
+    // (`textwrap.fill`) and each help string (`textwrap.wrap` at the help
+    // column, with whitespace collapsed) at the terminal width — the
+    // COLUMNS variable when set, else the tty width, else 80 — minus 2;
+    // the help column is min(24, width - 20). The same wrapped usage
+    // heads every error. Transcripts captured from python3 3.11 with
+    // COLUMNS unset (no tty: 80), 40 and 120.
+    let scratch = Scratch::new("apwrap");
+    let file = scratch.path().join("wrap.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"wrap\", description=\"A description long enough that the formatter has to wrap it onto a second line, and then onto a third one so the fill is exercised properly.\")\n",
+            "    parser.add_argument(\"--alpha-option\", default=\"a\", help=\"the alpha option takes a value and this help text is long enough to wrap around at the help column more than once, really\")\n",
+            "    parser.add_argument(\"--beta\", type=int, default=0, help=\"short\")\n",
+            "    parser.add_argument(\"-v\", \"--verbose\", action=\"store_true\", help=\"say   more   with   odd   spacing\")\n",
+            "    parser.add_argument(\"files\", nargs=\"+\", help=\"input files\")\n",
+            "    parser.add_argument(\"output\")\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(args.alpha_option, args.beta, args.verbose, args.files, args.output)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/wrap");
+    let run = |columns: Option<&str>, args: &[&str]| {
+        let mut cmd = Command::new(&bin);
+        cmd.args(args).current_dir(scratch.path()).env_remove("COLUMNS");
+        if let Some(c) = columns {
+            cmd.env("COLUMNS", c);
+        }
+        cmd.output().expect("run")
+    };
+    let usage80 = "usage: wrap [-h] [--alpha-option ALPHA_OPTION] [--beta BETA] [-v]\n            files [files ...] output\n";
+    let help80 = format!(
+        "{}\nA description long enough that the formatter has to wrap it onto a second\nline, and then onto a third one so the fill is exercised properly.\n\npositional arguments:\n  files                 input files\n  output\n\noptions:\n  -h, --help            show this help message and exit\n  --alpha-option ALPHA_OPTION\n                        the alpha option takes a value and this help text is\n                        long enough to wrap around at the help column more\n                        than once, really\n  --beta BETA           short\n  -v, --verbose         say more with odd spacing\n",
+        usage80
+    );
+    let usage40 = "usage: wrap [-h]\n            [--alpha-option ALPHA_OPTION]\n            [--beta BETA] [-v]\n            files [files ...] output\n";
+    let help40 = format!(
+        "{}\nA description long enough that the\nformatter has to wrap it onto a second\nline, and then onto a third one so the\nfill is exercised properly.\n\npositional arguments:\n  files           input files\n  output\n\noptions:\n  -h, --help      show this help\n                  message and exit\n  --alpha-option ALPHA_OPTION\n                  the alpha option\n                  takes a value and\n                  this help text is\n                  long enough to wrap\n                  around at the help\n                  column more than\n                  once, really\n  --beta BETA     short\n  -v, --verbose   say more with odd\n                  spacing\n",
+        usage40
+    );
+    let usage120 = "usage: wrap [-h] [--alpha-option ALPHA_OPTION] [--beta BETA] [-v] files [files ...] output\n";
+    let help120 = format!(
+        "{}\nA description long enough that the formatter has to wrap it onto a second line, and then onto a third one so the fill\nis exercised properly.\n\npositional arguments:\n  files                 input files\n  output\n\noptions:\n  -h, --help            show this help message and exit\n  --alpha-option ALPHA_OPTION\n                        the alpha option takes a value and this help text is long enough to wrap around at the help\n                        column more than once, really\n  --beta BETA           short\n  -v, --verbose         say more with odd spacing\n",
+        usage120
+    );
+    // Verified against python3.
+    for (columns, usage, help) in [(None, usage80, help80), (Some("40"), usage40, help40), (Some("120"), usage120, help120)] {
+        let output = run(columns, &["-h"]);
+        assert_eq!(output.status.code(), Some(0), "{:?}", columns);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), help, "{:?}", columns);
+        let output = run(columns, &["--bogus"]);
+        assert_eq!(output.status.code(), Some(2), "{:?}", columns);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("{}wrap: error: the following arguments are required: files, output\n", usage),
+            "{:?}",
+            columns
+        );
+    }
+}
+
+#[test]
+fn closing_a_dash_stream_closes_it_for_print_and_input_too() {
+    // Round 6 of the review on #339: `FileType("r")("-")` IS sys.stdin and
+    // `FileType("w")("-")` IS sys.stdout, so closing one closes the stream
+    // every builtin uses — a later `input()` and a later `print()` are
+    // CPython's `ValueError: I/O operation on closed file.` (the print
+    // failure is recorded in a file, since stdout is gone). Transcript
+    // captured from python3 3.11 with piped stdin.
+    let scratch = Scratch::new("apclosed");
+    let file = scratch.path().join("closed.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"closed\")\n",
+            "    parser.add_argument(\"src\", type=argparse.FileType(\"r\"))\n",
+            "    parser.add_argument(\"out\", type=argparse.FileType(\"w\"))\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(\"before\", args.src.read().strip())\n",
+            "    args.src.close()\n",
+            "    try:\n",
+            "        input()\n",
+            "    except ValueError as e:\n",
+            "        print(\"input:\", e)\n",
+            "    args.out.write(\"written\\n\")\n",
+            "    args.out.flush()\n",
+            "    args.out.close()\n",
+            "    with open(\"after.txt\", \"w\") as log:\n",
+            "        try:\n",
+            "            print(\"after\")\n",
+            "        except ValueError as e:\n",
+            "            log.write(\"print: \" + str(e) + \"\\n\")\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(scratch.path().join("input.txt"), "piped\n").unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/closed");
+    // Verified against python3.
+    let output = Command::new(&bin)
+        .args(["-", "-"])
+        .current_dir(scratch.path())
+        .stdin(fs::File::open(scratch.path().join("input.txt")).unwrap())
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "before piped\ninput: I/O operation on closed file.\nwritten\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(
+        fs::read_to_string(scratch.path().join("after.txt")).unwrap(),
+        "print: I/O operation on closed file.\n"
+    );
+}
+
+#[test]
+fn argparse_defaults_bind_where_add_argument_stood() {
+    // Round 10 of the review on #339: Python evaluates `default=` when
+    // add_argument runs, so a name rebound before parse_args does not
+    // change an omitted option's value — in a function body and at module
+    // level alike. Transcripts captured from python3 3.11 verbatim.
+    let scratch = Scratch::new("apdeforder");
+    let file = scratch.path().join("order.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    fallback = \"early\"\n",
+            "    parser = argparse.ArgumentParser(prog=\"order\")\n",
+            "    parser.add_argument(\"--name\", default=fallback)\n",
+            "    parser.add_argument(\"--tag\", default=\"lit-\" + fallback)\n",
+            "    fallback = \"late\"\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(args.name, args.tag, fallback)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/order");
+    // Verified against python3.
+    for (args, expected) in [
+        (&[][..], "early lit-early late\n"),
+        (&["--name", "given", "--tag", "t"][..], "given t late\n"),
+    ] {
+        let output = Command::new(&bin).args(args).output().expect("run");
+        assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "args: {:?}", args);
+    }
+
+    // The same at module level: the binding lands in __module_init__
+    // where the add_argument stood.
+    let scratch = Scratch::new("apdefordermod");
+    let file = scratch.path().join("ordermod.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "fallback = \"early\"\n",
+            "parser = argparse.ArgumentParser(prog=\"ordermod\")\n",
+            "parser.add_argument(\"--name\", default=fallback)\n",
+            "fallback = \"late\"\n",
+            "args = parser.parse_args()\n",
+            "print(args.name, fallback)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/ordermod");
+    for (args, expected) in [(&[][..], "early late\n"), (&["--name", "given"][..], "given late\n")] {
+        let output = Command::new(&bin).args(args).output().expect("run");
+        assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "args: {:?}", args);
+    }
+}
+
+#[test]
+fn numeric_argparse_values_follow_pythons_underscore_grammar() {
+    // Round 10 of the review on #339: `type=int` / `type=float` are the
+    // builtins, so a string default and a command-line value accept single
+    // underscores BETWEEN digits (`1_000`, `1_0.5`, `.5_1`, `1e1_0`) and
+    // nothing else (`1__0` is CPython's invalid-value error). Transcripts
+    // captured from python3 3.11 verbatim.
+    let scratch = Scratch::new("apunder");
+    let file = scratch.path().join("under.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"under\")\n",
+            "    parser.add_argument(\"--count\", type=int, default=\"1_000\")\n",
+            "    parser.add_argument(\"--ratio\", type=float, default=\"1_0.5\")\n",
+            "    parser.add_argument(\"--tail\", type=float, default=\".5_1\")\n",
+            "    parser.add_argument(\"--big\", type=float, default=\"1e1_0\")\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(args.count, args.ratio, args.tail, args.big)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/under");
+    // Verified against python3.
+    let cases: &[(&[&str], i32, &str, &str)] = &[
+        (&[], 0, "1000 10.5 0.51 10000000000.0\n", ""),
+        (&["--count", "1_0", "--ratio", "2_5.5"], 0, "10 25.5 0.51 10000000000.0\n", ""),
+        (
+            &["--count", "1__0"],
+            2,
+            "",
+            "usage: under [-h] [--count COUNT] [--ratio RATIO] [--tail TAIL] [--big BIG]\nunder: error: argument --count: invalid int value: '1__0'\n",
+        ),
+    ];
+    for (args, code, stdout, stderr) in cases {
+        let output = Command::new(&bin).args(*args).env_remove("COLUMNS").output().expect("run");
+        assert_eq!(output.status.code(), Some(*code), "args: {:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), *stdout, "args: {:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stderr), *stderr, "args: {:?}", args);
+    }
+}
+
+#[test]
+fn numeric_argparse_values_keep_the_i64_minimum_and_a_nans_sign() {
+    // Round 11 of the review on #339: `int("-9223372036854775808")` is
+    // i64::MIN (its magnitude is not an i64, so the string is parsed with
+    // its sign), and `float("-nan")` keeps its sign bit — visible only
+    // through `math.copysign`. Both as string defaults and as command-line
+    // values; `--f -nan` is CPython's "expected one argument", since `-nan`
+    // looks like an option, while `--f=-nan` is the value. An int CPython
+    // reads that i64 cannot hold is loud. Transcripts captured from
+    // python3 3.11 verbatim.
+    let scratch = Scratch::new("apedge");
+    let file = scratch.path().join("edge.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "import math\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"edge\")\n",
+            "    parser.add_argument(\"--n\", type=int, default=\"-9223372036854775808\")\n",
+            "    parser.add_argument(\"--f\", type=float, default=\"-nan\")\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(args.n, math.copysign(1.0, args.f))\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/edge");
+    // Verified against python3.
+    let cases: &[(&[&str], i32, &str, &str)] = &[
+        (&[], 0, "-9223372036854775808 -1.0\n", ""),
+        (&["--n", "-9223372036854775808", "--f=-nan"], 0, "-9223372036854775808 -1.0\n", ""),
+        (&["--n", "9223372036854775807", "--f", "nan"], 0, "9223372036854775807 1.0\n", ""),
+        (&["--f=+nan"], 0, "-9223372036854775808 1.0\n", ""),
+        (&["--f=-inf"], 0, "-9223372036854775808 -1.0\n", ""),
+        (
+            &["--f", "-nan"],
+            2,
+            "",
+            "usage: edge [-h] [--n N] [--f F]\nedge: error: argument --f: expected one argument\n",
+        ),
+    ];
+    for (args, code, stdout, stderr) in cases {
+        let output = Command::new(&bin).args(*args).env_remove("COLUMNS").output().expect("run");
+        assert_eq!(output.status.code(), Some(*code), "args: {:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), *stdout, "args: {:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stderr), *stderr, "args: {:?}", args);
+    }
+    // python3 prints -9223372036854775809; the i64 field cannot hold it,
+    // so the run is loud rather than a different number.
+    let output = Command::new(&bin).args(["--n", "-9223372036854775809"]).output().expect("run");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("NotImplementedError: int('-9223372036854775809'): an int outside i64 are not supported yet"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn input_without_a_prompt_ignores_a_closed_stdout() {
+    // Round 10 of the review on #339: `input()` without a prompt writes
+    // nothing to sys.stdout (CPython flushes it and clears the error), so
+    // a closed `FileType("w")("-")` does not stop it reading; a prompt IS
+    // written, so `input("prompt> ")` is the closed-file ValueError, like
+    // `print()`. Transcript captured from python3 3.11 with piped stdin.
+    let scratch = Scratch::new("appromptless");
+    let file = scratch.path().join("promptless.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"promptless\")\n",
+            "    parser.add_argument(\"out\", type=argparse.FileType(\"w\"))\n",
+            "    args = parser.parse_args(argv)\n",
+            "    args.out.close()\n",
+            "    with open(\"log.txt\", \"w\") as log:\n",
+            "        line = input()\n",
+            "        log.write(\"read: \" + line + \"\\n\")\n",
+            "        try:\n",
+            "            input(\"prompt> \")\n",
+            "        except ValueError as e:\n",
+            "            log.write(\"prompted: \" + str(e) + \"\\n\")\n",
+            "        try:\n",
+            "            print(\"gone\")\n",
+            "        except ValueError as e:\n",
+            "            log.write(\"print: \" + str(e) + \"\\n\")\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(scratch.path().join("input.txt"), "first\nsecond\n").unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/promptless");
+    // Verified against python3.
+    let output = Command::new(&bin)
+        .arg("-")
+        .current_dir(scratch.path())
+        .stdin(fs::File::open(scratch.path().join("input.txt")).unwrap())
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(
+        fs::read_to_string(scratch.path().join("log.txt")).unwrap(),
+        "read: first\nprompted: I/O operation on closed file.\nprint: I/O operation on closed file.\n"
+    );
+}
+
+#[test]
+fn a_failed_write_to_stdout_is_a_catchable_broken_pipe_error() {
+    // Round 7 of the review on #339: print() writes through the fallible
+    // path, so stdout rejecting a write — the reader of a pipe gone — is
+    // CPython's `BrokenPipeError: [Errno 32] Broken pipe`, caught by the
+    // program, never a panic; input()'s prompt takes the same path. The
+    // test closes the pipe's read end before the program prints (the
+    // program waits on stdin first), and reads the recorded exceptions
+    // from a file since stdout is gone. Transcript captured from python3
+    // 3.11 the same way.
+    let scratch = Scratch::new("appipe");
+    let file = scratch.path().join("pipe.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> None:\n",
+            "    line = input()\n",
+            "    try:\n",
+            "        print(\"x\" * 10)\n",
+            "    except BrokenPipeError as e:\n",
+            "        with open(\"pipe_err.txt\", \"w\") as f:\n",
+            "            f.write(\"print: \" + str(e) + \"\\n\")\n",
+            "    try:\n",
+            "        input(\"prompt\")\n",
+            "    except OSError as e:\n",
+            "        with open(\"pipe_err.txt\", \"a\") as f:\n",
+            "            f.write(\"input: \" + str(e) + \"\\n\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/pipe");
+    let mut child = Command::new(&bin)
+        .current_dir(scratch.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    // Close the read end of stdout before the program prints.
+    drop(child.stdout.take());
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"go\n").unwrap();
+    }
+    // Verified against python3.
+    let output = child.wait_with_output().expect("wait");
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(
+        fs::read_to_string(scratch.path().join("pipe_err.txt")).unwrap(),
+        "print: [Errno 32] Broken pipe\ninput: [Errno 32] Broken pipe\n"
+    );
+}
+
+#[test]
+fn equals_after_a_packed_short_flag_is_an_explicit_argument_error() {
+    // Round 8 of the review on #339 claimed CPython accepts `-v=x` with
+    // `-v` and `-x` both flags. It does not: `consume_optional` raises
+    // `ignored explicit argument` when the explicit argument came with a
+    // separator (`=`) on a zero-argument single-dash option, whatever
+    // the letters after it name; `-vx` packs, `-vn=3` and `-vn3` give the
+    // value-taking `-n` its value, `-vz` is unrecognized, `-v=` is the
+    // empty explicit argument. Transcripts captured from python3 3.11.
+    let scratch = Scratch::new("appacked");
+    let file = scratch.path().join("packed.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"tool\")\n",
+            "    parser.add_argument(\"-v\", \"--verbose\", action=\"store_true\")\n",
+            "    parser.add_argument(\"-x\", \"--extra\", action=\"store_true\")\n",
+            "    parser.add_argument(\"-n\", \"--num\", type=int, default=0)\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(args.verbose, args.extra, args.num)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/packed");
+    let usage = "usage: tool [-h] [-v] [-x] [-n NUM]\n";
+    // Verified against python3.
+    let cases: &[(&[&str], i32, &str, &str)] = &[
+        (&["-v=x"], 2, "", "tool: error: argument -v/--verbose: ignored explicit argument 'x'\n"),
+        (&["-vx"], 0, "True True 0\n", ""),
+        (&["-vn=3"], 0, "True False 3\n", ""),
+        (&["-vn3"], 0, "True False 3\n", ""),
+        (&["-v=n"], 2, "", "tool: error: argument -v/--verbose: ignored explicit argument 'n'\n"),
+        (&["-vz"], 2, "", "tool: error: unrecognized arguments: -z\n"),
+        (&["-v="], 2, "", "tool: error: argument -v/--verbose: ignored explicit argument ''\n"),
+    ];
+    for (args, code, stdout, stderr) in cases {
+        let output = Command::new(&bin)
+            .args(*args)
+            .current_dir(scratch.path())
+            .output()
+            .expect("run");
+        assert_eq!(output.status.code(), Some(*code), "{:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), *stdout, "{:?}", args);
+        let expected_err = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!("{}{}", usage, stderr)
+        };
+        assert_eq!(String::from_utf8_lossy(&output.stderr), expected_err, "{:?}", args);
+    }
+}
+
+#[test]
+fn argparse_defaults_keep_cpythons_types() {
+    // Round 9 of the review on #339: CPython applies `type=` to
+    // command-line strings and to a STRING default only; a default of
+    // the declared type is kept as it is. So `type=float, default=1.5`
+    // prints `1.5` when omitted and `2.0` when given `2`; `type=int,
+    // default="3"` is the int 3; `type=float, default="2"` is `2.0`
+    // (converted through float); `default=-1` is the int -1. A
+    // non-string default of another type (`type=float, default=1`) is
+    // refused at conversion, since CPython would keep the int.
+    // Transcripts captured from python3 3.11 verbatim.
+    let scratch = Scratch::new("apdefaults");
+    let file = scratch.path().join("defaults.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    parser = argparse.ArgumentParser(prog=\"defaults\")\n",
+            "    parser.add_argument(\"--scale\", type=float, default=1.5)\n",
+            "    parser.add_argument(\"--count\", type=int, default=\"3\")\n",
+            "    parser.add_argument(\"--ratio\", type=float, default=\"2\")\n",
+            "    parser.add_argument(\"--neg\", type=int, default=-1)\n",
+            "    parser.add_argument(\"--name\", default=\"none\")\n",
+            "    args = parser.parse_args(argv)\n",
+            "    print(args.scale, args.count, args.ratio, args.neg, args.name)\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/defaults");
+    // Verified against python3.
+    let cases: &[(&[&str], i32, &str, &str)] = &[
+        (&[], 0, "1.5 3 2.0 -1 none\n", ""),
+        (
+            &["--scale", "2", "--count", "4", "--ratio", "1", "--neg", "5", "--name", "x"],
+            0,
+            "2.0 4 1.0 5 x\n",
+            "",
+        ),
+        (
+            &["--scale", "2.5", "--count", "x"],
+            2,
+            "",
+            "usage: defaults [-h] [--scale SCALE] [--count COUNT] [--ratio RATIO]\n                [--neg NEG] [--name NAME]\ndefaults: error: argument --count: invalid int value: 'x'\n",
+        ),
+    ];
+    for (args, code, stdout, stderr) in cases {
+        let output = Command::new(&bin)
+            .args(*args)
+            .current_dir(scratch.path())
+            .env_remove("COLUMNS")
+            .output()
+            .expect("run");
+        assert_eq!(output.status.code(), Some(*code), "{:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), *stdout, "{:?}", args);
+        assert_eq!(String::from_utf8_lossy(&output.stderr), *stderr, "{:?}", args);
+    }
+}
+
+#[test]
+fn binary_filetype_and_binary_open_match_python_at_runtime() {
+    // Issue #332: `type=argparse.FileType("rb")` with `nargs="*"` (zero
+    // files is an empty list), and `open(p, "wb")` / `open(p, "rb")` —
+    // the bytes file: read() yields bytes, write() takes them.
+    let scratch = Scratch::new("apbin");
+    let file = scratch.path().join("ap_bin.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    parser = argparse.ArgumentParser(prog=\"sizes\")\n",
+            "    parser.add_argument(\"blobs\", type=argparse.FileType(\"rb\"), nargs=\"*\")\n",
+            "    args = parser.parse_args()\n",
+            "    for blob in args.blobs:\n",
+            "        data = blob.read()\n",
+            "        print(blob.name, len(data))\n",
+            "    with open(\"out.bin\", \"wb\") as sink:\n",
+            "        sink.write(b\"\\x00\\x01\\x02\")\n",
+            "    with open(\"out.bin\", \"rb\") as src:\n",
+            "        print(len(src.read()))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(scratch.path().join("a.bin"), b"hello").unwrap();
+    fs::write(scratch.path().join("b.bin"), [1u8, 2, 3, 4]).unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = krate.root.join("target/debug/ap_bin");
+
+    // Verified against python3.
+    let output = Command::new(&bin)
+        .args(["a.bin", "b.bin"])
+        .current_dir(scratch.path())
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "a.bin 5\nb.bin 4\n3\n");
+    let output = Command::new(&bin).current_dir(scratch.path()).output().expect("run");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "3\n");
+}
+
+#[test]
 fn module_level_argparse_with_short_aliases_matches_python() {
     // Issue #118: certifi's __main__.py shape — the parser built at
     // MODULE level (not inside a function), with -short/--long alias

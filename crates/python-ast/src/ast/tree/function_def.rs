@@ -58,9 +58,162 @@ pub(crate) struct ArgparseSpec {
     /// The short alias of `add_argument("-c", "--contents", ...)`
     /// (issue #118 — certifi's __main__); None otherwise.
     short: Option<String>,
-    kind: &'static str, // "Str" | "Int" | "Float" | "StoreTrue"
-    default: Option<ExprType>,
+    kind: ArgparseKind,
+    /// `dest=` — the namespace attribute when given (options only; a
+    /// positional's dest is its name in Python too).
+    dest: Option<String>,
+    /// `nargs="+"` / `"*"` on a positional: a list-valued field.
+    nargs: Option<ArgparseNargs>,
+    default: Option<ArgparseDefault>,
     help: Option<String>,
+}
+
+/// An option's `default=`, as CPython keeps it: `type=` is applied to
+/// command-line strings and to a STRING default only, a non-string
+/// default is kept as it is (`type=float, default=1` is the int 1). A
+/// typed field can hold only its own type, so the converter accepts a
+/// literal of the declared type, or a string literal it converts here as
+/// the parser would, and refuses anything else (Devin review on #339,
+/// round 9).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ArgparseDefault {
+    Int(i64),
+    Float(f64),
+    /// A str option's default given as a string literal, rendered at the
+    /// parse site.
+    Str(ExprType),
+    /// A str option's default given as any other expression: the Rust
+    /// local it is bound to WHERE THE add_argument STATEMENT STOOD, as a
+    /// version string is (Python evaluates `default=` when add_argument
+    /// runs, so a name rebound before parse_args does not change it;
+    /// Devin review on #339, round 10).
+    Bound(String),
+}
+
+/// The keywords `argparse.ArgumentParser(...)` may take here. Every
+/// argparse surface the converter knows is a typed enum with a
+/// `from_name` (Devin review on #339, round 2): an unknown spelling is
+/// one loud error, never a silently ignored keyword.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ParserKeyword {
+    Prog,
+    Description,
+}
+
+impl ParserKeyword {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "prog" => Some(Self::Prog),
+            "description" => Some(Self::Description),
+            _ => None,
+        }
+    }
+}
+
+/// The keywords `add_argument(...)` may take here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ArgparseKeyword {
+    Type,
+    Default,
+    Help,
+    Action,
+    Version,
+    Dest,
+    Nargs,
+}
+
+impl ArgparseKeyword {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "type" => Some(Self::Type),
+            "default" => Some(Self::Default),
+            "help" => Some(Self::Help),
+            "action" => Some(Self::Action),
+            "version" => Some(Self::Version),
+            "dest" => Some(Self::Dest),
+            "nargs" => Some(Self::Nargs),
+            _ => None,
+        }
+    }
+}
+
+/// The `action=` spellings the converter models.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ArgparseAction {
+    /// Python's default action.
+    Store,
+    StoreTrue,
+    Version,
+}
+
+impl ArgparseAction {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "store" => Some(Self::Store),
+            "store_true" => Some(Self::StoreTrue),
+            "version" => Some(Self::Version),
+            _ => None,
+        }
+    }
+}
+
+/// The builtin `type=` callables the converter models (FileType is
+/// resolved apart, through the symbol table).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ArgparseTypeName {
+    Int,
+    Float,
+    Str,
+}
+
+impl ArgparseTypeName {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "int" => Some(Self::Int),
+            "float" => Some(Self::Float),
+            "str" => Some(Self::Str),
+            _ => None,
+        }
+    }
+}
+
+/// The `nargs=` spellings the converter models: one or more, zero or
+/// more (a `Vec` field).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ArgparseNargs {
+    Plus,
+    Star,
+}
+
+impl ArgparseNargs {
+    fn from_spelling(spelling: &str) -> Option<Self> {
+        match spelling {
+            "+" => Some(Self::Plus),
+            "*" => Some(Self::Star),
+            _ => None,
+        }
+    }
+}
+
+/// The typed coercion of one argument — Python's `type=` / `action=`
+/// (issue #332: `type=FileType(mode)` opens the named file, in a text
+/// or a binary mode; `action="version"` prints and exits).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ArgparseKind {
+    /// No `type=` (values are str; CPython's type=None).
+    Untyped,
+    /// An explicit `type=str`.
+    Str,
+    Int,
+    Float,
+    StoreTrue,
+    File(String),
+    BinaryFile(String),
+    /// `action="version"`: the Rust local holding the version string,
+    /// bound where the add_argument statement stood (see
+    /// [`ArgparseRewrite::bindings`]) and carried as the spec's default
+    /// at the parse site.
+    Version(String),
 }
 
 /// The argparse rewrite plan for a function body: parser-building
@@ -75,6 +228,36 @@ pub(crate) struct ArgparseRewrite {
     prog: Option<String>,
     description: Option<String>,
     specs: Vec<ArgparseSpec>,
+    /// `parse_args(argv)`: the explicit argument list (a `list[str]` or
+    /// `list[str] | None` expression); None is sys.argv[1:].
+    argv: Option<ExprType>,
+    /// `version=` and non-literal `default=` expressions, each evaluated
+    /// WHERE ITS add_argument STATEMENT STOOD: Python evaluates them when
+    /// add_argument runs, so a name rebound before parse_args does not
+    /// change them (Devin review on #339, rounds 2 and 10). The callers
+    /// emit `let <local>: String = <expr>` at that statement's index
+    /// through [`lower_argparse_bindings`].
+    bindings: Vec<ArgparseBinding>,
+}
+
+/// One expression a skipped add_argument statement leaves bound at its
+/// position (see [`ArgparseRewrite::bindings`]).
+pub(crate) struct ArgparseBinding {
+    /// The statement index in the body.
+    at: usize,
+    /// The Rust local's name.
+    local: String,
+    expr: ExprType,
+    role: BindingRole,
+}
+
+/// What a bound expression is for: the type each accepts differs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BindingRole {
+    /// `version=`: must be a str (CPython's TypeError otherwise).
+    Version,
+    /// A str option's `default=`: any str expression.
+    Default,
 }
 
 fn literal_str(e: &ExprType) -> Option<String> {
@@ -87,8 +270,213 @@ fn literal_str(e: &ExprType) -> Option<String> {
     }
 }
 
+/// Python's repr of a plain string, for a message.
+fn py_repr_str(s: &str) -> String {
+    if s.contains('\'') && !s.contains('"') {
+        format!("\"{}\"", s)
+    } else {
+        format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+    }
+}
+
+/// An int literal, negated or not (`-1`).
+fn literal_int(e: &ExprType) -> Option<i64> {
+    match e {
+        ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::Integer(i)) => i.value::<i64>(),
+            _ => None,
+        },
+        ExprType::UnaryOp(u) if matches!(u.op, crate::ast::tree::unary_op::Ops::USub) => {
+            literal_int(&u.operand).map(|v| -v)
+        }
+        _ => None,
+    }
+}
+
+/// A float literal, negated or not (`-1.5`).
+fn literal_float(e: &ExprType) -> Option<f64> {
+    match e {
+        ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::Float(f)) => f.number_part().replace('_', "").parse::<f64>().ok(),
+            _ => None,
+        },
+        ExprType::UnaryOp(u) if matches!(u.op, crate::ast::tree::unary_op::Ops::USub) => {
+            literal_float(&u.operand).map(|v| -v)
+        }
+        _ => None,
+    }
+}
+
+/// A string default converted through `type=` at conversion time, as
+/// the parser would at every run: the value, CPython's ValueError (the
+/// program fails on every run, refused with that message), or a value
+/// CPython accepts that the typed field cannot hold (refused with the
+/// reason). The grammar mirrors the runtime's one authority,
+/// `stdpython::python_int_of` / `python_float_of` (the compiler does not
+/// link the runtime); `string_default_tests` pins both to the same
+/// python3 table.
+enum StringDefault<T> {
+    Value(T),
+    Invalid,
+    Unsupported(&'static str),
+}
+
+/// Python's digit-run grammar, `digit (["_"] digit)*`: ASCII digits with
+/// single underscores BETWEEN digits (`1_000`; never `_1`, `1_`, `1__2`).
+/// Returns the run without underscores and the rest of the input.
+fn python_digitpart(s: &str) -> Option<(String, &str)> {
+    let bytes = s.as_bytes();
+    let mut digits = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_digit() {
+            digits.push(b as char);
+            i += 1;
+        } else if b == b'_' && !digits.is_empty() && bytes.get(i + 1).is_some_and(|n| n.is_ascii_digit()) {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    (!digits.is_empty()).then(|| (digits, &s[i..]))
+}
+
+/// Python's `int(s)` on a string default: surrounding whitespace, a
+/// sign and single underscores between digits are accepted, nothing
+/// else (Devin review on #339, round 10: `_1`, `1_` and `1__2` are
+/// CPython's ValueError). Non-ASCII decimal digits, which CPython
+/// accepts, and values outside i64 are unsupported.
+fn python_int_of(s: &str) -> StringDefault<i64> {
+    if s.chars().any(|c| !c.is_ascii() && c.is_numeric()) {
+        return StringDefault::Unsupported("non-ASCII digits in a string default");
+    }
+    let t = s.trim();
+    let (negative, body) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let Some((digits, rest)) = python_digitpart(body) else {
+        return StringDefault::Invalid;
+    };
+    if !rest.is_empty() {
+        return StringDefault::Invalid;
+    }
+    // Parsed with its sign, so i64::MIN (whose magnitude is not an i64)
+    // is read as CPython reads it (Devin review on #339, round 11).
+    let signed = if negative { format!("-{}", digits) } else { digits };
+    match signed.parse::<i64>() {
+        Ok(v) => StringDefault::Value(v),
+        Err(_) => StringDefault::Unsupported("an int outside i64"),
+    }
+}
+
+/// Python's `float(s)` on a string default: whitespace, a sign, then
+/// `inf`/`infinity`/`nan` (any case) or `digitpart? ["." digitpart?]
+/// [("e" | "E") sign? digitpart]` with at least one mantissa digit —
+/// underscores only between digits of one run, as in `int`.
+fn python_float_of(s: &str) -> StringDefault<f64> {
+    if s.chars().any(|c| !c.is_ascii() && c.is_numeric()) {
+        return StringDefault::Unsupported("non-ASCII digits in a string default");
+    }
+    let t = s.trim();
+    let (sign, body) = match t.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", t.strip_prefix('+').unwrap_or(t)),
+    };
+    match body.to_ascii_lowercase().as_str() {
+        "inf" | "infinity" => {
+            return StringDefault::Value(if sign == "-" { f64::NEG_INFINITY } else { f64::INFINITY })
+        }
+        // The sign survives on a nan as it does in CPython (`float("-nan")`
+        // has its sign bit set; `math.copysign(1.0, x)` is -1.0).
+        "nan" => return StringDefault::Value(if sign == "-" { -f64::NAN } else { f64::NAN }),
+        _ => {}
+    }
+    let mut text = String::from(sign);
+    let mut rest = body;
+    let mut mantissa_digits = false;
+    if let Some((digits, after)) = python_digitpart(rest) {
+        text.push_str(&digits);
+        mantissa_digits = true;
+        rest = after;
+    }
+    if let Some(after) = rest.strip_prefix('.') {
+        text.push('.');
+        rest = after;
+        if let Some((digits, after)) = python_digitpart(rest) {
+            text.push_str(&digits);
+            mantissa_digits = true;
+            rest = after;
+        }
+    }
+    if !mantissa_digits {
+        return StringDefault::Invalid;
+    }
+    if let Some(after) = rest.strip_prefix(['e', 'E']) {
+        text.push('e');
+        let after = match after.strip_prefix('-') {
+            Some(r) => {
+                text.push('-');
+                r
+            }
+            None => after.strip_prefix('+').unwrap_or(after),
+        };
+        let Some((digits, after)) = python_digitpart(after) else {
+            return StringDefault::Invalid;
+        };
+        text.push_str(&digits);
+        rest = after;
+    }
+    if !rest.is_empty() {
+        return StringDefault::Invalid;
+    }
+    match text.parse::<f64>() {
+        Ok(v) => StringDefault::Value(v),
+        Err(_) => StringDefault::Invalid,
+    }
+}
+
+/// Whether a `type=` callee is argparse's FileType: `argparse.FileType`
+/// (the module by its name or an alias of it), or a bare name the module
+/// binds by `from argparse import FileType [as name]` — through the
+/// symbol table, never by the final identifier alone: a user-defined
+/// `FileType` converts values, it does not open paths (Devin review on
+/// #339).
+fn is_argparse_filetype(func: &ExprType, symbols: &SymbolTableScopes) -> bool {
+    match func {
+        ExprType::Attribute(a) if a.attr == "FileType" => match a.value.as_ref() {
+            ExprType::Name(m) => {
+                crate::StdModule::from_name(&m.id) == Some(crate::StdModule::Argparse)
+                    || matches!(symbols.get(&m.id), Some(crate::SymbolTableNode::Alias(canonical))
+                        if crate::StdModule::from_name(canonical) == Some(crate::StdModule::Argparse))
+            }
+            _ => false,
+        },
+        ExprType::Name(n) => {
+            let mut current = n.id.clone();
+            for _ in 0..8 {
+                match symbols.get(&current) {
+                    Some(crate::SymbolTableNode::Alias(canonical)) => current = canonical.clone(),
+                    Some(crate::SymbolTableNode::ImportFrom(ifm)) => {
+                        return ifm.module == "argparse"
+                            && ifm.names.iter().any(|a| {
+                                a.name == "FileType"
+                                    && a.asname.as_deref().unwrap_or(&a.name) == n.id
+                            });
+                    }
+                    _ => return false,
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn scan_argparse(
     body: &[Statement],
+    symbols: &SymbolTableScopes,
 ) -> Result<Option<ArgparseRewrite>, Box<dyn std::error::Error>> {
     // Find `<var> = argparse.ArgumentParser(...)`.
     let mut parser: Option<(usize, String, Option<String>, Option<String>)> = None;
@@ -118,7 +506,23 @@ pub(crate) fn scan_argparse(
         }
         let mut prog = None;
         let mut description = None;
+        let mut seen_keywords: Vec<String> = Vec::new();
         for kw in &call.keywords {
+            // A repeated keyword is CPython's SyntaxError (`keyword
+            // argument repeated: prog`); rython's front end accepts the
+            // spelling, so the scan refuses it rather than letting the
+            // last value win (Devin review on #339, round 7).
+            if let Some(name) = kw.arg.as_deref() {
+                if seen_keywords.iter().any(|k| k == name) {
+                    return Err(format!(
+                        "argparse.ArgumentParser: keyword argument repeated: {} (Python's \
+                         SyntaxError)",
+                        name
+                    )
+                    .into());
+                }
+                seen_keywords.push(name.to_string());
+            }
             let value = literal_str(&kw.value).ok_or_else(|| {
                 format!(
                     "argparse.ArgumentParser: {} must be a string literal (the parser \
@@ -126,13 +530,13 @@ pub(crate) fn scan_argparse(
                     kw.arg.as_deref().unwrap_or("argument")
                 )
             })?;
-            match kw.arg.as_deref() {
-                Some("prog") => prog = Some(value),
-                Some("description") => description = Some(value),
-                other => {
+            match kw.arg.as_deref().and_then(ParserKeyword::from_name) {
+                Some(ParserKeyword::Prog) => prog = Some(value),
+                Some(ParserKeyword::Description) => description = Some(value),
+                None => {
                     return Err(format!(
                         "argparse.ArgumentParser keyword '{}' is not supported yet",
-                        other.unwrap_or("**kwargs")
+                        kw.arg.as_deref().unwrap_or("**kwargs")
                     )
                     .into())
                 }
@@ -150,6 +554,8 @@ pub(crate) fn scan_argparse(
     let mut skip = std::collections::HashSet::from([ctor_index]);
     let mut specs = Vec::new();
     let mut parse: Option<(usize, String)> = None;
+    let mut argv: Option<ExprType> = None;
+    let mut bindings: Vec<ArgparseBinding> = Vec::new();
     for (i, stmt) in body.iter().enumerate().skip(ctor_index + 1) {
         let call_on_parser = |call: &crate::Call| -> Option<String> {
             let ExprType::Attribute(attr) = call.func.as_ref() else {
@@ -218,29 +624,102 @@ pub(crate) fn scan_argparse(
                         );
                     }
                 };
-                let mut kind: Option<&'static str> = None;
+                let mut kind: Option<ArgparseKind> = None;
                 let mut default = None;
                 let mut help = None;
                 let mut store_true = false;
+                // `action="version"` and `version=` are tracked apart:
+                // both are needed, in either keyword order (Devin review
+                // on #339).
+                let mut action_version = false;
+                let mut version: Option<ExprType> = None;
+                let mut dest: Option<String> = None;
+                let mut nargs: Option<ArgparseNargs> = None;
+                let is_positional = !name.starts_with('-');
+                let mut seen_keywords: Vec<String> = Vec::new();
                 for kw in &call.keywords {
-                    match kw.arg.as_deref() {
-                        Some("type") => {
+                    // A repeated keyword is CPython's SyntaxError (round 7).
+                    if let Some(kname) = kw.arg.as_deref() {
+                        if seen_keywords.iter().any(|k| k == kname) {
+                            return Err(format!(
+                                "add_argument('{}'): keyword argument repeated: {} (Python's \
+                                 SyntaxError)",
+                                name, kname
+                            )
+                            .into());
+                        }
+                        seen_keywords.push(kname.to_string());
+                    }
+                    let keyword = kw.arg.as_deref().and_then(ArgparseKeyword::from_name);
+                    match keyword {
+                        Some(ArgparseKeyword::Type) => {
                             kind = Some(match &kw.value {
-                                ExprType::Name(n) if n.id == "int" => "Int",
-                                ExprType::Name(n) if n.id == "float" => "Float",
-                                ExprType::Name(n) if n.id == "str" => "Str",
+                                ExprType::Name(n) if ArgparseTypeName::from_name(&n.id).is_some() => {
+                                    match ArgparseTypeName::from_name(&n.id).expect("checked") {
+                                        ArgparseTypeName::Int => ArgparseKind::Int,
+                                        ArgparseTypeName::Float => ArgparseKind::Float,
+                                        ArgparseTypeName::Str => ArgparseKind::Str,
+                                    }
+                                }
+                                // `type=FileType(mode)` (a literal mode;
+                                // `argparse.FileType` or the name imported
+                                // from argparse, resolved through the
+                                // symbol table): the parser opens the
+                                // named file (issue #332 —
+                                // charset_normalizer's CLI).
+                                ExprType::Call(c) if is_argparse_filetype(&c.func, symbols) => {
+                                    if !c.keywords.is_empty() || c.args.len() > 1 {
+                                        return Err(format!(
+                                            "add_argument('{}'): FileType takes the mode \
+                                             only (bufsize/encoding/errors are not \
+                                             supported yet)",
+                                            name
+                                        )
+                                        .into());
+                                    }
+                                    let mode = match c.args.first() {
+                                        None => "r".to_string(),
+                                        Some(m) => literal_str(m).ok_or_else(|| {
+                                            format!(
+                                                "add_argument('{}'): FileType's mode must \
+                                                 be a string literal",
+                                                name
+                                            )
+                                        })?,
+                                    };
+                                    // An update mode is valid Python the
+                                    // runtime does not model: refused here,
+                                    // so `-` cannot quietly accept what a
+                                    // path would fail on (Devin review on
+                                    // #339, round 2). The rest of the mode
+                                    // grammar is the runtime's
+                                    // (`parse_open_mode`, CPython's errors).
+                                    if mode.contains('+') {
+                                        return Err(format!(
+                                            "add_argument('{}'): FileType('{}') is an \
+                                             update mode, which is not supported yet",
+                                            name, mode
+                                        )
+                                        .into());
+                                    }
+                                    if mode.contains('b') {
+                                        ArgparseKind::BinaryFile(mode)
+                                    } else {
+                                        ArgparseKind::File(mode)
+                                    }
+                                }
                                 _ => {
                                     return Err(format!(
                                         "add_argument('{}'): type must be int, float, \
-                                         or str",
+                                         str, or FileType(mode)",
                                         name
                                     )
                                     .into())
                                 }
                             });
                         }
-                        Some("default") => default = Some(kw.value.clone()),
-                        Some("help") => {
+                        Some(ArgparseKeyword::Default) => default = Some(kw.value.clone()),
+                        Some(ArgparseKeyword::Help) => {
                             help = Some(literal_str(&kw.value).ok_or_else(|| {
                                 format!(
                                     "add_argument('{}'): help must be a string literal",
@@ -248,41 +727,145 @@ pub(crate) fn scan_argparse(
                                 )
                             })?)
                         }
-                        Some("action") => match literal_str(&kw.value).as_deref() {
-                            Some("store_true") => store_true = true,
-                            _ => {
+                        Some(ArgparseKeyword::Action) => match literal_str(&kw.value)
+                            .as_deref()
+                            .and_then(ArgparseAction::from_name)
+                        {
+                            Some(ArgparseAction::StoreTrue) => store_true = true,
+                            Some(ArgparseAction::Store) => {}
+                            Some(ArgparseAction::Version) => action_version = true,
+                            None => {
                                 return Err(format!(
-                                    "add_argument('{}'): only action=\"store_true\" is \
-                                     supported",
+                                    "add_argument('{}'): only action=\"store\", \
+                                     \"store_true\" and \"version\" are supported",
                                     name
                                 )
                                 .into())
                             }
                         },
-                        other => {
+                        Some(ArgparseKeyword::Version) => {
+                            // Any str expression, evaluated where this
+                            // statement stands (it may read runtime
+                            // values, which Python reads NOW).
+                            version = Some(kw.value.clone());
+                        }
+                        Some(ArgparseKeyword::Dest) => {
+                            if is_positional {
+                                return Err(format!(
+                                    "add_argument('{}'): dest is supplied by the \
+                                     positional's name (Python refuses it too)",
+                                    name
+                                )
+                                .into());
+                            }
+                            dest = Some(literal_str(&kw.value).ok_or_else(|| {
+                                format!(
+                                    "add_argument('{}'): dest must be a string literal",
+                                    name
+                                )
+                            })?);
+                        }
+                        Some(ArgparseKeyword::Nargs) => {
+                            let spelled = literal_str(&kw.value);
+                            nargs = Some(match spelled.as_deref().and_then(ArgparseNargs::from_spelling) {
+                                Some(n) => n,
+                                None => {
+                                    return Err(format!(
+                                        "add_argument('{}'): only nargs=\"+\" and \
+                                         nargs=\"*\" are supported yet",
+                                        name
+                                    )
+                                    .into())
+                                }
+                            });
+                            if !is_positional {
+                                return Err(format!(
+                                    "add_argument('{}'): nargs on an option is not \
+                                     supported yet",
+                                    name
+                                )
+                                .into());
+                            }
+                        }
+                        None => {
                             return Err(format!(
                                 "add_argument('{}'): keyword '{}' is not supported yet",
                                 name,
-                                other.unwrap_or("**kwargs")
+                                kw.arg.as_deref().unwrap_or("**kwargs")
                             )
                             .into())
                         }
                     }
                 }
-                let kind = if store_true {
-                    if kind.is_some() || default.is_some() {
+                // `action="version"` needs its `version=` string, and
+                // `version=` is only valid with that action (Python:
+                // TypeError for any other action), whatever the keyword
+                // order.
+                let kind = if action_version || version.is_some() {
+                    let Some(v) = version else {
                         return Err(format!(
-                            "add_argument('{}'): store_true takes neither type nor \
-                             default",
+                            "add_argument('{}'): action=\"version\" needs version=",
+                            name
+                        )
+                        .into());
+                    };
+                    if !action_version {
+                        return Err(format!(
+                            "add_argument('{}'): version= is only valid with \
+                             action=\"version\" (Python raises TypeError)",
                             name
                         )
                         .into());
                     }
-                    "StoreTrue"
+                    if kind.is_some() || default.is_some() || store_true || is_positional {
+                        return Err(format!(
+                            "add_argument('{}'): action=\"version\" is an option that \
+                             takes neither type nor default",
+                            name
+                        )
+                        .into());
+                    }
+                    let local = format!("__argparse_version_{}", bindings.len());
+                    bindings.push(ArgparseBinding { at: i, local: local.clone(), expr: v, role: BindingRole::Version });
+                    ArgparseKind::Version(local)
+                } else if store_true {
+                    // A positional store_true is a degenerate CPython shape
+                    // (the flag is set to True without consuming a token,
+                    // so the argument means nothing on the command line);
+                    // refused rather than modeled as a value-taking
+                    // positional (Devin review on #339, round 5).
+                    if is_positional {
+                        return Err(format!(
+                            "add_argument('{}'): action=\"store_true\" on a positional \
+                             consumes no token in CPython (the flag is simply True); \
+                             it is only supported on options",
+                            name
+                        )
+                        .into());
+                    }
+                    // `default=False` is store_true's own default (Python
+                    // allows spelling it); anything else is a divergent
+                    // flag.
+                    let default_is_false = match &default {
+                        None => true,
+                        Some(ExprType::Constant(c)) => {
+                            matches!(&c.0, Some(litrs::Literal::Bool(b)) if !b.value())
+                        }
+                        Some(_) => false,
+                    };
+                    if kind.is_some() || !default_is_false {
+                        return Err(format!(
+                            "add_argument('{}'): store_true takes neither type nor a \
+                             default other than False",
+                            name
+                        )
+                        .into());
+                    }
+                    default = None;
+                    ArgparseKind::StoreTrue
                 } else {
-                    kind.unwrap_or("Str")
+                    kind.unwrap_or(ArgparseKind::Untyped)
                 };
-                let is_positional = !name.starts_with('-');
                 if is_positional && default.is_some() {
                     return Err(format!(
                         "add_argument('{}'): defaults on positionals are not supported",
@@ -290,7 +873,10 @@ pub(crate) fn scan_argparse(
                     )
                     .into());
                 }
-                if !is_positional && !store_true && default.is_none() {
+                if !is_positional
+                    && !matches!(kind, ArgparseKind::StoreTrue | ArgparseKind::Version(_))
+                    && default.is_none()
+                {
                     return Err(format!(
                         "add_argument('{}'): a value-taking option needs default= (its \
                          Python default None cannot inhabit a typed field)",
@@ -298,10 +884,148 @@ pub(crate) fn scan_argparse(
                     )
                     .into());
                 }
+                if matches!(kind, ArgparseKind::File(_) | ArgparseKind::BinaryFile(_))
+                    && default.is_some()
+                {
+                    return Err(format!(
+                        "add_argument('{}'): a FileType option with a default is not \
+                         supported yet (the default would need opening too)",
+                        name
+                    )
+                    .into());
+                }
+                // An option string already registered — by a previous
+                // add_argument's short or long alias, or the parser's own
+                // -h/--help — is CPython's ArgumentError at add_argument
+                // (`argument -x/--two: conflicting option string: -x`):
+                // refused here, since the runtime would otherwise resolve
+                // the first registration (Devin review on #339, round 6).
+                if !is_positional {
+                    let mine: Vec<&str> = short.iter().map(String::as_str).chain([name.as_str()]).collect();
+                    let taken = |candidate: &str| -> bool {
+                        candidate == "-h"
+                            || candidate == "--help"
+                            || specs.iter().any(|s: &ArgparseSpec| {
+                                !s.name.starts_with('-') == false
+                                    && (s.name == candidate || s.short.as_deref() == Some(candidate))
+                            })
+                    };
+                    let conflicts: Vec<&str> = mine.iter().copied().filter(|c| taken(c)).collect();
+                    if !conflicts.is_empty() {
+                        return Err(format!(
+                            "add_argument('{}'): argument {}: conflicting option string{}: {} \
+                             (Python raises argparse.ArgumentError at add_argument)",
+                            name,
+                            mine.join("/"),
+                            if conflicts.len() > 1 { "s" } else { "" },
+                            conflicts.join(", ")
+                        )
+                        .into());
+                    }
+                }
+                if nargs.is_some() && specs.iter().any(|s: &ArgparseSpec| s.nargs.is_some()) {
+                    return Err(format!(
+                        "add_argument('{}'): only one variadic (nargs) positional is \
+                         supported yet",
+                        name
+                    )
+                    .into());
+                }
+                // CPython applies `type=` to strings only and keeps a
+                // non-string default as it is; the typed field holds one
+                // type, so: a literal of the declared type, or a string
+                // literal converted here as the parser would (a failure is
+                // the error CPython raises at every run), else refused.
+                let default = match (&kind, default) {
+                    (_, None) => None,
+                    (ArgparseKind::Int, Some(e)) => Some(match (literal_int(&e), literal_str(&e)) {
+                        (Some(v), _) => ArgparseDefault::Int(v),
+                        (None, Some(text)) => ArgparseDefault::Int(match python_int_of(&text) {
+                            StringDefault::Value(v) => v,
+                            StringDefault::Invalid => {
+                                return Err(format!(
+                                    "add_argument('{}'): argument {}: invalid int value: {} (CPython \
+                                     converts a string default through type= at parse time, so this \
+                                     program fails on every run)",
+                                    name, name, py_repr_str(&text)
+                                )
+                                .into())
+                            }
+                            StringDefault::Unsupported(why) => {
+                                return Err(format!(
+                                    "add_argument('{}'): default={} is {}, which the i64 field \
+                                     cannot hold",
+                                    name, py_repr_str(&text), why
+                                )
+                                .into())
+                            }
+                        }),
+                        (None, None) => {
+                            return Err(format!(
+                                "add_argument('{}'): CPython keeps a non-string default as it is \
+                                 (type= applies to strings only), so this default is not the int \
+                                 the i64 field holds; write an int literal or a string",
+                                name
+                            )
+                            .into())
+                        }
+                    }),
+                    (ArgparseKind::Float, Some(e)) => Some(match (literal_float(&e), literal_int(&e), literal_str(&e)) {
+                        (Some(v), _, _) => ArgparseDefault::Float(v),
+                        (None, Some(i), _) => {
+                            return Err(format!(
+                                "add_argument('{}'): CPython keeps a non-string default as it is \
+                                 (type= applies to strings only), so default={} with type=float \
+                                 is the int {} — which the f64 field cannot hold; write {}.0",
+                                name, i, i, i
+                            )
+                            .into())
+                        }
+                        (None, None, Some(text)) => ArgparseDefault::Float(match python_float_of(&text) {
+                            StringDefault::Value(v) => v,
+                            StringDefault::Invalid => {
+                                return Err(format!(
+                                    "add_argument('{}'): argument {}: invalid float value: {} (CPython \
+                                     converts a string default through type= at parse time, so this \
+                                     program fails on every run)",
+                                    name, name, py_repr_str(&text)
+                                )
+                                .into())
+                            }
+                            StringDefault::Unsupported(why) => {
+                                return Err(format!(
+                                    "add_argument('{}'): default={} is {}, which the f64 field \
+                                     cannot hold",
+                                    name, py_repr_str(&text), why
+                                )
+                                .into())
+                            }
+                        }),
+                        (None, None, None) => {
+                            return Err(format!(
+                                "add_argument('{}'): CPython keeps a non-string default as it is \
+                                 (type= applies to strings only), so this default is not the float \
+                                 the f64 field holds; write a float literal or a string",
+                                name
+                            )
+                            .into())
+                        }
+                    }),
+                    (_, Some(e)) if literal_str(&e).is_some() => Some(ArgparseDefault::Str(e)),
+                    // Any other str expression is evaluated where the
+                    // add_argument stood, as a version string is.
+                    (_, Some(e)) => {
+                        let local = format!("__argparse_default_{}", bindings.len());
+                        bindings.push(ArgparseBinding { at: i, local: local.clone(), expr: e, role: BindingRole::Default });
+                        Some(ArgparseDefault::Bound(local))
+                    }
+                };
                 specs.push(ArgparseSpec {
                     name,
                     short,
                     kind,
+                    dest,
+                    nargs,
                     default,
                     help,
                 });
@@ -310,12 +1034,16 @@ pub(crate) fn scan_argparse(
             StatementType::Assign(assign) => {
                 if let ExprType::Call(call) = &assign.value {
                     if call_on_parser(call) == Some("parse_args".into()) {
-                        if !call.args.is_empty() || !call.keywords.is_empty() {
-                            return Err("parse_args with arguments is not supported".into());
+                        if !call.keywords.is_empty() || call.args.len() > 1 {
+                            return Err(
+                                "parse_args takes at most the argument list (parse_args(argv))"
+                                    .into(),
+                            );
                         }
                         let [ExprType::Name(t)] = assign.targets.as_slice() else {
                             return Err("parse_args must be assigned to a plain name".into());
                         };
+                        argv = call.args.first().cloned();
                         parse = Some((i, t.id.clone()));
                     } else if call_on_parser(call).is_some() {
                         return Err(format!(
@@ -341,6 +1069,39 @@ pub(crate) fn scan_argparse(
     let Some((parse_index, args_var)) = parse else {
         return Err("argparse.ArgumentParser built but parse_args() never assigned".into());
     };
+    // The parser is evaluated at conversion time from the body's
+    // top-level statements. Any reference to it elsewhere — under
+    // module-level control flow, inside a nested def or class, in a
+    // lambda — is a parser operation the rewrite cannot see (`if
+    // debug: parser.add_argument(...)`): refused, through the one
+    // statement visitor (Devin review on #339).
+    {
+        use crate::ast::tree::visit::{any_expr_for, stmt_exprs, walk_stmts, Descend, Flow};
+        let mut nested_use: Option<usize> = None;
+        walk_stmts(body, Descend::All, &mut |st| {
+            if body.iter().any(|top| std::ptr::eq(top, st)) {
+                return Flow::Continue;
+            }
+            let mentions = stmt_exprs(st).into_iter().any(|e| {
+                any_expr_for(e, Descend::All, |x| matches!(x, ExprType::Name(n) if n.id == pvar))
+            });
+            if mentions {
+                nested_use = Some(st.lineno.unwrap_or(0));
+                return Flow::Stop;
+            }
+            Flow::Continue
+        });
+        if let Some(line) = nested_use {
+            return Err(format!(
+                "argparse parser `{}` is used under control flow or inside a nested \
+                 definition (line {}): the parser is evaluated at conversion time from \
+                 the top-level statements, so a parser operation there cannot be \
+                 represented; build the parser unconditionally at the top level",
+                pvar, line
+            )
+            .into());
+        }
+    }
     Ok(Some(ArgparseRewrite {
         skip,
         parse_index,
@@ -348,7 +1109,75 @@ pub(crate) fn scan_argparse(
         prog,
         description,
         specs,
+        argv,
+        bindings,
     }))
+}
+
+/// The Rust bindings a skipped parser statement leaves behind, if any:
+/// `let <local>: String = <expr>` for an `action="version"` add_argument's
+/// version string and for a str option's non-literal `default=`,
+/// evaluated at that statement's position. None for every other skipped
+/// statement (they vanish).
+pub(crate) fn lower_argparse_bindings(
+    rw: &ArgparseRewrite,
+    index: usize,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+    let mut out = TokenStream::new();
+    for binding in rw.bindings.iter().filter(|b| b.at == index) {
+        let ident = quote::format_ident!("{}", binding.local);
+        let value = binding
+            .expr
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let bound = match binding.role {
+            BindingRole::Version => {
+                // `version=` must be a str: CPython's formatter raises
+                // TypeError (`argument of type 'int' is not iterable`) when
+                // `--version` runs with anything else, so a program whose
+                // version action can never print is refused here; a value
+                // the inference cannot type is bound through
+                // `String::from`, which rustc rejects for a non-string
+                // (Devin review on #339, round 4).
+                let inferred =
+                    crate::ast::tree::type_ctx::infer_type(Some(ctx), &binding.expr, options, symbols);
+                match inferred {
+                    crate::TypeInfo::String | crate::TypeInfo::StrRef => quote!((#value).to_string()),
+                    crate::TypeInfo::PyObject => quote!(String::from(#value)),
+                    other => {
+                        return Err(format!(
+                            "add_argument(version=...): the version must be a str (CPython raises \
+                             TypeError when --version runs with anything else); this expression is \
+                             a {:?}",
+                            other
+                        )
+                        .into());
+                    }
+                }
+            }
+            // The str field's default, as the parse site rendered it
+            // before round 10.
+            BindingRole::Default => quote!((#value).to_string()),
+        };
+        out.extend(quote!(let #ident: String = #bound;));
+    }
+    Ok((!out.is_empty()).then_some(out))
+}
+
+/// The skipped statement indices of a rewrite that leave a binding
+/// behind, keyed by the index of the NEXT statement the body keeps: the
+/// function path emits the bindings right before that statement, so
+/// they sit where the add_argument stood.
+pub(crate) fn argparse_bindings_before(rw: &ArgparseRewrite) -> std::collections::HashMap<usize, Vec<usize>> {
+    let mut before: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for binding in &rw.bindings {
+        let effective = (0..binding.at).filter(|i| !rw.skip.contains(i)).count();
+        before.entry(effective).or_default().push(binding.at);
+    }
+    before
 }
 
 /// Emit the parse_args replacement: a namespace struct typed from the
@@ -360,35 +1189,63 @@ pub(crate) fn lower_parse_args(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-    use quote::format_ident;
     let mut fields = Vec::new();
     let mut field_types = Vec::new();
     let mut spec_tokens = Vec::new();
-    let mut accessors = Vec::new();
+    // Every spec yields one parsed value, in spec order; the namespace
+    // takes a field per value-bearing spec (a version action has none).
+    let mut takes: Vec<TokenStream> = Vec::new();
     for spec in &rw.specs {
-        let dest = spec.name.trim_start_matches('-').replace('-', "_");
-        fields.push(crate::safe_ident(&dest));
-        let (fty, kind, accessor) = match spec.kind {
-            "Int" => (quote!(i64), quote!(Int), format_ident!("into_int")),
-            "Float" => (quote!(f64), quote!(Float), format_ident!("into_float")),
-            "StoreTrue" => (quote!(bool), quote!(StoreTrue), format_ident!("into_flag")),
-            _ => (quote!(String), quote!(Str), format_ident!("into_str")),
+        let dest = spec
+            .dest
+            .clone()
+            .unwrap_or_else(|| spec.name.trim_start_matches('-').replace('-', "_"));
+        let (fty, kind, accessor): (TokenStream, TokenStream, TokenStream) = match &spec.kind {
+            ArgparseKind::Int => (quote!(i64), quote!(Int), quote!(into_int())),
+            ArgparseKind::Float => (quote!(f64), quote!(Float), quote!(into_float())),
+            ArgparseKind::StoreTrue => (quote!(bool), quote!(StoreTrue), quote!(into_flag())),
+            ArgparseKind::Str => (quote!(String), quote!(Str), quote!(into_str())),
+            ArgparseKind::Untyped => (quote!(String), quote!(Untyped), quote!(into_str())),
+            ArgparseKind::File(mode) => {
+                (quote!(PyFile), quote!(File(#mode)), quote!(into_file()))
+            }
+            ArgparseKind::BinaryFile(mode) => (
+                quote!(stdpython::io::PyBytesIO),
+                quote!(BinaryFile(#mode)),
+                quote!(into_binary_file()),
+            ),
+            ArgparseKind::Version(_) => (quote!(()), quote!(Version), quote!()),
         };
-        field_types.push(fty);
-        accessors.push(accessor);
-        let default = match &spec.default {
-            None => quote!(None),
-            Some(e) => {
+        let default = match (&spec.kind, &spec.default) {
+            (ArgparseKind::Version(local), _) => {
+                let local = quote::format_ident!("{}", local);
+                quote!(Some(argparse::ParsedValue::Str(#local.clone())))
+            }
+            (_, None) => quote!(None),
+            // The default as CPython keeps it (see ArgparseDefault): the
+            // declared type's own literal, or the string default already
+            // converted at conversion time.
+            (_, Some(ArgparseDefault::Int(v))) => quote!(Some(argparse::ParsedValue::Int(#v))),
+            (_, Some(ArgparseDefault::Float(v))) => {
+                let lit = if v.is_nan() {
+                    // The sign survives (`default="-nan"`; round 11).
+                    if v.is_sign_negative() { quote!(-f64::NAN) } else { quote!(f64::NAN) }
+                } else if v.is_infinite() {
+                    if *v > 0.0 { quote!(f64::INFINITY) } else { quote!(f64::NEG_INFINITY) }
+                } else {
+                    quote!(#v)
+                };
+                quote!(Some(argparse::ParsedValue::Float(#lit)))
+            }
+            (_, Some(ArgparseDefault::Str(e))) => {
                 let d = e
                     .clone()
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                // Coerce literal defaults onto the declared type
-                // (default=1 with type=float is valid Python).
-                match spec.kind {
-                    "Int" => quote!(Some(argparse::ParsedValue::Int((#d) as i64))),
-                    "Float" => quote!(Some(argparse::ParsedValue::Float((#d) as f64))),
-                    _ => quote!(Some(argparse::ParsedValue::Str((#d).to_string()))),
-                }
+                quote!(Some(argparse::ParsedValue::Str((#d).to_string())))
+            }
+            (_, Some(ArgparseDefault::Bound(local))) => {
+                let local = quote::format_ident!("{}", local);
+                quote!(Some(argparse::ParsedValue::Str(#local.clone())))
             }
         };
         let name = &spec.name;
@@ -400,14 +1257,57 @@ pub(crate) fn lower_parse_args(
             Some(s) => quote!(Some(#s)),
             None => quote!(None),
         };
+        let dest_tokens = match &spec.dest {
+            Some(d) => quote!(Some(#d)),
+            None => quote!(None),
+        };
+        let nargs = match spec.nargs {
+            Some(ArgparseNargs::Plus) => quote!(Plus),
+            Some(ArgparseNargs::Star) => quote!(Star),
+            None => quote!(One),
+        };
         spec_tokens.push(quote!(argparse::ArgSpec {
             name: #name,
             short: #short,
             kind: argparse::ArgKind::#kind,
+            dest: #dest_tokens,
+            nargs: argparse::Nargs::#nargs,
             default: #default,
             help: #help,
         }));
+        if matches!(spec.kind, ArgparseKind::Version(_)) {
+            takes.push(quote!(let _ = __parsed.next();));
+            continue;
+        }
+        let field = crate::safe_ident(&dest);
+        let take = quote!(__parsed.next().expect("one value per spec"));
+        if spec.nargs.is_some() {
+            field_types.push(quote!(Vec<#fty>));
+            takes.push(quote! {
+                let #field: Vec<#fty> = #take
+                    .into_list()
+                    .into_iter()
+                    .map(|__v| __v.#accessor)
+                    .collect();
+            });
+        } else {
+            field_types.push(fty);
+            takes.push(quote!(let #field = #take.#accessor;));
+        }
+        fields.push(field);
     }
+    let argv = match &rw.argv {
+        None => quote!(None),
+        Some(e) => {
+            let a = e.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            // `list[str] | None` passes through; a plain list is Some.
+            if expr_yields_option(e, options, symbols) {
+                quote!(#a)
+            } else {
+                quote!(Some((#a).into_iter().map(|__s| __s.to_string()).collect()))
+            }
+        }
+    };
     let prog = match &rw.prog {
         Some(p) => quote!(Some(#p)),
         None => quote!(None),
@@ -426,10 +1326,12 @@ pub(crate) fn lower_parse_args(
             #prog,
             #description,
             &[#(#spec_tokens),*],
+            #argv,
         )?
         .into_iter();
+        #(#takes)*
         #args_var = __ArgparseArgs {
-            #(#fields: __parsed.next().expect("one value per spec").#accessors(),)*
+            #(#fields,)*
         }
     })
 }
@@ -1062,7 +1964,7 @@ impl FunctionDef {
 
         // An argparse parser in the body is evaluated at conversion time:
         // its statements vanish and parse_args becomes a typed struct.
-        let argparse_rewrite = scan_argparse(&self.body)?;
+        let argparse_rewrite = scan_argparse(&self.body, &symbols)?;
         let mut effective_body: Vec<Statement> = match &argparse_rewrite {
             None => self.body.clone(),
             Some(rw) => self
@@ -2422,7 +3324,23 @@ impl FunctionDef {
         // drops out of the narrowed set again.
         let mut narrowed: std::collections::HashMap<String, crate::TypeInfo> =
             std::collections::HashMap::new();
+        let argparse_bindings = argparse_rewrite
+            .as_ref()
+            .map(argparse_bindings_before)
+            .unwrap_or_default();
         for (i, s) in effective_body.iter().enumerate().skip(body_start) {
+            // A version string is bound where its add_argument stood.
+            if let Some(rw) = &argparse_rewrite
+                && let Some(originals) = argparse_bindings.get(&i)
+            {
+                for &at in originals {
+                    if let Some(tokens) =
+                        lower_argparse_bindings(rw, at, &body_ctx, &options, &symbols)?
+                    {
+                        streams.extend(tokens);
+                    }
+                }
+            }
             if Some(i) == argparse_parse_at {
                 let rw = argparse_rewrite.as_ref().expect("index implies rewrite");
                 streams.extend(lower_parse_args(
@@ -5193,4 +6111,69 @@ pub fn body_returns_not_implemented(f: &FunctionDef, symbols: &SymbolTableScopes
             matches!(&s.statement, crate::StatementType::Return(Some(e))
                 if matches!(&e.value, ExprType::Name(n) if n.id == "NotImplemented"))
         })
+}
+
+#[cfg(test)]
+mod string_default_tests {
+    use super::{python_float_of, python_int_of, StringDefault};
+
+    #[test]
+    fn numeric_string_defaults_follow_pythons_underscore_grammar() {
+        // Round 10 of the review on #339: the same python3 3.11 table the
+        // runtime's `numeric_strings_follow_pythons_underscore_grammar`
+        // pins (None = ValueError): single underscores BETWEEN digits only.
+        let table: &[(&str, Option<i64>, Option<f64>)] = &[
+            ("_1", None, None),
+            ("1_", None, None),
+            ("1__2", None, None),
+            ("1_000", Some(1000), Some(1000.0)),
+            (" 1_0 ", Some(10), Some(10.0)),
+            ("+1_0", Some(10), Some(10.0)),
+            ("-1_0", Some(-10), Some(-10.0)),
+            ("1_0_0", Some(100), Some(100.0)),
+            ("0_1", Some(1), Some(1.0)),
+            ("1 0", None, None),
+            ("", None, None),
+            ("1_0.5", None, Some(10.5)),
+            ("1_.0", None, None),
+            ("1__0.5", None, None),
+            ("1e1_0", None, Some(1e10)),
+            ("1_e10", None, None),
+            ("1.5_", None, None),
+            ("_1.5", None, None),
+            (".5", None, Some(0.5)),
+            (".5_1", None, Some(0.51)),
+            ("5.", None, Some(5.0)),
+            ("5._1", None, None),
+            ("1e_1", None, None),
+            ("in_f", None, None),
+            ("inf", None, Some(f64::INFINITY)),
+            ("-Infinity", None, Some(f64::NEG_INFINITY)),
+            ("1_0e-1_0", None, Some(1e-9)),
+            ("1.", None, Some(1.0)),
+            ("-.5e+2", None, Some(-50.0)),
+            ("1e", None, None),
+            ("e1", None, None),
+            ("0x1_0", None, None),
+            ("-9223372036854775808", Some(i64::MIN), Some(-9223372036854775808.0)),
+            ("9223372036854775807", Some(i64::MAX), Some(9223372036854775807.0)),
+        ];
+        for (text, int, float) in table {
+            match (python_int_of(text), int) {
+                (StringDefault::Value(v), Some(want)) => assert_eq!(v, *want, "int({:?})", text),
+                (StringDefault::Invalid, None) => {}
+                (_, want) => panic!("int({:?}): python3 gives {:?}", text, want),
+            }
+            match (python_float_of(text), float) {
+                (StringDefault::Value(v), Some(want)) => assert_eq!(v, *want, "float({:?})", text),
+                (StringDefault::Invalid, None) => {}
+                (_, want) => panic!("float({:?}): python3 gives {:?}", text, want),
+            }
+        }
+        assert!(matches!(python_float_of("+nan"), StringDefault::Value(v) if v.is_nan() && v.is_sign_positive()));
+        // python3: math.copysign(1.0, float("-nan")) == -1.0 (round 11).
+        assert!(matches!(python_float_of("-nan"), StringDefault::Value(v) if v.is_nan() && v.is_sign_negative()));
+        assert!(matches!(python_int_of("٣"), StringDefault::Unsupported("non-ASCII digits in a string default")));
+        assert!(matches!(python_int_of("99999999999999999999"), StringDefault::Unsupported("an int outside i64")));
+    }
 }

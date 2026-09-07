@@ -381,8 +381,9 @@ impl CodeGen for Module {
         // inside __module_init__ (later module-level statements read the
         // namespace there; functions cannot — a module-init local, loud
         // in rustc).
-        let module_argparse = crate::ast::tree::function_def::scan_argparse(&self.raw.body)
-            .map_err(|e| wrap_module_error(&module_filename, e))?;
+        let module_argparse =
+            crate::ast::tree::function_def::scan_argparse(&self.raw.body, &symbols)
+                .map_err(|e| wrap_module_error(&module_filename, e))?;
 
         // Classes that participate in an inheritance hierarchy (have a real
         // base, or are used as a base) lower with the trait machinery; every
@@ -1122,6 +1123,15 @@ impl CodeGen for Module {
             // destructure inside __module_init__, at its original position.
             if let Some(rw) = &module_argparse {
                 if rw.skip.contains(&stmt_index) {
+                    // A version string is bound where its add_argument
+                    // stood; every other parser statement vanishes.
+                    if let Some(tokens) = crate::ast::tree::function_def::lower_argparse_bindings(
+                        rw, stmt_index, &ctx, &options, &symbols,
+                    )
+                    .map_err(|e| wrap_module_error(&module_filename, e))?
+                    {
+                        module_init_stmts.push(tokens);
+                    }
                     continue;
                 }
                 if stmt_index == rw.parse_index {

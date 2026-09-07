@@ -81,6 +81,10 @@ impl BuiltinException {
             ConnectionRefusedError => PyConnectionRefusedError::new_err(msg),
             ConnectionResetError => PyConnectionResetError::new_err(msg),
             FileExistsError => PyFileExistsError::new_err(msg),
+            // io.UnsupportedOperation: an OSError (and ValueError) in CPython;
+            // pyo3 wraps no io-module exception, so it surfaces as its OSError
+            // ancestor.
+            UnsupportedOperation => PyOSError::new_err(msg),
             FileNotFoundError => PyFileNotFoundError::new_err(msg),
             InterruptedError => PyInterruptedError::new_err(msg),
             IsADirectoryError => PyIsADirectoryError::new_err(msg),

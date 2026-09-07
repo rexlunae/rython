@@ -232,7 +232,7 @@ fn test_python_io_compatibility() {
     println!("📋 Testing Python I/O compatibility (std feature)...");
     
     // Test print function (should not panic)
-    print("Hello from compiled Python!");
+    print("Hello from compiled Python!").unwrap();
     
     // Test that I/O functions are available
     // Note: We can't test input() in automated tests, but we can verify it compiles

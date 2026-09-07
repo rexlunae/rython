@@ -321,21 +321,42 @@ pub fn py_display<T: PyDisplay + ?Sized>(x: &T) -> String {
 /// Python print() with a single argument and default sep/end.
 /// Note: Only available with `std` feature - requires OS I/O capabilities
 #[cfg(feature = "std")]
-pub fn print<T: PyDisplay>(object: T) {
-    println!("{}", object.py_display());
+pub fn print<T: PyDisplay>(object: T) -> Result<(), PyException> {
+    print_parts(&[object.py_display()], "", "\n")?;
+    Ok(())
 }
 
 /// Python print() with multiple arguments and/or explicit sep=/end=:
 /// the arguments arrive pre-rendered through py_display.
 /// Note: Only available with `std` feature - requires OS I/O capabilities
 #[cfg(feature = "std")]
-pub fn print_parts<S: AsRef<str>, Sep: AsRef<str>, E: AsRef<str>>(parts: &[S], sep: Sep, end: E) {
+pub fn print_parts<S: AsRef<str>, Sep: AsRef<str>, E: AsRef<str>>(
+    parts: &[S],
+    sep: Sep,
+    end: E,
+) -> Result<(), PyException> {
+    // print() writes to sys.stdout — the ONE stdout object, which a
+    // `FileType("w")("-")` handle can have closed: then this is
+    // CPython's `ValueError: I/O operation on closed file.` (Devin review
+    // on #339, round 6).
+    if stdout_closed() {
+        return Err(closed_file_error());
+    }
     let output = parts
         .iter()
         .map(|p| p.as_ref())
         .collect::<Vec<_>>()
         .join(sep.as_ref());
-    print!("{}{}", output, end.as_ref());
+    // Through std::io::Write, never the print! macro (which panics on a
+    // failed write): a rejected write — a closed pipe — is the OSError
+    // CPython raises, `BrokenPipeError: [Errno 32] Broken pipe`, catchable
+    // by the program (round 7).
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    out.write_all(output.as_bytes())
+        .and_then(|_| out.write_all(end.as_ref().as_bytes()))
+        .map_err(|e| stream_error(&e))?;
+    Ok(())
 }
 
 /// print(..., flush=True): as print_parts, then flush stdout when asked.
@@ -346,14 +367,13 @@ pub fn print_parts_flush<S: AsRef<str>, Sep: AsRef<str>, E: AsRef<str>>(
     sep: Sep,
     end: E,
     flush: bool,
-) {
-    print_parts(parts, sep, end);
+) -> Result<(), PyException> {
+    print_parts(parts, sep, end)?;
     if flush {
         use std::io::Write;
-        std::io::stdout()
-            .flush()
-            .expect("print(flush=True): I/O error flushing stdout");
+        std::io::stdout().flush().map_err(|e| stream_error(&e))?;
     }
+    Ok(())
 }
 
 /// No-std version of print - stores output in a string instead of printing
@@ -1691,16 +1711,156 @@ impl PyBool for &PyStr {
     }
 }
 
+/// What a string is to Python's `int()` / `float()`: the value, a
+/// ValueError (the string is not a number), or a number CPython accepts
+/// that the runtime's `i64`/`f64` cannot hold or read (non-ASCII decimal
+/// digits, an int outside i64) — reported loudly, never as a different
+/// value. The one authority for the numeric-string grammar at runtime:
+/// `int(s)`, `float(s)` and argparse's `type=int`/`type=float` share it
+/// (Devin review on #339, round 10; the converter mirrors it for a
+/// string `default=` converted at conversion time).
+pub enum PyNumberParse<T> {
+    Value(T),
+    Invalid,
+    Unsupported(&'static str),
+}
+
+/// Python's digit-run grammar, `digit (["_"] digit)*`: ASCII digits with
+/// single underscores BETWEEN digits (`1_000`; never `_1`, `1_`, `1__2`).
+/// Returns the run without underscores and the rest of the input.
+fn python_digitpart(s: &str) -> Option<(String, &str)> {
+    let bytes = s.as_bytes();
+    let mut digits = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_digit() {
+            digits.push(b as char);
+            i += 1;
+        } else if b == b'_' && !digits.is_empty() && bytes.get(i + 1).is_some_and(|n| n.is_ascii_digit()) {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    (!digits.is_empty()).then(|| (digits, &s[i..]))
+}
+
+/// Python's `int(s)` (base 10): surrounding whitespace, a sign and single
+/// underscores between digits are accepted, nothing else.
+pub fn python_int_of(s: &str) -> PyNumberParse<i64> {
+    if s.chars().any(|c| !c.is_ascii() && c.is_numeric()) {
+        return PyNumberParse::Unsupported("non-ASCII digits");
+    }
+    let t = s.trim();
+    let (negative, body) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let Some((digits, rest)) = python_digitpart(body) else {
+        return PyNumberParse::Invalid;
+    };
+    if !rest.is_empty() {
+        return PyNumberParse::Invalid;
+    }
+    // Parsed with its sign, so i64::MIN (whose magnitude is not an i64)
+    // is read as CPython reads it (Devin review on #339, round 11).
+    let signed = if negative { alloc::format!("-{}", digits) } else { digits };
+    match signed.parse::<i64>() {
+        Ok(v) => PyNumberParse::Value(v),
+        Err(_) => PyNumberParse::Unsupported("an int outside i64"),
+    }
+}
+
+/// Python's `float(s)`: whitespace, a sign, then `inf`/`infinity`/`nan`
+/// (any case) or `digitpart? ["." digitpart?] [("e" | "E") sign?
+/// digitpart]` with at least one mantissa digit — underscores only
+/// between the digits of one run, as in `int`.
+pub fn python_float_of(s: &str) -> PyNumberParse<f64> {
+    if s.chars().any(|c| !c.is_ascii() && c.is_numeric()) {
+        return PyNumberParse::Unsupported("non-ASCII digits");
+    }
+    let t = s.trim();
+    let (sign, body) = match t.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", t.strip_prefix('+').unwrap_or(t)),
+    };
+    match body.to_ascii_lowercase().as_str() {
+        "inf" | "infinity" => {
+            return PyNumberParse::Value(if sign == "-" { f64::NEG_INFINITY } else { f64::INFINITY })
+        }
+        // The sign survives on a nan as it does in CPython (`float("-nan")`
+        // has its sign bit set; `math.copysign(1.0, x)` is -1.0).
+        "nan" => return PyNumberParse::Value(if sign == "-" { -f64::NAN } else { f64::NAN }),
+        _ => {}
+    }
+    let mut text = String::from(sign);
+    let mut rest = body;
+    let mut mantissa_digits = false;
+    if let Some((digits, after)) = python_digitpart(rest) {
+        text.push_str(&digits);
+        mantissa_digits = true;
+        rest = after;
+    }
+    if let Some(after) = rest.strip_prefix('.') {
+        text.push('.');
+        rest = after;
+        if let Some((digits, after)) = python_digitpart(rest) {
+            text.push_str(&digits);
+            mantissa_digits = true;
+            rest = after;
+        }
+    }
+    if !mantissa_digits {
+        return PyNumberParse::Invalid;
+    }
+    if let Some(after) = rest.strip_prefix(['e', 'E']) {
+        text.push('e');
+        let after = match after.strip_prefix('-') {
+            Some(r) => {
+                text.push('-');
+                r
+            }
+            None => after.strip_prefix('+').unwrap_or(after),
+        };
+        let Some((digits, after)) = python_digitpart(after) else {
+            return PyNumberParse::Invalid;
+        };
+        text.push_str(&digits);
+        rest = after;
+    }
+    if !rest.is_empty() {
+        return PyNumberParse::Invalid;
+    }
+    match text.parse::<f64>() {
+        Ok(v) => PyNumberParse::Value(v),
+        Err(_) => PyNumberParse::Invalid,
+    }
+}
+
+/// The loud exception for a numeric string CPython reads and the runtime
+/// cannot (see [`PyNumberParse::Unsupported`]).
+pub fn unsupported_number(callee: &str, s: &str, why: &str) -> PyException {
+    PyException::new(
+        "NotImplementedError",
+        &format!("{}({}): {} are not supported yet", callee, py_str_repr(s), why),
+    )
+}
+
 // PyInt implementations
 impl PyInt for &str {
     fn py_int(self) -> Result<i64, PyException> {
-        // Python strips surrounding whitespace and accepts `_` digit
-        // separators, so int(line) over a file's lines works; Rust's
-        // parse() rejects both.
-        let cleaned = self.trim().replace('_', "");
-        cleaned
-            .parse()
-            .map_err(|_| value_error(&format!("invalid literal for int(): '{}'", self)))
+        // Python's grammar: surrounding whitespace, a sign, single
+        // underscores between digits (`1_000`; `_1`, `1_` and `1__2` are
+        // ValueError), with CPython's message.
+        match python_int_of(self) {
+            PyNumberParse::Value(v) => Ok(v),
+            PyNumberParse::Invalid => Err(value_error(&format!(
+                "invalid literal for int() with base 10: {}",
+                py_str_repr(self)
+            ))),
+            PyNumberParse::Unsupported(why) => Err(unsupported_number("int", self, why)),
+        }
     }
 }
 
@@ -1759,10 +1919,14 @@ impl PyInt for u8 {
 // PyFloat implementations
 impl PyFloat for &str {
     fn py_float(self) -> Result<f64, PyException> {
-        let cleaned = self.trim().replace('_', "");
-        cleaned
-            .parse()
-            .map_err(|_| value_error(&format!("could not convert string to float: '{}'", self)))
+        match python_float_of(self) {
+            PyNumberParse::Value(v) => Ok(v),
+            PyNumberParse::Invalid => Err(value_error(&format!(
+                "could not convert string to float: {}",
+                py_str_repr(self)
+            ))),
+            PyNumberParse::Unsupported(why) => Err(unsupported_number("float", self, why)),
+        }
     }
 }
 
@@ -6624,6 +6788,15 @@ impl PyRepr for PyException {
 impl std::error::Error for PyException {}
 
 /// Python ValueError
+/// `io.UnsupportedOperation` — the exception a stream raises for an
+/// operation its mode does not allow (a write on a read-only file, a
+/// read on a write-only one). Its MRO (OSError and ValueError) comes
+/// from the interpreter-derived table, so `except OSError:` catches it
+/// as in CPython (Devin review on #339, round 4).
+pub fn unsupported_operation<M: AsRef<str>>(message: M) -> PyException {
+    PyException::new("UnsupportedOperation", message.as_ref().to_string())
+}
+
 pub fn value_error<M: AsRef<str>>(message: M) -> PyException {
     PyException::new("ValueError", message.as_ref())
 }
@@ -7065,10 +7238,22 @@ pub const __name__: &str = "__main__";
 #[cfg(feature = "std")]
 pub fn input<P: AsRef<str>>(prompt: Option<P>) -> Result<String, PyException> {
     use std::io::{self, Write};
-    
+
+    // input() reads sys.stdin and writes its prompt to sys.stdout — the
+    // one object each, closed process-wide by a `FileType("-")` handle's
+    // close(): CPython's closed-file ValueError then (round 6). Without a
+    // prompt nothing is written, so a closed stdout does not matter
+    // (CPython flushes it and clears the error; Devin review on #339,
+    // round 10).
+    if stdin_closed() || (prompt.is_some() && stdout_closed()) {
+        return Err(closed_file_error());
+    }
     if let Some(p) = prompt {
-        print!("{}", p.as_ref());
-        io::stdout().flush().map_err(|e| runtime_error(&format!("I/O error: {}", e)))?;
+        // The prompt goes to sys.stdout through the fallible path too.
+        let mut out = io::stdout().lock();
+        out.write_all(p.as_ref().as_bytes())
+            .and_then(|_| out.flush())
+            .map_err(|e| stream_error(&e))?;
     }
     
     let mut input = String::new();
@@ -7097,51 +7282,242 @@ pub fn input<P: AsRef<str>>(prompt: Option<P>) -> Result<String, PyException> {
 /// RuntimeError would never match, and the error would escape the try.
 #[cfg(feature = "std")]
 fn os_error(e: &std::io::Error, path: &str) -> PyException {
+    let kind = os_error_kind(e);
+    // CPython's str(OSError): `[Errno 2] No such file or directory:
+    // 'path'` — the errno and the OS's own text (Rust's Display appends
+    // " (os error N)", which Python never shows).
+    let text = e.to_string();
+    let text = text
+        .split_once(" (os error ")
+        .map(|(t, _)| t.to_string())
+        .unwrap_or(text);
+    // The path is Python's repr (`"it's.txt"` switches quotes, as
+    // CPython's `filename` rendering does — Devin review on #339,
+    // round 4).
+    let message = match e.raw_os_error() {
+        Some(code) => format!("[Errno {}] {}: {}", code, text, py_str_repr(path)),
+        None => format!("{}: {}", text, py_str_repr(path)),
+    };
+    PyException::new(kind, message)
+}
+
+/// The OSError subclass CPython raises for an I/O failure's errno.
+#[cfg(feature = "std")]
+fn os_error_kind(e: &std::io::Error) -> &'static str {
     use std::io::ErrorKind;
-    let kind = match e.kind() {
+    match e.kind() {
         ErrorKind::NotFound => "FileNotFoundError",
         ErrorKind::PermissionDenied => "PermissionError",
         ErrorKind::AlreadyExists => "FileExistsError",
         ErrorKind::IsADirectory => "IsADirectoryError",
         ErrorKind::NotADirectory => "NotADirectoryError",
+        ErrorKind::BrokenPipe => "BrokenPipeError",
+        ErrorKind::ConnectionReset => "ConnectionResetError",
+        ErrorKind::ConnectionRefused => "ConnectionRefusedError",
+        ErrorKind::ConnectionAborted => "ConnectionAbortedError",
+        ErrorKind::TimedOut => "TimeoutError",
+        ErrorKind::Interrupted => "InterruptedError",
         _ => "OSError",
-    };
-    PyException::new(kind, format!("{}: '{}'", e, path))
+    }
 }
 
-/// Python open() function - opens a file
-/// 
+/// An I/O failure on a stream with no filename — a write to a closed
+/// pipe on stdout is CPython's `BrokenPipeError: [Errno 32] Broken pipe`
+/// (Devin review on #339, round 7): the errno and the OS's own text.
+#[cfg(feature = "std")]
+pub(crate) fn stream_error(e: &std::io::Error) -> PyException {
+    let text = e.to_string();
+    let text = text
+        .split_once(" (os error ")
+        .map(|(t, _)| t.to_string())
+        .unwrap_or(text);
+    let message = match e.raw_os_error() {
+        Some(code) => format!("[Errno {}] {}", code, text),
+        None => text,
+    };
+    PyException::new(os_error_kind(e), message)
+}
+
+/// The access a validated Python open() mode asks for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OpenAccess {
+    Read,
+    Write,
+    Append,
+    /// `x`: exclusive creation — FileExistsError when the path exists.
+    Create,
+}
+
+/// A Python open() mode after CPython's grammar check: the access and
+/// whether the file is binary.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OpenMode {
+    pub access: OpenAccess,
+    pub binary: bool,
+}
+
+/// CPython's mode grammar (`io.open`), checked in ITS order and before
+/// any file-system side effect (Devin review on #339): a letter outside
+/// `axrwb+t` or a repeated letter is `invalid mode: '<mode>'`; `t` with
+/// `b` is `can't have text and binary mode at once`; more than one of
+/// `a`/`x`/`r`/`w` is `must have exactly one of create/read/write/append
+/// mode`; none of them is CPython's capitalised `Must have exactly one of
+/// create/read/write/append mode and at most one plus`. An update mode
+/// (`+`) is valid Python the runtime does not model yet: loud, distinct
+/// from every CPython error.
+pub fn parse_open_mode(mode: &str) -> Result<OpenMode, PyException> {
+    let mut seen: alloc::vec::Vec<char> = alloc::vec::Vec::new();
+    for c in mode.chars() {
+        if !matches!(c, 'a' | 'x' | 'r' | 'w' | 'b' | '+' | 't') || seen.contains(&c) {
+            return Err(value_error(&format!("invalid mode: '{}'", mode)));
+        }
+        seen.push(c);
+    }
+    let binary = seen.contains(&'b');
+    if binary && seen.contains(&'t') {
+        return Err(value_error("can't have text and binary mode at once"));
+    }
+    let accesses: alloc::vec::Vec<OpenAccess> = seen
+        .iter()
+        .filter_map(|c| match c {
+            'r' => Some(OpenAccess::Read),
+            'w' => Some(OpenAccess::Write),
+            'a' => Some(OpenAccess::Append),
+            'x' => Some(OpenAccess::Create),
+            _ => None,
+        })
+        .collect();
+    let access = match accesses.as_slice() {
+        [one] => *one,
+        [] => {
+            return Err(value_error(
+                "Must have exactly one of create/read/write/append mode and at most one plus",
+            ))
+        }
+        _ => {
+            return Err(value_error(
+                "must have exactly one of create/read/write/append mode",
+            ))
+        }
+    };
+    if seen.contains(&'+') {
+        return Err(value_error(&format!(
+            "file mode '{}' is not supported yet (update modes)",
+            mode
+        )));
+    }
+    Ok(OpenMode { access, binary })
+}
+
+/// The OS handle for a validated mode: the read side as a buffered
+/// reader, any writing mode as a buffered writer.
+#[cfg(feature = "std")]
+enum DiskHandle {
+    Read(std::io::BufReader<std::fs::File>),
+    Write(std::io::BufWriter<std::fs::File>),
+}
+
+#[cfg(feature = "std")]
+fn open_disk(path: &str, access: OpenAccess) -> Result<DiskHandle, PyException> {
+    use std::fs::{File, OpenOptions};
+    use std::io::{BufReader, BufWriter};
+    let handle = match access {
+        OpenAccess::Read => DiskHandle::Read(BufReader::new(
+            File::open(path).map_err(|e| os_error(&e, path))?,
+        )),
+        OpenAccess::Write => DiskHandle::Write(BufWriter::new(
+            File::create(path).map_err(|e| os_error(&e, path))?,
+        )),
+        OpenAccess::Append => DiskHandle::Write(BufWriter::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| os_error(&e, path))?,
+        )),
+        OpenAccess::Create => DiskHandle::Write(BufWriter::new(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|e| os_error(&e, path))?,
+        )),
+    };
+    Ok(handle)
+}
+
+/// Python open() function - opens a file in a TEXT mode (the default
+/// `r`; `t` is accepted as Python's explicit text marker). A binary
+/// mode reaching this function is loud: the converter routes a LITERAL
+/// mode containing 'b' to `open_binary`, and a computed binary mode
+/// cannot choose the bytes file type at runtime.
+///
 /// Note: Only available with `std` feature - requires OS I/O capabilities
 #[cfg(feature = "std")]
 pub fn open<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: Option<M>) -> Result<PyFile, PyException> {
-    use std::fs::{File, OpenOptions};
-    use std::io::{BufReader, BufWriter};
-    
+    let path = filename.as_ref();
     let mode = mode.as_ref().map(|m| m.as_ref()).unwrap_or("r");
-    
-    let file = match mode {
-        "r" => {
-            let f = File::open(filename.as_ref())
-                .map_err(|e| os_error(&e, filename.as_ref()))?;
-            PyFile::new_read(BufReader::new(f))
-        },
-        "w" => {
-            let f = File::create(filename.as_ref())
-                .map_err(|e| os_error(&e, filename.as_ref()))?;
-            PyFile::new_write(BufWriter::new(f))
-        },
-        "a" => {
-            let f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(filename.as_ref())
-                .map_err(|e| os_error(&e, filename.as_ref()))?;
-            PyFile::new_write(BufWriter::new(f))
-        },
-        _ => return Err(value_error(&format!("Invalid file mode: '{}'", mode))),
-    };
-    
-    Ok(file)
+    let parsed = parse_open_mode(mode)?;
+    if parsed.binary {
+        return Err(value_error(&format!(
+            "open(..., '{}'): a binary mode must be a literal in the source for the \
+             bytes file type to be chosen (a computed binary mode is not supported yet)",
+            mode
+        )));
+    }
+    Ok(match open_disk(path, parsed.access)? {
+        DiskHandle::Read(f) => PyFile::new_read(f, path),
+        DiskHandle::Write(f) => PyFile::new_write(f, path),
+    })
+}
+
+/// Python open() in a BINARY mode ("rb", "wb", "ab", "xb"): the binary
+/// file type — the same type as io.BytesIO, over a disk backend — whose
+/// read() yields bytes and write() takes them. The converter routes a
+/// literal mode containing 'b' here; text modes go to `open()`. The
+/// mode grammar (`parse_open_mode`) is checked before any file-system
+/// side effect.
+///
+/// Note: Only available with `std` feature - requires OS I/O capabilities
+#[cfg(feature = "std")]
+pub fn open_binary<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: M) -> Result<stdlib::io::PyBytesIO, PyException> {
+    open_binary_with(filename, mode, false, false)
+}
+
+/// `open_binary` with the text-only settings CPython refuses in a binary
+/// mode: an `encoding` or `errors` argument that is not None is
+/// `ValueError: binary mode doesn't take an encoding argument` /
+/// `... an errors argument`, checked in CPython's order — after the mode
+/// grammar, before any file-system effect (Devin review on #339, round
+/// 3). The converter passes whether each was given (a literal None is
+/// not given).
+#[cfg(feature = "std")]
+pub fn open_binary_with<F: AsRef<str>, M: AsRef<str>>(
+    filename: F,
+    mode: M,
+    encoding_given: bool,
+    errors_given: bool,
+) -> Result<stdlib::io::PyBytesIO, PyException> {
+    let path = filename.as_ref();
+    let mode = mode.as_ref();
+    let parsed = parse_open_mode(mode)?;
+    if parsed.binary && encoding_given {
+        return Err(value_error("binary mode doesn't take an encoding argument"));
+    }
+    if parsed.binary && errors_given {
+        return Err(value_error("binary mode doesn't take an errors argument"));
+    }
+    if !parsed.binary {
+        return Err(value_error(&format!(
+            "open_binary(..., '{}'): a text mode reached the binary open (the converter \
+             routes literal 'b' modes here)",
+            mode
+        )));
+    }
+    Ok(match open_disk(path, parsed.access)? {
+        DiskHandle::Read(f) => stdlib::io::PyBytesIO::new_disk_read(f, path),
+        DiskHandle::Write(f) => stdlib::io::PyBytesIO::new_disk_write(f, path),
+    })
 }
 
 /// Python file object: one type over every backend — disk handles from
@@ -7152,15 +7528,187 @@ pub fn open<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: Option<M>) -> Resul
 /// The in-memory Buffer backend is pure alloc, so the type lives on every
 /// tier (no_std file I/O = io.StringIO/io.BytesIO); the DISK backends and
 /// `open()` are std-gated.
+///
+/// A file object is a REFERENCE in Python (`g = f` aliases the same
+/// stream; `for f in files:` reads and closes the caller's files), so the
+/// handle is a cheap clone over one shared backend — `Rc<RefCell>`, the
+/// scheme shared class instances use (PyRef) — and every method takes
+/// `&self`.
+#[derive(Clone)]
 pub struct PyFile {
-    backend: PyFileBackend,
+    inner: alloc::rc::Rc<core::cell::RefCell<PyFileBackend>>,
+    /// Python `f.name`: the path a disk file was opened from (an
+    /// in-memory StringIO has no name in Python; here it is "").
+    pub name: String,
+}
+
+/// The text-mode reader of a disk file — CPython's TextIOWrapper over
+/// its buffer: the bytes are read in 8192-byte chunks and each chunk is
+/// decoded as UTF-8 (an incomplete sequence at a chunk's end waits for
+/// the next chunk, as the incremental decoder's pending bytes do);
+/// `read()` decodes everything that remains at once. A decode failure is
+/// `UnicodeDecodeError` with CPython's message, its positions relative
+/// to the bytes handed to the decoder — the pending tail plus the chunk
+/// — which for a file under one chunk is the file offset (Devin review
+/// on #339, round 9).
+#[cfg(feature = "std")]
+struct TextReader {
+    inner: alloc::boxed::Box<dyn std::io::BufRead>,
+    /// An incomplete UTF-8 sequence carried from the last chunk.
+    pending: alloc::vec::Vec<u8>,
+    /// Decoded text not yet handed out.
+    decoded: String,
+    eof: bool,
+}
+
+#[cfg(feature = "std")]
+const TEXT_CHUNK_SIZE: usize = 8192;
+
+#[cfg(feature = "std")]
+impl TextReader {
+    fn new(inner: alloc::boxed::Box<dyn std::io::BufRead>) -> Self {
+        Self {
+            inner,
+            pending: alloc::vec::Vec::new(),
+            decoded: String::new(),
+            eof: false,
+        }
+    }
+
+    /// `read()`: everything remaining, decoded as one final chunk.
+    fn read_all(&mut self) -> Result<String, PyException> {
+        use std::io::Read;
+        let mut rest = core::mem::take(&mut self.pending);
+        self.inner.read_to_end(&mut rest).map_err(|e| stream_error(&e))?;
+        self.eof = true;
+        let text = decode_utf8_final(&rest)?;
+        let mut out = core::mem::take(&mut self.decoded);
+        out.push_str(&text);
+        Ok(out)
+    }
+
+    /// Decode one more chunk into `decoded`; false once the stream is
+    /// exhausted and nothing was added.
+    fn fill(&mut self) -> Result<bool, PyException> {
+        use std::io::Read;
+        if self.eof {
+            return Ok(false);
+        }
+        let mut chunk = alloc::vec![0u8; TEXT_CHUNK_SIZE];
+        let n = self.inner.read(&mut chunk).map_err(|e| stream_error(&e))?;
+        chunk.truncate(n);
+        let mut data = core::mem::take(&mut self.pending);
+        data.extend_from_slice(&chunk);
+        if n == 0 {
+            self.eof = true;
+            let text = decode_utf8_final(&data)?;
+            let added = !text.is_empty();
+            self.decoded.push_str(&text);
+            return Ok(added);
+        }
+        let (text, tail) = decode_utf8_partial(&data)?;
+        self.pending = tail;
+        self.decoded.push_str(&text);
+        Ok(true)
+    }
+
+    /// `readline()`: up to and including the next newline, or the rest.
+    fn readline(&mut self) -> Result<String, PyException> {
+        loop {
+            if let Some(at) = self.decoded.find('\n') {
+                let line: String = self.decoded.drain(..=at).collect();
+                return Ok(line);
+            }
+            if !self.fill()? {
+                return Ok(core::mem::take(&mut self.decoded));
+            }
+        }
+    }
+}
+
+/// CPython's UnicodeDecodeError for a UTF-8 failure at `err` in `data`:
+/// one byte (`can't decode byte 0xff in position 2: invalid start
+/// byte`, or an `invalid continuation byte`), or a run (`can't decode
+/// bytes in position 0-1: invalid continuation byte` / `unexpected end
+/// of data`).
+#[cfg(feature = "std")]
+fn utf8_decode_failure(data: &[u8], err: core::str::Utf8Error) -> PyException {
+    let start = err.valid_up_to();
+    let (end, reason) = match err.error_len() {
+        None => (data.len() - 1, "unexpected end of data"),
+        Some(n) => (
+            start + n - 1,
+            // A byte that cannot begin a sequence (a continuation byte,
+            // an overlong lead, a lead past U+10FFFF) is an invalid start
+            // byte; a lead whose followers are wrong, an invalid
+            // continuation byte.
+            if (0xC2..=0xF4).contains(&data[start]) {
+                "invalid continuation byte"
+            } else {
+                "invalid start byte"
+            },
+        ),
+    };
+    let message = if end == start {
+        format!(
+            "'utf-8' codec can't decode byte 0x{:02x} in position {}: {}",
+            data[start], start, reason
+        )
+    } else {
+        format!(
+            "'utf-8' codec can't decode bytes in position {}-{}: {}",
+            start, end, reason
+        )
+    };
+    unicode_decode_error(message)
+}
+
+/// Decode with `final=True`: an incomplete trailing sequence is an error.
+#[cfg(feature = "std")]
+fn decode_utf8_final(data: &[u8]) -> Result<String, PyException> {
+    core::str::from_utf8(data)
+        .map(str::to_string)
+        .map_err(|e| utf8_decode_failure(data, e))
+}
+
+/// Decode with `final=False`: an incomplete trailing sequence is returned
+/// as the pending tail rather than an error.
+#[cfg(feature = "std")]
+fn decode_utf8_partial(data: &[u8]) -> Result<(String, alloc::vec::Vec<u8>), PyException> {
+    match core::str::from_utf8(data) {
+        Ok(text) => Ok((text.to_string(), alloc::vec::Vec::new())),
+        Err(e) if e.error_len().is_none() => {
+            let valid = e.valid_up_to();
+            Ok((
+                core::str::from_utf8(&data[..valid]).expect("valid prefix").to_string(),
+                data[valid..].to_vec(),
+            ))
+        }
+        Err(e) => Err(utf8_decode_failure(data, e)),
+    }
 }
 
 enum PyFileBackend {
+    /// A readable disk file in text mode, decoded chunk by chunk as
+    /// CPython's TextIOWrapper does (see [`TextReader`]).
     #[cfg(feature = "std")]
-    DiskRead(std::io::BufReader<std::fs::File>),
+    DiskRead(TextReader),
+    /// A writable stream: a buffered disk file.
     #[cfg(feature = "std")]
-    DiskWrite(std::io::BufWriter<std::fs::File>),
+    DiskWrite(alloc::boxed::Box<dyn std::io::Write>),
+    /// The live standard input (`sys.stdin`; argparse's
+    /// `FileType("r")("-")`): reads go through the process's one
+    /// `std::io::stdin()` buffer, and the closed state is the
+    /// process-wide [`STDIN_CLOSED`], so every handle on every thread is
+    /// an alias of one object, as in CPython (Devin review on #339,
+    /// round 5).
+    #[cfg(feature = "std")]
+    Stdin,
+    /// The live standard output (`sys.stdout`; `FileType("w")("-")`):
+    /// writes go through `std::io::stdout()`, the closed state is
+    /// [`STDOUT_CLOSED`]; close() flushes and leaves the descriptor open.
+    #[cfg(feature = "std")]
+    Stdout,
     /// io.StringIO: contents plus a cursor in CHARACTERS (Python
     /// counts positions in code points). write() OVERWRITES at the
     /// cursor, as in Python — StringIO("seeded").write("!") yields
@@ -7175,64 +7723,127 @@ pub(crate) fn closed_file_error() -> PyException {
 }
 
 impl PyFile {
-    #[cfg(feature = "std")]
-    fn new_read(reader: std::io::BufReader<std::fs::File>) -> Self {
+    fn from_backend(backend: PyFileBackend, name: &str) -> Self {
         Self {
-            backend: PyFileBackend::DiskRead(reader),
+            inner: alloc::rc::Rc::new(core::cell::RefCell::new(backend)),
+            name: name.to_string(),
         }
     }
 
     #[cfg(feature = "std")]
-    fn new_write(writer: std::io::BufWriter<std::fs::File>) -> Self {
-        Self {
-            backend: PyFileBackend::DiskWrite(writer),
-        }
+    fn new_read(reader: impl std::io::BufRead + 'static, name: &str) -> Self {
+        Self::from_backend(
+            PyFileBackend::DiskRead(TextReader::new(alloc::boxed::Box::new(reader))),
+            name,
+        )
+    }
+
+    #[cfg(feature = "std")]
+    fn new_write(writer: impl std::io::Write + 'static, name: &str) -> Self {
+        Self::from_backend(PyFileBackend::DiskWrite(alloc::boxed::Box::new(writer)), name)
+    }
+
+    /// The live standard input as a text file (`sys.stdin`; argparse's
+    /// `FileType("r")("-")`): reads come from the process's stdin as
+    /// they are asked for, never from a copy.
+    #[cfg(feature = "std")]
+    pub fn stdin() -> Self {
+        Self::from_backend(PyFileBackend::Stdin, "<stdin>")
+    }
+
+    /// The live standard output as a text file (`sys.stdout`; argparse's
+    /// `FileType("w")("-")`): every write reaches the process's stdout;
+    /// close() flushes it and leaves the descriptor open, as Python's
+    /// `closefd=False` stream does.
+    #[cfg(feature = "std")]
+    pub fn stdout() -> Self {
+        Self::from_backend(PyFileBackend::Stdout, "<stdout>")
     }
 
     /// io.StringIO backing constructor.
     pub(crate) fn new_buffer(initial: &str) -> Self {
-        Self {
-            backend: PyFileBackend::Buffer {
+        Self::from_backend(
+            PyFileBackend::Buffer {
                 data: initial.to_string(),
                 pos: 0,
             },
+            "",
+        )
+    }
+
+    /// Python `f.closed`: whether close() ran on this stream (through
+    /// any alias of it).
+    pub fn closed(&self) -> bool {
+        match &*self.inner.borrow() {
+            PyFileBackend::Closed => true,
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdin => stdin_closed(),
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdout => stdout_closed(),
+            _ => false,
         }
     }
 
     /// Python file.read() method
-    pub fn read(&mut self) -> Result<String, PyException> {
-        match &mut self.backend {
+    pub fn read(&self) -> Result<String, PyException> {
+        match &mut *self.inner.borrow_mut() {
             #[cfg(feature = "std")]
-            PyFileBackend::DiskRead(reader) => {
+            PyFileBackend::Stdin => {
                 use std::io::Read;
-                let mut contents = String::new();
-                reader.read_to_string(&mut contents)
-                    .map_err(|e| runtime_error(&format!("Read error: {}", e)))?;
-                Ok(contents)
+                if stdin_closed() {
+                    return Err(closed_file_error());
+                }
+                let mut bytes = Vec::new();
+                std::io::stdin()
+                    .lock()
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| stream_error(&e))?;
+                decode_utf8_final(&bytes)
             }
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdout => Err(if stdout_closed() {
+                closed_file_error()
+            } else {
+                unsupported_operation("not readable")
+            }),
+            #[cfg(feature = "std")]
+            PyFileBackend::DiskRead(reader) => reader.read_all(),
             PyFileBackend::Buffer { data, pos } => {
                 let out: String = data.chars().skip(*pos).collect();
                 *pos = data.chars().count();
                 Ok(out)
             }
             #[cfg(feature = "std")]
-            PyFileBackend::DiskWrite(_) => Err(runtime_error("File not opened for reading")),
+            PyFileBackend::DiskWrite(_) => Err(unsupported_operation("not readable")),
             PyFileBackend::Closed => Err(closed_file_error()),
         }
     }
 
     /// Python file.readline() method: the line INCLUDES its
     /// terminator, as in Python; empty means end of file.
-    pub fn readline(&mut self) -> Result<String, PyException> {
-        match &mut self.backend {
+    pub fn readline(&self) -> Result<String, PyException> {
+        match &mut *self.inner.borrow_mut() {
             #[cfg(feature = "std")]
-            PyFileBackend::DiskRead(reader) => {
+            PyFileBackend::Stdin => {
                 use std::io::BufRead;
-                let mut line = String::new();
-                reader.read_line(&mut line)
-                    .map_err(|e| runtime_error(&format!("Read error: {}", e)))?;
-                Ok(line)
+                if stdin_closed() {
+                    return Err(closed_file_error());
+                }
+                let mut bytes = Vec::new();
+                std::io::stdin()
+                    .lock()
+                    .read_until(b'\n', &mut bytes)
+                    .map_err(|e| stream_error(&e))?;
+                decode_utf8_final(&bytes)
             }
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdout => Err(if stdout_closed() {
+                closed_file_error()
+            } else {
+                unsupported_operation("not readable")
+            }),
+            #[cfg(feature = "std")]
+            PyFileBackend::DiskRead(reader) => reader.readline(),
             PyFileBackend::Buffer { data, pos } => {
                 let mut line = String::new();
                 for c in data.chars().skip(*pos) {
@@ -7245,7 +7856,7 @@ impl PyFile {
                 Ok(line)
             }
             #[cfg(feature = "std")]
-            PyFileBackend::DiskWrite(_) => Err(runtime_error("File not opened for reading")),
+            PyFileBackend::DiskWrite(_) => Err(unsupported_operation("not readable")),
             PyFileBackend::Closed => Err(closed_file_error()),
         }
     }
@@ -7254,7 +7865,7 @@ impl PyFile {
     /// ("x\n", "y\n"), exactly as Python's readlines does — stripping
     /// them silently diverges (and breaks csv.reader's newline
     /// handling).
-    pub fn readlines(&mut self) -> Result<Vec<String>, PyException> {
+    pub fn readlines(&self) -> Result<Vec<String>, PyException> {
         let mut lines = Vec::new();
         loop {
             let line = self.readline()?;
@@ -7268,14 +7879,32 @@ impl PyFile {
     /// Python file.write() method: returns the number of CHARACTERS
     /// written, as Python does. On a StringIO buffer this overwrites at
     /// the cursor (Python semantics), not appends.
-    pub fn write<D: AsRef<str>>(&mut self, data: D) -> Result<i64, PyException> {
+    pub fn write<D: AsRef<str>>(&self, data: D) -> Result<i64, PyException> {
         let text = data.as_ref();
-        match &mut self.backend {
+        match &mut *self.inner.borrow_mut() {
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdout => {
+                use std::io::Write;
+                if stdout_closed() {
+                    return Err(closed_file_error());
+                }
+                std::io::stdout()
+                    .lock()
+                    .write_all(text.as_bytes())
+                    .map_err(|e| stream_error(&e))?;
+                Ok(text.chars().count() as i64)
+            }
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdin => Err(if stdin_closed() {
+                closed_file_error()
+            } else {
+                unsupported_operation("not writable")
+            }),
             #[cfg(feature = "std")]
             PyFileBackend::DiskWrite(writer) => {
                 use std::io::Write;
                 writer.write_all(text.as_bytes())
-                    .map_err(|e| runtime_error(&format!("Write error: {}", e)))?;
+                    .map_err(|e| stream_error(&e))?;
                 Ok(text.chars().count() as i64)
             }
             PyFileBackend::Buffer { data, pos } => {
@@ -7287,13 +7916,13 @@ impl PyFile {
                 Ok(written as i64)
             }
             #[cfg(feature = "std")]
-            PyFileBackend::DiskRead(_) => Err(runtime_error("File not opened for writing")),
+            PyFileBackend::DiskRead(_) => Err(unsupported_operation("not writable")),
             PyFileBackend::Closed => Err(closed_file_error()),
         }
     }
 
     /// Python file.writelines() method
-    pub fn writelines<S: AsRef<str>>(&mut self, lines: &[S]) -> Result<(), PyException> {
+    pub fn writelines<S: AsRef<str>>(&self, lines: &[S]) -> Result<(), PyException> {
         for line in lines {
             self.write(line.as_ref())?;
         }
@@ -7305,7 +7934,7 @@ impl PyFile {
     /// the typed lowering cannot know the backend at conversion time,
     /// so this fails loudly at runtime instead.
     pub fn getvalue(&self) -> Result<String, PyException> {
-        match &self.backend {
+        match &*self.inner.borrow() {
             PyFileBackend::Buffer { data, .. } => Ok(data.clone()),
             PyFileBackend::Closed => Err(closed_file_error()),
             #[cfg(feature = "std")]
@@ -7316,19 +7945,98 @@ impl PyFile {
         }
     }
 
+    /// Python file.flush(): push buffered writes to the stream (a read
+    /// stream or a buffer has nothing to push).
+    pub fn flush(&self) -> Result<(), PyException> {
+        match &mut *self.inner.borrow_mut() {
+            #[cfg(feature = "std")]
+            PyFileBackend::DiskWrite(writer) => {
+                use std::io::Write;
+                writer.flush().map_err(|e| stream_error(&e))
+            }
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdout => {
+                use std::io::Write;
+                if stdout_closed() {
+                    return Err(closed_file_error());
+                }
+                std::io::stdout().flush().map_err(|e| stream_error(&e))
+            }
+            #[cfg(feature = "std")]
+            PyFileBackend::Stdin if stdin_closed() => Err(closed_file_error()),
+            PyFileBackend::Closed => Err(closed_file_error()),
+            _ => Ok(()),
+        }
+    }
+
     /// Python file.close() method
-    pub fn close(&mut self) -> Result<(), PyException> {
-        let old = core::mem::replace(&mut self.backend, PyFileBackend::Closed);
+    pub fn close(&self) -> Result<(), PyException> {
+        // The standard streams close PROCESS-WIDE (every alias, on every
+        // thread, sees it — CPython's one object) and keep the
+        // descriptor open; closing twice is a no-op as in Python.
+        #[cfg(feature = "std")]
+        match &*self.inner.borrow() {
+            PyFileBackend::Stdin => {
+                STDIN_CLOSED.store(true, core::sync::atomic::Ordering::SeqCst);
+                return Ok(());
+            }
+            PyFileBackend::Stdout => {
+                use std::io::Write;
+                if !stdout_closed() {
+                    std::io::stdout()
+                        .flush()
+                        .map_err(|e| stream_error(&e))?;
+                    STDOUT_CLOSED.store(true, core::sync::atomic::Ordering::SeqCst);
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        let old = core::mem::replace(&mut *self.inner.borrow_mut(), PyFileBackend::Closed);
         #[cfg(feature = "std")]
         if let PyFileBackend::DiskWrite(mut writer) = old {
             use std::io::Write;
             writer.flush()
-                .map_err(|e| runtime_error(&format!("Flush error: {}", e)))?;
+                .map_err(|e| stream_error(&e))?;
         }
         #[cfg(not(feature = "std"))]
         let _ = old;
         Ok(())
     }
+}
+
+/// The process-wide closed state of the standard streams: CPython has
+/// ONE `sys.stdin` and ONE `sys.stdout`, whose text wrapper and binary
+/// buffer close together, so the text and the binary handles on every
+/// thread share these (Devin review on #339, round 5).
+#[cfg(feature = "std")]
+pub(crate) static STDIN_CLOSED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "std")]
+pub(crate) static STDOUT_CLOSED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Reopen the standard streams: clear the process-wide closed state of
+/// sys.stdin and sys.stdout. CPython has no such call — a closed
+/// `sys.stdout` stays closed for the interpreter's life unless the program
+/// rebinds it (`sys.stdout = sys.__stdout__`) — so generated programs
+/// never call this; it is the entry point for an embedder that runs
+/// several converted programs in one process, and for in-process tests
+/// (Devin review on #339, round 7).
+#[cfg(feature = "std")]
+pub fn reopen_standard_streams() {
+    STDIN_CLOSED.store(false, core::sync::atomic::Ordering::SeqCst);
+    STDOUT_CLOSED.store(false, core::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(feature = "std")]
+pub(crate) fn stdin_closed() -> bool {
+    STDIN_CLOSED.load(core::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(feature = "std")]
+pub(crate) fn stdout_closed() -> bool {
+    STDOUT_CLOSED.load(core::sync::atomic::Ordering::SeqCst)
 }
 
 // ============================================================================

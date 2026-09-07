@@ -2273,7 +2273,7 @@ impl<'a> CodeGen for Call {
                     | "issubclass"
                     | "hash"
                     | "print"
-                    | "open"
+                    | "open" | "input"
                     | "round"
                     | "divmod"
                     | "bytes"
@@ -2610,13 +2610,72 @@ impl<'a> CodeGen for Call {
                                 .to_string()
                                 .into());
                         }
-                        let (ExprType::Name(c1), ExprType::Name(c2)) =
-                            (&self.args[0], &self.args[1])
-                        else {
-                            return Err("issubclass() over non-class values is not supported: \
-                                         classes are not runtime values in rython"
+                        // issubclass over a DYNAMIC first operand (an
+                        // attribute of an external module's value —
+                        // `issubclass(importlib.import_module(...).
+                        // IncrementalDecoder, MultibyteIncrementalDecoder)`,
+                        // charset_normalizer's utils): classes are not
+                        // runtime values, so nothing is known about the
+                        // operand — statically false, like hasattr over an
+                        // unmodeled value, through the -W channel (issue
+                        // #332). A NAME operand that is not a class stays
+                        // the loud refusal below.
+                        let ExprType::Name(c2) = &self.args[1] else {
+                            return Err("issubclass() arg 2 must be a class name: rython \
+                                        decides issubclass at conversion time"
                                 .to_string()
                                 .into());
+                        };
+                        let c1 = match &self.args[0] {
+                            ExprType::Name(c1) => c1,
+                            // `issubclass(type(x), C)` IS `isinstance(x, C)`:
+                            // the one computed operand shape whose class
+                            // the conversion can resolve — lowered as that
+                            // (Devin review on #339).
+                            ExprType::Call(c)
+                                if matches!(c.func.as_ref(), ExprType::Name(f) if f.id == "type")
+                                    && c.args.len() == 1
+                                    && c.keywords.is_empty() =>
+                            {
+                                let isinstance = Call {
+                                    func: Box::new(ExprType::Name(crate::Name {
+                                        id: "isinstance".to_string(),
+                                    })),
+                                    args: vec![c.args[0].clone(), self.args[1].clone()],
+                                    keywords: Vec::new(),
+                                };
+                                return isinstance.to_rust(ctx.clone(), options.clone(), symbols.clone());
+                            }
+                            // The one shape issue #332 motivated: an
+                            // attribute of an EXTERNAL module's value
+                            // (`importlib.import_module(...).
+                            // IncrementalDecoder`) — classes are not
+                            // runtime values, so nothing is known about
+                            // it: statically false through the -W channel,
+                            // like hasattr over an unmodeled value.
+                            e if external_operand(e, &symbols, &options) => {
+                                options.definition_warnings.borrow_mut().push(
+                                    "issubclass(<external module's value>, cls) is statically \
+                                     false: classes are not runtime values, so nothing is \
+                                     known about a computed operand's class (the \
+                                     external-object divergence)"
+                                        .to_string(),
+                                );
+                                return Ok(quote!(false));
+                            }
+                            // Any other computed operand — a value (Python's
+                            // TypeError `issubclass() arg 1 must be a
+                            // class`) or a class expression the conversion
+                            // cannot resolve — is loud.
+                            _ => {
+                                return Err("issubclass() arg 1 must be a class the conversion \
+                                            can resolve: the name of a class, `type(<value>)`, \
+                                            or an attribute of an external module's value; \
+                                            a computed operand is not (Python raises TypeError \
+                                            for a non-class)"
+                                    .to_string()
+                                    .into());
+                            }
                         };
                         // A class resolves locally or through its
                         // import, with its defining module's scope (the
@@ -3402,7 +3461,10 @@ impl<'a> CodeGen for Call {
                         };
                         if sep.is_none() && end.is_none() && flush.is_none() {
                             match rendered.as_slice() {
-                                [] => return Ok(quote!(println!())),
+                                // print() is fallible: sys.stdout may have
+                                // been closed through a `FileType("-")`
+                                // handle (Devin review on #339, round 6).
+                                [] => return Ok(quote!(print_parts(&[] as &[&str], "", "\n")?)),
                                 // A BYTES argument prints its CPython form
                                 // (`b'ab'`), not the int-list the blanket
                                 // Vec<T> display renders (issue #137): route
@@ -3415,9 +3477,9 @@ impl<'a> CodeGen for Call {
                                         &symbols,
                                     ) {
                                         let runtime = crate::safe_ident(&options.stdpython);
-                                        return Ok(quote!(print(&(#runtime::py_bytes_repr(&(#a))))));
+                                        return Ok(quote!(print(&(#runtime::py_bytes_repr(&(#a))))?));
                                     }
-                                    return Ok(quote!(print(&(#a))));
+                                    return Ok(quote!(print(&(#a))?));
                                 }
                                 _ => {}
                             }
@@ -3438,10 +3500,29 @@ impl<'a> CodeGen for Call {
                             quote!(&[#(py_display(&(#rendered))),*])
                         };
                         return Ok(match flush {
-                            None => quote!(print_parts(#parts, #sep, #end)),
+                            None => quote!(print_parts(#parts, #sep, #end)?),
                             Some(f) => {
                                 let f = render(f)?;
-                                quote!(print_parts_flush(#parts, #sep, #end, #f))
+                                quote!(print_parts_flush(#parts, #sep, #end, #f)?)
+                            }
+                        });
+                    }
+                    "input" => {
+                        // input([prompt]): the runtime reads sys.stdin (and
+                        // writes the prompt to sys.stdout) — both fallible:
+                        // EOFError at end of input, the closed-file
+                        // ValueError after a `FileType("-")` close (Devin
+                        // review on #339, round 6).
+                        if !self.keywords.is_empty() {
+                            return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        return Ok(match rendered.as_slice() {
+                            [] => quote!(input(None::<&str>)?),
+                            [p] => quote!(input(Some(#p))?),
+                            _ => {
+                                return Err("input() takes at most one argument (the prompt)"
+                                    .to_string()
+                                    .into())
                             }
                         });
                     }
@@ -3463,6 +3544,112 @@ impl<'a> CodeGen for Call {
                             })
                         {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
+                        }
+                        // The same parameter by name AND by position is
+                        // Python's TypeError (`argument for open() given by
+                        // name ('encoding') and position (4)`), whatever the
+                        // values — refused here (Devin review on #339,
+                        // round 4).
+                        for (name, position) in [("encoding", 4usize), ("errors", 5usize)] {
+                            if self.keywords.iter().any(|k| k.arg.as_deref() == Some(name))
+                                && self.args.len() >= position
+                            {
+                                return Err(format!(
+                                    "open(): argument for open() given by name ('{}') and \
+                                     position ({}) — Python's TypeError",
+                                    name, position
+                                )
+                                .into());
+                            }
+                        }
+                        // A LITERAL update mode (`r+`, `rb+`) is valid Python
+                        // the runtime does not model yet: refused at
+                        // conversion, not at the first open (Devin review
+                        // on #339, round 2). The rest of the mode grammar is
+                        // the runtime's (`parse_open_mode`, CPython's own
+                        // errors, raised before any file-system effect).
+                        if let Some(mode) = self.args.get(1).and_then(|m| match m {
+                            ExprType::Constant(c) => match &c.0 {
+                                Some(litrs::Literal::String(s)) => Some(s.value().to_string()),
+                                _ => None,
+                            },
+                            _ => None,
+                        }) && mode.contains('+')
+                        {
+                            return Err(format!(
+                                "open(..., '{}'): update modes ('+') are not supported yet \
+                                 (issue #332)",
+                                mode
+                            )
+                            .into());
+                        }
+                        // A LITERAL mode containing 'b' is the binary file
+                        // (read() yields bytes): `open_binary` (issue #332).
+                        let binary_mode = self.args.get(1).is_some_and(|m| {
+                            matches!(m, ExprType::Constant(c)
+                                if matches!(&c.0, Some(litrs::Literal::String(s)) if s.value().contains('b')))
+                        });
+                        if binary_mode {
+                            let p = &rendered[0];
+                            let m = &rendered[1];
+                            // The text-only settings — `encoding` and
+                            // `errors`, by keyword or by position (open's
+                            // third positional is buffering, then
+                            // encoding, then errors) — are CPython's
+                            // ValueError in a binary mode when not None:
+                            // the runtime raises it (Devin review on #339,
+                            // round 3). A literal None is not given; an
+                            // expression that may or may not be None
+                            // cannot be judged here and is loud.
+                            let is_none = |e: &ExprType| {
+                                matches!(e, ExprType::Constant(c) if c.0.is_none())
+                            };
+                            let given = |slot: &str, e: Option<&ExprType>| -> Result<bool, Box<dyn std::error::Error>> {
+                                match e {
+                                    None => Ok(false),
+                                    Some(e) if is_none(e) => Ok(false),
+                                    Some(ExprType::Constant(_)) => Ok(true),
+                                    Some(_) => Err(format!(
+                                        "open(..., '{}', {}=<expr>): a binary mode takes no \
+                                         {} (Python's ValueError when it is not None), and \
+                                         the expression cannot be judged at conversion; \
+                                         pass None or a literal",
+                                        rendered_mode_literal(&self.args[1]),
+                                        slot,
+                                        slot
+                                    )
+                                    .into()),
+                                }
+                            };
+                            let keyword = |name: &str| {
+                                self.keywords
+                                    .iter()
+                                    .find(|k| k.arg.as_deref() == Some(name))
+                                    .map(|k| &k.value)
+                            };
+                            let encoding_given =
+                                given("encoding", keyword("encoding").or(self.args.get(3)))?;
+                            let errors_given =
+                                given("errors", keyword("errors").or(self.args.get(4)))?;
+                            if self.args.len() > 5 {
+                                return Err(
+                                    "open() in a binary mode: newline/closefd/opener positionals \
+                                     are not supported yet"
+                                        .into(),
+                                );
+                            }
+                            if self.args.len() > 2 {
+                                options.definition_warnings.borrow_mut().push(format!(
+                                    "open({}, ...) passes only the path and mode: a binary \
+                                     file has no encoding, and the buffer is the default \
+                                     (the buffering divergence)",
+                                    bname
+                                ));
+                            }
+                            if encoding_given || errors_given {
+                                return Ok(quote!(open_binary_with(&(#p), #m, #encoding_given, #errors_given)?));
+                            }
+                            return Ok(quote!(open_binary(&(#p), #m)?));
                         }
                         return Ok(match rendered.as_slice() {
                             [p] => quote!(open(&(#p), None::<&str>)?),
@@ -11461,4 +11648,67 @@ fn shared_construction(class_name: &str, construct: TokenStream) -> TokenStream 
         return quote!(#any::from(#shared));
     }
     shared
+}
+
+/// Whether an expression is rooted at a name the module binds by an
+/// import of an EXTERNAL module (not a crate module): `importlib.
+/// import_module(...).X`, `os.path.Y` — a value the conversion does not
+/// model (the external-object divergence).
+fn external_operand(e: &ExprType, symbols: &SymbolTableScopes, options: &PythonOptions) -> bool {
+    let mut cur = e;
+    loop {
+        match cur {
+            ExprType::Attribute(a) => cur = &a.value,
+            ExprType::Call(c) => cur = &c.func,
+            ExprType::Subscript(s) => cur = &s.value,
+            ExprType::Name(n) => {
+                // `import ext as e` binds `e` as an alias of the canonical
+                // name; follow it to the import that binds the module.
+                let mut bound = n.id.clone();
+                for _ in 0..8 {
+                    match symbols.get(&bound) {
+                        Some(crate::SymbolTableNode::Alias(canonical)) => bound = canonical.clone(),
+                        _ => break,
+                    }
+                }
+                return match symbols.get(&bound) {
+                    // The alias that binds THIS name (`import local, ext`
+                    // binds two; `import a.b as c` binds `c` to `a`) — not
+                    // any alias of the statement (Devin review on #339,
+                    // round 3).
+                    Some(crate::SymbolTableNode::Import(im)) => im
+                        .names
+                        .iter()
+                        .find(|a| match &a.asname {
+                            Some(named) => named == &bound || named == &n.id,
+                            None => a.name.split('.').next() == Some(bound.as_str()),
+                        })
+                        .is_some_and(|a| {
+                            let root = a.name.split('.').next().unwrap_or(&a.name);
+                            !options
+                                .module_defs
+                                .keys()
+                                .any(|k| k.first().map(String::as_str) == Some(root))
+                        }),
+                    Some(crate::SymbolTableNode::ImportFrom(ifm)) => {
+                        crate::module_defs_key(options, &ifm.resolved_module_path(options)).is_none()
+                    }
+                    _ => false,
+                };
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// The literal mode of an `open` call, for a message (the caller has
+/// already established it is a string literal).
+fn rendered_mode_literal(e: &ExprType) -> String {
+    match e {
+        ExprType::Constant(c) => match &c.0 {
+            Some(litrs::Literal::String(s)) => s.value().to_string(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
 }

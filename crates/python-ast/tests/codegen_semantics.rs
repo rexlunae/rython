@@ -2242,11 +2242,14 @@ fn calls_to_user_functions_propagate_with_question_mark() {
     let out = compile(src, "prop.py");
     assert!(out.contains("helper () ?"), "generated: {}", out);
 
-    // Builtins that don't raise stay plain (print takes its argument by
-    // reference).
+    // print raises too since round 6 of the review on #339 (sys.stdout
+    // may be closed through a FileType("-") handle): its call carries the
+    // `?` like every fallible builtin, by reference still.
     let out = compile("def f(x: int):\n    print(x)\n", "plaincall.py");
-    assert!(out.contains("print (& (x))"), "generated: {}", out);
-    assert!(!out.contains("print (& (x)) ?"), "generated: {}", out);
+    assert!(out.contains("print (& (x)) ?"), "generated: {}", out);
+    // A builtin that cannot raise stays plain.
+    let out = compile("def f(xs: list[int]) -> int:\n    return len(xs)\n", "plainlen.py");
+    assert!(out.contains("len (") && !out.contains("len (& (xs)) ?"), "generated: {}", out);
 }
 
 #[test]
@@ -5788,8 +5791,10 @@ fn print_sep_end_flush_keywords_map() {
 
 #[test]
 fn print_zero_and_single_arg_shapes() {
+    // A bare print() goes through the runtime too (round 6 of the review
+    // on #339: sys.stdout may be closed), never a bare println!.
     let out = compile("def f():\n    print()\n", "pr4.py");
-    assert!(out.contains("println ! ()"), "generated: {}", out);
+    assert!(out.contains("print_parts (& [] as & [& str] , \"\" , \"\\n\") ?"), "generated: {}", out);
 
     // print(end="") with no arguments still needs a typed empty slice.
     let out = compile("def f():\n    print(end='')\n", "pr5.py");
@@ -6340,16 +6345,665 @@ fn argparse_dynamic_or_unsupported_specs_are_loud() {
             "\n",
             "def main() -> None:\n",
             "    p = argparse.ArgumentParser()\n",
-            "    p.add_argument(\"xs\", nargs=\"+\")\n",
+            "    p.add_argument(\"xs\", nargs=\"?\")\n",
             "    args = p.parse_args()\n",
         ),
         "ap4.py",
     );
     assert!(
-        err.contains("'nargs' is not supported yet"),
+        err.contains("only nargs=\"+\" and nargs=\"*\" are supported yet"),
         "error: {}",
         err
     );
+}
+
+#[test]
+fn argparse_filetype_nargs_dest_and_version_shape_the_namespace() {
+    // Issue #332 (charset_normalizer's CLI): `type=FileType(mode)` opens
+    // the named file — a PyFile field (a binary mode: the bytes file);
+    // `nargs="+"` makes the positional a Vec; `dest=` names the field;
+    // `action="version"` takes no field and prints `version=`;
+    // `parse_args(argv)` passes the explicit list (an Option passes
+    // through, a plain list is Some).
+    let out = compile(
+        concat!(
+            "import argparse\n",
+            "from argparse import FileType\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> None:\n",
+            "    p = argparse.ArgumentParser(prog=\"tool\")\n",
+            "    p.add_argument(\"files\", type=FileType(\"r\"), nargs=\"+\")\n",
+            "    p.add_argument(\"blob\", type=argparse.FileType(\"rb\"))\n",
+            "    p.add_argument(\"-n\", \"--number\", action=\"store_true\", default=False, dest=\"numbered\")\n",
+            "    p.add_argument(\"-t\", \"--threshold\", action=\"store\", type=float, default=0.5, dest=\"limit\")\n",
+            "    p.add_argument(\"--version\", action=\"version\", version=\"tool \" + \"1.0\")\n",
+            "    args = p.parse_args(argv)\n",
+            "    print(len(args.files), args.numbered, args.limit)\n",
+        ),
+        "ap5.py",
+    );
+    assert!(out.contains("files : Vec < PyFile >"), "generated: {}", out);
+    assert!(out.contains("blob : stdpython :: io :: PyBytesIO"), "generated: {}", out);
+    assert!(out.contains("numbered : bool"), "generated: {}", out);
+    assert!(out.contains("limit : f64"), "generated: {}", out);
+    assert!(!out.contains("version :"), "a version action has no field: {}", out);
+    assert!(out.contains("argparse :: ArgKind :: File (\"r\")"), "generated: {}", out);
+    assert!(out.contains("argparse :: ArgKind :: BinaryFile (\"rb\")"), "generated: {}", out);
+    assert!(out.contains("argparse :: ArgKind :: Version"), "generated: {}", out);
+    assert!(out.contains("nargs : argparse :: Nargs :: Plus"), "generated: {}", out);
+    assert!(out.contains("dest : Some (\"numbered\")"), "generated: {}", out);
+    assert!(out.contains("into_list ()"), "generated: {}", out);
+    assert!(out.contains("into_binary_file ()"), "generated: {}", out);
+    // The version string is bound where the add_argument stood (Python
+    // evaluates it then) and is the spec's default at the parse site.
+    assert!(out.contains("let __argparse_version_0 : String = "), "generated: {}", out);
+    assert!(
+        out.contains("ParsedValue :: Str (__argparse_version_0 . clone ())"),
+        "generated: {}",
+        out
+    );
+    // The Option-typed argv passes through unchanged.
+    assert!(out.contains("] , argv ,)"), "generated: {}", out);
+
+    // A plain list argv is wrapped in Some.
+    let out = compile(
+        concat!(
+            "import argparse\n",
+            "import sys\n",
+            "\n",
+            "def main() -> None:\n",
+            "    p = argparse.ArgumentParser()\n",
+            "    p.add_argument(\"name\")\n",
+            "    args = p.parse_args(sys.argv[1:])\n",
+            "    print(args.name)\n",
+        ),
+        "ap6.py",
+    );
+    assert!(out.contains("Some ((") && out.contains("to_string ()) . collect ())"), "generated: {}", out);
+
+    // Unsupported shapes stay loud: nargs on an option, a second variadic
+    // positional, a FileType default, a version action without version=.
+    for (src, needle) in [
+        ("    p.add_argument(\"--xs\", nargs=\"+\", default=\"a\")\n", "nargs on an option"),
+        (
+            "    p.add_argument(\"a\", nargs=\"+\")\n    p.add_argument(\"b\", nargs=\"*\")\n",
+            "only one variadic",
+        ),
+        (
+            "    p.add_argument(\"--log\", type=FileType(\"w\"), default=\"x\")\n",
+            "FileType option with a default",
+        ),
+        ("    p.add_argument(\"--version\", action=\"version\")\n", "needs version="),
+        ("    p.add_argument(\"f\", type=FileType(\"r\", -1))\n", "FileType takes the mode only"),
+    ] {
+        let err = compile_err(
+            &format!(
+                "import argparse\nfrom argparse import FileType\n\ndef main() -> None:\n    p = argparse.ArgumentParser()\n{}    args = p.parse_args()\n",
+                src
+            ),
+            "ap7.py",
+        );
+        assert!(err.contains(needle), "error for {:?}: {}", src, err);
+    }
+}
+
+#[test]
+fn issubclass_over_a_dynamic_operand_is_statically_false_and_warned() {
+    // `issubclass(importlib.import_module(...).IncrementalDecoder, Base)`
+    // (charset_normalizer's utils, issue #332): classes are not runtime
+    // values, so a computed first operand has no class to judge — false,
+    // through the -W channel like hasattr over an unmodeled value. A NAME
+    // that is not a class keeps the loud refusal.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "import importlib\n",
+            "\n",
+            "class Base:\n",
+            "    pass\n",
+            "\n",
+            "def probe(name: str) -> bool:\n",
+            "    return name in {\"utf_8\"} or issubclass(importlib.import_module(name).Decoder, Base)\n",
+        ),
+        "isc1.py",
+    );
+    assert!(out.contains("|| (false)"), "generated: {}", out);
+    assert!(
+        warnings.iter().any(|w| w.contains("issubclass(<external module's value>, cls) is statically false")),
+        "warnings: {:?}",
+        warnings
+    );
+    let err = compile_err(
+        "def probe(x: int) -> bool:\n    return issubclass(x, int)\n",
+        "isc2.py",
+    );
+    assert!(err.contains("classes are not runtime values"), "error: {}", err);
+    // Round 1 of the review on #339: the fold is the external shape ONLY.
+    // `issubclass(type(x), C)` is `isinstance(x, C)` (CPython: True for
+    // type(1), int) and lowers as that, without a warning; any other
+    // computed operand (a value — Python's TypeError — or an unresolved
+    // class expression) is loud.
+    let (out, warnings) = compile_with_warnings(
+        "def probe(x: int) -> bool:\n    return issubclass(type(x), int)\n",
+        "isc3.py",
+    );
+    assert!(!out.contains("(false)"), "generated: {}", out);
+    assert!(
+        !warnings.iter().any(|w| w.contains("statically false")),
+        "warnings: {:?}",
+        warnings
+    );
+    for src in [
+        "def probe(x: int) -> bool:\n    return issubclass(x + 1, int)\n",
+        "def probe(xs: list[int]) -> bool:\n    return issubclass(xs[0], int)\n",
+        "class Local:\n    pass\n\ndef probe() -> bool:\n    return issubclass(Local(), Local)\n",
+    ] {
+        let err = compile_err(src, "isc4.py");
+        assert!(
+            err.contains("issubclass() arg 1 must be a class the conversion can resolve"),
+            "{}: error: {}",
+            src,
+            err
+        );
+    }
+}
+
+#[test]
+fn argparse_resolves_filetype_by_binding_and_the_version_keywords_in_either_order() {
+    // Round 1 of the review on #339: `FileType` is argparse's only through
+    // the symbol table — a def of that name, or another module's
+    // `.FileType`, is a custom type callable (loud); `action="version"`
+    // and `version=` pair up in either keyword order, and `version=` with
+    // another action is Python's TypeError (loud); a parser referenced
+    // under control flow or inside a nested def is refused.
+    for src in [
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    p = argparse.ArgumentParser(prog=\"t\")\n",
+            "    p.add_argument(\"--version\", version=\"1.0\", action=\"version\")\n",
+            "    args = p.parse_args(argv)\n",
+            "    return 0\n",
+        ),
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    p = argparse.ArgumentParser(prog=\"t\")\n",
+            "    p.add_argument(\"--version\", action=\"version\", version=\"1.0\")\n",
+            "    args = p.parse_args(argv)\n",
+            "    return 0\n",
+        ),
+    ] {
+        let out = compile(src, "apv.py");
+        assert!(out.contains("argparse :: ArgKind :: Version"), "generated: {}", out);
+    }
+    for (src, expected) in [
+        (
+            concat!(
+                "import argparse\n",
+                "\n",
+                "def main(argv: list[str] | None = None) -> int:\n",
+                "    p = argparse.ArgumentParser(prog=\"t\")\n",
+                "    p.add_argument(\"--version\", version=\"1.0\")\n",
+                "    args = p.parse_args(argv)\n",
+                "    return 0\n",
+            ),
+            "version= is only valid with action=\"version\"",
+        ),
+        (
+            concat!(
+                "import argparse\n",
+                "\n",
+                "def FileType(mode: str) -> str:\n",
+                "    return mode\n",
+                "\n",
+                "def main(argv: list[str] | None = None) -> int:\n",
+                "    p = argparse.ArgumentParser(prog=\"t\")\n",
+                "    p.add_argument(\"f\", type=FileType(\"r\"))\n",
+                "    args = p.parse_args(argv)\n",
+                "    return 0\n",
+            ),
+            "FileType(mode)",
+        ),
+        (
+            concat!(
+                "import argparse\n",
+                "import other\n",
+                "\n",
+                "def main(argv: list[str] | None = None) -> int:\n",
+                "    p = argparse.ArgumentParser(prog=\"t\")\n",
+                "    p.add_argument(\"f\", type=other.FileType(\"r\"))\n",
+                "    args = p.parse_args(argv)\n",
+                "    return 0\n",
+            ),
+            "FileType(mode)",
+        ),
+        (
+            concat!(
+                "import argparse\n",
+                "\n",
+                "def main(argv: list[str] | None = None, debug: bool = False) -> int:\n",
+                "    p = argparse.ArgumentParser(prog=\"t\")\n",
+                "    p.add_argument(\"f\", type=str)\n",
+                "    if debug:\n",
+                "        p.add_argument(\"--trace\", action=\"store_true\", default=False)\n",
+                "    args = p.parse_args(argv)\n",
+                "    return 0\n",
+            ),
+            "is used under control flow or inside a nested definition",
+        ),
+    ] {
+        let err = compile_err(src, "apbad.py");
+        assert!(err.contains(expected), "{}\nerror: {}", src, err);
+    }
+    // The bare name IS argparse's when imported from argparse under an alias.
+    let out = compile(
+        concat!(
+            "import argparse\n",
+            "from argparse import FileType as FT\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    p = argparse.ArgumentParser(prog=\"t\")\n",
+            "    p.add_argument(\"f\", type=FT(\"r\"))\n",
+            "    args = p.parse_args(argv)\n",
+            "    return 0\n",
+        ),
+        "apft.py",
+    );
+    assert!(out.contains("argparse :: ArgKind :: File (\"r\")"), "generated: {}", out);
+}
+
+#[test]
+fn argparse_version_strings_bind_where_add_argument_stood() {
+    // Round 2 of the review on #339: Python evaluates `version=` when
+    // add_argument runs, so a name rebound before parse_args does not
+    // change it. The string is bound at the statement's position, before
+    // the rebinding, and the rebinding still happens.
+    let out = compile(
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    v = \"1.0\"\n",
+            "    p = argparse.ArgumentParser(prog=\"tool\")\n",
+            "    p.add_argument(\"--version\", action=\"version\", version=\"tool \" + v)\n",
+            "    v = \"2.0\"\n",
+            "    args = p.parse_args(argv)\n",
+            "    print(v)\n",
+            "    return 0\n",
+        ),
+        "apver.py",
+    );
+    let bind = out.find("let __argparse_version_0 : String = ").expect("the binding is emitted");
+    let rebind = out.find("v = \"2.0\"").expect("the rebinding survives");
+    let parse = out.find("argparse :: run_parser").expect("the parse site");
+    assert!(bind < rebind && rebind < parse, "order: {}", out);
+
+    // Round 10: a non-literal `default=` is evaluated when add_argument
+    // runs too (python3: `fallback = "early"; add_argument("--name",
+    // default=fallback); fallback = "late"` parses to "early"), so it is
+    // bound the same way; a string literal stays where it was.
+    let out = compile(
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    fallback = \"early\"\n",
+            "    p = argparse.ArgumentParser(prog=\"tool\")\n",
+            "    p.add_argument(\"--name\", default=fallback)\n",
+            "    p.add_argument(\"--tag\", default=\"lit\")\n",
+            "    fallback = \"late\"\n",
+            "    args = p.parse_args(argv)\n",
+            "    print(args.name, fallback)\n",
+            "    return 0\n",
+        ),
+        "apdef.py",
+    );
+    let bind = out.find("let __argparse_default_0 : String = ").expect("the default binding is emitted");
+    let rebind = out.find("fallback = \"late\"").expect("the rebinding survives");
+    let parse = out.find("argparse :: run_parser").expect("the parse site");
+    assert!(bind < rebind && rebind < parse, "order: {}", out);
+    assert!(out.contains("Str (__argparse_default_0 . clone ())"), "the spec takes the local: {}", out);
+    assert!(out.contains("Str ((\"lit\") . to_string ())"), "a literal default stays inline: {}", out);
+    assert!(!out.contains("__argparse_default_1"), "only the non-literal default is bound: {}", out);
+}
+
+#[test]
+fn issubclass_external_fold_follows_the_alias_that_binds_the_name() {
+    // Round 3 of the review on #339: `import local, ext` binds two names
+    // with one statement; only a value rooted at the EXTERNAL binding
+    // folds to false. The in-crate binding is a class expression the
+    // conversion resolves through the module (or refuses loudly) — never
+    // the fold. Aliases (`import ext as e`) resolve the same way.
+    let local = parse(
+        concat!(
+            "class Base:\n",
+            "    pass\n",
+            "\n",
+            "class Thing(Base):\n",
+            "    pass\n",
+        ),
+        "local.py",
+    )
+    .unwrap();
+    let mut defs = std::collections::HashMap::new();
+    defs.insert(vec!["local".to_string()], std::rc::Rc::new(local));
+    let options = PythonOptions {
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    };
+    // The external root folds, with the warning.
+    let src = concat!(
+        "import local, importlib\n",
+        "from local import Base\n",
+        "\n",
+        "def probe(name: str) -> bool:\n",
+        "    return issubclass(importlib.import_module(name).Decoder, Base)\n",
+    );
+    let out = compile_with_options(src, "grp1.py", options.clone()).expect("converts");
+    assert!(out.contains("(false)"), "generated: {}", out);
+    assert!(
+        options.definition_warnings.borrow().iter().any(|w| w.contains("statically false")),
+        "warnings: {:?}",
+        options.definition_warnings.borrow()
+    );
+    // The in-crate root of the SAME statement is not external: no fold.
+    let src = concat!(
+        "import local, importlib\n",
+        "from local import Base\n",
+        "\n",
+        "def probe(name: str) -> bool:\n",
+        "    return issubclass(local.Thing(), Base)\n",
+    );
+    let err = compile_with_options(src, "grp2.py", options.clone()).expect_err("loud, not false");
+    assert!(
+        err.contains("issubclass() arg 1 must be a class the conversion can resolve"),
+        "error: {}",
+        err
+    );
+    // An aliased external import folds under its alias.
+    let src = concat!(
+        "import local\n",
+        "from local import Base\n",
+        "import importlib as il\n",
+        "\n",
+        "def probe(name: str) -> bool:\n",
+        "    return issubclass(il.import_module(name).Decoder, Base)\n",
+    );
+    let out = compile_with_options(src, "grp3.py", options.clone()).expect("converts");
+    assert!(out.contains("(false)"), "generated: {}", out);
+}
+
+#[test]
+fn binary_open_text_settings_raise_cpythons_value_error() {
+    // Round 3 of the review on #339: `open(p, "rb", encoding="utf-8")` is
+    // CPython's `ValueError: binary mode doesn't take an encoding
+    // argument`, raised at the open; so is `errors=`, by keyword or by
+    // position (open's fourth and fifth positionals). A literal None is
+    // not given; an expression that may be None is refused at conversion.
+    let out = compile(
+        "def main() -> None:\n    f = open(\"x.bin\", \"rb\", encoding=\"utf-8\")\n",
+        "bo1.py",
+    );
+    assert!(out.contains("open_binary_with (& (\"x.bin\") , \"rb\" , true , false)"), "generated: {}", out);
+    let out = compile(
+        "def main() -> None:\n    f = open(\"x.bin\", \"rb\", -1, None, \"strict\")\n",
+        "bo2.py",
+    );
+    assert!(out.contains("open_binary_with (& (\"x.bin\") , \"rb\" , false , true)"), "generated: {}", out);
+    let out = compile(
+        "def main() -> None:\n    f = open(\"x.bin\", \"rb\", -1, None, errors=None)\n",
+        "bo3.py",
+    );
+    assert!(out.contains("open_binary (& (\"x.bin\") , \"rb\")"), "generated: {}", out);
+    let err = compile_err(
+        "def main(enc: str) -> None:\n    f = open(\"x.bin\", \"rb\", encoding=enc)\n",
+        "bo4.py",
+    );
+    assert!(err.contains("a binary mode takes no encoding"), "error: {}", err);
+}
+
+#[test]
+fn duplicate_open_arguments_and_non_str_versions_are_refused() {
+    // Round 4 of the review on #339: the same open() parameter by name
+    // AND by position is Python's TypeError whatever the values — refused
+    // at conversion, in a binary or a text mode; and `version=` must be a
+    // str (CPython's formatter raises TypeError when --version runs with
+    // an int), so a version action that can never print is refused.
+    for (src, expected) in [
+        (
+            "def main() -> None:\n    f = open(\"x.bin\", \"rb\", -1, \"utf-8\", encoding=\"utf-8\")\n",
+            "given by name ('encoding') and position (4)",
+        ),
+        (
+            "def main() -> None:\n    f = open(\"x.txt\", \"r\", -1, None, \"strict\", errors=\"strict\")\n",
+            "given by name ('errors') and position (5)",
+        ),
+        (
+            concat!(
+                "import argparse\n",
+                "\n",
+                "def main(argv: list[str] | None = None) -> int:\n",
+                "    p = argparse.ArgumentParser(prog=\"t\")\n",
+                "    p.add_argument(\"--version\", action=\"version\", version=123)\n",
+                "    args = p.parse_args(argv)\n",
+                "    return 0\n",
+            ),
+            "the version must be a str",
+        ),
+    ] {
+        let err = compile_err(src, "dup.py");
+        assert!(err.contains(expected), "{}\nerror: {}", src, err);
+    }
+    // A str-typed version expression binds as before.
+    let out = compile(
+        concat!(
+            "import argparse\n",
+            "\n",
+            "def main(argv: list[str] | None = None) -> int:\n",
+            "    v = \"1.0\"\n",
+            "    p = argparse.ArgumentParser(prog=\"t\")\n",
+            "    p.add_argument(\"--version\", action=\"version\", version=\"t \" + v)\n",
+            "    args = p.parse_args(argv)\n",
+            "    return 0\n",
+        ),
+        "ver.py",
+    );
+    assert!(out.contains("let __argparse_version_0 : String ="), "generated: {}", out);
+}
+
+#[test]
+fn a_repeated_keyword_argument_is_refused_as_cpythons_syntax_error() {
+    // Round 7 of the review on #339: `f(a=1, a=2)` is CPython's
+    // `SyntaxError: keyword argument repeated: a`. rython's front end
+    // accepts the spelling, so `scan_argparse` refuses it for the parser
+    // constructor and for add_argument (a repeated action= included)
+    // rather than letting the last value win.
+    for (src, expected) in [
+        (
+            "import argparse\n\ndef main(argv: list[str] | None = None) -> int:\n    p = argparse.ArgumentParser(prog=\"t\", prog=\"u\")\n    args = p.parse_args(argv)\n    return 0\n",
+            "argparse.ArgumentParser: keyword argument repeated: prog",
+        ),
+        (
+            "import argparse\n\ndef main(argv: list[str] | None = None) -> int:\n    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--x\", default=\"a\", help=\"a\", help=\"b\")\n    args = p.parse_args(argv)\n    return 0\n",
+            "add_argument('--x'): keyword argument repeated: help",
+        ),
+        (
+            "import argparse\n\ndef main(argv: list[str] | None = None) -> int:\n    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--x\", action=\"store\", action=\"store_true\")\n    args = p.parse_args(argv)\n    return 0\n",
+            "add_argument('--x'): keyword argument repeated: action",
+        ),
+    ] {
+        let err = compile_err(src, "dupkw.py");
+        assert!(err.contains(expected), "{}\nerror: {}", src, err);
+    }
+}
+
+#[test]
+fn update_file_modes_are_refused_at_conversion() {
+    // Round 2 of the review on #339: an update mode (`+`) is valid Python
+    // the runtime does not model; a literal one is refused when the
+    // program is converted, not at its first open — for `open()` and for
+    // `FileType`. Text and binary spellings alike.
+    for (src, expected) in [
+        (
+            concat!(
+                "def main() -> None:\n",
+                "    with open(\"x.bin\", \"rb+\") as f:\n",
+                "        f.read()\n",
+            ),
+            "open(..., 'rb+'): update modes ('+') are not supported yet",
+        ),
+        (
+            concat!(
+                "def main() -> None:\n",
+                "    with open(\"x.txt\", \"r+\") as f:\n",
+                "        f.read()\n",
+            ),
+            "open(..., 'r+'): update modes ('+') are not supported yet",
+        ),
+        (
+            concat!(
+                "import argparse\n",
+                "\n",
+                "def main(argv: list[str] | None = None) -> int:\n",
+                "    p = argparse.ArgumentParser(prog=\"t\")\n",
+                "    p.add_argument(\"f\", type=argparse.FileType(\"rb+\"))\n",
+                "    args = p.parse_args(argv)\n",
+                "    return 0\n",
+            ),
+            "FileType('rb+') is an update mode, which is not supported yet",
+        ),
+    ] {
+        let err = compile_err(src, "plus.py");
+        assert!(err.contains(expected), "{}\nerror: {}", src, err);
+    }
+    // Every argparse spelling the converter reads goes through a typed
+    // enum: an unknown parser keyword, action, type name or nargs is one
+    // loud error naming it.
+    for (line, expected) in [
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\", epilog=\"bye\")\n    p.add_argument(\"f\")\n",
+            "keyword 'epilog' is not supported yet",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"f\", action=\"append\")\n",
+            "only action=\"store\", \"store_true\" and \"version\" are supported",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"f\", type=bool)\n",
+            "type must be int, float, str, or FileType(mode)",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"f\", nargs=\"?\")\n",
+            "only nargs=\"+\" and nargs=\"*\" are supported yet",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"f\", choices=[\"a\"])\n",
+            "keyword 'choices' is not supported yet",
+        ),
+        // An option string already registered (a previous argument's
+        // short or long alias, or -h/--help) is CPython's ArgumentError
+        // at add_argument: refused (round 6).
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--value\", dest=\"first\", default=\"a\")\n    p.add_argument(\"-x\", \"--value\", dest=\"second\", default=\"b\")\n",
+            "argument -x/--value: conflicting option string: --value",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"-x\", \"--one\", default=\"a\")\n    p.add_argument(\"-x\", \"--two\", default=\"b\")\n",
+            "argument -x/--two: conflicting option string: -x",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"-h\", \"--hh\", action=\"store_true\")\n",
+            "argument -h/--hh: conflicting option string: -h",
+        ),
+        // CPython keeps a non-string default as it is (type= applies to
+        // strings only): default=1 with type=float is the int 1, which the
+        // f64 field cannot hold — refused; a string default converts as
+        // the parser would, and one that cannot is CPython's run-time
+        // error, refused (round 9).
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--f\", type=float, default=1)\n",
+            "default=1 with type=float is the int 1",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--i\", type=int, default=1.5)\n",
+            "not the int the i64 field holds",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--i\", type=int, default=True)\n",
+            "not the int the i64 field holds",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--i\", type=int, default=\"abc\")\n",
+            "argument --i: invalid int value: 'abc'",
+        ),
+        // Python's numeric-string grammar allows single underscores
+        // BETWEEN digits only; `_1`, `1_`, `1__2`, `1_.0` and `1__0.5` are
+        // CPython's ValueError at every run, refused (round 10). A number
+        // CPython reads that the typed field cannot hold is refused with
+        // the reason.
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--i\", type=int, default=\"_1\")\n",
+            "argument --i: invalid int value: '_1'",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--i\", type=int, default=\"1_\")\n",
+            "argument --i: invalid int value: '1_'",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--i\", type=int, default=\"1__2\")\n",
+            "argument --i: invalid int value: '1__2'",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--f\", type=float, default=\"1_.0\")\n",
+            "argument --f: invalid float value: '1_.0'",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--f\", type=float, default=\"1__0.5\")\n",
+            "argument --f: invalid float value: '1__0.5'",
+        ),
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"--i\", type=int, default=\"99999999999999999999\")\n",
+            "default='99999999999999999999' is an int outside i64, which the i64 field cannot hold",
+        ),
+        // A positional store_true consumes no token in CPython (the flag
+        // is simply True): refused rather than modeled as a value
+        // (round 5).
+        (
+            "    p = argparse.ArgumentParser(prog=\"t\")\n    p.add_argument(\"flag\", action=\"store_true\")\n",
+            "action=\"store_true\" on a positional consumes no token in CPython",
+        ),
+    ] {
+        let src = format!(
+            "import argparse\n\ndef main(argv: list[str] | None = None) -> int:\n{}    args = p.parse_args(argv)\n    return 0\n",
+            line
+        );
+        let err = compile_err(&src, "apenum.py");
+        assert!(err.contains(expected), "{}\nerror: {}", src, err);
+    }
+}
+
+#[test]
+fn a_binary_open_mode_is_the_bytes_file() {
+    // `open(p, "rb")` / `open(p, "wb")`: the binary file (io.BytesIO's
+    // type over a disk backend) whose read() yields bytes and write()
+    // takes them — never the text `open()` (issue #332).
+    let out = compile(
+        concat!(
+            "def copy(src: str, dst: str) -> int:\n",
+            "    with open(src, \"rb\") as f:\n",
+            "        data = f.read()\n",
+            "    with open(dst, \"wb\") as g:\n",
+            "        g.write(data)\n",
+            "    with open(dst) as h:\n",
+            "        return len(h.read())\n",
+        ),
+        "binopen.py",
+    );
+    assert!(out.contains("open_binary (& (src) , \"rb\") ?"), "generated: {}", out);
+    assert!(out.contains("open_binary (& (dst) , \"wb\") ?"), "generated: {}", out);
+    assert!(out.contains("open (& (dst) , None :: < & str >) ?"), "generated: {}", out);
 }
 
 // ---- chained comparisons and loop control through try ----

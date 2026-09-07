@@ -2730,7 +2730,7 @@ mod file_objects {
     fn stringio_cursor_semantics_match_python() {
         // python3: StringIO("seeded").write("!") OVERWRITES at the
         // cursor: buffer becomes "!eeded", cursor 1, read() -> "eeded".
-        let mut b = io::StringIO_seeded("seeded");
+        let b = io::StringIO_seeded("seeded");
         assert_eq!(b.write("!").unwrap(), 1);
         assert_eq!(b.getvalue().unwrap(), "!eeded");
         assert_eq!(b.read().unwrap(), "eeded");
@@ -2739,7 +2739,7 @@ mod file_objects {
         assert_eq!(b.getvalue().unwrap(), "!eededaprès");
 
         // readline/readlines keep terminators, as Python.
-        let mut two = io::StringIO_seeded("x\ny\nz");
+        let two = io::StringIO_seeded("x\ny\nz");
         assert_eq!(two.readline().unwrap(), "x\n");
         assert_eq!(two.readlines().unwrap(), vec!["y\n", "z"]);
         // Exhausted: empty line, empty list.
@@ -2748,7 +2748,7 @@ mod file_objects {
 
     #[test]
     fn closed_files_raise_pythons_value_error() {
-        let mut b = io::StringIO();
+        let b = io::StringIO();
         b.close().unwrap();
         let e = b.read().unwrap_err();
         assert_eq!(format!("{}", e), "ValueError: I/O operation on closed file.");
@@ -2867,7 +2867,7 @@ mod dict_and_exception_display {
 }
 
 mod cpython_numeric_and_stdlib_fixes {
-    use stdpython::{datetime::date, py_pow, PyInt, PyMul};
+    use stdpython::{datetime::date, math, py_pow, py_str_repr, PyFloat, PyInt, PyMul};
 
     #[test]
     fn float_power_uses_libm_pow_not_repeated_squaring() {
@@ -2876,6 +2876,101 @@ mod cpython_numeric_and_stdlib_fixes {
         assert_eq!(py_pow(0.1f64, 4i64), 0.1f64.powf(4.0));
         assert_eq!(format!("{:?}", py_pow(0.1f64, 4i64)), "0.00010000000000000002");
         assert_eq!(format!("{:?}", py_pow(1.05f64, 10i64)), "1.628894626777442");
+    }
+
+    #[test]
+    fn numeric_strings_follow_pythons_underscore_grammar() {
+        // Round 10 of the review on #339: `int(s)` and `float(s)` accept
+        // single underscores BETWEEN digits only — `_1`, `1_` and `1__2`
+        // are CPython's ValueError, never a number with the underscores
+        // dropped. Every row is python3 3.11's answer (VE = ValueError).
+        let table: &[(&str, Option<i64>, Option<f64>)] = &[
+            ("_1", None, None),
+            ("1_", None, None),
+            ("1__2", None, None),
+            ("1_000", Some(1000), Some(1000.0)),
+            (" 1_0 ", Some(10), Some(10.0)),
+            ("+1_0", Some(10), Some(10.0)),
+            ("-1_0", Some(-10), Some(-10.0)),
+            ("1_0_0", Some(100), Some(100.0)),
+            ("0_1", Some(1), Some(1.0)),
+            ("1 0", None, None),
+            ("", None, None),
+            ("  ", None, None),
+            ("1_0.5", None, Some(10.5)),
+            ("1_.0", None, None),
+            ("1__0.5", None, None),
+            ("1e1_0", None, Some(1e10)),
+            ("1_e10", None, None),
+            ("1.5_", None, None),
+            ("_1.5", None, None),
+            (".5", None, Some(0.5)),
+            (".5_1", None, Some(0.51)),
+            ("5.", None, Some(5.0)),
+            ("5._1", None, None),
+            ("1e_1", None, None),
+            ("in_f", None, None),
+            ("inf", None, Some(f64::INFINITY)),
+            ("-Infinity", None, Some(f64::NEG_INFINITY)),
+            ("1_0e-1_0", None, Some(1e-9)),
+            ("1.", None, Some(1.0)),
+            ("-.5e+2", None, Some(-50.0)),
+            ("1e", None, None),
+            ("e1", None, None),
+            ("0x1_0", None, None),
+            ("1_0j", None, None),
+            // i64::MIN, whose magnitude is not an i64, reads as CPython
+            // reads it (round 11).
+            ("-9223372036854775808", Some(i64::MIN), Some(-9223372036854775808.0)),
+            ("9223372036854775807", Some(i64::MAX), Some(9223372036854775807.0)),
+        ];
+        for (text, int, float) in table {
+            match (text.py_int(), int) {
+                (Ok(v), Some(want)) => assert_eq!(v, *want, "int({:?})", text),
+                (Err(e), None) => assert_eq!(
+                    e.to_string(),
+                    format!("ValueError: invalid literal for int() with base 10: {}", py_str_repr(text)),
+                    "int({:?})",
+                    text
+                ),
+                (got, want) => panic!("int({:?}): got {:?}, python3 gives {:?}", text, got, want),
+            }
+            match (text.py_float(), float) {
+                (Ok(v), Some(want)) => assert_eq!(v, *want, "float({:?})", text),
+                (Err(e), None) => assert_eq!(
+                    e.to_string(),
+                    format!("ValueError: could not convert string to float: {}", py_str_repr(text)),
+                    "float({:?})",
+                    text
+                ),
+                (got, want) => panic!("float({:?}): got {:?}, python3 gives {:?}", text, got, want),
+            }
+        }
+        // python3: float("nan") is nan (both spellings), and the message
+        // quotes the string as Python's repr does.
+        assert!("+nan".py_float().unwrap().is_nan());
+        assert!("NaN".py_float().unwrap().is_nan());
+        // python3: math.copysign(1.0, float("-nan")) == -1.0 — the sign
+        // survives on a nan (round 11); "+nan" and "nan" are positive.
+        assert!("-nan".py_float().unwrap().is_sign_negative());
+        assert!(" -NaN ".py_float().unwrap().is_sign_negative());
+        assert!("+nan".py_float().unwrap().is_sign_positive());
+        assert!("nan".py_float().unwrap().is_sign_positive());
+        assert_eq!(math::copysign(1.0, "-nan".py_float().unwrap()), -1.0);
+        assert_eq!(
+            "it's".py_int().unwrap_err().to_string(),
+            "ValueError: invalid literal for int() with base 10: \"it's\""
+        );
+        // What CPython reads and the runtime's i64 cannot hold is loud,
+        // never a different value: non-ASCII decimal digits (python3:
+        // int("٣") == 3) and an int outside i64.
+        let e = "٣".py_int().unwrap_err();
+        assert_eq!(e.to_string(), "NotImplementedError: int('٣'): non-ASCII digits are not supported yet");
+        let e = "99999999999999999999".py_int().unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "NotImplementedError: int('99999999999999999999'): an int outside i64 are not supported yet"
+        );
     }
 
     #[test]
@@ -3303,7 +3398,7 @@ mod bytesio {
     fn bytesio_cursor_semantics_match_python() {
         // python3: BytesIO(b"seeded").write(b"!") OVERWRITES at the
         // cursor: buffer b'!eeded', write returns 1, read() -> b'eeded'.
-        let mut b = io::BytesIO_seeded(b"seeded");
+        let b = io::BytesIO_seeded(b"seeded");
         assert_eq!(b.write(b"!").unwrap(), 1);
         assert_eq!(b.getvalue().unwrap(), b"!eeded");
         assert_eq!(b.read().unwrap(), b"eeded");
@@ -3315,7 +3410,7 @@ mod bytesio {
     #[test]
     fn closed_bytesio_raises_pythons_value_error() {
         // Verified against python3: ValueError('I/O operation on closed file.')
-        let mut b = io::BytesIO();
+        let b = io::BytesIO();
         b.close().unwrap();
         let e = b.read().unwrap_err();
         assert_eq!(format!("{}", e), "ValueError: I/O operation on closed file.");
@@ -3910,4 +4005,188 @@ fn an_exceptions_repr_is_its_class_and_its_args() {
     assert_eq!(one.py_repr(), "Inner('x')");
     let none = PyException::new("Inner", "");
     assert_eq!(none.py_repr(), "Inner()");
+}
+
+#[test]
+fn file_errors_quote_paths_as_python_does_and_wrong_direction_io_is_unsupported_operation() {
+    // Round 4 of the review on #339: an OSError's filename is Python's
+    // repr (an apostrophe switches to double quotes); a write on a
+    // read-only stream or a read on a write-only one is
+    // io.UnsupportedOperation — an OSError AND a ValueError in CPython's
+    // tree — with CPython's messages (`write`/`read` for a binary file,
+    // `not writable`/`not readable` for a text file); the standard
+    // streams are one shared object each, so closing one alias closes
+    // the other.
+    let err = stdpython::open("/nonexistent/dir/it's.txt", Some("r")).err().expect("missing");
+    assert!(err.matches("FileNotFoundError"), "{:?}", err);
+    assert_eq!(
+        err.message,
+        "[Errno 2] No such file or directory: \"/nonexistent/dir/it's.txt\""
+    );
+    let dir = std::env::temp_dir().join(format!("rython-uo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("x.bin");
+    std::fs::write(&path, b"abc").unwrap();
+    let p = path.to_str().unwrap();
+    let err = stdpython::open_binary(p, "rb").unwrap().write(b"x").err().expect("read-only");
+    assert!(err.matches("UnsupportedOperation") && err.matches("OSError") && err.matches("ValueError"), "{:?}", err);
+    assert_eq!(err.message, "write");
+    let err = stdpython::open_binary(p, "wb").unwrap().read().err().expect("write-only");
+    assert!(err.matches("OSError"), "{:?}", err);
+    assert_eq!(err.message, "read");
+    let err = stdpython::open(p, Some("r")).unwrap().write("x").err().expect("read-only text");
+    assert!(err.matches("UnsupportedOperation"), "{:?}", err);
+    assert_eq!(err.message, "not writable");
+    let err = stdpython::open(p, Some("w")).unwrap().read().err().expect("write-only text");
+    assert_eq!(err.message, "not readable");
+    // A post-open I/O failure is the OSError CPython raises (round 8):
+    // /dev/full accepts the buffered write and fails the flush with
+    // `[Errno 28] No space left on device`, text and binary alike.
+    if std::path::Path::new("/dev/full").exists() {
+        let full = stdpython::open_binary("/dev/full", "wb").unwrap();
+        full.write(b"x").unwrap();
+        let err = full.flush().err().expect("no space");
+        assert!(err.matches("OSError"), "{:?}", err);
+        assert_eq!(err.message, "[Errno 28] No space left on device");
+        let full = stdpython::open("/dev/full", Some("w")).unwrap();
+        full.write("x").unwrap();
+        let err = full.flush().err().expect("no space");
+        assert!(err.matches("OSError"), "{:?}", err);
+        assert_eq!(err.message, "[Errno 28] No space left on device");
+    }
+    // getvalue() on a disk handle is CPython's AttributeError, naming the
+    // receiver's class (round 5).
+    let err = stdpython::open_binary(p, "rb").unwrap().getvalue().err().expect("no getvalue");
+    assert!(err.matches("AttributeError"), "{:?}", err);
+    assert_eq!(err.message, "'_io.BufferedReader' object has no attribute 'getvalue'");
+    let err = stdpython::open_binary(p, "wb").unwrap().getvalue().err().expect("no getvalue");
+    assert_eq!(err.message, "'_io.BufferedWriter' object has no attribute 'getvalue'");
+    let err = stdpython::open(p, Some("r")).unwrap().getvalue().err().expect("no getvalue");
+    assert_eq!(err.message, "'_io.TextIOWrapper' object has no attribute 'getvalue'");
+    std::fs::remove_dir_all(&dir).unwrap();
+    // ONE stdin and ONE stdout object, process-wide (round 5): the text
+    // and the binary handles are aliases of the same stream, and a close
+    // on another thread is seen here — CPython's `sys.stdin`/`sys.stdout`
+    // (whose text wrapper and binary buffer close together).
+    let text_in = stdpython::PyFile::stdin();
+    assert!(!text_in.closed());
+    stdpython::io::PyBytesIO::stdin().close().unwrap();
+    assert!(text_in.closed(), "the binary alias closed the one stdin");
+    assert_eq!(text_in.read().err().expect("closed").message, "I/O operation on closed file.");
+    let a = stdpython::PyFile::stdout();
+    let b = stdpython::io::PyBytesIO::stdout();
+    assert!(!a.closed() && !b.closed());
+    std::thread::spawn(|| stdpython::PyFile::stdout().close().unwrap())
+        .join()
+        .unwrap();
+    assert!(a.closed() && b.closed(), "a close on another thread closes every alias");
+    assert_eq!(b.write(b"x").err().expect("closed").message, "I/O operation on closed file.");
+    // print() sees the same closed stdout; the embedder's reset reopens
+    // both streams for the next program (round 7).
+    assert_eq!(
+        stdpython::print_parts(&["x"], " ", "\n").err().expect("closed stdout").message,
+        "I/O operation on closed file."
+    );
+    stdpython::reopen_standard_streams();
+    assert!(!a.closed() && !b.closed() && !text_in.closed());
+    stdpython::print_parts(&[] as &[&str], "", "").unwrap();
+}
+
+#[test]
+fn invalid_utf8_in_a_text_file_is_cpythons_unicode_decode_error() {
+    // Round 9 of the review on #339: a text-mode read of invalid UTF-8 is
+    // UnicodeDecodeError, never an OSError, with CPython's message — one
+    // byte (`can't decode byte 0xff in position 2: invalid start byte`)
+    // or a run (`bytes in position 0-1: unexpected end of data`). The
+    // reader decodes 8192-byte chunks as TextIOWrapper does, so
+    // readline() on a small file fails on its first call even when the
+    // bad byte sits on a later line, with the same position; the seven
+    // cases are python3 3.11's messages verbatim.
+    let dir = std::env::temp_dir().join(format!("rython-utf8-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bad.txt");
+    let p = path.to_str().unwrap();
+    let cases: &[(&[u8], &str)] = &[
+        (b"\xff", "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"),
+        (b"ab\xffcd", "'utf-8' codec can't decode byte 0xff in position 2: invalid start byte"),
+        (b"\xe2\x82", "'utf-8' codec can't decode bytes in position 0-1: unexpected end of data"),
+        (b"\xe2\x82x", "'utf-8' codec can't decode bytes in position 0-1: invalid continuation byte"),
+        (b"ab\xc0\xafz", "'utf-8' codec can't decode byte 0xc0 in position 2: invalid start byte"),
+        (b"\xed\xa0\x80", "'utf-8' codec can't decode byte 0xed in position 0: invalid continuation byte"),
+        (b"ok\n\xffbad\n", "'utf-8' codec can't decode byte 0xff in position 3: invalid start byte"),
+    ];
+    for (bytes, expected) in cases {
+        std::fs::write(&path, bytes).unwrap();
+        let err = stdpython::open(p, Some("r")).unwrap().read().err().expect("read fails");
+        assert!(err.matches("UnicodeDecodeError") && !err.matches("OSError"), "{:?}", err);
+        assert_eq!(err.message, *expected, "read of {:?}", bytes);
+        let err = stdpython::open(p, Some("r")).unwrap().readline().err().expect("readline fails");
+        assert!(err.matches("UnicodeDecodeError"), "{:?}", err);
+        assert_eq!(err.message, *expected, "readline of {:?}", bytes);
+    }
+    // Valid text still reads line by line, a multi-byte character across
+    // the chunk boundary included.
+    let mut big = "a".repeat(8191).into_bytes();
+    big.extend_from_slice("é\nsecond\n".as_bytes());
+    std::fs::write(&path, &big).unwrap();
+    let f = stdpython::open(p, Some("r")).unwrap();
+    let first = f.readline().unwrap();
+    assert_eq!(first.chars().count(), 8193);
+    assert!(first.ends_with("é\n"));
+    assert_eq!(f.readline().unwrap(), "second\n");
+    assert_eq!(f.readline().unwrap(), "");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn open_binary_validates_the_mode_before_touching_the_path() {
+    // CPython's mode grammar, in its order, before the path is looked
+    // at (Devin review on #339, rounds 1 and 2): a letter outside
+    // `axrwb+t` or a repeated letter is `invalid mode`; `t` with `b` is
+    // "can't have text and binary mode at once" (`rbt` is NOT a valid
+    // Python mode); more than one access letter, or none, are the two
+    // "exactly one of create/read/write/append" errors; an update mode
+    // is rython's own loud refusal. "rb" and "br" are the same read.
+    let missing = "/nonexistent/dir/for/rython/x.bin";
+    for (mode, expected) in [
+        ("rbb", "invalid mode: 'rbb'"),
+        ("bbr", "invalid mode: 'bbr'"),
+        ("rbq", "invalid mode: 'rbq'"),
+        ("rbt", "can't have text and binary mode at once"),
+        ("rwb", "must have exactly one of create/read/write/append mode"),
+        ("b", "Must have exactly one of create/read/write/append mode and at most one plus"),
+        ("rb+", "file mode 'rb+' is not supported yet (update modes)"),
+    ] {
+        let err = stdpython::open_binary(missing, mode).err().expect("refused");
+        assert!(err.matches("ValueError"), "{}: {:?}", mode, err);
+        assert_eq!(err.message, expected, "{}", mode);
+    }
+    for (mode, expected) in [
+        ("rt", "[Errno 2] No such file or directory: '/nonexistent/dir/for/rython/x.bin'"),
+        ("rr", "invalid mode: 'rr'"),
+        ("rw", "must have exactly one of create/read/write/append mode"),
+        ("t", "Must have exactly one of create/read/write/append mode and at most one plus"),
+        ("r+", "file mode 'r+' is not supported yet (update modes)"),
+    ] {
+        let err = stdpython::open(missing, Some(mode)).err().expect("refused");
+        assert_eq!(err.message, expected, "{}", mode);
+    }
+    let dir = std::env::temp_dir().join(format!("rython-open-binary-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("x.bin");
+    std::fs::write(&path, b"abc").unwrap();
+    for mode in ["rb", "br"] {
+        let f = stdpython::open_binary(path.to_str().unwrap(), mode).expect(mode);
+        assert_eq!(f.read().unwrap(), b"abc");
+    }
+    // `x` creates exclusively: FileExistsError the second time.
+    let fresh = dir.join("fresh.bin");
+    let f = stdpython::open_binary(fresh.to_str().unwrap(), "xb").expect("xb creates");
+    f.write(b"new").unwrap();
+    f.close().unwrap();
+    assert_eq!(std::fs::read(&fresh).unwrap(), b"new");
+    let err = stdpython::open_binary(fresh.to_str().unwrap(), "xb").err().expect("exists");
+    assert!(err.matches("FileExistsError"), "{:?}", err);
+    assert!(err.message.starts_with("[Errno 17] File exists: "), "{:?}", err);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

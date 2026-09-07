@@ -19,7 +19,7 @@
     {
       "name": "charset_normalizer",
       "requirement": "charset-normalizer==3.4.1",
-      "note": "Round 66: tuple-literal for-iteration (289 -> 285)."
+      "note": "Round 66: tuple-literal for-iteration (289 -> 285). Issue #332: the dynamic issubclass in utils.py no longer blocks conversion; 121 at that round."
     },
     {
       "name": "requests",

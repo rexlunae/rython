@@ -7,11 +7,11 @@ fn main() {
     println!("=== STD MODE EXAMPLE ===");
     
     // Standard I/O operations available
-    print("Hello from std mode!");
+    print("Hello from std mode!").unwrap();
     
     // File operations available
     match open("example.txt", Some("w")) {
-        Ok(mut file) => {
+        Ok(file) => {
             let _ = file.write("Hello, file system!");
             let _ = file.close();
             println!("File operations work in std mode");

@@ -78,7 +78,7 @@ fn test_nostd_stringio() {
     // The alloc tier's file I/O is the in-memory buffers: StringIO works
     // with no OS. python3: StringIO("seeded").write("!") -> 1, buffer
     // "!eeded", read() -> "eeded".
-    let mut b = stdpython::io::StringIO_seeded("seeded");
+    let b = stdpython::io::StringIO_seeded("seeded");
     assert_eq!(b.write("!").unwrap(), 1);
     assert_eq!(b.getvalue().unwrap(), "seeded".replace("s", "!"));
     assert_eq!(b.read().unwrap(), "eeded");
@@ -89,7 +89,7 @@ fn test_nostd_stringio() {
 #[test]
 fn test_nostd_bytesio() {
     // python3: BytesIO(b"ab").write(b"c") overwrites at the cursor.
-    let mut b = stdpython::io::BytesIO_seeded(b"ab");
+    let b = stdpython::io::BytesIO_seeded(b"ab");
     assert_eq!(b.write(b"c").unwrap(), 1);
     assert_eq!(b.getvalue().unwrap(), b"cb");
     assert_eq!(b.read().unwrap(), b"b");

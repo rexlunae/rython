@@ -157,7 +157,7 @@ fn test_python_io_operations_simulation() {
     // Simulate what compiled Python I/O operations would look like
     
     // Simulate: print("Hello, World!") in Python
-    print("Hello, World!");
+    print("Hello, World!").unwrap();
     
     // In nostd mode, this would be:
     // let output = print_to_string("Hello, World!");
