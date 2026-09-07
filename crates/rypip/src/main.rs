@@ -99,7 +99,9 @@ enum Cmd {
         /// Where to write the generated crate (defaults to a directory under
         /// the system temp dir keyed by the package name and the source
         /// path, reused across runs of that source so rebuilds are
-        /// incremental).
+        /// incremental). An explicit directory is one crate you own, as
+        /// with `convert --out`: two different programs given the same one
+        /// take turns in it and replace each other's sources.
         #[arg(long, short)]
         out: Option<PathBuf>,
         #[arg(long)]
@@ -217,10 +219,7 @@ fn main() -> Result<()> {
                 Some(out) => out,
                 None => rypip::run_work_dir(&package, &pkg.name)?,
             };
-            // Held from source generation through the build, released
-            // before the program runs.
-            let lock = rypip::lock_work_dir(&out)?;
-            let krate = rypip::convert(
+            let status = rypip::run(
                 &pkg,
                 &out,
                 &ConvertOptions {
@@ -233,11 +232,10 @@ fn main() -> Result<()> {
                     rust_for_linux: false,
                     no_deps,
                 },
+                package.as_os_str(),
+                &args,
+                report_warnings,
             )?;
-            report_warnings(&krate);
-            let binary = rypip::cargo_build_executable(&krate)?;
-            drop(lock);
-            let status = rypip::run_program(&binary, package.as_os_str(), &args)?;
             // The program's exit status is ours: the code as is; a signal
             // death as the shell reports it (128 + the signal number).
             let code = status.code().unwrap_or_else(|| {

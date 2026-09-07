@@ -189,3 +189,106 @@ fn rypip_run_keeps_same_named_programs_apart_and_serializes_a_shared_work_dir() 
         let _ = fs::remove_file(dir.with_extension("lock"));
     }
 }
+
+#[test]
+fn rypip_run_shows_the_compilers_diagnostics_when_the_generated_crate_fails() {
+    // The build runs with `--message-format=json-render-diagnostics`, so
+    // cargo renders rustc's diagnostics to stderr itself while the artifact
+    // messages go to stdout: a program the converter accepts but rustc
+    // rejects (`f.closed`, an attribute spelling the runtime keeps loud as
+    // E0615) fails with the real diagnostic visible (Devin review on #340,
+    // round 2).
+    let scratch = Scratch::new("runbad");
+    let file = scratch.path().join("bad.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> None:\n",
+            "    with open(\"x.txt\", \"w\") as f:\n",
+            "        f.write(\"hi\")\n",
+            "        print(f.closed)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rypip"))
+        .arg("run")
+        .arg("bad.py")
+        .arg("--no-deps")
+        .arg("--out")
+        .arg(scratch.path().join("crate"))
+        .current_dir(scratch.path())
+        .env_remove("RUSTFLAGS")
+        .output()
+        .expect("running rypip");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error[E0615]"), "stderr: {}", stderr);
+    assert!(stderr.contains("cargo build failed"), "stderr: {}", stderr);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "", "no JSON leaks to stdout");
+}
+
+#[cfg(unix)]
+#[test]
+fn argparse_reads_the_same_argv_authority_as_sys_argv() {
+    // argparse's `parse_args()` reads sys.argv[1:] through the runtime's
+    // one process-argument authority, so a non-UTF-8 argument is the same
+    // loud exit as `sys.argv` gives, never a panic (Devin review on #340,
+    // round 2); a valid run prints the parsed value.
+    use std::os::unix::ffi::OsStrExt;
+    let scratch = Scratch::new("runargparse");
+    let file = scratch.path().join("cli.py");
+    fs::write(
+        &file,
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    parser = argparse.ArgumentParser(prog=\"cli\")\n",
+            "    parser.add_argument(\"name\")\n",
+            "    args = parser.parse_args()\n",
+            "    print(\"hello\", args.name)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let output = Command::new(env!("CARGO_BIN_EXE_rypip"))
+        .arg("run")
+        .arg("cli.py")
+        .arg("--no-deps")
+        .arg("--out")
+        .arg(&out)
+        .arg("--")
+        .arg("world")
+        .current_dir(scratch.path())
+        .env_remove("RUSTFLAGS")
+        .output()
+        .expect("running rypip");
+    // Verified against python3.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello world\n", "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.status.code(), Some(0));
+    let output = Command::new(env!("CARGO_BIN_EXE_rypip"))
+        .arg("run")
+        .arg("cli.py")
+        .arg("--no-deps")
+        .arg("--out")
+        .arg(&out)
+        .arg("--")
+        .arg(std::ffi::OsStr::from_bytes(b"w\xf6rld"))
+        .current_dir(scratch.path())
+        .env_remove("RUSTFLAGS")
+        .output()
+        .expect("running rypip");
+    assert_eq!(output.status.code(), Some(1), "stdout: {}", String::from_utf8_lossy(&output.stdout));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("rython: sys.argv[1] is not valid UTF-8"), "stderr: {}", stderr);
+    assert!(!stderr.contains("panicked"), "stderr: {}", stderr);
+}

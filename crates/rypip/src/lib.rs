@@ -52,7 +52,10 @@ fn require_binary(krate: &ConvertedCrate, verb: &str) -> Result<()> {
 /// given: under the system temp dir, keyed by the package name AND a hash
 /// of the canonical source path, so two programs that discover the same
 /// name never share a crate (Devin review on #340), while repeated runs
-/// of one source reuse theirs and rebuild incrementally.
+/// of one source reuse theirs and rebuild incrementally. An explicit
+/// `--out` is one crate directory the user owns, as with `rypip convert
+/// --out`: two different programs given the same one take turns in it
+/// (the lock) and each conversion replaces the other's sources.
 pub fn run_work_dir(package: &Path, name: &str) -> Result<PathBuf> {
     use sha2::{Digest, Sha256};
     let canonical = package
@@ -162,12 +165,25 @@ pub fn run_program(binary: &Path, program: &OsStr, args: &[OsString]) -> Result<
         .with_context(|| format!("running {}", binary.display()))
 }
 
-/// `rypip run` in one call: build, then execute (issue #166: CPython's
-/// command-line shape over the convert/build pipeline, with no new
-/// semantics). The CLI splits the two so its work-dir lock is released
-/// before the program runs.
-pub fn cargo_run(krate: &ConvertedCrate, program: &OsStr, args: &[OsString]) -> Result<ExitStatus> {
-    let binary = cargo_build_executable(krate)?;
+/// `rypip run` in one call (issue #166: CPython's command-line shape over
+/// the convert/build pipeline, with no new semantics): take the work
+/// dir's lock, convert, hand the crate to `on_converted` (the CLI reports
+/// its warnings there), build, release the lock, then execute with
+/// `program` as `sys.argv[0]` and `args`. The one workflow the CLI and a
+/// library caller share (Devin review on #340, round 2).
+pub fn run(
+    pkg: &PyPackage,
+    out: &Path,
+    options: &ConvertOptions,
+    program: &OsStr,
+    args: &[OsString],
+    on_converted: impl FnOnce(&ConvertedCrate),
+) -> Result<ExitStatus> {
+    let lock = lock_work_dir(out)?;
+    let krate = convert(pkg, out, options)?;
+    on_converted(&krate);
+    let binary = cargo_build_executable(&krate)?;
+    drop(lock);
     run_program(&binary, program, args)
 }
 
