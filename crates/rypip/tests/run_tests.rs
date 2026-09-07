@@ -370,3 +370,157 @@ fn argparse_reads_the_same_argv_authority_as_sys_argv() {
     assert!(stderr.contains("rython: sys.argv[1] is not valid UTF-8"), "stderr: {}", stderr);
     assert!(!stderr.contains("panicked"), "stderr: {}", stderr);
 }
+
+#[test]
+fn rypip_run_refuses_an_output_that_is_not_its_own() {
+    // Round 4 of the review on #340: `run` regenerates its work dir's
+    // `src/` from scratch, so `--out` must be its own directory. A
+    // src-layout project run as `rypip run . --out .` would have erased its
+    // own sources: refused loudly, sources intact; so is an output that
+    // CONTAINS the project, and a non-empty directory that is not a crate
+    // rypip generated. A separate directory works (python3 prints `proj`).
+    let scratch = Scratch::new("runown");
+    let proj = scratch.path().join("proj");
+    let pkg = proj.join("src").join("proj");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(proj.join("pyproject.toml"), "[project]\nname = \"proj\"\nversion = \"0.1.0\"\n").unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(pkg.join("__main__.py"), "print(\"proj\")\n").unwrap();
+    let run = |package: &str, out: &std::path::Path, cwd: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_rypip"))
+            .arg("run")
+            .arg(package)
+            .arg("--no-deps")
+            .arg("--out")
+            .arg(out)
+            .current_dir(cwd)
+            .env_remove("RUSTFLAGS")
+            .output()
+            .expect("running rypip")
+    };
+    // `rypip run . --out .` inside the project.
+    let output = run(".", std::path::Path::new("."), &proj);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("holds the program's sources"), "stderr: {}", stderr);
+    assert!(pkg.join("__main__.py").is_file(), "the sources survive");
+    // An output directory that contains the project.
+    let output = run("proj", std::path::Path::new("."), scratch.path());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("holds the program's sources"), "stderr: {}", stderr);
+    assert!(pkg.join("__main__.py").is_file());
+    // A non-empty directory that is not a crate rypip generated.
+    let stray = scratch.path().join("stray");
+    fs::create_dir_all(stray.join("src")).unwrap();
+    fs::write(stray.join("src").join("notes.txt"), "mine").unwrap();
+    let output = run("proj", &stray, scratch.path());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not a crate rypip generated"), "stderr: {}", stderr);
+    assert_eq!(fs::read_to_string(stray.join("src").join("notes.txt")).unwrap(), "mine");
+    // A separate directory: the src-layout project runs.
+    let output = run("proj", &scratch.path().join("crate"), scratch.path());
+    // Verified against python3.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "proj\n", "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[cfg(unix)]
+#[test]
+fn the_lock_follows_the_physical_output_directory() {
+    // Round 4 of the review on #340: the lock's identity is the output's
+    // PHYSICAL path (the canonical nearest existing ancestor plus the
+    // components still to be created), so a symlinked alias of the same
+    // directory takes the same lock, before and after the directory exists;
+    // and two runs through the two spellings serialize on it.
+    let scratch = Scratch::new("runalias");
+    let real = scratch.path().join("real");
+    fs::create_dir_all(&real).unwrap();
+    let alias = scratch.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let out_real = real.join("out");
+    let out_alias = alias.join("out");
+    let lock_real = rypip::work_dir_lock_path(&out_real).unwrap();
+    let lock_alias = rypip::work_dir_lock_path(&out_alias).unwrap();
+    assert_eq!(lock_real, lock_alias, "before the directory exists");
+    assert!(lock_real.to_string_lossy().ends_with("/real/out.lock"), "{}", lock_real.display());
+    fs::create_dir_all(&out_real).unwrap();
+    assert_eq!(rypip::work_dir_lock_path(&out_real).unwrap(), rypip::work_dir_lock_path(&out_alias).unwrap());
+
+    fs::write(
+        scratch.path().join("hello.py"),
+        concat!(
+            "def main() -> None:\n",
+            "    print(\"alias\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let spawn = |out: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_rypip"))
+            .arg("run")
+            .arg("hello.py")
+            .arg("--no-deps")
+            .arg("--out")
+            .arg(out)
+            .current_dir(scratch.path())
+            .env_remove("RUSTFLAGS")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawning rypip")
+    };
+    let (a, b) = (spawn(&out_real), spawn(&out_alias));
+    let (oa, ob) = (a.wait_with_output().unwrap(), b.wait_with_output().unwrap());
+    // Verified against python3.
+    assert_eq!(String::from_utf8_lossy(&oa.stdout), "alias\n", "stderr: {}", String::from_utf8_lossy(&oa.stderr));
+    assert_eq!(String::from_utf8_lossy(&ob.stdout), "alias\n", "stderr: {}", String::from_utf8_lossy(&ob.stderr));
+}
+
+#[cfg(unix)]
+#[test]
+fn argparse_with_an_explicit_list_never_reads_the_process_arguments() {
+    // Round 4 of the review on #340: `parse_args([...])` with the default
+    // prog needs argv[0] only, read through `sys.argv_at(0)`, so a
+    // non-UTF-8 process argument the program never reads does not abort
+    // it — python3 prints `hello world` (verified) and so does this.
+    use std::os::unix::ffi::OsStrExt;
+    let scratch = Scratch::new("runexplicit");
+    fs::write(
+        scratch.path().join("cli.py"),
+        concat!(
+            "import argparse\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    parser = argparse.ArgumentParser()\n",
+            "    parser.add_argument(\"name\")\n",
+            "    args = parser.parse_args([\"world\"])\n",
+            "    print(\"hello\", args.name)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rypip"))
+        .arg("run")
+        .arg("cli.py")
+        .arg("--no-deps")
+        .arg("--out")
+        .arg(scratch.path().join("crate"))
+        .arg("--")
+        .arg(std::ffi::OsStr::from_bytes(b"\xff"))
+        .current_dir(scratch.path())
+        .env_remove("RUSTFLAGS")
+        .output()
+        .expect("running rypip");
+    // Verified against python3.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello world\n", "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.status.code(), Some(0));
+}

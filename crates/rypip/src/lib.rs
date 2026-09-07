@@ -84,16 +84,52 @@ impl Drop for WorkDirLock {
     }
 }
 
+/// The physical spelling of a path — the canonical path of its nearest
+/// existing ancestor plus the components not yet created — so two
+/// spellings of one directory (a symlinked parent, `./x`, `a/../x`) name
+/// the same thing (Devin review on #340, round 4).
+fn physical_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut existing = absolute.clone();
+    let mut pending: Vec<OsString> = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name().map(|n| n.to_os_string()) else {
+            break;
+        };
+        pending.push(name);
+        if !existing.pop() {
+            break;
+        }
+    }
+    let mut physical = existing
+        .canonicalize()
+        .with_context(|| format!("resolving {}", existing.display()))?;
+    for name in pending.iter().rev() {
+        physical.push(name);
+    }
+    Ok(physical)
+}
+
+/// The lock file guarding a work dir: the dir's PHYSICAL path with
+/// `.lock` appended — appended, never substituted, so `--out foo.lock`
+/// locks `foo.lock.lock` and `foo.bar` never shares a lock with a sibling
+/// `foo.lock` (Devin review on #340, rounds 3 and 4); physical, so a
+/// symlinked alias of the directory takes the same lock.
+pub fn work_dir_lock_path(dir: &Path) -> Result<PathBuf> {
+    let mut lock_name = physical_path(dir)?.into_os_string();
+    lock_name.push(".lock");
+    Ok(PathBuf::from(lock_name))
+}
+
 pub fn lock_work_dir(dir: &Path) -> Result<WorkDirLock> {
-    if let Some(parent) = dir.parent() {
+    let path = work_dir_lock_path(dir)?;
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Appended, never substituted: `--out foo.lock` locks `foo.lock.lock`,
-    // and `foo.bar` never shares a lock with a sibling `foo.lock` (Devin
-    // review on #340, round 3).
-    let mut lock_name = dir.as_os_str().to_os_string();
-    lock_name.push(".lock");
-    let path = PathBuf::from(lock_name);
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -217,6 +253,55 @@ pub fn stage_executable(work_dir: &Path, executable: &Path) -> Result<StagedExec
     Ok(StagedExecutable { path })
 }
 
+/// `run` regenerates its work dir's `src/` from scratch, so the work dir
+/// must be its own: never a directory holding the program's sources
+/// (`rypip run . --out .` in a src-layout project would erase them), never
+/// one whose `src/` holds a discovered module, and never a non-empty
+/// directory that is not a crate rypip generated (its manifest starts
+/// with [`convert::GENERATED_MANIFEST_HEADER`]). Refused loudly, naming a
+/// separate directory as the fix (Devin review on #340, round 4).
+fn refuse_foreign_output(pkg: &PyPackage, out: &Path) -> Result<()> {
+    let physical = |p: &Path| physical_path(p).unwrap_or_else(|_| p.to_path_buf());
+    let out_physical = physical(out);
+    let root = physical(&pkg.root);
+    if root.starts_with(&out_physical) {
+        bail!(
+            "rypip run regenerates `{}`'s src/ from scratch, but that directory holds the \
+             program's sources ({}); give --out a separate directory",
+            out.display(),
+            pkg.root.display()
+        );
+    }
+    let out_src = out_physical.join("src");
+    for module in &pkg.modules {
+        if physical(&module.file).starts_with(&out_src) {
+            bail!(
+                "rypip run regenerates `{}`'s src/ from scratch, but it holds the program's \
+                 module {}; give --out a separate directory",
+                out.display(),
+                module.file.display()
+            );
+        }
+    }
+    let occupied = out.is_dir() && out.read_dir()?.next().is_some();
+    if occupied {
+        let manifest = out.join("Cargo.toml");
+        let generated = std::fs::read_to_string(&manifest)
+            .map(|text| text.starts_with(convert::GENERATED_MANIFEST_HEADER))
+            .unwrap_or(false);
+        if !generated {
+            bail!(
+                "rypip run regenerates `{}` from scratch, but it is not empty and not a crate \
+                 rypip generated (no {} starting with `{}`); give --out a fresh directory",
+                out.display(),
+                manifest.display(),
+                convert::GENERATED_MANIFEST_HEADER
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `rypip run` in one call (issue #166: CPython's command-line shape over
 /// the convert/build pipeline, with no new semantics): take the work
 /// dir's lock, regenerate the crate's sources from scratch (`src/` is
@@ -236,6 +321,7 @@ pub fn run(
     on_converted: impl FnOnce(&ConvertedCrate),
 ) -> Result<ExitStatus> {
     let lock = lock_work_dir(out)?;
+    refuse_foreign_output(pkg, out)?;
     let src = out.join("src");
     if src.exists() {
         std::fs::remove_dir_all(&src).with_context(|| format!("clearing {}", src.display()))?;

@@ -226,10 +226,11 @@ fn prog_name(explicit: Option<&str>) -> String {
     match explicit {
         Some(p) => p.to_string(),
         // `os.path.basename(sys.argv[0])`, from the one process-argument
-        // authority (a non-UTF-8 argument is its loud exit, never a panic
-        // here; Devin review on #340).
-        None => crate::stdlib::sys::argv
-            .first()
+        // authority — argv[0] alone, so an explicit `parse_args(list)` never
+        // reads the process arguments it does not use (a non-UTF-8 one is
+        // the authority's loud exit, never a panic here; Devin review on
+        // #340, rounds 2 and 4).
+        None => crate::stdlib::sys::argv_at(0)
             .and_then(|p| p.rsplit('/').next().map(str::to_string))
             .unwrap_or_else(|| "prog".to_string()),
     }
