@@ -1,7 +1,7 @@
 {
- "rypip_commit": "c819579",
+ "rypip_commit": "45caa11",
  "rypip_path": "target/debug/rypip",
- "elapsed_seconds": 596.6,
+ "elapsed_seconds": 565.9,
  "packages": {
   "urllib3": {
    "total": 705,
