@@ -75,12 +75,112 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Module {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         // RawModule's extraction already produces precise per-statement
         // errors; don't re-wrap them here.
-        let raw_module = ob.extract()?;
+        let mut raw_module: RawModule = ob.extract()?;
+        normalize_typing_aliases(&mut raw_module.body);
 
         Ok(Self {
             raw: raw_module,
             ..Default::default()
         })
+    }
+}
+
+/// `import typing as t` / `import typing_extensions as te`: every
+/// annotation whose root is such an alias is rewritten to the `typing`
+/// spelling ONCE, when the module is built, so the annotation readers
+/// (`is_typing` and its callers) see one spelling and never an alias
+/// (Devin review on #342, round 9). Parameter annotations, return
+/// annotations and annotated names are rewritten, through nested
+/// functions, classes and blocks.
+pub(crate) fn normalize_typing_aliases(body: &mut Vec<Statement>) {
+    let mut aliases: Vec<String> = Vec::new();
+    for stmt in body.iter() {
+        if let StatementType::Import(imp) = &stmt.statement {
+            for alias in &imp.names {
+                let module = alias.name.split('.').next().unwrap_or(&alias.name);
+                if matches!(
+                    crate::AnnotationModule::from_name(module),
+                    Some(crate::AnnotationModule::Typing)
+                        | Some(crate::AnnotationModule::TypingExtensions)
+                ) && let Some(asname) = &alias.asname
+                    && asname != "typing"
+                {
+                    aliases.push(asname.clone());
+                }
+            }
+        }
+    }
+    if aliases.is_empty() {
+        return;
+    }
+    rewrite_typing_aliases_in(body, &aliases);
+}
+
+fn rewrite_typing_alias_roots(ann: &mut ExprType, aliases: &[String]) {
+    crate::ast::tree::visit::walk_expr_mut(ann, &mut |e| {
+        if let ExprType::Attribute(a) = e
+            && let ExprType::Name(n) = a.value.as_mut()
+            && aliases.iter().any(|alias| alias == &n.id)
+        {
+            n.id = "typing".to_string();
+        }
+    });
+}
+
+fn rewrite_typing_aliases_in(body: &mut Vec<Statement>, aliases: &[String]) {
+    for stmt in body.iter_mut() {
+        match &mut stmt.statement {
+            StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
+                for p in f
+                    .args
+                    .posonlyargs
+                    .iter_mut()
+                    .chain(f.args.args.iter_mut())
+                    .chain(f.args.kwonlyargs.iter_mut())
+                    .chain(f.args.vararg.iter_mut())
+                    .chain(f.args.kwarg.iter_mut())
+                {
+                    if let Some(ann) = p.annotation.as_mut() {
+                        rewrite_typing_alias_roots(ann, aliases);
+                    }
+                }
+                if let Some(ret) = f.returns.as_mut() {
+                    rewrite_typing_alias_roots(ret, aliases);
+                }
+                rewrite_typing_aliases_in(&mut f.body, aliases);
+            }
+            StatementType::ClassDef(c) => rewrite_typing_aliases_in(&mut c.body, aliases),
+            StatementType::If(i) => {
+                rewrite_typing_aliases_in(&mut i.body, aliases);
+                rewrite_typing_aliases_in(&mut i.orelse, aliases);
+            }
+            StatementType::For(f) => {
+                rewrite_typing_aliases_in(&mut f.body, aliases);
+                rewrite_typing_aliases_in(&mut f.orelse, aliases);
+            }
+            StatementType::AsyncFor(f) => {
+                rewrite_typing_aliases_in(&mut f.body, aliases);
+                rewrite_typing_aliases_in(&mut f.orelse, aliases);
+            }
+            StatementType::While(w) => {
+                rewrite_typing_aliases_in(&mut w.body, aliases);
+                rewrite_typing_aliases_in(&mut w.orelse, aliases);
+            }
+            StatementType::With(w) => rewrite_typing_aliases_in(&mut w.body, aliases),
+            StatementType::AsyncWith(w) => rewrite_typing_aliases_in(&mut w.body, aliases),
+            StatementType::Try(t) => {
+                rewrite_typing_aliases_in(&mut t.body, aliases);
+                for h in t.handlers.iter_mut() {
+                    rewrite_typing_aliases_in(&mut h.body, aliases);
+                }
+                rewrite_typing_aliases_in(&mut t.orelse, aliases);
+                rewrite_typing_aliases_in(&mut t.finalbody, aliases);
+            }
+            StatementType::AnnotatedName { annotation, .. } => {
+                rewrite_typing_alias_roots(annotation, aliases);
+            }
+            _ => {}
+        }
     }
 }
 

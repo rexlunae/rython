@@ -22321,3 +22321,40 @@ fn a_module_qualified_exception_member_takes_the_exception_rule() {
     assert!(out.contains("handle (err : PyException)"), "{}", out);
     assert!(!out.contains("plain (x : PyException)"), "a non-exception qualified member: {}", out);
 }
+
+#[test]
+fn aliased_and_typing_extensions_qualified_annotations_lower_like_typing() {
+    // Devin review on #342, round 9: `import typing as t` (the alias
+    // root rewritten to `typing` when the module is built),
+    // `typing_extensions.Optional[int]` (the same names), and an aliased
+    // typing_extensions import all lower exactly like `Optional[int]`.
+    let plain = compile(
+        "from typing import Optional\n\
+         \n\
+         def f(x: Optional[int]) -> int:\n\
+         \x20   if x is None:\n\
+         \x20       return 0\n\
+         \x20   return x\n",
+        "plain_opt.py",
+    );
+    let body_of = |out: &str| out[out.find("pub fn f").expect("fn f")..].to_string();
+    for (name, src) in [
+        (
+            "typing as t",
+            "import typing as t\n\ndef f(x: t.Optional[int]) -> int:\n    if x is None:\n        return 0\n    return x\n",
+        ),
+        (
+            "typing_extensions",
+            "import typing_extensions\n\ndef f(x: typing_extensions.Optional[int]) -> int:\n    if x is None:\n        return 0\n    return x\n",
+        ),
+        (
+            "typing_extensions as te",
+            "import typing_extensions as te\n\ndef f(x: te.Optional[int]) -> int:\n    if x is None:\n        return 0\n    return x\n",
+        ),
+    ] {
+        let out = compile(src, "aliased_opt.py");
+        assert!(out.contains("x : Option < i64 >"), "{name}: {}", out);
+        assert_eq!(body_of(&out), body_of(&plain), "{name} lowers like the plain spelling");
+        assert!(!out.contains("crate :: typing"), "{name}: {}", out);
+    }
+}

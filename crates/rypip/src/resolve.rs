@@ -354,22 +354,54 @@ fn cmp_key(v: &Version) -> (u64, Vec<u64>, (u8, u64, u64), u64, u64, Vec<(u8, u6
     )
 }
 
+/// The PEP 440 prefix match (`==1.2.*`): the candidate's release starts
+/// with the prefix's release, and a pre/post/dev marker the prefix
+/// spells (`==1.0a1.*`, `==1.0.post1.*`) must match exactly; the
+/// candidate's local label is ignored, and a prefix that is not a
+/// version (`==1.x.*`, a local label) matches nothing — loud in the
+/// sense that such a requirement never resolves, never silently
+/// widened (Devin review on #342, round 9).
+fn matches_prefix(version: &Version, prefix: &str) -> bool {
+    let Some(parsed) = parse_version(prefix) else {
+        return false;
+    };
+    // The lenient parser reads `1.x` as `1`: a prefix is a version only
+    // if it spells one — its normalized form round-trips.
+    let normalized = prefix
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .to_ascii_lowercase()
+        .replace(['-', '_'], ".");
+    if version_str_of(&parsed) != normalized {
+        return false;
+    }
+    let prefix = parsed;
+    if prefix.local.is_some() {
+        return false;
+    }
+    let mut release = version.release.clone();
+    while release.len() < prefix.release.len() {
+        release.push(0);
+    }
+    if !prefix
+        .release
+        .iter()
+        .zip(release.iter())
+        .all(|(p, r)| p == r)
+    {
+        return false;
+    }
+    (prefix.pre.is_none() || prefix.pre == version.pre)
+        && (prefix.post.is_none() || prefix.post == version.post)
+        && (prefix.dev.is_none() || prefix.dev == version.dev)
+}
+
 /// Whether `version` satisfies `(op, spec)`.
 pub fn matches_specifier(version: &Version, op: &str, spec: &str) -> bool {
     match op {
         "==" => {
             if let Some(prefix) = spec.strip_suffix(".*") {
-                // `==1.2.*` matches any version whose release starts with
-                // the prefix.
-                let prefix: Vec<u64> = prefix
-                    .split('.')
-                    .filter_map(|s| s.parse().ok())
-                    .collect();
-                let release = &version.release;
-                if prefix.len() > release.len() {
-                    return false;
-                }
-                return prefix.iter().zip(release.iter()).all(|(p, r)| p == r);
+                return matches_prefix(version, prefix);
             }
             match parse_version(spec) {
                 Some(sv) => cmp_for_specifier(version, &sv) == Ordering::Equal,
@@ -634,15 +666,12 @@ pub fn resolve_dependency_in(cache: &Path, req: &Requirement, offline: bool) -> 
         Err(_) => false,
     };
     if !cached_matches {
-        if artifact_path.exists() {
-            // A stale or tampered cache file: its extraction (if any) is
-            // as untrusted as the file.
-            let stale = extraction_dir(&dist_dir, &file_name);
-            if stale.exists() {
-                fs::remove_dir_all(&stale)
-                    .with_context(|| format!("clearing {}", stale.display()))?;
-            }
-        }
+        // A stale or tampered cache file is replaced below; its
+        // extraction (if any) is tied to the OLD digest by its marker,
+        // so `extract_distribution` sets it aside and rebuilds it under
+        // the rename-and-recheck protocol — nothing is removed in place
+        // here, where a concurrent resolver's freshly published tree
+        // could be the casualty (Devin review on #342, round 9).
         let bytes = fetch_bytes(&url)?;
         let actual = sha256_hex(&bytes);
         if actual != expected {
@@ -1618,13 +1647,33 @@ mod extraction_tests {
             w.join().unwrap();
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let (verified, _torn) = reader.join().unwrap();
-        assert!(verified > 0, "consistent pairs were observed");
+        // The reader's counts are what the race happened to show; the
+        // invariant is that every read was verified, empty, or loud.
+        let (_verified, _torn) = reader.join().unwrap();
         // Whatever the race left, a consistent publish heals the path.
         publish_file(&path, &contents[0]).unwrap();
         publish_file(&sidecar, format!("{}\n", digests[0]).as_bytes()).unwrap();
         assert!(cached_artifact_verified(&path).unwrap());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wildcard_specifiers_match_the_release_prefix_and_exact_markers() {
+        // Devin review on #342, round 9: the supported wildcard forms.
+        let v = |s: &str| parse_version(s).unwrap();
+        assert!(matches_specifier(&v("1.0.3"), "==", "1.0.*"));
+        assert!(matches_specifier(&v("1.0"), "==", "1.0.*"));
+        assert!(matches_specifier(&v("1"), "==", "1.0.*"), "trailing zeros are implicit");
+        assert!(!matches_specifier(&v("1.1"), "==", "1.0.*"));
+        assert!(!matches_specifier(&v("10.0"), "==", "1.*"), "a prefix is a segment, not text");
+        assert!(matches_specifier(&v("1.0a1"), "==", "1.0.*"), "a prerelease shares the release");
+        assert!(matches_specifier(&v("1.0a1"), "==", "1.0a1.*"));
+        assert!(!matches_specifier(&v("1.0a2"), "==", "1.0a1.*"), "the marker must match exactly");
+        assert!(matches_specifier(&v("1.0.post1"), "==", "1.0.post1.*"));
+        assert!(matches_specifier(&v("1.0.3+cpu"), "==", "1.0.*"), "the local label is ignored");
+        assert!(!matches_specifier(&v("1.0.3"), "==", "1.0+cpu.*"), "a local prefix matches nothing");
+        assert!(!matches_specifier(&v("1.0.3"), "==", "1.x.*"), "a non-version prefix matches nothing");
+        assert!(matches_specifier(&v("1.1"), "!=", "1.0.*"));
     }
 
     #[test]

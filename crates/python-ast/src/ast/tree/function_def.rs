@@ -2778,7 +2778,7 @@ impl FunctionDef {
             match param {
                 Some(p) => {
                     options.pyvalue_into_params.contains(n)
-                        || p.annotation.as_deref().is_some_and(|ann| {
+                        || p.evaluated_annotation().as_ref().is_some_and(|ann| {
                             matches!(
                                 crate::resolve_alias_typeinfo(ann, &symbols, &options)
                                     .or_else(|| crate::annotation_type_info(ann)),
