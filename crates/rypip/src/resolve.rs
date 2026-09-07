@@ -870,15 +870,19 @@ enum Cached {
 /// unpinned requirement resolves the same version from the cache in any
 /// directory order); an artifact is extracted now. An extraction without
 /// its completion marker and an artifact without its recorded digest are
-/// not candidates; an artifact whose digest no longer matches is skipped
-/// — a loud error only when no valid candidate remains.
+/// not candidates; an artifact whose digest no longer matches is the loud
+/// error when the ranking would have chosen it, and is skipped when a
+/// candidate it would not have outranked resolves.
 fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDependency>> {
     let mut candidates: Vec<(Version, Cached)> = Vec::new();
     // A candidate whose artifact no longer hashes to its sidecar is
-    // CORRUPT: it is skipped so a valid alternative still resolves, and
-    // its error surfaces only when nothing valid remains (Devin review
-    // on #342, round 10) — loud where it blocks, silent where it does not.
-    let mut corrupt: Vec<anyhow::Error> = Vec::new();
+    // CORRUPT. Correct-or-loud (Devin review on #342, rounds 10 and 11):
+    // a corrupt candidate that would have OUTRANKED the chosen one (a
+    // newer version, a wheel over the chosen sdist) is the loud error —
+    // resolving to something else would be a silent downgrade — while a
+    // corrupt candidate the ranking would not have chosen anyway does
+    // not block the valid choice.
+    let mut corrupt: Vec<(Version, u8, anyhow::Error)> = Vec::new();
     if let Ok(entries) = fs::read_dir(dist_dir.join("extracted")) {
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
@@ -908,7 +912,8 @@ fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDep
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
-                    corrupt.push(e);
+                    let wheel = artifact_name.ends_with(".whl");
+                    corrupt.push((version, (wheel as u8) * 2 + 1, e));
                     continue;
                 }
             }
@@ -939,7 +944,8 @@ fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDep
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
-                    corrupt.push(e);
+                    let wheel = path.extension().is_some_and(|e| e == "whl");
+                    corrupt.push((version, (wheel as u8) * 2, e));
                     continue;
                 }
             }
@@ -964,11 +970,22 @@ fn cached_match(dist_dir: &Path, req: &Requirement) -> Result<Option<ResolvedDep
         })
     });
     let Some((version, cached)) = candidates.pop() else {
-        if let Some(e) = corrupt.into_iter().next() {
+        if let Some((_, _, e)) = corrupt.into_iter().next() {
             return Err(e);
         }
         return Ok(None);
     };
+    let chosen_rank = match &cached {
+        Cached::Extracted { wheel, .. } => (*wheel as u8) * 2 + 1,
+        Cached::Artifact(p) => (p.extension().is_some_and(|e| e == "whl") as u8) * 2,
+    };
+    if let Some((_, _, e)) = corrupt.into_iter().find(|(cv, rank, _)| {
+        version_cmp(cv, &version)
+            .then_with(|| rank.cmp(&chosen_rank))
+            == Ordering::Greater
+    }) {
+        return Err(e);
+    }
     let root = match cached {
         Cached::Extracted { root, .. } => root,
         Cached::Artifact(path) => extract_distribution(&path, dist_dir, &req.name)?,

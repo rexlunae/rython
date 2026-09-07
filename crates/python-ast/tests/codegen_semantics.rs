@@ -22388,3 +22388,45 @@ fn typing_aliases_reach_type_checking_imports_annotated_assignments_and_respect_
     assert!(out.contains("pub fn shadow"), "the shadowing scope converts: {}", out);
     assert!(!out.contains("crate :: typing"), "{}", out);
 }
+
+#[test]
+fn typing_aliases_are_scoped_and_source_ordered() {
+    // Devin review on #342, round 11: an alias imported only inside a
+    // nested function does not reach an outer annotation; in one scope an
+    // annotation before a rebinding sees the alias and one after does
+    // not; a conditional import declares the alias from its point on.
+    let out = compile(
+        "import typing as t\n\
+         \n\
+         def before(x: t.Optional[int]) -> int:\n\
+         \x20   return 0 if x is None else x\n\
+         \n\
+         t = 3\n\
+         \n\
+         def after(x: t) -> int:\n\
+         \x20   return 0\n\
+         \n\
+         def inner_only() -> int:\n\
+         \x20   import typing as u\n\
+         \x20   y: u.Optional[int] = None\n\
+         \x20   return 0 if y is None else y\n\
+         \n\
+         def outer(x: u) -> int:\n\
+         \x20   return 0\n\
+         \n\
+         if True:\n\
+         \x20   import typing as w\n\
+         \n\
+         def later(x: w.Optional[int]) -> int:\n\
+         \x20   return 0 if x is None else x\n",
+        "scoped_alias.py",
+    );
+    let sig = |name: &str| {
+        let i = out.find(&format!("pub fn {name} (")).unwrap_or_else(|| panic!("{name}: {out}"));
+        out[i..i + 80].to_string()
+    };
+    assert!(sig("before").contains("x : Option < i64 >"), "{}", sig("before"));
+    assert!(!sig("after").contains("Option"), "a rebinding ends the alias: {}", sig("after"));
+    assert!(!sig("outer").contains("Option"), "a nested-only alias stays nested: {}", sig("outer"));
+    assert!(sig("later").contains("x : Option < i64 >"), "a conditional import declares: {}", sig("later"));
+}

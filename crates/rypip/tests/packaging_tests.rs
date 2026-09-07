@@ -692,31 +692,54 @@ fn cached_local_versions_keep_their_label_and_match_their_public_version() {
 }
 
 #[test]
-fn a_corrupt_cached_candidate_does_not_block_a_valid_one() {
-    // A cached artifact whose bytes no longer hash to its sidecar is
-    // skipped when another candidate satisfies the requirement, and
-    // is the loud error when it is the only one (Devin review on #342,
-    // round 10).
-    let scratch = Scratch::new("cache-corrupt-fallback");
+fn a_corrupt_cached_candidate_is_loud_when_it_would_have_won_and_skipped_otherwise() {
+    // Correct-or-loud (Devin review on #342, rounds 10 and 11): a corrupt
+    // candidate the ranking would have chosen (the newer version) is the
+    // loud error — never a silent downgrade — while a corrupt candidate
+    // it would not have chosen (the older version) does not block.
+    let scratch = Scratch::new("cache-corrupt-policy");
     let cache = scratch.path().join("cache");
     let dist_dir = cache.join("idna");
-    write_wheel(&dist_dir, "idna", "1.0", &[("idna/__init__.py", "")]);
-    let newer = write_wheel(&dist_dir, "idna", "2.0", &[("idna/__init__.py", "")]);
-    fs::write(&newer, b"altered after its digest was recorded").unwrap();
+    let older = write_wheel(&dist_dir, "idna", "1.0", &[("idna/__init__.py", "")]);
+    write_wheel(&dist_dir, "idna", "2.0", &[("idna/__init__.py", "")]);
+    fs::write(&older, b"altered after its digest was recorded").unwrap();
     let dep = rypip::resolve::resolve_dependency_in(
         &cache,
         &parse_requirement("idna>=1.0").unwrap(),
         true,
     )
-    .expect("the valid older candidate resolves");
-    assert_eq!(dep.version, "1.0");
+    .expect("the corrupt older candidate does not block the newer valid one");
+    assert_eq!(dep.version, "2.0");
     let err = rypip::resolve::resolve_dependency_in(
         &cache,
-        &parse_requirement("idna==2.0").unwrap(),
+        &parse_requirement("idna==1.0").unwrap(),
         true,
     )
     .expect_err("the corrupt candidate alone is loud");
     assert!(err.to_string().contains("sha256 mismatch"), "{err:?}");
+
+    // The newer candidate corrupt: `>=1.0` would have chosen it, so the
+    // resolution is loud rather than a downgrade to 1.0.
+    let scratch2 = Scratch::new("cache-corrupt-newer");
+    let cache2 = scratch2.path().join("cache");
+    let dist_dir2 = cache2.join("idna");
+    write_wheel(&dist_dir2, "idna", "1.0", &[("idna/__init__.py", "")]);
+    let newer = write_wheel(&dist_dir2, "idna", "2.0", &[("idna/__init__.py", "")]);
+    fs::write(&newer, b"altered after its digest was recorded").unwrap();
+    let err = rypip::resolve::resolve_dependency_in(
+        &cache2,
+        &parse_requirement("idna>=1.0").unwrap(),
+        true,
+    )
+    .expect_err("a corrupt candidate that would have won is loud");
+    assert!(err.to_string().contains("sha256 mismatch"), "{err:?}");
+    let pinned = rypip::resolve::resolve_dependency_in(
+        &cache2,
+        &parse_requirement("idna==1.0").unwrap(),
+        true,
+    )
+    .expect("a requirement the corrupt candidate does not satisfy resolves");
+    assert_eq!(pinned.version, "1.0");
 }
 
 #[test]
