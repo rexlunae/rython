@@ -523,6 +523,54 @@ fn an_interrupted_extraction_is_never_a_cache_hit() {
 }
 
 #[test]
+fn a_failed_extraction_leaves_no_partial_directory_and_stale_ones_are_cleared() {
+    // A corrupt archive (its digest recorded, so the cache trusts it)
+    // fails to extract: the error is loud and the `.partial-` sibling is
+    // removed; a crashed run's stale sibling (older than an hour) is
+    // cleared before the next extraction of that artifact; a fresh
+    // sibling of another live process is left alone (Devin review on
+    // #342).
+    let scratch = Scratch::new("cache-partial-cleanup");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("idna");
+    fs::create_dir_all(&dist_dir).unwrap();
+    let artifact = dist_dir.join("idna-1.0-py3-none-any.whl");
+    fs::write(&artifact, b"this is not a zip archive").unwrap();
+    record_digest(&artifact);
+    let req = parse_requirement("idna==1.0").unwrap();
+    let err = rypip::resolve::resolve_dependency_in(&cache, &req, true)
+        .expect_err("a corrupt archive does not extract");
+    assert!(err.to_string().contains("reading zip"), "{err:?}");
+    let partials = |dir: &Path| -> Vec<String> {
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| n.contains(".partial-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(partials(&dist_dir.join("extracted")).is_empty(), "{:?}", partials(&dist_dir.join("extracted")));
+
+    // A real wheel now, beside two leftovers: a stale one and a live one.
+    write_wheel(&dist_dir, "idna", "1.0", &[("idna/__init__.py", "")]);
+    let extracted = dist_dir.join("extracted");
+    let stale = extracted.join("idna-1.0-py3-none-any.partial-4242");
+    fs::create_dir_all(stale.join("idna")).unwrap();
+    let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+    fs::File::open(&stale).unwrap().set_modified(two_hours_ago).unwrap();
+    let live = extracted.join("idna-1.0-py3-none-any.partial-4343");
+    fs::create_dir_all(live.join("idna")).unwrap();
+    let dep = rypip::resolve::resolve_dependency_in(&cache, &req, true).unwrap();
+    assert_eq!(dep.version, "1.0");
+    assert!(!stale.exists(), "the stale sibling is cleared");
+    assert!(live.exists(), "a fresh sibling of another process is left alone");
+    assert!(extracted.join("idna-1.0-py3-none-any/.rypip-complete").is_file());
+}
+
+#[test]
 fn a_cached_artifact_is_reused_only_through_its_verified_digest() {
     // The offline path trusts an artifact only through the digest a
     // verified download recorded beside it: no sidecar (an older cache)

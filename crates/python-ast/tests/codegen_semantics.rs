@@ -11832,15 +11832,18 @@ fn exception_union_parameter_is_a_pyexception() {
         "a mixed union parameter still boxes: {}",
         out
     );
-    // A class OF THE CRATE is judged by its ancestry, never by its name
-    // (Devin review on #342): value classes that happen to end in
-    // `Error` are not exceptions, a class extending one is.
+    // A class OF THE CRATE is judged by the crate's one exception
+    // authority — the closure's `is_exception_class`: its ancestry
+    // through the crate's classes, the builtin exceptions and the
+    // documented naming convention (§8.1) — never by a second walk
+    // (Devin review on #342). Value classes outside all of that are not
+    // exceptions; a class extending one through a parent is.
     let out = compile(
-        "class ParseError:\n\
+        "class Parse:\n\
          \x20   def __init__(self, line: int) -> None:\n\
          \x20       self.line = line\n\
          \n\
-         class LexError:\n\
+         class Lex:\n\
          \x20   def __init__(self, col: int) -> None:\n\
          \x20       self.col = col\n\
          \n\
@@ -11850,7 +11853,7 @@ fn exception_union_parameter_is_a_pyexception() {
          class Worse(Failed):\n\
          \x20   pass\n\
          \n\
-         def report(e: ParseError | LexError) -> None:\n\
+         def report(e: Parse | Lex) -> None:\n\
          \x20   pass\n\
          \n\
          def handle(e: Worse | OSError) -> None:\n\
@@ -11859,7 +11862,7 @@ fn exception_union_parameter_is_a_pyexception() {
     );
     assert!(
         !out.contains("report (e : PyException)"),
-        "value classes named like exceptions are not exception parameters: {}",
+        "value classes are not exception parameters: {}",
         out
     );
     assert!(
@@ -11867,6 +11870,37 @@ fn exception_union_parameter_is_a_pyexception() {
         "a crate class extending a builtin exception (through a parent) is: {}",
         out
     );
+    // Every union spelling is the same rule (Devin review on #342):
+    // `Union[...]`, `typing.Union[...]`, `Optional[...]`, nested.
+    let out = compile(
+        "import typing\n\
+         from typing import Optional, Union\n\
+         \n\
+         def a(e: Union[OSError, TimeoutError]) -> None:\n\
+         \x20   pass\n\
+         \n\
+         def b(e: typing.Union[OSError, TimeoutError]) -> None:\n\
+         \x20   pass\n\
+         \n\
+         def c(e: Optional[OSError]) -> None:\n\
+         \x20   pass\n\
+         \n\
+         def d(e: typing.Optional[Union[OSError, ValueError]]) -> None:\n\
+         \x20   pass\n\
+         \n\
+         def m(e: Union[OSError, int]) -> None:\n\
+         \x20   pass\n",
+        "typingunions.py",
+    );
+    assert!(out.contains("a (e : PyException)"), "Union[...]: {}", out);
+    assert!(out.contains("b (e : PyException)"), "typing.Union[...]: {}", out);
+    assert!(out.contains("c (e : Option < PyException >)"), "Optional[...]: {}", out);
+    assert!(
+        out.contains("d (e : Option < PyException >)"),
+        "typing.Optional[Union[...]]: {}",
+        out
+    );
+    assert!(out.contains("m (e : stdpython :: PyValue)"), "a mixed Union still boxes: {}", out);
     assert!(
         !out.contains("| (SocketTimeout)"),
         "the union must not render literally: {}",

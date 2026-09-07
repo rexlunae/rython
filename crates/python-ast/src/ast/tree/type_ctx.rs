@@ -665,6 +665,13 @@ fn infer_type_inner(
             if let Some(t) = options.name_types.get(&n.id) {
                 return t.clone();
             }
+            // An `except ... as e` binding IS the runtime exception
+            // (issue #335): typed as the exception, so a call site
+            // Some-wraps it into an `Option<PyException>` slot and passes
+            // it bare into a PyException one.
+            if matches!(symbols.get(&n.id), Some(SymbolTableNode::ExceptBinding(_))) {
+                return crate::ast::tree::arguments::exception_typeinfo(false);
+            }
             // 3. A MUTABLE module global: its static's value type is the
             // name's type — a Boxed static is the boxed PyValue, so a
             // method call on the global drops like any boxed receiver
@@ -1821,6 +1828,18 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
     // and every use of the parameter breaks.
     let unquoted = crate::ast::tree::arguments::unquote_annotation(ann);
     let ann: &ExprType = unquoted.as_ref().unwrap_or(ann);
+    // A union of builtin exception classes only, in any spelling
+    // (`OSError | TimeoutError`, `Union[OSError, TimeoutError]`,
+    // `Optional[OSError]`, `BaseException | None` — the context-manager
+    // protocol): the runtime's one exception type, PyException (an
+    // Option of one with a None member). The symbols-aware authority
+    // (arguments.rs's exception_union_typeinfo) adds the crate's
+    // exception classes and import aliases over the same member reader;
+    // this is its syntax-only half, so the two never disagree on a
+    // builtin.
+    if let Some(t) = builtin_exception_union(ann) {
+        return Some(t);
+    }
     // `T | None` (and `None | T`) is Option<T>; the inner type resolves
     // through the same mapping. A union of two non-None members that map
     // to the same TypeInfo (bytes | bytearray) is that type. `str | bytes`
@@ -1834,16 +1853,6 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
             return Some(TypeInfo::StrOrBytes);
         }
         let members = crate::union_members(ann);
-        // A union of builtin exception classes only (`OSError |
-        // TimeoutError`, `BaseException | None` — the context-manager
-        // protocol): the runtime's one exception type, PyException (an
-        // Option of one with a None member). The symbols-aware
-        // authority (arguments.rs's exception_union_typeinfo) adds the
-        // crate's exception classes and import aliases; this is its
-        // syntax-only half, so the two never disagree on a builtin.
-        if let Some(t) = builtin_exception_union(members.as_deref()) {
-            return Some(t);
-        }
         if crate::is_none_expr(&op.left) {
             if let Some(t) = annotation_type_info(&op.right) {
                 // A boxed PyValue already contains None (`bool | str |
@@ -2144,32 +2153,22 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
 
 /// A union of boxable members with no single Rust type becomes the boxed
 /// PyValue. Returns None when a member is not boxable.
-/// The syntax-only half of `exception_union_typeinfo`: a union whose
-/// non-None members are ALL builtin exception names (or the stdlib
-/// `socket.timeout` spelling) is PyException, Option<PyException> with a
-/// None member; anything else is None.
-fn builtin_exception_union(members: Option<&[&ExprType]>) -> Option<TypeInfo> {
-    let members = members?;
+/// The syntax-only half of `exception_union_typeinfo`: a union (any
+/// spelling) whose non-None members are ALL builtin exception names (or
+/// the stdlib `socket.timeout` spelling) is PyException,
+/// Option<PyException> with a None member; anything else is None.
+fn builtin_exception_union(ann: &ExprType) -> Option<TypeInfo> {
+    let (members, has_none) = crate::ast::tree::arguments::union_annotation_members(ann)?;
     let is_builtin = |m: &ExprType| match m {
         ExprType::Name(n) => crate::ast::tree::raise_stmt::is_builtin_exception_name(&n.id),
         ExprType::Attribute(a) => matches!(a.value.as_ref(), ExprType::Name(m)
             if crate::ast::tree::raise_stmt::stdlib_exception_canonical(&m.id, &a.attr).is_some()),
         _ => false,
     };
-    let classes = members.iter().filter(|m| !crate::is_none_expr(m)).count();
-    if classes == 0
-        || !members
-            .iter()
-            .all(|m| crate::is_none_expr(m) || is_builtin(m))
-    {
+    if members.is_empty() || !members.iter().all(|m| is_builtin(m)) {
         return None;
     }
-    let exception = TypeInfo::Custom(quote!(PyException));
-    Some(if classes == members.len() {
-        exception
-    } else {
-        TypeInfo::Option(Box::new(exception))
-    })
+    Some(crate::ast::tree::arguments::exception_typeinfo(has_none))
 }
 
 fn boxable_union(members: Option<Vec<&ExprType>>) -> Option<TypeInfo> {
@@ -3611,6 +3610,14 @@ fn resolve_alias_typeinfo_inner(
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<TypeInfo> {
+    // A union of exception classes only, in ANY spelling (builtin names,
+    // import aliases, the crate's exception classes): PyException, as the
+    // signature declares it (arguments.rs — one rule). Decided before the
+    // arms below resolve a member alone (`Optional[OSError]` would box
+    // its builtin member).
+    if let Some(t) = crate::ast::tree::arguments::exception_union_typeinfo(ann, symbols, options) {
+        return Some(t);
+    }
     match ann {
         // `T | None`: Option of the alias-resolved inner type
         // (`list[CharsetMatch] | None`). A boxed PyValue already contains
@@ -3622,12 +3629,6 @@ fn resolve_alias_typeinfo_inner(
             // #137's systemic review).
             if crate::is_str_bytes_union(ann) {
                 return Some(TypeInfo::StrOrBytes);
-            }
-            // A union of exception classes only (builtin names, import
-            // aliases, the crate's exception classes): PyException, as
-            // the signature declares it (arguments.rs — one rule).
-            if let Some(t) = crate::ast::tree::arguments::exception_union_typeinfo(ann, symbols, options) {
-                return Some(t);
             }
             if crate::is_none_expr(&op.left) {
                 if let Some(t) = resolve_alias_typeinfo(&op.right, symbols, options) {

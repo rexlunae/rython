@@ -14786,3 +14786,72 @@ fn comprehension_fields_hold_the_element_class() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn typing_spelled_exception_unions_take_a_caught_exception() {
+    // Issue #335 (Devin review on #342): `Union[OSError, TimeoutError]`,
+    // `typing.Union[...]` and `Optional[OSError]` are the same
+    // exception-union rule as `OSError | TimeoutError` — a caught
+    // exception passes into each, `isinstance` tests its kind, and the
+    // Optional one takes None.
+    let scratch = Scratch::new("typing_unions");
+    let file = scratch.path().join("typing_unions.py");
+    fs::write(
+        &file,
+        concat!(
+            "import typing\n",
+            "from typing import Optional, Union\n",
+            "\n",
+            "\n",
+            "def describe(err: Union[OSError, TimeoutError], where: str) -> str:\n",
+            "    if isinstance(err, TimeoutError):\n",
+            "        return \"timeout at \" + where\n",
+            "    return \"os error at \" + where + \": \" + str(err)\n",
+            "\n",
+            "\n",
+            "def note(err: typing.Union[OSError, TimeoutError]) -> str:\n",
+            "    return \"noted \" + str(err)\n",
+            "\n",
+            "\n",
+            "def maybe(err: Optional[OSError]) -> str:\n",
+            "    if err is None:\n",
+            "        return \"nothing\"\n",
+            "    return \"got \" + str(err)\n",
+            "\n",
+            "\n",
+            "def attempt(fail: int) -> str:\n",
+            "    try:\n",
+            "        if fail == 1:\n",
+            "            raise TimeoutError(\"slow\")\n",
+            "        if fail == 2:\n",
+            "            raise OSError(\"refused\")\n",
+            "        return \"ok\"\n",
+            "    except (OSError, TimeoutError) as e:\n",
+            "        return describe(e, \"attempt\") + \" / \" + note(e) + \" / \" + maybe(e)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    for fail in range(3):\n",
+            "        print(attempt(fail))\n",
+            "    print(maybe(None))\n"
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/typing_unions"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["ok", "timeout at attempt / noted slow / got slow", "os error at attempt: refused / noted refused / got refused", "nothing"],
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

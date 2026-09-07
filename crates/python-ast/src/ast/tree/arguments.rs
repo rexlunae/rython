@@ -306,11 +306,12 @@ pub(crate) fn unquote_annotation(annotation: &ExprType) -> Option<ExprType> {
 
 /// Whether a union member names an exception class: a builtin exception
 /// name, an imported stdlib alias (`SocketTimeout`), a class of the crate
-/// whose ANCESTRY reaches one (never a crate class by its name alone — a
-/// value class called `ParseError` is a value class), or a name the
-/// conversion cannot resolve at all that follows the exception naming
-/// convention (an external `BaseSSLError` — the raise model's rule for an
-/// unknown name).
+/// the exception closure holds (`is_exception_class` — the one C3
+/// authority: its ancestry through the crate's classes, the builtin
+/// exceptions and the documented `*Error`/`*Exception`/`*Warning`
+/// convention, §8.1), or a name the conversion cannot resolve at all that
+/// follows the convention (an external `BaseSSLError` — the raise model's
+/// rule for an unknown name).
 pub(crate) fn is_exception_class_member(
     member: &ExprType,
     symbols: &SymbolTableScopes,
@@ -318,10 +319,10 @@ pub(crate) fn is_exception_class_member(
 ) -> bool {
     match member {
         ExprType::Name(n) => {
-            if let Some((class, class_symbols)) =
+            if let Some((class, _)) =
                 crate::ast::tree::call::resolve_construction_class(&n.id, symbols, options)
             {
-                return class_extends_exception(&class, &class_symbols, options, 0);
+                return crate::is_exception_class(&class);
             }
             crate::ast::tree::raise_stmt::is_builtin_exception_name(&n.id)
                 || crate::ast::tree::raise_stmt::imported_exception_alias(
@@ -342,79 +343,104 @@ pub(crate) fn is_exception_class_member(
     }
 }
 
-/// Whether a class of the crate extends an exception: a base that is a
-/// builtin exception, a stdlib alias, or (recursively) a crate class
-/// extending one. The class's own name decides nothing.
-fn class_extends_exception(
-    class: &crate::ClassDef,
-    symbols: &SymbolTableScopes,
-    options: &PythonOptions,
-    depth: usize,
-) -> bool {
-    if depth > 16 {
-        return false;
-    }
-    class.bases.iter().any(|base| match base {
-        ExprType::Name(n) => {
-            if let Some((parent, parent_symbols)) =
-                crate::ast::tree::call::resolve_construction_class(&n.id, symbols, options)
-            {
-                if parent.name == class.name {
-                    return false;
+/// The members of a union annotation in ANY supported spelling — PEP 604
+/// `A | B | None`, `Union[A, B]` / `typing.Union[A, B]`, `Optional[A]` /
+/// `typing.Optional[A]` (also nested: `Optional[Union[A, B]]`) — as the
+/// non-None members plus whether None is a member. None for anything
+/// that is not a union (a bare name, a container subscript).
+pub(crate) fn union_annotation_members(ann: &ExprType) -> Option<(Vec<&ExprType>, bool)> {
+    match ann {
+        ExprType::BinOp(op) if matches!(op.op, crate::BinOps::BitOr) => {
+            let mut members = Vec::new();
+            let mut has_none = false;
+            for m in union_members(ann)? {
+                if crate::is_none_expr(m) {
+                    has_none = true;
+                } else if let Some((inner, inner_none)) = union_annotation_members(m) {
+                    members.extend(inner);
+                    has_none |= inner_none;
+                } else {
+                    members.push(m);
                 }
-                return class_extends_exception(&parent, &parent_symbols, options, depth + 1);
             }
-            crate::ast::tree::raise_stmt::is_builtin_exception_name(&n.id)
-                || crate::ast::tree::raise_stmt::imported_exception_alias(
-                    &n.id,
-                    symbols,
-                    Some(options),
-                )
-                .is_some()
-                || crate::ast::tree::raise_stmt::is_exception_class_name(&n.id)
+            Some((members, has_none))
         }
-        ExprType::Attribute(a) => {
-            matches!(a.value.as_ref(), ExprType::Name(m)
-                if crate::ast::tree::raise_stmt::stdlib_exception_canonical(&m.id, &a.attr).is_some())
+        ExprType::Subscript(sub) => {
+            let container = match sub.value.as_ref() {
+                ExprType::Name(n) => n.id.as_str(),
+                ExprType::Attribute(a)
+                    if matches!(a.value.as_ref(), ExprType::Name(m) if crate::is_typing(&m.id)) =>
+                {
+                    a.attr.as_str()
+                }
+                _ => return None,
+            };
+            let crate::SubscriptKind::Index(index) = &sub.kind else {
+                return None;
+            };
+            let elements: Vec<&ExprType> = match (container, index.as_ref()) {
+                ("Union", ExprType::Tuple(t)) => t.elts.iter().collect(),
+                ("Union", single) => vec![single],
+                ("Optional", single) => vec![single],
+                _ => return None,
+            };
+            let mut members = Vec::new();
+            let mut has_none = container == "Optional";
+            for m in elements {
+                if crate::is_none_expr(m) {
+                    has_none = true;
+                } else if let Some((inner, inner_none)) = union_annotation_members(m) {
+                    members.extend(inner);
+                    has_none |= inner_none;
+                } else {
+                    members.push(m);
+                }
+            }
+            Some((members, has_none))
         }
-        _ => false,
-    })
+        _ => None,
+    }
 }
 
-/// The type of a `A | B | ...` annotation whose members are ALL exception
-/// classes (optionally with None): the runtime's one exception type,
-/// `PyException`, or `Option<PyException>` with a None member. Any other
-/// union (a boxable or class member, or no exception member) is None.
-/// ONE rule for the signature (Parameter::to_rust) and the body's name
-/// types (function_def.rs), so a parameter's reads see the type its
-/// signature declares.
+/// The type of a union annotation (any spelling `union_annotation_members`
+/// reads) whose members are ALL exception classes (optionally with None):
+/// the runtime's one exception type, `PyException`, or
+/// `Option<PyException>` with a None member. Any other union (a boxable or
+/// class member, or no exception member) is None. ONE rule for the
+/// signature (Parameter::to_rust), the body's name types
+/// (function_def.rs) and the alias resolver, so a parameter's reads see
+/// the type its signature declares.
 pub(crate) fn exception_union_typeinfo(
     annotation: &ExprType,
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<crate::TypeInfo> {
-    let ExprType::BinOp(op) = annotation else {
-        return None;
-    };
-    if !matches!(op.op, crate::BinOps::BitOr) {
-        return None;
-    }
-    let members = crate::union_members(annotation)?;
-    let (none, classes): (Vec<&ExprType>, Vec<&ExprType>) =
-        members.iter().partition(|m| crate::is_none_expr(m));
-    if classes.is_empty()
-        || !classes
+    let (members, has_none) = union_annotation_members(annotation)?;
+    if members.is_empty()
+        || !members
             .iter()
             .all(|m| is_exception_class_member(m, symbols, options))
     {
         return None;
     }
+    Some(exception_typeinfo(has_none))
+}
+
+/// The runtime's exception type as a TypeInfo: `PyException`, or
+/// `Option<PyException>` for a None-able slot.
+pub(crate) fn exception_typeinfo(optional: bool) -> crate::TypeInfo {
     let exception = crate::TypeInfo::Custom(quote!(PyException));
-    Some(if none.is_empty() {
-        exception
-    } else {
+    if optional {
         crate::TypeInfo::Option(Box::new(exception))
-    })
+    } else {
+        exception
+    }
+}
+
+/// Whether a TypeInfo is the runtime's exception type (the `Custom`
+/// payload the exception-union rule produces).
+pub(crate) fn is_exception_typeinfo(t: &crate::TypeInfo) -> bool {
+    matches!(t, crate::TypeInfo::Custom(tokens) if tokens.to_string() == "PyException")
 }
 
 pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStream> {

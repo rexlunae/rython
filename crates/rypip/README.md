@@ -128,7 +128,9 @@ package's own modules. Every downloaded artifact extracts into its own
 directory (`<cache>/<dist>/extracted/<artifact stem>/`), so two cached
 versions of one distribution never share a tree; an extraction is
 complete only once its `.rypip-complete` marker is in place (the archive
-unpacks into a sibling directory that is renamed in), and a verified
+unpacks into a sibling directory that is renamed in; a failed or crashed
+extraction's sibling is removed, and two resolvers extracting the same
+artifact at once share the first complete tree), and a verified
 download records its sha256 beside the artifact (`<file>.sha256`). A
 cached artifact is reused only through that digest — one without it is
 fetched again, one that no longer matches is a loud error — and among

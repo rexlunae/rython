@@ -2052,6 +2052,17 @@ impl CodeGen for Import {
                     return Err(std_only_import_error(&alias.name));
                 }
             }
+            // `import typing` (an annotation-only module): nothing at
+            // runtime — its names are read by the annotation authorities
+            // through the `typing.X[...]` spelling (the from-import form
+            // already emits nothing for them). A `use crate::typing;`
+            // named a module the crate does not have (issue #335).
+            {
+                let root = alias.name.split('.').next().unwrap_or(&alias.name);
+                if crate::AnnotationModule::from_name(root).is_some() {
+                    continue;
+                }
+            }
             // Check if this is a Python standard library module that needs special handling
             let rust_import = match alias.name.as_str() {
                 // `import numpy as np` (and `import numpy.linalg as np`) is

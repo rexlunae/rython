@@ -870,6 +870,11 @@ fn version_str_of(v: &Version) -> String {
     s
 }
 
+/// An in-progress extraction directory older than this is a crashed
+/// run's leftover (unpacking one artifact never takes an hour): removed
+/// before the next extraction of the same artifact.
+const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 /// Extract a wheel or sdist into its own directory under
 /// `{dist_dir}/extracted/{artifact stem}/`, returning the extracted
 /// distribution's root: the directory holding the package (and, for a
@@ -880,8 +885,10 @@ fn version_str_of(v: &Version) -> String {
 /// extraction is ATOMIC: the archive unpacks into a `<stem>.partial-<pid>`
 /// sibling, the root is located there, the completion marker is written,
 /// and only then is the directory renamed into place — an interrupted
-/// extraction leaves nothing the cache lookup accepts, and is replaced
-/// the next time the artifact is needed.
+/// extraction leaves nothing the cache lookup accepts. Every failure
+/// after the sibling was created removes it; a concurrent resolver that
+/// published the same artifact first wins the rename, and its complete
+/// tree is used. A stale sibling of a crashed run is cleared first.
 fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Result<PathBuf> {
     let file_name = artifact
         .file_name()
@@ -900,6 +907,7 @@ fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Re
             .with_context(|| format!("clearing {}", extract_dir.display()))?;
     }
     let stem = artifact_stem(file_name).unwrap_or(file_name);
+    remove_stale_partials(&dist_dir.join("extracted"), stem);
     let partial = dist_dir
         .join("extracted")
         .join(format!("{stem}{PARTIAL_INFIX}{}", std::process::id()));
@@ -908,7 +916,27 @@ fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Re
             .with_context(|| format!("clearing {}", partial.display()))?;
     }
     fs::create_dir_all(&partial)?;
+    let published = publish_extraction(artifact, file_name, dist_name, &partial, &extract_dir);
+    // Whatever happened, this process's sibling is gone: on success it
+    // was renamed away (or the other resolver's tree won), on failure
+    // its unpacked files are not left for the cache to skip forever.
+    if partial.exists() {
+        let _ = fs::remove_dir_all(&partial);
+    }
+    published?;
+    locate_extracted_root(&extract_dir)
+}
 
+/// Unpack `artifact` into `partial`, validate, mark complete, and rename
+/// into `extract_dir`. A rename that fails because another resolver
+/// published a COMPLETE tree there meanwhile is that tree's success.
+fn publish_extraction(
+    artifact: &Path,
+    file_name: &str,
+    dist_name: &str,
+    partial: &Path,
+    extract_dir: &Path,
+) -> Result<()> {
     if file_name.ends_with(".whl") || file_name.ends_with(".zip") {
         let file = fs::File::open(artifact)
             .with_context(|| format!("opening {}", artifact.display()))?;
@@ -938,11 +966,10 @@ fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Re
         let gz = flate2::read::GzDecoder::new(file);
         let mut archive = tar::Archive::new(gz);
         archive
-            .unpack(&partial)
+            .unpack(partial)
             .with_context(|| format!("extracting {}", artifact.display()))?;
     }
-
-    locate_extracted_root(&partial).with_context(|| {
+    locate_extracted_root(partial).with_context(|| {
         format!(
             "could not locate the extracted package for `{}` under {}",
             dist_name,
@@ -952,14 +979,49 @@ fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Re
     let marker = partial.join(COMPLETE_MARKER);
     fs::write(&marker, format!("{file_name}\n"))
         .with_context(|| format!("writing {}", marker.display()))?;
-    fs::rename(&partial, &extract_dir).with_context(|| {
-        format!(
-            "moving the extraction {} into place at {}",
-            partial.display(),
-            extract_dir.display()
-        )
-    })?;
-    locate_extracted_root(&extract_dir)
+    match fs::rename(partial, extract_dir) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Another resolver published the same artifact between our
+            // check and our rename: its complete tree is the cache entry.
+            if extract_dir.join(COMPLETE_MARKER).is_file()
+                && locate_extracted_root(extract_dir).is_ok()
+            {
+                return Ok(());
+            }
+            Err(anyhow::Error::new(e).context(format!(
+                "moving the extraction {} into place at {}",
+                partial.display(),
+                extract_dir.display()
+            )))
+        }
+    }
+}
+
+/// Remove `<stem>.partial-*` siblings whose last modification is older
+/// than STALE_PARTIAL: a crashed run's leftovers (a live extraction of
+/// one artifact never takes that long). Best effort — a failure to
+/// remove one only leaves it for the next run.
+fn remove_stale_partials(extracted: &Path, stem: &str) {
+    let Ok(entries) = fs::read_dir(extracted) else {
+        return;
+    };
+    let prefix = format!("{stem}{PARTIAL_INFIX}");
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > STALE_PARTIAL);
+        if stale {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// The distribution root inside an extraction directory: the directory

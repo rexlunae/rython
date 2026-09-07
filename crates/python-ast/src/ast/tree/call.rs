@@ -4178,27 +4178,30 @@ impl<'a> CodeGen for Call {
                                     crate::ExprType::Name(n)
                                         if options.param_type_vars.contains_key(&n.id)
                                 );
+                                let arg_type = crate::infer_type(
+                                    Some(&ctx),
+                                    &self.args[0],
+                                    &options,
+                                    &symbols,
+                                );
                                 if !generic
-                                    && matches!(
-                                        crate::infer_type(Some(&ctx), 
-                                            &self.args[0],
-                                            &options,
-                                            &symbols
-                                        ),
+                                    && (matches!(
+                                        arg_type,
                                         crate::TypeInfo::Class(_)
                                             | crate::TypeInfo::Option(_)
                                             | crate::TypeInfo::PyValue
                                             | crate::TypeInfo::PyValueMember(_)
                                             | crate::TypeInfo::PyObject
-                                            // A PyException-typed parameter
-                                            // (an exception-class union —
-                                            // `str(err)` in urllib3's
-                                            // _raise_timeout): its str() is
-                                            // the exception's display, read
-                                            // through the reference so the
-                                            // name stays usable after.
-                                            | crate::TypeInfo::Custom(_)
                                     )
+                                    // A PyException-typed parameter (an
+                                    // exception-class union — `str(err)`
+                                    // in urllib3's _raise_timeout): its
+                                    // str() is the exception's display,
+                                    // read through the reference so the
+                                    // name stays usable after. The
+                                    // exception type only — no other
+                                    // Custom type gains the contract.
+                                    || crate::ast::tree::arguments::is_exception_typeinfo(&arg_type))
                                 {
                                     return Ok(quote!(py_display(&(#a))));
                                 }
