@@ -92,28 +92,52 @@ impl CodeGen for IfExp {
                 matches!(e, crate::ExprType::Name(n) if narrowings.iter().any(|(name, _)| *name == n.id))
             },
         );
+        // The true branch's inferred type IN the narrowed scope, computed
+        // once (before the body's to_rust moves the narrowed options): the
+        // Some-wrap decision must not double-wrap a branch that is ALREADY
+        // Option (`maybe(x) if x is not None else None` where maybe
+        // returns `-> Optional[T]` — a returned None would become
+        // Some(None), which is not None for a later `is None` check), and
+        // the string-else ownership applies only to a String branch.
+        let body_ty = if body_reads_narrowed {
+            crate::infer_type(Some(&ctx), &self.body, &body_options, &symbols)
+        } else {
+            crate::TypeInfo::PyObject
+        };
+        let body_is_concrete = !matches!(
+            body_ty,
+            crate::TypeInfo::Option(_)
+                | crate::TypeInfo::PyObject
+                | crate::TypeInfo::PyValue
+                | crate::TypeInfo::PyValueMember(_)
+        );
+        let body_is_string = matches!(
+            body_ty,
+            crate::TypeInfo::String | crate::TypeInfo::StrRef | crate::TypeInfo::StrOrBytes
+        );
         // Captured before the orelse is moved by the to_rust below.
         let orelse_is_string_literal = matches!(
             self.orelse.as_ref(),
             crate::ExprType::Constant(c)
                 if matches!(&c.0, Some(litrs::Literal::String(_)))
         );
+        let orelse_is_none = crate::is_none_expr(&self.orelse);
         let body = self
             .body
             .to_rust(ctx.clone(), body_options, symbols.clone())?;
-        let body = if body_reads_narrowed && crate::is_none_expr(&self.orelse) {
+        let body = if body_reads_narrowed && orelse_is_none && body_is_concrete {
             // True branch is the concrete inner value; the ternary is the
-            // value-or-None the Python spells: Option(inner). (A body that
-            // is ALREADY Option-typed — a None-literal-else ternary over an
-            // Option read — must NOT wrap; the corpus shapes read concrete
-            // members off the narrowed receiver, so the wrap is exact
-            // there.)
+            // value-or-None the Python spells: Option(inner). An ALREADY
+            // Option-typed branch (an Option-returning callee on the
+            // narrowed value) and an UNKNOWN-typed branch keep their shape
+            // — wrapping either would double-wrap (`Some(None)` is not
+            // None) or hide a later-stage error.
             quote!(Some(#body))
         } else {
             body
         };
         let mut orelse = self.orelse.to_rust(ctx, options, symbols)?;
-        if body_reads_narrowed && orelse_is_string_literal {
+        if body_reads_narrowed && orelse_is_string_literal && body_is_string {
             orelse = quote!((#orelse).to_string());
         }
 

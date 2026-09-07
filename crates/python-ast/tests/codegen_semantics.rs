@@ -2457,6 +2457,36 @@ fn is_not_none_ternary_narrows_and_keeps_option() {
 }
 
 #[test]
+fn guarded_ternary_does_not_double_wrap_an_option_body() {
+    // A None-literal-else ternary whose TRUE branch itself returns Option
+    // (`maybe(x) if x is not None else None` where maybe is `-> Optional`):
+    // the branch must NOT be Some-wrapped — a returned None would become
+    // Some(None), which is not None for a later `is None` check (Devin
+    // review on the round-99 narrowing PR).
+    let out = compile(
+        concat!(
+            "def maybe(x: int) -> int | None:\n",
+            "    return None\n",
+            "\n",
+            "def f(x: int | None) -> str:\n",
+            "    r = maybe(x) if x is not None else None\n",
+            "    return \"none\" if r is None else \"some\"\n",
+        ),
+        "nestedopt.py",
+    );
+    assert!(
+        out.contains("r = if ! (x) . py_is_none () { maybe ((x) . clone () . unwrap ()) ? } else { None }"),
+        "guarded Option-returning call must stay unwrapped: {}",
+        out
+    );
+    assert!(
+        !out.contains("Some (maybe"),
+        "an Option body must not double-wrap: {}",
+        out
+    );
+}
+
+#[test]
 fn python_list_methods_map_to_correct_rust() {
     let src = concat!(
         "def f() -> int:\n",
