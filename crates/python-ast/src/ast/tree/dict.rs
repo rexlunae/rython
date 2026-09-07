@@ -101,9 +101,30 @@ impl CodeGen for Dict {
             }
             k_expected = crate::TypeInfo::PyValue;
         }
-        if forced_kv.is_none()
-            && v_distinct.len() > 1
-            && matches!(v_expected, crate::TypeInfo::PyObject)
+        // Whether the distinct value types share a CONCRETE unifiable
+        // family (all-stringy → String, all-numeric → Float, all-Option →
+        // the unified Option). Anything else mixed has no single concrete
+        // Rust type: it must box (or refuse). The old gate keyed off
+        // `v_expected == PyObject`, but `unify` never returns PyObject for
+        // a mixed set (it absorbs the last non-PyObject), so the gate only
+        // ever fired by accident of order — a `{Option<String>, String,
+        // Option<f64>}` dict (charset_normalizer's legacy.detect return)
+        // sailed past it and rendered a raw `PyDict::from` whose V type
+        // rustc inferred from the first pair (E0308, round 100).
+        let v_unifiable = v_distinct.len() == 1
+            || v_distinct.iter().all(|t| {
+                matches!(
+                    t,
+                    crate::TypeInfo::String
+                        | crate::TypeInfo::StrRef
+                        | crate::TypeInfo::StrOrBytes
+                )
+            })
+            || v_distinct.iter().all(|t| {
+                matches!(t, crate::TypeInfo::Int | crate::TypeInfo::Float)
+            })
+            || v_distinct.iter().all(|t| matches!(t, crate::TypeInfo::Option(_)));
+        if forced_kv.is_none() && v_distinct.len() > 1 && !v_unifiable
         {
             // All values are TUPLES of strings of different lengths
             // (`{100: ("continue",), 101: ("switching_protocols",), 103:

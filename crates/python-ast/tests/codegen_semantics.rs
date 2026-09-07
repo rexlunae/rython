@@ -2487,6 +2487,36 @@ fn guarded_ternary_does_not_double_wrap_an_option_body() {
 }
 
 #[test]
+fn mixed_option_dict_values_box_into_pyvalue() {
+    // A dict literal whose values are a MIX of Option and plain concrete
+    // types (`{"encoding": Option<String>, "language": String,
+    // "confidence": Option<f64>}` — charset_normalizer's legacy.detect
+    // return, round 100): no single concrete value type unifies, so the
+    // values box into PyValue (the None-else Option values via the
+    // Some/None match). The old gate keyed off `v_expected == PyObject`,
+    // which unify never yields for a mixed set, so the literal rendered a
+    // raw PyDict::from whose V type rustc inferred from the first pair
+    // (E0308).
+    let src = concat!(
+        "from typing import TypedDict\n",
+        "\n",
+        "class ResultDict(TypedDict):\n",
+        "    encoding: str | None\n",
+        "    language: str\n",
+        "    confidence: float | None\n",
+        "\n",
+        "def detect(enc: str | None, lang: str, conf: float | None) -> ResultDict:\n",
+        "    return {\"encoding\": enc, \"language\": lang, \"confidence\": conf}\n",
+    );
+    let out = compile(src, "mixeddict.py");
+    assert!(
+        out.contains("PyValue :: from") && out.contains("None => stdpython :: PyValue :: None_"),
+        "mixed Option/concrete dict values must box into PyValue: {}",
+        out
+    );
+}
+
+#[test]
 fn python_list_methods_map_to_correct_rust() {
     let src = concat!(
         "def f() -> int:\n",
