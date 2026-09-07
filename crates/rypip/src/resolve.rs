@@ -466,7 +466,12 @@ pub fn resolve_dependency_tree(req: &Requirement, offline: bool) -> Result<Vec<R
 /// Resolve one requirement from PyPI. `offline` skips the network and
 /// fails loudly if the dependency is not already in the cache.
 pub fn resolve_dependency(req: &Requirement, offline: bool) -> Result<ResolvedDependency> {
-    let cache = cache_dir();
+    resolve_dependency_in(&cache_dir(), req, offline)
+}
+
+/// `resolve_dependency` against an explicit cache directory (the
+/// `RYPIP_CACHE_DIR` / `~/.cache/rypip` default is `cache_dir()`).
+pub fn resolve_dependency_in(cache: &Path, req: &Requirement, offline: bool) -> Result<ResolvedDependency> {
     let dist_dir = cache.join(&req.name);
 
     // A cached, already-extracted distribution that satisfies the
@@ -591,8 +596,7 @@ pub fn resolve_dependency(req: &Requirement, offline: bool) -> Result<ResolvedDe
     }
 
     // Extract (wheels are zips, sdists are gzipped tarballs).
-    let extract_dir = dist_dir.join("extracted");
-    let package_dir = extract_distribution(&artifact_path, &extract_dir, &req.name)?;
+    let package_dir = extract_distribution(&artifact_path, &dist_dir, &req.name)?;
     Ok(finalize_dependency(package_dir, &req.name, &best_version))
 }
 
@@ -639,34 +643,94 @@ fn is_pure_wheel(file_name: &str) -> bool {
         && tags[n - 1] == "any"
 }
 
-/// Look for an already-extracted cached dependency satisfying the
-/// requirement.
+/// Look for a cached distribution satisfying the requirement: one already
+/// extracted under `extracted/`, else a downloaded artifact in the
+/// distribution's cache directory, extracted now. Any satisfying cached
+/// version is reused (the cache is not an index; pinning is the
+/// requirement's job).
 fn cached_match(dist_dir: &Path, req: &Requirement) -> Option<ResolvedDependency> {
     let extracted = dist_dir.join("extracted");
-    let entries = fs::read_dir(&extracted).ok()?;
-    for entry in entries.filter_map(|e| e.ok()) {
+    if let Ok(entries) = fs::read_dir(&extracted) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            // The .dist-info metadata directory is not a distribution
+            // root, and neither is the wheel DATA directory
+            // (`{dist}-{version}.data`).
+            if name.ends_with(".dist-info") || name.contains(".data") {
+                continue;
+            }
+            let Some(version) = cached_version_of(&name, &req.name) else {
+                continue;
+            };
+            if !version_satisfies(&version, &req.specifiers) {
+                continue;
+            }
+            let Ok(root) = locate_extracted_root(&path) else {
+                continue;
+            };
+            return Some(finalize_dependency(root, &req.name, &version_str_of(&version)));
+        }
+    }
+    // A downloaded artifact whose extraction is missing (an older cache
+    // layout, or an interrupted run): extract it now.
+    let artifacts = fs::read_dir(dist_dir).ok()?;
+    for entry in artifacts.filter_map(|e| e.ok()) {
         let path = entry.path();
-        if !path.is_dir() {
+        if !path.is_file() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        // The .dist-info metadata directory is not a distribution root,
-        // and neither is the wheel DATA directory (`{dist}-{version}.data`).
-        if name.ends_with(".dist-info") || name.contains(".data") {
-            continue;
-        }
-        // Layout: `{dist}-{version}/` where the version may itself contain
-        // dots/hyphens; find the version by stripping the normalized name.
-        let Some(version) = name.strip_prefix(&format!("{}-", req.name)) else {
+        let Some(stem) = artifact_stem(&name) else {
             continue;
         };
-        let Some(version) = parse_version(version) else {
+        let Some(version) = cached_version_of(stem, &req.name) else {
             continue;
         };
         if !version_satisfies(&version, &req.specifiers) {
             continue;
         }
-        return Some(finalize_dependency(path, &req.name, &version_str_of(&version)));
+        let Ok(root) = extract_distribution(&path, dist_dir, &req.name) else {
+            continue;
+        };
+        return Some(finalize_dependency(root, &req.name, &version_str_of(&version)));
+    }
+    None
+}
+
+/// The artifact file name without its archive extension: the name of the
+/// directory the artifact extracts into.
+fn artifact_stem(file_name: &str) -> Option<&str> {
+    file_name
+        .strip_suffix(".whl")
+        .or_else(|| file_name.strip_suffix(".tar.gz"))
+        .or_else(|| file_name.strip_suffix(".tgz"))
+        .or_else(|| file_name.strip_suffix(".zip"))
+}
+
+/// The version an artifact stem (`idna-3.10-py3-none-any`, `idna-3.10`,
+/// `charset-normalizer-3.4.0`) names for the distribution `dist_name`:
+/// the stem's leading name, compared normalized (`-`/`.` as `_`, lowercase,
+/// as requirement names are stored), followed by the version. A stem of another distribution (or a bare directory name) is
+/// None.
+fn cached_version_of(stem: &str, dist_name: &str) -> Option<Version> {
+    let want = normalize_dist_name(dist_name);
+    // A wheel stem is `{name}-{version}-{tags...}`; an sdist stem is
+    // `{name}-{version}`, where a legacy name may itself contain `-`.
+    // Try every `-` split: the leading part that normalizes to the wanted
+    // name, followed by a parseable version.
+    for (index, _) in stem.match_indices('-') {
+        let (name, rest) = (&stem[..index], &stem[index + 1..]);
+        if normalize_dist_name(name) != want {
+            continue;
+        }
+        let version = rest.split('-').next().unwrap_or(rest);
+        if let Some(version) = parse_version(version) {
+            return Some(version);
+        }
     }
     None
 }
@@ -688,47 +752,30 @@ fn version_str_of(v: &Version) -> String {
     s
 }
 
-/// Extract a wheel or sdist into `extract_dir`, returning the extracted
-/// distribution's top directory.
-fn extract_distribution(artifact: &Path, extract_dir: &Path, dist_name: &str) -> Result<PathBuf> {
-    fs::create_dir_all(extract_dir)?;
+/// Extract a wheel or sdist into its own directory under
+/// `{dist_dir}/extracted/{artifact stem}/`, returning the extracted
+/// distribution's root: the directory holding the package (and, for a
+/// wheel, its `.dist-info`). Each artifact gets its own directory: two
+/// versions of one distribution extracted into a shared directory merge
+/// their files (a module the newer version added survives into the older
+/// version's tree), which is not any version of the package.
+fn extract_distribution(artifact: &Path, dist_dir: &Path, dist_name: &str) -> Result<PathBuf> {
     let file_name = artifact
         .file_name()
         .and_then(|n| n.to_str())
         .context("artifact has no file name")?;
-
-    // The extracted top dir: strip the extension.
-    let top_name = if file_name.ends_with(".whl") {
-        file_name.strip_suffix(".whl").unwrap()
-    } else {
-        file_name
-            .strip_suffix(".tar.gz")
-            .or_else(|| file_name.strip_suffix(".tgz"))
-            .or_else(|| file_name.strip_suffix(".zip"))
-            .unwrap_or(file_name)
-    };
-    let top = extract_dir.join(top_name);
-    if top.join("__init__.py").is_file() || top.is_dir() && has_dist_info(&top) {
-        return Ok(top);
+    let stem = artifact_stem(file_name).unwrap_or(file_name);
+    let extract_dir = dist_dir.join("extracted").join(stem);
+    if let Ok(root) = locate_extracted_root(&extract_dir) {
+        return Ok(root);
     }
-
-    // A top-level .py file next to the dist-info: the single-module wheel
-    // layout (six-1.17.0 extracts to six.py + six-1.17.0.dist-info/).
-    let module_files: Vec<PathBuf> = fs::read_dir(extract_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "py"))
-        .collect();
-    if module_files.len() == 1 {
-        let only_metadata_dirs = fs::read_dir(extract_dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .all(|d| is_dist_info(&d));
-        if only_metadata_dirs {
-            return Ok(extract_dir.to_path_buf());
-        }
+    // A partial extraction (an interrupted run) is replaced, never
+    // extracted over.
+    if extract_dir.exists() {
+        fs::remove_dir_all(&extract_dir)
+            .with_context(|| format!("clearing {}", extract_dir.display()))?;
     }
+    fs::create_dir_all(&extract_dir)?;
 
     if file_name.ends_with(".whl") || file_name.ends_with(".zip") {
         let file = fs::File::open(artifact)
@@ -759,40 +806,51 @@ fn extract_distribution(artifact: &Path, extract_dir: &Path, dist_name: &str) ->
         let gz = flate2::read::GzDecoder::new(file);
         let mut archive = tar::Archive::new(gz);
         archive
-            .unpack(extract_dir)
+            .unpack(&extract_dir)
             .with_context(|| format!("extracting {}", artifact.display()))?;
     }
 
-    let top = extract_dir.join(top_name);
-    if top.is_dir() {
-        Ok(top)
-    } else {
-        // Some sdists extract with a different top dir; pick the single
-        // subdirectory.
-        let mut dirs: Vec<PathBuf> = fs::read_dir(extract_dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        dirs.retain(|p| p.join("__init__.py").is_file() || has_dist_info(p));
-        if dirs.len() == 1 {
-            Ok(dirs.remove(0))
-        } else {
-            bail!(
-                "could not locate the extracted package for `{}` under {}",
-                dist_name,
-                extract_dir.display()
-            )
-        }
-    }
+    locate_extracted_root(&extract_dir).with_context(|| {
+        format!(
+            "could not locate the extracted package for `{}` under {}",
+            dist_name,
+            extract_dir.display()
+        )
+    })
 }
 
-/// Whether a directory is itself a `.dist-info` directory (its name ends
-/// with `.dist-info`) — a wheel's metadata dir, distinct from a package.
-fn is_dist_info(dir: &Path) -> bool {
-    dir.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.ends_with(".dist-info"))
+/// The distribution root inside an extraction directory: the directory
+/// itself when it is a wheel's contents (a `.dist-info` beside the
+/// package) or a single-module layout (one `.py` file beside the
+/// metadata), else the one subdirectory an sdist tarball unpacked to, or
+/// the directory itself when it carries the sdist's own metadata (an
+/// older cache layout that unpacked the tarball's top directly).
+fn locate_extracted_root(extract_dir: &Path) -> Result<PathBuf> {
+    if !extract_dir.is_dir() {
+        bail!("{} is not a directory", extract_dir.display());
+    }
+    if has_dist_info(extract_dir) {
+        return Ok(extract_dir.to_path_buf());
+    }
+    let is_sdist_top = |dir: &Path| {
+        dir.join("PKG-INFO").is_file()
+            || dir.join("pyproject.toml").is_file()
+            || dir.join("setup.py").is_file()
+            || dir.join("setup.cfg").is_file()
+    };
+    let mut dirs: Vec<PathBuf> = fs::read_dir(extract_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.retain(|p| p.join("__init__.py").is_file() || has_dist_info(p) || is_sdist_top(p));
+    if dirs.len() == 1 && !is_sdist_top(extract_dir) && !dirs[0].join("__init__.py").is_file() {
+        return Ok(dirs.remove(0));
+    }
+    if is_sdist_top(extract_dir) || dirs.iter().any(|d| d.join("__init__.py").is_file()) {
+        return Ok(extract_dir.to_path_buf());
+    }
+    bail!("no distribution root under {}", extract_dir.display())
 }
 
 fn has_dist_info(dir: &Path) -> bool {

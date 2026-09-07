@@ -2,6 +2,7 @@
 //! setup.py) and PEP 440/508 dependency resolution.
 
 use std::fs;
+use std::path::{Path, PathBuf};
 
 mod common;
 
@@ -314,6 +315,143 @@ fn resolve_requirement_from_cache_requires_network_or_cache() {
     let req = parse_requirement("this-package-definitely-does-not-exist-rython-test").unwrap();
     let err = rypip::resolve::resolve_dependency(&req, true).expect_err("offline + uncached");
     assert!(err.to_string().contains("offline"), "{:?}", err);
+}
+
+/// Write a pure-Python wheel (a zip) with the given `path -> contents`
+/// entries into `dir`, named `{dist}-{version}-py3-none-any.whl`.
+fn write_wheel(dir: &Path, dist: &str, version: &str, files: &[(&str, &str)]) -> PathBuf {
+    use std::io::Write;
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join(format!("{dist}-{version}-py3-none-any.whl"));
+    let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored);
+    for (name, contents) in files {
+        zip.start_file(*name, options).unwrap();
+        zip.write_all(contents.as_bytes()).unwrap();
+    }
+    let info = format!("{dist}-{version}.dist-info");
+    zip.start_file(format!("{info}/METADATA"), options).unwrap();
+    zip.write_all(format!("Metadata-Version: 2.1\nName: {dist}\nVersion: {version}\n").as_bytes())
+        .unwrap();
+    zip.start_file(format!("{info}/top_level.txt"), options).unwrap();
+    zip.write_all(format!("{dist}\n").as_bytes()).unwrap();
+    zip.finish().unwrap();
+    path
+}
+
+#[test]
+fn cached_versions_of_one_distribution_extract_apart() {
+    // Two versions of one distribution in the cache: each resolves to its
+    // OWN extracted tree. They used to extract into one shared directory,
+    // so a module the newer version added (idna 3.19's cli.py) survived
+    // into the older version's tree and was converted as part of it.
+    let scratch = Scratch::new("cache-versions");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("idna");
+    write_wheel(
+        &dist_dir,
+        "idna",
+        "1.0",
+        &[("idna/__init__.py", "VERSION = \"1.0\"\n")],
+    );
+    write_wheel(
+        &dist_dir,
+        "idna",
+        "2.0",
+        &[
+            ("idna/__init__.py", "VERSION = \"2.0\"\n"),
+            ("idna/cli.py", "def main() -> None:\n    pass\n"),
+        ],
+    );
+
+    // A cached artifact satisfying the requirement resolves offline: the
+    // cache is the artifact, extraction is on demand.
+    let newer = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("idna==2.0").unwrap(),
+        true,
+    )
+    .expect("idna 2.0 from the cache");
+    let older = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("idna==1.0").unwrap(),
+        true,
+    )
+    .expect("idna 1.0 from the cache");
+    assert_eq!(newer.version, "2.0");
+    assert_eq!(older.version, "1.0");
+    assert_eq!(newer.import_name, "idna");
+    assert_ne!(newer.path, older.path);
+    assert!(newer.path.join("cli.py").is_file(), "{}", newer.path.display());
+    assert!(!older.path.join("cli.py").exists(), "{}", older.path.display());
+    assert_eq!(fs::read_to_string(older.path.join("__init__.py")).unwrap(), "VERSION = \"1.0\"\n");
+    // Each artifact extracts under its own stem.
+    assert!(newer.path.starts_with(dist_dir.join("extracted/idna-2.0-py3-none-any")));
+    assert!(older.path.starts_with(dist_dir.join("extracted/idna-1.0-py3-none-any")));
+
+    // The extracted trees are reused on the next resolution.
+    let again = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("idna==1.0").unwrap(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(again.path, older.path);
+
+    // A version the cache does not hold is still the loud offline error.
+    let err = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("idna==3.0").unwrap(),
+        true,
+    )
+    .expect_err("idna 3.0 is not cached");
+    assert!(err.to_string().contains("offline"), "{err:?}");
+}
+
+#[test]
+fn cached_sdist_resolves_to_its_package_directory() {
+    // An sdist tarball extracts to `{stem}/{dist}-{version}/{package}`;
+    // the resolved path is the importable package directory.
+    let scratch = Scratch::new("cache-sdist");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("charset_normalizer");
+    fs::create_dir_all(&dist_dir).unwrap();
+    let artifact = dist_dir.join("charset-normalizer-3.4.0.tar.gz");
+    {
+        let gz = flate2::write::GzEncoder::new(
+            fs::File::create(&artifact).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut tar = tar::Builder::new(gz);
+        let mut add = |name: &str, body: &str| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, name, body.as_bytes()).unwrap();
+        };
+        add(
+            "charset-normalizer-3.4.0/PKG-INFO",
+            "Metadata-Version: 2.1\nName: charset-normalizer\nVersion: 3.4.0\n",
+        );
+        add(
+            "charset-normalizer-3.4.0/pyproject.toml",
+            "[project]\nname = \"charset-normalizer\"\nversion = \"3.4.0\"\n",
+        );
+        add("charset-normalizer-3.4.0/charset_normalizer/__init__.py", "VERSION = \"3.4.0\"\n");
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+    let dep = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("charset-normalizer>=3").unwrap(),
+        true,
+    )
+    .expect("sdist from the cache");
+    assert_eq!(dep.version, "3.4.0");
+    assert_eq!(dep.import_name, "charset_normalizer");
+    assert!(dep.path.join("__init__.py").is_file(), "{}", dep.path.display());
+    assert!(dep.path.starts_with(dist_dir.join("extracted/charset-normalizer-3.4.0")));
 }
 
 #[test]
