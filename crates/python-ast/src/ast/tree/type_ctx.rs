@@ -1710,7 +1710,31 @@ pub fn render_typed(
     if matches!(expected, TypeInfo::PyValue) && crate::is_none_expr(expr) {
         return Ok(quote!(stdpython::PyValue::None_));
     }
-    let actual = infer_type(None, expr, &options, &symbols);
+    // The ctx-less inference answers PyObject for a SELF-FIELD read (the
+    // class table needs the enclosing class), and the Option-fabrication
+    // below then assumes the value is an Option of the EXPECTED type —
+    // right for a name bound to a boxed value (`conn: Option<PyValue>`)
+    // but wrong for a genuinely-typed field: `self.encoding` of type
+    // `Option<String>` into a `PyValue` slot fabricated `Option<PyValue>`
+    // and rendered `.unwrap_or(PyValue::None_)` on the Option<String>
+    // tokens (E0308 — charset_normalizer's CliDetectionResult.__dict__,
+    // round 107). A self-rooted attribute infers with the class context
+    // so its REAL field type reaches the coercion — the Option<T> →
+    // PyValue arm then boxes Some and maps None to PyValue::None_
+    // (Python's dict), and the Option<T> → T arm keeps the round-83/104
+    // loud unwrap for a concrete slot.
+    let actual = infer_type(
+        if matches!(expr, ExprType::Attribute(_))
+            && crate::ast::tree::attribute::chain_root_is_self(expr)
+        {
+            Some(&ctx)
+        } else {
+            None
+        },
+        expr,
+        &options,
+        &symbols,
+    );
     // Round 81: a NARROWED name read already converts to the member type
     // (name.rs: `(x).as_bytes().unwrap().to_vec()` for a Bytes-narrowed
     // boxed value, `(x).as_str().unwrap().to_string()` for String). The

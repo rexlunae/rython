@@ -6475,6 +6475,103 @@ fn mutating_property_reads_and_tuple_membership_match_python() {
 }
 
 #[test]
+fn option_fields_box_into_any_dicts_and_container_returns_unwrap() {
+    // Round 107: four move/coercion shapes in one transcript.
+    // - A `str | None` field read into a `dict[str, Any]` literal
+    //   (CliDetectionResult.__dict__): the ctx-less inference could not
+    //   resolve the SELF-FIELD, so the Option-fabrication assumed
+    //   `Option<PyValue>` and rendered `.unwrap_or(PyValue::None_)` on
+    //   the Option<String> (E0308). The field now infers with the class
+    //   context and boxes through the Some/None match — Python's dict.
+    // - An `Option<list[str]>` field RETURNED from a `-> list[str]`
+    //   function (alphabets — `_unicode_ranges`): fn_return_typed
+    //   normalizes scalars only, so the round-103 return coercion never
+    //   unwrapped a container-typed return (E0308 ×2); container
+    //   annotations now join the typed-return shapes.
+    // - `str(bytes, encoding)` where the encoding is a REUSED local and
+    //   a `str | None` field (models.py's __str__/utils.py): the codec
+    //   argument is borrowed, never moved (E0507/E0382).
+    // - A generator `yield from self.<field>` clones the field instead of
+    //   moving it out of the receiver (E0507).
+    // Transcript pinned against python3.
+    let scratch = Scratch::new("optbox");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "from typing import Any, Dict, Iterator, List, Optional\n",
+            "\n",
+            "\n",
+            "class Rec:\n",
+            "    def __init__(self, name: str, enc: Optional[str]):\n",
+            "        self.name: str = name\n",
+            "        self.encoding: Optional[str] = enc\n",
+            "        self._ranges: Optional[List[str]] = None\n",
+            "        self._items: List[str] = []\n",
+            "\n",
+            "    def as_dict(self) -> Dict[str, Any]:\n",
+            "        return {\"name\": self.name, \"encoding\": self.encoding}\n",
+            "\n",
+            "    def alphabets(self) -> List[str]:\n",
+            "        if self._ranges is not None:\n",
+            "            return self._ranges\n",
+            "        self._ranges = [\"a\", \"b\"]\n",
+            "        return self._ranges\n",
+            "\n",
+            "    def decode_twice(self, data: bytes) -> str:\n",
+            "        enc = self.encoding or \"utf-8\"\n",
+            "        first = str(data, enc)\n",
+            "        second = str(data[:1], enc)\n",
+            "        return first + second\n",
+            "\n",
+            "    def all_items(self) -> Iterator[str]:\n",
+            "        yield from self._items\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    r = Rec(\"x\", \"utf-8\")\n",
+            "    print(r.as_dict())\n",
+            "    print(r.alphabets())\n",
+            "    print(r.alphabets())\n",
+            "    r2 = Rec(\"y\", None)\n",
+            "    print(r2.as_dict())\n",
+            "    print(r2.decode_twice(\"hi\".encode()))\n",
+            "    r._items = [\"bb\", \"a\"]\n",
+            "    print(sorted(r.all_items()))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "{'name': 'x', 'encoding': 'utf-8'}",
+            "['a', 'b']",
+            "['a', 'b']",
+            "{'name': 'y', 'encoding': None}",
+            "hih",
+            "['a', 'bb']",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {
     // Round 41: a trait-DEFAULT body that formats `self` in an exception
     // message (`raise PoolError(self)` — urllib3's _get_conn raises

@@ -3563,6 +3563,28 @@ impl FunctionDef {
                             && !options.fn_return_is_pyvalue
                             && !options.fn_return_is_option
                     })
+            })
+            // A declared CONTAINER return (`-> list[str]`, `-> dict[str,
+            // int]`, `-> tuple[...]`): the return-site Option-coercion
+            // compares an Option-typed return value's INNER against this
+            // (round 107 — an `Option<Vec<String>>` field like
+            // charset_normalizer's `_unicode_ranges` returned from a
+            // `-> list[str]` alphabets never unwrapped while the typed
+            // shape was None; the scalar normalization above cannot name
+            // a container).
+            .or_else(|| {
+                self.returns
+                    .as_deref()
+                    .and_then(|ann| crate::resolve_alias_typeinfo(ann, &symbols, &options))
+                    .filter(|t| {
+                        matches!(
+                            t,
+                            crate::TypeInfo::Vec(_)
+                                | crate::TypeInfo::Dict(_, _)
+                                | crate::TypeInfo::Tuple(_)
+                        ) && !options.fn_return_is_pyvalue
+                            && !options.fn_return_is_option
+                    })
             });
 
         // A `-> List[Union[...]]` return whose element resolves to the
