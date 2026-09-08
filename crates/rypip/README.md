@@ -124,13 +124,24 @@ not already vendored: rypip queries the PyPI JSON API, picks the newest
 version satisfying the PEP 440 specifiers, downloads the pure-Python wheel
 (or sdist), extracts it into a cache (`$RYPIP_CACHE_DIR` or
 `~/.cache/rypip`), and transpiles it into the generated crate beside the
-package's own modules.
+package's own modules. Every downloaded artifact extracts into its own
+directory (`<cache>/<dist>/extracted/<artifact stem>/`), so two cached
+versions of one distribution never share a tree; an extraction is
+complete only once its `.rypip-complete` marker is in place (the archive
+unpacks into a sibling directory that is renamed in; a failed or crashed
+extraction's sibling is removed, and two resolvers extracting the same
+artifact at once share the first complete tree), and a verified
+download records its sha256 beside the artifact (`<file>.sha256`). A
+cached artifact is reused only through that digest — one without it is
+fetched again, one that no longer matches is a loud error — and among
+several cached versions satisfying a requirement the newest wins, as it
+does online.
 
 - Explicit `rython.toml` `[python-modules]` entries always win over a
   fetched dependency (pin a local copy by vendoring it).
 - `--no-deps` skips resolution entirely; `RYPIP_OFFLINE=1` fails loudly
-  instead of fetching (a vendored or already-cached dependency still
-  resolves offline).
+  instead of fetching (a vendored dependency, or any cached artifact that
+  satisfies the requirement, still resolves offline).
 - The dependency's source must fit rython's typed subset, like any other
   vendored library — a failed conversion names the module and construct.
 

@@ -1007,15 +1007,34 @@ impl<'a> CodeGen for Assign {
                     // encode_multipart_formdata). Only fires when a slot
                     // pairing actually needs typing; otherwise the plain
                     // whole-tuple store below keeps its exact shape.
+                    // A None into a BOXED slot (`old_pool, self.pool =
+                    // self.pool, None` — urllib3's HTTPConnectionPool.close,
+                    // where the pool field is a boxed PyValue) is the boxed
+                    // None, like the single-target store: the slot's type
+                    // is the name's recorded type or the owner class's
+                    // field type.
+                    let is_boxed_none_pair = |t: &ExprType, v: &ExprType| -> bool {
+                        crate::is_none_expr(v)
+                            && match t {
+                                ExprType::Name(n) => matches!(
+                                    options.name_types.get(&n.id),
+                                    Some(crate::TypeInfo::PyValue)
+                                ) || options.pyvalue_into_params.contains(&n.id),
+                                ExprType::Attribute(_) => attr_field_is_pyvalue(t),
+                                _ => false,
+                            }
+                    };
+                    let is_owned_pair = |t: &ExprType, v: &ExprType| -> bool {
+                        matches!(t, ExprType::Name(n)
+                            if matches!(options.name_types.get(&n.id),
+                                Some(crate::TypeInfo::String))
+                                && matches!(v, ExprType::Constant(c)
+                                    if matches!(&c.0, Some(litrs::Literal::String(_)))))
+                    };
                     let needs_slot_typing = matches!(&value_expr, ExprType::Tuple(vt)
                         if vt.elts.len() == tuple_target.elts.len()
                             && tuple_target.elts.iter().zip(vt.elts.iter()).any(
-                                |(t, v)| matches!(t, ExprType::Name(n)
-                                    if matches!(options.name_types.get(&n.id),
-                                        Some(crate::TypeInfo::String))
-                                        && matches!(v, ExprType::Constant(c)
-                                            if matches!(&c.0, Some(litrs::Literal::String(_))))
-                                )
+                                |(t, v)| is_owned_pair(t, v) || is_boxed_none_pair(t, v)
                             ));
                     if needs_slot_typing {
                         let ExprType::Tuple(vt) = &value_expr else {
@@ -1023,18 +1042,18 @@ impl<'a> CodeGen for Assign {
                         };
                         let mut rendered = Vec::with_capacity(vt.elts.len());
                         for (t, v) in tuple_target.elts.iter().zip(vt.elts.iter()) {
-                            // Only the STR-LITERAL-INTO-STRING-SLOT pairings
-                            // re-render typed; every other element keeps the
-                            // plain render so unrelated slots (a dropped
+                            // Only the STR-LITERAL-INTO-STRING-SLOT and the
+                            // NONE-INTO-BOXED-SLOT pairings re-render typed;
+                            // a self-field read beside them clones out of
+                            // the shared receiver (the swap idiom reads the
+                            // field it re-stores); every other element keeps
+                            // the plain render so unrelated slots (a dropped
                             // call landing as PyValue::None_ into a
                             // StrOrBytes-typed body slot) stay exactly as
                             // before.
-                            let is_owned_pair = matches!(t, ExprType::Name(n)
-                                if matches!(options.name_types.get(&n.id),
-                                    Some(crate::TypeInfo::String))
-                                    && matches!(v, ExprType::Constant(c)
-                                        if matches!(&c.0, Some(litrs::Literal::String(_)))));
-                            if is_owned_pair {
+                            if is_boxed_none_pair(t, v) {
+                                rendered.push(quote!(stdpython::PyValue::None_));
+                            } else if is_owned_pair(t, v) {
                                 rendered.push(crate::render_typed(
                                     v,
                                     ctx.clone(),
@@ -1042,6 +1061,19 @@ impl<'a> CodeGen for Assign {
                                     symbols.clone(),
                                     Some(crate::TypeInfo::String),
                                 )?);
+                            } else if matches!(v, ExprType::Attribute(a)
+                                if crate::ast::tree::visit::is_self(a.value.as_ref()))
+                                && attr_field_is_pyvalue(v)
+                            {
+                                // The boxed field is clone-safe (the Arc
+                                // copy — Python's reference); the read
+                                // clones whichever class in the chain
+                                // owns the field (a derived pool reads
+                                // its base's `pool`).
+                                let tokens = v
+                                    .clone()
+                                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                rendered.push(quote!((#tokens).clone()));
                             } else {
                                 rendered.push(
                                     v.clone()

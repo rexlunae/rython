@@ -71,6 +71,48 @@ pub fn stmt_bodies(s: &Statement) -> Vec<&[Statement]> {
 }
 
 
+/// `stmt_bodies`, mutably: the SAME enumeration of body-carrying forms
+/// (a new statement form is added to both, side by side), for the
+/// passes that rewrite statements in place (`walk_stmts_mut`).
+pub fn stmt_bodies_mut(s: &mut Statement) -> Vec<&mut Vec<Statement>> {
+    match &mut s.statement {
+        StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => vec![&mut f.body],
+        StatementType::ClassDef(c) => vec![&mut c.body],
+        StatementType::If(i) => vec![&mut i.body, &mut i.orelse],
+        StatementType::For(f) => vec![&mut f.body, &mut f.orelse],
+        StatementType::AsyncFor(f) => vec![&mut f.body, &mut f.orelse],
+        StatementType::While(w) => vec![&mut w.body, &mut w.orelse],
+        StatementType::With(w) => vec![&mut w.body],
+        StatementType::AsyncWith(w) => vec![&mut w.body],
+        StatementType::Try(t) => std::iter::once(&mut t.body)
+            .chain(t.handlers.iter_mut().map(|h| &mut h.body))
+            .chain([&mut t.orelse, &mut t.finalbody])
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `walk_stmts`, mutably and in source order: `f` sees each statement
+/// (and may rewrite it) before the walk descends into its bodies;
+/// `Flow::Skip` leaves a statement's bodies to `f` (a pass that opens a
+/// new scope there recurses itself), `Flow::Stop` ends the walk.
+pub fn walk_stmts_mut(stmts: &mut [Statement], f: &mut impl FnMut(&mut Statement) -> Flow) -> bool {
+    for s in stmts.iter_mut() {
+        match f(s) {
+            Flow::Stop => return false,
+            Flow::Skip => continue,
+            Flow::Continue => {
+                for body in stmt_bodies_mut(s) {
+                    if !walk_stmts_mut(body, f) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 /// The nested statement bodies a walk with `descend` enters.
 pub fn stmt_bodies_for(s: &Statement, descend: Descend) -> Vec<&[Statement]> {
     if descend != Descend::All && opens_scope(s) {

@@ -11999,23 +11999,103 @@ fn resolved_import_try_splices_body_and_drops_dead_handler() {
 }
 
 #[test]
-fn exception_union_parameter_boxes_to_pyvalue() {
+fn exception_union_parameter_is_a_pyexception() {
     // `err: BaseSSLError | OSError | SocketTimeout` (urllib3's
     // _raise_timeout): exception members — by naming convention or via
-    // the imported-alias table — box the parameter as PyValue instead of
-    // rendering the union literally (invalid Rust).
+    // the imported-alias table — make the parameter the runtime's one
+    // exception type (issue #335; it used to box as PyValue, which holds
+    // no exception, so a caught exception never fit the slot) instead of
+    // rendering the union literally (invalid Rust). A union MIXING an
+    // exception with a boxable member still boxes.
     let out = compile(
         "from socket import timeout as SocketTimeout\n\
          \n\
          def f(err: BaseSSLError | OSError | SocketTimeout) -> None:\n\
+         \x20   pass\n\
+         \n\
+         def g(err: OSError | str | None) -> None:\n\
          \x20   pass\n",
         "excunion.py",
     );
     assert!(
-        out.contains("err : stdpython :: PyValue"),
-        "an all-exception union parameter must box: {}",
+        out.contains("err : PyException"),
+        "an all-exception union parameter is a PyException: {}",
         out
     );
+    assert!(
+        out.contains("g (err : stdpython :: PyValue)"),
+        "a mixed union parameter still boxes: {}",
+        out
+    );
+    // A class OF THE CRATE is judged by the crate's one exception
+    // authority — the closure's `is_exception_class`: its ancestry
+    // through the crate's classes, the builtin exceptions and the
+    // documented naming convention (§8.1) — never by a second walk
+    // (Devin review on #342). Value classes outside all of that are not
+    // exceptions; a class extending one through a parent is.
+    let out = compile(
+        "class Parse:\n\
+         \x20   def __init__(self, line: int) -> None:\n\
+         \x20       self.line = line\n\
+         \n\
+         class Lex:\n\
+         \x20   def __init__(self, col: int) -> None:\n\
+         \x20       self.col = col\n\
+         \n\
+         class Failed(ValueError):\n\
+         \x20   pass\n\
+         \n\
+         class Worse(Failed):\n\
+         \x20   pass\n\
+         \n\
+         def report(e: Parse | Lex) -> None:\n\
+         \x20   pass\n\
+         \n\
+         def handle(e: Worse | OSError) -> None:\n\
+         \x20   pass\n",
+        "valueclasses.py",
+    );
+    assert!(
+        !out.contains("report (e : PyException)"),
+        "value classes are not exception parameters: {}",
+        out
+    );
+    assert!(
+        out.contains("handle (e : PyException)"),
+        "a crate class extending a builtin exception (through a parent) is: {}",
+        out
+    );
+    // Every union spelling is the same rule (Devin review on #342):
+    // `Union[...]`, `typing.Union[...]`, `Optional[...]`, nested.
+    let out = compile(
+        "import typing\n\
+         from typing import Optional, Union\n\
+         \n\
+         def a(e: Union[OSError, TimeoutError]) -> None:\n\
+         \x20   pass\n\
+         \n\
+         def b(e: typing.Union[OSError, TimeoutError]) -> None:\n\
+         \x20   pass\n\
+         \n\
+         def c(e: Optional[OSError]) -> None:\n\
+         \x20   pass\n\
+         \n\
+         def d(e: typing.Optional[Union[OSError, ValueError]]) -> None:\n\
+         \x20   pass\n\
+         \n\
+         def m(e: Union[OSError, int]) -> None:\n\
+         \x20   pass\n",
+        "typingunions.py",
+    );
+    assert!(out.contains("a (e : PyException)"), "Union[...]: {}", out);
+    assert!(out.contains("b (e : PyException)"), "typing.Union[...]: {}", out);
+    assert!(out.contains("c (e : Option < PyException >)"), "Optional[...]: {}", out);
+    assert!(
+        out.contains("d (e : Option < PyException >)"),
+        "typing.Optional[Union[...]]: {}",
+        out
+    );
+    assert!(out.contains("m (e : stdpython :: PyValue)"), "a mixed Union still boxes: {}", out);
     assert!(
         !out.contains("| (SocketTimeout)"),
         "the union must not render literally: {}",
@@ -15071,9 +15151,22 @@ fn a_none_stored_local_into_a_boxed_class_param_unwraps() {
         ),
         "boxedparam.py",
     );
+    // Issue #335: the local's binding IS the boxed value (its None store
+    // is the boxed None, never an Option slot — the box already contains
+    // None), so the argument passes through unchanged.
     assert!(
-        out.contains("(conn) . unwrap_or (stdpython :: PyValue :: None_)"),
-        "the None-stored local must unwrap to the boxed value with Python's None passing through: {}",
+        out.contains("conn = PyValue :: None_ ;"),
+        "the None store into the boxed local is the boxed None: {}",
+        out
+    );
+    assert!(
+        out.contains("_prepare_proxy (conn) ?"),
+        "the boxed local passes into the boxed slot unchanged: {}",
+        out
+    );
+    assert!(
+        !out.contains("unwrap_or (stdpython :: PyValue :: None_)"),
+        "no Option unwrap remains on a boxed binding: {}",
         out
     );
 }
@@ -22246,4 +22339,318 @@ fn a_cyclic_exception_chain_is_refused() {
         "raise_cyclic_bases.py",
     );
     assert!(err.contains("cyclic inheritance"), "error: {}", err);
+}
+
+#[test]
+fn comprehension_fields_type_their_elements_through_the_generator_targets() {
+    // Issue #335 (Devin review on #342, round 3): a field assigned a list
+    // comprehension types its element through the comprehension scope's
+    // targets — `m` over `modes.split(",")` is a str, so `m.strip()` is a
+    // String element; `len(x)` over a `list[str]` parameter is an int
+    // element; a call into a class-returning function is that class.
+    let out = compile(
+        "class Decoder:\n\
+         \x20   pass\n\
+         \n\
+         def make(name: str) -> Decoder:\n\
+         \x20   return Decoder()\n\
+         \n\
+         class Multi:\n\
+         \x20   def __init__(self, modes: str, xs: list[str]) -> None:\n\
+         \x20       self._names = [m.strip() for m in modes.split(\",\")]\n\
+         \x20       self._lens = [len(x) for x in xs]\n\
+         \x20       self._decoders = [make(m) for m in modes.split(\",\")]\n",
+        "compfields.py",
+    );
+    assert!(out.contains("_names : Vec < String >"), "str element over a str target: {}", out);
+    assert!(out.contains("_lens : Vec < i64 >"), "len element over a list[str] target: {}", out);
+    assert!(out.contains("_decoders : Vec < Decoder >"), "class element: {}", out);
+}
+
+
+#[test]
+fn quoted_exception_union_annotations_type_the_parameter_and_its_calls_alike() {
+    // Devin review on #342, round 4: a QUOTED union of user exception
+    // classes is evaluated before the body's name types derive, so the
+    // signature (`Option<PyException>` / `PyException`) and a call site
+    // passing a caught exception agree.
+    let out = compile(
+        "from typing import Optional, Union\n\
+         \n\
+         class MyError(Exception):\n\
+         \x20   pass\n\
+         \n\
+         def maybe(err: \"Optional[MyError]\") -> str:\n\
+         \x20   if err is None:\n\
+         \x20       return \"nothing\"\n\
+         \x20   return \"got \" + str(err)\n\
+         \n\
+         def either(err: \"Union[MyError, ValueError]\") -> str:\n\
+         \x20   return \"got \" + str(err)\n\
+         \n\
+         def go() -> str:\n\
+         \x20   try:\n\
+         \x20       raise MyError(\"x\")\n\
+         \x20   except MyError as e:\n\
+         \x20       return maybe(e) + either(e)\n",
+        "quoted.py",
+    );
+    assert!(out.contains("err : Option < PyException >"), "quoted Optional: {}", out);
+    assert!(
+        out.contains("maybe (Some ((e) . clone ()))"),
+        "the caught exception Some-wraps, cloned inside the wrap (it is reused): {}",
+        out
+    );
+    assert!(out.contains("either ((e) . clone ())"), "the union takes it bare: {}", out);
+}
+
+#[test]
+fn bare_imports_of_typing_are_silent_and_of_runtime_annotation_modules_are_loud() {
+    // Devin review on #342, round 4: `import typing` emits nothing
+    // (annotation-only); `import abc`/`contextlib`/`dataclasses` emit
+    // nothing TOO but warn — their items are modeled under from-import
+    // names only, so a module-qualified use is not silently accepted.
+    let (out, warnings) = compile_with_warnings(
+        "import typing\nimport abc\nimport contextlib\n\ndef f(x: typing.Optional[int]) -> int:\n    return 0 if x is None else x\n",
+        "bare.py",
+    );
+    assert!(!out.contains("crate :: typing"), "{}", out);
+    assert!(!out.contains("crate :: abc"), "{}", out);
+    assert!(!out.contains("crate :: contextlib"), "{}", out);
+    assert!(warnings.iter().any(|w| w.contains("import `abc` is dropped")), "{warnings:?}");
+    assert!(warnings.iter().any(|w| w.contains("import `contextlib` is dropped")), "{warnings:?}");
+    assert!(!warnings.iter().any(|w| w.contains("import `typing` is dropped")), "{warnings:?}");
+}
+
+#[test]
+fn a_convention_named_value_binding_is_not_an_exception_union_member() {
+    // Devin review on #342, round 6: `NetworkError = 1` is a value, so
+    // `NetworkError | ValueError` is a MIXED union (boxed), not the
+    // exception type; an alias to an exception name still is one.
+    let out = compile(
+        "NetworkError = 1\n\
+         Alias = ValueError\n\
+         \n\
+         def mixed(err: NetworkError | ValueError) -> str:\n\
+         \x20   return str(err)\n\
+         \n\
+         def aliased(err: Alias | OSError) -> str:\n\
+         \x20   return str(err)\n",
+        "convention_value.py",
+    );
+    // `1 | ValueError` is not a type at all (Python raises at the
+    // annotation): the only rule is that it is NOT the exception type —
+    // the rendering is the non-type union's, which rustc rejects loudly.
+    assert!(!out.contains("mixed (err : PyException)"), "a bound value is not an exception: {}", out);
+    assert!(out.contains("aliased (err : PyException)"), "an alias to an exception is one: {}", out);
+}
+
+#[test]
+fn an_exception_alias_cycle_converts_without_overflowing() {
+    // Devin review on #342, round 7: `A = B; B = A` — the member
+    // classifier ends the walk at the name it already followed.
+    let out = compile(
+        "A = B\n\
+         B = A\n\
+         \n\
+         def f(err: A | ValueError) -> str:\n\
+         \x20   return str(err)\n",
+        "alias_cycle.py",
+    );
+    assert!(out.contains("pub fn f ("), "the conversion returns: {}", out);
+}
+
+#[test]
+fn quoted_scalar_and_optional_annotations_type_the_local_like_the_plain_spelling() {
+    // Devin review on #342, round 7: the parser bridge evaluates a
+    // quoted annotation, so the local type pass and optional-name
+    // seeding see `str` / `Optional[str]` — `isinstance(x, str)` folds
+    // like the plain spelling and the Optional narrows as an Option.
+    let quoted = compile(
+        "from typing import Optional\n\
+         \n\
+         def scalar(x: \"str\") -> str:\n\
+         \x20   if isinstance(x, str):\n\
+         \x20       return \"str \" + x\n\
+         \x20   return \"other\"\n\
+         \n\
+         def opt(x: \"Optional[str]\") -> str:\n\
+         \x20   if x is None:\n\
+         \x20       return \"none\"\n\
+         \x20   return x.upper()\n",
+        "quoted_scalar.py",
+    );
+    let plain = compile(
+        "from typing import Optional\n\
+         \n\
+         def scalar(x: str) -> str:\n\
+         \x20   if isinstance(x, str):\n\
+         \x20       return \"str \" + x\n\
+         \x20   return \"other\"\n\
+         \n\
+         def opt(x: Optional[str]) -> str:\n\
+         \x20   if x is None:\n\
+         \x20       return \"none\"\n\
+         \x20   return x.upper()\n",
+        "plain_scalar.py",
+    );
+    assert_eq!(quoted, plain, "the quoted spelling lowers exactly like the plain one");
+}
+
+#[test]
+fn a_module_qualified_exception_member_takes_the_exception_rule() {
+    // Devin review on #342, round 8: `errors.MyError | OSError` — the
+    // qualified member is judged through the crate's module authorities
+    // when the module is the crate's, and by the naming convention when
+    // it is not (here `errors` is external to this one-module crate).
+    let out = compile(
+        "import errors\n\
+         \n\
+         def handle(err: errors.MyError | OSError) -> str:\n\
+         \x20   return \"handled \" + str(err)\n\
+         \n\
+         def plain(x: errors.Thing | int) -> str:\n\
+         \x20   return str(x)\n",
+        "qualified.py",
+    );
+    assert!(out.contains("handle (err : PyException)"), "{}", out);
+    assert!(!out.contains("plain (x : PyException)"), "a non-exception qualified member: {}", out);
+}
+
+#[test]
+fn aliased_and_typing_extensions_qualified_annotations_lower_like_typing() {
+    // Devin review on #342, round 9: `import typing as t` (the alias
+    // root rewritten to `typing` when the module is built),
+    // `typing_extensions.Optional[int]` (the same names), and an aliased
+    // typing_extensions import all lower exactly like `Optional[int]`.
+    let plain = compile(
+        "from typing import Optional\n\
+         \n\
+         def f(x: Optional[int]) -> int:\n\
+         \x20   if x is None:\n\
+         \x20       return 0\n\
+         \x20   return x\n",
+        "plain_opt.py",
+    );
+    let body_of = |out: &str| out[out.find("pub fn f").expect("fn f")..].to_string();
+    for (name, src) in [
+        (
+            "typing as t",
+            "import typing as t\n\ndef f(x: t.Optional[int]) -> int:\n    if x is None:\n        return 0\n    return x\n",
+        ),
+        (
+            "typing_extensions",
+            "import typing_extensions\n\ndef f(x: typing_extensions.Optional[int]) -> int:\n    if x is None:\n        return 0\n    return x\n",
+        ),
+        (
+            "typing_extensions as te",
+            "import typing_extensions as te\n\ndef f(x: te.Optional[int]) -> int:\n    if x is None:\n        return 0\n    return x\n",
+        ),
+    ] {
+        let out = compile(src, "aliased_opt.py");
+        assert!(out.contains("x : Option < i64 >"), "{name}: {}", out);
+        assert_eq!(body_of(&out), body_of(&plain), "{name} lowers like the plain spelling");
+        assert!(!out.contains("crate :: typing"), "{name}: {}", out);
+    }
+}
+
+#[test]
+fn typing_aliases_reach_type_checking_imports_annotated_assignments_and_respect_shadowing() {
+    // Devin review on #342, round 10: the alias is collected under
+    // `if TYPE_CHECKING:`, a value-bearing annotated assignment is
+    // rewritten, and a scope that rebinds the alias name to another
+    // import keeps its own binding.
+    let out = compile(
+        "from typing import TYPE_CHECKING\n\
+         \n\
+         if TYPE_CHECKING:\n\
+         \x20   import typing as t\n\
+         \n\
+         LIMIT: t.Optional[int] = None\n\
+         \n\
+         def f(x: t.Optional[int]) -> int:\n\
+         \x20   y: t.Optional[int] = None\n\
+         \x20   if x is None:\n\
+         \x20       return 0 if y is None else y\n\
+         \x20   return x\n\
+         \n\
+         def shadow() -> int:\n\
+         \x20   import os as t\n\
+         \x20   return 1\n",
+        "type_checking_alias.py",
+    );
+    assert!(out.contains("x : Option < i64 >"), "the parameter through a TYPE_CHECKING alias: {}", out);
+    assert!(out.contains("pub fn shadow"), "the shadowing scope converts: {}", out);
+    assert!(!out.contains("crate :: typing"), "{}", out);
+}
+
+#[test]
+fn typing_aliases_are_scoped_and_source_ordered() {
+    // Devin review on #342, round 11: an alias imported only inside a
+    // nested function does not reach an outer annotation; in one scope an
+    // annotation before a rebinding sees the alias and one after does
+    // not; a conditional import declares the alias from its point on.
+    let out = compile(
+        "import typing as t\n\
+         \n\
+         def before(x: t.Optional[int]) -> int:\n\
+         \x20   return 0 if x is None else x\n\
+         \n\
+         t = 3\n\
+         \n\
+         def after(x: t) -> int:\n\
+         \x20   return 0\n\
+         \n\
+         def inner_only() -> int:\n\
+         \x20   import typing as u\n\
+         \x20   y: u.Optional[int] = None\n\
+         \x20   return 0 if y is None else y\n\
+         \n\
+         def outer(x: u) -> int:\n\
+         \x20   return 0\n\
+         \n\
+         if True:\n\
+         \x20   import typing as w\n\
+         \n\
+         def later(x: w.Optional[int]) -> int:\n\
+         \x20   return 0 if x is None else x\n",
+        "scoped_alias.py",
+    );
+    let sig = |name: &str| {
+        let i = out.find(&format!("pub fn {name} (")).unwrap_or_else(|| panic!("{name}: {out}"));
+        out[i..i + 80].to_string()
+    };
+    assert!(sig("before").contains("x : Option < i64 >"), "{}", sig("before"));
+    assert!(!sig("after").contains("Option"), "a rebinding ends the alias: {}", sig("after"));
+    assert!(!sig("outer").contains("Option"), "a nested-only alias stays nested: {}", sig("outer"));
+    assert!(sig("later").contains("x : Option < i64 >"), "a conditional import declares: {}", sig("later"));
+}
+
+#[test]
+fn bound_functions_and_known_module_imports_are_not_exception_union_members() {
+    // Devin review on #342, round 12: the naming convention applies to
+    // genuinely unresolved names only — a local function named
+    // `ParseError`, a stdlib item named `LoadError` are not exception
+    // classes; an import from a module the crate does not hold still is
+    // (the documented rule for an absent external name).
+    let out = compile(
+        "from os import LoadError\n\
+         from helpers import RemoteError\n\
+         \n\
+         def ParseError(text: str) -> int:\n\
+         \x20   return len(text)\n\
+         \n\
+         def local_fn(err: ParseError | ValueError) -> str:\n\
+         \x20   return str(err)\n\
+         \n\
+         def stdlib_item(err: LoadError | ValueError) -> str:\n\
+         \x20   return str(err)\n\
+         \n\
+         def external(err: RemoteError | ValueError) -> str:\n\
+         \x20   return str(err)\n",
+        "convention_bound.py",
+    );
+    assert!(!out.contains("local_fn (err : PyException)"), "a bound function: {}", out);
+    assert!(!out.contains("stdlib_item (err : PyException)"), "a stdlib item: {}", out);
+    assert!(out.contains("external (err : PyException)"), "an absent external name: {}", out);
 }

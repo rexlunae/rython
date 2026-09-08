@@ -2,6 +2,7 @@
 //! setup.py) and PEP 440/508 dependency resolution.
 
 use std::fs;
+use std::path::{Path, PathBuf};
 
 mod common;
 
@@ -314,6 +315,587 @@ fn resolve_requirement_from_cache_requires_network_or_cache() {
     let req = parse_requirement("this-package-definitely-does-not-exist-rython-test").unwrap();
     let err = rypip::resolve::resolve_dependency(&req, true).expect_err("offline + uncached");
     assert!(err.to_string().contains("offline"), "{:?}", err);
+}
+
+/// Write a pure-Python wheel (a zip) with the given `path -> contents`
+/// entries into `dir`, named `{dist}-{version}-py3-none-any.whl`.
+fn write_wheel(dir: &Path, dist: &str, version: &str, files: &[(&str, &str)]) -> PathBuf {
+    write_wheel_tagged(dir, dist, version, "py3-none-any", files)
+}
+
+/// `write_wheel` with an explicit compatibility tag (a native wheel is
+/// `cp312-cp312-manylinux_2_17_x86_64`).
+fn write_wheel_tagged(dir: &Path, dist: &str, version: &str, tag: &str, files: &[(&str, &str)]) -> PathBuf {
+    use std::io::Write;
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join(format!("{dist}-{version}-{tag}.whl"));
+    let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored);
+    for (name, contents) in files {
+        zip.start_file(*name, options).unwrap();
+        zip.write_all(contents.as_bytes()).unwrap();
+    }
+    let info = format!("{dist}-{version}.dist-info");
+    zip.start_file(format!("{info}/METADATA"), options).unwrap();
+    zip.write_all(format!("Metadata-Version: 2.1\nName: {dist}\nVersion: {version}\n").as_bytes())
+        .unwrap();
+    zip.start_file(format!("{info}/top_level.txt"), options).unwrap();
+    zip.write_all(format!("{dist}\n").as_bytes()).unwrap();
+    zip.finish().unwrap();
+    record_digest(&path);
+    path
+}
+
+/// Write the digest sidecar a verified download leaves beside a cached
+/// artifact (the offline path reuses an artifact only through it).
+fn record_digest(artifact: &Path) {
+    use sha2::{Digest, Sha256};
+    let digest: String = Sha256::digest(fs::read(artifact).unwrap())
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    fs::write(sidecar_of(artifact), format!("{digest}\n")).unwrap();
+}
+
+fn sidecar_of(artifact: &Path) -> PathBuf {
+    let mut name = artifact.file_name().unwrap().to_os_string();
+    name.push(".sha256");
+    artifact.with_file_name(name)
+}
+
+/// Write an sdist tarball `{dist}-{version}.tar.gz` whose top directory
+/// holds PKG-INFO, pyproject.toml and the package, plus its digest.
+fn write_sdist(dir: &Path, dist: &str, version: &str, package: &str) -> PathBuf {
+    fs::create_dir_all(dir).unwrap();
+    let artifact = dir.join(format!("{dist}-{version}.tar.gz"));
+    {
+        let gz = flate2::write::GzEncoder::new(
+            fs::File::create(&artifact).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut tar = tar::Builder::new(gz);
+        let mut add = |name: &str, body: &str| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, name, body.as_bytes()).unwrap();
+        };
+        let top = format!("{dist}-{version}");
+        add(
+            &format!("{top}/PKG-INFO"),
+            &format!("Metadata-Version: 2.1\nName: {dist}\nVersion: {version}\n"),
+        );
+        add(
+            &format!("{top}/pyproject.toml"),
+            &format!("[project]\nname = \"{dist}\"\nversion = \"{version}\"\n"),
+        );
+        add(
+            &format!("{top}/{package}/__init__.py"),
+            &format!("VERSION = \"{version}\"\n"),
+        );
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+    record_digest(&artifact);
+    artifact
+}
+
+#[test]
+fn cached_versions_of_one_distribution_extract_apart() {
+    // Two versions of one distribution in the cache: each resolves to its
+    // OWN extracted tree. They used to extract into one shared directory,
+    // so a module the newer version added (idna 3.19's cli.py) survived
+    // into the older version's tree and was converted as part of it.
+    let scratch = Scratch::new("cache-versions");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("idna");
+    write_wheel(
+        &dist_dir,
+        "idna",
+        "1.0",
+        &[("idna/__init__.py", "VERSION = \"1.0\"\n")],
+    );
+    write_wheel(
+        &dist_dir,
+        "idna",
+        "2.0",
+        &[
+            ("idna/__init__.py", "VERSION = \"2.0\"\n"),
+            ("idna/cli.py", "def main() -> None:\n    pass\n"),
+        ],
+    );
+
+    // A cached artifact satisfying the requirement resolves offline: the
+    // cache is the artifact, extraction is on demand.
+    let newer = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("idna==2.0").unwrap(),
+        true,
+    )
+    .expect("idna 2.0 from the cache");
+    let older = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("idna==1.0").unwrap(),
+        true,
+    )
+    .expect("idna 1.0 from the cache");
+    assert_eq!(newer.version, "2.0");
+    assert_eq!(older.version, "1.0");
+    assert_eq!(newer.import_name, "idna");
+    assert_ne!(newer.path, older.path);
+    assert!(newer.path.join("cli.py").is_file(), "{}", newer.path.display());
+    assert!(!older.path.join("cli.py").exists(), "{}", older.path.display());
+    assert_eq!(fs::read_to_string(older.path.join("__init__.py")).unwrap(), "VERSION = \"1.0\"\n");
+    // Each artifact extracts under its own stem.
+    assert!(newer.path.starts_with(dist_dir.join("extracted/idna-2.0-py3-none-any")));
+    assert!(older.path.starts_with(dist_dir.join("extracted/idna-1.0-py3-none-any")));
+
+    // The extracted trees are reused on the next resolution.
+    let again = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("idna==1.0").unwrap(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(again.path, older.path);
+
+    // A version the cache does not hold is still the loud offline error.
+    let err = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("idna==3.0").unwrap(),
+        true,
+    )
+    .expect_err("idna 3.0 is not cached");
+    assert!(err.to_string().contains("offline"), "{err:?}");
+
+    // An UNPINNED requirement resolves the NEWEST satisfying cached
+    // version — the choice online resolution makes — whatever order the
+    // file system lists the cache in (Devin review on #342).
+    for _ in 0..3 {
+        let newest = rypip::resolve::resolve_dependency_in(
+            &cache,
+            &parse_requirement("idna>=1").unwrap(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(newest.version, "2.0");
+        assert_eq!(newest.path, newer.path);
+    }
+    // A complete extraction carries its marker, naming the artifact and
+    // its digest.
+    let marker = dist_dir.join("extracted/idna-2.0-py3-none-any/.rypip-complete");
+    let marker_text = fs::read_to_string(&marker).unwrap();
+    assert_eq!(marker_text.lines().next(), Some("idna-2.0-py3-none-any.whl"));
+    assert_eq!(marker_text.lines().nth(1).map(str::len), Some(64), "{marker_text:?}");
+}
+
+#[test]
+fn an_interrupted_extraction_is_never_a_cache_hit() {
+    // A tree at the extraction path WITHOUT the completion marker (an
+    // interrupted run that got as far as the .dist-info) is not reused:
+    // the artifact is extracted again, atomically, and the complete tree
+    // replaces the partial one (Devin review on #342).
+    let scratch = Scratch::new("cache-partial");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("idna");
+    write_wheel(&dist_dir, "idna", "1.0", &[("idna/__init__.py", "VERSION = \"1.0\"\n")]);
+    let partial = dist_dir.join("extracted/idna-1.0-py3-none-any");
+    fs::create_dir_all(partial.join("idna-1.0.dist-info")).unwrap();
+    fs::write(partial.join("idna-1.0.dist-info/METADATA"), "truncated").unwrap();
+    // No package directory, no marker.
+
+    let dep = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("idna==1.0").unwrap(),
+        true,
+    )
+    .expect("the artifact is extracted again");
+    assert_eq!(dep.path, partial.join("idna"));
+    assert!(dep.path.join("__init__.py").is_file(), "{}", dep.path.display());
+    assert!(partial.join(".rypip-complete").is_file());
+    assert_eq!(
+        fs::read_to_string(partial.join("idna-1.0.dist-info/top_level.txt")).unwrap(),
+        "idna\n"
+    );
+    // No in-progress directory is left behind.
+    let leftovers: Vec<String> = fs::read_dir(dist_dir.join("extracted"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains(".partial-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[test]
+fn a_failed_extraction_leaves_no_partial_directory_and_dead_owners_are_cleared() {
+    // A corrupt archive (its digest recorded, so the cache trusts it)
+    // fails to extract: the error is loud and the `.partial-` sibling is
+    // removed; a crashed run's sibling (its owning pid provably dead) is
+    // cleared before the next extraction of that artifact; a sibling of
+    // a LIVE process is left alone whatever its age (Devin review on
+    // #342, rounds 2 and 4).
+    let scratch = Scratch::new("cache-partial-cleanup");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("idna");
+    fs::create_dir_all(&dist_dir).unwrap();
+    let artifact = dist_dir.join("idna-1.0-py3-none-any.whl");
+    fs::write(&artifact, b"this is not a zip archive").unwrap();
+    record_digest(&artifact);
+    let req = parse_requirement("idna==1.0").unwrap();
+    let err = rypip::resolve::resolve_dependency_in(&cache, &req, true)
+        .expect_err("a corrupt archive does not extract");
+    assert!(err.to_string().contains("reading zip"), "{err:?}");
+    let partials = |dir: &Path| -> Vec<String> {
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| n.contains(".partial-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(partials(&dist_dir.join("extracted")).is_empty(), "{:?}", partials(&dist_dir.join("extracted")));
+
+    // A real wheel now, beside two leftovers: a dead process's and a
+    // live (this) process's, the live one made old to show age is not
+    // the rule.
+    write_wheel(&dist_dir, "idna", "1.0", &[("idna/__init__.py", "")]);
+    let extracted = dist_dir.join("extracted");
+    let dead = extracted.join(format!("idna-1.0-py3-none-any.partial-{}-0", u32::MAX));
+    fs::create_dir_all(dead.join("idna")).unwrap();
+    let live = extracted.join(format!("idna-1.0-py3-none-any.partial-{}-999999", std::process::id()));
+    fs::create_dir_all(live.join("idna")).unwrap();
+    let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+    fs::File::open(&live).unwrap().set_modified(two_hours_ago).unwrap();
+    let dep = rypip::resolve::resolve_dependency_in(&cache, &req, true).unwrap();
+    assert_eq!(dep.version, "1.0");
+    if cfg!(unix) {
+        assert!(!dead.exists(), "a dead owner's sibling is cleared");
+    }
+    assert!(live.exists(), "a live process's sibling is left alone, however old");
+    assert!(extracted.join("idna-1.0-py3-none-any/.rypip-complete").is_file());
+}
+
+#[test]
+fn a_replaced_artifact_rebuilds_its_extraction() {
+    // The completion marker records the artifact's digest: after the
+    // same file name is replaced by other verified contents, the next
+    // resolution rebuilds the extraction and returns the replacement
+    // (Devin review on #342, round 5).
+    let scratch = Scratch::new("cache-replaced");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("idna");
+    write_wheel(&dist_dir, "idna", "1.0", &[("idna/__init__.py", "VERSION = 'first'\n")]);
+    let req = parse_requirement("idna==1.0").unwrap();
+    let first = rypip::resolve::resolve_dependency_in(&cache, &req, true).unwrap();
+    assert!(fs::read_to_string(first.path.join("__init__.py")).unwrap().contains("first"));
+    let marker = dist_dir.join("extracted/idna-1.0-py3-none-any/.rypip-complete");
+    let recorded = fs::read_to_string(&marker).unwrap();
+    assert_eq!(recorded.lines().count(), 2, "file name and digest: {recorded:?}");
+
+    // The same file name, other verified contents.
+    write_wheel(&dist_dir, "idna", "1.0", &[("idna/__init__.py", "VERSION = 'second'\n")]);
+    let second = rypip::resolve::resolve_dependency_in(&cache, &req, true).unwrap();
+    assert_eq!(second.version, "1.0");
+    assert!(
+        fs::read_to_string(second.path.join("__init__.py")).unwrap().contains("second"),
+        "the replacement's contents"
+    );
+    assert_ne!(fs::read_to_string(&marker).unwrap(), recorded, "the marker carries the new digest");
+
+    // An extraction whose artifact is gone is no candidate: nothing to
+    // verify it against.
+    fs::remove_file(dist_dir.join("idna-1.0-py3-none-any.whl")).unwrap();
+    let err = rypip::resolve::resolve_dependency_in(&cache, &req, true)
+        .expect_err("an extraction without its artifact is not trusted");
+    assert!(err.to_string().contains("offline"), "{err:?}");
+}
+
+#[test]
+fn a_cached_wheel_is_preferred_over_the_sdist_of_the_same_version() {
+    // The offline choice is the online one: at one version a wheel
+    // beats an sdist whatever the directory order (Devin review on
+    // #342, round 6).
+    let scratch = Scratch::new("cache-wheel-vs-sdist");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("both");
+    write_sdist(&dist_dir, "both", "1.0", "both");
+    write_wheel(&dist_dir, "both", "1.0", &[("both/__init__.py", "KIND = 'wheel'\n")]);
+    let dep = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("both==1.0").unwrap(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(dep.version, "1.0");
+    assert!(
+        dep.path.starts_with(dist_dir.join("extracted/both-1.0-py3-none-any")),
+        "the wheel's extraction: {}",
+        dep.path.display()
+    );
+    assert!(fs::read_to_string(dep.path.join("__init__.py")).unwrap().contains("wheel"));
+}
+
+#[test]
+fn a_wheel_arriving_after_the_sdist_was_extracted_wins() {
+    // An extracted sdist does not outrank a wheel of the same version:
+    // the artifact kind ranks first, extraction readiness second (Devin
+    // review on #342, round 7).
+    let scratch = Scratch::new("cache-sdist-then-wheel");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("late");
+    write_sdist(&dist_dir, "late", "1.0", "late");
+    let req = parse_requirement("late==1.0").unwrap();
+    let from_sdist = rypip::resolve::resolve_dependency_in(&cache, &req, true).unwrap();
+    assert!(from_sdist.path.starts_with(dist_dir.join("extracted/late-1.0")));
+    assert!(!from_sdist.path.starts_with(dist_dir.join("extracted/late-1.0-py3-none-any")));
+
+    write_wheel(&dist_dir, "late", "1.0", &[("late/__init__.py", "KIND = 'wheel'\n")]);
+    let from_wheel = rypip::resolve::resolve_dependency_in(&cache, &req, true).unwrap();
+    assert!(
+        from_wheel.path.starts_with(dist_dir.join("extracted/late-1.0-py3-none-any")),
+        "the wheel is extracted and chosen: {}",
+        from_wheel.path.display()
+    );
+    assert!(fs::read_to_string(from_wheel.path.join("__init__.py")).unwrap().contains("wheel"));
+}
+
+#[test]
+fn cached_local_versions_keep_their_label_and_match_their_public_version() {
+    // A `+local` label (PEP 440) survives the cache — the offline
+    // resolution reports `1.0+cpu` — and a specifier without a label
+    // (`==1.0`) matches the local variant while `==1.0+gpu` does not
+    // (Devin review on #342, round 8).
+    let scratch = Scratch::new("cache-local");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("loc");
+    write_wheel(&dist_dir, "loc", "1.0+cpu", &[("loc/__init__.py", "")]);
+    let exact = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("loc==1.0+cpu").unwrap(),
+        true,
+    )
+    .expect("the local version resolves under its own spelling");
+    assert_eq!(exact.version, "1.0+cpu");
+    let public = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("loc==1.0").unwrap(),
+        true,
+    )
+    .expect("a public specifier matches the local variant");
+    assert_eq!(public.version, "1.0+cpu");
+    let err = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("loc==1.0+gpu").unwrap(),
+        true,
+    )
+    .expect_err("another label is another version");
+    assert!(err.to_string().contains("offline"), "{err:?}");
+}
+
+#[test]
+fn a_corrupt_cached_candidate_is_loud_when_it_would_have_won_and_skipped_otherwise() {
+    // Correct-or-loud (Devin review on #342, rounds 10 and 11): a corrupt
+    // candidate the ranking would have chosen (the newer version) is the
+    // loud error — never a silent downgrade — while a corrupt candidate
+    // it would not have chosen (the older version) does not block.
+    let scratch = Scratch::new("cache-corrupt-policy");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("idna");
+    let older = write_wheel(&dist_dir, "idna", "1.0", &[("idna/__init__.py", "")]);
+    write_wheel(&dist_dir, "idna", "2.0", &[("idna/__init__.py", "")]);
+    fs::write(&older, b"altered after its digest was recorded").unwrap();
+    let dep = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("idna>=1.0").unwrap(),
+        true,
+    )
+    .expect("the corrupt older candidate does not block the newer valid one");
+    assert_eq!(dep.version, "2.0");
+    let err = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("idna==1.0").unwrap(),
+        true,
+    )
+    .expect_err("the corrupt candidate alone is loud");
+    assert!(err.to_string().contains("sha256 mismatch"), "{err:?}");
+
+    // The newer candidate corrupt: `>=1.0` would have chosen it, so the
+    // resolution is loud rather than a downgrade to 1.0.
+    let scratch2 = Scratch::new("cache-corrupt-newer");
+    let cache2 = scratch2.path().join("cache");
+    let dist_dir2 = cache2.join("idna");
+    write_wheel(&dist_dir2, "idna", "1.0", &[("idna/__init__.py", "")]);
+    let newer = write_wheel(&dist_dir2, "idna", "2.0", &[("idna/__init__.py", "")]);
+    fs::write(&newer, b"altered after its digest was recorded").unwrap();
+    let err = rypip::resolve::resolve_dependency_in(
+        &cache2,
+        &parse_requirement("idna>=1.0").unwrap(),
+        true,
+    )
+    .expect_err("a corrupt candidate that would have won is loud");
+    assert!(err.to_string().contains("sha256 mismatch"), "{err:?}");
+    let pinned = rypip::resolve::resolve_dependency_in(
+        &cache2,
+        &parse_requirement("idna==1.0").unwrap(),
+        true,
+    )
+    .expect("a requirement the corrupt candidate does not satisfy resolves");
+    assert_eq!(pinned.version, "1.0");
+}
+
+#[test]
+fn a_cached_native_wheel_is_never_a_candidate() {
+    // The offline eligibility is the online one (Devin review on #342,
+    // round 12): a native wheel in the cache is neither chosen over an
+    // sdist of the same version nor over an older pure wheel, and alone
+    // it resolves nothing.
+    let scratch = Scratch::new("cache-native-wheel");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("nat");
+    write_wheel_tagged(&dist_dir, "nat", "2.0", "cp312-cp312-manylinux_2_17_x86_64", &[("nat/__init__.py", "")]);
+    write_sdist(&dist_dir, "nat", "2.0", "nat");
+    let req = parse_requirement("nat>=1.0").unwrap();
+    let dep = rypip::resolve::resolve_dependency_in(&cache, &req, true).unwrap();
+    assert_eq!(dep.version, "2.0");
+    assert!(
+        dep.path.starts_with(dist_dir.join("extracted/nat-2.0")) && !dep.path.to_string_lossy().contains("cp312"),
+        "the sdist, not the native wheel: {}",
+        dep.path.display()
+    );
+
+    let scratch2 = Scratch::new("cache-native-vs-older-pure");
+    let cache2 = scratch2.path().join("cache");
+    let dist_dir2 = cache2.join("nat");
+    write_wheel_tagged(&dist_dir2, "nat", "2.0", "cp312-cp312-manylinux_2_17_x86_64", &[("nat/__init__.py", "")]);
+    write_wheel(&dist_dir2, "nat", "1.0", &[("nat/__init__.py", "")]);
+    let dep = rypip::resolve::resolve_dependency_in(&cache2, &req, true).unwrap();
+    assert_eq!(dep.version, "1.0", "the older pure wheel, never the native one");
+    let err = rypip::resolve::resolve_dependency_in(
+        &cache2,
+        &parse_requirement("nat==2.0").unwrap(),
+        true,
+    )
+    .expect_err("a native wheel alone resolves nothing");
+    assert!(err.to_string().contains("offline"), "{err:?}");
+}
+
+#[test]
+fn cached_epoch_versions_keep_their_epoch() {
+    // An epoch-qualified artifact (`1!2.0`) resolves offline under the
+    // same version spelling the online path records (Devin review on
+    // #342, round 4): the epoch is part of the version.
+    let scratch = Scratch::new("cache-epoch");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("ep");
+    write_wheel(&dist_dir, "ep", "1!2.0", &[("ep/__init__.py", "")]);
+    let dep = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("ep==1!2.0").unwrap(),
+        true,
+    )
+    .expect("the epoch-qualified artifact resolves");
+    assert_eq!(dep.version, "1!2.0");
+    let err = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("ep==2.0").unwrap(),
+        true,
+    )
+    .expect_err("2.0 without the epoch is a different version");
+    assert!(err.to_string().contains("offline"), "{err:?}");
+}
+
+#[test]
+fn a_cached_artifact_is_reused_only_through_its_verified_digest() {
+    // The offline path trusts an artifact only through the digest a
+    // verified download recorded beside it: no sidecar (an older cache)
+    // means the artifact is not a cache hit, a mismatch is a loud error
+    // naming the file, never a silent extraction (Devin review on #342).
+    let scratch = Scratch::new("cache-digest");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("idna");
+    let artifact = write_wheel(&dist_dir, "idna", "1.0", &[("idna/__init__.py", "")]);
+    let req = parse_requirement("idna==1.0").unwrap();
+
+    fs::remove_file(sidecar_of(&artifact)).unwrap();
+    let err = rypip::resolve::resolve_dependency_in(&cache, &req, true)
+        .expect_err("an unverified artifact is not reused offline");
+    assert!(err.to_string().contains("offline"), "{err:?}");
+
+    fs::write(sidecar_of(&artifact), format!("{}\n", "0".repeat(64))).unwrap();
+    let err = rypip::resolve::resolve_dependency_in(&cache, &req, true)
+        .expect_err("an altered artifact is loud");
+    let text = err.to_string();
+    assert!(text.contains("sha256 mismatch"), "{text}");
+    assert!(text.contains("idna-1.0-py3-none-any.whl"), "{text}");
+    assert!(!dist_dir.join("extracted/idna-1.0-py3-none-any").exists());
+
+    record_digest(&artifact);
+    let dep = rypip::resolve::resolve_dependency_in(&cache, &req, true).unwrap();
+    assert_eq!(dep.version, "1.0");
+}
+
+#[test]
+fn cached_sdist_prereleases_keep_their_version() {
+    // An sdist stem's version is everything after the distribution name
+    // — a hyphen-separated prerelease included — so `pkg-1.0-rc1` is
+    // 1.0rc1, not the final 1.0 (Devin review on #342); a wheel's version
+    // is the one component before its tags.
+    let scratch = Scratch::new("cache-prerelease");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("pre");
+    write_sdist(&dist_dir, "pre", "1.0-rc1", "pre");
+    write_sdist(&dist_dir, "pre", "0.9", "pre");
+
+    let rc = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("pre==1.0rc1").unwrap(),
+        true,
+    )
+    .expect("the prerelease resolves under its own version");
+    assert_eq!(rc.version, "1.0rc1");
+    assert!(rc.path.join("__init__.py").is_file(), "{}", rc.path.display());
+    assert!(rc.path.starts_with(dist_dir.join("extracted/pre-1.0-rc1")));
+
+    let err = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("pre==1.0").unwrap(),
+        true,
+    )
+    .expect_err("the prerelease is not the final release");
+    assert!(err.to_string().contains("offline"), "{err:?}");
+
+    let stable = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("pre==0.9").unwrap(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(stable.version, "0.9");
+}
+
+#[test]
+fn cached_sdist_resolves_to_its_package_directory() {
+    // An sdist tarball extracts to `{stem}/{dist}-{version}/{package}`;
+    // the resolved path is the importable package directory.
+    let scratch = Scratch::new("cache-sdist");
+    let cache = scratch.path().join("cache");
+    let dist_dir = cache.join("charset_normalizer");
+    write_sdist(&dist_dir, "charset-normalizer", "3.4.0", "charset_normalizer");
+    let dep = rypip::resolve::resolve_dependency_in(
+        &cache,
+        &parse_requirement("charset-normalizer>=3").unwrap(),
+        true,
+    )
+    .expect("sdist from the cache");
+    assert_eq!(dep.version, "3.4.0");
+    assert_eq!(dep.import_name, "charset_normalizer");
+    assert!(dep.path.join("__init__.py").is_file(), "{}", dep.path.display());
+    assert!(dep.path.starts_with(dist_dir.join("extracted/charset-normalizer-3.4.0")));
 }
 
 #[test]

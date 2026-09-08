@@ -43,7 +43,15 @@ impl AnnotationModule {
 /// dedicated sites. One predicate instead of scattered `== "typing"`
 /// literals.
 pub(crate) fn is_typing(name: &str) -> bool {
-    AnnotationModule::from_name(name) == Some(AnnotationModule::Typing)
+    // `typing_extensions` spells the same names (`Optional`, `Union`,
+    // `Literal`, ...) and lowers identically (Devin review on #342,
+    // round 9); an ALIASED root (`import typing as t`) is rewritten to
+    // `typing` once, when the module is built (module.rs
+    // normalize_typing_aliases), so this predicate never sees it.
+    matches!(
+        AnnotationModule::from_name(name),
+        Some(AnnotationModule::Typing) | Some(AnnotationModule::TypingExtensions)
+    )
 }
 
 #[cfg(test)]
@@ -77,7 +85,7 @@ mod tests {
         assert_eq!(AnnotationModule::from_name("typo"), None);
         assert_eq!(AnnotationModule::from_name(""), None);
         assert!(is_typing("typing"));
-        assert!(!is_typing("typing_extensions"));
+        assert!(is_typing("typing_extensions"));
         assert!(!is_typing("functools"));
     }
 }

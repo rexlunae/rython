@@ -2541,7 +2541,14 @@ impl FunctionDef {
                 .chain(self.args.posonlyargs.iter())
                 .chain(self.args.kwonlyargs.iter())
             {
-                if let Some(ann) = p.annotation.as_deref() {
+                // A QUOTED annotation (`err: "Optional[MyError]"`) is
+                // the annotation it spells — evaluated here exactly as
+                // the signature evaluates it (arguments.rs
+                // unquote_annotation), so the body's name types and the
+                // parameter's declared type never disagree (Devin review
+                // on #342, round 4).
+                let unquoted = p.evaluated_annotation();
+                if let Some(ann) = unquoted.as_ref() {
                     // Scalar annotations map directly; container
                     // annotations (`list[float]`, `dict[str, int]`,
                     // `Optional[str]`) arrive as Subscript expressions.
@@ -2630,6 +2637,15 @@ impl FunctionDef {
                             if crate::is_none_expr(other) {
                                 info.name_types
                                     .insert(p.arg.clone(), crate::TypeInfo::Option(Box::new(crate::TypeInfo::PyObject)));
+                            } else if let Some(t) = crate::ast::tree::arguments::exception_union_typeinfo(
+                                other, &symbols, &options,
+                            ) {
+                                // A union of exception classes only: the
+                                // PyException the signature declares
+                                // (arguments.rs — one rule, decided before
+                                // the syntax-only mapping boxes a builtin
+                                // member).
+                                info.name_types.insert(p.arg.clone(), t);
                             } else if matches!(other, ExprType::Subscript(sub)
                                 if matches!(sub.value.as_ref(), ExprType::Name(n)
                                     if matches!(n.id.as_str(), "type" | "Type")))
@@ -2738,6 +2754,52 @@ impl FunctionDef {
             options.use_counts = std::rc::Rc::new(info.use_counts);
             options.name_types = std::rc::Rc::new(info.name_types);
             options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
+        }
+        // A name bound to the boxed PyValue (a parameter whose union
+        // annotation boxes — `body: _TYPE_BODY | None` — or a value-pinned
+        // parameter) is never an Option slot: the box already contains
+        // None, so its `name = None` store is the boxed None. The analysis
+        // records every None store as an optional name; the codegen's set
+        // is filtered by the final binding types (urllib3's urlopen drops
+        // the body under a 303 redirect: `body = None` on a PyValue local).
+        // A PARAMETER's authority is its signature: the annotation must
+        // itself resolve to the boxed value (a bare `dict | None` renders
+        // an Option parameter while the body analysis records the boxed
+        // fallback — that one stays an Option slot). A local's authority
+        // is the analysis's joined type.
+        let boxed_binding = |n: &String| -> bool {
+            let param = self
+                .args
+                .args
+                .iter()
+                .chain(self.args.posonlyargs.iter())
+                .chain(self.args.kwonlyargs.iter())
+                .find(|p| p.arg == *n);
+            match param {
+                Some(p) => {
+                    options.pyvalue_into_params.contains(n)
+                        || p.evaluated_annotation().as_ref().is_some_and(|ann| {
+                            matches!(
+                                crate::resolve_alias_typeinfo(ann, &symbols, &options)
+                                    .or_else(|| crate::annotation_type_info(ann)),
+                                Some(crate::TypeInfo::PyValue)
+                            )
+                        })
+                }
+                None => {
+                    matches!(options.name_types.get(n), Some(crate::TypeInfo::PyValue))
+                        || options.pyvalue_into_params.contains(n)
+                }
+            }
+        };
+        if options.optional_names.iter().any(boxed_binding) {
+            let kept: std::collections::HashSet<String> = options
+                .optional_names
+                .iter()
+                .filter(|n| !boxed_binding(n))
+                .cloned()
+                .collect();
+            options.optional_names = std::rc::Rc::new(kept);
         }
         // Empty-container pinning needs the parameter annotations above,
         // so re-run the pin pass now that name_types knows the params
@@ -5163,7 +5225,17 @@ pub(crate) fn lower_optional_value(
         };
         return Ok(read);
     }
-    let tokens = expr.clone().to_rust(ctx, options, symbols)?;
+    // The plain value read takes the reuse-clone (render_reused): a
+    // non-Copy NAME read again later (`maybe(e) + either(e)` — the
+    // caught exception into an `Optional[MyError]` slot) is cloned
+    // INSIDE the Some wrap; the wrap of a plain read would move it
+    // (Devin review on #342, round 4). A literal and the boxed slot
+    // below keep their own spellings.
+    let tokens = if matches!(expr, ExprType::Name(_)) && !boxed {
+        crate::render_reused(expr, ctx, options, symbols)?
+    } else {
+        expr.clone().to_rust(ctx, options, symbols)?
+    };
     // A string LITERAL lowers to `&'static str`; an Option<String> slot
     // owns it (`pick("x")` where the parameter is `str | None`) — the
     // same ownership the `-> str` return path applies (issue #137's

@@ -1166,6 +1166,7 @@ impl ClassDef {
                 params.push(crate::Parameter {
                     arg: name.clone(),
                     annotation: Some(Box::new(ann)),
+                    quoted_source: None,
                     type_comment: None,
                     lineno: None,
                     col_offset: None,
@@ -1181,6 +1182,7 @@ impl ClassDef {
                     params.push(crate::Parameter {
                         arg: name.clone(),
                         annotation: Some(Box::new(annotation.clone())),
+                        quoted_source: None,
                         type_comment: None,
                         lineno: None,
                         col_offset: None,
@@ -1198,6 +1200,7 @@ impl ClassDef {
                         params.push(crate::Parameter {
                             arg: n.id.clone(),
                             annotation: Some(Box::new(ann.clone())),
+                            quoted_source: None,
                             type_comment: None,
                             lineno: None,
                             col_offset: None,
@@ -1251,6 +1254,7 @@ impl ClassDef {
                 args: std::iter::once(crate::Parameter {
                     arg: "self".to_string(),
                     annotation: None,
+                    quoted_source: None,
                     type_comment: None,
                     lineno: None,
                     col_offset: None,
@@ -5736,10 +5740,41 @@ fn infer_field_type(
         ExprType::Attribute(a) if matches!(a.value.as_ref(), ExprType::Call(_)) => {
             Some(crate::TypeInfo::PyValue)
         }
-        // A list comprehension of foreign objects (`self._decoders =
-        // [_get_decoder(e) for e in ...]` — urllib3's MultiDecoder): the
-        // element type is a boxed PyValue.
-        ExprType::ListComp(_) => Some(crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue))),
+        // A list comprehension (`self._decoders = [_get_decoder(e) for e
+        // in ...]` — urllib3's MultiDecoder): the element type is the
+        // element expression's — a call into a class-returning function
+        // makes a `Vec<Class>` (the hierarchy's slot type for a
+        // polymorphic root, so `d.decompress(data)` over the elements
+        // dispatches), a construction its class; an element the field
+        // inference cannot type (one over the comprehension's own
+        // targets) is the boxed PyValue, as before.
+        ExprType::ListComp(lc) => {
+            // The generators' targets are typed by the comprehension
+            // scope (the one binder authority — `m` over `modes.split(",")`
+            // is a str), so an element over them types too (Devin review
+            // on #342): the field inference over the scoped names first,
+            // the general inferrer in that scope second.
+            let field_ctx = crate::CodeGenContext::Class(class_name.to_string());
+            let scope = crate::ast::tree::type_ctx::comprehension_scope(
+                &lc.generators,
+                Some(&field_ctx),
+                options,
+                symbols,
+            );
+            let mut scoped_names = name_types.clone();
+            scoped_names.extend(scope.name_types.iter().map(|(k, v)| (k.clone(), v.clone())));
+            // The field inference's boxed fallback for an element it
+            // cannot type (a builtin call over a target) defers to the
+            // scoped inferrer's concrete answer (`len(x)` is an int).
+            let elt = infer_field_type(&lc.elt, &scoped_names, symbols, &scope, class_name)
+                .filter(|t| !matches!(t, crate::TypeInfo::PyValue | crate::TypeInfo::PyObject))
+                .or_else(|| {
+                    let t = crate::infer_type(Some(&field_ctx), &lc.elt, &scope, symbols);
+                    (!matches!(t, crate::TypeInfo::PyObject)).then_some(t)
+                })
+                .unwrap_or(crate::TypeInfo::PyValue);
+            Some(crate::TypeInfo::Vec(Box::new(elt)))
+        }
         // Logical combinations (`self.common_cjk = self.is_cjk and
         // character in COMMON_CJK_CHARACTERS`, `not x`) are bool — UNLESS
         // a branch is a boxed value (`excluded_params or frozenset()` —

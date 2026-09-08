@@ -9855,6 +9855,75 @@ fn a_vendored_dependencys_imports_reach_the_surface_feature_list() {
 }
 
 #[test]
+fn a_crate_modules_exception_qualified_in_a_union_takes_a_caught_exception() {
+    // Devin review on #342, round 8: `errors.MyError | OSError` where
+    // errors.py is a module of the crate — the member resolves through
+    // the crate's module authorities and the exception closure, so the
+    // parameter is the exception type and a caught exception passes in.
+    let scratch = Scratch::new("qualified-union");
+    fs::create_dir_all(scratch.path().join("vendor")).unwrap();
+    fs::write(
+        scratch.path().join("vendor/errors.py"),
+        concat!(
+            "class MyError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def boom() -> None:\n",
+            "    raise MyError(\"qualified\")\n",
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(scratch.path().join("qualapp")).unwrap();
+    fs::write(scratch.path().join("qualapp/__init__.py"), "").unwrap();
+    fs::write(
+        scratch.path().join("qualapp/main.py"),
+        concat!(
+            "import errors\n",
+            "\n",
+            "\n",
+            "def handle(err: errors.MyError | OSError) -> str:\n",
+            "    return \"handled \" + str(err)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    try:\n",
+            "        errors.boom()\n",
+            "    except errors.MyError as e:\n",
+            "        print(handle(e))\n",
+            "    try:\n",
+            "        raise OSError(\"os\")\n",
+            "    except OSError as e:\n",
+            "        print(handle(e))\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("rython.toml"),
+        "[python-modules]\nerrors = { path = \"vendor/errors.py\" }\n",
+    )
+    .unwrap();
+
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let main_rs = fs::read_to_string(krate.root.join("src/main.rs")).unwrap();
+    assert!(main_rs.contains("fn handle(err: PyException)"), "{}", main_rs);
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/qualapp"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3 (PYTHONPATH=vendor python3 qualapp/main.py).
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["handled qualified", "handled os"],
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn an_unreachable_vendored_module_does_not_add_a_surface() {
     // `convert` transpiles only import-reachable modules, so a vendored
     // dependency the program never imports contributes no code to the
@@ -14750,5 +14819,376 @@ fn not_implemented_in_a_shared_eq_is_identity_at_runtime() {
         String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
         vec!["True True False x!", "True True True False", "False", "True True False d?"],
         "the equality dispatch diverged from CPython"
+    );
+}
+
+#[test]
+fn boxed_slots_take_none_literals_and_conditionals() {
+    // Issue #335: a boxed slot takes None, a literal and a conditional.
+    // `body = None` under a branch on a parameter whose union annotation
+    // boxes is the boxed None (the name is never an Option slot); a tuple
+    // swap stores the boxed None into a boxed field and reads the field
+    // by clone; a bytes literal into an `Optional[alias]` parameter that
+    // boxes is boxed, not Some-wrapped; a conditional returned from a
+    // `-> str` function owns its literal arms.
+    let scratch = Scratch::new("boxed_slots");
+    let file = scratch.path().join("boxed_slots.py");
+    fs::write(
+        &file,
+        concat!(
+            "from typing import IO, Any, Iterable, Optional, Union\n",
+            "\n",
+            "_TYPE_BODY = Union[bytes, IO[Any], Iterable[bytes], str]\n",
+            "\n",
+            "\n",
+            "def send(body: Optional[_TYPE_BODY] = None, code: int = 0) -> str:\n",
+            "    if code == 303:\n",
+            "        body = None\n",
+            "    if body is None:\n",
+            "        return \"empty\"\n",
+            "    return \"has body\"\n",
+            "\n",
+            "\n",
+            "class Conn:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.pool: Optional[Any] = None\n",
+            "\n",
+            "    def close(self) -> str:\n",
+            "        old_pool, self.pool = self.pool, None\n",
+            "        return \"closed\" if old_pool is None else \"had pool\"\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(send(b\"x\", 303))\n",
+            "    print(send(b\"x\", 200))\n",
+            "    c = Conn()\n",
+            "    print(c.close())\n"
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/boxed_slots"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["empty", "has body", "closed"],
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn exception_class_unions_are_pyexception_parameters() {
+    // Issue #335: a parameter annotated with a union of exception classes
+    // only (`OSError | SocketTimeout`) is a PyException — a caught
+    // exception passes straight in — and `isinstance(err, SocketTimeout)`
+    // on it (or on an except-bound name) tests the kind through the
+    // stdlib alias's canonical builtin, like the except clause does;
+    // `str(err)` reads the exception by reference.
+    let scratch = Scratch::new("exc_unions");
+    let file = scratch.path().join("exc_unions.py");
+    fs::write(
+        &file,
+        concat!(
+            "import socket\n",
+            "from socket import timeout as SocketTimeout\n",
+            "\n",
+            "\n",
+            "class ReadTimeoutError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Pool:\n",
+            "    def _raise_timeout(self, err: OSError | SocketTimeout, url: str) -> None:\n",
+            "        if isinstance(err, SocketTimeout):\n",
+            "            raise ReadTimeoutError(f\"Read timed out on {url}\")\n",
+            "        if \"timed out\" in str(err):\n",
+            "            raise ReadTimeoutError(f\"Read timed out on {url} ({err})\")\n",
+            "\n",
+            "    def fetch(self, url: str, fail: int) -> str:\n",
+            "        try:\n",
+            "            if fail == 1:\n",
+            "                raise SocketTimeout(\"slow\")\n",
+            "            if fail == 2:\n",
+            "                raise OSError(\"connection timed out\")\n",
+            "            if fail == 3:\n",
+            "                raise OSError(\"refused\")\n",
+            "            return \"ok\"\n",
+            "        except (OSError, SocketTimeout) as e:\n",
+            "            self._raise_timeout(err=e, url=url)\n",
+            "            raise\n",
+            "\n",
+            "\n",
+            "def classify(fail: int) -> str:\n",
+            "    try:\n",
+            "        if fail == 1:\n",
+            "            raise SocketTimeout(\"slow\")\n",
+            "        if fail == 2:\n",
+            "            raise OSError(\"refused\")\n",
+            "        return \"ok\"\n",
+            "    except (OSError, SocketTimeout) as e:\n",
+            "        if isinstance(e, SocketTimeout):\n",
+            "            return \"timeout: \" + str(e)\n",
+            "        return \"oserror: \" + str(e)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    p = Pool()\n",
+            "    for fail in range(4):\n",
+            "        try:\n",
+            "            print(p.fetch(\"http://x\", fail))\n",
+            "        except ReadTimeoutError as e:\n",
+            "            print(\"ReadTimeoutError\", e)\n",
+            "        except OSError as e:\n",
+            "            print(\"OSError\", e)\n",
+            "    for fail in range(3):\n",
+            "        print(classify(fail))\n"
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/exc_unions"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["ok", "ReadTimeoutError Read timed out on http://x", "ReadTimeoutError Read timed out on http://x (connection timed out)", "OSError refused", "ok", "timeout: slow", "oserror: refused"],
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn comprehension_fields_hold_the_element_class() {
+    // Issue #335: a field assigned a list comprehension over a
+    // class-returning call holds that class (the hierarchy's slot type
+    // for a polymorphic root), so `d.decompress(data)` over its elements
+    // dispatches instead of dropping to the boxed None; a method call's
+    // bytes result prints as CPython prints bytes.
+    let scratch = Scratch::new("decoder_fields");
+    let file = scratch.path().join("decoder_fields.py");
+    fs::write(
+        &file,
+        concat!(
+            "from typing import Optional\n",
+            "\n",
+            "\n",
+            "class ContentDecoder:\n",
+            "    def decompress(self, data: bytes) -> bytes:\n",
+            "        raise NotImplementedError()\n",
+            "\n",
+            "    def flush(self) -> bytes:\n",
+            "        raise NotImplementedError()\n",
+            "\n",
+            "\n",
+            "class UpperDecoder(ContentDecoder):\n",
+            "    def __init__(self) -> None:\n",
+            "        self._first = True\n",
+            "\n",
+            "    def decompress(self, data: bytes) -> bytes:\n",
+            "        if not data:\n",
+            "            return data\n",
+            "        self._first = False\n",
+            "        return b\"<\" + data + b\">\"\n",
+            "\n",
+            "    def flush(self) -> bytes:\n",
+            "        return b\"\"\n",
+            "\n",
+            "\n",
+            "class MultiDecoder(ContentDecoder):\n",
+            "    def __init__(self, modes: str) -> None:\n",
+            "        self._decoders = [_get_decoder(m.strip()) for m in modes.split(\",\")]\n",
+            "\n",
+            "    def flush(self) -> bytes:\n",
+            "        return self._decoders[0].flush()\n",
+            "\n",
+            "    def decompress(self, data: bytes) -> bytes:\n",
+            "        for d in reversed(self._decoders):\n",
+            "            data = d.decompress(data)\n",
+            "        return data\n",
+            "\n",
+            "\n",
+            "def _get_decoder(mode: str) -> ContentDecoder:\n",
+            "    if \",\" in mode:\n",
+            "        return MultiDecoder(mode)\n",
+            "    return UpperDecoder()\n",
+            "\n",
+            "\n",
+            "class Box:\n",
+            "    def run(self, data: bytes) -> bytes:\n",
+            "        return data\n",
+            "\n",
+            "\n",
+            "class Response:\n",
+            "    def __init__(self, encoding: str) -> None:\n",
+            "        self._decoder: Optional[ContentDecoder] = None\n",
+            "        if encoding:\n",
+            "            self._decoder = _get_decoder(encoding)\n",
+            "\n",
+            "    def _decode(self, data: bytes, decode_content: bool) -> bytes:\n",
+            "        if not decode_content:\n",
+            "            return data\n",
+            "        if self._decoder:\n",
+            "            data = self._decoder.decompress(data)\n",
+            "        return data\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(Response(\"upper\")._decode(b\"abc\", True))\n",
+            "    print(Response(\"upper, upper\")._decode(b\"abc\", True))\n",
+            "    print(Response(\"\")._decode(b\"abc\", True))\n",
+            "    print(Response(\"upper\")._decode(b\"abc\", False))\n",
+            "    print(Box().run(b\"q\"))\n"
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/decoder_fields"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["b'<abc>'", "b'<<abc>>'", "b'abc'", "b'abc'", "b'q'"],
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn typing_spelled_exception_unions_take_a_caught_exception() {
+    // Issue #335 (Devin review on #342): `Union[OSError, TimeoutError]`,
+    // `typing.Union[...]` and `Optional[OSError]` are the same
+    // exception-union rule as `OSError | TimeoutError` — a caught
+    // exception passes into each, `isinstance` tests its kind, and the
+    // Optional one takes None. A QUOTED `"Optional[MyError]"` over a
+    // crate exception class is the same rule (round 4), and the caught
+    // exception reused twice clones inside its Some.
+    let scratch = Scratch::new("typing_unions");
+    let file = scratch.path().join("typing_unions.py");
+    fs::write(
+        &file,
+        concat!(
+            "import typing\n",
+            "from typing import Optional, Union\n",
+            "\n",
+            "\n",
+            "def describe(err: Union[OSError, TimeoutError], where: str) -> str:\n",
+            "    if isinstance(err, TimeoutError):\n",
+            "        return \"timeout at \" + where\n",
+            "    return \"os error at \" + where + \": \" + str(err)\n",
+            "\n",
+            "\n",
+            "def note(err: typing.Union[OSError, TimeoutError]) -> str:\n",
+            "    return \"noted \" + str(err)\n",
+            "\n",
+            "\n",
+            "def maybe(err: Optional[OSError]) -> str:\n",
+            "    if err is None:\n",
+            "        return \"nothing\"\n",
+            "    return \"got \" + str(err)\n",
+            "\n",
+            "\n",
+            "def attempt(fail: int) -> str:\n",
+            "    try:\n",
+            "        if fail == 1:\n",
+            "            raise TimeoutError(\"slow\")\n",
+            "        if fail == 2:\n",
+            "            raise OSError(\"refused\")\n",
+            "        return \"ok\"\n",
+            "    except (OSError, TimeoutError) as e:\n",
+            "        return describe(e, \"attempt\") + \" / \" + note(e) + \" / \" + maybe(e)\n",
+            "\n",
+            "\n",
+            "class MyError(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def quoted(err: \"Optional[MyError]\") -> str:\n",
+            "    if err is None:\n",
+            "        return \"quoted nothing\"\n",
+            "    return \"quoted \" + str(err)\n",
+            "\n",
+            "\n",
+            "def user(fail: bool) -> str:\n",
+            "    try:\n",
+            "        if fail:\n",
+            "            raise MyError(\"bad\")\n",
+            "        return quoted(None)\n",
+            "    except MyError as e:\n",
+            "        return quoted(e) + \" / \" + quoted(e)\n",
+            "\n",
+            "\n",
+            "def scalar(x: \"str\") -> str:\n",
+            "    if isinstance(x, str):\n",
+            "        return \"str \" + x\n",
+            "    return \"other\"\n",
+            "\n",
+            "\n",
+            "def opt(x: \"Optional[str]\") -> str:\n",
+            "    if x is None:\n",
+            "        return \"none\"\n",
+            "    return x.upper()\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    for fail in range(3):\n",
+            "        print(attempt(fail))\n",
+            "    print(maybe(None))\n",
+            "    print(user(False))\n",
+            "    print(user(True))\n",
+            "    print(scalar(\"s\"))\n",
+            "    print(opt(None))\n",
+            "    print(opt(\"up\"))\n"
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/typing_unions"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec![
+            "ok",
+            "timeout at attempt / noted slow / got slow",
+            "os error at attempt: refused / noted refused / got refused",
+            "nothing",
+            "quoted nothing",
+            "quoted bad / quoted bad",
+            "str s",
+            "none",
+            "UP",
+        ],
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

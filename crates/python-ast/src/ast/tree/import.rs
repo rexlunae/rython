@@ -2052,6 +2052,34 @@ impl CodeGen for Import {
                     return Err(std_only_import_error(&alias.name));
                 }
             }
+            // `import typing` / `import typing_extensions` (annotation-
+            // only modules): nothing at runtime — their names are read by
+            // the annotation authorities through the `typing.X[...]`
+            // spelling (the from-import form already emits nothing for
+            // them). A `use crate::typing;` named a module the crate does
+            // not have (issue #335). The other annotation modules (abc,
+            // contextlib, dataclasses) DO have runtime items, modeled
+            // only under their from-import names (`ABC`, `contextmanager`,
+            // `dataclass`): their bare import is dropped LOUDLY — a
+            // module-qualified use (`abc.ABC`, `@contextlib.contextmanager`)
+            // is not modeled (Devin review on #342, round 4).
+            {
+                let root = alias.name.split('.').next().unwrap_or(&alias.name);
+                match crate::AnnotationModule::from_name(root) {
+                    Some(crate::AnnotationModule::Typing)
+                    | Some(crate::AnnotationModule::TypingExtensions) => continue,
+                    Some(_) => {
+                        options.definition_warnings.borrow_mut().push(format!(
+                            "import `{}` is dropped: its items are modeled under \
+                             their from-import names only (`from {} import ...`); \
+                             a module-qualified use is not modeled",
+                            alias.name, root
+                        ));
+                        continue;
+                    }
+                    None => {}
+                }
+            }
             // Check if this is a Python standard library module that needs special handling
             let rust_import = match alias.name.as_str() {
                 // `import numpy as np` (and `import numpy.linalg as np`) is

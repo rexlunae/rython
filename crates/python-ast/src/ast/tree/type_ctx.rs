@@ -381,6 +381,16 @@ pub fn coerce_tokens(
         {
             Some(quote!((#tokens).unwrap_or(stdpython::PyValue::None_)))
         }
+        // A class instance, a PyException, or an Option of one has no
+        // boxed representation: the value is left as is, so the mismatch
+        // stays a plain E0308 naming both types (a `PyValue::from` would
+        // only move the error to a missing From impl).
+        (TypeInfo::Class(_) | TypeInfo::Custom(_), TypeInfo::PyValue) => None,
+        (TypeInfo::Option(inner), TypeInfo::PyValue)
+            if matches!(**inner, TypeInfo::Class(_) | TypeInfo::Custom(_)) =>
+        {
+            None
+        }
         // Option<T> → PyValue: the same, for a typed optional — the inner
         // value boxes, and the empty case is Python's None.
         (TypeInfo::Option(inner), TypeInfo::PyValue) => {
@@ -628,6 +638,33 @@ pub fn infer_type(
     )
 }
 
+thread_local! {
+    /// The names whose assigned values are being inferred right now
+    /// (the name → assignment hop of `infer_type_inner`): a name met
+    /// again on its own path is a cycle.
+    static NAME_INFERENCE_PATH: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One name on the inference path, popped when the hop ends — by
+/// normal return OR by unwinding (Devin review on #342, round 8: a
+/// caught panic must not leave the name behind as a false cycle).
+struct NameInferenceEntry;
+
+impl NameInferenceEntry {
+    fn enter(name: String) -> Self {
+        NAME_INFERENCE_PATH.with(|path| path.borrow_mut().push(name));
+        NameInferenceEntry
+    }
+}
+
+impl Drop for NameInferenceEntry {
+    fn drop(&mut self) {
+        NAME_INFERENCE_PATH.with(|path| {
+            path.borrow_mut().pop();
+        });
+    }
+}
+
 fn infer_type_inner(
     ctx: Option<&CodeGenContext>,
     expr: &ExprType,
@@ -655,6 +692,13 @@ fn infer_type_inner(
             if let Some(t) = options.name_types.get(&n.id) {
                 return t.clone();
             }
+            // An `except ... as e` binding IS the runtime exception
+            // (issue #335): typed as the exception, so a call site
+            // Some-wraps it into an `Option<PyException>` slot and passes
+            // it bare into a PyException one.
+            if matches!(symbols.get(&n.id), Some(SymbolTableNode::ExceptBinding(_))) {
+                return crate::ast::tree::arguments::exception_typeinfo(false);
+            }
             // 3. A MUTABLE module global: its static's value type is the
             // name's type — a Boxed static is the boxed PyValue, so a
             // method call on the global drops like any boxed receiver
@@ -681,6 +725,15 @@ fn infer_type_inner(
             if let Some(SymbolTableNode::Assign { value, .. }) = symbols.get(&n.id)
                 && !crate::expr_references(value, &n.id)
             {
+                // A CYCLE through other names (`A = B; B = A` — Devin
+                // review on #342, round 7) is not a type: the names on
+                // the current inference path end the walk as "no answer"
+                // instead of overflowing the stack.
+                let on_path = NAME_INFERENCE_PATH.with(|path| path.borrow().contains(&n.id));
+                if on_path {
+                    return TypeInfo::PyObject;
+                }
+                let _entry = NameInferenceEntry::enter(n.id.clone());
                 return infer_type_inner(ctx, value, options, symbols);
             }
             // A CLASS NAME read as a VALUE (`[ChecksumError]`,
@@ -1024,12 +1077,22 @@ fn infer_type_inner(
                             _ => TypeInfo::PyObject,
                         }
                     }
-                    _ if matches!(attr.value.as_ref(), ExprType::Name(_)) => {
+                    _ if matches!(attr.value.as_ref(), ExprType::Name(_))
+                        || matches!(attr.value.as_ref(), ExprType::Call(c)
+                            if matches!(c.func.as_ref(), ExprType::Name(_))) =>
+                    {
                         // A CLASS-receiver method call (V.parse("a") — a
                         // classmethod whose return types the list-comp
-                        // holding it — records's Version.parse, round 99).
+                        // holding it — records's Version.parse, round 99),
+                        // or a method call on a CONSTRUCTION in place
+                        // (`Response(...)._decode(data, True)`): the
+                        // constructed class's method return.
                         let recv = match attr.value.as_ref() {
                             ExprType::Name(n) => Some(n.id.clone()),
+                            ExprType::Call(c) => match c.func.as_ref() {
+                                ExprType::Name(n) => Some(n.id.clone()),
+                                _ => None,
+                            },
                             _ => None,
                         };
                         match recv.and_then(|id| {
@@ -1520,6 +1583,30 @@ pub fn render_typed(
     if let Some(tokens) = builtin_class_value(expr, &symbols, &options) {
         return Ok(tokens);
     }
+    // A conditional expression into a SCALAR slot (`"closed" if pool is
+    // None else "had pool"` returned from a `-> str` function): each arm
+    // renders against the slot's type, so a literal arm owns itself and a
+    // boxed slot boxes both arms. Scalar slots only: an Option or
+    // container slot keeps the arm-independent handling of its own
+    // lowering (lower_optional_value).
+    if let ExprType::IfExp(i) = expr
+        && let Some(slot) = &expected
+        && matches!(
+            slot,
+            TypeInfo::String
+                | TypeInfo::Bytes
+                | TypeInfo::Int
+                | TypeInfo::Float
+                | TypeInfo::Bool
+                | TypeInfo::PyValue
+        )
+    {
+        let test =
+            crate::condition_to_rust(&i.test, ctx.clone(), options.clone(), symbols.clone())?;
+        let body = render_typed(&i.body, ctx.clone(), options.clone(), symbols.clone(), expected.clone())?;
+        let orelse = render_typed(&i.orelse, ctx, options, symbols, expected)?;
+        return Ok(quote!(if #test { #body } else { #orelse }));
+    }
     let tokens = expr
         .clone()
         .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
@@ -1770,6 +1857,12 @@ pub fn render_typed_reused(
     // round-92 boxing (`PyValue::from((x))` → the box is a fresh value)
     // NEEDS the clone or the move returns.
     let adapted_is_into = adapted && tokens.to_string().contains("into");
+    // A `Some(x)` wrap (a present value into an Option slot — the
+    // exception-union rule's `Optional[MyError]`): the clone belongs to
+    // the READ inside the wrap — `Some((x).clone())` — a clone of the
+    // wrapped Option would move x into it first (Devin review on #342,
+    // round 4).
+    let some_wrapped = adapted && tokens.to_string() == format!("Some ({})", raw);
     // A MODULE-attribute read (`socket.AF_INET` — a constant) never
     // clones: the root is a module, not a class instance, so the read
     // cannot move anything a later read needs (round 99).
@@ -1799,6 +1892,12 @@ pub fn render_typed_reused(
                 // See render_reused: a CLASS-typed name's reuse-clone must
                 // be the trait-qualified std Clone (`Clone::clone(&x)`),
                 // never the class's own `clone` method (round 88).
+                if some_wrapped {
+                    if matches!(t, TypeInfo::Class(_)) {
+                        return Ok(quote!(Some(Clone::clone(&(#raw)))));
+                    }
+                    return Ok(quote!(Some((#raw).clone())));
+                }
                 if matches!(t, TypeInfo::Class(_)) {
                     return Ok(quote!(Clone::clone(&(#tokens))));
                 }
@@ -1869,6 +1968,24 @@ pub fn is_boxable_value_type(t: &TypeInfo) -> bool {
     )
 }
 
+/// `call_arg_expected_type` with the SYMBOLS-AWARE exception-union rule
+/// first (`Optional[MyError]` where MyError is a crate exception class —
+/// the syntax-only mapping cannot see it): the parameter's declared type
+/// (arguments.rs) is what the argument coerces to (Devin review on
+/// #342, round 4). The annotation is evaluated (unquoted) first.
+pub fn call_arg_expected_type_in(
+    ann: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<TypeInfo> {
+    let unquoted = crate::ast::tree::arguments::unquote_annotation(ann);
+    let ann: &ExprType = unquoted.as_ref().unwrap_or(ann);
+    if let Some(t) = crate::ast::tree::arguments::exception_union_typeinfo(ann, symbols, options) {
+        return Some(t);
+    }
+    call_arg_expected_type(ann)
+}
+
 pub fn call_arg_expected_type(ann: &ExprType) -> Option<TypeInfo> {
     let t = annotation_type_info(ann)?;
     if matches!(t, TypeInfo::String) {
@@ -1889,6 +2006,18 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
     // and every use of the parameter breaks.
     let unquoted = crate::ast::tree::arguments::unquote_annotation(ann);
     let ann: &ExprType = unquoted.as_ref().unwrap_or(ann);
+    // A union of builtin exception classes only, in any spelling
+    // (`OSError | TimeoutError`, `Union[OSError, TimeoutError]`,
+    // `Optional[OSError]`, `BaseException | None` — the context-manager
+    // protocol): the runtime's one exception type, PyException (an
+    // Option of one with a None member). The symbols-aware authority
+    // (arguments.rs's exception_union_typeinfo) adds the crate's
+    // exception classes and import aliases over the same member reader;
+    // this is its syntax-only half, so the two never disagree on a
+    // builtin.
+    if let Some(t) = builtin_exception_union(ann) {
+        return Some(t);
+    }
     // `T | None` (and `None | T`) is Option<T>; the inner type resolves
     // through the same mapping. A union of two non-None members that map
     // to the same TypeInfo (bytes | bytearray) is that type. `str | bytes`
@@ -2202,6 +2331,24 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
 
 /// A union of boxable members with no single Rust type becomes the boxed
 /// PyValue. Returns None when a member is not boxable.
+/// The syntax-only half of `exception_union_typeinfo`: a union (any
+/// spelling) whose non-None members are ALL builtin exception names (or
+/// the stdlib `socket.timeout` spelling) is PyException,
+/// Option<PyException> with a None member; anything else is None.
+fn builtin_exception_union(ann: &ExprType) -> Option<TypeInfo> {
+    let (members, has_none) = crate::ast::tree::arguments::union_annotation_members(ann)?;
+    let is_builtin = |m: &ExprType| match m {
+        ExprType::Name(n) => crate::ast::tree::raise_stmt::is_builtin_exception_name(&n.id),
+        ExprType::Attribute(a) => matches!(a.value.as_ref(), ExprType::Name(m)
+            if crate::ast::tree::raise_stmt::stdlib_exception_canonical(&m.id, &a.attr).is_some()),
+        _ => false,
+    };
+    if members.is_empty() || !members.iter().all(|m| is_builtin(m)) {
+        return None;
+    }
+    Some(crate::ast::tree::arguments::exception_typeinfo(has_none))
+}
+
 fn boxable_union(members: Option<Vec<&ExprType>>) -> Option<TypeInfo> {
     let members = members?;
     if members.len() < 2 {
@@ -3671,6 +3818,14 @@ fn resolve_alias_typeinfo_inner(
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<TypeInfo> {
+    // A union of exception classes only, in ANY spelling (builtin names,
+    // import aliases, the crate's exception classes): PyException, as the
+    // signature declares it (arguments.rs — one rule). Decided before the
+    // arms below resolve a member alone (`Optional[OSError]` would box
+    // its builtin member).
+    if let Some(t) = crate::ast::tree::arguments::exception_union_typeinfo(ann, symbols, options) {
+        return Some(t);
+    }
     match ann {
         // `T | None`: Option of the alias-resolved inner type
         // (`list[CharsetMatch] | None`). A boxed PyValue already contains

@@ -30,8 +30,14 @@ pub type Arg = ExprType;
 pub struct Parameter {
     /// Parameter name
     pub arg: String,
-    /// Optional type annotation
+    /// Optional type annotation — EVALUATED: a quoted annotation is the
+    /// expression it spells (the parser bridge evaluates it once).
     pub annotation: Option<Box<ExprType>>,
+    /// The ORIGINAL text of a quoted annotation, for the one reader that
+    /// wants the text rather than the expression: the Rust stub loader
+    /// (`.pyi` stubs spell Rust types as strings — `"&[u8]"`, `"u32"`).
+    #[serde(default)]
+    pub quoted_source: Option<String>,
     /// Optional type comment (deprecated Python feature)
     pub type_comment: Option<String>,
     /// Position information
@@ -108,12 +114,21 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Parameter {
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let arg: String = ob.getattr("arg")?.extract()?;
         
-        // Extract optional annotation
+        let mut quoted_source = None;
+        // Extract optional annotation. A QUOTED annotation (`err:
+        // "Optional[MyError]"`, `x: "str"`) is evaluated HERE, at the
+        // parser bridge — the one place every reader of a parameter's
+        // annotation inherits from (the signature, the body's name
+        // types, the local type pass, optional-name seeding, call sites,
+        // field inference, dunder routing), so no consumer can see the
+        // raw string (Devin review on #342, rounds 4 and 7).
         let annotation = if let Ok(ann) = ob.getattr("annotation") {
             if ann.is_none() {
                 None
             } else {
-                Some(Box::new(ann.extract()?))
+                let raw: ExprType = ann.extract()?;
+                quoted_source = quoted_annotation_text(&raw);
+                Some(Box::new(unquote_annotation(&raw).unwrap_or(raw)))
             }
         } else {
             None
@@ -133,6 +148,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Parameter {
         Ok(Self {
             arg,
             annotation,
+            quoted_source,
             type_comment,
             lineno: ob.lineno(),
             col_offset: ob.col_offset(),
@@ -285,6 +301,33 @@ pub(crate) fn is_type_annotation(annotation: &ExprType) -> bool {
 /// `annotation_type_info`, Parameter::to_rust) see the real union instead
 /// of a bare string Constant. Returns None when the annotation is not a
 /// string literal or the content cannot be parsed (round 56).
+impl Parameter {
+    /// The parameter's annotation as EVALUATED: a quoted annotation
+    /// (`err: "Optional[MyError]"`) is the expression it spells. The
+    /// parser bridge (`FromPyObject for Parameter`) evaluates it once
+    /// at construction, so `annotation` already holds the expression
+    /// and every reader agrees; this accessor names that contract for
+    /// the readers that want it spelled out, and evaluates again only
+    /// for a Parameter built elsewhere (the class synthesizers) with a
+    /// quoted form (Devin review on #342, rounds 4 and 7).
+    pub(crate) fn evaluated_annotation(&self) -> Option<ExprType> {
+        let ann = self.annotation.as_deref()?;
+        Some(unquote_annotation(ann).unwrap_or_else(|| ann.clone()))
+    }
+}
+
+/// The text of a string-literal annotation (`"Optional[MyError]"`), None
+/// for any other annotation.
+pub(crate) fn quoted_annotation_text(annotation: &ExprType) -> Option<String> {
+    let ExprType::Constant(c) = annotation else {
+        return None;
+    };
+    let Some(litrs::Literal::String(s)) = &c.0 else {
+        return None;
+    };
+    Some(s.value().to_string())
+}
+
 pub(crate) fn unquote_annotation(annotation: &ExprType) -> Option<ExprType> {
     let ExprType::Constant(c) = annotation else {
         return None;
@@ -302,6 +345,260 @@ pub(crate) fn unquote_annotation(annotation: &ExprType) -> Option<ExprType> {
         return None;
     };
     Some(annotation.clone())
+}
+
+/// Whether a union member names an exception class: a builtin exception
+/// name, an imported stdlib alias (`SocketTimeout`), a class of the crate
+/// the exception closure holds (`is_exception_class` — the one C3
+/// authority: its ancestry through the crate's classes, the builtin
+/// exceptions and the documented `*Error`/`*Exception`/`*Warning`
+/// convention, §8.1), or a name the conversion cannot resolve at all that
+/// follows the convention (an external `BaseSSLError` — the raise model's
+/// rule for an unknown name).
+pub(crate) fn is_exception_class_member(
+    member: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    is_exception_class_member_within(member, symbols, options, &mut Vec::new())
+}
+
+/// `is_exception_class_member` with the names already followed through
+/// `Assign`/`Alias` hops: a cycle (`A = B; B = A` — Devin review on
+/// #342, round 7) ends the walk as "not an exception class" instead of
+/// overflowing the stack, the same closure the alias resolvers keep.
+fn is_exception_class_member_within(
+    member: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+    followed: &mut Vec<String>,
+) -> bool {
+    match member {
+        ExprType::Name(n) => {
+            if followed.iter().any(|seen| seen == &n.id) {
+                return false;
+            }
+            followed.push(n.id.clone());
+            if let Some((class, _)) =
+                crate::ast::tree::call::resolve_construction_class(&n.id, symbols, options)
+            {
+                return crate::is_exception_class(&class);
+            }
+            // A name BOUND in scope as a value (`NetworkError = 1`) is
+            // that value, whatever its spelling: the naming convention
+            // applies to genuinely unresolved names only (Devin review
+            // on #342, round 6). A binding to another name or attribute
+            // (`NetworkError = requests.ConnectionError`) is judged by
+            // what it names.
+            match symbols.get(&n.id) {
+                Some(crate::SymbolTableNode::Assign { value, .. }) => {
+                    return matches!(value, ExprType::Name(_) | ExprType::Attribute(_))
+                        && !crate::expr_references(value, &n.id)
+                        && is_exception_class_member_within(value, symbols, options, followed);
+                }
+                Some(crate::SymbolTableNode::Alias(target)) if target != &n.id => {
+                    let target = ExprType::Name(crate::Name { id: target.clone() });
+                    return is_exception_class_member_within(&target, symbols, options, followed);
+                }
+                // A bound FUNCTION, a module import, an except binding or a
+                // Rust binding is what it is — never an exception class,
+                // whatever its spelling (Devin review on #342, round 12).
+                Some(crate::SymbolTableNode::FunctionDef(_))
+                | Some(crate::SymbolTableNode::Import(_))
+                | Some(crate::SymbolTableNode::ExceptBinding(_))
+                | Some(crate::SymbolTableNode::RustBinding(_))
+                | Some(crate::SymbolTableNode::RustModule(_)) => return false,
+                // A from-import is judged by its MODULE: a recognized
+                // exception alias is one (below); a stdlib or crate
+                // module's other item is not (a class of the crate would
+                // have resolved above); only a module the crate does not
+                // hold falls to the naming convention — the documented
+                // rule for an absent external name.
+                Some(crate::SymbolTableNode::ImportFrom(imp)) => {
+                    if crate::ast::tree::raise_stmt::is_builtin_exception_name(&n.id)
+                        || crate::ast::tree::raise_stmt::imported_exception_alias(
+                            &n.id,
+                            symbols,
+                            Some(options),
+                        )
+                        .is_some()
+                    {
+                        return true;
+                    }
+                    let root = imp.module.split('.').next().unwrap_or(&imp.module);
+                    let path: Vec<String> = imp.module.split('.').map(str::to_string).collect();
+                    let known_module = imp.level > 0
+                        || crate::StdModule::from_name(root).is_some()
+                        || crate::ast::tree::import::is_std_only_module(root)
+                        || crate::AnnotationModule::from_name(root).is_some()
+                        || crate::ast::tree::module::module_defs_key(options, &path).is_some();
+                    return !known_module
+                        && crate::ast::tree::raise_stmt::is_exception_class_name(&n.id);
+                }
+                _ => {}
+            }
+            crate::ast::tree::raise_stmt::is_builtin_exception_name(&n.id)
+                || crate::ast::tree::raise_stmt::imported_exception_alias(
+                    &n.id,
+                    symbols,
+                    Some(options),
+                )
+                .is_some()
+                || crate::ast::tree::raise_stmt::is_exception_class_name(&n.id)
+        }
+        ExprType::Attribute(a) => {
+            // The dotted module path (`errors.MyError`, `pkg.errors.MyError`);
+            // an aliased root (`import errors as e`) is the module it
+            // names.
+            let mut path: Vec<String> = Vec::new();
+            let mut cur = a.value.as_ref();
+            loop {
+                match cur {
+                    ExprType::Name(m) => {
+                        path.push(m.id.clone());
+                        break;
+                    }
+                    ExprType::Attribute(inner) => {
+                        path.push(inner.attr.clone());
+                        cur = inner.value.as_ref();
+                    }
+                    _ => return false,
+                }
+            }
+            path.reverse();
+            if let Some(crate::SymbolTableNode::Alias(target)) = symbols.get(&path[0]) {
+                let mut target: Vec<String> = target.split('.').map(str::to_string).collect();
+                target.extend(path.drain(1..));
+                path = target;
+            }
+            if let [m] = path.as_slice()
+                && crate::ast::tree::raise_stmt::stdlib_exception_canonical(m, &a.attr).is_some()
+            {
+                return true;
+            }
+            // A module the CRATE holds: its class, judged by the one
+            // exception closure (re-export chains followed) — Devin
+            // review on #342, round 8.
+            let key: Vec<String> = crate::ast::tree::module::module_defs_key(options, &path)
+                .map(|k| k.to_vec())
+                .unwrap_or_else(|| path.clone());
+            if let Some((class, _)) =
+                crate::ast::tree::module::module_class_def(options, &key, &a.attr).or_else(|| {
+                    crate::ast::tree::module::resolve_imported_class(options, &key, &a.attr, 0)
+                })
+            {
+                return crate::is_exception_class(&class);
+            }
+            if options.module_defs.contains_key(&key) {
+                // A crate module without that class: not an exception.
+                return false;
+            }
+            // A module the crate does not hold (external): the naming
+            // convention, as for an unresolved bare name.
+            crate::ast::tree::raise_stmt::is_exception_class_name(&a.attr)
+        }
+        _ => false,
+    }
+}
+
+/// The members of a union annotation in ANY supported spelling — PEP 604
+/// `A | B | None`, `Union[A, B]` / `typing.Union[A, B]`, `Optional[A]` /
+/// `typing.Optional[A]` (also nested: `Optional[Union[A, B]]`) — as the
+/// non-None members plus whether None is a member. None for anything
+/// that is not a union (a bare name, a container subscript).
+pub(crate) fn union_annotation_members(ann: &ExprType) -> Option<(Vec<&ExprType>, bool)> {
+    match ann {
+        ExprType::BinOp(op) if matches!(op.op, crate::BinOps::BitOr) => {
+            let mut members = Vec::new();
+            let mut has_none = false;
+            for m in union_members(ann)? {
+                if crate::is_none_expr(m) {
+                    has_none = true;
+                } else if let Some((inner, inner_none)) = union_annotation_members(m) {
+                    members.extend(inner);
+                    has_none |= inner_none;
+                } else {
+                    members.push(m);
+                }
+            }
+            Some((members, has_none))
+        }
+        ExprType::Subscript(sub) => {
+            let container = match sub.value.as_ref() {
+                ExprType::Name(n) => n.id.as_str(),
+                ExprType::Attribute(a)
+                    if matches!(a.value.as_ref(), ExprType::Name(m) if crate::is_typing(&m.id)) =>
+                {
+                    a.attr.as_str()
+                }
+                _ => return None,
+            };
+            let crate::SubscriptKind::Index(index) = &sub.kind else {
+                return None;
+            };
+            let elements: Vec<&ExprType> = match (container, index.as_ref()) {
+                ("Union", ExprType::Tuple(t)) => t.elts.iter().collect(),
+                ("Union", single) => vec![single],
+                ("Optional", single) => vec![single],
+                _ => return None,
+            };
+            let mut members = Vec::new();
+            let mut has_none = container == "Optional";
+            for m in elements {
+                if crate::is_none_expr(m) {
+                    has_none = true;
+                } else if let Some((inner, inner_none)) = union_annotation_members(m) {
+                    members.extend(inner);
+                    has_none |= inner_none;
+                } else {
+                    members.push(m);
+                }
+            }
+            Some((members, has_none))
+        }
+        _ => None,
+    }
+}
+
+/// The type of a union annotation (any spelling `union_annotation_members`
+/// reads) whose members are ALL exception classes (optionally with None):
+/// the runtime's one exception type, `PyException`, or
+/// `Option<PyException>` with a None member. Any other union (a boxable or
+/// class member, or no exception member) is None. ONE rule for the
+/// signature (Parameter::to_rust), the body's name types
+/// (function_def.rs) and the alias resolver, so a parameter's reads see
+/// the type its signature declares.
+pub(crate) fn exception_union_typeinfo(
+    annotation: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<crate::TypeInfo> {
+    let (members, has_none) = union_annotation_members(annotation)?;
+    if members.is_empty()
+        || !members
+            .iter()
+            .all(|m| is_exception_class_member(m, symbols, options))
+    {
+        return None;
+    }
+    Some(exception_typeinfo(has_none))
+}
+
+/// The runtime's exception type as a TypeInfo: `PyException`, or
+/// `Option<PyException>` for a None-able slot.
+pub(crate) fn exception_typeinfo(optional: bool) -> crate::TypeInfo {
+    let exception = crate::TypeInfo::Custom(quote!(PyException));
+    if optional {
+        crate::TypeInfo::Option(Box::new(exception))
+    } else {
+        exception
+    }
+}
+
+/// Whether a TypeInfo is the runtime's exception type (the `Custom`
+/// payload the exception-union rule produces).
+pub(crate) fn is_exception_typeinfo(t: &crate::TypeInfo) -> bool {
+    matches!(t, crate::TypeInfo::Custom(tokens) if tokens.to_string() == "PyException")
 }
 
 pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStream> {
@@ -363,6 +660,17 @@ impl CodeGen for Parameter {
             // alias in another module resolves through symbols
             // (charset_normalizer). Anything else falls back to rendering
             // the annotation expression (e.g. a user-defined class name).
+            // A union of exception classes only (`err: BaseSSLError |
+            // OSError | SocketTimeout` — urllib3's _raise_timeout): the
+            // exception model has one runtime type, so the parameter IS a
+            // PyException (an Option of one with a None member) — a caught
+            // exception passes straight in, and `isinstance(err, X)` tests
+            // its kind like an except clause. Decided FIRST: the
+            // syntax-only mapping boxes a builtin exception member.
+            if let Some(t) = exception_union_typeinfo(&annotation, &symbols, &options) {
+                let rust_type = t.to_rust_type();
+                return Ok(quote!(#param_name: #rust_type));
+            }
             let rust_type = match python_annotation_to_rust_type(&annotation) {
                 Some(mapped) => mapped,
                 None => {
@@ -375,24 +683,15 @@ impl CodeGen for Parameter {
                         && !members.is_empty()
                         && members.iter().all(|m| {
                             crate::is_pyvalue_boxable_member(m)
-                                || matches!(m, ExprType::Name(n)
-                                    if crate::ast::tree::raise_stmt::is_exception_class_name(&n.id)
-                                        || crate::ast::tree::raise_stmt::imported_exception_alias(
-                                            &n.id,
-                                            &symbols,
-                                            Some(&options),
-                                        )
-                                        .is_some())
+                                || is_exception_class_member(m, &symbols, &options)
                         })
                     {
-                        // A union with exception-class members (`err:
-                        // BaseSSLError | OSError | SocketTimeout` —
-                        // urllib3's _raise_timeout): exceptions are boxed
-                        // values, so the parameter boxes. Checked only
-                        // AFTER the direct mapping, so `str | bytes` still
-                        // lowers to StrOrBytes. Members resolve through
-                        // the naming convention and the symbol table
-                        // (import aliases like SocketTimeout).
+                        // A union MIXING exception classes with boxable
+                        // members: exceptions have no boxed representation,
+                        // so the parameter boxes and an exception argument
+                        // stays a loud mismatch. Checked only AFTER the
+                        // direct mapping, so `str | bytes` still lowers to
+                        // StrOrBytes.
                         quote!(stdpython::PyValue)
                     } else {
                         annotation.to_rust(ctx, options, symbols)?

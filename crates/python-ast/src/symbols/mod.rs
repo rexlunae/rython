@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
+use std::rc::Rc;
 
 use crate::tree::{ClassDef, FunctionDef, Import, ImportFrom};
 
@@ -134,20 +135,29 @@ pub enum SymbolTableNode {
     RustModule(RustModuleSpec),
 }
 
+/// One scope's bindings. The map is shared on clone and copied on the
+/// first write after a clone: the scopes are cloned per rendered element
+/// (the typed re-render of a tuple or list element clones the whole
+/// stack), and a module whose bindings carry its own data tables (idna's
+/// `uts46data.py`: eighty functions each returning a hundred tuples) made
+/// every such clone a copy of the entire module, quadratic in the module's
+/// size. Readers never see the sharing; `insert` writes through
+/// `Rc::make_mut`, so a scope that is still shared is copied once, then
+/// owned.
 #[derive(Clone, Debug)]
 pub struct SymbolTable {
-    pub symbols: HashMap<String, SymbolTableNode>,
+    pub symbols: Rc<HashMap<String, SymbolTableNode>>,
 }
 
 impl SymbolTable {
     pub fn new() -> Self {
         Self {
-            symbols: HashMap::new(),
+            symbols: Rc::new(HashMap::new()),
         }
     }
 
     pub fn insert(&mut self, key: String, value: SymbolTableNode) {
-        self.symbols.insert(key, value);
+        Rc::make_mut(&mut self.symbols).insert(key, value);
     }
 
     pub fn get(&self, key: &str) -> Option<&SymbolTableNode> {
@@ -314,6 +324,32 @@ mod tests {
             SymbolTableNode::Alias(name) => assert_eq!(name, "alias_name"),
             _ => panic!("Expected Alias node"),
         }
+    }
+
+    #[test]
+    fn a_cloned_scope_shares_its_bindings_until_written() {
+        // The typed re-render of every tuple/list element clones the
+        // scopes; a module carrying its own data tables (idna's
+        // uts46data.py) must not be copied per element. A clone shares
+        // each scope's map; the first insert after the clone copies that
+        // one scope and leaves the original untouched.
+        let mut scopes = SymbolTableScopes::new();
+        scopes.new_scope();
+        scopes.insert("outer".to_string(), SymbolTableNode::Alias("o".to_string()));
+        scopes.new_scope();
+        scopes.insert("inner".to_string(), SymbolTableNode::Alias("i".to_string()));
+
+        let mut copy = scopes.clone();
+        assert!(Rc::ptr_eq(&scopes.0[0].symbols, &copy.0[0].symbols));
+        assert!(Rc::ptr_eq(&scopes.0[1].symbols, &copy.0[1].symbols));
+
+        copy.insert("added".to_string(), SymbolTableNode::Alias("a".to_string()));
+        assert!(!Rc::ptr_eq(&scopes.0[0].symbols, &copy.0[0].symbols));
+        assert!(Rc::ptr_eq(&scopes.0[1].symbols, &copy.0[1].symbols));
+        assert!(copy.get("added").is_some());
+        assert!(scopes.get("added").is_none());
+        assert!(copy.get("inner").is_some());
+        assert!(copy.get("outer").is_some());
     }
 
     #[test]
