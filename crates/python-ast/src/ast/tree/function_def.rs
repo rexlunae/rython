@@ -3052,11 +3052,34 @@ impl FunctionDef {
             });
             match refusal {
                 None => {
-                    nested_closures
-                        .insert(nested.name.clone(), crate::ast::tree::closure::closure_info(
-                            &nested,
-                            &scope_names,
-                        ));
+                    let info = crate::ast::tree::closure::closure_info(&nested, &scope_names);
+                    // The receiver of an enclosing METHOD is a BORROW of the
+                    // caller's instance, not an owned value: a callable-value
+                    // closure MOVE-captures what it reads (`let self =
+                    // self.clone()` at its definition — E0424, `self` may not
+                    // be bound, and a `&mut` borrow has no clone), and the
+                    // closure could outlive the method's borrow anyway.
+                    // Reading the instance late is what a plain Rust closure
+                    // does by reference; a nested `def` cannot — refuse it
+                    // loudly and let the port pass the fields it reads as
+                    // parameters.
+                    if is_method && info.captures.iter().any(|c| c == "self") {
+                        let reason = format!(
+                            "nested function `{}` reads the method receiver \
+                             through `self`, which a callable value cannot \
+                             capture: the receiver is a borrow of the instance, \
+                             not a value to clone, and `self` may not be bound \
+                             in Rust. Pass the receiver's fields the nested \
+                             function needs as parameters",
+                            nested.name
+                        );
+                        options.definition_warnings.borrow_mut().push(reason.clone());
+                        inferred_signature.called_params.insert(nested.name.clone());
+                        value_callables.insert(nested.name.clone());
+                        refused_closures.insert(nested.name.clone(), reason);
+                    } else {
+                        nested_closures.insert(nested.name.clone(), info);
+                    }
                 }
                 Some(reason) => {
                     options.definition_warnings.borrow_mut().push(reason.clone());
@@ -3092,6 +3115,20 @@ impl FunctionDef {
                 .filter(|c| cell_locals.contains(*c))
                 .cloned()
                 .collect();
+        }
+        // A METHOD's receiver is a BORROW of the caller's instance, not an
+        // owned local: the closure-cell machinery cannot own it, and the
+        // cell it would declare is `let self = PyCell::empty("self")` —
+        // E0424, `self` may not be bound. It needs no cell either: a plain
+        // Rust closure (a lambda argument — `sub(repl=lambda m:
+        // ... self._encoding ...)` — charset_normalizer's
+        // CharsetMatch.output) captures the receiver binding BY REFERENCE,
+        // which reads the one object late exactly as Python's cell does,
+        // and attribute stores through `self` reach the same object the
+        // closure sees. A nested definition that must MOVE the receiver
+        // into a callable value is refused above.
+        if is_method {
+            cell_locals.remove("self");
         }
         options.cell_locals = std::rc::Rc::new(cell_locals);
         // A CAPTURED name keeps the type it has in the enclosing scope:
