@@ -1831,8 +1831,46 @@ fn lower_kernel_call_args(
     args.iter().map(|a| lower_kernel_value(a, line)).collect()
 }
 
+/// The stack the conversion runs on.
+///
+/// Lowering recurses once per AST node, and each frame carries the
+/// `PythonOptions` the scope is rendered under, so stack use grows with
+/// the deepest expression in the package. A twenty-line module already
+/// needs ~2 MiB — which is exactly Rust's default stack for a SPAWNED
+/// thread, so a conversion driven from a thread (a test harness, a build
+/// tool, a server) sat one field-width away from a `SIGABRT` that names
+/// nothing. The conversion therefore runs on a thread whose stack is
+/// sized explicitly, the way rustc sizes its own: the reservation is
+/// virtual, so the pages a small package never touches cost nothing.
+const CONVERT_STACK: usize = 256 * 1024 * 1024;
+
 /// Convert `package` into a Cargo crate under `out_dir`.
+///
+/// Runs on a dedicated thread — see [`CONVERT_STACK`]. Everything the
+/// conversion keeps in thread-local state (the written-file list, the
+/// codegen caches) is created and consumed inside that thread, so the
+/// move is invisible to callers.
 pub fn convert(
+    package: &PyPackage,
+    out_dir: &Path,
+    opts: &ConvertOptions,
+) -> Result<ConvertedCrate> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("rython-convert".to_string())
+            .stack_size(CONVERT_STACK)
+            .spawn_scoped(scope, || convert_on_this_thread(package, out_dir, opts))
+            .context("spawning the conversion thread")?
+            .join()
+            // A panic in the conversion is re-raised in the caller, so a
+            // bug still reports itself where the caller can see it.
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+/// The conversion proper. Call [`convert`], which gives this the stack it
+/// needs.
+fn convert_on_this_thread(
     package: &PyPackage,
     out_dir: &Path,
     opts: &ConvertOptions,

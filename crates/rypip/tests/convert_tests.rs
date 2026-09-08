@@ -2606,6 +2606,49 @@ fn kernel_module_rust_for_linux_rejects_unmappable_forms() {
 }
 
 #[test]
+fn a_conversion_driven_from_a_default_stack_thread_does_not_overflow() {
+    // Lowering recurses once per AST node and each frame carries the
+    // scope's PythonOptions, so a twenty-line module already needs about
+    // 2 MiB of stack — Rust's default for a SPAWNED thread. A conversion
+    // driven from any thread (a test harness, a build tool, a server) was
+    // therefore one struct field away from `fatal runtime error: stack
+    // overflow`, which aborts the process and names nothing. `convert`
+    // now runs on a thread whose stack it sizes itself; this pins that.
+    let scratch = Scratch::new("stackdepth");
+    let file = scratch.path().join("deep_demo.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> int:\n",
+            "    nums = [5, 1, 9, 3]\n",
+            "    words = [\"pear\", \"fig\", \"apple\"]\n",
+            "    print(f\"minkey={min(words, key=lambda w: len(w))}\")\n",
+            "    print(f\"sortedkey={repr(sorted(words, key=lambda w: len(w)))}\")\n",
+            "    for i, v in enumerate(reversed(nums), start=1):\n",
+            "        print(f\"rev{i}={v}\")\n",
+            "    print(f\"powm={pow(3, -1, 7)} fsum={repr(0.1 + 0.2)}\")\n",
+            "    return 0\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let converted = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let pkg = rypip::discover(&file).expect("discover");
+            rypip::convert(&pkg, &out, &ConvertOptions::default()).map(|k| k.name)
+        })
+        .expect("spawning the driving thread")
+        .join()
+        .expect("the conversion must not abort the process");
+    assert_eq!(converted.expect("convert").as_str(), "deep_demo");
+}
+
+#[test]
 fn builtins_match_python_at_runtime() {
     // min/max (n-ary, default=, key=), sorted (reverse=, key=, stability),
     // reversed, enumerate(start=), 2/3-arg pow, and repr (including
