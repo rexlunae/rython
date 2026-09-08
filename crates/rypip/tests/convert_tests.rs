@@ -6281,6 +6281,63 @@ fn guarded_option_field_returns_into_concrete_fns() {
 }
 
 #[test]
+fn guarded_option_field_args_into_str_params_match_python() {
+    // Round 104: a guarded `str | None` FIELD passed to a `str`-taking
+    // callee (`is_accentuated(self._last)` after `self._last is not
+    // None` — charset_normalizer's md.py SuspiciousAccentPlugin): the
+    // arg unwraps through the mapped path with the loud panic (the guard
+    // makes the None unreachable). Transcript pinned against python3.
+    let scratch = Scratch::new("fieldarg");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def is_accentuated(character: str) -> bool:\n",
+            "    return character.isupper()\n",
+            "\n",
+            "\n",
+            "class P:\n",
+            "    def __init__(self):\n",
+            "        self._last: str | None = None\n",
+            "\n",
+            "    def feed(self, ch: str) -> int:\n",
+            "        n = 0\n",
+            "        if self._last is not None and is_accentuated(ch) and is_accentuated(self._last):\n",
+            "            n += 1\n",
+            "        self._last = ch\n",
+            "        return n\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    p = P()\n",
+            "    print(p.feed(\"A\"), p.feed(\"B\"), p.feed(\"a\"))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["0 1 0"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {
     // Round 41: a trait-DEFAULT body that formats `self` in an exception
     // message (`raise PoolError(self)` — urllib3's _get_conn raises

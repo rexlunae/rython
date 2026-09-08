@@ -407,6 +407,19 @@ pub fn coerce_tokens(
         {
             Some(quote!((#tokens).unwrap_or(stdpython::PyValue::None_)))
         }
+        // Option<T> -> T where T is the Option's OWN inner type: an
+        // OPTION-typed value into a concrete slot of its own inner
+        // (`is_accentuated(self._last)` where `_last` is a `str | None`
+        // field a guard has tested non-None - charset_normalizer's
+        // md.py, round 104). The guard makes the None unreachable; where
+        // a None genuinely flows, Python would fail at use on it too
+        // (the str-operating callee), so the loud section-12.2 panic is
+        // the faithful reading.
+        (TypeInfo::Option(inner), to) if **inner == *to => {
+            let msg = "rython: an optional value was None where a concrete value was required \
+                       (Python would fail at use, rython at the conversion)";
+            Some(quote!((#tokens).clone().unwrap_or_else(|| panic!(#msg))))
+        }
         // A class instance, a PyException, or an Option of one has no
         // boxed representation: the value is left as is, so the mismatch
         // stays a plain E0308 naming both types (a `PyValue::from` would
