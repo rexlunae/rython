@@ -1192,7 +1192,24 @@ fn infer_type_inner(
             // resolvable receiver keeps the unknown marker.
             TypeInfo::PyObject
         }
-        ExprType::Subscript(sub) => match infer_type_inner(ctx, &sub.value, options, symbols) {
+        ExprType::Subscript(sub) => {
+            let container = infer_type_inner(ctx, &sub.value, options, symbols);
+            // A SLICE of a container is a container (`ws[:4]` of a
+            // `list[str]` is a `Vec<String>`, `s[1:]` of a str is a
+            // String): the element typing below applies to INDEXES only —
+            // the element answer for a slice made `for w in ws[:4]`
+            // (text_stats) look like a String iteration and broke the
+            // char conversion (round 101). The subscript LOWERING unwraps
+            // an Option base before slicing, so an `Option<Vec<T>>` /
+            // `Option<String>` slice infers the inner container, never
+            // the Option (Devin review on round 101).
+            if matches!(sub.kind, crate::SubscriptKind::Slice { .. }) {
+                return match container {
+                    crate::TypeInfo::Option(inner) => (*inner).clone(),
+                    other => other,
+                };
+            }
+            match container {
             TypeInfo::Vec(inner) => *inner,
             TypeInfo::Dict(_, v) => *v,
             // A TUPLE indexed by a constant (`pair[0]`, `pair[-1]`) is that
@@ -1241,7 +1258,8 @@ fn infer_type_inner(
                 other => other,
             },
             _ => TypeInfo::PyObject,
-        },
+        }
+        }
         // A comprehension's element type is its element expression's type
         // in the comprehension's own scope (the targets bound to their
         // iterables' elements — the same scope the lowering renders in).

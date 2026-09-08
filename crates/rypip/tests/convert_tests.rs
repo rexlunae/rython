@@ -6075,6 +6075,94 @@ fn mixed_length_string_tuple_dict_values_build_and_read() {
 }
 
 #[test]
+fn string_iteration_zip_and_comprehensions_match_python() {
+    // Round 101: a str used as a character SEQUENCE — `for ch in s`, an
+    // all()-comprehension over a string, `zip(s, range(n))`, slicing a
+    // str/list (plain and Optional), literal and parameter sources, both
+    // zip argument positions, unequal lengths (truncation) and reuse of
+    // the iterable after the loop (charset_normalizer's md.py iterates
+    // and zips its accumulated `_buffer: str`). Transcript pinned
+    // against python3.
+    let scratch = Scratch::new("strseq");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def feed(buf: str) -> int:\n",
+            "    bad = 0\n",
+            "    for ch in buf:\n",
+            "        if ch.isupper():\n",
+            "            bad += 1\n",
+            "    return bad\n",
+            "\n",
+            "\n",
+            "def first(buf: str) -> list[str]:\n",
+            "    return [c for c in buf[1:4] if c != \"o\"]\n",
+            "\n",
+            "\n",
+            "def camel(buf: str) -> list[int]:\n",
+            "    return [i for c, i in zip(buf, range(0, len(buf))) if c.isupper()]\n",
+            "\n",
+            "\n",
+            "def pair(a: str, b: list[str]) -> list[str]:\n",
+            "    return [x + y for x, y in zip(a, b)]\n",
+            "\n",
+            "\n",
+            "def revpair(a: list[str], b: str) -> list[str]:\n",
+            "    return [x + y for x, y in zip(a, b)]\n",
+            "\n",
+            "\n",
+            "def optslice(buf: str | None) -> int:\n",
+            "    n = 0\n",
+            "    for ch in buf[1:]:\n",
+            "        if ch == \"a\":\n",
+            "            n += 1\n",
+            "    return n\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    s = \"HeLLo\"\n",
+            "    print(feed(s), feed(\"abc\"), feed(\"aB\"))\n",
+            "    print(first(\"banana\"), first(\"hello\"))\n",
+            "    print(camel(\"aBcD\"))\n",
+            "    print(sorted(pair(\"ab\", [\"1\", \"22\"])))\n",
+            "    print(revpair([\"p\", \"q\", \"r\"], \"xy\"))\n",
+            "    print(optslice(\"banana\"), optslice(\"anna\"))\n",
+            "    print(s, \"usable after:\", s.lower())\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "3 0 1",
+            "['a', 'n', 'a'] ['e', 'l', 'l']",
+            "[1, 3]",
+            "['a1', 'b22']",
+            "['px', 'qy']",
+            "3 1",
+            "HeLLo usable after: hello",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+#[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {
     // Round 41: a trait-DEFAULT body that formats `self` in an exception
     // message (`raise PoolError(self)` — urllib3's _get_conn raises

@@ -303,6 +303,25 @@ fn build_comprehension_loops(
                 ) {
                     it = quote!(#it . py_keys ());
                 }
+                // A STRING-typed iterable (`all(_.isupper() for _ in
+                // buf)` — charset_normalizer's md.py, which iterates its
+                // accumulated `_buffer: str`): Python iterates
+                // one-character strings and the element analysis types
+                // them String — iterate the chars mapped back to
+                // one-char Strings (a raw String is not IntoIterator).
+                if matches!(
+                    crate::infer_type(
+                        Some(ctx),
+                        &generator.iter,
+                        iter_options,
+                        symbols
+                    ),
+                    crate::TypeInfo::String | crate::TypeInfo::StrRef
+                ) {
+                    it = quote!(
+                        #it . chars () . map (| __rython_char | __rython_char . to_string ())
+                    );
+                }
                 it
             }
         };
