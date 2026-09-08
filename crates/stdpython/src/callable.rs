@@ -111,7 +111,10 @@ impl<A, R> Eq for PyCallable<A, R> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
+    // The no_std tier has no prelude: the alloc items these tests use are
+    // named explicitly, as the rest of the crate names them.
+    use alloc::string::ToString;
+    use alloc::{vec, vec::Vec};
 
     #[test]
     fn a_callable_value_calls_through() {
@@ -150,11 +153,11 @@ mod tests {
 
     #[test]
     fn callables_live_in_containers_and_dispatch() {
-        let table: vec::Vec<PyCallable<(i64,), i64>> = vec![
+        let table: Vec<PyCallable<(i64,), i64>> = vec![
             PyCallable::new("double", |(x,)| Ok(x * 2)),
             PyCallable::new("square", |(x,)| Ok(x * x)),
         ];
-        let applied: vec::Vec<i64> =
+        let applied: Vec<i64> =
             table.iter().map(|f| f.call((5,)).unwrap()).collect();
         assert_eq!(applied, vec![10, 25]);
     }
