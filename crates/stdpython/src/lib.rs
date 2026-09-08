@@ -5450,6 +5450,25 @@ impl<V: Clone> PyIndex<&str> for PyDict<String, V> {
     }
 }
 
+/// An OPTION-typed key (`mapping[encoding]` where encoding is
+/// `str | None`, behind an `encoding in mapping` guard —
+/// charset_normalizer's legacy.detect, round 102): a `Some` key looks up
+/// as the string; a `None` key is CPython's `KeyError: None` (a loud
+/// panic — real code guards the index with a membership test that a None
+/// key fails, so this branch is unreachable there).
+impl<V: Clone> PyIndex<Option<String>> for PyDict<String, V> {
+    type Output = V;
+    fn py_index(&self, key: Option<String>) -> Result<V, PyException> {
+        match key {
+            Some(k) => self
+                .get(&k)
+                .cloned()
+                .ok_or_else(|| PyException::new("KeyError", key_repr(&k))),
+            None => Err(PyException::new("KeyError", "None".to_string())),
+        }
+    }
+}
+
 impl<V> PyIndexMut<&str> for PyDict<String, V> {
     type Output = V;
     fn py_index_mut(&mut self, key: &str) -> Result<&mut V, PyException> {
@@ -5472,6 +5491,16 @@ impl<K: Eq + Hash, V> PyContains<K> for PyDict<K, V> {
     }
 }
 
+/// An OPTION-typed membership operand (`encoding in mapping` where
+/// encoding is `str | None` — charset_normalizer's legacy.detect, round
+/// 102): a `Some` value probes as the string; `None` never matches a
+/// string key, exactly as CPython's `None in dict` is False.
+impl<V> PyContains<Option<String>> for PyDict<String, V> {
+    fn py_contains(&self, item: &Option<String>) -> bool {
+        item.as_ref().map_or(false, |k| self.contains_key(k))
+    }
+}
+
 // Python's `in` probes by CONTENT — a str operand tests a container of
 // OWNED strings regardless of Rust ownership: `"x" in vec_of_string`,
 // `"k" in string_keyed_dict`, `"x" in string_set` (issue #229: a class
@@ -5482,6 +5511,17 @@ impl<K: Eq + Hash, V> PyContains<K> for PyDict<K, V> {
 impl PyContains<str> for Vec<String> {
     fn py_contains(&self, item: &str) -> bool {
         self.iter().any(|s| s == item)
+    }
+}
+
+/// An OPTION-typed membership operand over a Vec of strings
+/// (`unicode_range in ["Hiragana", ...]` where unicode_range is
+/// `str | None` — charset_normalizer's md.py, round 102): a `Some`
+/// value probes by content; `None` never matches, as CPython's
+/// `None in list` is False.
+impl PyContains<Option<String>> for Vec<String> {
+    fn py_contains(&self, item: &Option<String>) -> bool {
+        item.as_ref().map_or(false, |s| self.iter().any(|m| m == s))
     }
 }
 

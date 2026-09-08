@@ -507,13 +507,35 @@ impl CodeGen for Compare {
                                     )
                             ))
                     ) {
-                        let left = crate::render_typed(
-                            left_ast,
-                            ctx.clone(),
-                            options.clone(),
-                            symbols.clone(),
-                            Some(crate::TypeInfo::String),
-                        )?;
+                        // An OPTION-of-string LEFT (`encoding in table` where
+                        // encoding is `str | None` — charset_normalizer's
+                        // legacy.detect, round 102): pass it through — the
+                        // runtime PyContains<Option<String>> gives CPython's
+                        // semantics (None never matches). The String-expected
+                        // coercion below would unwrap it, moving the value
+                        // (E0382 on a later use) and panicking where Python
+                        // answers False.
+                        let left_opt_string = matches!(
+                            crate::infer_type(Some(&ctx), left_ast, &options, &symbols),
+                            crate::TypeInfo::Option(inner)
+                                if matches!(
+                                    &*inner,
+                                    crate::TypeInfo::String | crate::TypeInfo::StrRef
+                                )
+                        );
+                        let left = if left_opt_string {
+                            left_ast
+                                .clone()
+                                .to_rust(ctx.clone(), options.clone(), symbols.clone())?
+                        } else {
+                            crate::render_typed(
+                                left_ast,
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(crate::TypeInfo::String),
+                            )?
+                        };
                         let recv = membership_receiver();
                         quote!((#recv).py_contains(&(#left)))
                     } else {
@@ -557,13 +579,31 @@ impl CodeGen for Compare {
                                     )
                             ))
                     ) {
-                        let left = crate::render_typed(
-                            left_ast,
-                            ctx.clone(),
-                            options.clone(),
-                            symbols.clone(),
-                            Some(crate::TypeInfo::String),
-                        )?;
+                        // The Option-of-string passthrough (see the In arm):
+                        // `x not in table` with x `str | None` never matches
+                        // when x is None (CPython), and the coercion would
+                        // move x out of the Option.
+                        let left_opt_string = matches!(
+                            crate::infer_type(Some(&ctx), left_ast, &options, &symbols),
+                            crate::TypeInfo::Option(inner)
+                                if matches!(
+                                    &*inner,
+                                    crate::TypeInfo::String | crate::TypeInfo::StrRef
+                                )
+                        );
+                        let left = if left_opt_string {
+                            left_ast
+                                .clone()
+                                .to_rust(ctx.clone(), options.clone(), symbols.clone())?
+                        } else {
+                            crate::render_typed(
+                                left_ast,
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(crate::TypeInfo::String),
+                            )?
+                        };
                         let recv = membership_receiver();
                         quote!(!(#recv).py_contains(&(#left)))
                     } else {
