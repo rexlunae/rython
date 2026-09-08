@@ -2577,6 +2577,23 @@ fn string_union_and_option_inner_mixes_box() {
 }
 
 #[test]
+fn zip_keyword_strict_is_a_loud_conversion_error() {
+    // Python 3.10+'s zip(strict=True) raises ValueError on unequal
+    // lengths; rython's zip truncates like the default zip, so the
+    // keyword is refused at conversion — never silently lowered as the
+    // truncating form (Devin review on round 101).
+    let err = compile_err(
+        "def z(a: str, b: str) -> int:\n    return len(list(zip(a, b, strict=True)))\n",
+        "zipstrict.py",
+    );
+    assert!(
+        err.contains("unexpected keyword argument 'strict'"),
+        "error: {}",
+        err
+    );
+}
+
+#[test]
 fn python_list_methods_map_to_correct_rust() {
     let src = concat!(
         "def f() -> int:\n",

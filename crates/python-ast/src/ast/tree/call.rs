@@ -2349,6 +2349,24 @@ impl<'a> CodeGen for Call {
                     // guarded arm must not let the plain call fall to the
                     // builtin match's unreachable.
                     "zip" if self.args.len() == 2 => {
+                        // CPython 3.10+'s `zip(strict=True)` raises
+                        // ValueError on unequal lengths; rython's zip
+                        // truncates like the default. A keyword is loud —
+                        // never silently lowered as the truncating zip
+                        // (Devin review on round 101).
+                        if !self.keywords.is_empty() {
+                            let kw = self.keywords[0]
+                                .arg
+                                .as_deref()
+                                .unwrap_or("**kwargs");
+                            return Err(format!(
+                                "zip() got an unexpected keyword argument '{}'; rython's zip \
+                                 has no strict= mode (CPython's zip(strict=True) raises \
+                                 ValueError when the iterables differ in length)",
+                                kw
+                            )
+                            .into());
+                        }
                         // A STRING argument (`zip(self._buffer, range(0,
                         // len))` — charset_normalizer's md.py, which
                         // zips its accumulated `_buffer: str` with an

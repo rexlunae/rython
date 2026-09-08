@@ -1136,9 +1136,15 @@ fn infer_type_inner(
             // String): the element typing below applies to INDEXES only —
             // the element answer for a slice made `for w in ws[:4]`
             // (text_stats) look like a String iteration and broke the
-            // char conversion (round 101).
+            // char conversion (round 101). The subscript LOWERING unwraps
+            // an Option base before slicing, so an `Option<Vec<T>>` /
+            // `Option<String>` slice infers the inner container, never
+            // the Option (Devin review on round 101).
             if matches!(sub.kind, crate::SubscriptKind::Slice { .. }) {
-                return container;
+                return match container {
+                    crate::TypeInfo::Option(inner) => (*inner).clone(),
+                    other => other,
+                };
             }
             match container {
             TypeInfo::Vec(inner) => *inner,

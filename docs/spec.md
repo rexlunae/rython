@@ -752,6 +752,18 @@ the two-argument bound form), and `map(str.m, xs)` lowers the function
 argument to a closure applying the bound method. Sweep −4 (urllib3
 1023→1019). Pinned in both shapes.
 
+Round 101 (strings as character SEQUENCES): a `str` used where Python
+iterates it — `for ch in buf` (and a string iterable inside a
+comprehension / `all(... for _ in s)` generator) — now iterates the
+chars mapped back to one-CHARACTER Strings (charset_normalizer's md.py
+iterates its accumulated `_buffer: str`); `zip(s, range(...))` converts
+a String argument to its char Vec and materializes a range argument
+(the runtime zip takes Vecs), truncating on unequal lengths like
+Python's default zip; `zip(..., strict=True)` is a loud conversion
+error (rython has no strict mode). A SLICE of a container types as the
+container (a `list[str]` slice is a `Vec<String>`, an `Optional` base
+unwraps to the inner container), fixing slice-iteration typing.
+
 Round 66 (the Option-dict method-call family): three members.
 `for key in ("headers", "_proxy_headers", "_socks_options")` (urllib3's
 poolmanager — 4 sites) iterated a Rust tuple, which is not

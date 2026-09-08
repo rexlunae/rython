@@ -6077,10 +6077,12 @@ fn mixed_length_string_tuple_dict_values_build_and_read() {
 #[test]
 fn string_iteration_zip_and_comprehensions_match_python() {
     // Round 101: a str used as a character SEQUENCE — `for ch in s`, an
-    // all()-comprehension over a string, and `zip(s, range(n))` — lowers
-    // through chars mapped to one-char Strings (charset_normalizer's
-    // md.py SuperWeirdWordPlugin iterates and zips its accumulated
-    // `_buffer: str`). Transcript pinned against python3.
+    // all()-comprehension over a string, `zip(s, range(n))`, slicing a
+    // str/list (plain and Optional), literal and parameter sources, both
+    // zip argument positions, unequal lengths (truncation) and reuse of
+    // the iterable after the loop (charset_normalizer's md.py iterates
+    // and zips its accumulated `_buffer: str`). Transcript pinned
+    // against python3.
     let scratch = Scratch::new("strseq");
     let file = scratch.path().join("app.py");
     fs::write(
@@ -6094,16 +6096,39 @@ fn string_iteration_zip_and_comprehensions_match_python() {
             "    return bad\n",
             "\n",
             "\n",
-            "def allupper(buf: str) -> bool:\n",
-            "    return all(ch.isupper() for ch in buf)\n",
+            "def first(buf: str) -> list[str]:\n",
+            "    return [c for c in buf[1:4] if c != \"o\"]\n",
             "\n",
             "\n",
             "def camel(buf: str) -> list[int]:\n",
             "    return [i for c, i in zip(buf, range(0, len(buf))) if c.isupper()]\n",
             "\n",
             "\n",
+            "def pair(a: str, b: list[str]) -> list[str]:\n",
+            "    return [x + y for x, y in zip(a, b)]\n",
+            "\n",
+            "\n",
+            "def revpair(a: list[str], b: str) -> list[str]:\n",
+            "    return [x + y for x, y in zip(a, b)]\n",
+            "\n",
+            "\n",
+            "def optslice(buf: str | None) -> int:\n",
+            "    n = 0\n",
+            "    for ch in buf[1:]:\n",
+            "        if ch == \"a\":\n",
+            "            n += 1\n",
+            "    return n\n",
+            "\n",
+            "\n",
             "def main() -> None:\n",
-            "    print(feed(\"HeLLo\"), allupper(\"ABC\"), allupper(\"AbC\"), camel(\"aBcD\"))\n",
+            "    s = \"HeLLo\"\n",
+            "    print(feed(s), feed(\"abc\"), feed(\"aB\"))\n",
+            "    print(first(\"banana\"), first(\"hello\"))\n",
+            "    print(camel(\"aBcD\"))\n",
+            "    print(sorted(pair(\"ab\", [\"1\", \"22\"])))\n",
+            "    print(revpair([\"p\", \"q\", \"r\"], \"xy\"))\n",
+            "    print(optslice(\"banana\"), optslice(\"anna\"))\n",
+            "    print(s, \"usable after:\", s.lower())\n",
             "\n",
             "\n",
             "if __name__ == \"__main__\":\n",
@@ -6123,13 +6148,20 @@ fn string_iteration_zip_and_comprehensions_match_python() {
     // Verified against python3.
     assert_eq!(
         stdout.lines().collect::<Vec<_>>(),
-        vec!["3 True False [1, 3]"],
+        vec![
+            "3 0 1",
+            "['a', 'n', 'a'] ['e', 'l', 'l']",
+            "[1, 3]",
+            "['a1', 'b22']",
+            "['px', 'qy']",
+            "3 1",
+            "HeLLo usable after: hello",
+        ],
         "stdout: {}",
         stdout
     );
     assert_eq!(output.status.code(), Some(0));
 }
-
 #[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {
     // Round 41: a trait-DEFAULT body that formats `self` in an exception
