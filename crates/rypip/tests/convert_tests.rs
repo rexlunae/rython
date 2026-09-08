@@ -6338,6 +6338,66 @@ fn guarded_option_field_args_into_str_params_match_python() {
 }
 
 #[test]
+fn method_self_captured_by_plain_lambda_compiles_and_matches_python() {
+    // Round 105: a method whose receiver `self` is captured by a plain
+    // Rust closure (a `map` argument lambda) AND stored through by the
+    // method (`self.tag = ...` before and after the closure use —
+    // charset_normalizer's CharsetMatch.output shape). `self` is not an
+    // owned local, so the closure-cell machinery must never make it a
+    // cell: `let self = PyCell::empty("self")` is E0424 (`self` may not
+    // be bound) and the borrow wrapper's `let mut self` too. The plain
+    // closure captures the receiver binding by reference, which reads the
+    // one object late exactly as Python's cell does. Transcript pinned
+    // against python3.
+    let scratch = Scratch::new("selfcell");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Rewriter:\n",
+            "    def __init__(self, initial: str):\n",
+            "        self.tag: str = initial\n",
+            "\n",
+            "    def rewrite(self, words: list[str], tag: str) -> str:\n",
+            "        if self.tag == \"\":\n",
+            "            self.tag = tag\n",
+            "        joined = \"\".join(map(lambda w: w + \"[\" + self.tag + \"]\", words))\n",
+            "        self.tag = tag + \"!\"\n",
+            "        return joined\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    r = Rewriter(\"\")\n",
+            "    print(r.rewrite([\"a\", \"bb\"], \"X\"))\n",
+            "    print(r.rewrite([\"c\"], \"Y\"))\n",
+            "    print(r.tag)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["a[X]bb[X]", "c[X!]", "Y!"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {
     // Round 41: a trait-DEFAULT body that formats `self` in an exception
     // message (`raise PoolError(self)` — urllib3's _get_conn raises

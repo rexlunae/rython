@@ -3232,6 +3232,81 @@ fn rebinding_a_nonself_receiver_is_a_loud_error() {
 }
 
 #[test]
+fn method_receiver_is_never_a_closure_cell() {
+    // Round 105: a method whose receiver `self` is captured by a plain
+    // closure (a `map` argument lambda) AND stored through by the method
+    // would previously be promoted to a closure CELL — the cell machinery
+    // emits `let self = PyCell::empty("self")` and the statement-level
+    // borrow shadow `let mut self = &mut *__rython_cell`, both E0424
+    // (`self` may not be bound). The receiver is a BORROW, never an owned
+    // local: no cell. The plain closure captures the binding by reference
+    // (Python's cell semantics), and stores go straight through `&mut
+    // self`.
+    let out = compile(
+        concat!(
+            "class Rewriter:\n",
+            "    def __init__(self, initial: str):\n",
+            "        self.tag: str = initial\n",
+            "\n",
+            "    def rewrite(self, words: list[str], tag: str) -> str:\n",
+            "        if self.tag == \"\":\n",
+            "            self.tag = tag\n",
+            "        joined = \"\".join(map(lambda w: w + \"[\" + self.tag + \"]\", words))\n",
+            "        self.tag = tag + \"!\"\n",
+            "        return joined\n",
+        ),
+        "selfcell.py",
+    );
+    assert!(
+        !out.contains("let self") && !out.contains("PyCell :: empty"),
+        "generated: {}",
+        out
+    );
+    // The lambda argument still reads the receiver: `self . tag` plain
+    // (a reference capture), with the stores around it direct.
+    assert!(
+        out.contains("map (| w | (w) . py_add (& ((self . tag) . clone ())))") ||
+        out.contains("self . tag"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn nested_def_capturing_method_self_is_a_loud_refusal() {
+    // Round 105: a nested `def` inside a method that reads the receiver
+    // (`def helper(x): return x + self.step`) cannot lower as a callable
+    // VALUE: its capture prologue is `let self = self.clone()` — E0424,
+    // `self` may not be bound, and a `&mut` receiver has no clone — and
+    // the value could outlive the method's borrow. The definition is
+    // refused loudly (a warning at the def) and the call site is a
+    // compile_error naming the fix, never a `let self` binding.
+    let out = compile(
+        concat!(
+            "class R:\n",
+            "    def __init__(self, step: int):\n",
+            "        self.step = step\n",
+            "\n",
+            "    def total(self, v: int) -> int:\n",
+            "        def helper(x: int) -> int:\n",
+            "            return x + self.step\n",
+            "        return helper(v) + self.step\n",
+        ),
+        "nestedself.py",
+    );
+    assert!(
+        out.contains("reads the method receiver"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        !out.contains("let self") && !out.contains("PyCell :: empty"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
 fn keyword_arguments_map_to_parameter_positions() {
     let src = concat!(
         "def volume(w: int, h: int, d: int) -> int:\n",
