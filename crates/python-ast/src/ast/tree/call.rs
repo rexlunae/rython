@@ -4388,15 +4388,35 @@ impl<'a> CodeGen for Call {
                                     symbols.clone(),
                                 )?;
                                 let runtime = crate::safe_ident(&options.stdpython);
+                                // The ENCODING argument is BORROWED, never
+                                // moved: decode_by_name takes it by value
+                                // (`N: AsRef<str>`), and a String-typed
+                                // `self.<field>` or a reused local would
+                                // otherwise move out of the receiver or
+                                // of the binding (E0507/E0382 —
+                                // charset_normalizer's models.py __str__
+                                // `str(self._payload, self._encoding,
+                                // "strict")` and utils.py's
+                                // encoding_iana loops).
                                 return Ok(quote!(
-                                    #runtime::stdlib::codec::decode_by_name(&(#a), #enc)?
+                                    #runtime::stdlib::codec::decode_by_name(&(#a), &(#enc))?
                                 ));
                             }
                             (2, _) => {
                                 let (a, enc) = (&rendered[0], &rendered[1]);
                                 let runtime = crate::safe_ident(&options.stdpython);
+                                // The ENCODING argument is BORROWED, never
+                                // moved: decode_by_name takes it by value
+                                // (`N: AsRef<str>`), and a String-typed
+                                // `self.<field>` or a reused local would
+                                // otherwise move out of the receiver or
+                                // of the binding (E0507/E0382 —
+                                // charset_normalizer's models.py __str__
+                                // `str(self._payload, self._encoding,
+                                // "strict")` and utils.py's
+                                // encoding_iana loops).
                                 return Ok(quote!(
-                                    #runtime::stdlib::codec::decode_by_name(&(#a), #enc)?
+                                    #runtime::stdlib::codec::decode_by_name(&(#a), &(#enc))?
                                 ));
                             }
                             // str(bytes, encoding, errors) — the errors
@@ -4406,8 +4426,18 @@ impl<'a> CodeGen for Call {
                             (3, _) => {
                                 let (a, enc) = (&rendered[0], &rendered[1]);
                                 let runtime = crate::safe_ident(&options.stdpython);
+                                // The ENCODING argument is BORROWED, never
+                                // moved: decode_by_name takes it by value
+                                // (`N: AsRef<str>`), and a String-typed
+                                // `self.<field>` or a reused local would
+                                // otherwise move out of the receiver or
+                                // of the binding (E0507/E0382 —
+                                // charset_normalizer's models.py __str__
+                                // `str(self._payload, self._encoding,
+                                // "strict")` and utils.py's
+                                // encoding_iana loops).
                                 return Ok(quote!(
-                                    #runtime::stdlib::codec::decode_by_name(&(#a), #enc)?
+                                    #runtime::stdlib::codec::decode_by_name(&(#a), &(#enc))?
                                 ));
                             }
                             _ => {
@@ -7641,8 +7671,11 @@ let mutating_self_field = boxed_self_ref_receiver
                             ));
                         }
                         // Runtime codec name: dispatch in the runtime.
+                        // The encoding is BORROWED (see the str(bytes,
+                        // encoding) arms): a String field read must not
+                        // move out of the receiver.
                         return Ok(quote!(
-                            #runtime::stdlib::codec::decode_by_name(&(#receiver), #enc)?
+                            #runtime::stdlib::codec::decode_by_name(&(#receiver), &(#enc))?
                         ));
                     }
                     ("decode", []) => {

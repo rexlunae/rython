@@ -17025,7 +17025,10 @@ fn compat_builtin_self_alias_import_drops_and_calls_dispatch_to_builtin() {
         out
     );
     assert!(
-        flat.contains("decode_by_name(&(x),enc)?"),
+        // The ENCODING argument is borrowed (round 107): decode_by_name
+        // takes it by value (`N: AsRef<str>`), and a String field or a
+        // reused local must not move into it (E0507/E0382).
+        flat.contains("decode_by_name(&(x),&(enc))?"),
         "str(x, encoding=enc) must dispatch to the decode arm: {}",
         out
     );
