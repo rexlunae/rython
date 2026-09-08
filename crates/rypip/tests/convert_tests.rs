@@ -15192,3 +15192,117 @@ fn typing_spelled_exception_unions_take_a_caught_exception() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn callables_are_values_that_capture_dispatch_and_raise() {
+    // Issue #122 (the #334/#181 family): a nested `def` returned out of
+    // its enclosing function keeps what it captured; a lambda typed by
+    // the position it sits in; a dict and a list of callables dispatched
+    // through; a module function name passed as a value; an exception
+    // raised inside a callable caught by its CALLER; a captured dict and
+    // list mutated by a closure seen by the enclosing scope; and an
+    // annotated `*args` summed as the ints it declares.
+    let scratch = Scratch::new("callables");
+    let file = scratch.path().join("callables.py");
+    fs::write(
+        &file,
+        concat!(
+            "from typing import Callable\n",
+            "\n",
+            "\n",
+            "class Refused(Exception):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def make_adder(n: int) -> Callable[[int], int]:\n",
+            "    def add(x: int) -> int:\n",
+            "        return x + n\n",
+            "    return add\n",
+            "\n",
+            "\n",
+            "def compose(f: Callable[[int], int], g: Callable[[int], int]) -> Callable[[int], int]:\n",
+            "    return lambda x: f(g(x))\n",
+            "\n",
+            "\n",
+            "def apply_all(fs: list[Callable[[int], int]], x: int) -> list[int]:\n",
+            "    return [f(x) for f in fs]\n",
+            "\n",
+            "\n",
+            "def guarded(step: Callable[[int], int], x: int) -> str:\n",
+            "    try:\n",
+            "        return \"ok \" + str(step(x))\n",
+            "    except Refused as e:\n",
+            "        return \"refused \" + str(e)\n",
+            "\n",
+            "\n",
+            "def checked(x: int) -> int:\n",
+            "    if x < 0:\n",
+            "        raise Refused(\"negative\")\n",
+            "    return x * 3\n",
+            "\n",
+            "\n",
+            "def total(*nums: int, scale: int = 1) -> int:\n",
+            "    return sum(nums) * scale\n",
+            "\n",
+            "\n",
+            "def tally() -> None:\n",
+            "    counter = {\"n\": 0}\n",
+            "    seen = []\n",
+            "\n",
+            "    def bump() -> int:\n",
+            "        counter[\"n\"] += 1\n",
+            "        seen.append(counter[\"n\"])\n",
+            "        return counter[\"n\"]\n",
+            "\n",
+            "    bump()\n",
+            "    bump()\n",
+            "    print(bump(), counter[\"n\"], seen)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    add5 = make_adder(5)\n",
+            "    add9 = make_adder(9)\n",
+            "    double = lambda x: x * 2\n",
+            "    both = compose(add5, double)\n",
+            "    print(add5(1), add9(1), double(4), both(3), compose(double, add5)(3))\n",
+            "    table: dict[str, Callable[[int], int]] = {\"add5\": add5, \"double\": double, \"both\": both}\n",
+            "    for name in sorted(table):\n",
+            "        print(name, table[name](10))\n",
+            "    print(apply_all([add5, double, both], 7))\n",
+            "    print(guarded(checked, 4), \"|\", guarded(checked, -1))\n",
+            "    print(total(1, 2, 3), total(1, 2, 3, scale=10), total())\n",
+            "    tally()\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/callables"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec![
+            "6 10 8 11 16",
+            "add5 15",
+            "both 25",
+            "double 20",
+            "[12, 14, 19]",
+            "ok 12 | refused negative",
+            "6 60 0",
+            "3 3 [1, 2, 3]",
+        ],
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

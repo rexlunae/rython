@@ -193,6 +193,46 @@ impl<'a> CodeGen for Assign {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // A `lambda` bound to a NAME whose type is a callable value
+        // (issue #122): the name's type — from its uses, or from an
+        // annotation — is what types the lambda's parameters, so the
+        // binding holds the same `PyCallable` every other callable value
+        // does instead of a bare Rust closure.
+        if self.targets.len() == 1
+            && let ExprType::Name(target) = &self.targets[0]
+            && matches!(self.value, ExprType::Lambda(_))
+            && let Some(expected @ crate::TypeInfo::Callable(..)) =
+                options.name_types.get(&target.id).cloned()
+        {
+            let ident = crate::safe_ident(&target.id);
+            let value = crate::render_typed(
+                &self.value,
+                ctx,
+                options.clone(),
+                symbols,
+                Some(expected),
+            )?;
+            return Ok(quote!(#ident = #value;));
+        }
+
+        // A closure CELL's binding (issue #122): the local a nested
+        // closure mutates lives in a shared `stdpython::PyCell`, so the
+        // closure's captured clone and this name are one object. The
+        // name is function-hoisted like every assigned local, so the
+        // binding is the plain store; only the value is wrapped.
+        if self.targets.len() == 1
+            && let ExprType::Name(target) = &self.targets[0]
+            && options.cell_locals.contains(&target.id)
+        {
+            let ident = crate::safe_ident(&target.id);
+            let mut inner = options.clone();
+            let mut cells = (*inner.cell_locals).clone();
+            cells.remove(&target.id);
+            inner.cell_locals = std::rc::Rc::new(cells);
+            let value = crate::render_typed(&self.value, ctx, inner, symbols, None)?;
+            return Ok(quote!(#ident = stdpython::PyCell::new(#value);));
+        }
+
         // rust.bind / rust.c_bind declarations are compile-time-only: the
         // assignment emits nothing (the binding lives in the symbol table).
         // Everything about the declaration is validated here, loudly.

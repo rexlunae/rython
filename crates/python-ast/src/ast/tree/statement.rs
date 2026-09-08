@@ -83,6 +83,29 @@ impl CodeGen for Statement {
             _ => None,
         };
         options.stmt_binds = marks.as_ref().map(|m| std::rc::Rc::new(m.bits()));
+        // A statement that MUTATES a closure cell (issue #122): borrow the
+        // shared object mutably for the statement and shadow the name with
+        // that borrow, so the ordinary store lowering below writes the ONE
+        // object the closure and the enclosing scope share instead of a
+        // snapshot. The recursion terminates — the inner render no longer
+        // sees the name as a cell.
+        if !options.cell_locals.is_empty()
+            && let Some(root) =
+                crate::ast::tree::closure::cell_mutation_root(&self, &options.cell_locals)
+        {
+            let ident = crate::safe_ident(&root);
+            let mut inner = options.clone();
+            let mut cells = (*inner.cell_locals).clone();
+            cells.remove(&root);
+            inner.cell_locals = std::rc::Rc::new(cells);
+            let body = self.to_rust(ctx, inner, symbols)?;
+            return Ok(quote! {{
+                let mut __rython_cell = #ident.borrow_mut();
+                #[allow(unused_mut)]
+                let mut #ident = &mut *__rython_cell;
+                #body
+            }});
+        }
         let bind = marks
             .as_ref()
             .filter(|m| !m.top_level)
@@ -164,9 +187,11 @@ pub enum StatementType {
     /// loud error (rython has no mutable module state).
     Global(Vec<String>),
     /// `nonlocal a, b` — a nested-function binding directive (rich's
-    /// traceback IPython hooks). rython's closures do not capture outer
-    /// function scopes, so the declaration has no runtime effect — a
-    /// no-op (the closure-capture divergence).
+    /// traceback IPython hooks). A nested `def` REBINDING an enclosing
+    /// name is not modeled (mutating the object the name is bound to is
+    /// — issue #122's cells): a def declaring `nonlocal` is refused as a
+    /// callable value with the reason, and the declaration itself is a
+    /// no-op.
     Nonlocal(Vec<String>),
     /// A bare annotated declaration (`x: int` — no value). At module/class
     /// level this is a dataclass-style field declaration; inside functions
@@ -621,16 +646,30 @@ impl CodeGen for StatementType {
             StatementType::Pass => Ok(quote! {}),
             StatementType::FunctionDef(s) => {
                 if ctx.is_function_body() {
-                    // A NESTED function definition (a closure in Python):
-                    // rython's closures do not capture the enclosing
-                    // function's scope (the closure-capture divergence), so
-                    // the definition is a no-op — calls through the name
-                    // drop (function_def.rs adds it to called_params).
-                    options.definition_warnings.borrow_mut().push(format!(
-                        "nested function `{}` is dropped: rython's closures do not \
-                         capture the enclosing scope (the closure-capture divergence)",
-                        s.name
-                    ));
+                    // A NESTED function definition is a CLOSURE in Python
+                    // (issue #122): it lowers to a `stdpython::PyCallable`
+                    // value binding that captures what it reads from this
+                    // scope, so the name holds a real callable and calls
+                    // through it run the body.
+                    if let Some(mut info) = options.nested_closures.get(&s.name).cloned() {
+                        info.hoisted = options.hoisted_names.contains(&s.name);
+                        let mut options = options;
+                        let capture_types: std::collections::HashMap<String, crate::TypeInfo> =
+                            info.captures
+                                .iter()
+                                .filter_map(|c| {
+                                    options.name_types.get(c).map(|t| (c.clone(), t.clone()))
+                                })
+                                .collect();
+                        options.closure_capture_types = std::rc::Rc::new(capture_types);
+                        options.closure_captures = Some(std::rc::Rc::new(info));
+                        return s.to_rust(ctx, options, symbols);
+                    }
+                    // A shape the closure model refuses (the function
+                    // generator recorded the reason and put the name in
+                    // value_callables): the definition has no runtime
+                    // value, and reads and calls through the name are loud
+                    // at the use site.
                     Ok(TokenStream::new())
                 } else {
                     s.to_rust(ctx, options, symbols)
@@ -782,7 +821,23 @@ impl CodeGen for StatementType {
                 // the NoneType variant); a plain-None function returns the
                 // unit value; an Option-returning function returns the
                 // None member.
-                let value = if options.fn_return_is_pyvalue
+                let value = if let (ExprType::Lambda(_), Some(crate::TypeInfo::Callable(..))) =
+                    (&e.value, options.fn_return_typed.as_ref())
+                {
+                    // A `lambda` RETURNED where the signature declares a
+                    // callable value (`def compose(...) -> Callable[[int],
+                    // int]: return lambda x: f(g(x))` — issue #122): the
+                    // declared return is what types the lambda's
+                    // parameters, so it becomes the same `PyCallable` a
+                    // nested `def` does.
+                    crate::render_typed(
+                        &e.value,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                        options.fn_return_typed.clone(),
+                    )?
+                } else if options.fn_return_is_pyvalue
                     && crate::is_none_expr(&e.value)
                 {
                     quote!(PyValue::None_)

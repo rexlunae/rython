@@ -1750,6 +1750,63 @@ pub(crate) fn boxed_receiver_method_dropped(
                 )))
 }
 
+/// The signature of a callee that is a callable VALUE (issue #122) — a
+/// parameter or local typed `Callable[[A], R]`, a container element, the
+/// result of a call that returns one — as opposed to every ordinary call,
+/// which names a definition the converter resolves at conversion time.
+///
+/// A NAME is a value call only when the CURRENT scope binds it (a
+/// parameter, a local, a loop target): a module-level `def` of the same
+/// name is shadowed by the binding in Python, and a name with no binding
+/// here IS the definition, so it keeps the by-name lowering. Every other
+/// callee shape (`ops[name](10)`, `compose(f, g)(3)`, `self.hook(x)`)
+/// asks the type inferrer, which answers `Callable` exactly when the
+/// expression evaluates to one.
+/// A callee's Python spelling for a conversion-time message (`ops[name]`,
+/// `add5`), best-effort: the shapes a callable value can take.
+pub(crate) fn callee_display(func: &ExprType) -> String {
+    match func {
+        ExprType::Name(n) => n.id.clone(),
+        ExprType::Attribute(a) => format!("{}.{}", callee_display(&a.value), a.attr),
+        ExprType::Subscript(sub) => format!("{}[...]", callee_display(&sub.value)),
+        ExprType::Call(c) => format!("{}(...)", callee_display(&c.func)),
+        _ => "<callable value>".to_string(),
+    }
+}
+
+pub(crate) fn callee_value_signature(
+    func: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<(Vec<crate::TypeInfo>, crate::TypeInfo)> {
+    let inferred = match func {
+        ExprType::Name(n) => {
+            // The scope's own binding first — it is the one a call goes
+            // through — then the inferrer for bindings the scope map does
+            // not carry (a comprehension's loop target over a list of
+            // callables).
+            match options.name_types.get(&n.id) {
+                Some(t) => t.clone(),
+                None => {
+                    if matches!(
+                        symbols.get(&n.id),
+                        Some(SymbolTableNode::FunctionDef(_)) | Some(SymbolTableNode::ClassDef(_))
+                    ) {
+                        return None;
+                    }
+                    crate::infer_type(Some(ctx), func, options, symbols)
+                }
+            }
+        }
+        _ => crate::infer_type(Some(ctx), func, options, symbols),
+    };
+    match inferred {
+        crate::TypeInfo::Callable(params, ret) => Some((params, *ret)),
+        _ => None,
+    }
+}
+
 impl<'a> CodeGen for Call {
     type Context = CodeGenContext;
     type Options = PythonOptions;
@@ -1819,6 +1876,56 @@ impl<'a> CodeGen for Call {
                 class.name
             );
             return Ok(quote!(compile_error!(#msg)));
+        }
+        // A call through a callable VALUE (issue #122): `add5(1)`,
+        // `ops[name](10)`, `compose(f, g)(3)`, `f(x)` on a list element.
+        // The value is a `PyCallable<(A, B), R>`, so the call is
+        // `f.call((a, b))?` — the arguments render against the callable's
+        // own parameter types (a str literal into a `Callable[[str], _]`
+        // owns itself, exactly as it does at a named call), and the
+        // `Result` the callable returns threads through `?` like every
+        // other fallible call.
+        if let Some((param_types, _)) =
+            callee_value_signature(self.func.as_ref(), &ctx, &options, &symbols)
+        {
+            if !self.keywords.is_empty() {
+                return Err(format!(
+                    "keyword arguments require the callee's signature, and `{}` is a \
+                     callable VALUE whose parameters have no names; pass the \
+                     arguments positionally",
+                    crate::ast::tree::call::callee_display(self.func.as_ref())
+                )
+                .into());
+            }
+            if self.args.len() != param_types.len() {
+                return Err(format!(
+                    "`{}` is a callable value taking {} argument(s), called with {}",
+                    crate::ast::tree::call::callee_display(self.func.as_ref()),
+                    param_types.len(),
+                    self.args.len()
+                )
+                .into());
+            }
+            let mut args = Vec::with_capacity(self.args.len());
+            for (arg, expected) in self.args.iter().zip(param_types.iter()) {
+                args.push(crate::render_typed(
+                    arg,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                    Some(expected.clone()),
+                )?);
+            }
+            // A Rust 1-tuple needs its trailing comma, and the 0-argument
+            // call passes the unit.
+            let arg_tuple = if args.len() == 1 {
+                let only = &args[0];
+                quote!((#only,))
+            } else {
+                quote!((#(#args),*))
+            };
+            let callee = self.func.clone().to_rust(ctx, options, symbols)?;
+            return Ok(quote!((#callee).call(#arg_tuple)?));
         }
         // A compat builtin ALIAS used as a callee (`builtin_str = str` —
         // requests/compat, called as `builtin_str(x)` in models.py): the
@@ -3996,6 +4103,21 @@ impl<'a> CodeGen for Call {
                             }
                             _ => rendered,
                         };
+                        // The ITERABLE arguments are consumed by value
+                        // (`map(f, xs)` takes `Vec<T>`), unlike the
+                        // borrowing builtins above: a REUSED name would
+                        // move here and fail at its next read, so the
+                        // reuse rule clones it exactly as a user-function
+                        // argument does.
+                        let mut rendered = rendered;
+                        for (i, arg) in self.args.iter().enumerate().skip(1) {
+                            rendered[i] = crate::render_reused(
+                                arg,
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?;
+                        }
                         let fallible = matches!(self.args.first(), Some(ExprType::Name(f))
                             if matches!(symbols.get(&f.id), Some(SymbolTableNode::FunctionDef(_))));
                         if bname == "filter" {
@@ -8369,6 +8491,19 @@ let mutating_self_field = boxed_self_ref_receiver
         // where `callback` iterates an unannotated `callbacks` parameter):
         // the callable-as-value divergence (#122) — the call is dropped
         // (the boxed value is not callable in rython).
+        // A call through a nested definition the closure model REFUSED
+        // (issue #122): the definition emitted nothing, so there is
+        // nothing to call — loud at the site with the reason, never a
+        // dropped no-op that silently answers None.
+        if let ExprType::Name(callee_name) = self.func.as_ref()
+            && let Some(reason) = options.refused_closures.get(&callee_name.id)
+        {
+            let msg = format!(
+                "rython: `{}` cannot be called here: {}",
+                callee_name.id, reason
+            );
+            return Ok(quote!(compile_error!(#msg)));
+        }
         if let ExprType::Name(callee_name) = self.func.as_ref()
             && options.called_params.contains(&callee_name.id)
         {
@@ -11172,6 +11307,12 @@ fn map_call_arguments_inner(
     // A *args callee (an exception `__init__(self, *args, **kwargs)`)
     // accepts extra positionals: they collect into the vararg slot.
     let vararg_param = func.args.vararg.as_ref();
+    // The *args element type (issue #120): the boxed PyValue by default,
+    // the annotation's type when the callee wrote one (`*nums: int`), so
+    // the call site packs plain values into `Vec<i64>` rather than boxing.
+    let vararg_elt = vararg_param
+        .map(|v| crate::ast::tree::arguments::vararg_element_type(v, &symbols, &options))
+        .unwrap_or(crate::TypeInfo::PyValue);
     if args.len() > n && vararg_param.is_none() {
         return Err(format!(
             "{}() takes {} positional argument(s) but {} were given",
@@ -11222,13 +11363,14 @@ fn map_call_arguments_inner(
             continue;
         }
         if i >= n {
-            // Extra positionals collect into the *args slot, boxed.
+            // Extra positionals collect into the *args slot, rendered
+            // against its element type (the boxed PyValue by default).
             let value = crate::render_typed(
                 arg,
                 ctx.clone(),
                 options.clone(),
                 symbols.clone(),
-                Some(crate::TypeInfo::PyValue),
+                Some(vararg_elt.clone()),
             )?;
             eval_order.push(value.clone());
             vararg_extras.push((eval_order.len() - 1, value, false));
@@ -11444,13 +11586,23 @@ fn map_call_arguments_inner(
             let vals: Vec<&TokenStream> = items.iter().map(|(v, _)| v).collect();
             quote!(vec![#(#vals),*])
         } else {
+            let elt = vararg_elt.to_rust_type();
+            let boxed_elt = matches!(vararg_elt, crate::TypeInfo::PyValue);
             let mut stmts =
-                quote!(let mut __rython_varargs: Vec<stdpython::PyValue> = Vec::new(););
+                quote!(let mut __rython_varargs: Vec<#elt> = Vec::new(););
             for (v, is_spread) in items {
                 if *is_spread {
-                    stmts.extend(quote!(__rython_varargs.extend(
-                        (#v).into_iter().map(stdpython::PyValue::from)
-                    );));
+                    // A forwarded `*args` (`g(*args)`): the elements box
+                    // when the callee's vector is the boxed one (an
+                    // identity for an already-boxed Vec<PyValue>), and
+                    // pass through when it is typed.
+                    stmts.extend(if boxed_elt {
+                        quote!(__rython_varargs.extend(
+                            (#v).into_iter().map(stdpython::PyValue::from)
+                        );)
+                    } else {
+                        quote!(__rython_varargs.extend((#v).into_iter());)
+                    });
                 } else {
                     stmts.extend(quote!(__rython_varargs.push(#v);));
                 }

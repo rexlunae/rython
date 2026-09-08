@@ -137,7 +137,8 @@ declaration — loud, but at the wrong layer (§12.1).
 | `np.ndarray`, `np.float64`, `np.int32`, … | `numpy::NdArray`, `f64`, `i32`, … | Provided by the runtime's `numpy` module |
 | `socket.socket` | `socket::Socket` | The runtime socket handle — `wait.py`'s `sock: socket.socket` parameters compile as real `Socket` values, not boxed PyValues |
 | `threading.Thread/Lock/RLock/Event/Semaphore` | `threading::*` | The runtime threading handles (`ready: threading.Event` — a real shared handle) |
-| `type[X]` / `Type[X]` | `Option<()>` | A CLASS value: rython cannot hold classes as values (the callables-as-data divergence); the tolerated opaque marker |
+| `Callable[[A, B], R]` | `stdpython::PyCallable<(A, B), R>` | A CALLABLE held as a VALUE (issue #122): the argument list renders as the argument TUPLE, so one runtime type serves every arity (`Callable[[], None]` is `PyCallable<(), ()>`). The members resolve through the same annotation authority as any other, so a callable over a module type alias is typed, not boxed. `Callable[..., R]` has no fixed arity, hence no Rust signature: it stays the boxed `PyValue`, and a call through it is loud |
+| `type[X]` / `Type[X]` | `Option<()>` | A CLASS value: rython cannot hold classes as values (the classes-as-data divergence — callables ARE values, §3.6); the tolerated opaque marker |
 | `typing.Tuple/Dict/List/Set/FrozenSet/Optional/Literal/…` | like the bare containers | The typing-module spellings map identically to the bare `tuple[...]`/`dict[...]`/… (one resolver, one answer) |
 
 All of the above resolve through ONE annotation authority (`resolve_alias_typeinfo` over the syntax core `annotation_type_info`; the old token-level resolver `python_annotation_to_rust_type` is a thin `TypeInfo::to_rust_type()` wrapper, issue #137's review of rounds 38–47). `set[T]`/`frozenset[T]` are `HashSet` everywhere — the generated structs are the arbiter (urllib3's PoolKey fields are `Option<HashSet<(String, String)>>`), and 1-tuples render `(T,)` with the trailing comma.
@@ -239,6 +240,68 @@ with the message (guarded code never hits it). An `Option`-typed RHS
 of `-` (`self.chunk_left - amt` where `amt: int | None`) likewise
 unwraps with the loud panic.
 
+### 3.6 Callables as values
+
+A call that NAMES a function is resolved at conversion time and lowers
+to that function. A callable held in a variable, a container, a
+parameter or a return is not: what runs is only known at run time, and
+that is what `stdpython::PyCallable<A, R>` is (issue #122). `A` is the
+argument TUPLE, so one type covers every arity and the signature stays
+fully typed — `Callable[[int], int]` is `PyCallable<(i64,), i64>`, never
+an erased bag of boxed values.
+
+Four things become one:
+
+- a `Callable[[A], R]` annotation, on a parameter, a return, a field, or
+  an element of a `list`/`dict` (§3.2);
+- a nested `def`, which is a Python CLOSURE — it lowers to a
+  `PyCallable` binding that captures what it reads from the enclosing
+  scope;
+- a `lambda` in a position that expects one — a lambda writes no
+  annotations, so the expected `Callable[[A], R]` is what types its
+  parameters: a declared return, an annotated assignment, or the
+  parameter of the call it is passed to (a local bound to a bare lambda
+  takes its type from those uses; uses that disagree name no type, and
+  the name is loud where it is called);
+- a module function NAME in such a position (`run(step)`,
+  `_INITIALIZERS.append(callback)`), wrapped in a `PyCallable` that
+  forwards to the item.
+
+A call through the value is `f.call((x,))?`: it returns the same
+`Result<R, PyException>` every generated function returns, so an
+exception raised INSIDE a callable propagates to its caller and is
+caught by the caller's `try`/`except`, exactly as in Python — a plain
+Rust closure could only panic (§4.5).
+
+**Capture.** Python's closure shares objects; it does not copy them. A
+captured name the closure only READS is cloned into it at the `def` —
+what Python's cell gives it for every immutable object, and for a
+container the closure never changes. A captured name the closure
+MUTATES (`counter["n"] += 1`, `seen.append(x)`) is a CELL:
+`stdpython::PyCell` holds it, the closure's `move` capture clones the
+cell (which shares it), stores borrow it mutably, and the enclosing
+scope's reads see every write. A closure's own captured cells are cells
+inside it too, so a doubly-nested mutation reaches the outermost object.
+A captured name keeps the TYPE it has in the enclosing scope; a name the
+closure binds itself shadows the capture, as Python's scoping says.
+
+A LAMBDA takes the same clone captures but has no cells — cells are
+decided per statement, and a lambda is an expression — so one that would
+mutate a capture is refused rather than letting the mutation vanish into
+the clone; the nested `def` spelling carries it.
+
+**What a callable value is not.** The shapes with no Rust type or no
+closure semantics are refused at the definition, with the reason, and
+the name's calls and reads stay loud rather than answering a silent
+None: an unannotated parameter or a missing return annotation (the
+argument tuple needs every type), `*args`/`**kwargs` (a fixed arity),
+a defaulted parameter, a decorator, a generator `def`, and
+`nonlocal`/`global` (rebinding an enclosing NAME, as opposed to mutating
+the object it is bound to, is not modeled). `Callable[..., R]` is the
+same refusal at the annotation. Classes are still not values (§3.2's
+`type[X]`), and a `PyCallable` is deliberately not `Send`: handing one
+to a thread is a build error, not a silent divergence.
+
 ---
 
 ## 4. Expressions
@@ -339,9 +402,14 @@ are **materialized eagerly** and then iterated — laziness is not modeled
 
 ### 4.5 Lambdas
 
-Lambdas lower to Rust closures. A lambda body that can raise cannot
-propagate a `PyException` through the closure boundary; it panics
-loudly instead of being catchable (deviation, §12.2).
+A lambda has two lowerings, decided by where it sits. In a position that
+expects a callable VALUE (§3.6) it is a `stdpython::PyCallable`, and its
+body runs inside a `Result`-returning closure — an exception it raises
+propagates to the CALLER and is catchable there. Everywhere else
+(`map`/`filter`/`sorted(key=…)`, which take Rust closures directly) it
+lowers to a plain Rust closure, and a body that can raise cannot
+propagate a `PyException` through that boundary: it panics loudly
+instead of being catchable (deviation, §12.2).
 
 ### 4.6 Indexing and slicing
 
@@ -1507,7 +1575,12 @@ conversion time:
 
 `*args`/`**kwargs` on module functions lower to the boxed heterogeneous
 containers (issue #120): `*args` is `Vec<stdpython::PyValue>` and
-`**kwargs` is `PyDict<String, stdpython::PyValue>`. Call sites with a
+`**kwargs` is `PyDict<String, stdpython::PyValue>`. An ANNOTATED `*args`
+is not heterogeneous and does not box: `def total(*nums: int)` says every
+extra positional is an int, so the parameter is `Vec<i64>`, the call
+sites pass plain values, and the body uses it as the list of ints it is
+(`sum(nums)`); a forwarded `f(*args)` between two typed varargs passes
+through unboxed. Call sites with a
 known callee pack the extras boxed (`PyValue::from` per value; a call
 with none still passes the empty container), `f(*args)` forwards the
 vector, and the body reads them like any list/dict (len, indexing,
@@ -1989,8 +2062,9 @@ modes, `seek`/`tell`, file-based `json.dump`/`load`.
 
 **`threading`** (std tier): `Thread(target=, args=, daemon=)` —
 the target must be a plain function name and args a tuple/list literal
-(callables are not values; the lowering resolves the target at
-conversion time, the `functools.partial` model), `start()`, `join()`,
+(a `PyCallable` is not `Send`, so a callable VALUE cannot cross a
+thread boundary — §3.6; the lowering resolves the target at conversion
+time, the `functools.partial` model), `start()`, `join()`,
 `is_alive()`, `Lock`/`RLock` (`acquire`/`release`/`locked`, CPython's
 RuntimeError messages, catchable), `Event`
 (`is_set`/`set`/`clear`/`wait`), `Semaphore`, `current_thread().name`
@@ -2336,7 +2410,8 @@ accepted as permanent spec:
 | `raise X from Y` folds the cause into the message; no `__cause__` | Model limit |
 | Argument-render-then-mutate shapes (`print(xs, xs.pop(), xs)`) render the first argument before the mutation | Recorded in issue #79 |
 | A read of a module member the generated module has no item for (`util.ssl_.PROTOCOL_TLS` — an external ssl constant) lowers to the boxed `None` with a warning (dynamic-module-member divergence) | Model limit; module members are static path items |
-| A call through a sibling-module member that is not a module-level function/class (`probe.acquire_and_get`, a bound-method alias) is dropped with the callable-as-value warning | Model limit; callables cannot be runtime values |
+| A call through a sibling-module member that is not a module-level function/class (`probe.acquire_and_get`, a bound-method alias) is dropped with the callable-as-value warning | Model limit; a BOUND METHOD is not a value (a plain callable is — §3.6) |
+| Callables as VALUES (issue #122): a `Callable[[A], R]` annotation, a nested `def`, a `lambda` in a callable position and a module function name in one are `stdpython::PyCallable<(A,), R>` — a call through the value is `f.call((x,))?`, whose `Result` makes an exception raised inside a callable catchable by its caller; a nested `def` captures what it reads by clone, and a capture it MUTATES is a shared `stdpython::PyCell` both sides see (§3.6). A lambda local is typed by the uses that name a type; uses that disagree, and the shapes with no Rust type or no closure semantics (an unannotated parameter, a missing return annotation, `*args`, a default, a decorator, a generator, `nonlocal`, `Callable[..., R]`) are refused at the definition with the reason and stay loud at the use site. CPython's function repr prints the plain name, not the nested qualname (`<function add at 0x…>`, not `make_adder.<locals>.add`), and a `PyCallable` is not `Send` | Correct-or-loud (issue #122) |
 | Release-mode integer overflow may wrap (debug panics) | Bounded by §12.2's contract |
 | A non-daemon thread never joined is joined when its LAST handle drops (at latest, end of `main`) — CPython joins at interpreter exit, so a fire-and-forget thread can block a scope exit earlier than CPython would | Model limit; the common create/start/join shape is identical |
 | A thread's unhandled exception prints CPython's header and final exception line but no traceback frames | Model limit (no frames) — same family as §8's messages |

@@ -2746,10 +2746,11 @@ impl FunctionDef {
             // list (`Vec<PyValue>`): extra positional arguments pack into
             // it at call sites; len/index/iterate yield PyValue.
             if let Some(vararg) = &self.args.vararg {
-                info.name_types.insert(
-                    vararg.arg.clone(),
-                    crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue)),
+                let elt = crate::ast::tree::arguments::vararg_element_type(
+                    vararg, &symbols, &options,
                 );
+                info.name_types
+                    .insert(vararg.arg.clone(), crate::TypeInfo::Vec(Box::new(elt)));
             }
             options.use_counts = std::rc::Rc::new(info.use_counts);
             options.name_types = std::rc::Rc::new(info.name_types);
@@ -3023,11 +3024,110 @@ impl FunctionDef {
         // called_params so the call sites lower as no-ops. Their VALUE
         // reads (`hash_utf8 = sha256_utf8`) box to the boxed None
         // (value_callables).
+        // A nested function name (`def add(x)` inside make_adder) is a
+        // CLOSURE in Python. One that the closure model can carry
+        // (closure.rs) lowers to a `stdpython::PyCallable` value binding,
+        // capturing what it reads from this scope; only the shapes the
+        // model refuses (an unannotated parameter, `*args`, a generator,
+        // `nonlocal`) keep the old divergence — their calls drop
+        // (called_params) and their value reads are loud (value_callables).
         let mut value_callables = std::collections::HashSet::new();
-        for nested in crate::nested_function_names(&self.body) {
-            inferred_signature.called_params.insert(nested.clone());
-            value_callables.insert(nested);
+        let mut nested_closures: std::collections::HashMap<
+            String,
+            crate::ast::tree::closure::ClosureInfo,
+        > = std::collections::HashMap::new();
+        let mut closure_types: Vec<(String, crate::TypeInfo)> = Vec::new();
+        let mut refused_closures: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let scope_names =
+            crate::ast::tree::closure::scope_binding_names(&self.args, &effective_body);
+        for nested in nested_defs(&effective_body) {
+            // One decision per nested def: the shape the closure model
+            // carries AND a type the enclosing scope can write down, or
+            // the loud divergence with the reason recorded here.
+            let refusal = crate::ast::tree::closure::closure_refusal(&nested).or_else(|| {
+                crate::ast::tree::closure::closure_typeinfo(&nested, &symbols, &options)
+                    .map(|t| closure_types.push((nested.name.clone(), t)))
+                    .is_none()
+                    .then(|| {
+                        format!(
+                            "nested function `{}` has an annotation that does not \
+                             resolve to a Rust type, so it has no callable-value type",
+                            nested.name
+                        )
+                    })
+            });
+            match refusal {
+                None => {
+                    nested_closures.insert(
+                        nested.name.clone(),
+                        crate::ast::tree::closure::closure_info(&nested, &scope_names),
+                    );
+                }
+                Some(reason) => {
+                    options.definition_warnings.borrow_mut().push(reason.clone());
+                    inferred_signature.called_params.insert(nested.name.clone());
+                    value_callables.insert(nested.name.clone());
+                    refused_closures.insert(nested.name.clone(), reason);
+                }
+            }
         }
+        // Every local a nested closure MUTATES is a shared cell in this
+        // scope, so both sides see one object.
+        let mut cell_locals: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for info in nested_closures.values() {
+            cell_locals.extend(info.cells.iter().cloned());
+        }
+        // A closure's OWN captured cells are cells inside it too: the
+        // `move` capture took a clone of the shared cell, so reads and
+        // stores there go through the same borrow (this is what makes a
+        // doubly-nested mutation reach the outermost object).
+        if let Some(info) = &options.closure_captures {
+            cell_locals.extend(info.cells.iter().cloned());
+        }
+        options.cell_locals = std::rc::Rc::new(cell_locals);
+        // A CAPTURED name keeps the type it has in the enclosing scope:
+        // it is the same object. Names this scope binds itself win — a
+        // parameter or local shadows the capture, as Python's scoping
+        // says.
+        if !options.closure_capture_types.is_empty() {
+            let mut name_types = (*options.name_types).clone();
+            for (name, t) in options.closure_capture_types.iter() {
+                name_types.entry(name.clone()).or_insert_with(|| t.clone());
+            }
+            options.name_types = std::rc::Rc::new(name_types);
+        }
+        // A local bound to a bare `lambda` is typed by the position its
+        // uses put it in (issue #122) — a lambda writes no annotations,
+        // so a call that takes a `Callable[[int], int]` is what says
+        // what its parameter is.
+        {
+            let lambda_types =
+                crate::ast::tree::closure::lambda_local_types(&effective_body, &symbols, &options);
+            if !lambda_types.is_empty() {
+                let mut name_types = (*options.name_types).clone();
+                for (name, t) in lambda_types {
+                    name_types.insert(name, t);
+                }
+                options.name_types = std::rc::Rc::new(name_types);
+            }
+        }
+        // The closure names are LOCALS of this scope holding a callable
+        // value: their type is the one the closure builds, so a call
+        // through the name (`bump()`) lowers as a value call and a read
+        // passes the callable on.
+        if !closure_types.is_empty() {
+            let mut name_types = (*options.name_types).clone();
+            for (name, t) in closure_types {
+                if nested_closures.contains_key(&name) {
+                    name_types.insert(name, t);
+                }
+            }
+            options.name_types = std::rc::Rc::new(name_types);
+        }
+        options.refused_closures = std::rc::Rc::new(refused_closures);
+        options.nested_closures = std::rc::Rc::new(nested_closures);
         // A `type`-annotated callable parameter is the same: calls drop
         // (called_params) and value reads box.
         for p in self
@@ -3331,6 +3431,16 @@ impl FunctionDef {
                     None
                 };
                 t.filter(|_| !options.fn_return_is_pyvalue && !options.fn_return_is_option)
+            })
+            // A declared `-> Callable[[A], R]` (issue #122): the return
+            // site needs the callable's own type to render a `lambda`
+            // there — a lambda writes no annotations, so the declared
+            // return is what types its parameters.
+            .or_else(|| {
+                self.returns
+                    .as_deref()
+                    .and_then(|ann| crate::resolve_alias_typeinfo(ann, &symbols, &options))
+                    .filter(|t| matches!(t, crate::TypeInfo::Callable(..)))
             })
             // A declared return naming a polymorphic ROOT (hierarchy.rs):
             // the slot is the sum type, and the return site converts a
@@ -3781,6 +3891,81 @@ impl FunctionDef {
             .clone()
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
 
+        // A nested definition lowered as a callable VALUE (issue #122):
+        // the same body, signature and return type as an item, bound to a
+        // `stdpython::PyCallable` instead of declared as a `fn`.
+        //
+        // Python's `def` inside a function CAPTURES: the closure clones
+        // what it reads from the enclosing scope at the definition point
+        // (a cell it mutates is an `Rc<RefCell<_>>` whose clone shares one
+        // object), and `move` takes those clones — so the enclosing scope
+        // keeps its own names usable after the `def`, exactly as Python
+        // does.
+        if let Some(info) = options.closure_captures.clone() {
+            if !inferred_signature.generic_header().is_empty() {
+                return Err(format!(
+                    "nested function `{}` needs a generic signature, which a \
+                     callable value cannot have: annotate its parameters",
+                    self.name
+                )
+                .into());
+            }
+            let mut param_idents = Vec::new();
+            let mut param_types = Vec::new();
+            for p in render_args
+                .posonlyargs
+                .iter()
+                .chain(render_args.args.iter())
+                .chain(render_args.kwonlyargs.iter())
+            {
+                param_idents.push(crate::safe_ident(&p.arg));
+                param_types.push(crate::ast::tree::arguments::parameter_rust_type(
+                    p,
+                    crate::ast::tree::arguments::ParamPosition::Closure,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?);
+            }
+            // A Rust 1-tuple needs its trailing comma; the 0-parameter
+            // closure takes the unit.
+            let arg_pattern = if param_idents.len() == 1 {
+                let only = &param_idents[0];
+                quote!((#only,))
+            } else {
+                quote!((#(#param_idents),*))
+            };
+            let arg_type = if param_types.len() == 1 {
+                let only = &param_types[0];
+                quote!((#only,))
+            } else {
+                quote!((#(#param_types),*))
+            };
+            let captures: Vec<proc_macro2::Ident> =
+                info.captures.iter().map(|c| crate::safe_ident(c)).collect();
+            let py_name = self.name.clone();
+            // Python names are function-scoped: a `def` nested in an
+            // `if` or a `try` binds the FUNCTION's name, so the closure
+            // stores into the hoisted binding rather than shadowing it
+            // with a block-local one.
+            let binding = if info.hoisted {
+                quote!(#fn_name)
+            } else {
+                quote!(let #fn_name)
+            };
+            return Ok(quote! {
+                #binding = {
+                    #(let #captures = #captures.clone();)*
+                    stdpython::PyCallable::new(
+                        #py_name,
+                        move |#arg_pattern: #arg_type| #return_type {
+                            #streams
+                        },
+                    )
+                };
+            });
+        }
+
         let function = if let Some(docstring) = self.get_docstring() {
             // Convert docstring to Rust doc comments
             let doc_lines: Vec<_> = docstring
@@ -3867,18 +4052,23 @@ fn literal_returns_need_boxing(body: &[Statement]) -> bool {
 /// These are CLOSURES in Python; rython's closures do not capture the
 /// enclosing scope (the closure-capture divergence), so the definitions
 /// drop (statement.rs) and calls through the names drop too.
-pub(crate) fn nested_function_names(body: &[crate::Statement]) -> Vec<String> {
+/// The nested definitions of a function body, in source order — the
+/// `def`s that are CLOSURES in Python (issue #122). Control flow is
+/// entered; a nested def's OWN nested defs are that def's business, seen
+/// when it is lowered.
+pub(crate) fn nested_defs(body: &[crate::Statement]) -> Vec<crate::FunctionDef> {
     let mut out = Vec::new();
     walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
         if let StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) =
             &stmt.statement
         {
-            out.push(f.name.clone());
+            out.push(f.clone());
         }
         Flow::Continue
     });
     out
 }
+
 
 /// Map an expression to an obviously-inferable Rust type, if any.
 /// Whether a [`crate::TypeInfo`] can stand as an inferred return type

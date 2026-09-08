@@ -6988,6 +6988,13 @@ pub fn not_a_directory_error<M: AsRef<str>>(message: M) -> PyException {
 // PYTHON STANDARD LIBRARY MODULES
 // ============================================================================
 
+#[cfg(feature = "alloc")]
+mod callable;
+/// Callables as VALUES (issue #122): the runtime type of a
+/// `Callable[[A], R]` annotation, a `lambda` and a nested `def`.
+#[cfg(feature = "alloc")]
+pub use callable::{PyCallable, PyCell};
+
 mod builtin_exceptions;
 /// The built-in exception discriminant, re-exported so generated code's
 /// `use stdpython::*;` names it in `matches_builtin(BuiltinException::X)`

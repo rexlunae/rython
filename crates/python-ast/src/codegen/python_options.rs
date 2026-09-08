@@ -556,6 +556,35 @@ pub struct PythonOptions {
     /// `type`-annotated callable parameters. Distinct from `called_params`
     /// (loop elements there only DROP calls, their value reads stay real).
     pub value_callables: std::rc::Rc<std::collections::HashSet<String>>,
+
+    /// Callables as VALUES (issue #122). The CURRENT scope's nested
+    /// definitions that lower to `stdpython::PyCallable` closures, by
+    /// name, each with what it captures from this scope. A nested `def`
+    /// the closure model refuses (see `closure::closure_refusal`) is
+    /// absent here and stays in `value_callables`/`called_params`, where
+    /// its reads and calls are loud.
+    pub nested_closures:
+        std::rc::Rc<std::collections::HashMap<String, crate::ast::tree::closure::ClosureInfo>>,
+    /// Set while the function generator renders a nested definition AS a
+    /// closure: the captures to clone in before `move`, and the cells
+    /// among them. `None` for every ordinary item.
+    pub closure_captures: Option<std::rc::Rc<crate::ast::tree::closure::ClosureInfo>>,
+    /// The TYPES the captured names have in the ENCLOSING scope, carried
+    /// into the closure: a capture is the same object with the same type
+    /// on both sides, so the body's dict keys own, its ints stay ints,
+    /// and its cells borrow like the enclosing scope's do.
+    pub closure_capture_types:
+        std::rc::Rc<std::collections::HashMap<String, crate::TypeInfo>>,
+    /// The CURRENT scope's locals that a nested closure MUTATES, so they
+    /// are held as `Rc<RefCell<T>>` and shared with it (Python's cell).
+    /// Reads borrow, stores borrow mutably, and the binding wraps.
+    pub cell_locals: std::rc::Rc<std::collections::HashSet<String>>,
+    /// Nested definitions the closure model REFUSED (issue #122), by
+    /// name. The definition emitted nothing, so the name has no runtime
+    /// value at all: a read or a call through it is a `compile_error!`
+    /// naming the reason, never a silent None that type-checks and
+    /// answers wrongly.
+    pub refused_closures: std::rc::Rc<std::collections::HashMap<String, String>>,
     /// Locals in the current function whose only known type is a string
     /// literal (`label = "fine"`), so they lower to `&'static str`. A
     /// `-> str` function returning one must own the string (`to_string`)
@@ -742,6 +771,11 @@ impl Default for PythonOptions {
             mutable_statics: std::rc::Rc::new(std::collections::HashMap::new()),
             scope_global_writables: std::rc::Rc::new(std::collections::HashSet::new()),
             value_callables: std::rc::Rc::new(std::collections::HashSet::new()),
+            nested_closures: std::rc::Rc::new(std::collections::HashMap::new()),
+            closure_captures: None,
+            closure_capture_types: std::rc::Rc::new(std::collections::HashMap::new()),
+            cell_locals: std::rc::Rc::new(std::collections::HashSet::new()),
+            refused_closures: std::rc::Rc::new(std::collections::HashMap::new()),
             str_literal_locals: std::rc::Rc::new(std::collections::HashSet::new()),
             rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),

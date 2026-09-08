@@ -325,6 +325,17 @@ impl CodeGen for Name {
             // requests' auth, where sha256_utf8 is a dropped nested
             // function): the callable-as-value divergence — the read lowers
             // to the boxed None.
+            // A nested definition the closure model REFUSED (issue
+            // #122): the definition emitted nothing, so the name has no
+            // runtime value — the read is loud at the site, with the
+            // reason, never a None that type-checks and answers wrongly.
+            if let Some(reason) = options.refused_closures.get(&self.id) {
+                let msg = format!(
+                    "rython: `{}` has no runtime value here: {}",
+                    self.id, reason
+                );
+                return Ok(quote!(compile_error!(#msg)));
+            }
             if options.value_callables.contains(&self.id)
             {
                 options.definition_warnings.borrow_mut().push(format!(
@@ -370,6 +381,15 @@ impl CodeGen for Name {
                     self.id
                 ));
                 return Ok(quote!(stdpython::PyValue::None_));
+            }
+            // A closure CELL (issue #122): a local a nested closure
+            // mutates is held in a `stdpython::PyCell` so both sides see
+            // one object. A VALUE read takes the snapshot the cell holds,
+            // exactly as a read of a promoted module static clones out of
+            // its LazyLock; a STORE through the name is lowered by the
+            // assignment layer, which borrows the cell mutably instead.
+            if options.cell_locals.contains(&self.id) {
+                return Ok(quote!(#name.get()));
             }
             Ok(quote!(#name))
         }

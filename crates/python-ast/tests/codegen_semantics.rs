@@ -22654,3 +22654,305 @@ fn bound_functions_and_known_module_imports_are_not_exception_union_members() {
     assert!(!out.contains("stdlib_item (err : PyException)"), "a stdlib item: {}", out);
     assert!(out.contains("external (err : PyException)"), "an absent external name: {}", out);
 }
+
+#[test]
+fn callable_annotations_are_the_runtime_callable_type() {
+    // Issue #122: `Callable[[A, B], R]` in every spelling is
+    // `stdpython::PyCallable<(A, B), R>` — the argument list as the
+    // argument TUPLE, so one runtime type serves every arity — and a
+    // container of callables is a container of that type.
+    let out = compile(
+        "import typing\n\
+         from typing import Callable\n\
+         \n\
+         def one(f: Callable[[int], int]) -> int:\n\
+         \x20   return f(1)\n\
+         \n\
+         def two(f: Callable[[int, str], bool]) -> bool:\n\
+         \x20   return f(1, \"a\")\n\
+         \n\
+         def none(f: typing.Callable[[], None]) -> None:\n\
+         \x20   f()\n\
+         \n\
+         def many(fs: list[Callable[[int], int]], table: dict[str, Callable[[int], int]]) -> int:\n\
+         \x20   return fs[0](1) + table[\"a\"](2)\n",
+        "callables.py",
+    );
+    assert!(out.contains("one (f : stdpython :: PyCallable < (i64 ,) , i64 >)"), "{}", out);
+    assert!(
+        out.contains("two (f : stdpython :: PyCallable < (i64 , String) , bool >)"),
+        "{}",
+        out
+    );
+    assert!(out.contains("none (f : stdpython :: PyCallable < () , () >)"), "{}", out);
+    assert!(
+        out.contains("fs : Vec < stdpython :: PyCallable < (i64 ,) , i64 > >"),
+        "{}",
+        out
+    );
+    assert!(
+        out.contains("table : PyDict < String , stdpython :: PyCallable < (i64 ,) , i64 > >"),
+        "{}",
+        out
+    );
+    // A call THROUGH the value is `f.call((args,))?`, threading the
+    // callable's Result like every other fallible call.
+    assert!(out.contains("(f) . call ((1 ,)) ?"), "{}", out);
+    assert!(out.contains("(f) . call ((1 , (\"a\") . to_string ())) ?"), "{}", out);
+    assert!(out.contains("(f) . call (()) ?"), "{}", out);
+}
+
+#[test]
+fn a_nested_def_is_a_closure_that_captures_by_clone() {
+    // Issue #122: a nested `def` is a Python CLOSURE — it lowers to a
+    // `PyCallable` binding that clones what it reads from the enclosing
+    // scope at the definition point, so returning it out of the
+    // enclosing function keeps the captured value alive.
+    let out = compile(
+        "from typing import Callable\n\
+         \n\
+         def make_adder(n: int) -> Callable[[int], int]:\n\
+         \x20   def add(x: int) -> int:\n\
+         \x20       return x + n\n\
+         \x20   return add\n",
+        "adder.py",
+    );
+    assert!(out.contains("let add ="), "the nested def binds a value: {}", out);
+    assert!(out.contains("let n = n . clone ()"), "the capture is cloned in: {}", out);
+    assert!(
+        out.contains("stdpython :: PyCallable :: new (\"add\" , move | (x ,) : (i64 ,) |"),
+        "{}",
+        out
+    );
+    assert!(out.contains("-> Result < i64 , PyException >"), "{}", out);
+}
+
+#[test]
+fn a_capture_a_closure_mutates_is_a_shared_cell() {
+    // Issue #122: Python's closure SHARES the object, so a captured name
+    // the closure mutates is a `stdpython::PyCell` — the closure's
+    // `move` capture clones the cell (sharing it), stores borrow it
+    // mutably, and the enclosing scope's reads see every write. A name
+    // the closure only READS stays an ordinary cloned capture.
+    let out = compile(
+        "def tally() -> int:\n\
+         \x20   counter = {\"n\": 0}\n\
+         \x20   step = 2\n\
+         \x20   def bump() -> int:\n\
+         \x20       counter[\"n\"] += step\n\
+         \x20       return counter[\"n\"]\n\
+         \x20   bump()\n\
+         \x20   return counter[\"n\"]\n",
+        "tally.py",
+    );
+    assert!(
+        out.contains("counter = stdpython :: PyCell :: new (PyDict :: from"),
+        "the mutated capture is a cell: {}",
+        out
+    );
+    assert!(
+        out.contains("let mut __rython_cell = counter . borrow_mut ()"),
+        "the store borrows the cell: {}",
+        out
+    );
+    assert!(
+        out.contains("counter . get ()"),
+        "a read takes the cell's snapshot: {}",
+        out
+    );
+    // The read-only capture is not a cell.
+    assert!(!out.contains("step = stdpython :: PyCell"), "{}", out);
+}
+
+#[test]
+fn a_lambda_is_a_callable_value_where_one_is_expected() {
+    // Issue #122: a lambda writes no annotations, so the POSITION types
+    // it — a declared `-> Callable[[int], int]` return, and the use a
+    // local's lambda is later passed to.
+    let out = compile(
+        "from typing import Callable\n\
+         \n\
+         def compose(f: Callable[[int], int], g: Callable[[int], int]) -> Callable[[int], int]:\n\
+         \x20   return lambda x: f(g(x))\n\
+         \n\
+         def main() -> None:\n\
+         \x20   double = lambda x: x * 2\n\
+         \x20   both = compose(double, double)\n\
+         \x20   print(both(3))\n",
+        "compose.py",
+    );
+    assert!(
+        out.contains("stdpython :: PyCallable :: new (\"<lambda>\" , move | (x ,) : (i64 ,) |"),
+        "{}",
+        out
+    );
+    // The returned lambda captures the enclosing parameters by clone.
+    assert!(out.contains("let f = f . clone ()"), "{}", out);
+    assert!(out.contains("let g = g . clone ()"), "{}", out);
+    // The local's lambda is typed by the call that takes it.
+    assert!(out.contains("double = { stdpython :: PyCallable :: new"), "{}", out);
+}
+
+#[test]
+fn a_function_name_in_a_callable_position_wraps_the_item() {
+    // Issue #122: a module `def` NAME used where a callable value is
+    // expected denotes a definition, not a value — it wraps in the one
+    // runtime callable type, forwarding to the item so its Result
+    // propagates exactly as a direct call's does.
+    let out = compile(
+        "from typing import Callable\n\
+         \n\
+         def step(x: int) -> int:\n\
+         \x20   return x + 1\n\
+         \n\
+         def run(f: Callable[[int], int]) -> int:\n\
+         \x20   return f(1)\n\
+         \n\
+         def main() -> None:\n\
+         \x20   print(run(step))\n",
+        "wrap.py",
+    );
+    assert!(
+        out.contains("stdpython :: PyCallable :: new (\"step\" , | (__rython_a0 ,) : (i64 ,) | step (__rython_a0) ,)"),
+        "{}",
+        out
+    );
+}
+
+#[test]
+fn a_nested_def_the_closure_model_refuses_is_loud() {
+    // Issue #122: the shapes a callable value cannot carry — an
+    // unannotated parameter, a missing return annotation, `*args`, a
+    // generator, `nonlocal` — are refused with the reason at the
+    // definition, and the name's calls and reads stay loud rather than
+    // answering a silent None.
+    for (src, needle) in [
+        (
+            "def outer() -> int:\n\
+             \x20   def inner(x) -> int:\n\
+             \x20       return x\n\
+             \x20   return 1\n",
+            "unannotated parameter",
+        ),
+        (
+            "def outer() -> int:\n\
+             \x20   def inner(x: int):\n\
+             \x20       return x\n\
+             \x20   return 1\n",
+            "no return annotation",
+        ),
+        (
+            "def outer() -> int:\n\
+             \x20   def inner(*xs: int) -> int:\n\
+             \x20       return 1\n\
+             \x20   return 1\n",
+            "`*args`/`**kwargs`",
+        ),
+        (
+            "def outer() -> int:\n\
+             \x20   def inner(x: int) -> int:\n\
+             \x20       yield x\n\
+             \x20   return 1\n",
+            "generator",
+        ),
+        (
+            "def outer() -> int:\n\
+             \x20   total = 0\n\
+             \x20   def inner(x: int) -> int:\n\
+             \x20       nonlocal total\n\
+             \x20       total = x\n\
+             \x20       return x\n\
+             \x20   return total\n",
+            "nonlocal",
+        ),
+    ] {
+        let (_, warnings) = compile_with_warnings(src, "refused.py");
+        assert!(
+            warnings.iter().any(|w| w.contains(needle)),
+            "expected a refusal naming {needle}, got {warnings:?}"
+        );
+    }
+}
+
+#[test]
+fn a_refused_nested_def_is_loud_where_it_is_used() {
+    // Issue #122 (issue #334's finding): a definition the closure model
+    // refuses emits NOTHING, so the name has no runtime value — a read
+    // and a call through it are `compile_error!` naming the reason, not
+    // the boxed None that type-checks and answers wrongly.
+    let out = compile(
+        "def outer() -> int:\n\
+         \x20   def inner(x) -> int:\n\
+         \x20       return x\n\
+         \x20   handler = inner\n\
+         \x20   return inner(1)\n",
+        "refused_use.py",
+    );
+    assert!(
+        out.contains("compile_error ! (\"rython: `inner` cannot be called here"),
+        "the call is loud: {}",
+        out
+    );
+    assert!(
+        out.contains("compile_error ! (\"rython: `inner` has no runtime value here"),
+        "the value read is loud: {}",
+        out
+    );
+    assert!(
+        !out.contains("PyValue :: None_"),
+        "no silent None survives: {}",
+        out
+    );
+}
+
+#[test]
+fn an_annotated_star_args_keeps_its_element_type() {
+    // Issue #120's boxed `Vec<PyValue>` is the UNANNOTATED default:
+    // `*nums: int` says every extra positional is an int, so the vector
+    // is `Vec<i64>`, the call site passes plain values, and the body can
+    // sum it like any list of ints.
+    let out = compile(
+        "def total(*nums: int) -> int:\n\
+         \x20   return sum(nums)\n\
+         \n\
+         def loose(*rest) -> int:\n\
+         \x20   return len(rest)\n\
+         \n\
+         def main() -> None:\n\
+         \x20   print(total(1, 2, 3))\n",
+        "varargs.py",
+    );
+    assert!(out.contains("total (nums : Vec < i64 >)"), "{}", out);
+    assert!(out.contains("loose (rest : Vec < stdpython :: PyValue >)"), "{}", out);
+    assert!(out.contains("total (vec ! [1 , 2 , 3])"), "{}", out);
+}
+
+#[test]
+fn a_lambda_that_would_mutate_a_capture_is_refused() {
+    // Issue #122: a lambda's captures are clones and it has no cell to
+    // write through, so a mutation would silently vanish — it is refused
+    // at conversion, naming the `def` spelling that carries it.
+    let module = parse(
+        "from typing import Callable\n\
+         \n\
+         def run(f: Callable[[int], None]) -> None:\n\
+         \x20   f(1)\n\
+         \n\
+         def main() -> None:\n\
+         \x20   acc = [0]\n\
+         \x20   run(lambda x: acc.append(x))\n",
+        "mutating_lambda.py",
+    )
+    .unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let err = module
+        .to_rust(
+            CodeGenContext::Module("mutating_lambda".to_string()),
+            PythonOptions::default(),
+            symbols,
+        )
+        .expect_err("a mutating lambda capture must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("cannot mutate the captured `acc`"), "{}", msg);
+    assert!(msg.contains("nested `def`"), "{}", msg);
+}
