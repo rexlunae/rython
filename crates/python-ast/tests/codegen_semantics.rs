@@ -3307,6 +3307,38 @@ fn nested_def_capturing_method_self_is_a_loud_refusal() {
 }
 
 #[test]
+fn class_attribute_reads_render_the_static_class_name() {
+    // Round 106: `other.__class__` on a class-typed receiver (an exception
+    // message — charset_normalizer's CharsetMatch.add_submatch formats
+    // `other.__class__`) previously emitted a plain FIELD read — E0609,
+    // the struct has no `__class__` field. The read is the class as a
+    // VALUE, and the class-as-value model spells a class as its name
+    // string (the same spelling type(x).__name__ emits) — the static
+    // class, never a field access.
+    let out = compile(
+        concat!(
+            "class W:\n",
+            "    def __init__(self):\n",
+            "        self.v: int = 0\n",
+            "\n",
+            "    def label(self, other: \"W\") -> str:\n",
+            "        return \"got {}\".format(other.__class__)\n",
+        ),
+        "clsattr.py",
+    );
+    assert!(
+        out.contains("stringify ! (W) . to_string ()") || out.contains("W) . to_string"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        !out.contains("__class__ . clone"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
 fn keyword_arguments_map_to_parameter_positions() {
     let src = concat!(
         "def volume(w: int, h: int, d: int) -> int:\n",

@@ -6398,6 +6398,83 @@ fn method_self_captured_by_plain_lambda_compiles_and_matches_python() {
 }
 
 #[test]
+fn mutating_property_reads_and_tuple_membership_match_python() {
+    // Round 106: three corpus shapes in one transcript.
+    // - A SHARED class's property whose getter MUTATES self (a cache
+    //   fill — charset_normalizer's CharsetMatch.fingerprint -> output):
+    //   reading it through a PyRef receiver (`other.fingerprint` in
+    //   __eq__/append) must borrow the one object MUTABLY, or the getter
+    //   call fails on the read-only Ref (E0596).
+    // - Membership in a constant TUPLE (`x in ("Hiragana", "Katakana")` —
+    //   md.py): a Rust tuple has no py_contains, so the all-string-literal
+    //   tuple materializes as a Vec.
+    // - str.isascii() (md.py `character.isascii()`).
+    // Transcript pinned against python3.
+    let scratch = Scratch::new("mutprop");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "from typing import List, Optional\n",
+            "\n",
+            "\n",
+            "class RangeBox:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name: str = name\n",
+            "        self._cache: Optional[str] = None\n",
+            "\n",
+            "    @property\n",
+            "    def fingerprint(self) -> str:\n",
+            "        if self._cache is None:\n",
+            "            self._cache = self.name + \"!\"\n",
+            "        return self._cache\n",
+            "\n",
+            "    def eq(self, other: \"RangeBox\") -> bool:\n",
+            "        return self.fingerprint == other.fingerprint\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    xs: List[RangeBox] = [RangeBox(\"a\"), RangeBox(\"b\"), RangeBox(\"Katakana\")]\n",
+            "    print(xs[0].eq(xs[1]))\n",
+            "    print(xs[0].eq(xs[2]) is False)\n",
+            "    a = xs[0].fingerprint\n",
+            "    print(a, a in (\"Hiragana\", \"Katakana\"))\n",
+            "    b = xs[2].fingerprint\n",
+            "    print(b, b in (\"Hiragana\", \"Katakana\"))\n",
+            "    print(\"\".isascii(), \"abc\".isascii(), \"\\u00e9\".isascii())\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "False",
+            "True",
+            "a! False",
+            "Katakana! False",
+            "True True False",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {
     // Round 41: a trait-DEFAULT body that formats `self` in an exception
     // message (`raise PoolError(self)` — urllib3's _get_conn raises

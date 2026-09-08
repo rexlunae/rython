@@ -539,7 +539,41 @@ impl CodeGen for Compare {
                         let recv = membership_receiver();
                         quote!((#recv).py_contains(&(#left)))
                     } else {
-                        let recv = membership_receiver();
+                        // A constant TUPLE comparator (`unicode_range_a in
+                        // ("Hiragana", "Katakana")` — charset_normalizer's
+                        // md.py, whose rython tuple value is a Rust tuple
+                        // with no py_contains): materialize a Vec of the
+                        // elements — string literals OWNED, mirroring the
+                        // for-loop's all-constant-tuple iteration (round
+                        // 66) — so the runtime PyContains for Vec<String>
+                        // applies.
+                        let recv = match comparator_ast {
+                            ExprType::Tuple(t)
+                                if !t.elts.is_empty()
+                                    && t.elts.iter().all(|e| {
+                                        matches!(
+                                            e,
+                                            ExprType::Constant(c)
+                                                if matches!(
+                                                    &c.0,
+                                                    Some(litrs::Literal::String(_))
+                                                )
+                                        )
+                                    }) =>
+                            {
+                                let mut elts = Vec::with_capacity(t.elts.len());
+                                for elt in &t.elts {
+                                    let tok = elt.clone().to_rust(
+                                        ctx.clone(),
+                                        options.clone(),
+                                        symbols.clone(),
+                                    )?;
+                                    elts.push(quote!((#tok).to_string()));
+                                }
+                                quote!(vec![#(#elts),*])
+                            }
+                            _ => membership_receiver(),
+                        };
                         quote!((#recv).py_contains(&(#left)))
                     }
                 }
@@ -607,7 +641,35 @@ impl CodeGen for Compare {
                         let recv = membership_receiver();
                         quote!(!(#recv).py_contains(&(#left)))
                     } else {
-                        let recv = membership_receiver();
+                        // The constant-TUPLE materialization (see the In
+                        // arm): `x not in ("a", "b")`.
+                        let recv = match comparator_ast {
+                            ExprType::Tuple(t)
+                                if !t.elts.is_empty()
+                                    && t.elts.iter().all(|e| {
+                                        matches!(
+                                            e,
+                                            ExprType::Constant(c)
+                                                if matches!(
+                                                    &c.0,
+                                                    Some(litrs::Literal::String(_))
+                                                )
+                                        )
+                                    }) =>
+                            {
+                                let mut elts = Vec::with_capacity(t.elts.len());
+                                for elt in &t.elts {
+                                    let tok = elt.clone().to_rust(
+                                        ctx.clone(),
+                                        options.clone(),
+                                        symbols.clone(),
+                                    )?;
+                                    elts.push(quote!((#tok).to_string()));
+                                }
+                                quote!(vec![#(#elts),*])
+                            }
+                            _ => membership_receiver(),
+                        };
                         quote!(!(#recv).py_contains(&(#left)))
                     }
                 }
