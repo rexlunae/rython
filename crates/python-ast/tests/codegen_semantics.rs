@@ -17787,9 +17787,14 @@ fn chained_is_none_and_none_assigning_else_do_not_narrow() {
         "a spread into a returning list[str] must own each element: {}",
         out_vs
     );
-    // Devin review on #285 (2nd pass): a walrus in a def DEFAULT or a
-    // class BASE in the else rebinds the guarded name.
-    let out7 = compile(
+    // Devin review on #285 (2nd pass): a walrus in a def DEFAULT rebinds
+    // the guarded name. Since issue #122 that program does not convert at
+    // all — Python evaluates a def's default WHERE THE `def` STANDS, and
+    // the nested definition the closure model refuses would have dropped
+    // the walrus with it (silently un-rebinding `x`, which is what made
+    // this case a narrowing question in the first place). The loud
+    // refusal at the definition subsumes the narrowing rule here.
+    let module = parse(
         "def d(x: str | None) -> str:\n\
          \x20   if x is None:\n\
          \x20       return \"a\"\n\
@@ -17798,11 +17803,20 @@ fn chained_is_none_and_none_assigning_else_do_not_narrow() {
          \x20           return y\n\
          \x20   return \"b\"\n",
         "none_defdefault.py",
-    );
+    )
+    .unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let err = module
+        .to_rust(
+            CodeGenContext::Module("none_defdefault".to_string()),
+            PythonOptions::default(),
+            symbols,
+        )
+        .expect_err("a walrus in a nested def default runs at the def");
     assert!(
-        !out7.contains("clone () . unwrap ()") && !out7.contains("clone().unwrap()"),
-        "a walrus in a nested def default must discard the narrowing: {}",
-        out7
+        err.to_string().contains("default whose expression Python"),
+        "{}",
+        err
     );
 }
 
