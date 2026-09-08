@@ -15473,9 +15473,8 @@ fn a_dict_update_with_an_option_dict_argument_unwraps_loudly() {
         "dictupdate.py",
     );
     assert!(
-        out.contains("match ((self . proxy_headers) . clone ()) { Some (__rython_v) => __rython_v")
-            || out.contains("match((self.proxy_headers).clone()){Some(__rython_v)=>__rython_v"),
-        "the Option dict argument must unwrap via the Some/None match: {}",
+        out.contains("unwrap_or_else (|| panic ! (\"rython: an optional value was None"),
+        "the Option dict argument must unwrap through the loud panic: {}",
         out
     );
     assert!(
@@ -16386,8 +16385,8 @@ fn an_option_field_value_into_a_concrete_slot_unwraps_loudly() {
         out
     );
     assert!(
-        out.contains("Some (__rython_v) => __rython_v"),
-        "the Some arm must yield the inner value: {}",
+        out.contains("unwrap_or_else (|| panic ! (\"rython: an optional value was None"),
+        "the Option must unwrap through the loud panic: {}",
         out
     );
 }
