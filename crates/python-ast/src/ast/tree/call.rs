@@ -2251,10 +2251,15 @@ impl<'a> CodeGen for Call {
             // builtin-call path below (the guard admitting every `zip`
             // sent the plain form to the missing arm — a converter panic
             // on charset_normalizer, the requests sweep's regression).
+            // The PLAIN two-argument form joins here too (round 101): its
+            // arm converts a STRING argument to its char Vec — the plain
+            // generic path has no signature to coerce against.
             let zip_splat = bname == "zip"
                 && self.args.len() == 1
                 && matches!(self.args.first(), Some(ExprType::Starred(_)));
+            let plain_zip = bname == "zip" && self.args.len() == 2;
             if (zip_splat
+                || plain_zip
                 || matches!(
                 bname,
                 "min"
@@ -2344,8 +2349,33 @@ impl<'a> CodeGen for Call {
                     // guarded arm must not let the plain call fall to the
                     // builtin match's unreachable.
                     "zip" if self.args.len() == 2 => {
+                        // A STRING argument (`zip(self._buffer, range(0,
+                        // len))` — charset_normalizer's md.py, which
+                        // zips its accumulated `_buffer: str` with an
+                        // index range): Python iterates one-character
+                        // strings; the runtime zip takes Vecs, so the
+                        // string becomes its char Vec<String>. A RANGE
+                        // argument is materialized the same way (`list`
+                        // over the PyRange — the runtime's PyListFrom).
+                        let seq = |arg: &ExprType, tok: &TokenStream| {
+                            match crate::infer_type(
+                                Some(&ctx),
+                                arg,
+                                &options,
+                                &symbols,
+                            ) {
+                                crate::TypeInfo::String
+                                | crate::TypeInfo::StrRef => quote!(
+                                    (#tok).chars().map(|__rython_char| __rython_char.to_string()).collect::<Vec<_>>()
+                                ),
+                                crate::TypeInfo::Range => quote!(list(#tok)),
+                                _ => quote!(#tok),
+                            }
+                        };
                         let a = &rendered[0];
                         let b = &rendered[1];
+                        let a = seq(&self.args[0], a);
+                        let b = seq(&self.args[1], b);
                         return Ok(quote!(zip(#a, #b)));
                     }
     "min" | "max" => {

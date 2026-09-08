@@ -237,6 +237,21 @@ impl CodeGen for For {
         ) {
             iter = quote!(#iter . py_keys ());
         }
+        // A STRING-typed iterable (`for ch in buf` where `buf: str` —
+        // charset_normalizer's md.py SuperWeirdWordPlugin, which iterates
+        // its accumulated `_buffer`): Python iterates one-CHARACTER
+        // strings, and the loop-target analysis types each element as a
+        // String (iterable_element_type), so the iteration runs over the
+        // chars mapped back to one-char Strings — a raw String is not
+        // IntoIterator (E0277).
+        if matches!(
+            crate::infer_type(Some(&ctx), &self.iter, &options, &symbols),
+            crate::TypeInfo::String | crate::TypeInfo::StrRef
+        ) {
+            iter = quote!(
+                #iter . chars () . map (| __rython_char | __rython_char . to_string ())
+            );
+        }
         // A TUPLE-LITERAL iterable (`for key in ("headers",
         // "_proxy_headers", "_socks_options")` — urllib3's poolmanager):
         // Python iterates the tuple; rython's tuple value is a Rust tuple,
