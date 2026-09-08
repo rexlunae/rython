@@ -231,6 +231,67 @@ impl Node for DictComp {
 /// `options` is the OUTER scope; each generator's iterable, target and
 /// filters render in the prefix scope that binds exactly the targets
 /// before / through it (`comprehension_prefix_scopes`).
+///
+/// The names a comprehension's `if` FILTERS prove non-None for the
+/// element: the element runs only after every guard passed, so a name a
+/// filter keeps is a plain value there. Two filter shapes narrow: the
+/// `x is not None` compare `narrowings_from_test` sees, and a filter
+/// that IS a bare Option-typed name (`{r for r in detected_ranges if r}`
+/// — charset_normalizer's alphabets: detected_ranges is `list[str |
+/// None]`, and the guard's Option-truthiness model (a None member is
+/// falsy, so the guard continues on it) makes the element read the
+/// inner String — the comprehension must insert Strings, not Options).
+/// Only Option-typed names narrow (mirroring the statement guard rules).
+fn comprehension_filter_narrowings(
+    generators: &[crate::Comprehension],
+    options: &PythonOptions,
+) -> Vec<(String, crate::TypeInfo)> {
+    let mut out: Vec<(String, crate::TypeInfo)> = Vec::new();
+    for generator in generators {
+        for if_expr in &generator.ifs {
+            let mut names: Vec<String> = Vec::new();
+            if let ExprType::Name(n) = if_expr {
+                names.push(n.id.clone());
+            }
+            for (name, _) in crate::narrowings_from_test(if_expr, options) {
+                names.push(name);
+            }
+            for name in names {
+                if let Some(crate::TypeInfo::Option(inner)) = options.name_types.get(&name)
+                    && !out.iter().any(|(seen, _)| *seen == name)
+                {
+                    out.push((name.clone(), (**inner).clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Apply a name's non-None narrowing to a comprehension element scope,
+/// the way the if-statement installs its body narrowing (reads of the
+/// name unwrap, and the name_types entry becomes the inner type so the
+/// element's own typing agrees).
+fn apply_comprehension_narrowing(
+    scope: &mut PythonOptions,
+    name: &str,
+    inner: crate::TypeInfo,
+) {
+    // The narrowed READ of an Option name unwraps only when the name is
+    // still recorded as Option-typed (name.rs consults optional_names):
+    // a comprehension target may not have been, so mark it — the guard
+    // proved the None case skipped.
+    let mut optional = scope.optional_names.as_ref().clone();
+    optional.insert(name.to_string());
+    scope.optional_names = std::rc::Rc::new(optional);
+    let mut narrowed = scope.narrowed_names.as_ref().clone();
+    narrowed.insert(name.to_string(), inner.clone());
+    scope.narrowed_names = std::rc::Rc::new(narrowed);
+    let mut types = scope.name_types.as_ref().clone();
+    types.insert(name.to_string(), inner);
+    scope.name_types = std::rc::Rc::new(types);
+}
+
 fn build_comprehension_loops(
     generators: &[Comprehension],
     inner: TokenStream,
@@ -380,7 +441,13 @@ impl CodeGen for ListComp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let scope = crate::comprehension_scope(&self.generators, Some(&ctx), &options, &symbols);
+        // The element renders in the full scope, with every name an `if`
+        // FILTER proved non-None narrowed to its inner (see
+        // comprehension_filter_narrowings).
+        let mut scope = crate::comprehension_scope(&self.generators, Some(&ctx), &options, &symbols);
+        for (name, inner) in comprehension_filter_narrowings(&self.generators, &scope) {
+            apply_comprehension_narrowing(&mut scope, &name, inner);
+        }
         let elt = (*self.elt).clone().to_rust(ctx.clone(), scope.clone(), symbols.clone())?;
         let loops = build_comprehension_loops(
             &self.generators,
@@ -420,7 +487,13 @@ impl CodeGen for SetComp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        let scope = crate::comprehension_scope(&self.generators, Some(&ctx), &options, &symbols);
+        // The element renders in the full scope, with every name an `if`
+        // FILTER proved non-None narrowed to its inner (see
+        // comprehension_filter_narrowings).
+        let mut scope = crate::comprehension_scope(&self.generators, Some(&ctx), &options, &symbols);
+        for (name, inner) in comprehension_filter_narrowings(&self.generators, &scope) {
+            apply_comprehension_narrowing(&mut scope, &name, inner);
+        }
         let elt = (*self.elt).clone().to_rust(ctx.clone(), scope.clone(), symbols.clone())?;
         let loops = build_comprehension_loops(
             &self.generators,
@@ -463,7 +536,13 @@ impl CodeGen for GeneratorExp {
         // Generator expressions are lowered eagerly (like a list
         // comprehension) and then turned back into an iterator; Python's lazy
         // evaluation is not modeled yet.
-        let scope = crate::comprehension_scope(&self.generators, Some(&ctx), &options, &symbols);
+        // The element renders in the full scope, with every name an `if`
+        // FILTER proved non-None narrowed to its inner (see
+        // comprehension_filter_narrowings).
+        let mut scope = crate::comprehension_scope(&self.generators, Some(&ctx), &options, &symbols);
+        for (name, inner) in comprehension_filter_narrowings(&self.generators, &scope) {
+            apply_comprehension_narrowing(&mut scope, &name, inner);
+        }
         let elt = (*self.elt).clone().to_rust(ctx.clone(), scope.clone(), symbols.clone())?;
         let loops = build_comprehension_loops(
             &self.generators,

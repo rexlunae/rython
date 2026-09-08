@@ -6572,6 +6572,82 @@ fn option_fields_box_into_any_dicts_and_container_returns_unwrap() {
 }
 
 #[test]
+fn option_filter_set_comprehensions_and_shared_eq_match_python() {
+    // Round 108: three corpus shapes in one transcript.
+    // - A SET comprehension whose `if` filter is a bare Option-typed name
+    //   (`{r for r in detected_ranges if r}` over `list[str | None]` —
+    //   charset_normalizer's alphabets): the filter's Option-truthiness
+    //   model (a None member is falsy, the guard continues on it) narrows
+    //   the target for the element, so the set holds Strings, not
+    //   Options (E0277 HashSet<Option<String>>).
+    // - `list(set)`: HashSet needed a PyListFrom impl (the corpus wraps
+    //   the set in list() before sorting).
+    // - `==` between two PyRefs of a SHARED class whose __eq__ needs
+    //   `&mut self` (it calls a mutating property — CharsetMatch.__eq__
+    //   -> fingerprint): the generated PyRefEq dispatches through
+    //   borrow_mut, or the read-only Ref cannot satisfy it (E0596).
+    // Transcript pinned against python3.
+    let scratch = Scratch::new("optset");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "from typing import List, Optional\n",
+            "\n",
+            "\n",
+            "class Item:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name: str = name\n",
+            "        self._cache: Optional[str] = None\n",
+            "\n",
+            "    @property\n",
+            "    def key(self) -> str:\n",
+            "        if self._cache is None:\n",
+            "            self._cache = self.name.lower()\n",
+            "        return self._cache\n",
+            "\n",
+            "    def __eq__(self, other: \"Item\") -> bool:\n",
+            "        return self.key == other.key\n",
+            "\n",
+            "\n",
+            "def pick(flag: bool) -> Optional[str]:\n",
+            "    if flag:\n",
+            "        return \"b\"\n",
+            "    return None\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    xs: List[Item] = [Item(\"A\"), Item(\"a\")]\n",
+            "    print(xs[0] == xs[1])\n",
+            "    items: List[Optional[str]] = [pick(True), pick(False), pick(True)]\n",
+            "    print(sorted(list({r for r in items if r})))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["True", "['b']"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {
     // Round 41: a trait-DEFAULT body that formats `self` in an exception
     // message (`raise PoolError(self)` — urllib3's _get_conn raises
