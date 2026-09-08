@@ -156,7 +156,13 @@ impl CodeGen for YieldFrom {
         if let Some(collector) = options.generator_collector.as_ref() {
             let collector = proc_macro2::Ident::new(collector, proc_macro2::Span::call_site());
             let boxes = options.generator_boxes;
-            let value = self.value.to_rust(ctx, options.clone(), symbols)?;
+            // The yielded-from value is CONSUMED by extend — through the
+            // reuse rule, so a SELF-FIELD iterable (`yield from
+            // self._results` in a `&self` __iter__ —
+            // charset_normalizer's CharsetMatches) clones instead of
+            // moving out of the receiver (E0507), and a local reused
+            // later clones too, exactly like a for-loop's iterable.
+            let value = crate::render_reused(&self.value, ctx, options.clone(), symbols)?;
             if boxes {
                 // A boxed collector: each yielded-from element boxes too
                 // (a concrete inner Vec fails Into<PyValue> loudly when

@@ -4751,6 +4751,11 @@ pub trait PyStrOps {
     /// (the first cased character after uncased is uppercase, the rest
     /// lowercase) and at least one is cased.
     fn istitle(&self) -> bool;
+    /// Python str.isascii(): true for the empty string and when every
+    /// character is 7-bit ASCII (charset_normalizer's md.py
+    /// `character.isascii()`). Rust's str::is_ascii is the same test
+    /// (every byte < 128).
+    fn isascii(&self) -> bool;
     /// str.ljust / str.rjust with a fill character, width in CHARACTERS.
     /// The fill must be exactly one character; Python raises TypeError
     /// otherwise (silently using a prefix would diverge).
@@ -5117,6 +5122,11 @@ impl<T: AsRef<str> + ?Sized> PyStrOps for T {
             prev_cased = cased;
         }
         has_cased
+    }
+    fn isascii(&self) -> bool {
+        // Python: true for the empty string and when every character is
+        // 7-bit ASCII. For valid UTF-8, all-bytes-ASCII is the same test.
+        self.as_ref().is_ascii()
     }
     fn py_ljust(&self, width: i64, fill: &str) -> Result<String, PyException> {
         let fill_char = single_fill_char(fill)?;

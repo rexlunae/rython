@@ -407,6 +407,19 @@ pub fn coerce_tokens(
         {
             Some(quote!((#tokens).unwrap_or(stdpython::PyValue::None_)))
         }
+        // Option<T> -> T where T is the Option's OWN inner type: an
+        // OPTION-typed value into a concrete slot of its own inner
+        // (`is_accentuated(self._last)` where `_last` is a `str | None`
+        // field a guard has tested non-None - charset_normalizer's
+        // md.py, round 104). The guard makes the None unreachable; where
+        // a None genuinely flows, Python would fail at use on it too
+        // (the str-operating callee), so the loud section-12.2 panic is
+        // the faithful reading.
+        (TypeInfo::Option(inner), to) if **inner == *to => {
+            let msg = "rython: an optional value was None where a concrete value was required \
+                       (Python would fail at use, rython at the conversion)";
+            Some(quote!((#tokens).clone().unwrap_or_else(|| panic!(#msg))))
+        }
         // A class instance, a PyException, or an Option of one has no
         // boxed representation: the value is left as is, so the mismatch
         // stays a plain E0308 naming both types (a `PyValue::from` would
@@ -1697,7 +1710,31 @@ pub fn render_typed(
     if matches!(expected, TypeInfo::PyValue) && crate::is_none_expr(expr) {
         return Ok(quote!(stdpython::PyValue::None_));
     }
-    let actual = infer_type(None, expr, &options, &symbols);
+    // The ctx-less inference answers PyObject for a SELF-FIELD read (the
+    // class table needs the enclosing class), and the Option-fabrication
+    // below then assumes the value is an Option of the EXPECTED type —
+    // right for a name bound to a boxed value (`conn: Option<PyValue>`)
+    // but wrong for a genuinely-typed field: `self.encoding` of type
+    // `Option<String>` into a `PyValue` slot fabricated `Option<PyValue>`
+    // and rendered `.unwrap_or(PyValue::None_)` on the Option<String>
+    // tokens (E0308 — charset_normalizer's CliDetectionResult.__dict__,
+    // round 107). A self-rooted attribute infers with the class context
+    // so its REAL field type reaches the coercion — the Option<T> →
+    // PyValue arm then boxes Some and maps None to PyValue::None_
+    // (Python's dict), and the Option<T> → T arm keeps the round-83/104
+    // loud unwrap for a concrete slot.
+    let actual = infer_type(
+        if matches!(expr, ExprType::Attribute(_))
+            && crate::ast::tree::attribute::chain_root_is_self(expr)
+        {
+            Some(&ctx)
+        } else {
+            None
+        },
+        expr,
+        &options,
+        &symbols,
+    );
     // Round 81: a NARROWED name read already converts to the member type
     // (name.rs: `(x).as_bytes().unwrap().to_vec()` for a Bytes-narrowed
     // boxed value, `(x).as_str().unwrap().to_string()` for String). The

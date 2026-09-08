@@ -415,6 +415,23 @@ pub(crate) fn render_lambda_callable(
         .into_iter()
         .filter(|c| !names.iter().any(|p| &p.arg == c))
         .collect();
+    // A lambda used as a callable VALUE (a `move` closure in a
+    // `PyCallable`) cannot capture the receiver of an enclosing METHOD:
+    // its capture prologue is `let self = self.clone()` — E0424, `self`
+    // may not be bound, and a `&mut` receiver has no clone — and the
+    // value could outlive the method's borrow. A plain Rust closure
+    // (an argument lambda) captures the receiver by reference instead;
+    // this callable-value form must refuse loudly.
+    if captured.iter().any(|c| c == "self") {
+        return Err(format!(
+            "a lambda used as a callable value cannot capture the method \
+             receiver through `self`: the receiver is a borrow of the \
+             instance, not a value to clone, and `self` may not be bound \
+             in Rust. Pass the receiver's fields the lambda needs as \
+             arguments"
+        )
+        .into());
+    }
     // A lambda that MUTATES a captured container has no cell to write
     // through: cells are decided per STATEMENT (a nested `def`'s stores),
     // and a lambda is an expression whose captures are clones. Rather

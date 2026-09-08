@@ -6324,6 +6324,297 @@ fn guarded_option_field_returns_into_concrete_fns() {
 }
 
 #[test]
+fn guarded_option_field_args_into_str_params_match_python() {
+    // Round 104: a guarded `str | None` FIELD passed to a `str`-taking
+    // callee (`is_accentuated(self._last)` after `self._last is not
+    // None` — charset_normalizer's md.py SuspiciousAccentPlugin): the
+    // arg unwraps through the mapped path with the loud panic (the guard
+    // makes the None unreachable). Transcript pinned against python3.
+    let scratch = Scratch::new("fieldarg");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def is_accentuated(character: str) -> bool:\n",
+            "    return character.isupper()\n",
+            "\n",
+            "\n",
+            "class P:\n",
+            "    def __init__(self):\n",
+            "        self._last: str | None = None\n",
+            "\n",
+            "    def feed(self, ch: str) -> int:\n",
+            "        n = 0\n",
+            "        if self._last is not None and is_accentuated(ch) and is_accentuated(self._last):\n",
+            "            n += 1\n",
+            "        self._last = ch\n",
+            "        return n\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    p = P()\n",
+            "    print(p.feed(\"A\"), p.feed(\"B\"), p.feed(\"a\"))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["0 1 0"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn method_self_captured_by_plain_lambda_compiles_and_matches_python() {
+    // Round 105: a method whose receiver `self` is captured by a plain
+    // Rust closure (a `map` argument lambda) AND stored through by the
+    // method (`self.tag = ...` before and after the closure use —
+    // charset_normalizer's CharsetMatch.output shape). `self` is not an
+    // owned local, so the closure-cell machinery must never make it a
+    // cell: `let self = PyCell::empty("self")` is E0424 (`self` may not
+    // be bound) and the borrow wrapper's `let mut self` too. The plain
+    // closure captures the receiver binding by reference, which reads the
+    // one object late exactly as Python's cell does. Transcript pinned
+    // against python3.
+    let scratch = Scratch::new("selfcell");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Rewriter:\n",
+            "    def __init__(self, initial: str):\n",
+            "        self.tag: str = initial\n",
+            "\n",
+            "    def rewrite(self, words: list[str], tag: str) -> str:\n",
+            "        if self.tag == \"\":\n",
+            "            self.tag = tag\n",
+            "        joined = \"\".join(map(lambda w: w + \"[\" + self.tag + \"]\", words))\n",
+            "        self.tag = tag + \"!\"\n",
+            "        return joined\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    r = Rewriter(\"\")\n",
+            "    print(r.rewrite([\"a\", \"bb\"], \"X\"))\n",
+            "    print(r.rewrite([\"c\"], \"Y\"))\n",
+            "    print(r.tag)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["a[X]bb[X]", "c[X!]", "Y!"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn mutating_property_reads_and_tuple_membership_match_python() {
+    // Round 106: three corpus shapes in one transcript.
+    // - A SHARED class's property whose getter MUTATES self (a cache
+    //   fill — charset_normalizer's CharsetMatch.fingerprint -> output):
+    //   reading it through a PyRef receiver (`other.fingerprint` in
+    //   __eq__/append) must borrow the one object MUTABLY, or the getter
+    //   call fails on the read-only Ref (E0596).
+    // - Membership in a constant TUPLE (`x in ("Hiragana", "Katakana")` —
+    //   md.py): a Rust tuple has no py_contains, so the all-string-literal
+    //   tuple materializes as a Vec.
+    // - str.isascii() (md.py `character.isascii()`).
+    // Transcript pinned against python3.
+    let scratch = Scratch::new("mutprop");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "from typing import List, Optional\n",
+            "\n",
+            "\n",
+            "class RangeBox:\n",
+            "    def __init__(self, name: str):\n",
+            "        self.name: str = name\n",
+            "        self._cache: Optional[str] = None\n",
+            "\n",
+            "    @property\n",
+            "    def fingerprint(self) -> str:\n",
+            "        if self._cache is None:\n",
+            "            self._cache = self.name + \"!\"\n",
+            "        return self._cache\n",
+            "\n",
+            "    def eq(self, other: \"RangeBox\") -> bool:\n",
+            "        return self.fingerprint == other.fingerprint\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    xs: List[RangeBox] = [RangeBox(\"a\"), RangeBox(\"b\"), RangeBox(\"Katakana\")]\n",
+            "    print(xs[0].eq(xs[1]))\n",
+            "    print(xs[0].eq(xs[2]) is False)\n",
+            "    a = xs[0].fingerprint\n",
+            "    print(a, a in (\"Hiragana\", \"Katakana\"))\n",
+            "    b = xs[2].fingerprint\n",
+            "    print(b, b in (\"Hiragana\", \"Katakana\"))\n",
+            "    print(\"\".isascii(), \"abc\".isascii(), \"\\u00e9\".isascii())\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "False",
+            "True",
+            "a! False",
+            "Katakana! False",
+            "True True False",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn option_fields_box_into_any_dicts_and_container_returns_unwrap() {
+    // Round 107: four move/coercion shapes in one transcript.
+    // - A `str | None` field read into a `dict[str, Any]` literal
+    //   (CliDetectionResult.__dict__): the ctx-less inference could not
+    //   resolve the SELF-FIELD, so the Option-fabrication assumed
+    //   `Option<PyValue>` and rendered `.unwrap_or(PyValue::None_)` on
+    //   the Option<String> (E0308). The field now infers with the class
+    //   context and boxes through the Some/None match — Python's dict.
+    // - An `Option<list[str]>` field RETURNED from a `-> list[str]`
+    //   function (alphabets — `_unicode_ranges`): fn_return_typed
+    //   normalizes scalars only, so the round-103 return coercion never
+    //   unwrapped a container-typed return (E0308 ×2); container
+    //   annotations now join the typed-return shapes.
+    // - `str(bytes, encoding)` where the encoding is a REUSED local and
+    //   a `str | None` field (models.py's __str__/utils.py): the codec
+    //   argument is borrowed, never moved (E0507/E0382).
+    // - A generator `yield from self.<field>` clones the field instead of
+    //   moving it out of the receiver (E0507).
+    // Transcript pinned against python3.
+    let scratch = Scratch::new("optbox");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "from typing import Any, Dict, Iterator, List, Optional\n",
+            "\n",
+            "\n",
+            "class Rec:\n",
+            "    def __init__(self, name: str, enc: Optional[str]):\n",
+            "        self.name: str = name\n",
+            "        self.encoding: Optional[str] = enc\n",
+            "        self._ranges: Optional[List[str]] = None\n",
+            "        self._items: List[str] = []\n",
+            "\n",
+            "    def as_dict(self) -> Dict[str, Any]:\n",
+            "        return {\"name\": self.name, \"encoding\": self.encoding}\n",
+            "\n",
+            "    def alphabets(self) -> List[str]:\n",
+            "        if self._ranges is not None:\n",
+            "            return self._ranges\n",
+            "        self._ranges = [\"a\", \"b\"]\n",
+            "        return self._ranges\n",
+            "\n",
+            "    def decode_twice(self, data: bytes) -> str:\n",
+            "        enc = self.encoding or \"utf-8\"\n",
+            "        first = str(data, enc)\n",
+            "        second = str(data[:1], enc)\n",
+            "        return first + second\n",
+            "\n",
+            "    def all_items(self) -> Iterator[str]:\n",
+            "        yield from self._items\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    r = Rec(\"x\", \"utf-8\")\n",
+            "    print(r.as_dict())\n",
+            "    print(r.alphabets())\n",
+            "    print(r.alphabets())\n",
+            "    r2 = Rec(\"y\", None)\n",
+            "    print(r2.as_dict())\n",
+            "    print(r2.decode_twice(\"hi\".encode()))\n",
+            "    r._items = [\"bb\", \"a\"]\n",
+            "    print(sorted(r.all_items()))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "{'name': 'x', 'encoding': 'utf-8'}",
+            "['a', 'b']",
+            "['a', 'b']",
+            "{'name': 'y', 'encoding': None}",
+            "hih",
+            "['a', 'bb']",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {
     // Round 41: a trait-DEFAULT body that formats `self` in an exception
     // message (`raise PoolError(self)` — urllib3's _get_conn raises

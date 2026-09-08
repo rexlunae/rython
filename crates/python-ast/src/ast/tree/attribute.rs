@@ -131,6 +131,24 @@ impl<'a> CodeGen for Attribute {
             );
             return Ok(quote!(stdpython::py_value_type_name(&stdpython::PyValue::from(#recv)).to_string()));
         }
+        // `x.__class__` on a class-typed receiver — the class as a VALUE,
+        // read off the receiver's STATIC class (`other.__class__` in an
+        // exception message — charset_normalizer's CharsetMatch.add_submatch,
+        // whose `other` is a CharsetMatch parameter). The class-as-value
+        // model spells a class as its name string, so the read IS that
+        // name (the same spelling `type(x).__name__` emits). CPython names
+        // the RUNTIME class object; the static class is the typed model's
+        // reading — a base-typed receiver names the base, the same class
+        // of divergence isinstance dispatch already has. A receiver whose
+        // class cannot be resolved keeps the plain field read (loud E0609
+        // when the struct has no such field).
+        if self.attr == "__class__"
+            && let Some((class, _)) =
+                crate::receiver_class(&self.value, &ctx, &symbols, &options)
+        {
+            let name = crate::safe_ident(&class.name);
+            return Ok(quote!(stringify!(#name).to_string()));
+        }
         // Inheritance-aware field access, computed before `self.value` is
         // moved below: `self.name` where `name` is a base class's field, or
         // `dog.name` where `dog` is a derived-class instance, must reach
@@ -457,12 +475,27 @@ impl<'a> CodeGen for Attribute {
         // A PROPERTY GETTER read (`self.url` — urllib3's geturl, where url
         // is `@property def url`): the property lowers as a plain method
         // returning Result, so the read routes to the getter CALL and
-        // unwraps (`self.url()?`). Computed before the moves below.
-        let property_getter =
+        // unwraps (`self.url()?`). Computed before the moves below. The
+        // resolved class is kept so the getter's receiver KIND decides the
+        // borrow of a shared receiver (`other.fingerprint` where the
+        // getter mutates self — charset_normalizer's CharsetMatch).
+        let property_getter: Option<(crate::ClassDef, SymbolTableScopes)> =
             crate::receiver_class_for_read(&self.value, &ctx, &symbols, &options)
-                .is_some_and(|(class, class_symbols)| {
-                    class.has_property_getter(&self.attr, &class_symbols, &options)
+                .and_then(|(class, class_symbols)| {
+                    if class.has_property_getter(&self.attr, &class_symbols, &options) {
+                        Some((class, class_symbols))
+                    } else {
+                        None
+                    }
                 });
+        // Whether the getter needs `&mut self` (it stores a cache — a
+        // SHARED receiver's read then borrows the one object MUTABLY;
+        // computed before `options` is moved by the receiver render).
+        let property_getter_needs_mut = property_getter
+            .as_ref()
+            .is_some_and(|(class, class_symbols)| {
+                class.method_needs_mut_self(&self.attr, class_symbols, &options)
+            });
 
         let warnings = options.definition_warnings.clone();
         // Issue #137's Option-aware access: a READ through an
@@ -692,11 +725,19 @@ impl<'a> CodeGen for Attribute {
             // method returning Result, so the read routes to the getter CALL
             // and unwraps (`self.url()?`). Only when the receiver's class
             // actually defines the getter — a genuine field read is untouched.
-            if property_getter && field_access.is_none() {
+            if let Some((_class, _class_symbols)) = &property_getter
+                && field_access.is_none()
+            {
                 // A SHARED receiver's getter call borrows first (the
                 // PyRef itself has no methods — records's v.patch where v
-                // is a PyRef<Version>, round 99).
+                // is a PyRef<Version>, round 99). MUTABLY when the getter
+                // needs `&mut self` (a getter that stores a cache —
+                // charset_normalizer's CharsetMatch.fingerprint -> output),
+                // or the call fails on the read-only Ref (E0596).
                 if shared_recv {
+                    if property_getter_needs_mut {
+                        return Ok(quote!((#value_tokens).borrow_mut().#attr()?));
+                    }
                     return Ok(quote!((#value_tokens).borrow().#attr()?));
                 }
                 return Ok(quote!(#value_tokens.#attr()?));

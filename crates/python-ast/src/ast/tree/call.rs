@@ -4390,15 +4390,35 @@ impl<'a> CodeGen for Call {
                                     symbols.clone(),
                                 )?;
                                 let runtime = crate::safe_ident(&options.stdpython);
+                                // The ENCODING argument is BORROWED, never
+                                // moved: decode_by_name takes it by value
+                                // (`N: AsRef<str>`), and a String-typed
+                                // `self.<field>` or a reused local would
+                                // otherwise move out of the receiver or
+                                // of the binding (E0507/E0382 —
+                                // charset_normalizer's models.py __str__
+                                // `str(self._payload, self._encoding,
+                                // "strict")` and utils.py's
+                                // encoding_iana loops).
                                 return Ok(quote!(
-                                    #runtime::stdlib::codec::decode_by_name(&(#a), #enc)?
+                                    #runtime::stdlib::codec::decode_by_name(&(#a), &(#enc))?
                                 ));
                             }
                             (2, _) => {
                                 let (a, enc) = (&rendered[0], &rendered[1]);
                                 let runtime = crate::safe_ident(&options.stdpython);
+                                // The ENCODING argument is BORROWED, never
+                                // moved: decode_by_name takes it by value
+                                // (`N: AsRef<str>`), and a String-typed
+                                // `self.<field>` or a reused local would
+                                // otherwise move out of the receiver or
+                                // of the binding (E0507/E0382 —
+                                // charset_normalizer's models.py __str__
+                                // `str(self._payload, self._encoding,
+                                // "strict")` and utils.py's
+                                // encoding_iana loops).
                                 return Ok(quote!(
-                                    #runtime::stdlib::codec::decode_by_name(&(#a), #enc)?
+                                    #runtime::stdlib::codec::decode_by_name(&(#a), &(#enc))?
                                 ));
                             }
                             // str(bytes, encoding, errors) — the errors
@@ -4408,8 +4428,18 @@ impl<'a> CodeGen for Call {
                             (3, _) => {
                                 let (a, enc) = (&rendered[0], &rendered[1]);
                                 let runtime = crate::safe_ident(&options.stdpython);
+                                // The ENCODING argument is BORROWED, never
+                                // moved: decode_by_name takes it by value
+                                // (`N: AsRef<str>`), and a String-typed
+                                // `self.<field>` or a reused local would
+                                // otherwise move out of the receiver or
+                                // of the binding (E0507/E0382 —
+                                // charset_normalizer's models.py __str__
+                                // `str(self._payload, self._encoding,
+                                // "strict")` and utils.py's
+                                // encoding_iana loops).
                                 return Ok(quote!(
-                                    #runtime::stdlib::codec::decode_by_name(&(#a), #enc)?
+                                    #runtime::stdlib::codec::decode_by_name(&(#a), &(#enc))?
                                 ));
                             }
                             _ => {
@@ -7643,8 +7673,11 @@ let mutating_self_field = boxed_self_ref_receiver
                             ));
                         }
                         // Runtime codec name: dispatch in the runtime.
+                        // The encoding is BORROWED (see the str(bytes,
+                        // encoding) arms): a String field read must not
+                        // move out of the receiver.
                         return Ok(quote!(
-                            #runtime::stdlib::codec::decode_by_name(&(#receiver), #enc)?
+                            #runtime::stdlib::codec::decode_by_name(&(#receiver), &(#enc))?
                         ));
                     }
                     ("decode", []) => {
@@ -8476,12 +8509,42 @@ let mutating_self_field = boxed_self_ref_receiver
             // A **kwargs or *args callee always routes through
             // map_call_arguments, which packs the extras into the boxed
             // PyDict / Vec<PyValue> (issue #120).
+            // An OPTION-of-string ARGUMENT into a `str`-annotated
+            // parameter (`is_accentuated(self._last)` where `_last` is a
+            // guarded `str | None` field — charset_normalizer's md.py,
+            // round 104) also routes through the mapped path: the plain
+            // renderer cannot type the arg, and the mapped fill unwraps
+            // the Option (the guard makes the None unreachable; a
+            // narrowed NAME read already unwraps and is excluded).
             let needs_mapping = !self.keywords.is_empty()
                 || !callee_def.args.kwonlyargs.is_empty()
                 || self.args.len() < pos_param_count
                 || has_optional_params
                 || callee_def.args.kwarg.is_some()
-                || callee_def.args.vararg.is_some();
+                || callee_def.args.vararg.is_some()
+                || callee_def
+                    .args
+                    .posonlyargs
+                    .iter()
+                    .chain(callee_def.args.args.iter())
+                    .zip(self.args.iter())
+                    .any(|(p, arg)| {
+                        p.annotation
+                            .as_deref()
+                            .is_some_and(|a| {
+                                matches!(a, crate::ExprType::Name(n) if n.id == "str")
+                            })
+                            && !matches!(arg, crate::ExprType::Name(n)
+                                if options.narrowed_names.contains_key(&n.id))
+                            && matches!(
+                                crate::infer_type(Some(&ctx), arg, &options, &symbols),
+                                crate::TypeInfo::Option(inner)
+                                    if matches!(
+                                        &*inner,
+                                        crate::TypeInfo::String | crate::TypeInfo::StrRef
+                                    )
+                            )
+                    });
             if needs_mapping {
                 let MappedArguments { prelude, args } = map_call_arguments(
                     callee_def,
@@ -11380,6 +11443,33 @@ fn map_call_arguments_inner(
                         None
                     }
                 });
+            // A `str` parameter takes anything `Into<String>` (the
+            // expected above stays None for it), but an OPTION-of-string
+            // argument (`is_accentuated(self._last)` where `_last` is a
+            // guarded `str | None` field — charset_normalizer's md.py,
+            // round 104) cannot `Into<String>`: render against the
+            // concrete String so the Option unwraps with the loud panic
+            // (the guard makes the None unreachable; a narrowed NAME
+            // read already unwraps and is excluded).
+            let expected = expected.or_else(|| {
+                if param.evaluated_annotation().is_some_and(|a| {
+                    matches!(a, crate::ExprType::Name(n) if n.id == "str")
+                }) && !matches!(expr, crate::ExprType::Name(n)
+                    if options.narrowed_names.contains_key(&n.id))
+                    && matches!(
+                        crate::infer_type(Some(&ctx), expr, &options, &symbols),
+                        crate::TypeInfo::Option(inner)
+                            if matches!(
+                                &*inner,
+                                crate::TypeInfo::String | crate::TypeInfo::StrRef
+                            )
+                    )
+                {
+                    Some(crate::TypeInfo::String)
+                } else {
+                    None
+                }
+            });
             crate::render_typed_reused(
                 expr,
                 ctx.clone(),
