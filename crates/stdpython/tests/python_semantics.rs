@@ -3858,6 +3858,13 @@ fn string_is_family_matches_python() {
     assert!(!'\t'.to_string().isprintable());
     assert!(!'\n'.to_string().isprintable());
     assert!(!'\u{0}'.to_string().isprintable());
+    // python3: str.isascii() — true for the empty string and when every
+    // character is 7-bit ASCII, false for any non-ASCII character.
+    assert!("".isascii(), "empty string isascii");
+    assert!("abc123 \t\n".isascii(), "ASCII text isascii");
+    assert!(!'\u{00E9}'.to_string().isascii(), "é is not ASCII");
+    assert!(!'\u{00FF}'.to_string().isascii(), "ÿ is not ASCII");
+    assert!(!'\u{20AC}'.to_string().isascii(), "€ is not ASCII");
     // python3: U+0345 (a combining mark with the Alphabetic property) is
     // not a letter — isalpha/isalnum are False; A-grave is a letter.
     assert!(!'\u{0345}'.to_string().isalpha());
