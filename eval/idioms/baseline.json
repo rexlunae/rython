@@ -22,8 +22,7 @@
       "status": "pass"
     },
     "pipeline": {
-      "status": "build-failed",
-      "errors": 5
+      "status": "pass"
     },
     "records": {
       "status": "pass"

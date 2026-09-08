@@ -193,6 +193,46 @@ impl<'a> CodeGen for Assign {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // A `lambda` bound to a NAME whose type is a callable value
+        // (issue #122): the name's type — from its uses, or from an
+        // annotation — is what types the lambda's parameters, so the
+        // binding holds the same `PyCallable` every other callable value
+        // does instead of a bare Rust closure.
+        if self.targets.len() == 1
+            && let ExprType::Name(target) = &self.targets[0]
+            && matches!(self.value, ExprType::Lambda(_))
+            && let Some(expected @ crate::TypeInfo::Callable(..)) =
+                options.name_types.get(&target.id).cloned()
+        {
+            let ident = crate::safe_ident(&target.id);
+            let value = crate::render_typed(
+                &self.value,
+                ctx,
+                options.clone(),
+                symbols,
+                Some(expected),
+            )?;
+            return Ok(quote!(#ident = #value;));
+        }
+
+        // An assignment to a closure CELL (issue #122): the binding a
+        // nested definition shares. The cell was declared once by the
+        // scope's prologue, so this BINDS THROUGH it — a closure created
+        // before this statement reads the value stored here, which is
+        // Python's late binding.
+        if self.targets.len() == 1
+            && let ExprType::Name(target) = &self.targets[0]
+            && options.cell_locals.contains(&target.id)
+        {
+            let ident = crate::safe_ident(&target.id);
+            let mut inner = options.clone();
+            let mut cells = (*inner.cell_locals).clone();
+            cells.remove(&target.id);
+            inner.cell_locals = std::rc::Rc::new(cells);
+            let value = crate::render_typed(&self.value, ctx, inner, symbols, None)?;
+            return Ok(quote!(#ident.set(#value);));
+        }
+
         // rust.bind / rust.c_bind declarations are compile-time-only: the
         // assignment emits nothing (the binding lives in the symbol table).
         // Everything about the declaration is validated here, loudly.

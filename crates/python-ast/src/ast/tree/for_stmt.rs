@@ -104,9 +104,11 @@ impl CodeGen for For {
                     && !crate::name_referenced_in(&self.body, &n.id)
                     && !crate::name_referenced_in(&self.orelse, &n.id)
         );
+        // A CELL target binds through the cell, which needs the same
+        // element-temp shape a leaked target uses.
         let any_hoisted = target_names
             .iter()
-            .any(|n| leaked.contains(*n));
+            .any(|n| leaked.contains(*n) || options.cell_locals.contains(*n));
         let has_else = !self.orelse.is_empty();
         // Break-tracking is only needed when the else clause could be skipped
         // by a break belonging to this loop; otherwise the flag would be
@@ -137,6 +139,7 @@ impl CodeGen for For {
                 &self.target,
                 quote!(__rython_elt),
                 &leaked,
+                &options.cell_locals,
                 &mut stmts,
                 &mut counter,
             );
@@ -351,13 +354,19 @@ pub(crate) fn lower_loop_target(
     target: &ExprType,
     value: TokenStream,
     hoisted: &std::collections::HashSet<String>,
+    cells: &std::collections::HashSet<String>,
     out: &mut Vec<TokenStream>,
     counter: &mut usize,
 ) {
     match target {
         ExprType::Name(n) => {
             let id = crate::safe_ident(&n.id);
-            if hoisted.contains(&n.id) {
+            // A closure CELL target (issue #122): the loop binds THROUGH
+            // the cell, so every closure built in the loop shares the one
+            // binding and sees the last value, as Python's does.
+            if cells.contains(&n.id) {
+                out.push(quote!(#id.set(#value);));
+            } else if hoisted.contains(&n.id) {
                 out.push(quote!(#id = #value;));
             } else {
                 out.push(quote!(let #id = #value;));
@@ -371,7 +380,7 @@ pub(crate) fn lower_loop_target(
                 *counter += 1;
                 pats.push(quote!(#tname));
                 let v = quote!(#tname);
-                lower_loop_target(elt, v, hoisted, &mut inner, counter);
+                lower_loop_target(elt, v, hoisted, cells, &mut inner, counter);
             }
             // The temps are unique (the counter), so the destructure
             // splices WITHOUT a block: a closing block would end the

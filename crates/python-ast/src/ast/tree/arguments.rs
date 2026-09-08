@@ -615,6 +615,166 @@ pub fn python_annotation_to_rust_type(annotation: &ExprType) -> Option<TokenStre
     crate::annotation_type_info(annotation).map(|t| t.to_rust_type())
 }
 
+/// Where a parameter's type is being rendered.
+///
+/// An ITEM signature can use `impl Trait`, so a `str` parameter takes
+/// `impl Into<String>` and call sites pass literals as well as owned
+/// Strings; the function prologue converts it. A CLOSURE signature (a
+/// nested `def` or a lambda lowered as a callable value, issue #122)
+/// cannot — `impl Trait` is illegal in closure parameter position, and
+/// the callable's type must name one concrete argument tuple — so the
+/// concrete type is used and the same prologue is a no-op conversion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ParamPosition {
+    Item,
+    Closure,
+}
+
+/// The Rust TYPE a parameter denotes — the one authority behind both an
+/// item's `name: Type` and a closure's argument tuple.
+pub(crate) fn parameter_rust_type(
+    param: &Parameter,
+    position: ParamPosition,
+    ctx: CodeGenContext,
+    options: PythonOptions,
+    symbols: SymbolTableScopes,
+) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
+    // Generate type annotation if present
+    if let Some(annotation) = param.annotation.clone() {
+        // A STRING-LITERAL annotation (`verify: "bool | str | None"` —
+        // requests' adapters.py quotes its annotations): re-parse the
+        // content so the checks below see the real expression (round
+        // 56), like typing.get_type_hints.
+        let annotation: ExprType =
+            unquote_annotation(&annotation).unwrap_or(*annotation);
+        // A str parameter accepts anything convertible to String, so
+        // call sites can pass &str literals as well as owned Strings;
+        // the function prologue converts it (`let s: String = s.into()`).
+        if matches!(&annotation, ExprType::Name(n) if n.id == "str") {
+            return Ok(match position {
+                ParamPosition::Item => quote!(impl Into<String>),
+                ParamPosition::Closure => quote!(String),
+            });
+        }
+        // A bare `type` annotation (`dict_class: type = OrderedDict` —
+        // requests' sessions): a callable/class — rython cannot hold
+        // callables as values (the callables-as-data divergence), so
+        // the parameter is a boxed PyValue.
+        if crate::ast::tree::arguments::is_type_annotation(&annotation) {
+            return Ok(quote!(stdpython::PyValue));
+        }
+        // A `None`-only annotation (`cookiejar: None = None`): nothing
+        // but None can ever be stored.
+        if crate::is_none_expr(&annotation) {
+            return Ok(quote!(Option<()>));
+        }
+        // Known Python types map to concrete Rust types; a module-level
+        // TYPE ALIAS (`CoherenceMatches = List[CoherenceMatch]`) or an
+        // alias in another module resolves through symbols
+        // (charset_normalizer). Anything else falls back to rendering
+        // the annotation expression (e.g. a user-defined class name).
+        // A union of exception classes only (`err: BaseSSLError |
+        // OSError | SocketTimeout` — urllib3's _raise_timeout): the
+        // exception model has one runtime type, so the parameter IS a
+        // PyException (an Option of one with a None member) — a caught
+        // exception passes straight in, and `isinstance(err, X)` tests
+        // its kind like an except clause. Decided FIRST: the
+        // syntax-only mapping boxes a builtin exception member.
+        if let Some(t) = exception_union_typeinfo(&annotation, &symbols, &options) {
+            return Ok(t.to_rust_type());
+        }
+        // `Callable[[A], R]` is a callable VALUE (issue #122): decided
+        // before the token-level mapping, which has no callable arm.
+        if let Some(t) = crate::resolve_alias_typeinfo(&annotation, &symbols, &options)
+            && matches!(t, crate::TypeInfo::Callable(..))
+        {
+            return Ok(t.to_rust_type());
+        }
+        let rust_type = match python_annotation_to_rust_type(&annotation) {
+            Some(mapped) => mapped,
+            None => {
+                if let Some(t) = crate::resolve_alias_typeinfo(&annotation, &symbols, &options)
+                {
+                    t.to_rust_type()
+                } else if let ExprType::BinOp(op) = &annotation
+                    && matches!(op.op, crate::BinOps::BitOr)
+                    && let Some(members) = crate::union_members(&annotation)
+                    && !members.is_empty()
+                    && members.iter().all(|m| {
+                        crate::is_pyvalue_boxable_member(m)
+                            || is_exception_class_member(m, &symbols, &options)
+                    })
+                {
+                    // A union MIXING exception classes with boxable
+                    // members: exceptions have no boxed representation,
+                    // so the parameter boxes and an exception argument
+                    // stays a loud mismatch. Checked only AFTER the
+                    // direct mapping, so `str | bytes` still lowers to
+                    // StrOrBytes.
+                    quote!(stdpython::PyValue)
+                } else {
+                    annotation.to_rust(ctx, options, symbols)?
+                }
+            }
+        };
+        Ok(rust_type)
+    } else {
+        // An unannotated parameter: the per-function inference pass
+        // (issue #109, M1) gives it a type-variable name from its uses
+        // (`def add(a, b): return a + b` → `a: A`). The old
+        // `impl Into<PyObject>` fallback is gone: no ordinary rython
+        // value satisfies it, so such functions converted but were
+        // uncallable. If no variable was inferred, the function
+        // generator already failed loudly with the reason.
+        match options.param_type_vars.get(&param.arg) {
+            // A value-pinned free-function parameter (inferred boxed
+            // PyValue — issue #161): `impl Into<stdpython::PyValue>`,
+            // boxed by the function prologue, so call sites pass plain
+            // values (String, bytes, an already-boxed PyValue) exactly
+            // like Python.
+            Some(_)
+                if options.pyvalue_into_params.contains(&param.arg)
+                    && position == ParamPosition::Item =>
+            {
+                Ok(quote!(impl Into<stdpython::PyValue>))
+            }
+            Some(tv) if options.pyvalue_into_params.contains(&param.arg) => {
+                let _ = tv;
+                Ok(quote!(stdpython::PyValue))
+            }
+            Some(tv) => Ok(quote!(#tv)),
+            // No type var (the constructor synthesis renders __init__
+            // params, or an unannotated method param): a boxed PyValue
+            // fallback — the parameter's value is unknown (documented
+            // divergence, issue #109).
+            None => Ok(quote!(stdpython::PyValue)),
+        }
+    }
+}
+
+/// The ELEMENT type of a `*args` parameter (issue #120).
+///
+/// `*args` is heterogeneous by default, so it packs into the boxed
+/// `Vec<PyValue>` — extra positionals box at the call site. An ANNOTATED
+/// vararg says otherwise: `def total(*nums: int)` means every extra
+/// positional IS an int, so the vector is `Vec<i64>`, the call sites
+/// pass plain values, and the body can `sum(nums)` like any list of
+/// ints. One authority, read by the signature, the body's name types and
+/// the call-site packing alike.
+pub(crate) fn vararg_element_type(
+    vararg: &Parameter,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> crate::TypeInfo {
+    vararg
+        .evaluated_annotation()
+        .and_then(|ann| crate::resolve_alias_typeinfo(&ann, symbols, options))
+        // A `str` element is an owned String in the vector — `impl Into`
+        // has no place inside a container.
+        .map(|t| if matches!(t, crate::TypeInfo::StrRef) { crate::TypeInfo::String } else { t })
+        .unwrap_or(crate::TypeInfo::PyValue)
+}
+
 impl CodeGen for Parameter {
     type Context = CodeGenContext;
     type Options = PythonOptions;
@@ -626,104 +786,10 @@ impl CodeGen for Parameter {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
-
         let param_name = crate::safe_ident(&self.arg);
-
-        // Generate type annotation if present
-        if let Some(annotation) = self.annotation {
-            // A STRING-LITERAL annotation (`verify: "bool | str | None"` —
-            // requests' adapters.py quotes its annotations): re-parse the
-            // content so the checks below see the real expression (round
-            // 56), like typing.get_type_hints.
-            let annotation: ExprType =
-                unquote_annotation(&annotation).unwrap_or(*annotation);
-            // A str parameter accepts anything convertible to String, so
-            // call sites can pass &str literals as well as owned Strings;
-            // the function prologue converts it (`let s: String = s.into()`).
-            if matches!(&annotation, ExprType::Name(n) if n.id == "str") {
-                return Ok(quote!(#param_name: impl Into<String>));
-            }
-            // A bare `type` annotation (`dict_class: type = OrderedDict` —
-            // requests' sessions): a callable/class — rython cannot hold
-            // callables as values (the callables-as-data divergence), so
-            // the parameter is a boxed PyValue.
-            if crate::ast::tree::arguments::is_type_annotation(&annotation) {
-                return Ok(quote!(#param_name: stdpython::PyValue));
-            }
-            // A `None`-only annotation (`cookiejar: None = None`): nothing
-            // but None can ever be stored.
-            if crate::is_none_expr(&annotation) {
-                return Ok(quote!(#param_name: Option<()>));
-            }
-            // Known Python types map to concrete Rust types; a module-level
-            // TYPE ALIAS (`CoherenceMatches = List[CoherenceMatch]`) or an
-            // alias in another module resolves through symbols
-            // (charset_normalizer). Anything else falls back to rendering
-            // the annotation expression (e.g. a user-defined class name).
-            // A union of exception classes only (`err: BaseSSLError |
-            // OSError | SocketTimeout` — urllib3's _raise_timeout): the
-            // exception model has one runtime type, so the parameter IS a
-            // PyException (an Option of one with a None member) — a caught
-            // exception passes straight in, and `isinstance(err, X)` tests
-            // its kind like an except clause. Decided FIRST: the
-            // syntax-only mapping boxes a builtin exception member.
-            if let Some(t) = exception_union_typeinfo(&annotation, &symbols, &options) {
-                let rust_type = t.to_rust_type();
-                return Ok(quote!(#param_name: #rust_type));
-            }
-            let rust_type = match python_annotation_to_rust_type(&annotation) {
-                Some(mapped) => mapped,
-                None => {
-                    if let Some(t) = crate::resolve_alias_typeinfo(&annotation, &symbols, &options)
-                    {
-                        t.to_rust_type()
-                    } else if let ExprType::BinOp(op) = &annotation
-                        && matches!(op.op, crate::BinOps::BitOr)
-                        && let Some(members) = crate::union_members(&annotation)
-                        && !members.is_empty()
-                        && members.iter().all(|m| {
-                            crate::is_pyvalue_boxable_member(m)
-                                || is_exception_class_member(m, &symbols, &options)
-                        })
-                    {
-                        // A union MIXING exception classes with boxable
-                        // members: exceptions have no boxed representation,
-                        // so the parameter boxes and an exception argument
-                        // stays a loud mismatch. Checked only AFTER the
-                        // direct mapping, so `str | bytes` still lowers to
-                        // StrOrBytes.
-                        quote!(stdpython::PyValue)
-                    } else {
-                        annotation.to_rust(ctx, options, symbols)?
-                    }
-                }
-            };
-            Ok(quote!(#param_name: #rust_type))
-        } else {
-            // An unannotated parameter: the per-function inference pass
-            // (issue #109, M1) gives it a type-variable name from its uses
-            // (`def add(a, b): return a + b` → `a: A`). The old
-            // `impl Into<PyObject>` fallback is gone: no ordinary rython
-            // value satisfies it, so such functions converted but were
-            // uncallable. If no variable was inferred, the function
-            // generator already failed loudly with the reason.
-            match options.param_type_vars.get(&self.arg) {
-                // A value-pinned free-function parameter (inferred boxed
-                // PyValue — issue #161): `impl Into<stdpython::PyValue>`,
-                // boxed by the function prologue, so call sites pass plain
-                // values (String, bytes, an already-boxed PyValue) exactly
-                // like Python.
-                Some(_) if options.pyvalue_into_params.contains(&self.arg) => {
-                    Ok(quote!(#param_name: impl Into<stdpython::PyValue>))
-                }
-                Some(tv) => Ok(quote!(#param_name: #tv)),
-                // No type var (the constructor synthesis renders __init__
-                // params, or an unannotated method param): a boxed PyValue
-                // fallback — the parameter's value is unknown (documented
-                // divergence, issue #109).
-                None => Ok(quote!(#param_name: stdpython::PyValue)),
-            }
-        }
+        let rust_type =
+            parameter_rust_type(&self, ParamPosition::Item, ctx, options, symbols)?;
+        Ok(quote!(#param_name: #rust_type))
     }
 }
 
@@ -813,7 +879,8 @@ impl CodeGen for Arguments {
         // forwards the vector.
         if let Some(vararg) = self.vararg {
             let vararg_name = crate::safe_ident(&vararg.arg);
-            params.push(quote!(#vararg_name: Vec<stdpython::PyValue>));
+            let elt = vararg_element_type(&vararg, &symbols, &options).to_rust_type();
+            params.push(quote!(#vararg_name: Vec<#elt>));
         }
         
         // Process keyword-only arguments. Like positional defaults above,

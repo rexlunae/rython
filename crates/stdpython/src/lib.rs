@@ -2673,6 +2673,21 @@ pub fn py_bytes_repr(bytes: &[u8]) -> String {
     out
 }
 
+/// `str(list)` / `str(tuple-of-one-type)`: Python renders a container by
+/// its repr (`str([1, 2, 3])` is `"[1, 2, 3]"`), which is exactly what
+/// PyDisplay produces for it — bytes included (`str(b"x")` is `"b'x'"`).
+impl<T: PyRepr> PyToString for Vec<T> {
+    fn py_str(self) -> String {
+        self.py_display()
+    }
+}
+
+impl<T: PyRepr> PyToString for &Vec<T> {
+    fn py_str(self) -> String {
+        self.py_display()
+    }
+}
+
 impl PyToString for StrOrBytes {
     fn py_str(self) -> String {
         match self {
@@ -7027,6 +7042,13 @@ pub fn not_a_directory_error<M: AsRef<str>>(message: M) -> PyException {
 // ============================================================================
 // PYTHON STANDARD LIBRARY MODULES
 // ============================================================================
+
+#[cfg(feature = "alloc")]
+mod callable;
+/// Callables as VALUES (issue #122): the runtime type of a
+/// `Callable[[A], R]` annotation, a `lambda` and a nested `def`.
+#[cfg(feature = "alloc")]
+pub use callable::{PyCallable, PyCell};
 
 mod builtin_exceptions;
 /// The built-in exception discriminant, re-exported so generated code's

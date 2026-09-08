@@ -238,7 +238,13 @@ impl CodeGen for Dict {
                         let elts = elts?;
                         quote!(vec![#(#elts),*])
                     } else {
-                        crate::render_typed(
+                        // A REUSED name stored into the literal
+                        // (`{"add5": add5, ...}` where `add5` is read
+                        // again after — pipeline's dispatch table): the
+                        // store MOVES it, so a later read would use
+                        // after move — the reuse rule clones it, like
+                        // every other argument position.
+                        crate::render_typed_reused(
                             value,
                             ctx.clone(),
                             options.clone(),

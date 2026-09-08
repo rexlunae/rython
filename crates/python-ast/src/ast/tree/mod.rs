@@ -22,6 +22,8 @@ pub use bool_ops::*;
 pub mod call;
 pub use call::*;
 
+pub mod closure;
+
 pub mod class_def;
 pub use class_def::*;
 

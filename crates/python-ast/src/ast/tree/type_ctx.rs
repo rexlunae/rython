@@ -96,6 +96,13 @@ pub enum TypeInfo {
     /// as values (the callables-as-data divergence): the tolerated opaque
     /// type is `Option<()>`.
     ClassValue,
+    /// `Callable[[A, B], R]` — a CALLABLE held as a value (issue #122):
+    /// `stdpython::PyCallable<(A, B), R>`, the argument list rendered as
+    /// the argument TUPLE so one runtime type serves every arity. A
+    /// lambda, a nested `def` and a function name read as a value all
+    /// carry this type; `f(x)` through such a value lowers to
+    /// `f.call((x,))?`.
+    Callable(Vec<TypeInfo>, Box<TypeInfo>),
     /// A runtime type with no structural meaning to the coercion
     /// machinery — the exact Rust type, rendered verbatim
     /// (`datetime::timedelta` — the datetime.timedelta struct). The
@@ -132,6 +139,9 @@ pub(crate) fn type_mentions_heap(t: &TypeInfo) -> bool {
         | TypeInfo::String
         | TypeInfo::StrRef
         | TypeInfo::Bytes
+        // A `PyCallable` is a reference-counted handle: a field of that
+        // type clones out of `&self` like every other owned value.
+        | TypeInfo::Callable(..)
         | TypeInfo::Custom(_) => true,
         TypeInfo::Vec(inner)
         | TypeInfo::Option(inner)
@@ -157,6 +167,12 @@ pub(crate) fn type_mentions_pyobject(t: &TypeInfo) -> bool {
         | TypeInfo::Borrowed(inner) => type_mentions_pyobject(inner),
         TypeInfo::Dict(k, v) => type_mentions_pyobject(k) || type_mentions_pyobject(v),
         TypeInfo::Tuple(ts) => ts.iter().any(type_mentions_pyobject),
+        // A callable whose argument or return did not resolve renders
+        // `PyCallable<(_,), _>` — an inference hole in an item signature,
+        // exactly like any other unresolved element.
+        TypeInfo::Callable(params, ret) => {
+            params.iter().any(type_mentions_pyobject) || type_mentions_pyobject(ret)
+        }
         _ => false,
     }
 }
@@ -296,6 +312,11 @@ impl TypeInfo {
             TypeInfo::Threading(t) => t.rust_path(),
             TypeInfo::Socket => quote!(socket::Socket),
             TypeInfo::ClassValue => quote!(Option<()>),
+            TypeInfo::Callable(params, ret) => {
+                let args = TypeInfo::Tuple(params.clone()).to_rust_type();
+                let r = ret.to_rust_type();
+                quote!(stdpython::PyCallable<#args, #r>)
+            }
             TypeInfo::Custom(t) => t.clone(),
             TypeInfo::PyObject => quote!(_),
         }
@@ -324,6 +345,11 @@ impl TypeInfo {
             TypeInfo::Threading(t) => t.name().into(),
             TypeInfo::Socket => "socket".into(),
             TypeInfo::ClassValue => "type".into(),
+            TypeInfo::Callable(params, ret) => format!(
+                "Callable[[{}], {}]",
+                params.iter().map(|t| t.display()).collect::<Vec<_>>().join(", "),
+                ret.display()
+            ),
             TypeInfo::Custom(_) => "custom".into(),
             TypeInfo::PyObject => "unknown".into(),
         }
@@ -1568,6 +1594,26 @@ pub fn render_typed(
     symbols: SymbolTableScopes,
     expected: Option<TypeInfo>,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    // A `lambda` where a CALLABLE VALUE is expected (issue #122): the
+    // expected `Callable[[A], R]` types the parameters a lambda cannot
+    // annotate, and the result is the same `PyCallable` a nested `def`
+    // becomes. Decided first: every arm below is a value-shape rule that
+    // would render the lambda as a bare Rust closure.
+    if let (ExprType::Lambda(lam), Some(TypeInfo::Callable(params, ret))) = (expr, &expected) {
+        return crate::ast::tree::closure::render_lambda_callable(
+            lam, params, ret, ctx, options, symbols,
+        );
+    }
+    // A module FUNCTION NAME where a callable value is expected
+    // (`guarded(checked, 4)`): the name denotes a definition, so it is
+    // wrapped in the runtime callable type, which forwards to the item.
+    if let Some(TypeInfo::Callable(params, _)) = &expected
+        && let Some(wrapped) = crate::ast::tree::closure::wrap_function_as_callable(
+            expr, params, &symbols, &options,
+        )
+    {
+        return wrapped;
+    }
     // A class name used as a VALUE (`[ChecksumError]`, `merge_setting(
     // ..., dict_class=OrderedDict)` — requests' sessions): classes as
     // values lower to their NAME STRINGS — the exception model is
@@ -2034,6 +2080,12 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
     // this is its syntax-only half, so the two never disagree on a
     // builtin.
     if let Some(t) = builtin_exception_union(ann) {
+        return Some(t);
+    }
+    // `Callable[[A], R]` — the callable value's type (issue #122), read
+    // by the SAME shape reader the alias-aware resolver uses; the members
+    // resolve through this syntax-only mapping.
+    if let Some(t) = callable_typeinfo_with(ann, annotation_type_info) {
         return Some(t);
     }
     // `T | None` (and `None | T`) is Option<T>; the inner type resolves
@@ -3831,6 +3883,79 @@ fn subscript_container_name(sub: &crate::Subscript) -> Option<String> {
     }
 }
 
+/// `Callable[[A, B], R]` in every spelling the front end can present (the
+/// bare name, `typing.Callable`, an aliased typing root already rewritten
+/// to `typing` by the module builder, quoted): the ONE reader both
+/// annotation authorities use, so the syntax-only mapping and the
+/// symbol-aware resolver never disagree about an arity.
+///
+/// `None` — not a subscripted Callable at all. `Some(Err(reason))` — a
+/// Callable rython does not model: `Callable[..., R]` has no fixed arity,
+/// so it has no Rust type, and the callers keep their pre-existing boxed
+/// fallback and report `reason`.
+pub(crate) fn callable_annotation_parts(
+    ann: &ExprType,
+) -> Option<Result<(Vec<ExprType>, ExprType), String>> {
+    let unquoted = crate::ast::tree::arguments::unquote_annotation(ann);
+    let ann: &ExprType = unquoted.as_ref().unwrap_or(ann);
+    let ExprType::Subscript(sub) = ann else {
+        return None;
+    };
+    if subscript_container_name(sub).as_deref() != Some("Callable") {
+        return None;
+    }
+    let crate::SubscriptKind::Index(inner) = &sub.kind else {
+        return Some(Err("a sliced `Callable[...]` is not an annotation".into()));
+    };
+    let ExprType::Tuple(pair) = inner.as_ref() else {
+        return Some(Err(
+            "`Callable` takes an argument list and a return type \
+             (`Callable[[int], str]`)"
+                .into(),
+        ));
+    };
+    if pair.elts.len() != 2 {
+        return Some(Err(format!(
+            "`Callable[...]` takes exactly two parameters, an argument list \
+             and a return type; this one has {}",
+            pair.elts.len()
+        )));
+    }
+    let ExprType::List(params) = &pair.elts[0] else {
+        return Some(Err(
+            "`Callable[..., R]` has no fixed arity, so it has no Rust \
+             signature: spell the argument types (`Callable[[int], str]`)"
+                .into(),
+        ));
+    };
+    Some(Ok((params.clone(), pair.elts[1].clone())))
+}
+
+/// The Callable annotation resolved through `member` — the caller's own
+/// annotation authority, so the syntax-only and symbol-aware readers each
+/// resolve the members their own way over one shape reader. A member that
+/// does not resolve makes the whole callable unresolvable (the caller
+/// keeps its boxed fallback) rather than silently boxing one argument.
+pub(crate) fn callable_typeinfo_with(
+    ann: &ExprType,
+    mut member: impl FnMut(&ExprType) -> Option<TypeInfo>,
+) -> Option<TypeInfo> {
+    let parts = callable_annotation_parts(ann)?.ok()?;
+    let (params, ret) = parts;
+    let mut resolved = Vec::with_capacity(params.len());
+    for p in &params {
+        resolved.push(member(p)?);
+    }
+    // A `-> None` callable returns Rust's unit, as a `-> None` function
+    // does; every other return resolves through the same authority.
+    let ret = if crate::is_none_expr(&ret) {
+        TypeInfo::Tuple(Vec::new())
+    } else {
+        member(&ret)?
+    };
+    Some(TypeInfo::Callable(resolved, Box::new(ret)))
+}
+
 fn resolve_alias_typeinfo_inner(
     ann: &ExprType,
     symbols: &SymbolTableScopes,
@@ -3842,6 +3967,15 @@ fn resolve_alias_typeinfo_inner(
     // arms below resolve a member alone (`Optional[OSError]` would box
     // its builtin member).
     if let Some(t) = crate::ast::tree::arguments::exception_union_typeinfo(ann, symbols, options) {
+        return Some(t);
+    }
+    // `Callable[[A], R]` is a CALLABLE VALUE (issue #122), decided before
+    // the typing-generic arms below box it: its members resolve through
+    // this same alias-aware authority, so a callable over a module's type
+    // alias (`Callable[[_TYPE_BODY], None]`) is typed, not boxed.
+    if let Some(t) =
+        callable_typeinfo_with(ann, |m| resolve_alias_typeinfo(m, symbols, options))
+    {
         return Some(t);
     }
     match ann {
