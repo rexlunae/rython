@@ -215,11 +215,11 @@ impl<'a> CodeGen for Assign {
             return Ok(quote!(#ident = #value;));
         }
 
-        // A closure CELL's binding (issue #122): the local a nested
-        // closure mutates lives in a shared `stdpython::PyCell`, so the
-        // closure's captured clone and this name are one object. The
-        // name is function-hoisted like every assigned local, so the
-        // binding is the plain store; only the value is wrapped.
+        // An assignment to a closure CELL (issue #122): the binding a
+        // nested definition shares. The cell was declared once by the
+        // scope's prologue, so this BINDS THROUGH it — a closure created
+        // before this statement reads the value stored here, which is
+        // Python's late binding.
         if self.targets.len() == 1
             && let ExprType::Name(target) = &self.targets[0]
             && options.cell_locals.contains(&target.id)
@@ -230,7 +230,7 @@ impl<'a> CodeGen for Assign {
             cells.remove(&target.id);
             inner.cell_locals = std::rc::Rc::new(cells);
             let value = crate::render_typed(&self.value, ctx, inner, symbols, None)?;
-            return Ok(quote!(#ident = stdpython::PyCell::new(#value);));
+            return Ok(quote!(#ident.set(#value);));
         }
 
         // rust.bind / rust.c_bind declarations are compile-time-only: the

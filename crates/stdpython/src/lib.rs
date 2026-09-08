@@ -2673,6 +2673,21 @@ pub fn py_bytes_repr(bytes: &[u8]) -> String {
     out
 }
 
+/// `str(list)` / `str(tuple-of-one-type)`: Python renders a container by
+/// its repr (`str([1, 2, 3])` is `"[1, 2, 3]"`), which is exactly what
+/// PyDisplay produces for it — bytes included (`str(b"x")` is `"b'x'"`).
+impl<T: PyRepr> PyToString for Vec<T> {
+    fn py_str(self) -> String {
+        self.py_display()
+    }
+}
+
+impl<T: PyRepr> PyToString for &Vec<T> {
+    fn py_str(self) -> String {
+        self.py_display()
+    }
+}
+
 impl PyToString for StrOrBytes {
     fn py_str(self) -> String {
         match self {

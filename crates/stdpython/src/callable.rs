@@ -171,75 +171,110 @@ mod tests {
     }
 }
 
-/// A closure CELL: the enclosing local a nested function mutates.
+/// A closure CELL: the binding a nested function captures.
 ///
-/// Python's closure shares objects, it does not copy them — `counter` in
+/// Python's closure is LATE-BINDING. The nested function does not copy
+/// the enclosing local, it holds the cell the name is bound in and reads
+/// it when it is CALLED — so
 ///
 /// ```python
-/// counter = {"n": 0}
-/// def bump() -> int:
-///     counter["n"] += 1
-///     return counter["n"]
+/// x = 1
+/// f = lambda: x
+/// x = 2
+/// f()          # 2, not 1
 /// ```
 ///
-/// is ONE dict that `bump` and the enclosing scope both see. rython's
-/// containers are values, so a name a nested closure mutates is held in
-/// a `PyCell` instead: cloning it (which is what the closure's `move`
+/// and a container the enclosing scope mutates after the `def`, and a
+/// loop variable every closure built in the loop shares. rython's locals
+/// are values, so a captured name whose binding can still change is held
+/// in a `PyCell` instead: cloning it (which is what the closure's `move`
 /// capture does) shares the cell, and both sides read and write one
-/// object. Only names a closure actually mutates become cells — a name
-/// it merely reads is cloned in, which is what Python's cell gives it for
-/// an immutable object anyway.
-pub struct PyCell<T>(Rc<RefCell<T>>);
+/// binding. A capture that is bound once, unconditionally, and never
+/// mutated is cloned in — no later value exists for the closure to have
+/// missed, so the clone and the cell cannot be told apart.
+///
+/// The cell starts EMPTY, as Python's local does before its first
+/// assignment: reading it then is CPython's `UnboundLocalError`.
+pub struct PyCell<T> {
+    name: Rc<str>,
+    slot: Rc<RefCell<Option<T>>>,
+}
 
 impl<T> PyCell<T> {
-    pub fn new(value: T) -> Self {
-        Self(Rc::new(RefCell::new(value)))
+    /// The cell of a local that has not been assigned yet.
+    pub fn empty(name: &str) -> Self {
+        Self { name: Rc::from(name), slot: Rc::new(RefCell::new(None)) }
     }
 
-    /// Borrow the shared object — the receiver of a read.
+    /// The cell of a name that is already bound (a captured parameter).
+    pub fn new(name: &str, value: T) -> Self {
+        Self { name: Rc::from(name), slot: Rc::new(RefCell::new(Some(value))) }
+    }
+
+    /// Bind the name — an assignment to it in any scope that holds the
+    /// cell.
+    pub fn set(&self, value: T) {
+        *self.slot.borrow_mut() = Some(value);
+    }
+
+    /// Borrow the bound object — the receiver of a read.
     pub fn borrow(&self) -> Ref<'_, T> {
-        self.0.borrow()
+        Ref::map(self.slot.borrow(), |v| {
+            v.as_ref().unwrap_or_else(|| unbound(&self.name))
+        })
     }
 
-    /// Borrow the shared object mutably — the receiver of a store.
+    /// Borrow the bound object mutably — the receiver of a store.
     pub fn borrow_mut(&self) -> RefMut<'_, T> {
-        self.0.borrow_mut()
+        let name = Rc::clone(&self.name);
+        RefMut::map(self.slot.borrow_mut(), move |v| {
+            v.as_mut().unwrap_or_else(|| unbound(&name))
+        })
     }
+}
+
+/// CPython's message for reading a local before its first assignment.
+fn unbound(name: &str) -> ! {
+    panic!(
+        "UnboundLocalError: cannot access local variable '{}' where it is not \
+         associated with a value",
+        name
+    )
 }
 
 impl<T: Clone> PyCell<T> {
     /// The value the cell holds, as a name READ in value position yields
-    /// it: a snapshot clone, the same reading a promoted module static
-    /// gets.
+    /// it: a snapshot clone taken at the read, so a closure sees whatever
+    /// the binding holds when it runs.
     pub fn get(&self) -> T {
-        self.0.borrow().clone()
+        self.borrow().clone()
     }
 }
 
 /// Cloning a cell SHARES it — that is the whole point: the closure's
-/// `move` capture takes a clone and still writes the enclosing scope's
-/// object.
+/// `move` capture takes a clone and still reads and writes the enclosing
+/// scope's binding.
 impl<T> Clone for PyCell<T> {
     fn clone(&self) -> Self {
-        Self(Rc::clone(&self.0))
+        Self { name: Rc::clone(&self.name), slot: Rc::clone(&self.slot) }
     }
 }
 
 impl<T: PyDisplay> PyDisplay for PyCell<T> {
     fn py_display(&self) -> String {
-        self.0.borrow().py_display()
+        self.borrow().py_display()
     }
 }
 
 impl<T: Debug> Debug for PyCell<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        Debug::fmt(&*self.0.borrow(), f)
+        Debug::fmt(&*self.borrow(), f)
     }
 }
 
 impl<T: PartialEq> PartialEq for PyCell<T> {
     fn eq(&self, other: &Self) -> bool {
-        *self.0.borrow() == *other.0.borrow()
+        *self.borrow() == *other.borrow()
     }
 }
 
@@ -249,16 +284,48 @@ mod cell_tests {
 
     #[test]
     fn a_cell_is_shared_by_its_clones() {
-        let counter: PyCell<i64> = PyCell::new(0);
+        let counter: PyCell<i64> = PyCell::new("counter", 0);
         let captured = counter.clone();
         let bump: PyCallable<(), i64> = PyCallable::new("bump", move |()| {
-            *captured.borrow_mut() += 1;
-            Ok(*captured.borrow())
+            let next = captured.get() + 1;
+            captured.set(next);
+            Ok(next)
         });
         bump.call(()).unwrap();
         bump.call(()).unwrap();
         assert_eq!(bump.call(()).unwrap(), 3);
         // The enclosing scope sees every write.
         assert_eq!(counter.get(), 3);
+    }
+
+    #[test]
+    fn a_closure_reads_the_binding_at_call_time() {
+        // Python's late binding: `x = 1; f = lambda: x; x = 2; f()` is 2.
+        let x: PyCell<i64> = PyCell::new("x", 1);
+        let captured = x.clone();
+        let f: PyCallable<(), i64> = PyCallable::new("<lambda>", move |()| Ok(captured.get()));
+        x.set(2);
+        assert_eq!(f.call(()).unwrap(), 2);
+    }
+
+    #[test]
+    fn every_closure_built_in_a_loop_shares_the_loop_binding() {
+        // `for i in range(3): fs.append(lambda: i)` gives [2, 2, 2].
+        let i: PyCell<i64> = PyCell::empty("i");
+        let mut fs: alloc::vec::Vec<PyCallable<(), i64>> = alloc::vec::Vec::new();
+        for n in 0..3 {
+            i.set(n);
+            let captured = i.clone();
+            fs.push(PyCallable::new("<lambda>", move |()| Ok(captured.get())));
+        }
+        let seen: alloc::vec::Vec<i64> = fs.iter().map(|f| f.call(()).unwrap()).collect();
+        assert_eq!(seen, alloc::vec![2, 2, 2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "UnboundLocalError: cannot access local variable 'x'")]
+    fn reading_an_unbound_cell_is_cpythons_unbound_local_error() {
+        let x: PyCell<i64> = PyCell::empty("x");
+        let _ = x.get();
     }
 }

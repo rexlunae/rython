@@ -670,6 +670,15 @@ impl CodeGen for StatementType {
                     // value_callables): the definition has no runtime
                     // value, and reads and calls through the name are loud
                     // at the use site.
+                    //
+                    // Unless its HEADER runs code. Python evaluates a
+                    // decorator and a non-literal default where the `def`
+                    // stands, so dropping the definition would drop that
+                    // too — silently, even when the name is never used.
+                    // That is a conversion error, not a warning.
+                    if let Some(reason) = crate::ast::tree::closure::header_runs_code(&s) {
+                        return Err(reason.into());
+                    }
                     Ok(TokenStream::new())
                 } else {
                     s.to_rust(ctx, options, symbols)

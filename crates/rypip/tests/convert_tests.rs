@@ -15306,3 +15306,91 @@ fn callables_are_values_that_capture_dispatch_and_raise() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn a_closure_reads_its_captures_at_call_time() {
+    // Issue #122 (Devin review on #345, round 1): Python's closure is
+    // LATE-BINDING. A rebinding after the definition, a container the
+    // enclosing scope mutates after it, and a loop whose every closure
+    // shares one binding all reach the closure — while a capture that
+    // cannot change afterwards stays a clone, which is indistinguishable.
+    let scratch = Scratch::new("latebind");
+    let file = scratch.path().join("latebind.py");
+    fs::write(
+        &file,
+        concat!(
+            "from typing import Callable\n",
+            "\n",
+            "\n",
+            "def run(f: Callable[[], int]) -> int:\n",
+            "    return f()\n",
+            "\n",
+            "\n",
+            "def show(f: Callable[[], list[int]]) -> str:\n",
+            "    return str(f())\n",
+            "\n",
+            "\n",
+            "def rebound() -> int:\n",
+            "    x = 1\n",
+            "    f = lambda: x\n",
+            "    x = 2\n",
+            "    return run(f)\n",
+            "\n",
+            "\n",
+            "def outer_mutation() -> str:\n",
+            "    acc = [1]\n",
+            "\n",
+            "    def peek() -> list[int]:\n",
+            "        return acc\n",
+            "    acc.append(2)\n",
+            "    return show(peek)\n",
+            "\n",
+            "\n",
+            "def loop_captures() -> str:\n",
+            "    fs: list[Callable[[], int]] = []\n",
+            "    for i in range(3):\n",
+            "        fs.append(lambda: i)\n",
+            "    out = []\n",
+            "    for g in fs:\n",
+            "        out.append(run(g))\n",
+            "    return str(out)\n",
+            "\n",
+            "\n",
+            "def stable() -> int:\n",
+            "    n = 5\n",
+            "\n",
+            "    def add(x: int) -> int:\n",
+            "        return x + n\n",
+            "    return add(1)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(rebound())\n",
+            "    print(outer_mutation())\n",
+            "    print(loop_captures())\n",
+            "    print(stable())\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/latebind"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().collect::<Vec<_>>(),
+        vec!["2", "[1, 2]", "[2, 2, 2]", "6"],
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -585,6 +585,12 @@ pub struct PythonOptions {
     /// naming the reason, never a silent None that type-checks and
     /// answers wrongly.
     pub refused_closures: std::rc::Rc<std::collections::HashMap<String, String>>,
+    /// Parameters whose annotation is a `Callable` rython does not model
+    /// (`Callable[..., R]` — no fixed arity, hence no Rust signature):
+    /// the parameter still carries the boxed value, so passing it on
+    /// works, but CALLING through it has no lowering — loud at the call,
+    /// never a dropped no-op (issue #122).
+    pub uncallable_params: std::rc::Rc<std::collections::HashMap<String, String>>,
     /// Locals in the current function whose only known type is a string
     /// literal (`label = "fine"`), so they lower to `&'static str`. A
     /// `-> str` function returning one must own the string (`to_string`)
@@ -776,6 +782,7 @@ impl Default for PythonOptions {
             closure_capture_types: std::rc::Rc::new(std::collections::HashMap::new()),
             cell_locals: std::rc::Rc::new(std::collections::HashSet::new()),
             refused_closures: std::rc::Rc::new(std::collections::HashMap::new()),
+            uncallable_params: std::rc::Rc::new(std::collections::HashMap::new()),
             str_literal_locals: std::rc::Rc::new(std::collections::HashSet::new()),
             rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),

@@ -2,25 +2,27 @@
 //! lowered as `stdpython::PyCallable` closures, and the capture analysis
 //! that keeps them faithful to Python.
 //!
-//! Python's closure is a set of CELLS: the nested function does not copy
-//! its enclosing scope, it shares the objects the enclosing names are
-//! bound to. rython models that in two halves, decided here:
+//! Python's closure is a set of CELLS, and it is LATE-BINDING: the
+//! nested function does not copy the enclosing scope, it holds the cells
+//! its free names are bound in and reads them when it is CALLED. So
+//! `x = 1; f = lambda: x; x = 2; f()` is 2, a container the enclosing
+//! scope mutates after the `def` is seen by the closure, and every
+//! closure built in a loop shares the loop variable's one binding.
 //!
-//! - a name the closure only READS is cloned into the closure at the
-//!   `def`, which is what Python's cell gives it for every immutable
-//!   object (an int, a str, a tuple) and for a container the closure
-//!   never changes;
-//! - a name the closure MUTATES (`counter["n"] += 1`, `seen.add(x)`) is
-//!   a CELL: the enclosing local becomes a `stdpython::PyCell` (a
-//!   shared `Rc<RefCell<T>>`), the closure's `move` capture clones the
-//!   handle, and both sides read and write one object — Python's
-//!   semantics, and the only way the enclosing scope can see what the
-//!   closure did.
+//! rython's locals are values, so a captured name is held in a
+//! `stdpython::PyCell` — the closure's `move` capture clones the cell,
+//! which shares it, and both sides read and write ONE binding.
 //!
-//! A LAMBDA takes the same clone captures but has no cells: cells are
-//! decided per STATEMENT, and a lambda is an expression. One that would
-//! mutate a capture is refused rather than letting the mutation vanish
-//! into the clone — the nested `def` spelling carries it.
+//! The exception is a capture that CANNOT change after the definition:
+//! bound exactly once, unconditionally, outside any loop, and mutated by
+//! nobody. There is no later value for the closure to have missed, so the
+//! clone and the cell cannot be told apart, and the clone is what is
+//! emitted — which is every ordinary `make_adder(n)`-shaped closure.
+//!
+//! A LAMBDA captures through the same cells. What it cannot do is MUTATE
+//! one: a cell's stores are decided per STATEMENT and a lambda is an
+//! expression, so one that would mutate a capture is refused rather than
+//! letting the mutation vanish — the nested `def` spelling carries it.
 //!
 //! What a closure cannot be is decided here too, once, and reported as a
 //! refusal the caller turns into a loud error rather than a silently
@@ -40,11 +42,12 @@ use crate::{
 /// What lowering a nested definition as a callable value requires.
 #[derive(Clone, Debug, Default)]
 pub struct ClosureInfo {
-    /// Enclosing-scope names the closure reads: cloned into it at the
-    /// definition point.
+    /// Enclosing-scope names the closure reads, cloned into it at the
+    /// definition point — the cells among them share, the rest copy.
     pub captures: Vec<String>,
-    /// The subset it mutates through: `stdpython::PyCell` cells shared
-    /// with the enclosing scope.
+    /// The subset held in a `stdpython::PyCell` shared with the enclosing
+    /// scope: everything the closure or the enclosing scope can still
+    /// change after the definition (see the module docs).
     pub cells: Vec<String>,
     /// Whether the enclosing scope HOISTS the definition's name. Python
     /// names are function-scoped, so a `def` under an `if` or in a `try`
@@ -75,13 +78,15 @@ pub(crate) fn closure_refusal(def: &FunctionDef) -> Option<String> {
             def.name
         ));
     }
-    for p in def
-        .args
-        .posonlyargs
-        .iter()
-        .chain(def.args.args.iter())
-        .chain(def.args.kwonlyargs.iter())
-    {
+    if !def.args.kwonlyargs.is_empty() {
+        return Some(format!(
+            "nested function `{}` has a keyword-only parameter; a callable \
+             value's argument tuple is positional and has no names to match \
+             a keyword against",
+            def.name
+        ));
+    }
+    for p in def.args.posonlyargs.iter().chain(def.args.args.iter()) {
         if p.evaluated_annotation().is_none() {
             return Some(format!(
                 "nested function `{}` has an unannotated parameter `{}`; a \
@@ -259,13 +264,7 @@ pub(crate) fn closure_typeinfo(
     options: &crate::PythonOptions,
 ) -> Option<crate::TypeInfo> {
     let mut params = Vec::new();
-    for p in def
-        .args
-        .posonlyargs
-        .iter()
-        .chain(def.args.args.iter())
-        .chain(def.args.kwonlyargs.iter())
-    {
+    for p in def.args.posonlyargs.iter().chain(def.args.args.iter()) {
         let ann = p.evaluated_annotation()?;
         params.push(crate::resolve_alias_typeinfo(&ann, symbols, options)?);
     }
@@ -364,16 +363,18 @@ pub(crate) fn render_lambda_callable(
     options: PythonOptions,
     symbols: SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-    let names: Vec<&crate::Parameter> = lam
-        .args
-        .posonlyargs
-        .iter()
-        .chain(lam.args.args.iter())
-        .chain(lam.args.kwonlyargs.iter())
-        .collect();
+    let names: Vec<&crate::Parameter> =
+        lam.args.posonlyargs.iter().chain(lam.args.args.iter()).collect();
     if lam.args.vararg.is_some() || lam.args.kwarg.is_some() {
         return Err("a lambda taking `*args`/`**kwargs` cannot be a callable value: \
                     the argument tuple has a fixed arity"
+            .to_string()
+            .into());
+    }
+    if !lam.args.kwonlyargs.is_empty() {
+        return Err("a lambda with a keyword-only parameter cannot be a callable \
+                    value: the argument tuple is positional and has no names to \
+                    match a keyword against"
             .to_string()
             .into());
     }
@@ -602,7 +603,18 @@ pub(crate) fn wrap_function_as_callable(
     let Some(crate::SymbolTableNode::FunctionDef(def)) = symbols.get(&n.id) else {
         return None;
     };
-    let arity = def.args.posonlyargs.len() + def.args.args.len() + def.args.kwonlyargs.len();
+    // Keyword-only parameters have no place in a positional argument
+    // tuple: `f(1)` would satisfy the wrapper where Python rejects it,
+    // and `f(x=1)` could not be spelled at all.
+    if !def.args.kwonlyargs.is_empty() {
+        return Some(Err(format!(
+            "`{}` has a keyword-only parameter and cannot be the callable value \
+             this position expects: the argument tuple is positional",
+            n.id
+        )
+        .into()));
+    }
+    let arity = def.args.posonlyargs.len() + def.args.args.len();
     if def.args.vararg.is_some() || def.args.kwarg.is_some() || arity != params.len() {
         return Some(Err(format!(
             "`{}` takes {}{} argument(s) and cannot be the callable value this \
@@ -632,4 +644,198 @@ pub(crate) fn wrap_function_as_callable(
             |#pattern: #arg_type| #item(#(#idents),*),
         )
     }))
+}
+
+/// Whether a captured name CANNOT change after the definitions in this
+/// scope run — the one case where cloning it into a closure is
+/// indistinguishable from sharing its cell (see the module docs).
+///
+/// It must be bound exactly once, and that binding must be
+/// unconditional-in-time: a parameter, or a top-level statement outside
+/// every loop. A binding inside a loop rebinds on each turn (every
+/// closure built there shares the last value in Python), and a second
+/// binding anywhere means a later value the closure would have to see.
+/// It must also be mutated by nobody — the enclosing scope or any nested
+/// definition — since a mutation changes the object the name is bound to.
+fn capture_cannot_change(
+    name: &str,
+    args: &crate::ParameterList,
+    body: &[Statement],
+) -> bool {
+    let mut bindings = usize::from(
+        args.posonlyargs
+            .iter()
+            .chain(args.args.iter())
+            .chain(args.kwonlyargs.iter())
+            .chain(args.vararg.iter())
+            .chain(args.kwarg.iter())
+            .any(|p| p.arg == name),
+    );
+    let mut rebound_under_a_loop = false;
+    count_bindings(body, name, false, &mut bindings, &mut rebound_under_a_loop);
+    if bindings != 1 || rebound_under_a_loop {
+        return false;
+    }
+    // A mutation ANYWHERE in the scope, nested definitions and lambda
+    // bodies included: the closure must see it.
+    !mutates_name(body, name)
+}
+
+/// Count the statements of `body` that bind `name`, flagging any that sit
+/// inside a loop. Nested definitions are their own scopes and do not
+/// bind this one's name.
+fn count_bindings(
+    body: &[Statement],
+    name: &str,
+    in_loop: bool,
+    bindings: &mut usize,
+    under_loop: &mut bool,
+) {
+    for s in body {
+        let loops = matches!(
+            &s.statement,
+            StatementType::For(_) | StatementType::AsyncFor(_) | StatementType::While(_)
+        );
+        if crate::ast::tree::visit::stmt_bound_names(
+            s,
+            crate::ast::tree::visit::Bindings::Scope,
+        )
+        .iter()
+        .any(|n| n == name)
+        {
+            *bindings += 1;
+            // A `for` TARGET is rebound on every turn, so one syntactic
+            // binding is many bindings in time: in Python each closure
+            // built in the loop sees the LAST value.
+            if in_loop
+                || matches!(&s.statement, StatementType::For(_) | StatementType::AsyncFor(_))
+            {
+                *under_loop = true;
+            }
+        }
+        for inner in crate::ast::tree::visit::stmt_bodies_for(s, Descend::SkipDefs) {
+            count_bindings(inner, name, in_loop || loops, bindings, under_loop);
+        }
+    }
+}
+
+/// Whether anything in `body` — this scope, a nested definition, or a
+/// lambda — mutates the object `name` is bound to: a store through it, or
+/// a mutating method on it.
+fn mutates_name(body: &[Statement], name: &str) -> bool {
+    let mut found = false;
+    walk_stmts(body, Descend::All, &mut |s| {
+        for t in crate::ast::tree::visit::stmt_targets(s) {
+            if !matches!(t, ExprType::Name(_)) && store_root(t) == Some(name) {
+                found = true;
+            }
+        }
+        for e in crate::ast::tree::visit::stmt_all_exprs(s) {
+            crate::ast::tree::visit::walk_expr(e, &mut |sub| {
+                if let ExprType::Call(c) = sub
+                    && let ExprType::Attribute(attr) = c.func.as_ref()
+                    && crate::ast::tree::scope::mutates_receiver(&attr.attr)
+                    && matches!(attr.value.as_ref(), ExprType::Name(r) if r.id == name)
+                {
+                    found = true;
+                }
+            });
+        }
+        if found { Flow::Stop } else { Flow::Continue }
+    });
+    found
+}
+
+/// Every name a nested definition or a callable-position lambda in this
+/// scope captures, and which of them must be CELLS.
+///
+/// The captures come from the definitions' free names; a name is a cell
+/// unless [`capture_cannot_change`] proves the clone is
+/// indistinguishable from the cell.
+pub(crate) fn scope_cell_locals(
+    args: &crate::ParameterList,
+    body: &[Statement],
+    scope_names: &HashSet<String>,
+) -> HashSet<String> {
+    let mut candidates: HashSet<String> = HashSet::new();
+    // A nested `def`'s free names.
+    walk_stmts(body, Descend::SkipDefs, &mut |s| {
+        if let StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) =
+            &s.statement
+        {
+            candidates.extend(closure_info(f, scope_names).captures);
+        }
+        Flow::Continue
+    });
+    // A LAMBDA's free names: a lambda in a callable position captures the
+    // same way, and one anywhere else is a plain Rust closure that reads
+    // the binding in place — a cell serves both.
+    walk_stmts(body, Descend::SkipDefs, &mut |s| {
+        for e in crate::ast::tree::visit::stmt_all_exprs(s) {
+            crate::ast::tree::visit::walk_expr(e, &mut |sub| {
+                if let ExprType::Lambda(lam) = sub {
+                    let params: HashSet<&str> = lam
+                        .args
+                        .posonlyargs
+                        .iter()
+                        .chain(lam.args.args.iter())
+                        .chain(lam.args.kwonlyargs.iter())
+                        .map(|p| p.arg.as_str())
+                        .collect();
+                    crate::ast::tree::visit::walk_expr(&lam.body, &mut |inner| {
+                        if let ExprType::Name(n) = inner
+                            && !params.contains(n.id.as_str())
+                            && scope_names.contains(&n.id)
+                        {
+                            candidates.insert(n.id.clone());
+                        }
+                    });
+                }
+            });
+        }
+        Flow::Continue
+    });
+    candidates
+        .into_iter()
+        .filter(|name| !capture_cannot_change(name, args, body))
+        .collect()
+}
+
+/// Whether a nested definition's HEADER runs code at the `def` — a
+/// decorator, or a default whose expression is not a literal.
+///
+/// Python evaluates these WHERE THE `def` STANDS, so a definition the
+/// closure model refuses cannot simply vanish: its header's output,
+/// mutations and exceptions are part of the program. Such a definition
+/// is a conversion error even when the name is never read or called.
+pub(crate) fn header_runs_code(def: &FunctionDef) -> Option<String> {
+    if !def.decorator_list.is_empty() {
+        return Some(format!(
+            "nested function `{}` has a decorator, which Python EVALUATES where \
+             the `def` stands — dropping the definition would drop that too. \
+             Move the definition to module level, or apply the decorator \
+             explicitly to a value the closure model can carry",
+            def.name
+        ));
+    }
+    let evaluates = |e: &ExprType| {
+        !matches!(e, ExprType::Constant(_) | ExprType::NoneType(_))
+    };
+    if def.args.defaults.iter().any(|d| evaluates(d))
+        || def
+            .args
+            .kw_defaults
+            .iter()
+            .flatten()
+            .any(|d| evaluates(d))
+    {
+        return Some(format!(
+            "nested function `{}` has a default whose expression Python \
+             EVALUATES where the `def` stands — dropping the definition would \
+             drop that too. Bind the default to a local before the `def` and \
+             pass it explicitly",
+            def.name
+        ));
+    }
+    None
 }

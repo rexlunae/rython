@@ -95,7 +95,9 @@ impl CodeGen for AsyncFor {
         let any_hoisted = {
             let mut names = Vec::new();
             super::for_stmt::collect_target_names(&self.target, &mut names);
-            names.iter().any(|n| leaked.contains(*n))
+            names
+                .iter()
+                .any(|n| leaked.contains(*n) || options.cell_locals.contains(*n))
         };
         let has_else = !self.orelse.is_empty();
         // Break-tracking is only needed when a break belonging to this loop
@@ -124,6 +126,7 @@ impl CodeGen for AsyncFor {
                 &self.target,
                 quote!(__rython_elt),
                 &leaked,
+                &options.cell_locals,
                 &mut stmts,
                 &mut counter,
             );

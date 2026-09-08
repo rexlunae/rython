@@ -7145,7 +7145,36 @@ let mutating_self_field = boxed_self_ref_receiver
                 // fall through
             } else {
                 let mut rendered_args = Vec::new();
+                // The ELEMENT type a container mutator stores, when the
+                // element is a callable VALUE (issue #122):
+                // `fs.append(lambda: i)` into a
+                // `list[Callable[[], int]]` must build the same
+                // `PyCallable` the slot holds, and a lambda writes no
+                // annotations, so this position is what types it.
+                let callable_element = match attr.attr.as_str() {
+                    "append" | "add" | "insert" | "push" => {
+                        match crate::infer_type(Some(&ctx), &attr.value, &options, &symbols) {
+                            crate::TypeInfo::Vec(inner) | crate::TypeInfo::HashSet(inner)
+                                if matches!(*inner, crate::TypeInfo::Callable(..)) =>
+                            {
+                                Some(*inner)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
                 for arg in &self.args {
+                    if let Some(expected) = &callable_element {
+                        rendered_args.push(crate::render_typed(
+                            arg,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(expected.clone()),
+                        )?);
+                        continue;
+                    }
                     // A SHARED class's reference stored into a container
                     // (`self.audit.append(acct)`) and read again later is
                     // another reference to the one object: clone it.
@@ -8497,6 +8526,20 @@ let mutating_self_field = boxed_self_ref_receiver
         // dropped no-op that silently answers None.
         if let ExprType::Name(callee_name) = self.func.as_ref()
             && let Some(reason) = options.refused_closures.get(&callee_name.id)
+        {
+            let msg = format!(
+                "rython: `{}` cannot be called here: {}",
+                callee_name.id, reason
+            );
+            return Ok(quote!(compile_error!(#msg)));
+        }
+        // A call through a parameter whose `Callable` annotation has no
+        // Rust signature (`Callable[..., R]` — issue #122): the value is
+        // there, but nothing says how to call it. Loud at the site with
+        // the reason, so the annotation gets fixed rather than the call
+        // silently answering None.
+        if let ExprType::Name(callee_name) = self.func.as_ref()
+            && let Some(reason) = options.uncallable_params.get(&callee_name.id)
         {
             let msg = format!(
                 "rython: `{}` cannot be called here: {}",

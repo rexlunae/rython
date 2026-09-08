@@ -273,32 +273,53 @@ exception raised INSIDE a callable propagates to its caller and is
 caught by the caller's `try`/`except`, exactly as in Python — a plain
 Rust closure could only panic (§4.5).
 
-**Capture.** Python's closure shares objects; it does not copy them. A
-captured name the closure only READS is cloned into it at the `def` —
-what Python's cell gives it for every immutable object, and for a
-container the closure never changes. A captured name the closure
-MUTATES (`counter["n"] += 1`, `seen.append(x)`) is a CELL:
-`stdpython::PyCell` holds it, the closure's `move` capture clones the
-cell (which shares it), stores borrow it mutably, and the enclosing
-scope's reads see every write. A closure's own captured cells are cells
-inside it too, so a doubly-nested mutation reaches the outermost object.
-A captured name keeps the TYPE it has in the enclosing scope; a name the
+**Capture.** Python's closure shares objects and is LATE-BINDING: the
+nested function holds the cells its free names are bound in and reads
+them when it is CALLED, not when it is defined. So `x = 1;
+f = lambda: x; x = 2; f()` is 2, a container the enclosing scope mutates
+after the `def` is seen by the closure, and every closure built in a loop
+shares the loop variable's one binding (three `lambda: i` built over
+`range(3)` all answer 2).
+
+A captured name is therefore held in a `stdpython::PyCell`: the cell is
+declared once for the scope, every assignment binds THROUGH it
+(`x.set(v)`, a loop target included), a read takes a snapshot
+(`x.get()`), a store through it borrows it mutably, and the closure's
+`move` capture clones the cell — which shares it. Reading a cell before
+its first assignment is CPython's `UnboundLocalError`, with the same
+message. A closure's own captured cells are cells inside it too, so a
+doubly-nested rebinding reaches the outermost binding.
+
+The exception is a capture that CANNOT change after the definition:
+bound exactly once, unconditionally, outside every loop, and mutated by
+nobody. No later value exists for the closure to have missed, so the
+clone and the cell cannot be told apart, and the clone is what is
+emitted — which is every ordinary `make_adder(n)`-shaped closure. A
+captured name keeps the TYPE it has in the enclosing scope; a name the
 closure binds itself shadows the capture, as Python's scoping says.
 
-A LAMBDA takes the same clone captures but has no cells — cells are
-decided per statement, and a lambda is an expression — so one that would
-mutate a capture is refused rather than letting the mutation vanish into
-the clone; the nested `def` spelling carries it.
+A LAMBDA captures through the same cells. What it cannot do is MUTATE
+one: a cell's stores are decided per statement and a lambda is an
+expression, so one that would mutate a capture is refused rather than
+letting the mutation vanish — the nested `def` spelling carries it.
 
 **What a callable value is not.** The shapes with no Rust type or no
 closure semantics are refused at the definition, with the reason, and
 the name's calls and reads stay loud rather than answering a silent
 None: an unannotated parameter or a missing return annotation (the
 argument tuple needs every type), `*args`/`**kwargs` (a fixed arity),
-a defaulted parameter, a decorator, a generator `def`, and
-`nonlocal`/`global` (rebinding an enclosing NAME, as opposed to mutating
-the object it is bound to, is not modeled). `Callable[..., R]` is the
-same refusal at the annotation. Classes are still not values (§3.2's
+a KEYWORD-ONLY parameter (the argument tuple is positional and has no
+names to match a keyword against), a defaulted parameter, a decorator, a
+generator `def`, and `nonlocal`/`global` (rebinding an enclosing NAME, as
+opposed to mutating the object it is bound to, is not modeled).
+`Callable[..., R]` keeps the boxed `PyValue` — passing such a parameter
+on works — and a CALL through it is loud at the site with the reason.
+
+A refused definition whose HEADER runs code is a different matter: Python
+evaluates a decorator and a non-literal default WHERE THE `def` STANDS,
+so dropping the definition would drop that too, silently, even when the
+name is never used. Those are refused at CONVERSION, not at the use
+site. Classes are still not values (§3.2's
 `type[X]`), and a `PyCallable` is deliberately not `Send`: handing one
 to a thread is a build error, not a silent divergence.
 
@@ -2411,7 +2432,7 @@ accepted as permanent spec:
 | Argument-render-then-mutate shapes (`print(xs, xs.pop(), xs)`) render the first argument before the mutation | Recorded in issue #79 |
 | A read of a module member the generated module has no item for (`util.ssl_.PROTOCOL_TLS` — an external ssl constant) lowers to the boxed `None` with a warning (dynamic-module-member divergence) | Model limit; module members are static path items |
 | A call through a sibling-module member that is not a module-level function/class (`probe.acquire_and_get`, a bound-method alias) is dropped with the callable-as-value warning | Model limit; a BOUND METHOD is not a value (a plain callable is — §3.6) |
-| Callables as VALUES (issue #122): a `Callable[[A], R]` annotation, a nested `def`, a `lambda` in a callable position and a module function name in one are `stdpython::PyCallable<(A,), R>` — a call through the value is `f.call((x,))?`, whose `Result` makes an exception raised inside a callable catchable by its caller; a nested `def` captures what it reads by clone, and a capture it MUTATES is a shared `stdpython::PyCell` both sides see (§3.6). A lambda local is typed by the uses that name a type; uses that disagree, and the shapes with no Rust type or no closure semantics (an unannotated parameter, a missing return annotation, `*args`, a default, a decorator, a generator, `nonlocal`, `Callable[..., R]`) are refused at the definition with the reason and stay loud at the use site. CPython's function repr prints the plain name, not the nested qualname (`<function add at 0x…>`, not `make_adder.<locals>.add`), and a `PyCallable` is not `Send` | Correct-or-loud (issue #122) |
+| Callables as VALUES (issue #122): a `Callable[[A], R]` annotation, a nested `def`, a `lambda` in a callable position and a module function name in one are `stdpython::PyCallable<(A,), R>` — a call through the value is `f.call((x,))?`, whose `Result` makes an exception raised inside a callable catchable by its caller. Capture is LATE-BINDING through a shared `stdpython::PyCell`, so a rebinding, a mutation, or a loop's next turn reaches the closure exactly as in Python, and reading a cell before its first assignment is CPython's UnboundLocalError; a capture that cannot change after the definition (bound once, unconditionally, outside every loop, mutated by nobody) is cloned in instead, which is indistinguishable (§3.6). A lambda local is typed by the uses that name a type; uses that disagree, and the shapes with no Rust type or no closure semantics (an unannotated parameter, a missing return annotation, `*args`, a keyword-only parameter, a default, a decorator, a generator, `nonlocal`, a lambda that would mutate a capture) are refused at the definition with the reason and are loud at the use site — a refused definition whose HEADER runs code (a decorator, a non-literal default) is refused at CONVERSION instead, since Python evaluates those where the `def` stands. `Callable[..., R]` keeps the boxed value and is loud at a call through it. CPython's function repr prints the plain name, not the nested qualname (`<function add at 0x…>`, not `make_adder.<locals>.add`), and a `PyCallable` is not `Send` | Correct-or-loud (issue #122) |
 | Release-mode integer overflow may wrap (debug panics) | Bounded by §12.2's contract |
 | A non-daemon thread never joined is joined when its LAST handle drops (at latest, end of `main`) — CPython joins at interpreter exit, so a fire-and-forget thread can block a scope exit earlier than CPython would | Model limit; the common create/start/join shape is identical |
 | A thread's unhandled exception prints CPython's header and final exception line but no traceback frames | Model limit (no frames) — same family as §8's messages |

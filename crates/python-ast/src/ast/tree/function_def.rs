@@ -3017,13 +3017,6 @@ impl FunctionDef {
             std::rc::Rc::new(inferred_signature.method_params.clone());
         options.duck_methods_on_params =
             std::rc::Rc::new(inferred_signature.duck_methods_on_params.clone());
-        // A nested function name (`def KD(s, d)` inside __init__ —
-        // requests' auth) is a CLOSURE in Python; rython's closures do not
-        // capture the enclosing scope, so the definition drops (statement.rs)
-        // and CALLS through the name drop too — add the names to
-        // called_params so the call sites lower as no-ops. Their VALUE
-        // reads (`hash_utf8 = sha256_utf8`) box to the boxed None
-        // (value_callables).
         // A nested function name (`def add(x)` inside make_adder) is a
         // CLOSURE in Python. One that the closure model can carry
         // (closure.rs) lowers to a `stdpython::PyCallable` value binding,
@@ -3059,10 +3052,11 @@ impl FunctionDef {
             });
             match refusal {
                 None => {
-                    nested_closures.insert(
-                        nested.name.clone(),
-                        crate::ast::tree::closure::closure_info(&nested, &scope_names),
-                    );
+                    nested_closures
+                        .insert(nested.name.clone(), crate::ast::tree::closure::closure_info(
+                            &nested,
+                            &scope_names,
+                        ));
                 }
                 Some(reason) => {
                     options.definition_warnings.borrow_mut().push(reason.clone());
@@ -3072,19 +3066,32 @@ impl FunctionDef {
                 }
             }
         }
-        // Every local a nested closure MUTATES is a shared cell in this
-        // scope, so both sides see one object.
-        let mut cell_locals: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        for info in nested_closures.values() {
-            cell_locals.extend(info.cells.iter().cloned());
-        }
+        // Python's closure is LATE-BINDING: a captured name is a shared
+        // CELL both sides read and write, so a rebinding or a mutation
+        // after the definition reaches the closure. Only a capture that
+        // cannot change afterwards is cloned in (closure.rs).
+        let mut cell_locals = crate::ast::tree::closure::scope_cell_locals(
+            &self.args,
+            &effective_body,
+            &scope_names,
+        );
         // A closure's OWN captured cells are cells inside it too: the
         // `move` capture took a clone of the shared cell, so reads and
-        // stores there go through the same borrow (this is what makes a
-        // doubly-nested mutation reach the outermost object).
+        // stores there go through the same binding (this is what makes a
+        // doubly-nested rebinding reach the outermost one).
         if let Some(info) = &options.closure_captures {
             cell_locals.extend(info.cells.iter().cloned());
+        }
+        // Each closure's cells are the captures this scope decided are
+        // cells: one decision, read from both sides, so the capture
+        // prologue's clone and the body's reads cannot disagree.
+        for info in nested_closures.values_mut() {
+            info.cells = info
+                .captures
+                .iter()
+                .filter(|c| cell_locals.contains(*c))
+                .cloned()
+                .collect();
         }
         options.cell_locals = std::rc::Rc::new(cell_locals);
         // A CAPTURED name keeps the type it has in the enclosing scope:
@@ -3125,6 +3132,28 @@ impl FunctionDef {
                 }
             }
             options.name_types = std::rc::Rc::new(name_types);
+        }
+        // A parameter annotated with a `Callable` shape that has no Rust
+        // signature (`Callable[..., R]`): it stays the boxed value, so
+        // passing it on works, but a CALL through it is loud (issue #122).
+        {
+            let mut uncallable: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for p in self
+                .args
+                .posonlyargs
+                .iter()
+                .chain(self.args.args.iter())
+                .chain(self.args.kwonlyargs.iter())
+            {
+                if let Some(ann) = p.evaluated_annotation()
+                    && let Some(Err(reason)) =
+                        crate::ast::tree::type_ctx::callable_annotation_parts(&ann)
+                {
+                    uncallable.insert(p.arg.clone(), reason);
+                }
+            }
+            options.uncallable_params = std::rc::Rc::new(uncallable);
         }
         options.refused_closures = std::rc::Rc::new(refused_closures);
         options.nested_closures = std::rc::Rc::new(nested_closures);
@@ -3187,6 +3216,14 @@ impl FunctionDef {
             } else if scope.needs_mut.contains(name) {
                 streams_prologue.extend(quote!(let mut #ident = #ident;));
             }
+            // A PARAMETER a nested definition captures through a cell
+            // (issue #122): it arrives bound, so the cell starts full.
+            // Emitted after the conversions above, which produce the
+            // value the cell holds.
+            if options.cell_locals.contains(name) {
+                streams_prologue
+                    .extend(quote!(let #ident = stdpython::PyCell::new(#name, #ident);));
+            }
         }
         for name in &scope.assigned {
             // `_` hoists like any name: safe_ident maps it to a real
@@ -3200,6 +3237,17 @@ impl FunctionDef {
                 continue;
             }
             let ident = crate::safe_ident(name);
+            // A closure CELL (issue #122): the binding a nested
+            // definition shares. It is declared ONCE, empty, and every
+            // assignment binds THROUGH it — so a closure created before
+            // an assignment still reads the value that assignment
+            // stores, as Python's late binding does. Reading it before
+            // any assignment is CPython's UnboundLocalError.
+            if options.cell_locals.contains(name) {
+                streams_prologue
+                    .extend(quote!(let #ident = stdpython::PyCell::empty(#name);));
+                continue;
+            }
             if scope.needs_mut.contains(name) {
                 if scope.closure_captured_uninit.contains(name) {
                     // The name is captured by a generated closure (try body,
@@ -3214,6 +3262,29 @@ impl FunctionDef {
             } else {
                 streams_prologue.extend(quote!(let #ident;));
             }
+        }
+        // A closure CELL the scope analysis does not list as an assigned
+        // local — a loop TARGET, which normally binds fresh each turn —
+        // still needs its one declaration: the cell is what the loop
+        // binds through (issue #122).
+        let captured_here: std::collections::HashSet<&String> = options
+            .closure_captures
+            .as_ref()
+            .map(|info| info.captures.iter().collect())
+            .unwrap_or_default();
+        for name in options.cell_locals.iter() {
+            // A cell this scope CAPTURED is already bound by the capture
+            // prologue's clone — declaring it again would shadow the
+            // shared cell with a fresh empty one.
+            if scope.assigned.iter().any(|n| n == name)
+                || param_names.iter().any(|n| n == name)
+                || fn_mutable_globals.contains(name)
+                || captured_here.contains(name)
+            {
+                continue;
+            }
+            let ident = crate::safe_ident(name);
+            streams_prologue.extend(quote!(let #ident = stdpython::PyCell::empty(#name);));
         }
         streams.extend(streams_prologue);
 
@@ -3912,12 +3983,10 @@ impl FunctionDef {
             }
             let mut param_idents = Vec::new();
             let mut param_types = Vec::new();
-            for p in render_args
-                .posonlyargs
-                .iter()
-                .chain(render_args.args.iter())
-                .chain(render_args.kwonlyargs.iter())
-            {
+            // Positional parameters only: a keyword-only one has no
+            // place in the unnamed argument tuple, and `closure_refusal`
+            // has already refused any definition that has one.
+            for p in render_args.posonlyargs.iter().chain(render_args.args.iter()) {
                 param_idents.push(crate::safe_ident(&p.arg));
                 param_types.push(crate::ast::tree::arguments::parameter_rust_type(
                     p,

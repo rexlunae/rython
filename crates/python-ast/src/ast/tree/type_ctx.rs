@@ -139,6 +139,9 @@ pub(crate) fn type_mentions_heap(t: &TypeInfo) -> bool {
         | TypeInfo::String
         | TypeInfo::StrRef
         | TypeInfo::Bytes
+        // A `PyCallable` is a reference-counted handle: a field of that
+        // type clones out of `&self` like every other owned value.
+        | TypeInfo::Callable(..)
         | TypeInfo::Custom(_) => true,
         TypeInfo::Vec(inner)
         | TypeInfo::Option(inner)
@@ -164,6 +167,12 @@ pub(crate) fn type_mentions_pyobject(t: &TypeInfo) -> bool {
         | TypeInfo::Borrowed(inner) => type_mentions_pyobject(inner),
         TypeInfo::Dict(k, v) => type_mentions_pyobject(k) || type_mentions_pyobject(v),
         TypeInfo::Tuple(ts) => ts.iter().any(type_mentions_pyobject),
+        // A callable whose argument or return did not resolve renders
+        // `PyCallable<(_,), _>` — an inference hole in an item signature,
+        // exactly like any other unresolved element.
+        TypeInfo::Callable(params, ret) => {
+            params.iter().any(type_mentions_pyobject) || type_mentions_pyobject(ret)
+        }
         _ => false,
     }
 }
