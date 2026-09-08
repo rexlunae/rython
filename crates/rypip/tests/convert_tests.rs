@@ -6163,6 +6163,61 @@ fn string_iteration_zip_and_comprehensions_match_python() {
     assert_eq!(output.status.code(), Some(0));
 }
 #[test]
+fn option_string_keys_in_membership_and_index_match_python() {
+    // Round 102: an Option<String> key in membership and guarded index
+    // (`encoding in table`, `table[encoding]` where encoding is
+    // `str | None`; `enc in layers` over a list of str). None never
+    // matches a string key/list member (CPython's `None in d` is False,
+    // not a panic), and a Some key probes as the string — the runtime
+    // Option-key impls carry the semantics. Transcript pinned against
+    // python3.
+    let scratch = Scratch::new("optkey");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def lookup(enc: str | None) -> str:\n",
+            "    table = {\"utf_8\": \"utf-8\", \"ascii\": \"us-ascii\"}\n",
+            "    out = \"none\"\n",
+            "    if enc in table:\n",
+            "        out = table[enc]\n",
+            "    return out\n",
+            "\n",
+            "\n",
+            "def member(enc: str | None, layers: list[str]) -> bool:\n",
+            "    return enc in layers\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(lookup(\"utf_8\"), lookup(None), lookup(\"latin1\"))\n",
+            "    print(member(\"Hiragana\", [\"Katakana\", \"Hiragana\"]), member(None, [\"Katakana\"]))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["utf-8 none none", "True False"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {
     // Round 41: a trait-DEFAULT body that formats `self` in an exception
     // message (`raise PoolError(self)` — urllib3's _get_conn raises
