@@ -7377,18 +7377,20 @@ fn module_level_empty_list_pinned_by_later_use() {
     // F1: `xs = []` at module level used to error because type info was
     // only computed for function bodies; the `xs.append(1)` use must pin
     // the element type the same way it does inside a function.
+    //
+    // The append MUTATES the module object, so `xs` is a mutable static
+    // (issue #337) and the pinned element type is carried by the static's
+    // declared type rather than a turbofish on the initializer.
     let out = compile("xs = []\nxs.append(1)\n", "mempty.py");
-    assert!(out.contains("Vec :: < i64 > :: new ()"), "generated: {}", out);
+    assert!(out.contains("Mutex < Vec < i64 > >"), "generated: {}", out);
+    assert!(out.contains("py_global_mutate"), "generated: {}", out);
 }
 
 #[test]
 fn module_level_empty_dict_pinned_by_later_store() {
     let out = compile("d = {}\nd[\"k\"] = 1\n", "memptyd.py");
-    assert!(
-        out.contains("PyDict :: < String , i64 > :: from ([])"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("Mutex < PyDict < String , i64 > >"), "generated: {}", out);
+    assert!(out.contains("py_global_mutate"), "generated: {}", out);
 }
 
 #[test]
@@ -7396,17 +7398,13 @@ fn annotated_empty_list_honors_annotation() {
     // F8: the empty-container error suggests `xs: list[float] = []`, so the
     // annotation must actually pin the type (it used to be discarded).
     let out = compile("xs: list[float] = []\nxs.append(1.0)\n", "ann_empty.py");
-    assert!(out.contains("Vec :: < f64 > :: new ()"), "generated: {}", out);
+    assert!(out.contains("Mutex < Vec < f64 > >"), "generated: {}", out);
 }
 
 #[test]
 fn annotated_empty_dict_honors_annotation() {
     let out = compile("d: dict[str, int] = {}\nd[\"k\"] = 1\n", "ann_emptyd.py");
-    assert!(
-        out.contains("PyDict :: < String , i64 > :: from ([])"),
-        "generated: {}",
-        out
-    );
+    assert!(out.contains("Mutex < PyDict < String , i64 > >"), "generated: {}", out);
 }
 
 #[test]

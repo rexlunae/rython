@@ -16,15 +16,15 @@
 //! exception raised inside a callable propagates through its caller
 //! exactly as one raised by a directly-named function does.
 //!
-//! The handle is reference-counted and single-threaded (`Rc`, matching
-//! Python's own "a function object is shared, not copied"): a callable
-//! value is deliberately NOT `Send`, so handing one to a thread is a
-//! build error rather than a silent divergence.
+//! The handle is reference-counted and thread-safe (`Arc` over a
+//! `Fn + Send + Sync`), matching Python's own "a function object is
+//! shared, not copied". Thread-safety is not decoration: a module-level
+//! registry of callbacks (`_INITIALIZERS = []` — issue #122) lowers to a
+//! `static`, and a Rust static must be `Sync`, so an `Rc` handle could
+//! not be stored at module level at all.
 
 #[cfg(feature = "alloc")]
-use alloc::{format, rc::Rc, string::String};
-
-use core::cell::{Ref, RefCell, RefMut};
+use alloc::{format, string::String, sync::Arc};
 
 use crate::{PyDisplay, PyException};
 use core::fmt::{Debug, Display, Formatter, Result as FmtResult};
@@ -36,18 +36,40 @@ use core::fmt::{Debug, Display, Formatter, Result as FmtResult};
 pub struct PyCallable<A, R> {
     /// The Python name the callable was defined under (`add`, `<lambda>`),
     /// used by `repr()`/`str()` and by the message of a call that raises.
-    name: Rc<str>,
-    f: Rc<dyn Fn(A) -> Result<R, PyException>>,
+    name: Arc<str>,
+    f: Arc<CallableFn<A, R>>,
 }
+
+/// The wrapped Rust closure. On the `std` tier it is `Send + Sync`, so a
+/// module-level registry of callables can live in a `static` (which Rust
+/// requires to be `Sync`). The `alloc`-only tier has no threads and no
+/// module-level mutable statics, and its closure cells are `RefCell`s,
+/// which are not `Sync` — so the bound is dropped there rather than
+/// making every no_std closure uncallable.
+#[cfg(feature = "std")]
+type CallableFn<A, R> = dyn Fn(A) -> Result<R, PyException> + Send + Sync;
+#[cfg(not(feature = "std"))]
+type CallableFn<A, R> = dyn Fn(A) -> Result<R, PyException>;
 
 impl<A, R> PyCallable<A, R> {
     /// Wrap a Rust closure as a Python callable value. `name` is the
     /// Python-side name (a `def`'s name, or `<lambda>`).
+    #[cfg(feature = "std")]
+    pub fn new<F>(name: &str, f: F) -> Self
+    where
+        F: Fn(A) -> Result<R, PyException> + Send + Sync + 'static,
+    {
+        Self { name: Arc::from(name), f: Arc::new(f) }
+    }
+
+    /// Wrap a Rust closure as a Python callable value (no_std tier — see
+    /// [`CallableFn`] for why the thread bounds are absent).
+    #[cfg(not(feature = "std"))]
     pub fn new<F>(name: &str, f: F) -> Self
     where
         F: Fn(A) -> Result<R, PyException> + 'static,
     {
-        Self { name: Rc::from(name), f: Rc::new(f) }
+        Self { name: Arc::from(name), f: Arc::new(f) }
     }
 
     /// Call the value: `f(x, y)` in Python is `f.call((x, y))` here.
@@ -63,7 +85,7 @@ impl<A, R> PyCallable<A, R> {
     /// The identity CPython prints in a function's repr. Two clones of
     /// one callable share it; two separately created closures do not.
     fn addr(&self) -> usize {
-        Rc::as_ptr(&self.f) as *const () as usize
+        Arc::as_ptr(&self.f) as *const () as usize
     }
 }
 
@@ -72,7 +94,7 @@ impl<A, R> PyCallable<A, R> {
 /// captures.
 impl<A, R> Clone for PyCallable<A, R> {
     fn clone(&self) -> Self {
-        Self { name: Rc::clone(&self.name), f: Rc::clone(&self.f) }
+        Self { name: Arc::clone(&self.name), f: Arc::clone(&self.f) }
     }
 }
 
@@ -102,7 +124,7 @@ impl<A, R> PyDisplay for PyCallable<A, R> {
 /// closures built from the same `lambda` are distinct objects.
 impl<A, R> PartialEq for PyCallable<A, R> {
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.f, &other.f)
+        Arc::ptr_eq(&self.f, &other.f)
     }
 }
 
@@ -195,41 +217,90 @@ mod tests {
 ///
 /// The cell starts EMPTY, as Python's local does before its first
 /// assignment: reading it then is CPython's `UnboundLocalError`.
+///
+/// The slot is a `Mutex` on the `std` tier — a module-level registry of
+/// callables is a `static`, and a Rust static must be `Sync`. The
+/// `alloc`-only tier has no `std::sync` at all, and cannot reach that
+/// shape either (module-level mutable statics are refused under
+/// `--no-std`), so it holds the slot in a `RefCell` instead. The two
+/// differ only in what they do under concurrent access, which the
+/// no_std tier does not have.
 pub struct PyCell<T> {
-    name: Rc<str>,
-    slot: Rc<RefCell<Option<T>>>,
+    name: Arc<str>,
+    slot: Arc<CellSlot<T>>,
 }
+
+#[cfg(feature = "std")]
+type CellSlot<T> = std::sync::Mutex<Option<T>>;
+#[cfg(not(feature = "std"))]
+type CellSlot<T> = core::cell::RefCell<Option<T>>;
+
+#[cfg(feature = "std")]
+type CellGuard<'a, T> = std::sync::MutexGuard<'a, Option<T>>;
+#[cfg(not(feature = "std"))]
+type CellGuard<'a, T> = core::cell::RefMut<'a, Option<T>>;
 
 impl<T> PyCell<T> {
     /// The cell of a local that has not been assigned yet.
     pub fn empty(name: &str) -> Self {
-        Self { name: Rc::from(name), slot: Rc::new(RefCell::new(None)) }
+        Self { name: Arc::from(name), slot: Arc::new(CellSlot::new(None)) }
     }
 
     /// The cell of a name that is already bound (a captured parameter).
     pub fn new(name: &str, value: T) -> Self {
-        Self { name: Rc::from(name), slot: Rc::new(RefCell::new(Some(value))) }
+        Self { name: Arc::from(name), slot: Arc::new(CellSlot::new(Some(value))) }
     }
 
     /// Bind the name — an assignment to it in any scope that holds the
     /// cell.
     pub fn set(&self, value: T) {
-        *self.slot.borrow_mut() = Some(value);
+        *self.lock() = Some(value);
     }
 
     /// Borrow the bound object — the receiver of a read.
-    pub fn borrow(&self) -> Ref<'_, T> {
-        Ref::map(self.slot.borrow(), |v| {
-            v.as_ref().unwrap_or_else(|| unbound(&self.name))
-        })
+    pub fn borrow(&self) -> PyCellRef<'_, T> {
+        PyCellRef { guard: self.lock(), name: &self.name }
     }
 
     /// Borrow the bound object mutably — the receiver of a store.
-    pub fn borrow_mut(&self) -> RefMut<'_, T> {
-        let name = Rc::clone(&self.name);
-        RefMut::map(self.slot.borrow_mut(), move |v| {
-            v.as_mut().unwrap_or_else(|| unbound(&name))
-        })
+    pub fn borrow_mut(&self) -> PyCellRef<'_, T> {
+        self.borrow()
+    }
+
+    /// A poisoned cell is recovered rather than propagated: the closure
+    /// that panicked left the binding in whatever state it reached, which
+    /// is what CPython leaves behind, and poisoning every later access
+    /// would turn one loud failure into an unrelated cascade.
+    #[cfg(feature = "std")]
+    fn lock(&self) -> CellGuard<'_, T> {
+        self.slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The no_std tier's slot: a `RefCell`, borrowed for the access.
+    #[cfg(not(feature = "std"))]
+    fn lock(&self) -> CellGuard<'_, T> {
+        self.slot.borrow_mut()
+    }
+}
+
+/// A borrow of a cell's bound object. Dereferencing one before the name's
+/// first assignment is CPython's `UnboundLocalError`.
+pub struct PyCellRef<'a, T> {
+    guard: CellGuard<'a, T>,
+    name: &'a str,
+}
+
+impl<T> core::ops::Deref for PyCellRef<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.guard.as_ref().unwrap_or_else(|| unbound(self.name))
+    }
+}
+
+impl<T> core::ops::DerefMut for PyCellRef<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        let name = self.name;
+        self.guard.as_mut().unwrap_or_else(|| unbound(name))
     }
 }
 
@@ -247,7 +318,7 @@ impl<T: Clone> PyCell<T> {
     /// it: a snapshot clone taken at the read, so a closure sees whatever
     /// the binding holds when it runs.
     pub fn get(&self) -> T {
-        self.borrow().clone()
+        (*self.borrow()).clone()
     }
 }
 
@@ -256,7 +327,7 @@ impl<T: Clone> PyCell<T> {
 /// scope's binding.
 impl<T> Clone for PyCell<T> {
     fn clone(&self) -> Self {
-        Self { name: Rc::clone(&self.name), slot: Rc::clone(&self.slot) }
+        Self { name: Arc::clone(&self.name), slot: Arc::clone(&self.slot) }
     }
 }
 

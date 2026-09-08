@@ -579,6 +579,22 @@ pub struct PythonOptions {
     /// are held as `Rc<RefCell<T>>` and shared with it (Python's cell).
     /// Reads borrow, stores borrow mutably, and the binding wraps.
     pub cell_locals: std::rc::Rc<std::collections::HashSet<String>>,
+    /// Module names that resolve to a LOCAL binding in the current
+    /// statement instead of their module static (issues #337, #122): the
+    /// in-place mutation of a module container binds the locked object to
+    /// a temporary, and every read of the name inside that statement is
+    /// the temporary, not another `py_global_read` clone. Rust also
+    /// forbids a binding that shadows a static (E0530), so the temporary
+    /// carries the reserved prefix and this map is what points the name at
+    /// it.
+    pub static_mutation_alias: std::rc::Rc<std::collections::HashMap<String, String>>,
+    /// The names the ENCLOSING loops bind: a loop target, and anything the
+    /// loop body assigns. A loop body moves on every turn, so a name
+    /// consumed there is reused — but only if it comes from OUTSIDE the
+    /// loop. These are rebound each turn and are fresh values, so the
+    /// reuse-clone rule must leave them alone (cloning them was correct
+    /// but pointless, and changed the generated shape).
+    pub loop_bound_names: std::rc::Rc<std::collections::HashSet<String>>,
     /// Nested definitions the closure model REFUSED (issue #122), by
     /// name. The definition emitted nothing, so the name has no runtime
     /// value at all: a read or a call through it is a `compile_error!`
@@ -781,6 +797,8 @@ impl Default for PythonOptions {
             closure_captures: None,
             closure_capture_types: std::rc::Rc::new(std::collections::HashMap::new()),
             cell_locals: std::rc::Rc::new(std::collections::HashSet::new()),
+            static_mutation_alias: std::rc::Rc::new(std::collections::HashMap::new()),
+            loop_bound_names: std::rc::Rc::new(std::collections::HashSet::new()),
             refused_closures: std::rc::Rc::new(std::collections::HashMap::new()),
             uncallable_params: std::rc::Rc::new(std::collections::HashMap::new()),
             str_literal_locals: std::rc::Rc::new(std::collections::HashSet::new()),

@@ -1888,6 +1888,11 @@ impl FunctionDef {
         symbols: SymbolTableScopes,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut streams = TokenStream::new();
+        // The MODULE's name types, before this function's own analysis
+        // replaces them: a module static a function reads keeps the type
+        // the module gave it (issues #337, #122 — `_INITIALIZERS.append(cb)`
+        // must see `Vec<PyCallable<..>>`, not the boxed fallback).
+        let module_name_types = options.name_types.clone();
         let fn_name = crate::safe_ident(&self.name);
 
         // Issue #119: a MODULE-level `__getattr__` / `__dir__` implements
@@ -2753,7 +2758,13 @@ impl FunctionDef {
                     .insert(vararg.arg.clone(), crate::TypeInfo::Vec(Box::new(elt)));
             }
             options.use_counts = std::rc::Rc::new(info.use_counts);
-            options.name_types = std::rc::Rc::new(info.name_types);
+            options.name_types = std::rc::Rc::new(merge_module_static_types(
+                info.name_types,
+                &module_name_types,
+                &options.mutable_statics,
+                &self.args,
+                &effective_body,
+            ));
             options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
         }
         // A name bound to the boxed PyValue (a parameter whose union
@@ -2816,7 +2827,13 @@ impl FunctionDef {
             };
             crate::pin_empty_containers(&effective_body, &mut info, Some(&symbols), Some(&options));
             options.use_counts = std::rc::Rc::new(info.use_counts);
-            options.name_types = std::rc::Rc::new(info.name_types);
+            options.name_types = std::rc::Rc::new(merge_module_static_types(
+                info.name_types,
+                &module_name_types,
+                &options.mutable_statics,
+                &self.args,
+                &effective_body,
+            ));
             options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
         }
         // Issue #79's cheap guard: reject aliasing shapes rython cannot
@@ -4125,6 +4142,34 @@ fn literal_returns_need_boxing(body: &[Statement]) -> bool {
 /// `def`s that are CLOSURES in Python (issue #122). Control flow is
 /// entered; a nested def's OWN nested defs are that def's business, seen
 /// when it is lowered.
+/// A function's own name types, with the MODULE's types restored for the
+/// module statics it merely reads.
+///
+/// A function's analysis starts from the module's map but produces a fresh
+/// one, so a module static the function never binds came out untyped and
+/// fell back to the boxed value — which is how `_INITIALIZERS.append(cb)`
+/// boxed a `PyCallable` into a `Vec<PyCallable>` (issues #337, #122). Only
+/// names this scope does NOT bind are restored: a local or parameter of
+/// the same name is its own binding and shadows the static, as Python says.
+fn merge_module_static_types(
+    mut own: std::collections::HashMap<String, crate::TypeInfo>,
+    module: &std::collections::HashMap<String, crate::TypeInfo>,
+    statics: &std::collections::HashMap<String, crate::MutableGlobalKind>,
+    args: &crate::ParameterList,
+    body: &[Statement],
+) -> std::collections::HashMap<String, crate::TypeInfo> {
+    if statics.is_empty() {
+        return own;
+    }
+    let bound = crate::ast::tree::closure::scope_binding_names(args, body);
+    for (name, ty) in module {
+        if statics.contains_key(name) && !bound.contains(name) {
+            own.insert(name.clone(), ty.clone());
+        }
+    }
+    own
+}
+
 pub(crate) fn nested_defs(body: &[crate::Statement]) -> Vec<crate::FunctionDef> {
     let mut out = Vec::new();
     walk_stmts(body, Descend::SkipDefs, &mut |stmt| {

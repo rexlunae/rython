@@ -107,8 +107,14 @@ impl CodeGen for AsyncFor {
             has_else: tracks_break,
             parent: Box::new(ctx.clone()),
         };
+        // A name the loop REBINDS each turn is fresh on every iteration, so
+        // the loop-body reuse rule must not clone it (issue #337).
+        let mut target_names = Vec::new();
+        super::for_stmt::collect_target_names(&self.target, &mut target_names);
+        let body_options =
+            super::for_stmt::loop_body_options(&options, &target_names, &self.body);
         let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self.body.into_iter()
-            .map(|stmt| stmt.to_rust(body_ctx.clone(), options.clone(), symbols.clone()))
+            .map(|stmt| stmt.to_rust(body_ctx.clone(), body_options.clone(), symbols.clone()))
             .collect();
         let mut body_tokens = body_tokens?;
         if let Some(bind) = body_bind {

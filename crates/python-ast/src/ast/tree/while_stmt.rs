@@ -73,13 +73,15 @@ impl CodeGen for While {
         let tracks_break = has_else && crate::loop_body_has_direct_break(&self.body);
         // Body statements compile inside a Loop context so `break` can honor
         // the else clause; the test and else clause are outside the loop.
+        let body_options =
+            crate::ast::tree::for_stmt::loop_body_options(&options, &[], &self.body);
         let body_ctx = crate::CodeGenContext::Loop {
             has_else: tracks_break,
             parent: Box::new(ctx.clone()),
         };
         let body_stmts: Result<Vec<_>, _> = self.body
             .into_iter()
-            .map(|stmt| stmt.to_rust(body_ctx.clone(), options.clone(), symbols.clone()))
+            .map(|stmt| stmt.to_rust(body_ctx.clone(), body_options.clone(), symbols.clone()))
             .collect();
         let body_stmts = body_stmts?;
 
