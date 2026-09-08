@@ -1490,6 +1490,17 @@ impl PyListFrom for PyRange {
     }
 }
 
+/// Python list(set): the set's elements in iteration order (Python's own
+/// set order is hash-seeded and arbitrary — charset_normalizer's alphabets
+/// builds `sorted(list({r for r in detected_ranges if r}))`, round 108,
+/// where the `if r` filter narrows the `str | None` members to Strings).
+impl<T> PyListFrom for HashSet<T> {
+    type Item = T;
+    fn py_list(self) -> Vec<T> {
+        self.into_iter().collect()
+    }
+}
+
 /// Python list() builtin.
 pub fn list<L: PyListFrom>(x: L) -> Vec<L::Item> {
     x.py_list()

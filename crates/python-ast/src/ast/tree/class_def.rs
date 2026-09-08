@@ -4227,14 +4227,28 @@ impl CodeGen for ClassDef {
                 // `Option<bool>`: CPython's dispatch runs here — the left
                 // operand, then the right one reflected, then identity
                 // (Devin review on #330).
+                // The borrows are MUTABLE when the class's __eq__ needs
+                // `&mut self` (it calls a mutating method — charset_
+                // normalizer's CharsetMatch.__eq__ → fingerprint, round
+                // 108), or the read-only Ref cannot satisfy it (E0596).
+                let mut_eq = self.method_needs_mut_self("__eq__", &symbols, &options);
+                let borrow = |side: proc_macro2::TokenStream| -> TokenStream {
+                    if mut_eq {
+                        quote!(#side.borrow_mut())
+                    } else {
+                        quote!(#side.borrow())
+                    }
+                };
+                let left = borrow(quote!(_a));
+                let right = borrow(quote!(_b));
                 if crate::ast::tree::function_def::body_returns_not_implemented(&eq, &symbols) {
                     quote!(impl stdpython::PyRefEq for #class_name {
                         fn ref_eq(_a: &stdpython::PyRef<Self>, _b: &stdpython::PyRef<Self>) -> bool {
-                            let left = _a.borrow().__eq__(_b.clone()).unwrap_or_else(|e| panic!("{}", e));
+                            let left = #left.__eq__(_b.clone()).unwrap_or_else(|e| panic!("{}", e));
                             match left {
                                 Some(r) => r,
                                 None => {
-                                    let right = _b.borrow().__eq__(_a.clone()).unwrap_or_else(|e| panic!("{}", e));
+                                    let right = #right.__eq__(_a.clone()).unwrap_or_else(|e| panic!("{}", e));
                                     match right {
                                         Some(r) => r,
                                         None => _a.py_is(_b),
@@ -4246,7 +4260,7 @@ impl CodeGen for ClassDef {
                 } else {
                     quote!(impl stdpython::PyRefEq for #class_name {
                         fn ref_eq(_a: &stdpython::PyRef<Self>, _b: &stdpython::PyRef<Self>) -> bool {
-                            _a.borrow()
+                            #left
                                 .__eq__(_b.clone())
                                 .unwrap_or_else(|e| panic!("{}", e))
                         }
@@ -4266,12 +4280,24 @@ impl CodeGen for ClassDef {
             && crate::ast::tree::shared::is_shared(&self.name)
             && self.method_on_mro("__lt__", &symbols).is_some()
         {
+            // MUTABLE borrows when the class's __lt__ needs `&mut self`
+            // (see the __eq__ note in ref_eq_impl).
+            let mut_lt = self.method_needs_mut_self("__lt__", &symbols, &options);
+            let borrow = |side: proc_macro2::TokenStream| -> TokenStream {
+                if mut_lt {
+                    quote!(#side.borrow_mut())
+                } else {
+                    quote!(#side.borrow())
+                }
+            };
+            let left = borrow(quote!(_a));
+            let right = borrow(quote!(_b));
             quote!(impl stdpython::PyRefOrd for #class_name {
                 fn ref_cmp(_a: &stdpython::PyRef<Self>, _b: &stdpython::PyRef<Self>) -> Option<core::cmp::Ordering> {
                     use core::cmp::Ordering;
-                    if _a.borrow().__lt__(_b.clone()).unwrap_or_else(|e| panic!("{}", e)) {
+                    if #left.__lt__(_b.clone()).unwrap_or_else(|e| panic!("{}", e)) {
                         Some(Ordering::Less)
-                    } else if _b.borrow().__lt__(_a.clone()).unwrap_or_else(|e| panic!("{}", e)) {
+                    } else if #right.__lt__(_a.clone()).unwrap_or_else(|e| panic!("{}", e)) {
                         Some(Ordering::Greater)
                     } else {
                         Some(Ordering::Equal)
