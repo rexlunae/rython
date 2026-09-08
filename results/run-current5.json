@@ -1,14 +1,14 @@
 {
-  "rypip_commit": "9d247fa",
+  "rypip_commit": "6ef0cab",
   "rypip_path": "/Users/tserica/rython/target/debug/rypip",
-  "elapsed_seconds": 749.9,
+  "elapsed_seconds": 631.6,
   "packages": {
     "urllib3": {
-      "total": 728,
+      "total": 727,
       "histogram": {
         "E0308": 305,
         "E0599": 155,
-        "E0277": 130,
+        "E0277": 129,
         "E0609": 77,
         "E0061": 26,
         "E0605": 8,
@@ -171,11 +171,11 @@
       "build_status": 0
     },
     "idna": {
-      "total": 48,
+      "total": 45,
       "histogram": {
         "E0308": 22,
-        "E0277": 11,
         "E0599": 10,
+        "E0277": 8,
         "E0382": 4,
         "E0432": 1
       },
@@ -198,13 +198,13 @@
       "build_status": 101
     },
     "charset_normalizer": {
-      "total": 111,
+      "total": 103,
       "histogram": {
-        "E0308": 39,
-        "E0277": 36,
+        "E0308": 34,
+        "E0277": 31,
         "E0599": 15,
         "E0609": 6,
-        "E0382": 4,
+        "E0382": 6,
         "E0596": 4,
         "E0061": 3,
         "E0369": 2,
@@ -212,9 +212,7 @@
         "E0507": 1
       },
       "e0308_pairs": {
-        "Vec<_> | PyRange": 5,
         "PyValue | (_, _)": 5,
-        "Vec<_> | String": 4,
         "PyValue | Option<Vec<PyRef<CharsetMatch>>>": 3,
         "HashSet<String> | HashSet<&str>": 3,
         "PyValue | Option<_>": 2,
@@ -242,12 +240,12 @@
       "build_status": 101
     },
     "requests": {
-      "total": 2407,
+      "total": 2399,
       "histogram": {
         "E0308": 912,
         "E0599": 489,
         "E0609": 435,
-        "E0277": 333,
+        "E0277": 325,
         "E0615": 80,
         "E0061": 58,
         "E0618": 19,
