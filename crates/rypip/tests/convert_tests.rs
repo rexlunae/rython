@@ -6218,6 +6218,69 @@ fn option_string_keys_in_membership_and_index_match_python() {
 }
 
 #[test]
+fn guarded_option_field_returns_into_concrete_fns() {
+    // Round 103: a `str | None`-typed field that an `if x is None:` guard
+    // initializes, then RETURNED from a `-> str` / `-> list[str]`
+    // function (`return self._string` — charset_normalizer's
+    // CharsetMatch.__str__ / unicode-range accessors): the value is
+    // guaranteed non-None on every path, so the return unwraps (the
+    // optional-into-concrete return coercion). Transcript pinned against
+    // python3.
+    let scratch = Scratch::new("retopt");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "class M:\n",
+            "    def __init__(self, payload: str):\n",
+            "        self._string: str | None = None\n",
+            "        self._payload = payload\n",
+            "\n",
+            "    def get_string(self) -> str:\n",
+            "        if self._string is None:\n",
+            "            self._string = self._payload + \"!\"\n",
+            "        return self._string\n",
+            "\n",
+            "    def words(self) -> list[str]:\n",
+            "        if self._string is None:\n",
+            "            self._string = self._payload + \"?\"\n",
+            "        return self._string.split()\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    m = M(\"hello world\")\n",
+            "    print(m.get_string(), m.words())\n",
+            "    print(m.get_string(), m.words())\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "hello world! ['hello', 'world!']",
+            "hello world! ['hello', 'world!']",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {
     // Round 41: a trait-DEFAULT body that formats `self` in an exception
     // message (`raise PoolError(self)` — urllib3's _get_conn raises

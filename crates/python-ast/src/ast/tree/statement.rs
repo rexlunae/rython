@@ -775,6 +775,46 @@ impl CodeGen for StatementType {
                                 ),
                                 crate::TypeInfo::PyValue
                             ) || name_binds_dropped_call(&n.id, &symbols, &options, &ctx))));
+                // A CONCRETE (non-Option, non-PyValue) typed return whose
+                // VALUE is an Option of the return's own inner type
+                // (`return self._string` where `_string` is a guarded
+                // `str | None` field in a `-> str` fn — charset_normalizer's
+                // __str__; `return self._unicode_ranges` — an
+                // Option<Vec<String>> field in a `-> list[str]` accessor):
+                // the Option unwraps with the loud §12.2 panic, the same
+                // optional-into-concrete contract the argument coercion
+                // applies (the store-guard in real code makes the None
+                // unreachable). Computed before the tokens move options.
+                let value_infers_option_of_typed_return = !options.fn_return_is_option
+                    && !options.fn_return_is_pyvalue
+                    // A NARROWED name read already unwraps (`if v is None:
+                    // return "none"; return v` reads v as its inner String —
+                    // the memoized infer below still reports the Option), so
+                    // the coercion must not wrap the unwrapped read again.
+                    && !matches!(&e.value, ExprType::Name(n)
+                        if options.narrowed_names.contains_key(&n.id))
+                    && match options.fn_return_typed.as_ref() {
+                        Some(ret)
+                            if !matches!(
+                                ret,
+                                crate::TypeInfo::PyValue
+                                    | crate::TypeInfo::PyObject
+                                    | crate::TypeInfo::Class(_)
+                            ) =>
+                        {
+                            matches!(
+                                crate::ast::tree::type_ctx::infer_type(
+                                    Some(&ctx),
+                                    &e.value,
+                                    &options,
+                                    &symbols,
+                                ),
+                                crate::TypeInfo::Option(inner)
+                                    if inner.as_ref() == ret
+                            )
+                        }
+                        _ => false,
+                    };
                 // A `return None` in a PyValue-returning function is the
                 // boxed None (the None-mixing unification), whichever AST
                 // shape the parser surfaced None as (issue #133: the
@@ -1067,6 +1107,10 @@ impl CodeGen for StatementType {
                     quote!((#value).into())
                 } else if value_infers_option_pyvalue_in_typed_return {
                     quote!((#value).map(Into::into).expect(
+                        "rython: the returned optional value was None (Python would fail at use, rython at the conversion)"
+                    ))
+                } else if value_infers_option_of_typed_return {
+                    quote!((#value).expect(
                         "rython: the returned optional value was None (Python would fail at use, rython at the conversion)"
                     ))
                 } else {
