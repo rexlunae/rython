@@ -6691,6 +6691,95 @@ fn option_filter_set_comprehensions_and_shared_eq_match_python() {
 }
 
 #[test]
+fn str_encode_by_name_and_error_handlers_match_python() {
+    // Round 109: str.encode with a RUNTIME codec name and an errors
+    // handler (`decoded_string.encode(encoding, "replace")` —
+    // charset_normalizer's CharsetMatch.output, whose `encoding` is a
+    // parameter): the codec registry dispatches on the normalized name
+    // (case and -/_ spellings alike) with CPython's
+    // strict/replace/ignore handlers, and an unknown codec raises
+    // CPython's runtime LookupError. Transcript pinned against python3.
+    let scratch = Scratch::new("encname");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "from typing import Optional\n",
+            "\n",
+            "\n",
+            "class M:\n",
+            "    def out(self, s: str, encoding: str) -> bytes:\n",
+            "        return s.encode(encoding, \"replace\")\n",
+            "\n",
+            "\n",
+            "def codec(flag: bool) -> str:\n",
+            "    if flag:\n",
+            "        return \"utf_8\"\n",
+            "    return \"bogus\"\n",
+            "\n",
+            "\n",
+            "def handler(flag: bool) -> str:\n",
+            "    if flag:\n",
+            "        return \"strict\"\n",
+            "    return \"bogus\"\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    m = M()\n",
+            "    print(m.out(\"héllo\", \"utf_8\"))\n",
+            "    print(m.out(\"héllo\", \"ascii\"))\n",
+            "    print(m.out(\"héllo\", \"ASCII\"))\n",
+            "    print(m.out(\"€uro\", \"latin1\"))\n",
+            "    print(m.out(\"plain\", \"UTF-8\"))\n",
+            "    print(\"héllo\".encode(\"utf_8\", \"replace\"))\n",
+            "    print(\"héllo\".encode(\"ascii\", \"ignore\"))\n",
+            "    bad = codec(False)\n",
+            "    try:\n",
+            "        \"héllo\".encode(bad)\n",
+            "    except LookupError as e:\n",
+            "        print(\"caught\", e)\n",
+            "    bad_handler = handler(False)\n",
+            "    try:\n",
+            "        \"héllo\".encode(\"ascii\", bad_handler)\n",
+            "    except LookupError as e:\n",
+            "        print(\"caught\", e)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "b'h\\xc3\\xa9llo'",
+            "b'h?llo'",
+            "b'h?llo'",
+            "b'?uro'",
+            "b'plain'",
+            "b'h\\xc3\\xa9llo'",
+            "b'hllo'",
+            "caught unknown encoding: bogus",
+            "caught unknown error handler name 'bogus'",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {
     // Round 41: a trait-DEFAULT body that formats `self` in an exception
     // message (`raise PoolError(self)` — urllib3's _get_conn raises

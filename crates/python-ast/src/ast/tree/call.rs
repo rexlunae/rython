@@ -7513,11 +7513,37 @@ let mutating_self_field = boxed_self_ref_receiver
                     {
                         return Ok(quote!((#receiver).as_bytes().to_vec()));
                     }
-                    ("encode", [enc])
+                    ("encode", args @ ([_] | [_, _]))
                         if crate::ast::tree::call::receiver_is_str_like(
                             &attr.value, &options, &symbols,
-                        ) =>
+                        )
+                            // The runtime registry handles CPython's
+                            // strict/replace/ignore handlers; an errors
+                            // argument the codec layer does not carry
+                            // (`"surrogatepass"` — urllib3's
+                            // _encode_invalid_chars) keeps the generic
+                            // fall-through, so the function's error shape
+                            // does not shift under a half-supported arm.
+                            && self.args.get(1).map_or(true, |e| match e {
+                                // A runtime handler name: the registry
+                                // decides at run time.
+                                ExprType::Name(_) => true,
+                                ExprType::Constant(c) => matches!(
+                                    &c.0,
+                                    Some(litrs::Literal::String(s))
+                                        if matches!(s.value(), "strict" | "replace" | "ignore")
+                                ),
+                                _ => true,
+                            }) =>
                     {
+                        // The rendered encoding expression (a literal's
+                        // tokens for the literal arms; any expression for a
+                        // runtime codec name).
+                        let enc = self.args[0].clone().to_rust(
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                        )?;
                         // A `self.CONST` encoding argument
                         // (`value.encode(self.DEFAULT_ENCODING)` — botocore's
                         // serialize, where DEFAULT_ENCODING = 'utf-8' is a
@@ -7544,20 +7570,70 @@ let mutating_self_field = boxed_self_ref_receiver
                                 _ => None,
                             })
                         {
-                            lit
+                            Some(lit)
+                        } else if let ExprType::Constant(c) = self.args.first().unwrap()
+                            && matches!(&c.0, Some(litrs::Literal::String(_)))
+                        {
+                            let v = c.to_string();
+                            Some(v.trim_matches('"').to_string())
                         } else {
-                            enc.to_string().trim_matches('"').to_string()
+                            None
                         };
-                        match codec.as_str() {
-                            // `utf8` (no hyphen) is Python's accepted
-                            // spelling (botocore's signers).
-                            "utf-8" | "utf8" => {
+                        // The errors argument defaults to Python's "strict"
+                        // when the one-arg form omits it.
+                        let errors = match args.len() {
+                            2 => {
+                                let e = self.args.get(1).unwrap();
+                                match e {
+                                    ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::String(_))) => {
+                                        c.to_string().trim_matches('"').to_string()
+                                    }
+                                    other => {
+                                        // A RUNTIME errors name: the registry
+                                        // handles the handler too, whatever
+                                        // the codec.
+                                        let runtime = crate::safe_ident(&options.stdpython);
+                                        let enc_e = other.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                        return Ok(quote!(
+                                            #runtime::stdlib::codec::encode_by_name(&(#receiver), &(#enc), &(#enc_e))?
+                                        ));
+                                    }
+                                }
+                            }
+                            _ => "strict".to_string(),
+                        };
+                        let codec = match codec {
+                            Some(c) => c,
+                            None => {
+                                // A RUNTIME codec name (a parameter —
+                                // `decoded_string.encode(encoding, "replace")`
+                                // — charset_normalizer's CharsetMatch.output):
+                                // the registry dispatches like CPython's
+                                // codec lookup, with the error handler.
+                                let runtime = crate::safe_ident(&options.stdpython);
+                                return Ok(quote!(
+                                    #runtime::stdlib::codec::encode_by_name(&(#receiver), &(#enc), &(#errors))?
+                                ));
+                            }
+                        };
+                        // Codec names normalize like CPython's aliases:
+                        // case-insensitive, `-` and `_` spellings alike
+                        // ("UTF_8" is "utf-8" — python3 accepts every
+                        // spelling).
+                        let normalized = codec.to_ascii_lowercase().replace('-', "_");
+                        match normalized.as_str() {
+                            "utf_8" | "utf8" => {
                                 return Ok(quote!((#receiver).as_bytes().to_vec()));
                             }
                             "ascii" => {
                                 let runtime = crate::safe_ident(&options.stdpython);
+                                if errors == "strict" {
+                                    return Ok(quote!(
+                                        #runtime::stdlib::codec::encode_ascii(#receiver)?
+                                    ));
+                                }
                                 return Ok(quote!(
-                                    #runtime::stdlib::codec::encode_ascii(#receiver)?
+                                    #runtime::stdlib::codec::encode_by_name(&(#receiver), "ascii", &(#errors))?
                                 ));
                             }
                             // `host.encode("idna")` — a VALIDATION call whose
@@ -7579,14 +7655,24 @@ let mutating_self_field = boxed_self_ref_receiver
                             // only a few code points (urllib3's emscripten
                             // fetch); treated as latin-1 — a documented
                             // divergence.
-                            "latin1" | "latin-1" | "iso-8859-1" | "iso-8859-15"
-                            | "ISO-8859-15" | "ISO-8859-1" => {
+                            "latin1" | "latin_1" | "iso_8859_1" | "iso_8859_15" => {
                                 let runtime = crate::safe_ident(&options.stdpython);
+                                if errors == "strict" {
+                                    return Ok(quote!(
+                                        #runtime::stdlib::codec::encode_latin1(#receiver)?
+                                    ));
+                                }
                                 return Ok(quote!(
-                                    #runtime::stdlib::codec::encode_latin1(#receiver)?
+                                    #runtime::stdlib::codec::encode_by_name(&(#receiver), "latin-1", &(#errors))?
                                 ));
                             }
                             other => {
+                                // A LITERAL codec outside the supported set
+                                // stays loud at CONVERSION (the port learns
+                                // the construct is unencodable, never ships a
+                                // runtime error where Python returned bytes):
+                                // a runtime NAME cannot be decided here and
+                                // routes through the registry above.
                                 return Err(format!(
                                     "str.encode({}): only utf-8, ascii, punycode, and \
                                      latin-1 are supported",
