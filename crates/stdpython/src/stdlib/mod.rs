@@ -119,6 +119,10 @@ pub mod csv;
 /// (RFC 3492), with CPython's error classes. Pure data transformation —
 /// no OS, so it lives on every tier.
 pub mod codec;
+/// std-gated like the codec layer it extends: the table builds a
+/// std-tier LazyLock.
+#[cfg(feature = "std")]
+pub mod encodings;
 
 /// Python numpy subset — dense N-dimensional arrays with broadcasting,
 /// ufuncs, reductions, and a small linalg module. Optional feature

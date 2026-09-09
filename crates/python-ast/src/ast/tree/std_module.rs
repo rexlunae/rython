@@ -52,6 +52,9 @@ pub(crate) enum StdModule {
     /// urllib.request lives on the ureq-backed `http-ureq` stdpython
     /// feature; rypip enables it when a package imports it.
     Urllib,
+    /// encodings.aliases carries the CPython codec alias table (a static
+    /// PyDict — `from encodings.aliases import aliases`, round 111).
+    Encodings,
 }
 
 impl StdModule {
@@ -91,6 +94,7 @@ impl StdModule {
             "socket" => StdModule::Socket,
             "ssl" => StdModule::Ssl,
             "urllib" => StdModule::Urllib,
+            "encodings" => StdModule::Encodings,
             _ => return None,
         })
     }
@@ -130,6 +134,7 @@ impl StdModule {
             StdModule::Socket => "socket",
             StdModule::Ssl => "ssl",
             StdModule::Urllib => "urllib",
+            StdModule::Encodings => "encodings",
         }
     }
 
@@ -160,7 +165,11 @@ impl StdModule {
             | StdModule::Threading
             | StdModule::Socket
             | StdModule::Ssl
-            | StdModule::Urllib => true,
+            | StdModule::Urllib
+            // The alias table builds a PyDict — the alloc-tier dict — but
+            // the runtime module lives beside the codec layer on the std
+            // tier where the corpus imports it.
+            | StdModule::Encodings => true,
             StdModule::Io
             | StdModule::Json
             | StdModule::Collections

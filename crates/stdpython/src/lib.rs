@@ -7125,6 +7125,8 @@ pub mod python_signature;
 
 // Re-export stdlib modules at the top level for convenience
 #[cfg(feature = "std")]
+pub use stdlib::encodings;
+#[cfg(feature = "std")]
 pub use stdlib::sys;
 #[cfg(feature = "std")]
 pub use stdlib::os; 
