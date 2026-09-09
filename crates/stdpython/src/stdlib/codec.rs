@@ -65,11 +65,71 @@ pub fn decode_utf8(b: &[u8]) -> Result<String, PyException> {
     String::from_utf8(b.to_vec()).map_err(|e| {
         PyException::new(
             "UnicodeDecodeError",
-            format!("'utf-8' codec can't decode byte 0x{:x} in position {}: invalid start byte", 
+            format!("'utf-8' codec can't decode byte 0x{:x} in position {}: invalid start byte",
                 e.utf8_error().error_len().map(|_| b[e.utf8_error().valid_up_to()]).unwrap_or(0),
                 e.utf8_error().valid_up_to()),
         )
     })
+}
+
+/// str.encode(name, errors) with a RUNTIME codec name (a parameter, not a
+/// literal — `decoded_string.encode(encoding, "replace")` —
+/// charset_normalizer's CharsetMatch.output): dispatch on the name string
+/// like CPython's codec registry, with CPython's strict/replace/ignore
+/// error handlers. Codec names normalize like CPython's aliases (case and
+/// `-`/`_` spelling; "UTF_8" is "utf-8"). Verified against python3.
+pub fn encode_by_name<S: AsRef<str>>(s: S, name: &str, errors: &str) -> Result<Vec<u8>, PyException> {
+    let s = s.as_ref();
+    let normalized = name.to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "utf_8" | "utf8" => Ok(s.as_bytes().to_vec()),
+        "ascii" => encode_with_errors(s, errors, |s| encode_ascii(s), |c| {
+            if c.is_ascii() { Some(c as u8) } else { None }
+        }),
+        "latin_1" | "latin1" | "iso_8859_1" | "iso_8859_15" => {
+            encode_with_errors(s, errors, |s| encode_latin1(s), |c| {
+                let cp = c as u32;
+                if cp <= 0xFF { Some(cp as u8) } else { None }
+            })
+        }
+        "punycode" => Ok(encode_punycode(s)),
+        other => Err(PyException::new(
+            "LookupError",
+            format!("unknown encoding: {}", other),
+        )),
+    }
+}
+
+/// The strict/replace/ignore error handlers around a PER-CHARACTER codec
+/// check (`per_char` answers the codec's byte for an encodable character,
+/// None for one it rejects): strict raises the codec's own
+/// UnicodeEncodeError, replace emits `'?'` for the rejected characters,
+/// ignore drops them.
+fn encode_with_errors<S: AsRef<str>>(
+    s: S,
+    errors: &str,
+    strict: fn(&str) -> Result<Vec<u8>, PyException>,
+    per_char: fn(char) -> Option<u8>,
+) -> Result<Vec<u8>, PyException> {
+    match errors {
+        "strict" => strict(s.as_ref()),
+        "replace" | "ignore" => {
+            let replace = errors == "replace";
+            let mut out = Vec::with_capacity(s.as_ref().len());
+            for c in s.as_ref().chars() {
+                match per_char(c) {
+                    Some(b) => out.push(b),
+                    None if replace => out.push(b'?'),
+                    None => {}
+                }
+            }
+            Ok(out)
+        }
+        other => Err(PyException::new(
+            "LookupError",
+            format!("unknown error handler name '{}'", other),
+        )),
+    }
 }
 
 /// bytes.decode(name) with a RUNTIME codec name (a parameter, not a
