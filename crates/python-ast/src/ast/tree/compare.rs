@@ -445,7 +445,46 @@ impl CodeGen for Compare {
                 if left_is_opt || !shared_option_identity { quote!(#left) } else { quote!(Some(#left)) },
                 if right_is_opt || !shared_option_identity { quote!(#comparator) } else { quote!(Some(#comparator)) },
             );
+            // A MIXED equality pair inside a method: one side the
+            // SHARED class's PyRef, the other the method receiver
+            // (`other == self` in add_submatch — charset_normalizer's
+            // models.py, round 113): py_eq needs two PyRefs, and a
+            // plain `&mut CharsetMatch` is not one. The class's own
+            // `__eq__` runs with the VALUE side as the receiver (the
+            // method has the mutable access) and the PyRef as its
+            // parameter — Python's same-class dispatch, symmetric for
+            // the field comparison this shape defines. A raise inside
+            // == panics loudly (the §12.2 posture ref_eq uses).
+            let self_mixed_pair = (matches!(op, Compares::Eq | Compares::NotEq))
+                && (crate::ast::tree::attribute::chain_root_is_self(comparator_ast)
+                    || crate::ast::tree::attribute::chain_root_is_self(left_ast))
+                && (is_shared_class(&identity_type_of(left_ast, &ctx, &options, &symbols))
+                    || is_shared_class(&comparator_identity_type));
             let tokens = match op {
+                // The PyRef argument clones (an Rc clone): the comparison
+                // must not consume it — the Python raise path after the
+                // `or` still reads the operand. The value-side receiver
+                // (the method's own `&mut self`) is what makes the class's
+                // `__eq__`(&mut self, PyRef) callable here; when the two
+                // operands are the SAME object, CPython answers and rython
+                // hits the documented aliasing boundary (§12.2, issue
+                // #137) — the mutating-__eq__ self-comparison.
+                Compares::Eq if self_mixed_pair => {
+                    let (recv, arg) = if crate::ast::tree::attribute::chain_root_is_self(comparator_ast) {
+                        (&comparator, &left)
+                    } else {
+                        (&left, &comparator)
+                    };
+                    quote!((#recv).__eq__((#arg).clone()).unwrap_or_else(|e| panic!("{}", e)))
+                }
+                Compares::NotEq if self_mixed_pair => {
+                    let (recv, arg) = if crate::ast::tree::attribute::chain_root_is_self(comparator_ast) {
+                        (&comparator, &left)
+                    } else {
+                        (&left, &comparator)
+                    };
+                    quote!(!((#recv).__eq__((#arg).clone()).unwrap_or_else(|e| panic!("{}", e))))
+                }
                 Compares::Eq => quote!((#left).py_eq(&(#comparator))),
                 Compares::NotEq => quote!((#left).py_ne(&(#comparator))),
                 Compares::Lt => quote!((#left).py_lt(&(#comparator))),
