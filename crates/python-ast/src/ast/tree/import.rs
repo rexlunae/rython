@@ -37,6 +37,8 @@ pub(crate) fn stdpython_module_class(module: &str, name: &str) -> bool {
         // urllib: urlopen and the parse submodule's items are ALL
         // functions (urlparse/urlsplit/urljoin/urlencode/quote/...).
         StdModule::Urllib => false,
+        // The alias table is a static dict, not a constructible class.
+        StdModule::Encodings => false,
         StdModule::Collections => matches!(name, "OrderedDict" | "defaultdict" | "deque"),
         StdModule::Re => false,
         StdModule::Itertools => false,
@@ -82,8 +84,16 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
     let Some(module) = StdModule::from_name(module) else {
         return false;
     };
+    // The dotted encodings.aliases submodule: its table item.
+    if module == StdModule::Encodings {
+        // `from encodings.aliases import aliases` — the dotted module
+        // resolves with the member matching the submodule name.
+        return name == "aliases";
+    }
     match module {
         StdModule::Io => matches!(name, "StringIO" | "BytesIO" | "DEFAULT_BUFFER_SIZE"),
+        // The dotted encodings.aliases submodule's table item.
+        StdModule::Encodings => name == "aliases",
         // The type names come from the ThreadingType enum (one source of
         // truth); current_thread/active_count are module functions.
         StdModule::Threading => {
