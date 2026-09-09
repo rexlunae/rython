@@ -12912,6 +12912,73 @@ fn a_package_binding_still_pending_in_a_cycle_falls_back_to_the_submodule() {
 }
 
 #[test]
+fn a_table_a_sibling_imports_inside_a_function_is_still_a_static() {
+    // idna's shape (issue #333): `uts46data = tuple(_seg_0() + _seg_1())`
+    // in one module, pulled in by `from .segs import table` INSIDE a
+    // function of a sibling. The value's initializer calls fallible
+    // helpers, so it can only be computed in `__module_init__` — and as a
+    // module-init local it is invisible to the sibling, whose generated
+    // `pub use crate::segs::table;` then fails with E0432.
+    //
+    // A function-local sibling import promotes the name exactly as a
+    // module-level one does. This was excluded on purpose once, when
+    // boxing such a table cost more in the consumers' inference than the
+    // missing static did; re-measured on idna 3.10 it now pays for itself.
+    let scratch = Scratch::new("fnimport");
+    let krate = package_crate(
+        &scratch,
+        "fnimport",
+        &[
+            (
+                "segs.py",
+                concat!(
+                    "def _seg_0() -> list[str]:\n",
+                    "    return [\"a\", \"b\"]\n",
+                    "\n",
+                    "\n",
+                    "def _seg_1() -> list[str]:\n",
+                    "    return [\"c\", \"d\"]\n",
+                    "\n",
+                    "\n",
+                    "table = tuple(_seg_0() + _seg_1())\n",
+                ),
+            ),
+            (
+                "core.py",
+                concat!(
+                    "def pick(i: int) -> str:\n",
+                    "    from .segs import table\n",
+                    "\n",
+                    "    return str(table[i])\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .core import pick\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(pick(2))\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    let segs = fs::read_to_string(krate.root.join("src/segs.rs")).unwrap();
+    assert!(
+        segs.contains("pub static table"),
+        "the table is a static the sibling can import, not a module-init local: {}",
+        segs
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "fnimport"), vec!["c"]);
+}
+
+#[test]
 fn a_walrus_in_an_if_header_is_bound_at_the_top_of_its_body() {
     // `if (X := 1): from .b import value` — Python binds X when the test
     // is evaluated, before the body's import: the walrus records the
