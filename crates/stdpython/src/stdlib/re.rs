@@ -102,6 +102,12 @@ pub struct PyMatch {
     groups: Vec<Option<(String, i64, i64)>>,
     /// Per-group name from (?P<name>...), parallel to `groups`.
     names: Vec<Option<String>>,
+    /// The subject the match ran against (Python's `m.string` —
+    /// `m.string[m.span()[0]:m.span()[1]]` — charset_normalizer's
+    /// CharsetMatch.output, round 110). A pub FIELD: the lambda body
+    /// renders `m.string` as a plain attribute read on the untyped
+    /// closure parameter, so the field is the surface.
+    pub string: String,
 }
 
 fn char_offset(text: &str, byte: usize) -> i64 {
@@ -124,7 +130,7 @@ fn make_match(re: &regex::Regex, text: &str, caps: &regex::Captures) -> PyMatch 
         .capture_names()
         .map(|n| n.map(|n| n.to_string()))
         .collect();
-    PyMatch { groups, names }
+    PyMatch { groups, names, string: text.to_string() }
 }
 
 impl PyMatch {
@@ -217,6 +223,13 @@ impl PyMatch {
         self.group_entry(0).2
     }
 
+    /// m.string: the subject the match ran against (the field is the
+    /// surface the lambda bodies read; the method serves the
+    /// Option<PyMatch> trait surface).
+    pub fn string(&self) -> String {
+        self.string.clone()
+    }
+
     /// m.span()
     pub fn span(&self) -> (i64, i64) {
         let e = self.group_entry(0);
@@ -257,6 +270,7 @@ pub trait PyMatchOps {
     fn group_name(&self, name: &str) -> String;
     fn groupdict(&self) -> crate::PyDict<String, String>;
     fn groups(&self) -> Vec<String>;
+    fn string(&self) -> String;
     fn start(&self) -> i64;
     fn end(&self) -> i64;
     fn span(&self) -> (i64, i64);
@@ -296,6 +310,12 @@ impl PyMatchOps for Option<PyMatch> {
         match self {
             Some(m) => m.groups(),
             None => none_match_panic("groups"),
+        }
+    }
+    fn string(&self) -> String {
+        match self {
+            Some(m) => m.string(),
+            None => none_match_panic("string"),
         }
     }
     fn start(&self) -> i64 {
@@ -603,6 +623,58 @@ where
     }
     Ok(re
         .replacen(string.as_ref(), count as usize, repl.as_str())
+        .into_owned())
+}
+
+/// re.sub(COMPILED_PATTERN, callable_repl, string, count): a pattern the
+/// module already compiled (a module static or a `re.compile` value) with
+/// a CALLABLE replacement — `sub(RE_POSSIBLE_ENCODING_INDICATION, lambda
+/// m: ..., text, count=1)` — charset_normalizer's CharsetMatch.output,
+/// round 110. The callable receives the Match and answers the
+/// replacement; count 0 (or omitted) replaces everything, a negative
+/// count replaces nothing, exactly like CPython's sub.
+pub fn sub_re_callable(
+    re: &Regex,
+    repl: &dyn Fn(&PyMatch) -> String,
+    text: &str,
+    count: i64,
+) -> Result<String, PyException> {
+    if count < 0 {
+        return Ok(text.to_string());
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0usize;
+    let mut done = 0usize;
+    for caps in re.captures_iter(text) {
+        if count > 0 && done >= count as usize {
+            break;
+        }
+        let whole = caps.get(0).expect("group 0 always participates");
+        out.push_str(&text[last..whole.start()]);
+        let m = make_match(re, text, &caps);
+        out.push_str(&repl(&m));
+        last = whole.end();
+        done += 1;
+    }
+    out.push_str(&text[last..]);
+    Ok(out)
+}
+
+/// re.sub(COMPILED_PATTERN, string_repl, string, count): the string
+/// replacement form over an already-compiled pattern (the Python
+/// replacement syntax translates like the str-pattern sub's does).
+pub fn sub_re_str(
+    re: &Regex,
+    repl: &str,
+    text: &str,
+    count: i64,
+) -> Result<String, PyException> {
+    if count < 0 {
+        return Ok(text.to_string());
+    }
+    let repl = translate_replacement(repl)?;
+    Ok(re
+        .replacen(text, count as usize, repl.as_str())
         .into_owned())
 }
 

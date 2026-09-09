@@ -6780,6 +6780,65 @@ fn str_encode_by_name_and_error_handlers_match_python() {
 }
 
 #[test]
+fn re_sub_compiled_pattern_with_callable_repl_matches_python() {
+    // Round 110: `sub(COMPILED_PATTERN, lambda m: ..., text, count=2)` —
+    // the compiled pattern is a module static built through a
+    // `from re import compile as re_compile` ALIAS (charset_normalizer's
+    // constant.py), and the lambda reads m.string / m.span() /
+    // m.groups() with RUNTIME str.replace arguments. The registry's
+    // compiled-pattern sub dispatches the callable per match.
+    // Transcript pinned against python3.
+    let scratch = Scratch::new("subcall");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "from re import compile as re_compile\n",
+            "from re import IGNORECASE\n",
+            "from re import sub\n",
+            "\n",
+            "\n",
+            "PATTERN = re_compile(r\"([a-z]+)([0-9]*)\", IGNORECASE)\n",
+            "\n",
+            "\n",
+            "def rewrite(text: str, tag: str) -> str:\n",
+            "    return sub(\n",
+            "        PATTERN,\n",
+            "        lambda m: m.string[m.span()[0] : m.span()[1]].replace(m.groups()[0], m.groups()[0].upper()) + tag,\n",
+            "        text,\n",
+            "        count=2,\n",
+            "    )\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(rewrite(\"abc12def34\", \"!\"))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["ABC12!DEF34!"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {
     // Round 41: a trait-DEFAULT body that formats `self` in an exception
     // message (`raise PoolError(self)` — urllib3's _get_conn raises

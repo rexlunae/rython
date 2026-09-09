@@ -1045,7 +1045,7 @@ impl CodeGen for Module {
                 && matches!(kind, crate::MutableGlobalKind::Computed { .. })
             {
                 *kind = crate::MutableGlobalKind::Computed {
-                    boxed: module_init_static_ty(&n.id, &a.value, &options).is_none(),
+                    boxed: module_init_static_ty(&n.id, &a.value, &options, &symbols).is_none(),
                 };
             }
         }
@@ -1661,7 +1661,7 @@ impl CodeGen for Module {
                                     quote!(stdpython::PyValue::from(#value_tokens)),
                                 )
                             } else {
-                                let ty = module_init_static_ty(&target.id, &a.value, &options)
+                                let ty = module_init_static_ty(&target.id, &a.value, &options, &symbols)
                                     .expect("Computed{boxed:false} implies an inferred type");
                                 (ty, value_tokens)
                             };
@@ -1847,7 +1847,7 @@ impl CodeGen for Module {
                     // Boxed values wrap in PyValue::from so the closure's
                     // type matches.
                     let (ty, wrapped) =
-                        match module_init_static_ty(&n, &a.value, &options) {
+                        match module_init_static_ty(&n, &a.value, &options, &symbols) {
                             Some(ty) => {
                                 // A `Vec<String>` static whose init is a
                                 // list LITERAL (`UNICODE_SECONDARY_RANGE_
@@ -5496,6 +5496,7 @@ fn module_init_static_ty(
     name: &str,
     value: &crate::ExprType,
     options: &crate::PythonOptions,
+    symbols: &crate::SymbolTableScopes,
 ) -> Option<TokenStream> {
     // A type containing the UNINFERRED `_` (`PyDict<_, _>` — a dict of
     // EXTERNAL values that all box to None, urllib3's pyopenssl
@@ -5506,6 +5507,20 @@ fn module_init_static_ty(
         && !type_contains_uninferred(t)
     {
         return Some(t.to_rust_type());
+    }
+    if let crate::ExprType::Call(c) = value
+        // `from re import compile as re_compile` — an ALIAS callee
+        // (`RE_POSSIBLE_ENCODING_INDICATION = re_compile(...)` —
+        // charset_normalizer's constant.py): the alias resolves through
+        // the from-import it was bound by, so the static holds the raw
+        // Regex exactly like the module-qualified spelling below.
+        && let crate::ExprType::Name(cn) = c.func.as_ref()
+        && let Some(crate::SymbolTableNode::Alias(member)) = symbols.get(&cn.id)
+        && let Some(crate::SymbolTableNode::ImportFrom(i)) = symbols.get(member)
+        && i.module == "re"
+        && i.names.iter().any(|a| a.name == *member && a.name == "compile")
+    {
+        return Some(quote!(stdpython::stdlib::re::Regex));
     }
     if let crate::ExprType::Call(c) = value
         && let crate::ExprType::Attribute(a) = c.func.as_ref()

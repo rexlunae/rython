@@ -5690,6 +5690,57 @@ impl<'a> CodeGen for Call {
                         let p = qual("split");
                         Ok(quote!(#p(&(#pat), &(#text), #maxsplit, #flags)?))
                     }
+                    // re.sub with a CALLABLE replacement over a COMPILED
+                    // pattern (`sub(RE_POSSIBLE_ENCODING_INDICATION, lambda
+                    // m: ..., text, count=1)` — charset_normalizer's
+                    // CharsetMatch.output, round 110): the module's compiled
+                    // static (or a `re.compile` value) dispatches through the
+                    // registry's compiled-pattern sub, and the lambda
+                    // receives the Match. A string replacement over a
+                    // compiled pattern lowers through the string form.
+                    ("sub", [pat, repl, text, ..])
+                        if matches!(self.args.get(1), Some(ExprType::Lambda(_)))
+                            || self
+                                .args
+                                .first()
+                                .is_some_and(|p| is_compiled_regex_expr(p, &symbols, &options)) =>
+                    {
+                        let pat_is_compiled = self
+                            .args
+                            .first()
+                            .is_some_and(|p| is_compiled_regex_expr(p, &symbols, &options));
+                        let count = match (rendered.get(3), count_kw) {
+                            (Some(c), None) => quote!(#c),
+                            (None, Some(c)) => {
+                                let c = c.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                quote!(#c)
+                            }
+                            (None, None) => quote!(0),
+                            _ => unreachable!(),
+                        };
+                        let runtime = crate::safe_ident(&options.stdpython);
+                        // The compiled pattern: a module static / re.compile
+                        // value passes as the Regex; a string pattern
+                        // compiles first. The args here are the RENDERED
+                        // tokens (the enclosing dispatch pre-rendered them).
+                        let pat_tokens = if pat_is_compiled {
+                            quote!(#pat)
+                        } else {
+                            let flags = match flags_kw {
+                                Some(e) => flag_letters(&symbols, &e)?,
+                                None => String::new(),
+                            };
+                            quote!(#runtime::stdlib::re::compile(&(#pat), #flags)?)
+                        };
+                        if matches!(self.args.get(1), Some(ExprType::Lambda(_))) {
+                            return Ok(quote!(
+                                #runtime::stdlib::re::sub_re_callable(&(#pat_tokens), &(#repl), &(#text), #count)?
+                            ));
+                        }
+                        return Ok(quote!(
+                            #runtime::stdlib::re::sub_re_str(&(#pat_tokens), &(#repl), &(#text), #count)?
+                        ));
+                    }
                     ("sub", [pat, repl, text, ..]) => {
                         if rendered.len() > 4 {
                             return Err("sub() takes at most 4 positional arguments"
@@ -8090,6 +8141,31 @@ let mutating_self_field = boxed_self_ref_receiver
                         }
                         return Ok(quote!((#receiver).py_insert(#idx, #value)?));
                     }
+                    // str.replace(old, new): RUNTIME string arguments
+                    // (`...replace(m.groups()[0], ...)` inside a sub's
+                    // lambda — charset_normalizer's CharsetMatch.output,
+                    // round 110) — Rust's inherent str::replace needs a
+                    // Pattern and &str, which a String argument is not;
+                    // the PyStrOps form takes AsRef<str> for both.
+                    ("replace", [old, new])
+                        if (crate::ast::tree::call::receiver_is_str_like(
+                            &attr.value, &options, &symbols,
+                        ) || matches!(
+                            crate::infer_type(Some(&ctx), &attr.value, &options, &symbols),
+                            crate::TypeInfo::String
+                                | crate::TypeInfo::StrRef
+                                | crate::TypeInfo::StrOrBytes
+                                // An UNTYPED receiver (a lambda body's
+                                // `m.string[...]` whose `m` is the sub
+                                // callable's Match parameter) — the corpus
+                                // defines no user-class `replace` method,
+                                // and Python's str.replace is the only
+                                // positional-replace surface.
+                                | crate::TypeInfo::PyObject
+                        )) && self.keywords.is_empty() =>
+                    {
+                        return Ok(quote!((#receiver).py_replace(&(#old), &(#new))));
+                    }
                     // partition/rpartition raise ValueError on an empty
                     // separator, so the calls take `?`.
                     ("partition", [sep]) => {
@@ -10225,6 +10301,96 @@ fn render_lambda_over(
 /// table): same-module, an imported class through its defining module, or
 /// — when the scope does not bind the name at all — any crate module that
 /// defines it.
+/// Whether `expr` holds a COMPILED regex pattern: a `re.compile(...)`
+/// call (module-qualified, or through a `from re import compile as X`
+/// alias — charset_normalizer's constant.py, round 110), or a name
+/// whose module-level binding is one. The compiled-pattern `re.sub`
+/// dispatch keys off this.
+pub(crate) fn is_compiled_regex_expr(
+    expr: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    fn is_re_compile_call(call: &crate::Call, symbols: &SymbolTableScopes) -> bool {
+        match call.func.as_ref() {
+            ExprType::Attribute(a) => {
+                matches!(a.value.as_ref(), ExprType::Name(n) if crate::StdModule::from_name(&n.id) == Some(crate::StdModule::Re))
+                    && a.attr == "compile"
+            }
+            ExprType::Name(cn) => {
+                matches!(
+                    symbols.get(&cn.id),
+                    Some(crate::SymbolTableNode::Alias(member))
+                        if matches!(
+                            symbols.get(member),
+                            Some(crate::SymbolTableNode::ImportFrom(i))
+                                if i.module == "re"
+                                    && i.names.iter().any(|a| a.name == *member && a.name == "compile")
+                        )
+                )
+            }
+            _ => false,
+        }
+    }
+    match expr {
+        ExprType::Call(c) => is_re_compile_call(c, symbols),
+        ExprType::Name(n) => {
+            if let Some(crate::SymbolTableNode::Assign { value, .. }) = symbols.get(&n.id) {
+                return matches!(value, ExprType::Call(c) if is_re_compile_call(c, symbols));
+            }
+            // A re-EXPORT (`from .constant import RE_...` — models.py's
+            // view of constant.py's compiled static): resolve through the
+            // defining module's binding of the original name. The
+            // defining module's OWN `from re import compile as X` aliases
+            // are what its re.compile calls are spelled with, so they are
+            // collected first and the callee checked against them.
+            if let Some(crate::SymbolTableNode::ImportFrom(i)) = symbols.get(&n.id) {
+                let path = i.resolved_module_path(options);
+                if !path.is_empty()
+                    && let Some(def) = options.module_defs.get(&path)
+                {
+                    let mut re_compile_aliases: Vec<String> = Vec::new();
+                    for st in &def.raw.body {
+                        if let crate::StatementType::ImportFrom(fi) = &st.statement
+                            && fi.module == "re"
+                        {
+                            for al in &fi.names {
+                                if al.name == "compile" {
+                                    if let Some(asname) = &al.asname {
+                                        re_compile_aliases.push(asname.clone());
+                                    } else {
+                                        re_compile_aliases.push(al.name.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for st in &def.raw.body {
+                        if let crate::StatementType::Assign(a) = &st.statement
+                            && let [crate::ExprType::Name(t)] = a.targets.as_slice()
+                            && i.names.iter().any(|al| al.name == t.id)
+                            && let crate::ExprType::Call(c) = &a.value
+                        {
+                            let called = match c.func.as_ref() {
+                                ExprType::Name(cn) => {
+                                    re_compile_aliases.contains(&cn.id)
+                                        || is_re_compile_call(c, symbols)
+                                }
+                                _ => is_re_compile_call(c, symbols),
+                            };
+                            if called {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn receiver_class_tail(
     class_name: &str,
     class_symbols: SymbolTableScopes,
