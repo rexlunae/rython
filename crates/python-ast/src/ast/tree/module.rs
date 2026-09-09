@@ -3009,13 +3009,19 @@ fn sibling_imported_names(options: &PythonOptions) -> std::collections::HashSet<
     if options.module_defs.len() <= 1 || options.this_module_path.is_empty() {
         return names;
     }
-    // MODULE-LEVEL sibling imports only. A FUNCTION-LOCAL sibling import
-    // (`from .uts46data import uts46data` inside idna's methods) is NOT
-    // promoted: the imported value may be a huge heterogeneous table
-    // whose boxed-static type change cascades through the consumers'
-    // inference (idna 3.10 measured 87 -> 179 rustc errors in round 57);
-    // the module-level import of a name still promotes it (the common
-    // cross-module constant pattern).
+    // Every sibling import promotes, wherever it is WRITTEN: a
+    // FUNCTION-LOCAL `from .uts46data import uts46data` (idna's
+    // `uts46_remap`) needs the static exactly as a module-level one does,
+    // because the generated `pub use crate::idna::uts46data::uts46data;`
+    // is emitted at module scope either way and a module-init local
+    // cannot satisfy it (E0432, issue #333).
+    //
+    // Function-local imports were once excluded here: boxing a huge
+    // heterogeneous table cost more in the consumers' inference than the
+    // missing static did (idna 3.10 measured 87 -> 179 rustc errors in
+    // round 57). Re-measured on the same package after the intervening
+    // inference work, it now pays for itself — idna 46 -> 45 and requests
+    // 1853 -> 1849 — so the exclusion is gone rather than carried.
     let this_path = &options.this_module_path;
     for (path, module) in options.module_defs.iter() {
         if *path == *this_path {
@@ -3025,7 +3031,18 @@ fn sibling_imported_names(options: &PythonOptions) -> std::collections::HashSet<
         // resolve against ITS path, not this module's.
         let mut sibling_options = options.clone();
         sibling_options.module_path = module_package_path_from_defs(path, &options);
-        for stmt in &module.raw.body {
+        let mut sibling_imports: Vec<&crate::Statement> = Vec::new();
+        crate::ast::tree::visit::walk_stmts(
+            &module.raw.body,
+            crate::ast::tree::visit::Descend::All,
+            &mut |st| {
+                if matches!(st.statement, ST::ImportFrom(_)) {
+                    sibling_imports.push(st);
+                }
+                crate::ast::tree::visit::Flow::Continue
+            },
+        );
+        for stmt in sibling_imports {
             if let ST::ImportFrom(ifm) = &stmt.statement {
                 if ifm.resolved_module_path(&sibling_options) == *this_path {
                     for alias in &ifm.names {
