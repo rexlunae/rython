@@ -382,6 +382,16 @@ impl CodeGen for Name {
                 ));
                 return Ok(quote!(stdpython::PyValue::None_));
             }
+            // A module container being MUTATED IN PLACE by the
+            // enclosing statement (issues #337, #122): the locked object
+            // is bound to a temporary, and every read of the name inside
+            // that statement is that temporary — never another
+            // `py_global_read`, which would clone a second copy and read
+            // it instead of the object being mutated.
+            if let Some(alias) = options.static_mutation_alias.get(&self.id) {
+                let ident = crate::safe_ident(alias);
+                return Ok(quote!(#ident));
+            }
             // A closure CELL (issue #122): a local a nested closure
             // mutates is held in a `stdpython::PyCell` so both sides see
             // one object. A VALUE read takes the snapshot the cell holds,

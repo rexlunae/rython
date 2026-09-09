@@ -73,6 +73,22 @@ impl CodeGenContext {
         }
     }
 
+    /// Whether this code runs inside a LOOP BODY.
+    ///
+    /// A value moved in a loop body is moved on every turn, so a name
+    /// consumed here is reused whatever its textual use count says — one
+    /// occurrence in the source is many at run time. The reuse-clone rule
+    /// consults this the way it consults the use counts.
+    pub fn in_loop_body(&self) -> bool {
+        match self {
+            CodeGenContext::Loop { .. } => true,
+            CodeGenContext::TryBlock { parent }
+            | CodeGenContext::ExceptHandler { parent } => parent.in_loop_body(),
+            CodeGenContext::Async(inner) => inner.in_loop_body(),
+            _ => false,
+        }
+    }
+
     /// Whether a `break`/`continue` generated here would have to cross a
     /// try-block closure boundary to reach its loop. Walking outward, the
     /// first `Loop` means the statement binds to a real Rust loop; hitting

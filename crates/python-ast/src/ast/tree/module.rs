@@ -4083,6 +4083,46 @@ pub(crate) fn module_global_mutable_names(
             out.insert(name.clone(), kind);
         }
     }
+    // A module container MUTATED IN PLACE (`REGISTRY.append(x)` — issue
+    // #337, and botocore's `_INITIALIZERS.append(callback)` — issue #122):
+    // shared mutable state, not a promoted LazyLock whose clone-on-read
+    // would drop the mutation silently. No `global` declaration is
+    // involved — Python needs none to mutate the object a name is bound
+    // to — so this is decided here rather than by the write sets.
+    //
+    // The single top-level store is the static's initializer, exactly as
+    // the Computed kind above expects; a name with several stores is
+    // already classified by that pass.
+    let mutated = module_mutated_in_place(body);
+    for s in body {
+        let crate::StatementType::Assign(a) = &s.statement else {
+            continue;
+        };
+        let [crate::ExprType::Name(n)] = a.targets.as_slice() else {
+            continue;
+        };
+        if !mutated.contains(&n.id)
+            || out.contains_key(&n.id)
+            || module_assign_counts.get(&n.id) != Some(&1)
+            || global_written.contains(&n.id)
+            || bound_without_global.contains(&n.id)
+            || matches!(
+                symbols.get(&n.id),
+                Some(crate::SymbolTableNode::ImportFrom(_))
+                    | Some(crate::SymbolTableNode::Import(_))
+                    | Some(crate::SymbolTableNode::ClassDef(_))
+                    | Some(crate::SymbolTableNode::FunctionDef(_))
+            )
+        {
+            continue;
+        }
+        // Boxedness is refined by the module generator once the
+        // module-init type analysis has run, exactly as for the arm
+        // above: `name_types` is empty this early, so deciding it here
+        // would box every container.
+        out.insert(n.id.clone(), Kind::Computed { boxed: true });
+    }
+
     if global_written.is_empty() {
         return out;
     }
@@ -4152,6 +4192,181 @@ pub(crate) fn module_global_mutable_names(
 /// branches, read by a function (the `promoted_conditional` detection in
 /// `Module::to_rust`, mirrored so the mutable-static decision never claims
 /// the same name).
+/// Module-level names whose OBJECT is mutated in place anywhere in the
+/// module, function bodies included: a mutating method on the name
+/// (`REGISTRY.append(x)`, `TABLE.update(d)`) or a store THROUGH it
+/// (`REGISTRY[0] = v`, `TABLE["k"] = v`).
+///
+/// Python needs no `global` declaration for these — `global` rebinds a
+/// NAME, while these change the object the name is already bound to — so
+/// they never reach the `global`-driven analysis above. A promoted
+/// LazyLock static reads by clone, which puts the mutation on a temporary
+/// and loses it silently (issue #337: `((*REGISTRY).clone()).push(x)`).
+/// Such a name has to be shared mutable state instead.
+///
+/// A bare-name REBINDING is not one of these: that is the `global` case,
+/// and without the declaration Python makes it a function local.
+fn module_mutated_in_place(body: &[crate::Statement]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let note = |root: Option<&str>, out: &mut std::collections::HashSet<String>| {
+        if let Some(r) = root {
+            out.insert(r.to_string());
+        }
+    };
+    walk_stmts(body, Descend::All, &mut |s| {
+        for t in crate::ast::tree::visit::stmt_targets(s) {
+            // A bare name binds; only a store THROUGH the name mutates
+            // the object it holds.
+            if matches!(t, crate::ExprType::Name(_)) {
+                continue;
+            }
+            note(store_root(t), &mut out);
+        }
+        for e in crate::ast::tree::visit::stmt_all_exprs(s) {
+            crate::ast::tree::visit::walk_expr(e, &mut |sub| {
+                if let crate::ExprType::Call(c) = sub
+                    && let crate::ExprType::Attribute(attr) = c.func.as_ref()
+                    && crate::ast::tree::scope::mutates_receiver(&attr.attr)
+                    && let crate::ExprType::Name(recv) = attr.value.as_ref()
+                {
+                    out.insert(recv.id.clone());
+                }
+            });
+        }
+        Flow::Continue
+    });
+    out
+}
+
+/// The mutable module static a statement mutates IN PLACE, if any — a
+/// mutating method on the name or a store through it (issues #337, #122).
+///
+/// The same rule [`module_mutated_in_place`] uses to decide which names
+/// become shared statics, read from the other side so the two cannot
+/// disagree about what a mutation is. A bare-name target REBINDS and is
+/// the `global` write path (`py_global_write`), not this.
+pub(crate) fn static_mutation_root(
+    s: &crate::Statement,
+    statics: &std::collections::HashMap<String, crate::MutableGlobalKind>,
+) -> Option<String> {
+    for t in crate::ast::tree::visit::stmt_targets(s) {
+        if matches!(t, crate::ExprType::Name(_)) {
+            continue;
+        }
+        if let Some(root) = store_root(t)
+            && statics.contains_key(root)
+        {
+            return Some(root.to_string());
+        }
+    }
+    let mut found: Option<String> = None;
+    for e in crate::ast::tree::visit::stmt_all_exprs(s) {
+        crate::ast::tree::visit::walk_expr(e, &mut |sub| {
+            if found.is_some() {
+                return;
+            }
+            if let crate::ExprType::Call(c) = sub
+                && let crate::ExprType::Attribute(attr) = c.func.as_ref()
+                && crate::ast::tree::scope::mutates_receiver(&attr.attr)
+                && let crate::ExprType::Name(recv) = attr.value.as_ref()
+                && statics.contains_key(&recv.id)
+            {
+                found = Some(recv.id.clone());
+            }
+        });
+    }
+    found
+}
+
+/// Whether a statement that mutates `name` in place also READS it in the
+/// expressions it evaluates — `REGISTRY.append(len(REGISTRY))`. The
+/// mutation holds a non-reentrant lock, so such a read would deadlock;
+/// the caller refuses it at conversion.
+///
+/// The receiver of the mutation itself is not a read: it IS the mutation.
+pub(crate) fn statement_reads_static_in_arguments(
+    s: &crate::Statement,
+    name: &str,
+) -> bool {
+    let mut reads = false;
+    let mut check = |e: &crate::ExprType| {
+        crate::ast::tree::visit::walk_expr(e, &mut |sub| {
+            if let crate::ExprType::Name(n) = sub
+                && n.id == name
+            {
+                reads = true;
+            }
+        });
+    };
+    for e in crate::ast::tree::visit::stmt_exprs(s) {
+        match e {
+            // A mutating call: its RECEIVER is the mutation target, its
+            // arguments are ordinary reads.
+            crate::ExprType::Call(c)
+                if matches!(c.func.as_ref(), crate::ExprType::Attribute(attr)
+                    if crate::ast::tree::scope::mutates_receiver(&attr.attr)
+                        && matches!(attr.value.as_ref(),
+                            crate::ExprType::Name(r) if r.id == name)) =>
+            {
+                for a in &c.args {
+                    check(a);
+                }
+                for kw in &c.keywords {
+                    check(&kw.value);
+                }
+            }
+            // A store through the name: the target's INDEX is evaluated,
+            // and so is the value.
+            other => check(other),
+        }
+    }
+    for t in crate::ast::tree::visit::stmt_targets(s) {
+        // A store THROUGH the mutated name (`d[k] = v`, `d.f = v`) does
+        // not read it: the base is the object being written, which the
+        // lock already holds. What the store still evaluates are the
+        // subscript indices and slice bounds along the path.
+        if store_root(t) == Some(name) {
+            check_store_path(t, &mut check);
+        } else {
+            check(t);
+        }
+    }
+    reads
+}
+
+/// The parts of a store target that are EVALUATED — every subscript
+/// index and slice bound on the path down to the root name, which is the
+/// object being stored into rather than a read of it.
+fn check_store_path(target: &crate::ExprType, check: &mut impl FnMut(&crate::ExprType)) {
+    match target {
+        crate::ExprType::Name(_) => {}
+        crate::ExprType::Attribute(a) => check_store_path(&a.value, check),
+        crate::ExprType::Subscript(sub) => {
+            match &sub.kind {
+                crate::SubscriptKind::Index(idx) => check(idx),
+                crate::SubscriptKind::Slice { lower, upper, step } => {
+                    for part in [lower, upper, step].into_iter().flatten() {
+                        check(part);
+                    }
+                }
+            }
+            check_store_path(&sub.value, check);
+        }
+        other => check(other),
+    }
+}
+
+/// The NAME a store target is rooted at, through subscripts and
+/// attributes (`REGISTRY["k"].tag`).
+fn store_root(expr: &crate::ExprType) -> Option<&str> {
+    match expr {
+        crate::ExprType::Name(n) => Some(&n.id),
+        crate::ExprType::Attribute(a) => store_root(&a.value),
+        crate::ExprType::Subscript(sub) => store_root(&sub.value),
+        _ => None,
+    }
+}
+
 fn definite_conditional_names(
     body: &[crate::Statement],
     module_assign_counts: &std::collections::HashMap<String, usize>,

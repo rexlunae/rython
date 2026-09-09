@@ -1877,6 +1877,9 @@ pub fn render_reused(
     options: PythonOptions,
     symbols: SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    // A loop BODY moves on every turn, so one textual use is many at run
+    // time: a name consumed here is reused whatever the count says.
+    let in_loop = ctx.in_loop_body();
     let tokens = expr
         .clone()
         .to_rust(ctx, options.clone(), symbols.clone())?;
@@ -1895,7 +1898,8 @@ pub fn render_reused(
             && options.narrowed_names.get(&root).is_some_and(|t| {
                 !matches!(t, TypeInfo::StrOrBytes | TypeInfo::PyValue)
             });
-        if (uses > 1 || self_field) && !narrowed_owned {
+        let loop_reused = in_loop && !options.loop_bound_names.contains(&root);
+        if (uses > 1 || self_field || loop_reused) && !narrowed_owned {
             let t = infer_type(None, expr, &options, &symbols);
             // Round 92: clone whenever the name is not statically Copy —
             // INCLUDING an inferrer-unknown (PyObject) name, which the
@@ -1947,6 +1951,8 @@ pub fn render_typed_reused(
     // unconstrained inside the clone, round 98). A clone only applies to
     // an UN-adapted read; an adapted expression is a fresh value whose
     // source-consumption is the pre-existing shape.
+    // See render_reused: a loop body moves on every turn.
+    let in_loop = ctx.in_loop_body();
     let raw = expr
         .clone()
         .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
@@ -1981,7 +1987,8 @@ pub fn render_typed_reused(
     };
     if let Some(root) = reuse_root_name(expr) {
         let uses = options.use_counts.get(&root).copied().unwrap_or(0);
-        if uses > 1 && !adapted_is_into && !module_root {
+        let loop_reused = in_loop && !options.loop_bound_names.contains(&root);
+        if (uses > 1 || loop_reused) && !adapted_is_into && !module_root {
             let t = infer_type(None, expr, &options, &symbols);
             // See render_reused: clone whenever the name is not statically
             // Copy — INCLUDING inferrer-unknown (PyObject) names, whose

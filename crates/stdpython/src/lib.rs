@@ -3184,6 +3184,34 @@ pub fn py_global_write<T>(cell: &std::sync::Mutex<T>, value: T) {
     *cell.lock().unwrap() = value;
 }
 
+/// Mutate a mutable module global IN PLACE (issues #337, #122): the lock
+/// is held across the whole mutation, so `REGISTRY.append(x)` changes the
+/// one module object instead of a clone that is then dropped.
+///
+/// Python needs no `global` declaration to reach here — `global` rebinds a
+/// NAME, while this changes the object the name is already bound to.
+///
+/// The lock is held for the mutation only, and the converter refuses a
+/// mutation whose own arguments read the same global (`REGISTRY.append(
+/// len(REGISTRY))`) — that shape would deadlock on the non-reentrant
+/// Mutex, and a silent hang is the one outcome worse than a loud one, so
+/// it is a conversion error rather than a runtime risk. `try_lock` was the
+/// alternative and is worse: it would also fire on genuine contention
+/// between threads, turning correct concurrent code into a panic.
+///
+/// A poisoned lock is recovered rather than propagated: a mutation that
+/// panicked leaves the container in whatever state it reached, which is
+/// what CPython leaves behind too, and poisoning every later access would
+/// turn one loud failure into an unrelated cascade.
+#[cfg(feature = "std")]
+pub fn py_global_mutate<T, R>(
+    cell: &std::sync::Mutex<T>,
+    f: impl FnOnce(&mut T) -> R,
+) -> R {
+    let mut guard = cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut guard)
+}
+
 /// Python str() of a boxed heterogeneous value (issue #121): ints, floats,
 /// bools and None render as themselves; a str renders UNQUOTED; bytes use
 /// the `b'...'` repr form; tuple elements always render in REPR form

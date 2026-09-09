@@ -83,6 +83,63 @@ impl CodeGen for Statement {
             _ => None,
         };
         options.stmt_binds = marks.as_ref().map(|m| std::rc::Rc::new(m.bits()));
+        // A statement that MUTATES a module-level container IN PLACE
+        // (`REGISTRY.append(x)`, `TABLE["k"] = v` — issues #337, #122):
+        // the static holds the one module object behind a Mutex, so the
+        // mutation runs under the lock with the name shadowed by the
+        // borrow. Reading the static by clone and mutating THAT is what
+        // this replaces — the mutation landed on a temporary and vanished.
+        if !options.mutable_statics.is_empty()
+            && let Some(root) = crate::ast::tree::module::static_mutation_root(
+                &self,
+                &options.mutable_statics,
+            )
+        {
+            // The Mutex is not reentrant: a mutation whose own arguments
+            // read the same global would deadlock, and a silent hang is
+            // the one outcome worse than a loud one. Refuse it here.
+            if crate::ast::tree::module::statement_reads_static_in_arguments(&self, &root) {
+                return Err(format!(
+                    "`{root}` is mutated in place by a statement that also READS `{root}` \
+                     in its own arguments: the module object is held under a lock for the \
+                     mutation, so the read would deadlock. Bind the read to a local first \
+                     (`n = len({root})`), then mutate."
+                )
+                .into());
+            }
+            let ident = crate::safe_ident(&root);
+            // Rust forbids a binding that shadows a static (E0530), so the
+            // locked object takes a reserved-prefix temporary and the
+            // name resolves to it for this statement only.
+            let alias = format!("{}static_{}", crate::ast::tree::visit::RESERVED_PREFIX, root);
+            let alias_ident = crate::safe_ident(&alias);
+            let mut inner = options.clone();
+            let mut aliases = (*inner.static_mutation_alias).clone();
+            aliases.insert(root.clone(), alias.clone());
+            inner.static_mutation_alias = std::rc::Rc::new(aliases);
+            let mut statics = (*inner.mutable_statics).clone();
+            statics.remove(&root);
+            inner.mutable_statics = std::rc::Rc::new(statics);
+            let mut writables = (*inner.scope_global_writables).clone();
+            writables.remove(&root);
+            inner.scope_global_writables = std::rc::Rc::new(writables);
+            let mut promoted = (*inner.promoted_statics).clone();
+            promoted.remove(&root);
+            inner.promoted_statics = std::rc::Rc::new(promoted);
+            let kind = options.mutable_statics.get(&root).expect("root is a mutable static");
+            let static_ref = kind.static_ref(&ident);
+            let body = self.to_rust(ctx, inner, symbols)?;
+            // The temp is named after the Python global, so an
+            // UPPER_CASE module name (the common shape for a registry)
+            // would draw rustc's non_snake_case lint at every mutation
+            // site. The warning is about an identifier rython synthesized,
+            // not about the user's Python, so it is silenced here rather
+            // than left for the reader to sift out of the real ones.
+            return Ok(quote! {
+                #[allow(non_snake_case)]
+                stdpython::py_global_mutate(#static_ref, |#alias_ident| { #body });
+            });
+        }
         // A statement that MUTATES a closure cell (issue #122): borrow the
         // shared object mutably for the statement and shadow the name with
         // that borrow, so the ordinary store lowering below writes the ONE

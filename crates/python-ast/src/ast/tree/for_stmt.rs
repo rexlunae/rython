@@ -120,9 +120,14 @@ impl CodeGen for For {
             has_else: tracks_break,
             parent: Box::new(ctx.clone()),
         };
+        // The names this loop REBINDS each turn — its target, and whatever
+        // its body assigns. The reuse-clone rule treats a loop body as
+        // reuse for values from outside the loop; these are fresh values
+        // and must be left alone.
+        let body_options = loop_body_options(&options, &target_names, &self.body);
         let body_stmts: Result<Vec<_>, _> = self.body
             .into_iter()
-            .map(|stmt| stmt.to_rust(body_ctx.clone(), options.clone(), symbols.clone()))
+            .map(|stmt| stmt.to_rust(body_ctx.clone(), body_options.clone(), symbols.clone()))
             .collect();
         let mut body_stmts = body_stmts?;
         if let Some(bind) = body_bind {
@@ -350,6 +355,35 @@ pub(crate) fn collect_target_names<'a>(target: &'a ExprType, out: &mut Vec<&'a s
 /// names get a plain store into the prologue-managed binding, loop-local
 /// names a fresh `let`, and tuple targets destructure through unique temps
 /// so nested patterns never shadow a leaked outer name.
+/// The names a loop REBINDS on each turn — its target names plus whatever
+/// its body assigns — added to the options the body is lowered with.
+///
+/// The reuse-clone rule treats a loop body as a reuse of values from
+/// OUTSIDE the loop, since one textual use is many at run time. A name the
+/// loop itself binds is a fresh value each turn and must be left alone.
+pub(crate) fn loop_body_options(
+    options: &crate::PythonOptions,
+    targets: &[&str],
+    body: &[crate::Statement],
+) -> crate::PythonOptions {
+    let mut o = options.clone();
+    let mut bound = (*o.loop_bound_names).clone();
+    bound.extend(targets.iter().map(|n| n.to_string()));
+    crate::ast::tree::visit::walk_stmts(
+        body,
+        crate::ast::tree::visit::Descend::SkipDefs,
+        &mut |st| {
+            bound.extend(crate::ast::tree::visit::stmt_bound_names(
+                st,
+                crate::ast::tree::visit::Bindings::Every,
+            ));
+            crate::ast::tree::visit::Flow::Continue
+        },
+    );
+    o.loop_bound_names = std::rc::Rc::new(bound);
+    o
+}
+
 pub(crate) fn lower_loop_target(
     target: &ExprType,
     value: TokenStream,

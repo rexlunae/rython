@@ -1908,7 +1908,9 @@ impl<'a> CodeGen for Call {
             }
             let mut args = Vec::with_capacity(self.args.len());
             for (arg, expected) in self.args.iter().zip(param_types.iter()) {
-                args.push(crate::render_typed(
+                // A callable value's arguments are owned exactly like a
+                // named call's, so the reuse-clone rule applies here too.
+                args.push(crate::render_typed_reused(
                     arg,
                     ctx.clone(),
                     options.clone(),
