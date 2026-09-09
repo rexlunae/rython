@@ -4348,7 +4348,52 @@ impl CodeGen for ClassDef {
                         .iter()
                         .any(|a| a.methods().any(|m| m.name == name))
             };
-            let display_expr = if defines_dunder("__str__") {
+            // A display dunder that needs `&mut self` cannot run through
+            // the `&self` display surface: py_display borrows the value
+            // immutably, and a value-level impl has no cell to borrow
+            // through (charset_normalizer's CharsetMatch — its __str__
+            // caches the decoded payload — E0596 at the impl, round 111).
+            // Refuse loudly: the generated crate carries a compile_error
+            // naming the class and the fix, never a confusing E0596.
+            let mut_display_dunder = |name: &str| -> bool {
+                defines_dunder(name)
+                    && self.method_needs_mut_self(name, &symbols, &options)
+            };
+            // A display dunder that needs `&mut self` cannot run through
+            // the `&self` display surface: py_display borrows the value
+            // immutably, and a value-level impl has no cell to borrow
+            // through (charset_normalizer's CharsetMatch — its __str__
+            // caches the decoded payload — E0596 at the impl, round 111).
+            // Refuse loudly: the impl carries a compile_error naming the
+            // class and the fix, never a confusing E0596.
+            let mut_display_dunder = |name: &str| -> bool {
+                defines_dunder(name)
+                    && self.method_needs_mut_self(name, &symbols, &options)
+            };
+            let display_refusal = if mut_display_dunder("__str__")
+                || mut_display_dunder("__repr__")
+            {
+                let which = if mut_display_dunder("__str__") {
+                    "__str__"
+                } else {
+                    "__repr__"
+                };
+                Some(format!(
+                    "rython: class `{}` defines `{}` that mutates `self` (it stores \
+                     through the receiver), and the infallible display surface \
+                     (str()/print) runs on an immutable `&self` — the mutation \
+                     cannot reproduce. Make `{}` pure (compute the value without \
+                     storing it on the instance), or move the cached state to an \
+                     explicit method the port calls where CPython relies on the \
+                     cache",
+                    self.name, which, which
+                ))
+            } else {
+                None
+            };
+            let display_expr = if let Some(msg) = &display_refusal {
+                quote!(compile_error!(#msg))
+            } else if defines_dunder("__str__") {
                 quote!(self.__str__().unwrap_or_else(|e| panic!("{}", e)))
             } else if defines_dunder("__repr__") {
                 quote!(self.__repr__().unwrap_or_else(|e| panic!("{}", e)))
@@ -4366,7 +4411,9 @@ impl CodeGen for ClassDef {
             // object form. Every class carries PyRepr so a container of
             // instances prints (`print(sorted(shapes, key=...))`) and the
             // hierarchy sum type can delegate.
-            let repr_expr = if defines_dunder("__repr__") {
+            let repr_expr = if let Some(msg) = &display_refusal {
+                quote!(compile_error!(#msg))
+            } else if defines_dunder("__repr__") {
                 quote!(self.__repr__().unwrap_or_else(|e| panic!("{}", e)))
             } else {
                 let module = options.module_path.join(".");
