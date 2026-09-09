@@ -6315,16 +6315,19 @@ fn replace_bad_keywords_drop_the_call_or_stay_loud() {
 
 #[test]
 fn str_replace_positional_stays_a_plain_method_call() {
+    // Round 110: the positional replace lowers through the PyStrOps form
+    // (both arguments AsRef<str> — runtime String arguments inside a
+    // sub's lambda need it); for literal arguments the lowering is the
+    // same every-occurrence replace Python does.
     let out = compile(
         "def f(s: str):\n    return s.replace(\"a\", \"o\")\n",
         "rep5.py",
     );
     assert!(
-        out.contains("replace (\"a\" , \"o\")"),
+        out.contains(". py_replace (& (\"a\") , & (\"o\"))"),
         "generated: {}",
         out
     );
-    assert!(!out.contains("py_replace"), "generated: {}", out);
 }
 
 // ---- functools.partial over statically-known functions ----

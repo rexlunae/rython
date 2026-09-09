@@ -4767,6 +4767,11 @@ pub trait PyStrOps {
     /// `character.isascii()`). Rust's str::is_ascii is the same test
     /// (every byte < 128).
     fn isascii(&self) -> bool;
+    /// Python str.replace(old, new): every occurrence, both arguments
+    /// runtime strings (the lambda bodies' `...replace(m.groups()[0],
+    /// ...)` — round 110). Rust's inherent str::replace needs a Pattern
+    /// and &str, which a runtime String argument is not.
+    fn py_replace<O: AsRef<str>, N: AsRef<str>>(&self, old: O, new: N) -> String;
     /// str.ljust / str.rjust with a fill character, width in CHARACTERS.
     /// The fill must be exactly one character; Python raises TypeError
     /// otherwise (silently using a prefix would diverge).
@@ -5138,6 +5143,9 @@ impl<T: AsRef<str> + ?Sized> PyStrOps for T {
         // Python: true for the empty string and when every character is
         // 7-bit ASCII. For valid UTF-8, all-bytes-ASCII is the same test.
         self.as_ref().is_ascii()
+    }
+    fn py_replace<O: AsRef<str>, N: AsRef<str>>(&self, old: O, new: N) -> String {
+        self.as_ref().replace(old.as_ref(), new.as_ref())
     }
     fn py_ljust(&self, width: i64, fill: &str) -> Result<String, PyException> {
         let fill_char = single_fill_char(fill)?;
