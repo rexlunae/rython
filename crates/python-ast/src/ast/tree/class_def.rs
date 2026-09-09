@@ -4353,12 +4353,6 @@ impl CodeGen for ClassDef {
             // immutably, and a value-level impl has no cell to borrow
             // through (charset_normalizer's CharsetMatch — its __str__
             // caches the decoded payload — E0596 at the impl, round 111).
-            // Refuse loudly: the generated crate carries a compile_error
-            // naming the class and the fix, never a confusing E0596.
-            let mut_display_dunder = |name: &str| -> bool {
-                defines_dunder(name)
-                    && self.method_needs_mut_self(name, &symbols, &options)
-            };
             // A display dunder that needs `&mut self` cannot run through
             // the `&self` display surface: py_display borrows the value
             // immutably, and a value-level impl has no cell to borrow
