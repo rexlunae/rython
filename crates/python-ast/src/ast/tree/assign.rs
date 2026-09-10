@@ -215,6 +215,52 @@ impl<'a> CodeGen for Assign {
             return Ok(quote!(#ident = #value;));
         }
 
+        // An ANNOTATED binding of a COMPREHENSION (`detectors:
+        // list[MessDetectorPlugin] = [md_class() for ...]` —
+        // charset_normalizer's mess_ratio, round 114): the annotation's
+        // ELEMENT type threads into the comprehension — heterogeneous
+        // sibling-class pushes coerce to the hierarchy root, and the
+        // element's own lowering (a `md_class()` construction) types
+        // against it. Without the thread the comprehension's Vec cannot
+        // name a common element (E0282).
+        if self.targets.len() == 1
+            && matches!(&self.targets[0], ExprType::Name(_))
+            && match &self.value {
+                ExprType::ListComp(_) | ExprType::SetComp(_) => true,
+                // A non-empty LITERAL (`pets: list[Animal] =
+                // [Cat(..), Dog(..)]`): the sibling-class elements
+                // coerce to the root the annotation names — the
+                // literal's own sibling unification picks the DEEPEST
+                // common root instead (AnyRect for list[Shape]),
+                // mismatching the annotation.
+                ExprType::List(l) => !l.is_empty(),
+                _ => false,
+            }
+            && let Some(ann) = &self.annotation
+        {
+            if let Some(ty) = crate::resolve_alias_typeinfo(ann, &symbols, &options)
+                && let crate::TypeInfo::Vec(inner) = &ty
+            {
+            let mut value_options = options.clone();
+            value_options.forced_list_elt =
+                std::rc::Rc::new(Some((**inner).clone()));
+            return self
+                .value
+                .clone()
+                .to_rust(ctx, value_options, symbols)
+                .map(|tokens| {
+                    let ident = match &self.targets[0] {
+                        ExprType::Name(n) => crate::safe_ident(&n.id),
+                        other => {
+                            let _ = other;
+                            unreachable!("single-target name checked above")
+                        }
+                    };
+                    quote!(#ident = #tokens;)
+                });
+            }
+        }
+
         // An assignment to a closure CELL (issue #122): the binding a
         // nested definition shares. The cell was declared once by the
         // scope's prologue, so this BINDS THROUGH it — a closure created

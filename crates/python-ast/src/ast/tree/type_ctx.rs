@@ -375,7 +375,12 @@ pub fn coerce_tokens(
         && crate::ast::tree::hierarchy::is_polymorphic_root(b)
     {
         return if a == b || crate::ast::tree::class_def::ClassDef::extends_by_name(a, b) {
-            Some(quote!((#tokens).into()))
+            // The NAMED conversion (`AnyAnimal::from(cat)`): an `.into()`
+            // in a `vec![...]` literal leaves the element type unnamed
+            // (E0282 — a sibling-classes list, round 114), and the From
+            // impls the any_enum emission carries name the target.
+            let any = crate::ast::tree::hierarchy::any_ident(b);
+            Some(quote!(#any::from(#tokens)))
         } else {
             None
         };

@@ -18367,7 +18367,11 @@ fn a_list_of_a_root_holds_the_sum_type_and_its_elements_convert() {
     let out = compile(SHAPES_SRC, "hier_list.py");
     let flat: String = out.split_whitespace().collect();
     assert!(
-        flat.contains("Rect::new(2.0)?}).into()") && flat.contains("Square::new(1.0)?}).into()"),
+        // Round 114: the conversion NAMES the target sum type
+        // (`AnyShape::from(...)`) — an `.into()` in a `vec![...]` literal
+        // left the element type unnamed (E0282).
+        flat.contains("AnyShape::from({Rect::new(2.0)?})")
+            && flat.contains("AnyShape::from({Square::new(1.0)?})"),
         "every element converts into the root's sum type: {}",
         out
     );
@@ -19535,7 +19539,7 @@ fn a_shared_family_sum_type_holds_references_and_borrows_in_its_delegators() {
         out
     );
     assert!(
-        flat.contains("PyRef::new(Perishable::new()?)}).into()"),
+        flat.contains("::from({stdpython::PyRef::new(Perishable::new()?)}"),
         "a subtree construction converts into the sum type: {}",
         out
     );
