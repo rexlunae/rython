@@ -216,7 +216,25 @@ impl CodeGen for Subscript {
                 (norm >= 0 && norm < len).then_some(norm)
             })
         });
-        let value = self.value.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        // A NARROWED Option receiver (`decoded_payload` after the
+        // `if not (decoded_payload).py_is_none()` conjunct — utils.py,
+        // or `results` after the `if results else` truthiness test —
+        // round 117) renders UN-narrowed: the narrowed read's generic
+        // unwrap would double with the subscript's message-unwrap (the
+        // narrowed read unwraps without a message; the subscript's is
+        // the ONE unwrap, carrying CPython's TypeError).
+        let recv_options = {
+            let mut o = options.clone();
+            if value_yields_option
+                && let ExprType::Name(n) = self.value.as_ref()
+            {
+                let mut narrowed = o.narrowed_names.as_ref().clone();
+                narrowed.remove(&n.id);
+                o.narrowed_names = std::rc::Rc::new(narrowed);
+            }
+            o
+        };
+        let value = self.value.to_rust(ctx.clone(), recv_options, symbols.clone())?;
         let value = if value_yields_option {
             quote!((#value).clone().unwrap_or_else(|| {
                 panic!("TypeError: 'NoneType' object is not subscriptable")
