@@ -435,20 +435,126 @@ impl CodeGen for ListComp {
         })
     }
 
-    fn to_rust(
+        fn to_rust(
         self,
         ctx: Self::Context,
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // The element renders in the full scope, with every name an `if`
-        // FILTER proved non-None narrowed to its inner (see
-        // comprehension_filter_narrowings).
+        // The element type an ANNOTATED binding threads in (`pets:
+        // list[Animal] = [Cat(..), Dog(..)]` — the sibling-class pushes
+        // coerce to the hierarchy root, round 114): without it a
+        // heterogeneous Vec cannot even name its element.
+                // `X.__subclasses__()` — the DETECTOR-REGISTRY shape
+        // (`[md_class() for md_class in MessDetectorPlugin.__subclasses__()]`
+        // — charset_normalizer's mess_ratio, round 114): the registry
+        // enumerates the class's KNOWN subclasses — statically, from the
+        // hierarchy index — and the element (a no-argument construction of
+        // the bound target) renders per subclass, coerced to the root the
+        // binding's annotation names. Python's `__subclasses__` is live
+        // metadata; the static enumeration is the registry's only
+        // representable form — subclasses defined outside the converted
+        // modules are invisible (a divergence on the ledger), and a
+        // non-construction element stays on the general path below.
+        {
+            let registry_shape = self.generators.len() == 1
+                && {
+                    let iter_is_subclasses = match &self.generators[0].iter {
+                        ExprType::Call(c) => matches!(
+                            c.func.as_ref(),
+                            ExprType::Attribute(a)
+                                if a.attr == "__subclasses__"
+                                    && matches!(
+                                        a.value.as_ref(),
+                                        ExprType::Name(b)
+                                            if matches!(
+                                                symbols.get(&b.id),
+                                                Some(crate::SymbolTableNode::ClassDef(_))
+                                            )
+                                    )
+                        ),
+                        _ => false,
+                    };
+                    iter_is_subclasses
+                }
+                && match self.elt.as_ref() {
+                    ExprType::Call(c) => matches!(c.func.as_ref(), ExprType::Name(t)
+                        if match &self.generators[0].target {
+                            ExprType::Name(tn) => tn.id == t.id,
+                            _ => false,
+                        }),
+                    _ => false,
+                };
+            if registry_shape {
+                let base_name = match &self.generators[0].iter {
+                    ExprType::Call(c) => match c.func.as_ref() {
+                        ExprType::Attribute(a) => match a.value.as_ref() {
+                            ExprType::Name(b) => b.id.clone(),
+                            _ => unreachable!("checked above"),
+                        },
+                        _ => unreachable!("checked above"),
+                    },
+                    _ => unreachable!("checked above"),
+                };
+                let members: Vec<String> =
+                    crate::ast::tree::hierarchy::subtree(&options, &base_name)
+                        .map(|v| {
+                            v.iter()
+                                .skip(1)
+                                .map(|m| m.name.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                let elt_expected = (*options.forced_list_elt).clone();
+                let mut pushes = TokenStream::new();
+                for member in &members {
+                    let construction = ExprType::Call(crate::Call {
+                        func: Box::new(ExprType::Name(crate::Name {
+                            id: member.clone(),
+                        })),
+                        args: Vec::new(),
+                        keywords: Vec::new(),
+                    });
+                    let rendered = match &elt_expected {
+                        Some(ty) => crate::render_typed(
+                            &construction,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(ty.clone()),
+                        )?,
+                        None => construction.to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+                    };
+                    pushes.extend(quote!(__rython_comp.push(#rendered);));
+                }
+                let vec_ty = match &elt_expected {
+                    Some(ty) => ty.to_rust_type(),
+                    None => quote!(_),
+                };
+                return Ok(quote! {
+                    {
+                        let mut __rython_comp: Vec<#vec_ty> = Vec::new();
+                        #pushes
+                        __rython_comp
+                    }
+                });
+            }
+        }
         let mut scope = crate::comprehension_scope(&self.generators, Some(&ctx), &options, &symbols);
         for (name, inner) in comprehension_filter_narrowings(&self.generators, &scope) {
             apply_comprehension_narrowing(&mut scope, &name, inner);
         }
-        let elt = (*self.elt).clone().to_rust(ctx.clone(), scope.clone(), symbols.clone())?;
+        let elt_expected = (*options.forced_list_elt).clone();
+        let elt = match &elt_expected {
+            Some(ty) => crate::render_typed(
+                &self.elt,
+                ctx.clone(),
+                scope.clone(),
+                symbols.clone(),
+                Some(ty.clone()),
+            )?,
+            None => (*self.elt).clone().to_rust(ctx.clone(), scope.clone(), symbols.clone())?,
+        };
         let loops = build_comprehension_loops(
             &self.generators,
             quote! { __rython_comp.push(#elt); },
@@ -456,9 +562,13 @@ impl CodeGen for ListComp {
             &options,
             &symbols,
         )?;
+        let vec_ty = match &elt_expected {
+            Some(ty) => ty.to_rust_type(),
+            None => quote!(_),
+        };
         Ok(quote! {
             {
-                let mut __rython_comp = Vec::new();
+                let mut __rython_comp: Vec<#vec_ty> = Vec::new();
                 #loops
                 __rython_comp
             }

@@ -6839,6 +6839,107 @@ fn re_sub_compiled_pattern_with_callable_repl_matches_python() {
 }
 
 #[test]
+fn subclass_registry_comprehension_and_annotated_hierarchy_list_match_python() {
+    // Round 114: two hierarchy shapes.
+    // - `[d() for d in Detector.__subclasses__()]` (md.py's detector
+    //   registry): the registry enumerates the class's KNOWN subclasses —
+    //   statically, from the hierarchy index — and unrolls, each element a
+    //   no-argument construction of one subclass, coerced to the root the
+    //   annotation names. Python's `__subclasses__` is live metadata; the
+    //   static enumeration is the registry's only representable form.
+    // - `pets: list[Animal] = [Cat(..), Dog(..)]` — the annotated binding
+    //   threads its ELEMENT type into the list literal, so the
+    //   sibling-class elements coerce to the hierarchy root (the
+    //   literal's own unification picked the deepest common root).
+    // Transcripts pinned against python3.
+    let scratch = Scratch::new("subreg");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "from typing import List\n",
+            "\n",
+            "\n",
+            "class Detector:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.hits: int = 0\n",
+            "\n",
+            "    def feed(self, ch: str) -> None:\n",
+            "        self.hits += 1\n",
+            "\n",
+            "    def ratio(self) -> float:\n",
+            "        return self.hits / 10\n",
+            "\n",
+            "\n",
+            "class A(Detector):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class B(Detector):\n",
+            "    def feed(self, ch: str) -> None:\n",
+            "        self.hits += 2\n",
+            "\n",
+            "\n",
+            "def mess(text: str) -> List[float]:\n",
+            "    detectors: List[Detector] = [d() for d in Detector.__subclasses__()]\n",
+            "    out: List[float] = []\n",
+            "    for d in detectors:\n",
+            "        for ch in text:\n",
+            "            d.feed(ch)\n",
+            "        out.append(d.ratio())\n",
+            "    return out\n",
+            "\n",
+            "\n",
+            "class Animal:\n",
+            "    def __init__(self, name: str) -> None:\n",
+            "        self.name: str = name\n",
+            "\n",
+            "    def speak(self) -> str:\n",
+            "        return \"...\"\n",
+            "\n",
+            "\n",
+            "class Cat(Animal):\n",
+            "    def speak(self) -> str:\n",
+            "        return \"meow\"\n",
+            "\n",
+            "\n",
+            "class Dog(Animal):\n",
+            "    def speak(self) -> str:\n",
+            "        return \"woof\"\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(mess(\"abc\"))\n",
+            "    pets: List[Animal] = [Cat(\"a\"), Dog(\"b\")]\n",
+            "    for p in pets:\n",
+            "        print(p.name, p.speak())\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["[0.3, 0.6]", "a meow", "b woof"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {
     // Round 41: a trait-DEFAULT body that formats `self` in an exception
     // message (`raise PoolError(self)` — urllib3's _get_conn raises
