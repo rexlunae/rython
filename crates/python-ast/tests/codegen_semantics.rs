@@ -2797,6 +2797,43 @@ fn omitted_defaults_must_be_constant() {
 }
 
 #[test]
+fn nested_def_bare_name_default_converts() {
+    // A nested def whose default is a bare NAME resolves to a reference at
+    // def-site with NO side effects / output / mutation / exception, so it
+    // "runs code" only in the trivial reference sense the closure capture
+    // model already threads. header_runs_code used to refuse *any*
+    // expression default; a Name default is now allowed through and its
+    // value captured by the enclosing scope. (A mutable-list or genuine
+    // expression default still stays loud — see
+    // omitted_defaults_must_be_constant.)
+    let module = crate::parse(
+        "sep = \"-\"\ndef join(words):\n    def glue(a=x, b=sep):\n        return a + b\n    return [glue() for _ in words]\n",
+        "nestednamedefault.py",
+    )
+    .unwrap();
+    let symbols = module.clone().find_symbols(crate::SymbolTableScopes::new());
+    let out = module
+        .to_rust(
+            crate::CodeGenContext::Module("nestednamedefault".to_string()),
+            crate::PythonOptions::default(),
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    assert!(out.contains("glue"), "generated: {out}");
+
+    // The mutable-list sibling is still a loud refusal.
+    let err = compile_err(
+        "def outer():\n    def grade(breakpoints=[60, 70]):\n        return breakpoints\n    return grade()\n",
+        "nestedmutlist.py",
+    );
+    assert!(
+        err.contains("default") && err.contains("EVALUATES"),
+        "error: {err}",
+    );
+}
+
+#[test]
 fn nested_constant_binary_defaults_are_accepted() {
     // A default that is a NESTED constant binary expression
     // (`(2.0*pi)**0.5` — random's sqrt2pi, a Pow whose left is itself a
