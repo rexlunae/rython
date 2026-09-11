@@ -228,11 +228,24 @@ impl InferredSignature {
     }
 
     /// The `where A: ..., B: ...` clause, or empty when there are no bounds.
+    ///
+    /// A bound can be an EMPTY token stream — e.g. `ParamReq::Method` on an
+    /// unknown duck-typed member (`quote!()` at the ParamReq::Method arm)
+    /// emits no bound at all. Emitting it as-is would render `where , B:
+    /// Clone`, which is not valid Rust, so empty bounds are dropped here.
+    /// (They documented that no bound can be generated; contributing nothing
+    /// is the intended meaning, and dropping them cannot change semantics.)
     pub fn where_clause(&self) -> TokenStream {
-        if self.where_bounds.is_empty() {
+        // The dedupe below keeps the first of duplicate bounds; retain order.
+        let bounds: Vec<TokenStream> = self
+            .where_bounds
+            .iter()
+            .filter(|b| !b.to_string().trim().is_empty())
+            .map(|b| b.clone())
+            .collect();
+        if bounds.is_empty() {
             return TokenStream::new();
         }
-        let bounds = &self.where_bounds;
         quote!(where #(#bounds),*)
     }
 

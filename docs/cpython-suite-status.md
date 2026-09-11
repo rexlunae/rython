@@ -57,7 +57,7 @@ and `test.*` stdlib references, and asserts are dropped.
 
 | File | Status | First blocker |
 |---|---|---|
-| `test_heapq` | CONVERT | — (asserts dropped as warnings; needs #334 to assert/run) |
+| `test_heapq` | CONVERT* | `load_tests` null-`where` bug FIXED (this round); now blocks on the nested-`iterable` no-return-annotation callable wall (#334) |
 | `test_calendar` | CONVERT | — (same) |
 | `test_struct` | CONVERT | — (same) |
 | `test_fractions` | CONVERT | — (same) |
@@ -116,6 +116,13 @@ inside (or leads to) the unittest harness:
   (mutable lists, calls) stay loud. (`add7b07`)
 - Recursion whose base type sits under an `if`-expression's non-recursive leaf
   no longer bails — `count_set_bits` infers `i64` instead of refusing. (`…`)
+- **Empty `where`-clause bounds are dropped** instead of rendering
+  `where , B: Clone` — invalid Rust that broke the generated crate for every
+  `load_tests(loader, tests, ignore)` shape with an unbound nested-class
+  member. `test_heapq`'s `load_tests` now renders a valid signature (and its
+  crate advances to the nested-`iterable` callable wall). Real bounds
+  (`A: PyAdd<B>, A: Clone, …`) still emit; only the empty ones are dropped.
+  Pin: `empty_where_bound_does_not_emit_a_stray_comma`.
 - These recede pure-language walls (math advances past `count_set_bits`), but
   the *count* moves only when the #334 harness lands, because that is the
   shared gate for all 17 files.

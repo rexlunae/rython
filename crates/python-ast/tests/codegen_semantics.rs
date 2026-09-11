@@ -1896,6 +1896,34 @@ fn sibling_from_import_anchors_to_crate() {
 }
 
 #[test]
+fn empty_where_bound_does_not_emit_a_stray_comma() {
+    // A generic function whose inferred `where` clause gains an EMPTY bound
+    // (a duck-typed member it cannot bound — the `ParamReq::Method` unknown
+    // arm emits `quote!()` for it) rendered as `where , B: Clone`, which is
+    // not valid Rust and broke every such generated crate. The
+    // where-bounds collector must drop empty bounds so the join can never
+    // leave a leading comma. (test_heapq and its siblings all define a
+    // `load_tests(loader, tests, ignore)`; a nested class inside the body
+    // provokes the unbound member.)
+    let out = compile(
+        concat!(
+            "def load_tests(loader, tests, ignore):\n",
+            "    class Finder:\n",
+            "        def find(self, *args, **kwargs):\n",
+            "            return tests\n",
+            "    return tests\n",
+        ),
+        "load_tests_generic.rs",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !flat.contains("where,"),
+        "a `where ,` must not survive: {}",
+        out
+    );
+}
+
+#[test]
 fn defaulted_annotated_parameter_maps_type() {
     // Defaulted parameters lower to plain required parameters with mapped
     // types (never the raw Python name, and no Option wrapper, which
