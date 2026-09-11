@@ -124,3 +124,24 @@ The accounting tests are fast and run in CI without downloading the corpus:
 ```sh
 python3 -m unittest discover -s eval/sweep -p 'test_*.py'
 ```
+
+## Recorded post-#373 baseline
+
+[`run-e05416c-accounting.json`](results/run-e05416c-accounting.json) measures
+converter commit `e05416c` (merged into main as `419b143`) with schema 2:
+
+| Package | E-coded errors | Other error diagnostics | Build |
+|---|---:|---:|---|
+| urllib3 | 681 | 53 | failed |
+| certifi | 0 | 0 | built |
+| idna | 44 | 0 | failed |
+| charset_normalizer | 44 | 3 | failed |
+| requests | 2185 | 195 | failed |
+| **Total** | **2954** | **251** | **1/5 built** |
+
+The JSON E-code histograms match the historical text counter on the same
+build logs. This is a new measurement of existing compiler code, not a
+compiler improvement made by the accounting change. Its matching
+[idiom record](../idioms/results/run-e05416c.json) is **16/17 passing**, with
+the existing baseline holding. Neither measurement establishes coverage of
+omitted modules or unexecuted operations.
