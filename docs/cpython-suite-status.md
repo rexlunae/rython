@@ -35,10 +35,25 @@ with no `unittest` module.
 **Foundation landed (`dc566a3`):** `unittest` is now a registered StdModule
 routing to a real stdpython `stdlib::unittest`, so `import unittest` no longer
 emits the broken `crate::unittest` sibling reference and test crates BUILD.
-The runtime `main()` is a loud `NotImplementedError` (exit 1) until codegen
-lowers a real runner — never a silent pass. A minimal
-`import unittest; class TestAdd(unittest.TestCase): ...; unittest.main()`
-file now **converts, builds, and runs loudly**.
+`main()` is a loud `NotImplementedError` (exit 1) until codegen lowers a real
+runner — never a silent pass.
+
+**Runner landed (`a225dfd`):** a `unittest.main()` in the module's
+`if __name__ == "__main__"` now emits a runner that discovers the module's
+direct `*TestCase` subclasses, constructs each, and runs its `test_*`
+methods, counting failures; any erroring test prints `FAIL: …` and the
+runner raises `AssertionError: <n> test(s) failed` (exit 1). Verified:
+a minimal test module with a *raising* or erroring test fails loudly and
+exits 1; a passing one exits 0.
+
+**Still open (the next slice):** `self.assertEqual(a, b)` etc. lowering.
+The runtime helpers (`unittest::assert_eq/assert_true/assert_false`) are
+designed, but wiring the call-site lowering through `to_rust` re-triggers
+the round-17 codegen stack-overflow hazard (verified: reverting the lowering
+restores green; the helper call is what overflows `itertools_takewhile`'s
+deeply-nested `len(list(takewhile(lambda, reversed(it))))` conversion). A
+non-`to_rust` rendering path for asserted arguments is needed — a tracked
+follow-up, not a silent-drop regression.
 
 Verified on `test_operator` (`cargo build` in its generated crate):
 
