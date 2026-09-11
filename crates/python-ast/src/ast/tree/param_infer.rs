@@ -1586,12 +1586,13 @@ fn return_type_of(
                     return Ok(quote!(stdpython::PyValue));
                 }
             }
-            // `"sep".join(...)` on a string literal (or a String/&str
-            // local) returns an owned String — the method table omits join
-            // (its bound needs a compound IntoIterator), but the concrete
-            // receiver's return is a plain String (issue #116).
+            // `"sep".join(...)` / `"fmt".format(...)` on a string literal (or
+            // a String/&str local) returns an owned String — the method table
+            // omits join (its bound needs a compound IntoIterator) and format,
+            // but the concrete receiver's return is a plain String (issues
+            // #116 / `fmt.format(...)` in test_math's ulp_abs_check).
             if let ExprType::Attribute(a) = c.func.as_ref()
-                && a.attr == "join"
+                && (a.attr == "join" || a.attr == "format")
                 && (matches!(
                     a.value.as_ref(),
                     ExprType::Constant(c)

@@ -9375,6 +9375,35 @@ fn join_on_a_string_literal_infers_a_string_return() {
 }
 
 #[test]
+fn format_on_a_string_literal_local_infers_a_string_return() {
+    // `fmt.format(...)` where fmt is a String literal local returns an owned
+    // String — like the join arm, the concrete receiver's return is the
+    // method's String result. This closes the None|String union in test_math's
+    // ulp_abs_check (`return None` vs `return fmt.format(...)` -> Option<String>).
+    let out = compile(
+        concat!(
+            "def f(x):\n",
+            "    if x:\n",
+            "        return None\n",
+            "    else:\n",
+            "        fmt = \"hello {}\"\n",
+            "        return fmt.format(1)\n",
+        ),
+        "inf_fmt_union.py",
+    );
+    assert!(
+        out.contains("-> Result < Option < String > , PyException >"),
+        "the union must unify to Option<String>: {}",
+        out
+    );
+    assert!(
+        out.contains("return Ok (None)") && out.contains("format ! ("),
+        "the Option None/Some arms must construct correctly: {}",
+        out
+    );
+}
+
+#[test]
 fn genexpr_over_a_parameter_infers_iteration_bounds() {
     // Issue #116: `".".join(str(v) for v in version)` — the pip pattern.
     // The generator's iterable bounds IntoIterator; the element's uses

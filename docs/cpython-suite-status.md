@@ -63,7 +63,7 @@ and `test.*` stdlib references, and asserts are dropped.
 | `test_fractions` | CONVERT | — (same) |
 | `test_random` | CONVERT | — (same) |
 | `test_operator` | CONVERT | — (same) |
-| `test_math` | BLOCKED | `count_set_bits` recursion (FIXED → advanced past it); now `ulp_abs_check` needs **statement-level** `if/else` `Option<String>`-return inference (`return None` vs `return fmt.format(...)`). An `IfExp`-shaped None|str union already converts; the statement-level shape does not yet unify to `Option<String>`. |
+| `test_math` | BLOCKED | `count_set_bits` recursion (FIXED → advanced); `ulp_abs_check` union FIXED (this round: `local_str.format(...)` now infers String, so `None` vs `fmt.format(...)` unifies to `Option<String>`); test_math now advances from line 107 to line 744 — the heterogeneous `[float, FloatLike]` list-literal wall |
 | `test_bisect` | BLOCKED | nested `def grade(breakpoints=[60,70,80,90])` — a **mutable-list default**, deliberately loud (Python evaluates-and-shares it; cannot be lowered correctly) |
 | `test_csv` | BLOCKED | `csv.reader(..., escapechar=…)` reader feature FIXED (this round, now threads `Some::<u8>`); advances to the **dialect-registry** wall (`csv.reader([...], name)` / `register_dialect`), reached inside harness blocks |
 | `test_textwrap` | BLOCKED | `wrap(text, width, **kwargs)` — issue #368 `**kwargs`; reached only inside unittest `TestTextWrap` methods |
@@ -129,6 +129,12 @@ inside (or leads to) the unittest harness:
   `Some::<u8>((c).as_bytes()[0])` seam. `test_csv` advances past its
   `escapechar` body to the dialect-registry wall (`csv.reader([...], name)`).
   Pin: `csv_reader_escapechar_wires_through_like_the_writer`.
+- **`local_str.format(...)` infers a `String` return**, mirroring the `join`
+  arm's concrete-receiver logic (a string literal or String/&str local
+  receiver). This lets a `None` vs `fmt.format(...)` union unify to
+  `Option<String>` — test_math's `ulp_abs_check` — and test_math advances
+  from line 107 to line 744. Pin:
+  `format_on_a_string_literal_local_infers_a_string_return`.
 - These recede pure-language walls (math advances past `count_set_bits`), but
   the *count* moves only when the #334 harness lands, because that is the
   shared gate for all 17 files.
