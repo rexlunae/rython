@@ -65,7 +65,7 @@ and `test.*` stdlib references, and asserts are dropped.
 | `test_operator` | CONVERT | — (same) |
 | `test_math` | BLOCKED | `count_set_bits` recursion (FIXED this round → advances to `ulp_abs_check` union `None|String` return); then the `unittest` harness |
 | `test_bisect` | BLOCKED | nested `def grade(breakpoints=[60,70,80,90])` — a **mutable-list default**, deliberately loud (Python evaluates-and-shares it; cannot be lowered correctly) |
-| `test_csv` | BLOCKED | `csv.reader(..., escapechar=…)` reader feature, reached only inside `with self.subTest(...)` / `TemporaryFile` harness blocks |
+| `test_csv` | BLOCKED | `csv.reader(..., escapechar=…)` reader feature FIXED (this round, now threads `Some::<u8>`); advances to the **dialect-registry** wall (`csv.reader([...], name)` / `register_dialect`), reached inside harness blocks |
 | `test_textwrap` | BLOCKED | `wrap(text, width, **kwargs)` — issue #368 `**kwargs`; reached only inside unittest `TestTextWrap` methods |
 | `test_itertools` | BLOCKED | heterogeneous list literal `['abc', range(6)]` (str/range mix) |
 | `test_collections` | BLOCKED | heterogeneous list literal `[None, int(), gen(), object(), Bar()]` (int/Bar/mixed) |
@@ -123,6 +123,12 @@ inside (or leads to) the unittest harness:
   crate advances to the nested-`iterable` callable wall). Real bounds
   (`A: PyAdd<B>, A: Clone, …`) still emit; only the empty ones are dropped.
   Pin: `empty_where_bound_does_not_emit_a_stray_comma`.
+- **`csv.reader(f, quoting=…, escapechar=…)` is no longer a loud refusal.**
+  The runtime reader always honoured `escapechar` in QUOTE_NONE mode; the
+  codegen just refused to thread it. The reader now mirrors the writer's
+  `Some::<u8>((c).as_bytes()[0])` seam. `test_csv` advances past its
+  `escapechar` body to the dialect-registry wall (`csv.reader([...], name)`).
+  Pin: `csv_reader_escapechar_wires_through_like_the_writer`.
 - These recede pure-language walls (math advances past `count_set_bits`), but
   the *count* moves only when the #334 harness lands, because that is the
   shared gate for all 17 files.

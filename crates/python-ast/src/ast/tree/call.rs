@@ -5897,23 +5897,63 @@ impl<'a> CodeGen for Call {
                     }
                     ("reader", [lines]) => {
                         let p = qual("reader");
-                        // csv.reader(f, quoting=...) — thread the QUOTE_NONE
-                        // flag to the state-machine reader (issue #369).
-                        // escapechar= stays loud: the dialect-escape path is
-                        // not yet wired through the codegen without recursion.
-                        if escapechar_kw.is_some() {
-                            return Err("csv.reader(..., escapechar=...) is not \
-                                supported yet; drop the escapechar or split the \
-                                field ahead of time (issue #369)"
-                                .to_string()
-                                .into());
-                        }
+                        // csv.reader(f, quoting=csv.QUOTE_NONE, escapechar=...):
+                        // thread the no-quote flag and the escapechar to the
+                        // state-machine reader (issue #369). The runtime
+                        // reader(lines, no_quote, Option<u8> escapechar) already
+                        // honours an escapechar in QUOTE_NONE mode (it drops the
+                        // escapechar and lets the next char through literally).
+                        // The escapechar MUST be a single-character STRING
+                        // LITERAL, rendered at CODE-GEN time as its code point —
+                        // deliberately NOT via `#c.to_rust(...)`, which overflowed
+                        // the codegen stack in this exact arm (round-17; a
+                        // non-literal would render through the expression path the
+                        // test suite already exercises, so keep a literal-only seam).
                         let no_quote = match quoting_kw {
                             Some(crate::ExprType::Attribute(a))
                                 if a.attr == "QUOTE_NONE" => quote!(true),
                             _ => quote!(false),
                         };
-                        Ok(quote!(#p(&(#lines), #no_quote, None::<u8>)?))
+                        let esc = match escapechar_kw {
+                            None => quote!(None::<u8>),
+                            Some(crate::ExprType::Constant(c)) => {
+                                // `c.0` is Option<Literal<String>>; the
+                                // escapechar must be a single-character string
+                                // literal, rendered at code-GEN time as its code
+                                // point.
+                                match &c.0 {
+                                    Some(litrs::Literal::String(s))
+                                        if s.value().len() == 1 =>
+                                    {
+                                        let byte = s.value().as_bytes()[0];
+                                        quote!(Some::<u8>(#byte))
+                                    }
+                                    _ => {
+                                        return Err(
+                                            "csv.reader(... escapechar=...) needs a \
+                                             single-character string literal (e.g. \
+                                             escapechar=\"^\"); rython refuses to \
+                                             silently ignore a non-literal escapechar \
+                                             (issue #369)"
+                                                .to_string()
+                                                .into()
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {
+                                return Err(
+                                    "csv.reader(... escapechar=...) needs a \
+                                     single-character string literal (e.g. \
+                                     escapechar=\"^\"); rython refuses to \
+                                     silently ignore a non-literal escapechar \
+                                     (issue #369)"
+                                        .to_string()
+                                        .into()
+                                );
+                            }
+                        };
+                        Ok(quote!(#p(&(#lines), #no_quote, #esc)?))
                     }
                     ("md5" | "sha1" | "sha256" | "sha512", []) => {
                         let p = qual(crate::ast::tree::std_module::hashlib_new_variant(&fname)

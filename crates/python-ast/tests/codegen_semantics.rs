@@ -6820,8 +6820,8 @@ fn csv_writer_accepts_quoting_and_escapechar() {
 #[test]
 fn csv_reader_quote_none_routes_the_no_quote_flag() {
     // issue #369: `csv.reader(f, quoting=csv.QUOTE_NONE)` lowers the
-    // no-quote flag (`true`) into the 3-argument reader; escapechar on the
-    // reader is loud (not wired).
+    // no-quote flag (`true`) into the 3-argument reader; without an
+    // escapechar the escape seam is `None::<u8>`.
     let out = compile(
         "import csv\nrows = csv.reader([\"a,b\"], quoting=csv.QUOTE_NONE)\n",
         "crd_nq.py",
@@ -6832,6 +6832,29 @@ fn csv_reader_quote_none_routes_the_no_quote_flag() {
         out.len()
     );
 }
+
+#[test]
+fn csv_reader_escapechar_wires_through_like_the_writer() {
+    // issue #369: `csv.reader(f, quoting=csv.QUOTE_NONE, escapechar="\\")` must
+    // no longer be a loud refusal — the runtime reader already honours the
+    // escapechar in QUOTE_NONE mode, so the reader threads it through the same
+    // `Option<u8>` code-point seam the writer uses, wrapped in `Some::<u8>`.
+    let out = compile(
+        concat!(
+            "import csv\n",
+            "rows = csv.reader([\"a\\\\b\"], quoting=csv.QUOTE_NONE, escapechar=\"\\\\\")\n",
+        ),
+        "crd_esc.py",
+    );
+    assert!(
+        out.contains("csv :: reader")
+            && out.contains("Some :: < u8 >")
+            && !out.contains("not supported yet"),
+        "must thread the reader escapechar via Some::<u8>: {:}",
+        out
+    );
+}
+
 
 // ---- functools.lru_cache / cache decorators ----
 
