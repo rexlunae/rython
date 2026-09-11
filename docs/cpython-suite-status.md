@@ -32,6 +32,14 @@ use crate::pickle;` — but **none of those modules are emitted**, and the
 `if __name__ == "__main__": unittest.main()` tail lowers to `unittest::main()?`
 with no `unittest` module.
 
+**Foundation landed (`dc566a3`):** `unittest` is now a registered StdModule
+routing to a real stdpython `stdlib::unittest`, so `import unittest` no longer
+emits the broken `crate::unittest` sibling reference and test crates BUILD.
+The runtime `main()` is a loud `NotImplementedError` (exit 1) until codegen
+lowers a real runner — never a silent pass. A minimal
+`import unittest; class TestAdd(unittest.TestCase): ...; unittest.main()`
+file now **converts, builds, and runs loudly**.
+
 Verified on `test_operator` (`cargo build` in its generated crate):
 
 ```
