@@ -6598,7 +6598,7 @@ fn stringio_and_csv_writer_lower_with_mut_borrows() {
     let out = compile(src, "csw1.py");
     assert!(out.contains("io :: StringIO ()"), "generated: {}", out);
     assert!(
-        out.contains("csv :: writer (& mut (buf) , \"\\r\\n\" . to_string ())"),
+        out.contains("csv :: writer (& mut (buf) , \"\\r\\n\" . to_string () , false , None :: < u8 >)"),
         "generated: {}",
         out
     );
@@ -6647,7 +6647,7 @@ fn csv_writer_accepts_the_lineterminator_keyword() {
         "csw_lt.py",
     );
     assert!(
-        out.contains("csv :: writer (& mut (b) , (\"\\n\") . to_string ())"),
+        out.contains("csv :: writer (& mut (b) , (\"\\n\") . to_string () , false , None :: < u8 >)"),
         "generated: {}",
         out
     );
@@ -6667,6 +6667,29 @@ fn csv_writer_accepts_the_lineterminator_keyword() {
         out2.contains("\"\\r\\n\" . to_string ()"),
         "the default lineterminator must be '\\r\\n': {}",
         out2
+    );
+}
+
+#[test]
+fn csv_writer_accepts_quoting_and_escapechar() {
+    // issue #369: `csv.writer(f, quoting=csv.QUOTE_ALL, escapechar="\\")`
+    // lower the dialect seams through the 4-argument writer.
+    let out = compile(
+        concat!(
+            "import io\n",
+            "import csv\n",
+            "\n",
+            "def f() -> str:\n",
+            "    b = io.StringIO()\n",
+            "    w = csv.writer(b, quoting=csv.QUOTE_ALL, escapechar=\"\\\\\")\n",
+            "    return b.getvalue()\n",
+        ),
+        "csw_quote.py",
+    );
+    assert!(
+        out.contains("csv :: writer (& mut (b) , \"\\r\\n\" . to_string () , true , Some :: < u8 > ((\"\\\\\") . as_bytes () [0]))"),
+        "generated: {}",
+        out
     );
 }
 

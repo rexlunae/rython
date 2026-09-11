@@ -125,28 +125,71 @@ pub fn reader<S: AsRef<str>>(lines: &[S]) -> Result<Vec<Vec<String>>, PyExceptio
     Ok(rows)
 }
 
-/// csv.writer(f, lineterminator=...) with CPython's default "excel"
-/// dialect: comma delimiter, QUOTE_MINIMAL (a field is quoted only when
-/// it contains the delimiter, a quote, or a newline), "" quote doubling,
-/// and — by default — \r\n as the row terminator, overridable through the
-/// `lineterminator` keyword (issue #369), exactly as CPython's writer
-/// accepts it. Rows stringify their elements through PyDisplay — Python's
-/// writer calls str() — so ints, floats, and bools render exactly as
-/// Python prints them (True, 2.5, 1e+16). Only available with the std
-/// feature: it writes through PyFile.
+/// csv.writer(f, lineterminator=..., quoting=..., escapechar=...) with
+/// CPython's default "excel" dialect: comma delimiter, and by default
+/// QUOTE_MINIMAL (a field is quoted only when it contains the delimiter, a
+/// quote, or a newline), "" quote doubling, and — by default — \r\n as the
+/// row terminator. The `lineterminator` (issue #369), `quoting` and
+/// `escapechar` keywords (issue #369) are supported as value-shaped seams,
+/// exactly as CPython's writer accepts them. CPython's quote MODES:
+/// minimal quotes only when needed; all quotes every field; none never
+/// quotes and escapes the delimiter/quote/newline with `escapechar`. Rows
+/// stringify their elements through PyDisplay — Python's writer calls str()
+/// — so ints, floats, and bools render exactly as Python prints them
+/// (True, 2.5, 1e+16). Only available with the std feature: it writes
+/// through PyFile.
 #[cfg(feature = "std")]
 pub struct Writer<'a> {
     file: &'a mut crate::PyFile,
     lineterminator: String,
+    all_quote: bool,
+    escapechar: Option<u8>,
 }
 
 #[cfg(feature = "std")]
-pub fn writer(file: &mut crate::PyFile, lineterminator: String) -> Writer<'_> {
-    Writer { file, lineterminator }
+pub fn writer(
+    file: &mut crate::PyFile,
+    lineterminator: String,
+    all_quote: bool,
+    escapechar: Option<u8>,
+) -> Writer<'_> {
+    Writer { file, lineterminator, all_quote, escapechar }
 }
 
 #[cfg(feature = "std")]
 impl Writer<'_> {
+    /// Emit one field: QUOTE_MINIMAL (quote only when needed) or QUOTE_ALL
+    /// (always quote) quote the field; QUOTE_NONE never quotes and instead
+    /// escapes the delimiter/quote/CR/LF with the escapechar.
+    fn write_field(&self, out: &mut String, text: &str) {
+        let needs_escape = text.contains(',') || text.contains('"') || text.contains('\n')
+            || text.contains('\r');
+        if self.all_quote {
+            out.push('"');
+            out.push_str(&text.replace('"', "\"\""));
+            out.push('"');
+        } else if needs_escape {
+            if let Some(esc) = self.escapechar {
+                let mut escaped = String::new();
+                for c in text.chars() {
+                    if c == ',' || c == '"' || c == '\n' || c == '\r' {
+                        escaped.push(esc as char);
+                        escaped.push(c);
+                    } else {
+                        escaped.push(c);
+                    }
+                }
+                out.push_str(&escaped);
+            } else {
+                out.push('"');
+                out.push_str(&text.replace('"', "\"\""));
+                out.push('"');
+            }
+        } else {
+            out.push_str(text);
+        }
+    }
+
     pub fn writerow<T: crate::PyDisplay>(&mut self, row: &[T]) -> Result<(), PyException> {
         let mut out = String::new();
         for (i, field) in row.iter().enumerate() {
@@ -154,14 +197,7 @@ impl Writer<'_> {
                 out.push(',');
             }
             let text = field.py_display();
-            if text.contains(',') || text.contains('"') || text.contains('\n') || text.contains('\r')
-            {
-                out.push('"');
-                out.push_str(&text.replace('"', "\"\""));
-                out.push('"');
-            } else {
-                out.push_str(&text);
-            }
+            self.write_field(&mut out, text.as_ref());
         }
         out.push_str(&self.lineterminator);
         self.file.write(out)?;

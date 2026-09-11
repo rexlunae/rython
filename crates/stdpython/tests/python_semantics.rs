@@ -2762,7 +2762,7 @@ mod file_objects {
         // 'a,"b,c","say ""hi""",\r\n1,2,3\r\n\r\n"line\nbreak",tab\there\r\n'
         let mut buf = io::StringIO();
         {
-            let mut w = csv::writer(&mut buf, "\r\n".to_string());
+            let mut w = csv::writer(&mut buf, "\r\n".to_string(), false, None);
             w.writerow(&["a", "b,c", "say \"hi\"", ""]).unwrap();
             w.writerow(&[1i64, 2, 3]).unwrap();
             w.writerow(&[] as &[&str]).unwrap();
@@ -2777,7 +2777,7 @@ mod file_objects {
         // and floats render as Python prints them.
         let mut buf = io::StringIO();
         {
-            let mut w = csv::writer(&mut buf, "\r\n".to_string());
+            let mut w = csv::writer(&mut buf, "\r\n".to_string(), false, None);
             w.writerow(&[stdpython::py_display(&true), stdpython::py_display(&2.5f64)])
                 .unwrap();
             w.writerows(&[vec!["x", "y"], vec!["z", "w"]]).unwrap();
@@ -2787,7 +2787,7 @@ mod file_objects {
         // writer output round-trips through the reader.
         let mut buf = io::StringIO();
         {
-            let mut w = csv::writer(&mut buf, "\r\n".to_string());
+            let mut w = csv::writer(&mut buf, "\r\n".to_string(), false, None);
             w.writerow(&["a", "b,c", "say \"hi\""]).unwrap();
         }
         let text = buf.getvalue().unwrap();

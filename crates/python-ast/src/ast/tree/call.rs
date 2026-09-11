@@ -5240,6 +5240,8 @@ impl<'a> CodeGen for Call {
                 let mut maxsplit_kw: Option<crate::ExprType> = None;
                 let mut _usedforsecurity_kw: Option<crate::ExprType> = None;
                 let mut lineterminator_kw: Option<crate::ExprType> = None;
+                let mut quoting_kw: Option<crate::ExprType> = None;
+                let mut escapechar_kw: Option<crate::ExprType> = None;
                 for kw in &self.keywords {
                     let slot = match kw.arg.as_deref() {
                         Some("width") if matches!(fname.as_str(), "wrap" | "fill") => &mut width_kw,
@@ -5247,6 +5249,8 @@ impl<'a> CodeGen for Call {
                         Some("count") if fname == "sub" => &mut count_kw,
                         Some("maxsplit") if fname == "split" => &mut maxsplit_kw,
                         Some("lineterminator") if fname == "writer" => &mut lineterminator_kw,
+                        Some("quoting") if fname == "writer" => &mut quoting_kw,
+                        Some("escapechar") if fname == "writer" => &mut escapechar_kw,
                         // md5/sha's usedforsecurity is a FIPS policy flag —
                         // ignored (requests' digest auth).
                         Some("usedforsecurity")
@@ -5838,9 +5842,11 @@ impl<'a> CodeGen for Call {
                     // writer's lifetime (scope analysis marks f mut).
                     ("writer", [f]) => {
                         let p = qual("writer");
-                        // csv.writer(f, lineterminator=X) — the excel-dialect
-                        // writer with an overridable row terminator (#369);
-                        // the default is CPython's "\r\n".
+                        // csv.writer(f, lineterminator=..., quoting=...,
+                        // escapechar=...) — the excel-dialect writer with the
+                        // value-shaped dialect seams (issue #369); the
+                        // defaults are CPython's "\r\n", QUOTE_MINIMAL, no
+                        // escapechar.
                         let term = match lineterminator_kw {
                             Some(e) => {
                                 let t = e.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
@@ -5848,7 +5854,30 @@ impl<'a> CodeGen for Call {
                             }
                             None => quote!("\r\n".to_string()),
                         };
-                        Ok(quote!(#p(&mut (#f), #term)))
+                        // quoting= maps csv.QUOTE_ALL / QUOTE_NONE / other to
+                        // "quote every field" / "never quote" booleans.
+                        let all_quote = match quoting_kw {
+                            Some(crate::ExprType::Attribute(a))
+                                if a.attr == "QUOTE_ALL" =>
+                            {
+                                quote!(true)
+                            }
+                            Some(crate::ExprType::Attribute(a))
+                                if a.attr == "QUOTE_NONE" => quote!(false),
+                            Some(crate::ExprType::Attribute(a))
+                                if a.attr == "QUOTE_MINIMAL" => quote!(false),
+                            _ => quote!(false),
+                        };
+                        let esc = match escapechar_kw {
+                            Some(e) => {
+                                let c = e.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                // A single-char escapechar: its code point as
+                                // Option<u8> (the writer escapes with it).
+                                quote!(Some::<u8>((#c).as_bytes()[0]))
+                            }
+                            None => quote!(None::<u8>),
+                        };
+                        Ok(quote!(#p(&mut (#f), #term, #all_quote, #esc)))
                     }
                     ("reader", [lines]) => {
                         let p = qual("reader");
