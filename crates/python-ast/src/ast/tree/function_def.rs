@@ -4319,6 +4319,9 @@ pub(crate) fn simple_expr_typeinfo(expr: &ExprType) -> Option<crate::TypeInfo> {
 
 pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {    match expr {
         ExprType::Constant(c) => match &c.0 {
+            Some(l0) if crate::ast::tree::constant::is_complex_literal(&l0) => {
+                Some(quote!(Complex))
+            }
             Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
             Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
             Some(litrs::Literal::Bool(_)) => Some(quote!(bool)),

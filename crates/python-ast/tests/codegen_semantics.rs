@@ -5298,6 +5298,18 @@ fn integral_float_literals_keep_their_float_type() {
 }
 
 #[test]
+fn complex_literals_render_as_complex_values() {
+    // `2j`, `3.5j` must lower to `Complex::new(re, im)` with f64 tokens
+    // (issue #366) — a plain (possibly quoted-string) fallback would be a
+    // silent divergence.
+    let out = compile("def f():\n    y = 2j\n    return y\n", "complex_lit.py");
+    assert!(out.contains("Complex :: new (0.0 , 2.0)"), "generated: {}", out);
+    assert!(!out.contains("Complex :: new (\""), "float tokens must not be quoted: {}", out);
+    let out2 = compile("def g():\n    z = 3.5j\n    return z\n", "complex_lit2.py");
+    assert!(out2.contains("Complex :: new (0.0 , 3.5)"), "generated: {}", out2);
+}
+
+#[test]
 fn conditionally_reassigned_module_names_are_not_constants() {
     // DEBUG = False overwritten inside a module-level `if` must NOT freeze
     // as a static: the nested store would land on a shadowing local inside
