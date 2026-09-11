@@ -5440,6 +5440,19 @@ fn dynamic_call_base_is_a_loud_drop() {
         warnings.len()
     );
     let _ = out;
+
+    // A base NAME that does not resolve to a module class (a loop variable
+    // `class MyClass(T)` inside `for T in (...)`) is the same loud drop.
+    let (out2, warnings2) = compile_with_warnings(
+        "def f():\n    for T in (1, 2):\n        class MyClass(T):\n            pass\n",
+        "loopvar_base.py",
+    );
+    assert!(
+        warnings2.iter().any(|w| w.contains("does not resolve to a class")),
+        "must warn loudly: {}",
+        warnings2.len()
+    );
+    let _ = out2;
 }
 
 #[test]

@@ -3565,13 +3565,23 @@ impl CodeGen for ClassDef {
                     .into());
                 }
                 _ => {
-                    return Err(format!(
-                        "class `{}` inherits from `{}`, which is not a class defined \
-                         in this module; imported bases and built-in bases are not \
-                         supported yet",
+                    // A base Name that does NOT resolve to a class defined
+                    // in this module (a LOOP VARIABLE `class MyClass(T)`
+                    // inside `for T in (...)` — statistics; an unmodeled
+                    // user ot stdlib class): per P9 the class lowers as if
+                    // OBJECT-based (the inherited behavior is the documented
+                    // divergence) and a -W warning is emitted — never a
+                    // silently different class, never the hard class-body
+                    // error that would block a class whose body does not
+                    // depend on the dynamic base.
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "class `{}`: base `{}` does not resolve to a class \
+                         defined in this module (a loop variable or unmodeled \
+                         class); the class lowers as if object-based — inherited \
+                         behavior is not copied (issue #367)",
                         self.name, base_name,
-                    )
-                    .into());
+                    ));
+                    None
                 }
             },
         };
