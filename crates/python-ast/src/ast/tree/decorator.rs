@@ -60,6 +60,15 @@ pub enum Decorator {
     /// dispatch type. The definition emits nothing on its own; it is
     /// folded into the generic's dispatch function.
     Register { generic: String, dispatch_type: String },
+    /// A TEST-RUNNER GATE decorator — `@unittest.skipUnless(...)`,
+    /// `@skipIf(...)`, `@expectedFailure`, `@cpython_only`,
+    /// `@test.support.requires_*`, `@unittest.mock.patch(...)`, ... —
+    /// semantically no-ops for a compiler converting the TEST BODY (a
+    /// skip/mark is a test-runner directive, not program semantics). The
+    /// decorator is consumed with a `-W` warning (issue #371); it is never
+    /// silently ignored and never re-shapes the definition. Carries the
+    /// typed [`TestGate`] kind so consumers need not re-derive it.
+    TestGate(TestGate),
 }
 
 impl Decorator {
@@ -73,6 +82,7 @@ impl Decorator {
             Decorator::Property => "property",
             Decorator::SingleDispatch => "functools.singledispatch",
             Decorator::Register { .. } => "singledispatch register",
+            Decorator::TestGate(_) => "a test-runner gate decorator",
         }
     }
 
@@ -90,6 +100,10 @@ impl Decorator {
             // (the generic and its registers become one function), so
             // neither shapes a method on its own.
             Decorator::SingleDispatch | Decorator::Register { .. } => None,
+            // A test-runner gate: the definition lowers as a plain
+            // method/function (the gate is consumed with a -W warning at
+            // the call site).
+            Decorator::TestGate(_) => Some(MethodDecorator::None),
         }
     }
 
@@ -100,6 +114,116 @@ impl Decorator {
             Decorator::Cache(spec) => *spec,
             _ => None,
         }
+    }
+}
+
+/// A TEST-RUNNER GATE decorator (issue #371): `@skipUnless(...)`,
+/// `@unittest.skipIf(...)`, `@expectedFailure`, `@cpython_only`,
+/// `@test.support.requires_*` / `@support.bigmemtest` / ...
+/// `@hashlib_helper.requires_hashdigest(...)`, `@unittest.mock.patch(...)`.
+/// These name a skip/mark/mock that only a test RUNNER interprets; for a
+/// compiler converting the TEST BODY they are no-ops (consumed with a -W
+/// warning, never silently). The compiler-known taxonomy lives in this ONE
+/// enum; the string -> enum parse happens exactly once, in
+/// [`TestGate::from_name`]/[`test_gate_from_expr`], and every consumer keys
+/// off the enum — never a scattered string list.
+///
+/// The receiver-MODULE string check lives in `test_gate_from_expr` because
+/// `unittest` / `test.support` / `support` / `hashlib_helper` are EXTERNAL
+/// modules in rython's model (not `StdModule` variants), so any decorator
+/// bound to one is a gate regardless of the attribute name.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum TestGate {
+    /// `@skip`, `@skipIf(...)`, `@skipUnless(...)` (and `@unittest.*`).
+    Skip,
+    /// `@expectedFailure`, `@expectedFailureIf(...)`.
+    ExpectedFailure,
+    /// `@cpython_only`.
+    CpythonOnly,
+    /// `@unittest.mock.patch(...)`.
+    MockPatch,
+    /// Any `@<test-support-module>.<directive>` or `requires_*` gate
+    /// (`requires_docstrings`, `bigmemtest`, `impl_detail`, ...).
+    Support,
+}
+
+impl TestGate {
+    /// The ONE string boundary for a bare (no-receiver) decorator name.
+    pub(crate) fn from_name(name: &str) -> Option<TestGate> {
+        match name {
+            "skip" | "skipIf" | "skipUnless" => Some(TestGate::Skip),
+            "expectedFailure" | "expectedFailureIf" => Some(TestGate::ExpectedFailure),
+            "cpython_only" => Some(TestGate::CpythonOnly),
+            "patch" => Some(TestGate::MockPatch),
+            _ => None,
+        }
+    }
+}
+
+/// The ONE boundary turning a decorator EXPRESSION into a `TestGate`, or
+/// None when it is not a test-runner gate. Walks the attribute/call chain to
+/// the receiver module and the terminal decorator name, then classifies:
+///
+/// - any decorator bound to a known TEST-RUNNER module is a gate;
+/// - a `requires_*` name is a gate (regardless of receiver);
+/// - otherwise a recognition beyond the bare `TestGate::from_name` set.
+/// ONE typed predicate: is this decorator's leftmost receiver a TEST-RUNNER
+/// module? `unittest` / `test.support` / `support` / `hashlib_helper` are
+/// EXTERNAL to rython's `StdModule`, so they are matched by name here — the
+/// single string boundary for the receiver. Any decorator bound to one is a
+/// gate regardless of the attribute it names.
+fn is_test_support_receiver(e: &ExprType) -> bool {
+    match e {
+        ExprType::Name(n) => {
+            matches!(n.id.as_ref(), "unittest" | "support" | "test" | "hashlib_helper")
+        }
+        ExprType::Call(c) => is_test_support_receiver(c.func.as_ref()),
+        ExprType::Attribute(a) => is_test_support_receiver(a.value.as_ref()),
+        _ => false,
+    }
+}
+
+/// The ONE boundary turning a decorator EXPRESSION into a `TestGate`, or
+/// None when it is not a test-runner gate. A BARE name (no test-runner
+/// receiver) is classified by `TestGate::from_name` — the single
+/// string-to-type boundary, exactly the `ThreadingType::from_name` pattern.
+/// A receiver-bound gate (`@unittest.skipIf`, `@support.bigmemtest`, ...)
+/// is `TestGate::Support` regardless of the attribute.
+pub(crate) fn test_gate_from_expr(e: &ExprType) -> Option<TestGate> {
+    if is_test_support_receiver(e) {
+        return Some(TestGate::Support);
+    }
+    // A bare name: `@skipUnless`, `@cpython_only`, `@requires_*`, ...
+    // `name_of` surfaces the bare name only when the receiver is NOT a
+    // (non-test) module, which is exactly the no-receiver / bare case.
+    match e {
+        ExprType::Name(n) => {
+            if n.id.starts_with("requires_") {
+                Some(TestGate::Support)
+            } else {
+                TestGate::from_name(n.id.as_ref())
+            }
+        }
+        ExprType::Call(c) => match c.func.as_ref() {
+            ExprType::Name(n) => {
+                if n.id.starts_with("requires_") {
+                    Some(TestGate::Support)
+                } else {
+                    TestGate::from_name(n.id.as_ref())
+                }
+            }
+            _ => None,
+        },
+        ExprType::Attribute(a) => {
+            // A non-test-module receiver with a `requires_*`/known gate
+            // attribute (`@something.requires_x`, `@something.skipUnless`).
+            if a.attr.starts_with("requires_") {
+                Some(TestGate::Support)
+            } else {
+                TestGate::from_name(a.attr.as_ref())
+            }
+        }
+        _ => None,
     }
 }
 
@@ -169,6 +293,12 @@ pub fn parse_decorator(
         [single] => {
             if let Some(d) = register_form(single) {
                 return Ok(Some(d));
+            }
+            // A test-runner gate (`@skipUnless(...)`, `@cpython_only`,
+            // `@support.requires_*`, `@unittest.mock.patch(...)`): consumed
+            // as a no-op, reported by the caller with a -W warning.
+            if let Some(g) = test_gate_from_expr(single) {
+                return Ok(Some(Decorator::TestGate(g)));
             }
             let (base, call) = match single {
                 ExprType::Call(c) => (name_of(c.func.as_ref()), Some(c)),
@@ -371,6 +501,8 @@ pub fn decorator_to_tokens(d: &Decorator) -> TokenStream {
         // no decorator survives onto a synthesized wrapper.
         Decorator::SingleDispatch => quote!(singledispatch),
         Decorator::Register { .. } => quote!(register),
+        // Never round-trips: a test gate is consumed at the definition.
+        Decorator::TestGate(_) => quote!(),
     }
 }
 

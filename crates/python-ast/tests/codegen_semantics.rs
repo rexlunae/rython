@@ -5310,6 +5310,33 @@ fn complex_literals_render_as_complex_values() {
 }
 
 #[test]
+fn test_runner_gate_decorators_convert_with_a_warning() {
+    // issue #371: `@skipUnless(...)`, `@unittest.skipIf(...)`,
+    // `@cpython_only`, `@test.support.requires_*` are test-RUNNER gates —
+    // consumed as no-ops so the definition converts, but LOUDLY (a -W
+    // definition warning), never silently ignored and never re-shaping.
+    let (_, w1) = compile_with_warnings(
+        "class T:\n    @skipUnless(hasattr(t, 'x'), 'msg')\n    def m(self):\n        return 1\n",
+        "gate_skip.py",
+    );
+    assert!(
+        w1.iter().any(|x| x.contains("test-runner gate decorator consumed as a no-op")),
+        "a skipUnless gate must warn ({} warnings)",
+        w1.len()
+    );
+
+    let (_, w2) = compile_with_warnings(
+        "import support\n@support.requires_docstrings\nclass C:\n    pass\n",
+        "gate_support.py",
+    );
+    assert!(
+        w2.iter().any(|x| x.contains("test-runner gate decorator")),
+        "a test.support gate must warn ({} warnings)",
+        w2.len()
+    );
+}
+
+#[test]
 fn conditionally_reassigned_module_names_are_not_constants() {
     // DEBUG = False overwritten inside a module-level `if` must NOT freeze
     // as a static: the nested store would land on a shadowing local inside

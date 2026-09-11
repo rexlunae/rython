@@ -3296,6 +3296,17 @@ impl CodeGen for ClassDef {
                 // A metadata class decorator (`@functools.total_ordering` —
                 // pip's Link): no runtime effect in the lowered struct.
                 Some(crate::Decorator::Property) => {}
+                // A test-runner gate on the class (`@support.cpython_only`,
+                // `@skipUnless(...)`, ...): a no-op for the lowered class,
+                // but LOUD — a -W warning, never silently ignored.
+                Some(crate::Decorator::TestGate(_)) => {
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "test-runner gate decorator on a class consumed as a no-op \
+                         (the converted class body runs unconditionally; the \
+                         skip/mark/patch condition is a test-RUNNER directive that \
+                         rython does not model)"
+                    ));
+                }
                 Some(other) => {
                     return Err(format!(
                         "class `{}` uses the decorator `{}`, which is not supported \

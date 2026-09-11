@@ -1425,6 +1425,19 @@ fn parse_method_decorator(
             )
             .into())
         }
+        // A test-runner gate (`@skipUnless(...)`, `@cpython_only`,
+        // `@support.requires_*`, `@unittest.mock.patch(...)`, ...): a
+        // no-op for the converted function body — the definition lowers as
+        // a plain method/function — but it is LOUD (a -W definition
+        // warning), never silently ignored.
+        Some(crate::Decorator::TestGate(_)) => {
+            options.definition_warnings.borrow_mut().push(format!(
+                "test-runner gate decorator consumed as a no-op (the converted body \
+                 runs unconditionally; the skip/mark/patch condition is a test-RUNNER \
+                 directive that rython does not model)"
+            ));
+            Ok(MethodDecorator::None)
+        }
         Some(d) => d.as_method_decorator().ok_or_else(|| {
             format!(
                 "decorator `{}` does not apply to a function definition (only \
