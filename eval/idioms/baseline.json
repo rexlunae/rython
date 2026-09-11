@@ -47,6 +47,9 @@
     },
     "views": {
       "status": "pass"
+    },
+    "valueor": {
+      "status": "pass"
     }
   }
 }

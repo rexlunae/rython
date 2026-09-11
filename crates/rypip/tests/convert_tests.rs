@@ -607,6 +607,100 @@ fn true_division_by_zero_raises_catchable_zero_division_error_at_runtime() {
 }
 
 #[test]
+fn value_or_and_return_the_operand_not_a_bool_at_runtime() {
+    // Round 119: `path or "/"` and `items or fallback` are ORDINARY value
+    // expressions — Python returns the SELECTED OPERAND, never a bool.
+    // The old `||`/`&&` fallback typed them bool and broke every
+    // downstream value use. The two operands now unify to their value
+    // type and the fold lowers `a or b = truthy(a) ? a : b` (and `a and b
+    // = truthy(a) ? b : a`), binding the first operand ONCE: `b` is only
+    // evaluated when the first is falsy (short-circuit), left-to-right
+    // (evaluation order), and a first-use-only operand is read exactly
+    // once (input reuse). The `log` records which operands ran.
+    let scratch = Scratch::new("value-or-and");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "log: list[str] = []\n",
+            "def push_it(v: str) -> None:\n",
+            "    log.append(v)\n",
+            "def note(s: str) -> str:\n",
+            "    push_it(s)\n",
+            "    return s\n",
+            "\n",
+            "def path_or(path: str) -> str:\n",
+            "    return path or \"/\"\n",
+            "\n",
+            "def items_or(items: list[str], fallback: list[str]) -> list[str]:\n",
+            "    return items or fallback\n",
+            "\n",
+            "def int_or(a: int, b: int) -> int:\n",
+            "    return a or b\n",
+            "\n",
+            "def both(a: str, b: str) -> str:\n",
+            "    return a and b\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(repr(path_or(\"\")))\n",
+            "    print(repr(path_or(\"x\")))\n",
+            "    print(repr(items_or([], [\"a\"])))\n",
+            "    print(repr(items_or([\"b\"], [\"a\"])))\n",
+            "    print(repr(int_or(0, 7)))\n",
+            "    print(repr(int_or(3, 7)))\n",
+            "    print(repr(both(\"\", \"y\")))\n",
+            "    print(repr(both(\"x\", \"y\")))\n",
+            "    log.clear()\n",
+            "    r = note(\"\") or note(\"SECOND\")\n",
+            "    print(\"sc-or-falsy\", repr(r), log)\n",
+            "    log.clear()\n",
+            "    r = note(\"X\") or note(\"SECOND\")\n",
+            "    print(\"sc-or-truthy\", repr(r), log)\n",
+            "    log.clear()\n",
+            "    r = note(\"X\") and note(\"SECOND\")\n",
+            "    print(\"sc-and-truthy\", repr(r), log)\n",
+            "    log.clear()\n",
+            "    r = note(\"\") and note(\"SECOND\")\n",
+            "    print(\"sc-and-falsy\", repr(r), log)\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "'/'",
+            "'x'",
+            "['a']",
+            "['b']",
+            "7",
+            "3",
+            "''",
+            "'y'",
+            "sc-or-falsy 'SECOND' ['', 'SECOND']",
+            "sc-or-truthy 'X' ['X']",
+            "sc-and-truthy 'SECOND' ['X', 'SECOND']",
+            "sc-and-falsy '' ['']",
+        ],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn stdlib_divergence_fixes_match_cpython_at_runtime() {
     // Issue #82 end-to-end: math (IEEE remainder, ldexp, pow domain
     // errors) and json (insertion order, exact big integers) must behave
