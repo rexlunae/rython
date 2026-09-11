@@ -48,12 +48,16 @@ exits 1; a passing one exits 0.
 
 **Still open (the next slice):** `self.assertEqual(a, b)` etc. lowering.
 The runtime helpers (`unittest::assert_eq/assert_true/assert_false`) are
-designed, but wiring the call-site lowering through `to_rust` re-triggers
-the round-17 codegen stack-overflow hazard (verified: reverting the lowering
-restores green; the helper call is what overflows `itertools_takewhile`'s
-deeply-nested `len(list(takewhile(lambda, reversed(it))))` conversion). A
-non-`to_rust` rendering path for asserted arguments is needed — a tracked
-follow-up, not a silent-drop regression.
+designed and functionally correct — end-to-end a lowered
+`self.assertEqual(2, 3)` correctly raised `AssertionError: 2 != 3` and the
+crate ran+built. But **any arg-rendering assert arm added to `Call::to_rust`
+re-triggers the round-17 codegen stack overflow** (`itertools_takewhile`'s
+deeply-nested `len(list(takewhile(lambda, reversed(it))))` conversion),
+regardless of the render helper used (`to_rust` or `render_typed`) — a
+codegen stack-budget fragility in that hot path, not a logic gap. Landing
+it safely needs a structural fix (smaller `Call::to_rust` frames or a larger
+codegen stack), so it is deferred rather than forced at the cost of a green
+tree (verified: reverting restores 791/0).
 
 Verified on `test_operator` (`cargo build` in its generated crate):
 
