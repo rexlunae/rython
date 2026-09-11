@@ -4299,6 +4299,9 @@ fn renderable_return_typeinfo(t: &crate::TypeInfo) -> bool {
 pub(crate) fn simple_expr_typeinfo(expr: &ExprType) -> Option<crate::TypeInfo> {
     match expr {
         ExprType::Constant(c) => match &c.0 {
+            Some(l0) if crate::ast::tree::constant::is_nonfinite_literal(&l0) => {
+                Some(crate::TypeInfo::Float)
+            }
             Some(litrs::Literal::Integer(_)) => Some(crate::TypeInfo::Int),
             Some(litrs::Literal::Float(_)) => Some(crate::TypeInfo::Float),
             Some(litrs::Literal::Bool(_)) => Some(crate::TypeInfo::Bool),
@@ -4334,6 +4337,9 @@ pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {    matc
         ExprType::Constant(c) => match &c.0 {
             Some(l0) if crate::ast::tree::constant::is_complex_literal(&l0) => {
                 Some(quote!(Complex))
+            }
+            Some(l0) if crate::ast::tree::constant::is_nonfinite_literal(&l0) => {
+                Some(quote!(f64))
             }
             Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
             Some(litrs::Literal::Float(_)) => Some(quote!(f64)),

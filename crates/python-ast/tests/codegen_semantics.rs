@@ -5298,6 +5298,18 @@ fn integral_float_literals_keep_their_float_type() {
 }
 
 #[test]
+fn non_finite_float_literals_lower_to_f64_expressions() {
+    // issue #372: `1e400` (-> inf) has no Rust float LITERAL form ("inf"
+    // is not a valid Rust literal, which used to panic Literal::parse). It
+    // must lower to the f64 EXPRESSION and type as f64, not a string.
+    let out = compile("def f():\n    x = 1e400\n    return x\n", "inf_lit.py");
+    assert!(out.contains("f64 :: INFINITY"), "generated: {}", out);
+    assert!(!out.contains("& 'static str"), "inf must not type as str: {}", out);
+    let out2 = compile("def g():\n    y = -1e400\n    return y\n", "ninf_lit.py");
+    assert!(out2.contains("- f64 :: INFINITY"), "generated: {}", out2);
+}
+
+#[test]
 fn complex_literals_render_as_complex_values() {
     // `2j`, `3.5j` must lower to `Complex::new(re, im)` with f64 tokens
     // (issue #366) — a plain (possibly quoted-string) fallback would be a

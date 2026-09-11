@@ -79,16 +79,57 @@ pub fn try_int(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
 
 pub fn try_float(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
     let v: f64 = value.extract()?;
+    // A NON-FINITE float constant (`1e1000` → inf, `0/0`-free literals →
+    // nan) has no Rust float-LITERAL form: "inf"/"nan" are not valid Rust
+    // literals, so Literal::parse would panic. Carry it as a NUL-prefixed
+    // sentinel (like complex/Ellipsis) and render as the f64 EXPRESSION at
+    // codegen (issue #372).
+    if !v.is_finite() {
+        let kind = if v.is_nan() {
+            "nan"
+        } else if v.is_sign_negative() {
+            "ninf"
+        } else {
+            "inf"
+        };
+        return Ok(Some(Literal::parse(
+            format!("\"\u{0}RYTHON_NONFINITE:{}\"", kind)
+        )
+        .expect("non-finite sentinel literal")));
+    }
     // Rust's Display for integral floats drops the ".0" ("2.0" becomes
     // "2"), which would re-parse as an INTEGER literal and silently change
     // the generated type (and semantics — Python's 2.0 / 4 is 0.5).
     let mut s = format!("{}", v);
-    if v.is_finite() && !s.contains('.') && !s.contains('e') && !s.contains('E') {
+    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
         s.push_str(".0");
     }
     let l = Literal::parse(s).expect("[4] Parsing the literal");
 
     Ok(Some(l))
+}
+
+/// True when `l` is a non-finite float constant sentinel (issue #372).
+pub fn is_nonfinite_literal(l: &Literal<String>) -> bool {
+    l.to_string().starts_with("\"\u{0}RYTHON_NONFINITE:")
+}
+
+/// The Rust EXPRESSION tokens for a non-finite float constant
+/// (`f64::INFINITY` / `f64::NEG_INFINITY` / `f64::NAN`), or None when `l`
+/// is not a non-finite sentinel.
+pub fn nonfinite_expression(l: &Literal<String>) -> Option<TokenStream> {
+    let s = l.to_string();
+    let raw: &str = s.as_ref();
+    if !raw.starts_with("\"\u{0}RYTHON_NONFINITE:") {
+        return None;
+    }
+    match raw {
+        _ if raw.contains("\u{0}RYTHON_NONFINITE:nan") => Some(quote!(f64::NAN)),
+        _ if raw.contains("\u{0}RYTHON_NONFINITE:ninf") => {
+            Some(quote!(f64::NEG_INFINITY))
+        }
+        _ => Some(quote!(f64::INFINITY)),
+    }
 }
 
 pub fn try_bool(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
@@ -271,6 +312,13 @@ impl CodeGen for Constant {
         _symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
         match self.0 {
+            Some(c) if is_nonfinite_literal(&c) => {
+                // `1e1000` → f64::INFINITY etc.: the f64 EXPRESSION, not a
+                // literal (safe then, is_finite true for typical constants).
+                Ok(nonfinite_expression(&c).expect(
+                    "matched a non-finite sentinel, so the expression exists"
+                ))
+            }
             Some(c) if is_complex_literal(&c) => {
                 let (re, im) = complex_parts(&c).expect("complex literal parts");
                 let re_tok: TokenStream = f64_token(re).parse().map_err(

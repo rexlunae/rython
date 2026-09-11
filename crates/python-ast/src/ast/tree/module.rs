@@ -5448,6 +5448,10 @@ pub(crate) fn const_static_type(value: &crate::ExprType) -> Option<TokenStream> 
             // `Literal::String` internally) — that would silently make it
             // a `&'static str` static.
             Some(l0) if crate::ast::tree::constant::is_complex_literal(&l0) => None,
+            // A non-finite float (`1e1000` → inf) renders as `f64::INFINITY`,
+            // not a Rust const literal — not const-hoistable to a static
+            // (issue #372); a module-init value typed Float.
+            Some(l0) if crate::ast::tree::constant::is_nonfinite_literal(&l0) => None,
             Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
             Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
             Some(litrs::Literal::Bool(_)) => Some(quote!(bool)),
