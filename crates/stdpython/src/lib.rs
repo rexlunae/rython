@@ -7115,25 +7115,25 @@ pub fn not_a_directory_error<M: AsRef<str>>(message: M) -> PyException {
 #[derive(Clone, Debug, PartialEq)]
 /// A Python `complex`: real and imaginary `f64` parts.
 pub struct Complex {
-    re: f64,
-    im: f64,
+    pub real: f64,
+    pub imag: f64,
 }
 
 impl Complex {
     pub fn new(re: f64, im: f64) -> Complex {
-        Complex { re, im }
+        Complex { real: re, imag: im }
     }
     /// The real part.
     pub fn re(&self) -> f64 {
-        self.re
+        self.real
     }
     /// The imaginary part.
     pub fn im(&self) -> f64 {
-        self.im
+        self.imag
     }
     /// The complex conjugate: `(a+bj).conjugate()` is `(a-bj)`.
     pub fn conjugate(&self) -> Complex {
-        Complex::new(self.re, -self.im)
+        Complex::new(self.real, -self.imag)
     }
 }
 
@@ -7182,26 +7182,26 @@ pub fn complex_repr(re: f64, im: f64) -> String {
 impl PyBool for Complex {
     fn py_bool(self) -> bool {
         // bool(z) is False only for 0+0j (signed zero makes no difference).
-        self.re != 0.0 || self.im != 0.0
+        self.real != 0.0 || self.imag != 0.0
     }
 }
 
 impl PyToString for Complex {
     fn py_str(self) -> String {
         // str(complex) IS repr(complex).
-        complex_repr(self.re, self.im)
+        complex_repr(self.real, self.imag)
     }
 }
 
 impl PyRepr for Complex {
     fn py_repr(&self) -> String {
-        complex_repr(self.re, self.im)
+        complex_repr(self.real, self.imag)
     }
 }
 
 impl PyDisplay for Complex {
     fn py_display(&self) -> String {
-        complex_repr(self.re, self.im)
+        complex_repr(self.real, self.imag)
     }
 }
 
@@ -7209,7 +7209,7 @@ impl PyDisplay for Complex {
 impl PyAdd<Complex> for Complex {
     type Output = Complex;
     fn py_add(&self, rhs: &Complex) -> Complex {
-        Complex::new(self.re + rhs.re, self.im + rhs.im)
+        Complex::new(self.real + rhs.real, self.imag + rhs.imag)
     }
 }
 
@@ -7217,7 +7217,7 @@ impl PyAdd<Complex> for Complex {
 impl PySub<Complex> for Complex {
     type Output = Complex;
     fn py_sub(&self, rhs: &Complex) -> Complex {
-        Complex::new(self.re - rhs.re, self.im - rhs.im)
+        Complex::new(self.real - rhs.real, self.imag - rhs.imag)
     }
 }
 
@@ -7226,8 +7226,8 @@ impl PyMul<Complex> for Complex {
     type Output = Complex;
     fn py_mul(&self, rhs: &Complex) -> Complex {
         Complex::new(
-            self.re * rhs.re - self.im * rhs.im,
-            self.re * rhs.im + self.im * rhs.re,
+            self.real * rhs.real - self.imag * rhs.imag,
+            self.real * rhs.imag + self.imag * rhs.real,
         )
     }
 }
@@ -7237,13 +7237,13 @@ impl PyMul<Complex> for Complex {
 impl PyDiv<Complex> for Complex {
     type Output = Complex;
     fn py_div(&self, rhs: &Complex) -> Result<Complex, PyException> {
-        let denom = rhs.re * rhs.re + rhs.im * rhs.im;
+        let denom = rhs.real * rhs.real + rhs.imag * rhs.imag;
         if denom == 0.0 {
             return Err(PyException::new("ZeroDivisionError", "division by zero"));
         }
         Ok(Complex::new(
-            (self.re * rhs.re + self.im * rhs.im) / denom,
-            (self.im * rhs.re - self.re * rhs.im) / denom,
+            (self.real * rhs.real + self.imag * rhs.imag) / denom,
+            (self.imag * rhs.real - self.real * rhs.imag) / denom,
         ))
     }
 }
@@ -7253,7 +7253,7 @@ impl PyDiv<Complex> for Complex {
 impl PyAbs for Complex {
     type Output = f64;
     fn py_abs(self) -> f64 {
-        (self.re * self.re + self.im * self.im).sqrt()
+        (self.real * self.real + self.imag * self.imag).sqrt()
     }
 }
 
@@ -7271,14 +7271,14 @@ macro_rules! complex_add_scalar {
         impl PyAdd<$t> for Complex {
             type Output = Complex;
             fn py_add(&self, rhs: &$t) -> Complex {
-                Complex::new(self.re + (*rhs as f64), self.im)
+                Complex::new(self.real + (*rhs as f64), self.imag)
             }
         }
         // s + (a+bj) = (s+a) + bj (receiver scalar, rhs Complex).
         impl PyAdd<Complex> for $t {
             type Output = Complex;
             fn py_add(&self, rhs: &Complex) -> Complex {
-                Complex::new((*self as f64) + rhs.re, rhs.im)
+                Complex::new((*self as f64) + rhs.real, rhs.imag)
             }
         }
     )*};
@@ -7291,13 +7291,13 @@ macro_rules! complex_sub_scalar {
         impl PySub<$t> for Complex {
             type Output = Complex;
             fn py_sub(&self, rhs: &$t) -> Complex {
-                Complex::new(self.re - (*rhs as f64), self.im)
+                Complex::new(self.real - (*rhs as f64), self.imag)
             }
         }
         impl PySub<Complex> for $t {
             type Output = Complex;
             fn py_sub(&self, rhs: &Complex) -> Complex {
-                Complex::new((*self as f64) - rhs.re, -rhs.im)
+                Complex::new((*self as f64) - rhs.real, -rhs.imag)
             }
         }
     )*};
@@ -7310,13 +7310,13 @@ macro_rules! complex_mul_scalar {
         impl PyMul<$t> for Complex {
             type Output = Complex;
             fn py_mul(&self, rhs: &$t) -> Complex {
-                Complex::new(self.re * (*rhs as f64), self.im * (*rhs as f64))
+                Complex::new(self.real * (*rhs as f64), self.imag * (*rhs as f64))
             }
         }
         impl PyMul<Complex> for $t {
             type Output = Complex;
             fn py_mul(&self, rhs: &Complex) -> Complex {
-                Complex::new((*self as f64) * rhs.re, (*self as f64) * rhs.im)
+                Complex::new((*self as f64) * rhs.real, (*self as f64) * rhs.imag)
             }
         }
     )*};

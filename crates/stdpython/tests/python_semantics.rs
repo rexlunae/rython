@@ -4269,6 +4269,9 @@ fn complex_accessors() {
     let z = Complex::new(3.0, 4.0);
     assert_eq!(z.re(), 3.0);
     assert_eq!(z.im(), 4.0);
+    // Public fields: codegen lowers `z.real` / `z.imag` to field access.
+    assert_eq!(z.real, 3.0);
+    assert_eq!(z.imag, 4.0);
 }
 
 #[test]
