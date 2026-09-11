@@ -4197,3 +4197,76 @@ fn open_binary_validates_the_mode_before_touching_the_path() {
     assert!(err.message.starts_with("[Errno 17] File exists: "), "{:?}", err);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ============================================================================
+// complex (issue #366) — pinned against CPython 3.14.1
+// ============================================================================
+
+#[test]
+fn complex_repr_matches_cpython() {
+    use stdpython::PyToString;
+    use stdpython::PyRepr;
+    // Verified against python3 3.14.1 (repr is str for complex).
+    let c = |re, im| Complex::new(re, im);
+    assert_eq!(c(1.0, 2.0).py_repr(), "(1+2j)");
+    assert_eq!(c(0.0, 1.0).py_repr(), "1j");
+    assert_eq!(c(0.0, 2.0).py_repr(), "2j");
+    assert_eq!(c(-0.0, -1.0).py_repr(), "(-0-1j)");
+    assert_eq!(c(0.0, -1.0).py_repr(), "-1j");
+    assert_eq!(c(-1.0, 2.0).py_repr(), "(-1+2j)");
+    assert_eq!(c(1.0, -2.0).py_repr(), "(1-2j)");
+    assert_eq!(c(0.5, 0.25).py_repr(), "(0.5+0.25j)");
+    assert_eq!(c(0.0, 0.0).py_repr(), "0j");
+    assert_eq!(c(0.0, -0.0).py_repr(), "-0j");
+    assert_eq!(c(3.0, 0.0).py_repr(), "(3+0j)");
+    assert_eq!(c(1.0, 1.0).py_repr(), "(1+1j)");
+    assert_eq!(c(1e16, 1.0).py_repr(), "(1e+16+1j)");
+    assert_eq!(c(0.1, 0.2).py_repr(), "(0.1+0.2j)");
+    assert_eq!(c(100.0, 0.0).py_repr(), "(100+0j)");
+    assert_eq!(c(1234567.0, 1234567.0).py_repr(), "(1234567+1234567j)");
+    // str is repr for complex.
+    assert_eq!(c(1.0, 2.0).py_str(), "(1+2j)");
+    assert_eq!(c(0.0, 2.5).py_str(), "2.5j");
+}
+
+#[test]
+fn complex_bool_and_eq_matches_cpython() {
+    use stdpython::PyBool;
+    assert!(!Complex::new(0.0, 0.0).py_bool());
+    assert!(!Complex::new(0.0, -0.0).py_bool());
+    assert!(Complex::new(1.0, 2.0).py_bool());
+    assert!(Complex::new(0.0, 1.0).py_bool());
+    // PartialEq: complex-vs-complex equality by re & im.
+    assert_eq!(Complex::new(1.0, 2.0), Complex::new(1.0, 2.0));
+    assert_ne!(Complex::new(1.0, 2.0), Complex::new(2.0, 1.0));
+    assert_ne!(Complex::new(0.0, 1.0), Complex::new(0.0, 2.0));
+}
+
+#[test]
+fn complex_arithmetic_matches_cpython() {
+    use stdpython::{PyAdd, PySub, PyMul};
+    // (1+2j) + (3+4j) = (4+6j)
+    assert_eq!(
+        Complex::new(1.0, 2.0).py_add(&Complex::new(3.0, 4.0)),
+        Complex::new(4.0, 6.0)
+    );
+    // (1+2j) - (3-1j) = (-2+3j)
+    assert_eq!(
+        Complex::new(1.0, 2.0).py_sub(&Complex::new(3.0, -1.0)),
+        Complex::new(-2.0, 3.0)
+    );
+    // (1+2j) * (3+4j) = (-5+10j)
+    assert_eq!(
+        Complex::new(1.0, 2.0).py_mul(&Complex::new(3.0, 4.0)),
+        Complex::new(-5.0, 10.0)
+    );
+    // conjugate
+    assert_eq!(Complex::new(3.0, 4.0).conjugate(), Complex::new(3.0, -4.0));
+}
+
+#[test]
+fn complex_accessors() {
+    let z = Complex::new(3.0, 4.0);
+    assert_eq!(z.re(), 3.0);
+    assert_eq!(z.im(), 4.0);
+}

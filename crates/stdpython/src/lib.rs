@@ -7097,6 +7097,142 @@ pub fn not_a_directory_error<M: AsRef<str>>(message: M) -> PyException {
 }
 
 // ============================================================================
+// COMPLEX (issue #366)
+// ============================================================================
+// Python's `complex` type, as an `f64` real+imaginary pair, matched to
+// CPython's observable behavior and pinned against `python3` (3.14.1):
+//
+// - `str(z)` and `repr(z)` are the SAME, using CPython's complex formatter
+//   (shared `complex_repr` below): a pure imaginary (real == +0.0) prints
+//   as a bare `"Xj"`; otherwise `"(<real><sign><|imag|>j)"`. An integral
+//   component drops its trailing `.0` (`3+0j`, `-0-1j`, `1e+16+1j`).
+// - `bool(z)` is False only for `0+0j` (signed zeros included).
+// - Equality is derived (complex-vs-complex by re & im); cross-type
+//   equality against int/float is the codegen slice (#366 slice 3).
+// - Ordering (`<`, `<=`, `>`, `>=`) and complex division are NOT lowered
+//   yet; codegen refuses them loudly until the #366 arithmetic slice lands.
+
+#[derive(Clone, Debug, PartialEq)]
+/// A Python `complex`: real and imaginary `f64` parts.
+pub struct Complex {
+    re: f64,
+    im: f64,
+}
+
+impl Complex {
+    pub fn new(re: f64, im: f64) -> Complex {
+        Complex { re, im }
+    }
+    /// The real part.
+    pub fn re(&self) -> f64 {
+        self.re
+    }
+    /// The imaginary part.
+    pub fn im(&self) -> f64 {
+        self.im
+    }
+    /// The complex conjugate: `(a+bj).conjugate()` is `(a-bj)`.
+    pub fn conjugate(&self) -> Complex {
+        Complex::new(self.re, -self.im)
+    }
+}
+
+/// The imaginary-part coefficient of an `a+bj` component, matched to
+/// CPython: `py_float_repr`, but with the trailing `.0` of an integral
+/// finite value dropped (`3.0` → `3`, `-0.0` → `-0`, `2.5` stays `2.5`,
+/// `1e+16` stays `1e+16`).
+fn complex_component_repr(x: f64) -> String {
+    if x.is_nan() {
+        return "nan".to_string();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
+    let mut s = py_float_repr(x);
+    // CPython prints an integral component without the fraction: "3" not
+    // "3.0", "-0" not "-0.0". Only strip when the repr is a plain decimal
+    // ending ".0" (never an exponent form like "1e+16").
+    if s.ends_with(".0") && !s.contains('e') && !s.contains('E') {
+        s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+    }
+    s
+}
+
+/// CPython's complex formatter, shared by `str`, `repr` and f-string `!r`:
+///
+/// - If `real` is EXACTLY `+0.0` (positive zero; `-0.0` does NOT qualify),
+///   the result is a bare imaginary `"Xj"` — no parentheses, real dropped
+///   (`1j`, `-2.5j`, `0j`, `-0j`).
+/// - Otherwise `"(<real><sign><|imag|>j)"`, where `<sign>` is `+` when the
+///   imaginary part is `>= 0` (including `+0.0`) and `-` when it is
+///   negative or `-0.0` (`(1+2j)`, `(1-2j)`, `(-0-1j)`, `(3+0j)`).
+pub fn complex_repr(re: f64, im: f64) -> String {
+    if re == 0.0 && !re.is_sign_negative() {
+        // Pure imaginary: keep the imaginary part's own sign and coercion.
+        return format!("{}j", complex_component_repr(im));
+    }
+    let sign = if im < 0.0 || (im == 0.0 && im.is_sign_negative()) {
+        "-"
+    } else {
+        "+"
+    };
+    format!("({}{}{}j)", complex_component_repr(re), sign, complex_component_repr(im.abs()))
+}
+
+impl PyBool for Complex {
+    fn py_bool(self) -> bool {
+        // bool(z) is False only for 0+0j (signed zero makes no difference).
+        self.re != 0.0 || self.im != 0.0
+    }
+}
+
+impl PyToString for Complex {
+    fn py_str(self) -> String {
+        // str(complex) IS repr(complex).
+        complex_repr(self.re, self.im)
+    }
+}
+
+impl PyRepr for Complex {
+    fn py_repr(&self) -> String {
+        complex_repr(self.re, self.im)
+    }
+}
+
+impl PyDisplay for Complex {
+    fn py_display(&self) -> String {
+        complex_repr(self.re, self.im)
+    }
+}
+
+/// Addition: `(a+bj) + (c+dj) = (a+c) + (b+d)j`.
+impl PyAdd<Complex> for Complex {
+    type Output = Complex;
+    fn py_add(&self, rhs: &Complex) -> Complex {
+        Complex::new(self.re + rhs.re, self.im + rhs.im)
+    }
+}
+
+/// Subtraction: `(a+bj) - (c+dj) = (a-c) + (b-d)j`.
+impl PySub<Complex> for Complex {
+    type Output = Complex;
+    fn py_sub(&self, rhs: &Complex) -> Complex {
+        Complex::new(self.re - rhs.re, self.im - rhs.im)
+    }
+}
+
+/// Multiplication: `(a+bj)(c+dj) = (ac-bd) + (ad+bc)j`.
+impl PyMul<Complex> for Complex {
+    type Output = Complex;
+    fn py_mul(&self, rhs: &Complex) -> Complex {
+        Complex::new(
+            self.re * rhs.re - self.im * rhs.im,
+            self.re * rhs.im + self.im * rhs.re,
+        )
+    }
+}
+
+// ============================================================================
 // PYTHON STANDARD LIBRARY MODULES
 // ============================================================================
 
