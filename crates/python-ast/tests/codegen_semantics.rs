@@ -6540,7 +6540,7 @@ fn stringio_and_csv_writer_lower_with_mut_borrows() {
     let out = compile(src, "csw1.py");
     assert!(out.contains("io :: StringIO ()"), "generated: {}", out);
     assert!(
-        out.contains("csv :: writer (& mut (buf))"),
+        out.contains("csv :: writer (& mut (buf) , \"\\r\\n\" . to_string ())"),
         "generated: {}",
         out
     );
@@ -6569,6 +6569,46 @@ fn stringio_and_csv_writer_lower_with_mut_borrows() {
         out.contains("io :: StringIO_seeded (& (\"seed\"))"),
         "generated: {}",
         out
+    );
+}
+
+#[test]
+fn csv_writer_accepts_the_lineterminator_keyword() {
+    // issue #369: `csv.writer(f, lineterminator=X)` (and the default
+    // `\r\n`) lower to the 2-argument stdpython writer.
+    let out = compile(
+        concat!(
+            "import io\n",
+            "import csv\n",
+            "\n",
+            "def f() -> str:\n",
+            "    b = io.StringIO()\n",
+            "    w = csv.writer(b, lineterminator=\"\\n\")\n",
+            "    return b.getvalue()\n",
+        ),
+        "csw_lt.py",
+    );
+    assert!(
+        out.contains("csv :: writer (& mut (b) , (\"\\n\") . to_string ())"),
+        "generated: {}",
+        out
+    );
+    let out2 = compile(
+        concat!(
+            "import io\n",
+            "import csv\n",
+            "\n",
+            "def f() -> str:\n",
+            "    b = io.StringIO()\n",
+            "    w = csv.writer(b)\n",
+            "    return b.getvalue()\n",
+        ),
+        "csw_default.py",
+    );
+    assert!(
+        out2.contains("\"\\r\\n\" . to_string ()"),
+        "the default lineterminator must be '\\r\\n': {}",
+        out2
     );
 }
 

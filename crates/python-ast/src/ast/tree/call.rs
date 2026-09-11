@@ -5239,12 +5239,14 @@ impl<'a> CodeGen for Call {
                 let mut count_kw: Option<crate::ExprType> = None;
                 let mut maxsplit_kw: Option<crate::ExprType> = None;
                 let mut _usedforsecurity_kw: Option<crate::ExprType> = None;
+                let mut lineterminator_kw: Option<crate::ExprType> = None;
                 for kw in &self.keywords {
                     let slot = match kw.arg.as_deref() {
                         Some("width") if matches!(fname.as_str(), "wrap" | "fill") => &mut width_kw,
                         Some("flags") if is_re_fn => &mut flags_kw,
                         Some("count") if fname == "sub" => &mut count_kw,
                         Some("maxsplit") if fname == "split" => &mut maxsplit_kw,
+                        Some("lineterminator") if fname == "writer" => &mut lineterminator_kw,
                         // md5/sha's usedforsecurity is a FIPS policy flag —
                         // ignored (requests' digest auth).
                         Some("usedforsecurity")
@@ -5836,7 +5838,17 @@ impl<'a> CodeGen for Call {
                     // writer's lifetime (scope analysis marks f mut).
                     ("writer", [f]) => {
                         let p = qual("writer");
-                        Ok(quote!(#p(&mut (#f))))
+                        // csv.writer(f, lineterminator=X) — the excel-dialect
+                        // writer with an overridable row terminator (#369);
+                        // the default is CPython's "\r\n".
+                        let term = match lineterminator_kw {
+                            Some(e) => {
+                                let t = e.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                quote!((#t).to_string())
+                            }
+                            None => quote!("\r\n".to_string()),
+                        };
+                        Ok(quote!(#p(&mut (#f), #term)))
                     }
                     ("reader", [lines]) => {
                         let p = qual("reader");
