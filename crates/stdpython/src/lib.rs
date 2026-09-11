@@ -7232,6 +7232,31 @@ impl PyMul<Complex> for Complex {
     }
 }
 
+/// Division: `(a+bj)/(c+dj) = ((ac+bd) + (bc-ad)j)/(c^2+d^2)`. A zero
+/// divisor raises CPython's `ZeroDivisionError: division by zero`.
+impl PyDiv<Complex> for Complex {
+    type Output = Complex;
+    fn py_div(&self, rhs: &Complex) -> Result<Complex, PyException> {
+        let denom = rhs.re * rhs.re + rhs.im * rhs.im;
+        if denom == 0.0 {
+            return Err(PyException::new("ZeroDivisionError", "division by zero"));
+        }
+        Ok(Complex::new(
+            (self.re * rhs.re + self.im * rhs.im) / denom,
+            (self.im * rhs.re - self.re * rhs.im) / denom,
+        ))
+    }
+}
+
+/// `abs(complex)`: the Euclidean modulus `sqrt(re^2 + im^2)`, an `f64` —
+/// CPython returns a real `float`, not a `complex`.
+impl PyAbs for Complex {
+    type Output = f64;
+    fn py_abs(self) -> f64 {
+        (self.re * self.re + self.im * self.im).sqrt()
+    }
+}
+
 // ============================================================================
 // PYTHON STANDARD LIBRARY MODULES
 // ============================================================================

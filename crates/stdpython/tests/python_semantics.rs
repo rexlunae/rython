@@ -4270,3 +4270,32 @@ fn complex_accessors() {
     assert_eq!(z.re(), 3.0);
     assert_eq!(z.im(), 4.0);
 }
+
+#[test]
+fn complex_division_matches_cpython() {
+    use stdpython::PyDiv;
+    // (1+2j)/(3+4j) = 0.44+0.08j
+    let q = Complex::new(1.0, 2.0).py_div(&Complex::new(3.0, 4.0)).unwrap();
+    assert_eq!(q.re(), 0.44);
+    assert_eq!(q.im(), 0.08);
+    // (1+2j)/2 == (0.5+1j)
+    let q2 = Complex::new(1.0, 2.0).py_div(&Complex::new(2.0, 0.0)).unwrap();
+    assert_eq!(q2.re(), 0.5);
+    assert_eq!(q2.im(), 1.0);
+    // 1j/0 == ZeroDivisionError: division by zero
+    let err = Complex::new(0.0, 1.0).py_div(&Complex::new(0.0, 0.0)).err().unwrap();
+    assert!(err.matches("ZeroDivisionError"), "{:?}", err);
+    assert_eq!(err.message, "division by zero");
+    // 1j/0j also raises (0j IS complex(0,0))
+    let err2 = Complex::new(0.0, 1.0).py_div(&Complex::new(0.0, 0.0)).err().unwrap();
+    assert!(err2.matches("ZeroDivisionError"), "{:?}", err2);
+}
+
+#[test]
+fn complex_abs_matches_cpython() {
+    use stdpython::PyAbs;
+    // abs(3+4j) == 5.0, abs(0j) == 0.0 (an f64)
+    assert_eq!(Complex::new(3.0, 4.0).py_abs(), 5.0);
+    assert_eq!(Complex::new(0.0, 0.0).py_abs(), 0.0);
+    assert_eq!(Complex::new(1.0, 1.0).py_abs(), 2.0f64.sqrt());
+}
