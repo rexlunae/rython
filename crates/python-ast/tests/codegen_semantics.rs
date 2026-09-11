@@ -6088,9 +6088,20 @@ fn map_filter_dispatch_on_the_function_arguments_shape() {
     let out = compile("ys = filter(None, [0, 1, 2])\n", "mf4.py");
     assert!(out.contains("filter_truthy ("), "generated: {}", out);
 
-    // list() with no argument has no inferable type: loud.
-    let err = compile_err("ys = list()\n", "mf5.py");
-    assert!(err.contains("iterable argument"), "error: {}", err);
+    // list() with no argument has no inferable type: like an untyped `[]`,
+    // it lowers to a boxed empty vector WITH a warning (issue #370) rather
+    // than a conversion error.
+    let (out, warnings) = compile_with_warnings("ys = list()\n", "mf5.py");
+    assert!(
+        warnings.iter().any(|w| w.contains("no inferable element type")),
+        "must warn loudly: {}",
+        warnings.len()
+    );
+    assert!(
+        out.contains("PyValue"),
+        "must lower to a boxed empty vector: {}",
+        out.len()
+    );
 }
 
 // ---------------------------------------------------------------------------

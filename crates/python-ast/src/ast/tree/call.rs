@@ -4237,9 +4237,23 @@ impl<'a> CodeGen for Call {
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
-                        if rendered.len() != 1 {
-                            return Err("list() requires an iterable argument in rython (an \
-                                 empty list has no inferable element type; use [])"
+                        // `list()` with NO arguments is Python's empty list —
+                        // the `[]` shape (issue #370). Like an untyped `[]`,
+                        // it lowers to a boxed EMPTY vector with a -W warning
+                        // when no element type is inferable from context; a
+                        // mismatching use fails loudly at rustc, never a
+                        // silently wrong container.
+                        if rendered.is_empty() {
+                            options.definition_warnings.borrow_mut().push(
+                                "list() with no arguments has no inferable element \
+                                 type; lowering as Vec<PyValue> (the empty-container \
+                                 documented divergence; annotate or pass an iterable)"
+                                    .to_string(),
+                            );
+                            return Ok(quote!(Vec::<stdpython::PyValue>::new()));
+                        }
+                        if rendered.len() > 1 {
+                            return Err("list() takes at most 1 positional argument"
                                 .to_string()
                                 .into());
                         }
