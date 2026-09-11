@@ -734,7 +734,8 @@ impl CodeGen for Module {
         // binding, never a shadowing fresh binding (issue #80). The render
         // pass below repeats this classification (cheap); the raw lists
         // drive both the hoisted sets and hoisted_declarations.
-        for (stmt_index, s) in self.raw.body.iter().enumerate() {
+        let module_raw_body = self.raw.body.clone();
+        for (stmt_index, s) in module_raw_body.iter().enumerate() {
             // Issue #118: module-level argparse statements are consumed by
             // the conversion-time rewrite — the parser statements vanish
             // and the parse_args assignment is replaced in the emit loop.
@@ -1360,6 +1361,23 @@ impl CodeGen for Module {
                             o
                         };
                         for body_stmt in &if_stmt.body {
+                            // A `unittest.main()` call lowers to the emitted
+                            // test runner (issue #334): construct the module's
+                            // TestCase classes and run their test_* methods,
+                            // instead of the runtime's loud stub.
+                            if matched_unittest_main(body_stmt) {
+                                if let Some(runner) = emit_test_runner(
+                                    &module_raw_body,
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )
+                                {
+                                    main_body_stmts.push(runner);
+                                    has_main_code = true;
+                                    continue;
+                                }
+                            }
                             let stmt_token = body_stmt
                                 .clone()
                                 .to_rust(ctx.clone(), main_options.clone(), symbols.clone())
@@ -6157,6 +6175,109 @@ pub(crate) fn collect_class_defs(stmts: &[crate::Statement], out: &mut Vec<crate
         }
         Flow::Continue
     });
+}
+
+// ---------------------------------------------------------------------------
+// unittest runner (issue #334): the codegen-emitted replacement for
+// `unittest.main()` in a `__main__` block. It discovers the module's
+// `*TestCase` classes, constructs each, and runs its `test_*` methods,
+// counting failures and (in `main()`) exiting non-zero on any failure.
+// ---------------------------------------------------------------------------
+
+/// Whether a class's BASE (a `bases` ExprType) resolves to `unittest.TestCase`:
+/// the bare name `TestCase` or a `unittest.TestCase` attribute.
+fn is_testcase_base(base: &crate::ExprType) -> bool {
+    match base {
+        crate::ExprType::Name(n) => n.id == "TestCase",
+        crate::ExprType::Attribute(a) => a.attr == "TestCase",
+        _ => false,
+    }
+}
+
+/// Whether a statement is a direct `unittest.main()` call — the site the
+/// generated test runner replaces (issue #334).
+fn matched_unittest_main(stmt: &crate::Statement) -> bool {
+    matches!(
+        &stmt.statement,
+        crate::StatementType::Expr(e)
+            if matches!(
+                &e.value,
+                crate::ExprType::Call(c)
+                    if matches!(
+                        c.func.as_ref(),
+                        crate::ExprType::Attribute(a)
+                            if a.attr == "main"
+                                && matches!(
+                                    a.value.as_ref(),
+                                    crate::ExprType::Name(n) if n.id == "unittest"
+                                )
+                    )
+            )
+    )
+}
+
+/// The `test_*` method names directly defined on a class.
+fn test_method_names(class_def: &crate::ClassDef) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in &class_def.body {
+        match &s.statement {
+            crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
+                if f.name.starts_with("test") {
+                    out.push(format!("{}", f.name));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Emit the runner tokens for a `unittest.main()` site, or None when the
+/// module has no direct `unittest.TestCase`-derived classes (nothing to run —
+/// leave `unittest.main()` to the runtime, which then raises its loud
+/// NotImplementedError).
+fn emit_test_runner(
+    module_stmts: &[crate::Statement],
+    _ctx: crate::CodeGenContext,
+    _options: crate::PythonOptions,
+    _symbols: crate::SymbolTableScopes,
+) -> Option<TokenStream> {
+    let mut classes: Vec<crate::ClassDef> = Vec::new();
+    collect_class_defs(module_stmts, &mut classes);
+    let test_classes: Vec<&crate::ClassDef> = classes
+        .iter()
+        .filter(|c| c.bases.iter().any(is_testcase_base))
+        .collect();
+    if test_classes.is_empty() {
+        return None;
+    }
+    let mut stmts = TokenStream::new();
+    for c in test_classes {
+        let cname = quote::format_ident!("{}", c.name);
+        for m in test_method_names(c) {
+            let mident = quote::format_ident!("{}", m);
+            stmts.extend(quote! {
+                let __rython_tc = #cname::new()?;
+                match __rython_tc.#mident() {
+                    Ok(__rython_v) => __rython_v,
+                    Err(__rython_e) => {
+                        eprintln!("FAIL: {}", __rython_e);
+                        __rython_ntest_failures += 1;
+                    }
+                };
+            });
+        }
+    }
+    Some(quote! {
+        let mut __rython_ntest_failures: usize = 0usize;
+        #stmts
+        if __rython_ntest_failures != 0usize {
+            return Err(PyException::new(
+                "AssertionError",
+                format!("{__rython_ntest_failures} test(s) failed"),
+            ));
+        }
+    })
 }
 
 /// Is `name` — a class of the CURRENT module (options.this_module_path) —

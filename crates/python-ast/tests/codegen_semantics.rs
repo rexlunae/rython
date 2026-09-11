@@ -5399,6 +5399,47 @@ fn value_returning_main_gets_a_wrapper_entry_point() {
 }
 
 #[test]
+fn unittest_main_emits_a_test_runner() {
+    // issue #334: `unittest.main()` in a `__main__` block lowers to an
+    // emitted runner that constructs each *TestCase subclass and calls its
+    // test_* methods, counting failures (and raising AssertionError when
+    // any test fails) instead of the runtime's loud stub.
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "\n",
+            "class TestAdd(unittest.TestCase):\n",
+            "    def test_one_plus_one(self):\n",
+            "        self.assertEqual(1 + 1, 2)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+        "runner_test.py",
+    );
+    assert!(
+        out.contains("TestAdd :: new ()"),
+        "the runner must construct the TestCase: {}",
+        out
+    );
+    assert!(
+        out.contains("test_one_plus_one ()"),
+        "the runner must call the test method: {}",
+        out
+    );
+    assert!(
+        out.contains("__rython_ntest_failures"),
+        "the runner must count failures: {}",
+        out
+    );
+    assert!(
+        !out.contains("unittest :: main () ;"),
+        "unittest.main() must be replaced by the runner: {}",
+        out
+    );
+}
+
+#[test]
 fn integral_float_literals_keep_their_float_type() {
     // 2.0 must stay a float literal: Rust's Display drops the ".0" and the
     // re-parse would silently produce an integer (2.0 / 4 is 0.5 in
