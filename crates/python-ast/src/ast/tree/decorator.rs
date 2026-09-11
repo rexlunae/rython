@@ -155,6 +155,11 @@ impl TestGate {
             "expectedFailure" | "expectedFailureIf" => Some(TestGate::ExpectedFailure),
             "cpython_only" => Some(TestGate::CpythonOnly),
             "patch" => Some(TestGate::MockPatch),
+            // Common bare test-support directives imported as `from
+            // test.support import bigmemtest, reap_threads`:
+            "bigmemtest" | "bigmem" | "reap_threads" | "requires_version" => {
+                Some(TestGate::Support)
+            }
             _ => None,
         }
     }
@@ -196,32 +201,28 @@ pub(crate) fn test_gate_from_expr(e: &ExprType) -> Option<TestGate> {
     // A bare name: `@skipUnless`, `@cpython_only`, `@requires_*`, ...
     // `name_of` surfaces the bare name only when the receiver is NOT a
     // (non-test) module, which is exactly the no-receiver / bare case.
-    match e {
-        ExprType::Name(n) => {
-            if n.id.starts_with("requires_") {
-                Some(TestGate::Support)
-            } else {
-                TestGate::from_name(n.id.as_ref())
-            }
+    let named = |n: &str| -> Option<TestGate> {
+        // `support`/`unittest` directives often come bare via a
+        // `from test.support import ...` — the `skip_*`, `requires_*`,
+        // `bigmem*` families are unambiguously runner gates.
+        if n.starts_with("requires_")
+            || n.starts_with("skip_emscripten")
+            || n.starts_with("bigmem")
+        {
+            return Some(TestGate::Support);
         }
+        TestGate::from_name(n)
+    };
+    match e {
+        ExprType::Name(n) => named(n.id.as_ref()),
         ExprType::Call(c) => match c.func.as_ref() {
-            ExprType::Name(n) => {
-                if n.id.starts_with("requires_") {
-                    Some(TestGate::Support)
-                } else {
-                    TestGate::from_name(n.id.as_ref())
-                }
-            }
+            ExprType::Name(n) => named(n.id.as_ref()),
             _ => None,
         },
         ExprType::Attribute(a) => {
             // A non-test-module receiver with a `requires_*`/known gate
             // attribute (`@something.requires_x`, `@something.skipUnless`).
-            if a.attr.starts_with("requires_") {
-                Some(TestGate::Support)
-            } else {
-                TestGate::from_name(a.attr.as_ref())
-            }
+            named(a.attr.as_ref())
         }
         _ => None,
     }
@@ -440,6 +441,12 @@ pub fn parse_decorator(
                 ) {
                     return parse_decorator(std::slice::from_ref(d));
                 }
+            }
+            // Only test-runner GATES stacked (`@support.skip_if_sanitizer
+            // (...) @support.skip_emscripten_stack_overflow()`): consume as
+            // a single gate; the caller warns once.
+            if many.iter().all(|d| test_gate_from_expr(d).is_some()) {
+                return Ok(Some(Decorator::TestGate(TestGate::Support)));
             }
             // Only metadata markers stacked: a no-op.
             if many
