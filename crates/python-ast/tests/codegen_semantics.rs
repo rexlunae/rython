@@ -5408,6 +5408,23 @@ fn chained_class_level_literal_constants_lower_per_target() {
 }
 
 #[test]
+fn method_alias_chain_is_a_loud_noop() {
+    // issue #367: `__ne__ = __lt__ = __eq__` (heapq's CmpErr) aliases
+    // comparison dunders rython does not wire onto user classes — consumed
+    // as a no-op WITH a warning, never a hard error and never silent.
+    let (out, warnings) = compile_with_warnings(
+        "class C:\n    def __eq__(self):\n        return 1\n    __ne__ = __lt__ = __eq__\n",
+        "method_alias.py",
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("method-alias chain")),
+        "must warn loudly: {}",
+        warnings.len()
+    );
+    let _ = out;
+}
+
+#[test]
 fn conditionally_reassigned_module_names_are_not_constants() {
     // DEBUG = False overwritten inside a module-level `if` must NOT freeze
     // as a static: the nested store would land on a shadowing local inside

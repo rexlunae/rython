@@ -3615,6 +3615,36 @@ StatementType::Assign(a)
         class_constants.extend(quote!(pub const #ident: #ty = #value;));
     }
 }
+                // A class-level METHOD-ALIAS chain (`__ne__ = __lt__ = __eq__`
+                // — heapq's CmpErr): each target aliases a method defined in
+                // THIS class. rython does not wire Python's dunder-operator
+                // protocol onto user classes (comparison operators on user
+                // classes are not lowered), so these aliases have no OBSERVABLE
+                // runtime effect here — they are consumed as a no-op WITH a -W
+                // warning (the same loud-no-op the test-runner gates get),
+                // never silently dropped and never re-shaped.
+                StatementType::Assign(a)
+                    if a
+                        .targets
+                        .iter()
+                        .all(|t| matches!(t, ExprType::Name(_)))
+                        && let ExprType::Name(valuename) = &a.value
+                        && self.methods().any(|m| m.name == valuename.id) =>
+                {
+                    let first_target = match a.targets.first() {
+                        Some(ExprType::Name(n)) => n.id.clone(),
+                        _ => String::new(),
+                    };
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "class `{}`: method-alias chain binding `{}` to the \
+                         method `{}` aliases a comparison dunder rython does not \
+                         wire onto user classes (no observable effect); the \
+                         aliases are dropped (documented divergence)",
+                        self.name,
+                        first_target,
+                        valuename.id,
+                    ));
+                }
                 // A class-level COMPUTED constant: single-store name
                 // assigned a non-literal value (frozenset/dict/list/set
                 // literal or a constructor call). Python resolves these at
