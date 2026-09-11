@@ -2797,6 +2797,21 @@ fn omitted_defaults_must_be_constant() {
 }
 
 #[test]
+fn nested_constant_binary_defaults_are_accepted() {
+    // A default that is a NESTED constant binary expression
+    // (`(2.0*pi)**0.5` — random's sqrt2pi, a Pow whose left is itself a
+    // Mul of a literal and a module constant `pi`) is a pure constant
+    // expression: re-evaluating it at an omitted call site is observably
+    // identical, so it must convert (issue #80 / #370) rather than a
+    // "non-constant default" error.
+    let out = compile(
+        "from math import pi\ndef gamma(z, sqrt2pi=(2.0*pi)**0.5):\n    return sqrt2pi\ngamma(1)\n",
+        "cst_nested_default.py",
+    );
+    assert!(out.contains("sqrt2pi"), "generated: {out}");
+}
+
+#[test]
 fn user_definitions_shadow_stdlib_module_spellings() {
     // `re = ...` then `re.search(...)` must call the user's object, not
     // the re module (issue #80). The module intercept defers to the

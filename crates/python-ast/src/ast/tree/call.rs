@@ -10679,6 +10679,12 @@ fn check_default_constant(
         {
             Ok(())
         }
+        // A NESTED constant binary expression (`(2.0*pi)**0.5` — random's
+        // sqrt2pi default, a Pow whose left is itself a Mul of constant and
+        // a module constant): both operands are PURE scalars, so the whole
+        // default is a constant expression and re-evaluating it at each call
+        // site is observably identical (no mutation, no side effects).
+        ExprType::BinOp(op) if scalar(&op.left) && scalar(&op.right) => Ok(()),
         ExprType::UnaryOp(u) if matches!(u.operand.as_ref(), ExprType::Constant(_)) => Ok(()),
         // A CLASS-REFERENCE default (`executor_cls=concurrent.futures.
         // ThreadPoolExecutor` — s3transfer): a module-path attribute naming
