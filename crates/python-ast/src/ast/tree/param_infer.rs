@@ -2334,12 +2334,25 @@ fn collect_return_exprs(body: &[Statement], out: &mut Vec<ExprType>) {
 /// call (`regex_opt_inner(strings[1:], '(?:')` and BinOps around it —
 /// pygments' regexopt): only the recursion's concrete base returns. A
 /// return inside a nested def is not this function's.
+/// Push the non-recursive branches of a return expression into `out`.
+///
+/// A return may be a single expression with an `if`-expression that recurses
+/// on ONE branch only (`return 1 + count_set_bits(n & n - 1) if n else 0` —
+/// the base `0` carries the recursion's concrete type). Rather than drop the
+/// whole expression because some branch recurses, we expand it into its leaf
+/// branches (`collect_expr_branches` flattens nested IfExps) and push only
+/// the leaves that contain NO self-call. For a return with no recursion at
+/// all this is the identity — the branch set of a non-IfExp is itself.
 fn collect_non_self_returns(body: &[Statement], self_name: &str, out: &mut Vec<ExprType>) {
     walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
-        if let StatementType::Return(Some(e)) = &stmt.statement
-            && !expr_contains_call_to(&e.value, self_name)
-        {
-            out.push(e.value.clone());
+        if let StatementType::Return(Some(e)) = &stmt.statement {
+            let mut leaves: Vec<&ExprType> = Vec::new();
+            collect_expr_branches(&e.value, &mut leaves);
+            for leaf in leaves {
+                if !expr_contains_call_to(leaf, self_name) {
+                    out.push(leaf.clone());
+                }
+            }
         }
         Flow::Continue
     });

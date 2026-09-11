@@ -9249,6 +9249,21 @@ fn self_recursive_receiver_gets_a_pyadd_self_bound() {
 }
 
 #[test]
+fn recursion_base_under_ifexp_infers_concrete_int() {
+    // `return 1 + count_set_bits(n & n - 1) if n else 0`: the recursive
+    // arm's call sits on ONE branch of an if-expression, but the `else`
+    // base `0` still pins the recursion to i64. collect_non_self_returns
+    // used to drop the whole return because one branch recursed; it now
+    // expands into the non-recursive leaf branches. (test_math's
+    // count_set_bits.)
+    let out = compile(
+        "def count_set_bits(n):\n    return 1 + count_set_bits(n & n - 1) if n else 0\n",
+        "countsetbits.py",
+    );
+    assert!(out.contains("-> Result < i64 , PyException >"), "generated: {}", out);
+}
+
+#[test]
 fn definitionally_unsatisfiable_bounds_warn_but_convert() {
     // M5: `p.upper()` + `p.pop()` — no known type satisfies
     // PyStrOps + PyPop. A well-formed Python definition: it converts, with
