@@ -62,6 +62,12 @@ const FALLIBLE_STDLIB_FN: &[&str] = &[
     "MemoryBIO",
     // urllib.request.urlopen raises URLError/HTTPError.
     "urlopen",
+    // unittest.main() — the test-runner entry (issue #334). Its Result
+    // carries the runner's status: until codegen lowers a real runner, the
+    // runtime stub returns a loud NotImplementedError rather than silently
+    // passing, and threading `?` makes that surface instead of being
+    // swallowed by the statement.
+    "main",
 ];
 
 /// Issue #111: keyword-argument signatures of stdpython runtime functions

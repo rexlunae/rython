@@ -55,6 +55,9 @@ pub(crate) enum StdModule {
     /// encodings.aliases carries the CPython codec alias table (a static
     /// PyDict — `from encodings.aliases import aliases`, round 111).
     Encodings,
+    /// unittest — the test-runner harness (issue #334). std-gated: the
+    /// runner needs the process/panic machinery.
+    Unittest,
 }
 
 impl StdModule {
@@ -95,6 +98,7 @@ impl StdModule {
             "ssl" => StdModule::Ssl,
             "urllib" => StdModule::Urllib,
             "encodings" => StdModule::Encodings,
+            "unittest" => StdModule::Unittest,
             _ => return None,
         })
     }
@@ -135,6 +139,7 @@ impl StdModule {
             StdModule::Ssl => "ssl",
             StdModule::Urllib => "urllib",
             StdModule::Encodings => "encodings",
+            StdModule::Unittest => "unittest",
         }
     }
 
@@ -169,7 +174,8 @@ impl StdModule {
             // The alias table builds a PyDict — the alloc-tier dict — but
             // the runtime module lives beside the codec layer on the std
             // tier where the corpus imports it.
-            | StdModule::Encodings => true,
+            | StdModule::Encodings
+             | StdModule::Unittest => true,
             StdModule::Io
             | StdModule::Json
             | StdModule::Collections

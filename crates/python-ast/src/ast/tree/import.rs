@@ -56,6 +56,7 @@ pub(crate) fn stdpython_module_class(module: &str, name: &str) -> bool {
         }
         StdModule::Subprocess => matches!(name, "CompletedProcess"),
         StdModule::Csv => false,
+        StdModule::Unittest => false,
         StdModule::String => matches!(name, "Template"),
         StdModule::Venv => matches!(name, "EnvBuilder"),
         // Functions/constants only.
@@ -94,6 +95,10 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
         StdModule::Io => matches!(name, "StringIO" | "BytesIO" | "DEFAULT_BUFFER_SIZE"),
         // The dotted encodings.aliases submodule's table item.
         StdModule::Encodings => name == "aliases",
+        StdModule::Unittest => matches!(
+            name,
+            "main" | "TestCase" | "SkipTest" | "skip" | "skipIf" | "skipUnless" | "expectedFailure"
+        ),
         // The type names come from the ThreadingType enum (one source of
         // truth); current_thread/active_count are module functions.
         StdModule::Threading => {

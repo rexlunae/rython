@@ -7430,6 +7430,8 @@ pub use stdlib::textwrap;
 pub use stdlib::hashlib;
 pub use stdlib::csv;
 #[cfg(feature = "std")]
+pub use stdlib::unittest;
+#[cfg(feature = "std")]
 pub use stdlib::pathlib;
 #[cfg(feature = "std")]
 pub use stdlib::tempfile;

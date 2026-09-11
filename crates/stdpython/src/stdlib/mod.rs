@@ -124,6 +124,10 @@ pub mod codec;
 #[cfg(feature = "std")]
 pub mod encodings;
 
+/// Python unittest module - the test-runner harness (issue #334).
+#[cfg(feature = "std")]
+pub mod unittest;
+
 /// Python numpy subset — dense N-dimensional arrays with broadcasting,
 /// ufuncs, reductions, and a small linalg module. Optional feature
 /// `numpy` pulls in the sequential engine; `numpy-rayon`, `numpy-simd`,
