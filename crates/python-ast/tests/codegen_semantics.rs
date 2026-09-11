@@ -14568,6 +14568,95 @@ fn self_field_option_or_concrete_unwraps_to_plain() {
 }
 
 #[test]
+fn plain_string_or_literal_folds_to_the_operand_not_bool() {
+    // Round 119: `path or "/"` where `path` is a plain STRING (NOT
+    // Optional) — Python returns an OPERAND, never a bool. The old `||`
+    // fallback typed the expression bool and poisoned every downstream
+    // value use. The operand-returning fold binds `path` ONCE (short-
+    // circuits the literal and reads the first operand exactly once) and
+    // OWNS the falsy literal so both arms are String.
+    let out = compile(
+        "def pick(path: str) -> str:\n    return path or \"/\"\n",
+        "pathor.py",
+    );
+    assert!(
+        !out.contains(") || (") && !out.contains(") && ("),
+        "a plain `str or str-literal` must not emit Rust `||`/`&&`: {}",
+        out
+    );
+    assert!(
+        out.contains("let __rython_or = path")
+            && out.contains("is_truthy ()")
+            && out.contains("else { (\"/\") . to_string () }"),
+        "the OR fold must bind first once and own the literal default: {}",
+        out
+    );
+}
+
+#[test]
+fn plain_list_or_fallback_folds_to_the_operand() {
+    // Round 119: `items or fallback` (two lists) — Python returns the
+    // SELECTED list, not a bool. The old `||` fallback typed it bool and
+    // broke every downstream list use. The operand fold binds the first
+    // list once, short-circuits `fallback`, and returns the first when
+    // truthy.
+    let out = compile(
+        "def pick(items: list[str], fallback: list[str]) -> list[str]:\n    return items or fallback\n",
+        "listor.py",
+    );
+    assert!(
+        !out.contains(") || (") && !out.contains(") && ("),
+        "a plain `list or list` must not emit Rust `||`/`&&`: {}",
+        out
+    );
+    assert!(
+        out.contains("let __rython_or = items")
+            && out.contains("if (__rython_or) . is_truthy () { __rython_or } else { fallback }")
+            || out.contains("if (__rython_or).is_truthy() { __rython_or } else { fallback }"),
+        "the OR fold must bind the first list once and short-circuit: {}",
+        out
+    );
+}
+
+#[test]
+fn plain_and_folds_to_the_operand() {
+    // Round 119: `a and b` (two strings) — Python returns `b` when `a` is
+    // truthy, else `a`. The old `&&` fallback typed it bool; the fold
+    // returns the operand.
+    let out = compile(
+        "def pick(a: str, b: str) -> str:\n    return a and b\n",
+        "andv.py",
+    );
+    assert!(
+        !out.contains(") && (") && !out.contains(") || ("),
+        "a plain `str and str` must not emit Rust `&&`/`||`: {}",
+        out
+    );
+    assert!(
+        out.contains("if (__rython_or) . is_truthy () { b } else { __rython_or }")
+            || out.contains("if (__rython_or).is_truthy() { b } else { __rython_or }"),
+        "the AND fold must return b when truthy, else a: {}",
+        out
+    );
+}
+
+#[test]
+fn bool_or_bool_stays_bool_with_rust_or() {
+    // Round 119: `a or b` where BOTH operands are bool — Python returns
+    // the truthy BOOL operand, which `||` (bool result) reproduces
+    // exactly. Keep `||`; do not over-fold a bool pair.
+    let out = compile(
+        "def pick(a: bool, b: bool) -> bool:\n    return a or b\n",
+        "boolor.py",
+    );
+    assert!(
+        out.contains("(a) || (b)"),
+        "a bool-or-bool must keep Rust `||`: {}",
+        out
+    );
+}
+
+#[test]
 fn option_and_call_narrows_the_inner_argument() {
     // Round 48: `ca_certs and os.path.expanduser(ca_certs)` where
     // ca_certs is `str | None` (urllib3) — the truthy arm passes the

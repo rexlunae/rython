@@ -177,6 +177,11 @@ fn fold(
         // know, or the operand-returning semantics fall to `||`).
         let a = fold_operand_type(&values[i], ctx, options, symbols);
         let b = fold_operand_type(&values[i + 1], ctx, options, symbols);
+        // The operands' unified type — the agreed-on result type for BOTH
+        // inference and the fold. Unify is the same compatibility relation
+        // inference uses (`BoolOp -> unify(operands)`), so a value fold only
+        // fires when the operands land on a concrete value type.
+        let u = crate::ast::tree::type_ctx::unify(a.clone(), b.clone());
         use crate::TypeInfo as T;
         // Whether the operand can hold the Option's inner type: the
         // concrete match (`ca and x` where both are str), a STRING
@@ -345,6 +350,44 @@ fn fold(
                     })
                 }
             }
+            // a: VALUE, b: unifiable VALUE — Python returns an OPERAND, never
+            // a bool: `path or "/"` (String and a str literal) and `items or
+            // fallback` (two lists) must return the SELECTED operand, not
+            // `||`'s bool (which typed the expression bool and broke every
+            // downstream value use). Round 119: when the operands unify to a
+            // concrete non-bool VALUE type the fold lowers with operand-
+            // returning semantics — `or` = truthy ? first : rest — binding
+            // `first` ONCE (short-circuits `rest` when `first` is truthy and
+            // reads a first-use-only operand exactly once) and owning a
+            // string-literal arm (`.to_string()`) so both arms are String.
+            // Two Bools (u = Bool) still fall to `&&`/`||` (a bool's
+            // truthiness IS the result); an ununifiable mix (u =
+            // PyObject/PyValue) stays the loud fallback.
+            (_, _) if value_unify(&u) => {
+                let owned_first = maybe_own_string(&values[i], &u, first.clone());
+                // Own the REST arm only when it IS the last operand's raw
+                // render: `path or "/"` — the falsy literal must be
+                // `.to_string()`. For a CHAINED fold (`a or "x" or c`) the
+                // rest is a nested fold whose own midpoint already owned
+                // the literal (`"x".to_string()`), so wrapping it again
+                // would mis-touch a String.
+                let owned_rest = if i + 1 == values.len() - 1 {
+                    maybe_own_string(&values[i + 1], &u, rest.clone())
+                } else {
+                    rest.clone()
+                };
+                if op == BoolOps::And {
+                    quote!({
+                        let __rython_or = #owned_first;
+                        if (__rython_or).is_truthy() { #owned_rest } else { __rython_or }
+                    })
+                } else {
+                    quote!({
+                        let __rython_or = #owned_first;
+                        if (__rython_or).is_truthy() { __rython_or } else { #owned_rest }
+                    })
+                }
+            }
             _ => {
                 if op == BoolOps::And {
                     quote!((#first) && (#rest))
@@ -369,6 +412,47 @@ fn some_arm(expr: &crate::ExprType, tokens: TokenStream) -> TokenStream {
         quote!(Some((#tokens).to_string()))
     } else {
         quote!(Some(#tokens))
+    }
+}
+
+/// Whether the operands' unified type is a concrete non-bool VALUE type the
+/// operand-returning fold can emit (the runtime provides `is_truthy()` for
+/// all of these). Two Bools unify to Bool (excluded — `&&`/`||` is already
+/// correct for a bool pair); an ununifiable mix or a remaining Option/boxed
+/// pair unifies to PyObject/PyValue (excluded — the loud fallback stays). A
+/// Rust TUPLE has no `Truthy` impl (tuple truthiness is untied in the
+/// runtime), so a Tuple-typed fold is NOT emitted here — it stays `&&`/`||`
+/// (loud) rather than calling a method a Rust tuple lacks.
+fn value_unify(u: &crate::TypeInfo) -> bool {
+    matches!(
+        u,
+        crate::TypeInfo::Int
+            | crate::TypeInfo::Float
+            | crate::TypeInfo::String
+            | crate::TypeInfo::StrRef
+            | crate::TypeInfo::Bytes
+            | crate::TypeInfo::StrOrBytes
+    ) || matches!(u, crate::TypeInfo::Vec(_) | crate::TypeInfo::HashSet(_) | crate::TypeInfo::Dict(_, _))
+}
+
+/// Own a string-literal arm so both fold arms agree on `String` when the
+/// unified type is String: `path or "/"` binds the String-typed `path` and
+/// the falsy `"/"` literal must be `.to_string()` (a bare `&'static str`)
+/// or the two arms mismatch. Only when `u` is String and the operand is a
+/// string literal; otherwise the arm stands (a both-literal fold unifies to
+/// StrRef and both arms stay `&str`, served by the `&T` Truthy blanket).
+fn maybe_own_string(
+    expr: &crate::ExprType,
+    u: &crate::TypeInfo,
+    tokens: TokenStream,
+) -> TokenStream {
+    if matches!(u, crate::TypeInfo::String)
+        && matches!(expr, crate::ExprType::Constant(c)
+            if matches!(&c.0, Some(litrs::Literal::String(_))))
+    {
+        quote!((#tokens).to_string())
+    } else {
+        tokens
     }
 }
 

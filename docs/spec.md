@@ -377,6 +377,19 @@ loudly in rustc (§12.1) rather than silently returning a bool where
 Python returns a value. `a or None` gets Option semantics via the same
 unification.
 
+The value fold is not limited to Option operands: any two ordinary VALUE
+operands that unify to a concrete non-bool type (`path or "/"` —
+`String` and a `str` literal; `items or fallback` — two lists) lower with
+the same operand-returning semantics, binding the FIRST operand once:
+`a or b = truthy(a) ? a : b` (and `a and b = truthy(a) ? b : a`)
+short-circuits `b`, evaluates left-to-right, and reads a first-use-only
+non-`Copy` operand exactly once (round 119). A string-literal arm owns
+the literal (`.to_string()`) so both arms are `String`. Two Bools still
+lower to `&&`/`||` (a bool's truthiness *is* the result, so `||` is
+exact), and inference types a value BoolOp as the unify of its operands
+— the same relation the fold lowers — so inference and codegen agree on
+the selected operand's type.
+
 A subscript STORE into a boxed dict (`dict[str, Any]` →
 `PyDict<String, PyValue>`) absorbs an `Option` value the way the box
 absorbs `None`: `ctx["scheme"] = scheme or "http"` where `scheme` is

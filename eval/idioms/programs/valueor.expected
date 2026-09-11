@@ -1,0 +1,10 @@
+/default
+index.html
+[1, 2]
+[0]
+
+second
+or-falsy SECOND ['', 'SECOND']
+or-truthy x ['x']
+and-truthy SECOND ['x', 'SECOND']
+and-falsy  ['']

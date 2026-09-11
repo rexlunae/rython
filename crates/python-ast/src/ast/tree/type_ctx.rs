@@ -918,7 +918,22 @@ fn infer_type_inner(
             }
             _ => TypeInfo::PyObject,
         },
-        ExprType::BoolOp(_) => TypeInfo::Bool,
+        ExprType::BoolOp(b) => {
+            // Python's `a or b` / `a and b` return an OPERAND, not a bool:
+            // `path or "/"` is a String and `items or fallback` is a list
+            // (CPython), so a value BoolOp infers as the left-to-right
+            // unify of its operands — the same relation the codegen fold
+            // uses to lower it (`a or b = truthy(a) ? a : b`). A BoolOp
+            // whose operands unify to Bool stays Bool; an ununifiable mix
+            // (e.g. `bool and str`) unifies to PyObject while the loud
+            // `&&`/`||` fallback still renders a bool — rustc rejects the
+            // type mix loudly (§12.1), never a silent value-for-bool swap.
+            let mut u = infer_type(ctx, &b.values[0], options, symbols);
+            for v in b.values.iter().skip(1) {
+                u = unify(u, infer_type(ctx, v, options, symbols));
+            }
+            u
+        },
         ExprType::Compare(_) => TypeInfo::Bool,
         ExprType::IfExp(i) => {
             // The branches must agree for a useful inference.
