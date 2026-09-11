@@ -8212,7 +8212,7 @@ let mutating_self_field = boxed_self_ref_receiver
                     // emitted `.r#match()` on the static's value — E0599
                     // (no such method on a boxed PyValue). The MODULE name
                     // resolves through the StdModule registry.
-                    ("match" | "search" | "fullmatch", [text]) => {
+                    ("match" | "search" | "fullmatch", [_text]) => {
                         if crate::ast::tree::call::root_name(&attr.value).is_some_and(|root| {
                             matches!(
                                 symbols.get(&root),
@@ -8238,10 +8238,34 @@ let mutating_self_field = boxed_self_ref_receiver
                             // path uses; CPython would raise TypeError on
                             // an actual None here, and the unwrap fires
                             // only when the flow contradicts the guard.
+                            // A NARROWED name argument renders UN-narrowed:
+                            // the narrowed read's generic unwrap would
+                            // double with this message-unwrap (the same
+                            // single-unwrap rule the subscript receiver
+                            // follows — merged round 117; url.py's
+                            // _normalize_host here, round 118).
+                            let text_arg_options = {
+                                let mut o = options.clone();
+                                if let ExprType::Name(n) = &self.args[0] {
+                                    let mut narrowed = o.narrowed_names.as_ref().clone();
+                                    narrowed.remove(&n.id);
+                                    o.narrowed_names = std::rc::Rc::new(narrowed);
+                                }
+                                o
+                            };
+                            // Re-render the text UN-narrowed (the
+                            // pre-rendered arm pattern carries the narrowed
+                            // read's generic unwrap): the message-unwrap
+                            // below is the ONE unwrap.
+                            let text = self.args[0].clone().to_rust(
+                                ctx.clone(),
+                                text_arg_options.clone(),
+                                symbols.clone(),
+                            )?;
                             let text_arg = if crate::expr_yields_option_ctx(
                                 &self.args[0],
                                 &ctx,
-                                &options,
+                                &text_arg_options,
                                 &symbols,
                             ) {
                                 // CPython raises TypeError for a None text

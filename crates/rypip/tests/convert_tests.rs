@@ -6940,6 +6940,80 @@ fn subclass_registry_comprehension_and_annotated_hierarchy_list_match_python() {
 }
 
 #[test]
+fn bitor_union_optional_param_and_value_class_sorting_match_python() {
+    // Round 118: two shapes behind `sorted(results) if results else []`
+    // (charset_normalizer's CharsetMatches.__init__).
+    // - `widgets: List[Widget] | None = None` (PEP 604 spelling + a
+    //   None default): the container-member boxability rule required the
+    //   SYNTAX-ONLY mapping to resolve the member — a `list[Widget]`
+    //   whose element is a user class boxed the union to PyValue, while
+    //   the identical `Optional[List[Widget]]` spelling resolved. The
+    //   union now resolves to Option<Vec<Widget>> in both spellings.
+    // - `sorted(widgets)` over a VALUE class list (the instances are not
+    //   shared): the class's own __lt__ derives `PartialOrd for Widget`
+    //   (with the identity PartialEq CPython's default __eq__ gives,
+    //   which the sort never reads), so the sort orders by the class's
+    //   comparison. Without it: E0277 (can't compare Widget).
+    // - The truthiness narrowing (`if widgets else`) unwraps once — the
+    //   subscript's and the regex-argument's message-unwrap replace the
+    //   narrowed read's generic unwrap (the read-site audit).
+    // Verified against python3.
+    let scratch = Scratch::new("bitor_opt");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "from typing import List, Optional\n",
+            "\n",
+            "\n",
+            "class Widget:\n",
+            "    def __init__(self, name: str) -> None:\n",
+            "        self.name: str = name\n",
+            "\n",
+            "    def __lt__(self, other: \"Widget\") -> bool:\n",
+            "        return self.name < other.name\n",
+            "\n",
+            "\n",
+            "class Shelf:\n",
+            "    def __init__(self, widgets: List[Widget] | None = None) -> None:\n",
+            "        self._widgets: List[Widget] = sorted(widgets) if widgets else []\n",
+            "\n",
+            "    def names(self) -> List[str]:\n",
+            "        return [w.name for w in self._widgets]\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    shelf = Shelf([Widget(\"b\"), Widget(\"a\")])\n",
+            "    for w in shelf._widgets:\n",
+            "        print(w.name)\n",
+            "    print(shelf.names())\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["a", "b", "['a', 'b']"],
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn hierarchy_trait_display_bound_allows_self_in_messages() {
     // Round 41: a trait-DEFAULT body that formats `self` in an exception
     // message (`raise PoolError(self)` — urllib3's _get_conn raises
