@@ -5121,6 +5121,22 @@ fn str_format_lowers_to_format_macro() {
 }
 
 #[test]
+fn str_format_with_runtime_kwargs_routes_to_the_runtime_formatter() {
+    // issue #368: a `"t".format(**bag)` whose bag is a runtime dict (not
+    // statically resolvable) routes to the runtime field-name formatter,
+    // NOT a "not supported" conversion error.
+    let out = compile(
+        "def f(**kw) -> str:\n    return \"hi {a} and {b}\".format(**kw)\n",
+        "fmt_kw.py",
+    );
+    assert!(
+        out.contains("str_format_kwargs"),
+        "must route to the runtime formatter: {}",
+        out
+    );
+}
+
+#[test]
 fn str_format_errors_are_loud_or_lower_to_variants() {
     // Mixing auto and manual numbering is Python's ValueError.
     let err = compile_err(

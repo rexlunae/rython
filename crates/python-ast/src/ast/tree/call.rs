@@ -9754,9 +9754,15 @@ fn lower_str_format(
                 _ => {}
             }
             if entries.is_empty() {
-                return Err("str.format with **kwargs is not supported yet"
-                    .to_string()
-                    .into());
+                // A `**runtime_bag` spread with DYNAMIC keys (test_calendar's
+                // `format_` — a runtime dict from default_format.copy() plus a
+                // dynamic key): not statically resolvable. Route to the
+                // runtime field-name formatter (issue #368), which substitutes
+                // `{key}` from the bag at runtime and refuses loudly on a
+                // format-spec/conversion it cannot render. The static-core
+                // `format!` path stays for resolvable templates.
+                let bag = kw.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                return Ok(quote!(stdpython::str_format_kwargs(#template, &(#bag))?));
             }
             for (ename, evalue) in entries {
                 resolved_keywords.push(crate::Keyword {
