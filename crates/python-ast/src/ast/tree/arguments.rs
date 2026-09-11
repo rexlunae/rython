@@ -251,14 +251,33 @@ pub fn is_pyvalue_boxable_member(ann: &ExprType) -> bool {
         }
         ExprType::Subscript(sub) => {
             match sub.value.as_ref() {
-                ExprType::Name(n) => matches!(
-                    n.id.as_str(),
-                    "tuple" | "Tuple" | "Literal" | "list" | "List" | "IO" | "Iterable"
-                        | "Union" | "Callable" | "SupportsRead" | "SupportsItems"
-                        | "Mapping" | "Dict" | "Set" | "Sequence" | "MutableMapping" | "Collection" | "Container"
-                        | "Generator" | "Iterator" | "Type" | "Optional" | "Any"
-                        | "memoryview"
-                ),
+                // A subscript is a boxable union member ONLY when the
+                // syntax-only mapping RESOLVES it (`list[int]`,
+                // `tuple[str, int]`): a container whose element is a user
+                // class the mapping cannot see (`list[Widget] | None` —
+                // round 118) must NOT box the union — the alias-aware
+                // resolver resolves the element to the class and the
+                // `T | None` union becomes `Option<Vec<T>>` instead of a
+                // boxed PyValue parameter.
+                ExprType::Name(n)
+                    // The CONTAINER generics (`list`, `Dict`, `tuple`, ...)
+                    // are boxable IFF the syntax-only mapping resolves them
+                    // — their elements decide, so `list[Widget]` (a user
+                    // class the mapping cannot see) is NOT boxable and the
+                    // union falls through to the alias-aware resolver
+                    // (Option<Vec<Widget>>, round 118). The STRUCTURAL
+                    // generics (a Literal, a nested Union, IO handles)
+                    // stay boxable by name.
+                    if crate::annotation_type_info(ann).is_some()
+                        || matches!(
+                            n.id.as_str(),
+                            "Literal" | "Union" | "Callable" | "IO" | "SupportsRead"
+                                | "SupportsItems" | "Type" | "Optional" | "Any"
+                                | "memoryview"
+                        ) =>
+                {
+                    true
+                }
                 // `typing.Sequence[...]` / `typing.Iterable[...]` — the
                 // typing-module spelling of the same generics (urllib3's
                 // `dict[str, T] | typing.Sequence[tuple[str, T]]`).

@@ -1027,6 +1027,19 @@ pub fn narrowing_from_test(
     test: &ExprType,
     options: &PythonOptions,
 ) -> Option<(String, Option<crate::TypeInfo>)> {
+    // A test that IS a bare Option-typed name (`sorted(results) if
+    // results else []` — charset_normalizer's CharsetMatches.__init__,
+    // round 118): the truthiness model (a None member is falsy, so the
+    // true branch only runs for a present value) narrows the name to
+    // its inner, exactly as an `x is not None` test does. The narrowed
+    // read unwraps ONCE — the subscript's message-unwrap (merged round
+    // 117) replaces the generic unwrap at subscript sites.
+    if let ExprType::Name(n) = test
+        && options.optional_names.contains(&n.id)
+        && let Some(crate::TypeInfo::Option(inner)) = options.name_types.get(&n.id)
+    {
+        return Some((n.id.clone(), Some((**inner).clone())));
+    }
     let ExprType::Compare(cmp) = test else {
         return None;
     };

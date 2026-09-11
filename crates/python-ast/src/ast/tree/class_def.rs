@@ -4308,6 +4308,49 @@ impl CodeGen for ClassDef {
             quote!()
         };
 
+        // The ORDERING of a VALUE class (not shared — its instances move
+        // as values): `sorted(ws)` over Vec<Widget> needs `Widget:
+        // PartialOrd`, derived from the class's own `__lt__` the same way
+        // the shared path derives PyRefOrd (`other: Widget` — by value —
+        // so the comparison clones the operand; a raise inside __lt__
+        // panics loudly, the ref_eq posture). Round 118: without it,
+        // `sorted(widgets)` over a value-class list failed E0277 (can't
+        // compare Widget with Widget).
+        let value_ord_impl = if options.with_std_python
+            && !crate::ast::tree::shared::is_shared(&self.name)
+            && self.method_on_mro("__lt__", &symbols).is_some()
+        {
+            // PartialOrd requires PartialEq. The class has no `__eq__`
+            // (a defined one emits its own impl through ref_eq's value
+            // path): CPython's default `__eq__` is IDENTITY, so the
+            // emitted PartialEq is pointer equality — and the sorted
+            // path never reads it (partial_cmp below is overridden).
+            let eq_impl = if self.method_on_mro("__eq__", &symbols).is_some() {
+                quote!()
+            } else {
+                quote!(impl std::cmp::PartialEq for #class_name {
+                    fn eq(&self, other: &Self) -> bool {
+                        std::ptr::eq(self, other)
+                    }
+                })
+            };
+            quote!(#eq_impl
+            impl std::cmp::PartialOrd for #class_name {
+                fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+                    use core::cmp::Ordering;
+                    if self.__lt__(other.clone()).unwrap_or_else(|e| panic!("{}", e)) {
+                        Some(Ordering::Less)
+                    } else if other.__lt__(self.clone()).unwrap_or_else(|e| panic!("{}", e)) {
+                        Some(Ordering::Greater)
+                    } else {
+                        Some(Ordering::Equal)
+                    }
+                }
+            })
+        } else {
+            quote!()
+        };
+
         // The INHERENT base accessors: the derived struct's `base()` /
         // `base_mut()` reach its own embedded `__rython_base`. Inherent
         // methods take precedence over the trait ones, so a concrete
@@ -4449,6 +4492,7 @@ impl CodeGen for ClassDef {
             // ancestry bounds.
             #is_none_impl #truth_impl #ref_truth_impl #ref_eq_impl
             #ref_ord_impl
+            #value_ord_impl
             // Class-level COMPUTED constants live at module scope under
             // class-mangled names: associated statics are not legal Rust
             // (issue #137).
