@@ -3593,20 +3593,28 @@ impl CodeGen for ClassDef {
         for stmt in self.body.iter().skip(body_start) {
             match &stmt.statement {
                 StatementType::FunctionDef(_) | StatementType::Pass => {}
-                // A class-level literal constant assignment (int/float/
-                // bool/string): an associated const, not a struct field.
-                StatementType::Assign(a)
-                    if a.targets.len() == 1
-                        && let ExprType::Name(n) = &a.targets[0]
-                        && let Some(ty) = crate::ast::tree::module::const_static_type(&a.value) =>
-                {
-                    let ident = crate::safe_ident(&n.id);
-                    let value = a
-                        .value
-                        .clone()
-                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    class_constants.extend(quote!(pub const #ident: #ty = #value;));
-                }
+                // A class-level literal constant assignment (int/float/bool/string),
+// possibly CHAINED (`tol = rel = 0` — statistics' NumericTestCase):
+// an associated const per target, not a struct field.
+StatementType::Assign(a)
+    if let Some(ty) = crate::ast::tree::module::const_static_type(&a.value)
+        && a
+            .targets
+            .iter()
+            .all(|t| matches!(t, ExprType::Name(_))) =>
+{
+    for t in &a.targets {
+        let ExprType::Name(n) = t else {
+            continue;
+        };
+        let ident = crate::safe_ident(&n.id);
+        let value = a
+            .value
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        class_constants.extend(quote!(pub const #ident: #ty = #value;));
+    }
+}
                 // A class-level COMPUTED constant: single-store name
                 // assigned a non-literal value (frozenset/dict/list/set
                 // literal or a constructor call). Python resolves these at

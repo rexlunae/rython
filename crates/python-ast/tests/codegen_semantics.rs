@@ -5337,6 +5337,19 @@ fn test_runner_gate_decorators_convert_with_a_warning() {
 }
 
 #[test]
+fn chained_class_level_literal_constants_lower_per_target() {
+    // issue #367: a class-level CHAINED assignment (`tol = rel = 0` —
+    // statistics' NumericTestCase) must lower one associated const per
+    // target, not error as an unsupported class-body statement.
+    let out = compile(
+        "class C:\n    tol = rel = 0\n    def m(self):\n        return 1\n",
+        "chained_const.py",
+    );
+    assert!(out.contains("pub const tol : i64 = 0"), "generated: {}", out);
+    assert!(out.contains("pub const rel : i64 = 0"), "generated: {}", out);
+}
+
+#[test]
 fn conditionally_reassigned_module_names_are_not_constants() {
     // DEBUG = False overwritten inside a module-level `if` must NOT freeze
     // as a static: the nested store would land on a shadowing local inside
