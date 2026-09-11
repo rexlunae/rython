@@ -3420,13 +3420,19 @@ impl CodeGen for ClassDef {
                 && !is_typing_base(b)
                 && !external_attr_base(b)
         }) {
-            return Err(format!(
-                "class `{}` inherits from a base rython cannot lower (only single \
-                 inheritance from classes defined in this module is supported); \
-                 restructure the class hierarchy (issue: the PyPI sweep)",
+            // A DYNAMIC base (a call result: `class Point(namedtuple('_Point',
+            // [...]))` — collections' test fixture; a call-producing base):
+            // rython cannot inherit from a runtime value. Per P9 the class
+            // lowers as if OBJECT-based (the base's methods/fields are not
+            // inherited) but it is LOUD — a -W warning — never a silently
+            // different class and never a hard class-body error when the
+            // body does not depend on the dynamic base.
+            options.definition_warnings.borrow_mut().push(format!(
+                "class `{}`: dynamic base (a call result) is dropped; the \
+                 class lowers as if object-based. If the class body reads \
+                 base methods/fields, pass them explicitly (issue #367)",
                 self.name
-            )
-            .into());
+            ));
         }
         // `object`, `Enum`/`IntEnum`/`Flag` (and `typing.NamedTuple`,
         // filtered above) are metadata, not structural bases: the class

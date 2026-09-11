@@ -5425,6 +5425,24 @@ fn method_alias_chain_is_a_loud_noop() {
 }
 
 #[test]
+fn dynamic_call_base_is_a_loud_drop() {
+    // issue #367: `class Point(namedtuple('_Point', [...]))` — a base that
+    // is a CALL result rython cannot inherit from — lowers as if
+    // object-based WITH a warning (never a silent divergence, never a hard
+    // class-body error when the body doesn't depend on the base).
+    let (out, warnings) = compile_with_warnings(
+        "def nt(name, flds):\n    return 1\nclass Point(nt('_Point', ['x'])):\n    pass\n",
+        "dyn_base.py",
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("dynamic base")),
+        "must warn loudly: {}",
+        warnings.len()
+    );
+    let _ = out;
+}
+
+#[test]
 fn conditionally_reassigned_module_names_are_not_constants() {
     // DEBUG = False overwritten inside a module-level `if` must NOT freeze
     // as a static: the nested store would land on a shadowing local inside
