@@ -63,14 +63,14 @@ and `test.*` stdlib references, and asserts are dropped.
 | `test_fractions` | CONVERT | — (same) |
 | `test_random` | CONVERT | — (same) |
 | `test_operator` | CONVERT | — (same) |
-| `test_math` | BLOCKED | `count_set_bits` recursion (FIXED this round → advances to `ulp_abs_check` union `None|String` return); then the `unittest` harness |
+| `test_math` | BLOCKED | `count_set_bits` recursion (FIXED → advanced past it); now `ulp_abs_check` needs **statement-level** `if/else` `Option<String>`-return inference (`return None` vs `return fmt.format(...)`). An `IfExp`-shaped None|str union already converts; the statement-level shape does not yet unify to `Option<String>`. |
 | `test_bisect` | BLOCKED | nested `def grade(breakpoints=[60,70,80,90])` — a **mutable-list default**, deliberately loud (Python evaluates-and-shares it; cannot be lowered correctly) |
 | `test_csv` | BLOCKED | `csv.reader(..., escapechar=…)` reader feature FIXED (this round, now threads `Some::<u8>`); advances to the **dialect-registry** wall (`csv.reader([...], name)` / `register_dialect`), reached inside harness blocks |
 | `test_textwrap` | BLOCKED | `wrap(text, width, **kwargs)` — issue #368 `**kwargs`; reached only inside unittest `TestTextWrap` methods |
 | `test_itertools` | BLOCKED | heterogeneous list literal `['abc', range(6)]` (str/range mix) |
 | `test_collections` | BLOCKED | heterogeneous list literal `[None, int(), gen(), object(), Bar()]` (int/Bar/mixed) |
 | `test_functools` | BLOCKED | nested `class` at class level |
-| `test_statistics` | BLOCKED | undecorated class-method binding + harness (`self.assertRaises`, `_make_std_err_msg` class call) |
+| `test_statistics` | BLOCKED | `_make_std_err_msg` arity — **verified CPython-consistent**: `self._make_std_err_msg(a,b,c,d,e)` on a 5-param `def _make_std_err_msg(first,second,tol,rel,idx)` is a genuine `takes 5 … but 6 were given` TypeError under CPython too; rython's loud conversion error (reports 4/5) is correct-or-loud, only the *counts* differ. Then the harness. |
 | `test_re` | BLOCKED | `assertRaisesRegex` of an *intentional* runtime `TypeError` from `re.sub(...)` (error is correctly loud at compile time; needs harness to catch at runtime) |
 | `test_hmac` | BLOCKED | `with self.subTest(...)` harness, then compare/binding issues |
 | `test_hashlib` | BLOCKED | `isinstance(x, class)` with a class second arg (classes not yet supported) — reached in `__init__`, before any harness |
