@@ -17,7 +17,41 @@ missing *earlier* in a file, the file can only **convert and run** once the
 asserting (the harness calls are dropped as loud `-W` warnings), so they do
 not yet exhibit CPython-equal behavior.
 
-**Frontier: 6/17 CONVERT; 0/17 RUN.**
+**Frontier: 6/17 CONVERT; 0/17 BUILD; 0/17 RUN** (see the BUILD analysis below).
+
+## Why "CONVERT" ≠ "BUILD" (corrected this session)
+
+`convert <file> --no-deps` succeeding means **code generation** succeeds, not
+that the emitted crate compiles. A single-module (`--no-deps`) conversion
+treats every non-stdpython import as a "crate sibling" (documented contract,
+`crates/python-ast/src/ast/tree/import.rs`, pinned by
+`sibling_from_import_anchors_to_crate`), so the generated Rust emits
+`use crate::unittest; use crate::test::support::import_helper; use
+crate::decimal::Decimal; use crate::fractions::Fraction; use crate::inspect;
+use crate::pickle;` — but **none of those modules are emitted**, and the
+`if __name__ == "__main__": unittest.main()` tail lowers to `unittest::main()?`
+with no `unittest` module.
+
+Verified on `test_operator` (`cargo build` in its generated crate):
+
+```
+error[E0432]: unresolved import `crate::decimal`
+error[E0432]: unresolved import `crate::fractions`
+error[E0432]: unresolved import `crate::inspect`
+error[E0432]: unresolved import `crate::pickle`
+error[E0433]: cannot find `test` in the crate root
+error[E0432]: unresolved import `crate::unittest`
+```
+
+By contrast, a **harness-free, correctly-typed** module (`mini_math.py` with an
+annotated recursion + `math.floor`) converts AND `cargo build`s cleanly in ~4s,
+proving the toolchain and the build pipeline work — the 17 test files fail to
+build specifically because of the harness/stdlib-module references (#334 +
+the stdlib-module stub pipeline), not for lack of a build target.
+
+So the honest frontier is **0/17 BUILD and 0/17 RUN**: no test file produces a
+compiling crate yet, because every one terminates (or starts near) `unittest.*`
+and `test.*` stdlib references, and asserts are dropped.
 
 ## Per-file status (as of this round)
 
