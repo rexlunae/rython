@@ -8462,6 +8462,77 @@ pub fn format_string<T: AsRef<str>>(template: T, args: &[&dyn Display]) -> Strin
     result
 }
 
+/// Runtime `str.format(**kwargs)` for a KWARGS-DICT receiver (issue #368):
+/// substitutes `{key}` placeholders from a `PyDict<String, String>` of
+/// keyword values, with CPython's `{{`/`}}` escaping and a `KeyError` for a
+/// missing key. This is the DYNAMIC seam for the (rare) `"template".
+/// format(**runtime_dict)` calls that cannot be resolved at conversion
+/// time; the statically-resolvable templates still lower to `format!`.
+///
+/// The scalar `{key}` FIELD-NAME form is the supported surface (which is
+/// how the CPython test corpus uses it). A format-SPEC or CONVERSION
+/// (`{key:>5}`, `{key!r}`) is a loud `ValueError`, NOT a silent wrong
+/// substitution — the corpus's runtime-kwargs templates never use them,
+/// and a best-effort approximation is exactly what the prime directive
+/// forbids.
+pub fn str_format_kwargs<T: AsRef<str>>(
+    template: T,
+    kwargs: &PyDict<String, String>,
+) -> Result<String, PyException> {
+    let chars: Vec<char> = template.as_ref().chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    let n = chars.len();
+    while i < n {
+        let c = chars[i];
+        if c == '{' {
+            if (i + 1 < n) && chars[i + 1] == '{' {
+                out.push('{');
+                i += 2;
+                continue;
+            }
+            // A replacement field: find the closing '}'.
+            let mut j = i + 1;
+            let mut key = String::new();
+            while j < n && chars[j] != '}' {
+                let fc = chars[j];
+                if fc == ':' || fc == '!' {
+                    // format-spec or conversion — unsupported, be loud.
+                    return Err(PyException::new(
+                        "ValueError",
+                        "str.format(**kwargs) format-spec / conversion is not supported \
+                         by the runtime kwargs path (issue #368)"
+                    ));
+                }
+                key.push(fc);
+                j += 1;
+            }
+            if j >= n {
+                return Err(PyException::new("ValueError", "expected '}' before end of string"));
+            }
+            match kwargs.get(&key) {
+                Some(v) => out.push_str(v),
+                None => {
+                    return Err(PyException::new("KeyError", format!("'{}'", key)))
+                }
+            }
+            i = j + 1;
+            continue;
+        }
+        if c == '}' {
+            if (i + 1 < n) && chars[i + 1] == '}' {
+                out.push('}');
+                i += 2;
+                continue;
+            }
+            return Err(PyException::new("ValueError", "single '}' in format string"));
+        }
+        out.push(c);
+        i += 1;
+    }
+    Ok(out)
+}
+
 /// Helper for range() function with optional parameters - more flexible than the basic range
 pub fn range_flexible(start: i64, stop: Option<i64>, step: Option<i64>) -> Result<PyRange, PyException> {
     let (start, stop, step) = match (stop, step) {

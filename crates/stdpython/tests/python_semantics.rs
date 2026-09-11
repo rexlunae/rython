@@ -4328,3 +4328,28 @@ fn complex_cross_type_arithmetic_matches_cpython() {
     let r7 = Complex::new(0.0, 1.0).py_add(&2i64);
     assert_eq!(r7, Complex::new(2.0, 1.0));
 }
+
+#[test]
+fn str_format_with_runtime_kwargs_matches_cpython() {
+    // issue #368: the runtime `str.format(**kwargs)` path for templates
+    // that cannot be resolved at conversion time. Verified against CPython
+    // 3.14.1.
+    let kwargs = PyDict::<String, String>::from([
+        ("year".to_string(), "Y".to_string()),
+        ("month".to_string(), "M".to_string()),
+        ("encoding".to_string(), "utf-8".to_string()),
+    ]);
+    assert_eq!(
+        str_format_kwargs("hello {year} and {month}", &kwargs).unwrap(),
+        "hello Y and M"
+    );
+    // `{{`/`}}` escape to a literal brace.
+    assert_eq!(
+        str_format_kwargs("{{lit}} {year}", &kwargs).unwrap(),
+        "{lit} Y"
+    );
+    // Missing key raises KeyError with the quoted name.
+    let err = str_format_kwargs("a {missing} b", &kwargs).err().unwrap();
+    assert!(err.matches("KeyError"), "{:?}", err);
+    assert_eq!(err.message, "'missing'");
+}
