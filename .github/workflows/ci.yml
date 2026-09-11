@@ -10,6 +10,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  sweep-accounting:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Sweep accounting tests (no package downloads or Rust builds)
+        run: python3 -m unittest discover -s eval/sweep -p 'test_*.py'
+
   build:
     runs-on: ubuntu-latest
     steps:
