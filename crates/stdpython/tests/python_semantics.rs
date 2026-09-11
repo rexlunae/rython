@@ -4299,3 +4299,29 @@ fn complex_abs_matches_cpython() {
     assert_eq!(Complex::new(0.0, 0.0).py_abs(), 0.0);
     assert_eq!(Complex::new(1.0, 1.0).py_abs(), 2.0f64.sqrt());
 }
+
+#[test]
+fn complex_cross_type_arithmetic_matches_cpython() {
+    use stdpython::{PyAdd, PySub, PyMul};
+    // 1 - 3.5j == (1-3.5j)   (i64 receiver, Complex rhs)
+    let r1 = (1i64).py_sub(&Complex::new(0.0, 3.5));
+    assert_eq!(r1, Complex::new(1.0, -3.5));
+    // 3j - 1 == (-1+3j)      (Complex receiver, i64 rhs)
+    let r2 = Complex::new(0.0, 3.0).py_sub(&1i64);
+    assert_eq!(r2, Complex::new(-1.0, 3.0));
+    // 2 * (1+2j) == (2+4j)   (i64 receiver, Complex rhs)
+    let r3 = (2i64).py_mul(&Complex::new(1.0, 2.0));
+    assert_eq!(r3, Complex::new(2.0, 4.0));
+    // (1+2j) * 2 == (2+4j)   (Complex receiver, i64 rhs)
+    let r4 = Complex::new(1.0, 2.0).py_mul(&2i64);
+    assert_eq!(r4, Complex::new(2.0, 4.0));
+    // 1.5 + (2+3j) == (3.5+3j)  (f64 receiver, Complex rhs)
+    let r5 = (1.5f64).py_add(&Complex::new(2.0, 3.0));
+    assert_eq!(r5, Complex::new(3.5, 3.0));
+    // (2+3j) + 1.5 == (3.5+3j)  (Complex receiver, f64 rhs)
+    let r6 = Complex::new(2.0, 3.0).py_add(&1.5f64);
+    assert_eq!(r6, Complex::new(3.5, 3.0));
+    // 1j + 2 == (2+1j)
+    let r7 = Complex::new(0.0, 1.0).py_add(&2i64);
+    assert_eq!(r7, Complex::new(2.0, 1.0));
+}

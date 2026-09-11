@@ -5440,6 +5440,14 @@ pub(crate) fn is_type_alias_value(value: &crate::ExprType) -> bool {
 
 pub(crate) fn const_static_type(value: &crate::ExprType) -> Option<TokenStream> {    match value {
         crate::ExprType::Constant(c) => match &c.0 {
+            // A complex constant is NOT const-hoistable to a `pub static`
+            // (`Complex::new` is not a Rust const fn), so it is computed as
+            // a module-init value like a non-constant — but still typed as
+            // `Complex` by the literal typing at its render site. Do not
+            // fall through to the String arm (the complex sentinel is a
+            // `Literal::String` internally) — that would silently make it
+            // a `&'static str` static.
+            Some(l0) if crate::ast::tree::constant::is_complex_literal(&l0) => None,
             Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
             Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
             Some(litrs::Literal::Bool(_)) => Some(quote!(bool)),

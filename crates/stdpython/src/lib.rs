@@ -7257,6 +7257,72 @@ impl PyAbs for Complex {
     }
 }
 
+// Cross-type arithmetic: `complex` with an int (`i64`) or float (`f64`)
+// promotes the WHOLE expression to `complex` — `1 - 3j` is `(1-3j)`,
+// `2 * (1+2j)` is `(2+4j)`, matching CPython. Both orders are covered
+// because the generated receiver for `1 - 3j` is the i64 (`i64.py_sub`)
+// while `3j - 1` has the Complex receiver. The scalar converts to a
+// complex with imag `0.0` (the boundary is the usual i64→f64 integer
+// precision loss above 2^53, same as `float(int)`).
+
+// (a+bj) + s = (a+s) + bj, where s is i64 or f64 (receiver Complex).
+macro_rules! complex_add_scalar {
+    ($($t:ty),* $(,)?) => {$(
+        impl PyAdd<$t> for Complex {
+            type Output = Complex;
+            fn py_add(&self, rhs: &$t) -> Complex {
+                Complex::new(self.re + (*rhs as f64), self.im)
+            }
+        }
+        // s + (a+bj) = (s+a) + bj (receiver scalar, rhs Complex).
+        impl PyAdd<Complex> for $t {
+            type Output = Complex;
+            fn py_add(&self, rhs: &Complex) -> Complex {
+                Complex::new((*self as f64) + rhs.re, rhs.im)
+            }
+        }
+    )*};
+}
+complex_add_scalar!(i64, f64);
+
+// (a+bj) - s = (a-s) + bj ;  s - (a+bj) = (s-a) - bj.
+macro_rules! complex_sub_scalar {
+    ($($t:ty),* $(,)?) => {$(
+        impl PySub<$t> for Complex {
+            type Output = Complex;
+            fn py_sub(&self, rhs: &$t) -> Complex {
+                Complex::new(self.re - (*rhs as f64), self.im)
+            }
+        }
+        impl PySub<Complex> for $t {
+            type Output = Complex;
+            fn py_sub(&self, rhs: &Complex) -> Complex {
+                Complex::new((*self as f64) - rhs.re, -rhs.im)
+            }
+        }
+    )*};
+}
+complex_sub_scalar!(i64, f64);
+
+// (a+bj) * s = (a*s) + (b*s)j ;  s * (a+bj) = (s*a) + (s*b)j.
+macro_rules! complex_mul_scalar {
+    ($($t:ty),* $(,)?) => {$(
+        impl PyMul<$t> for Complex {
+            type Output = Complex;
+            fn py_mul(&self, rhs: &$t) -> Complex {
+                Complex::new(self.re * (*rhs as f64), self.im * (*rhs as f64))
+            }
+        }
+        impl PyMul<Complex> for $t {
+            type Output = Complex;
+            fn py_mul(&self, rhs: &Complex) -> Complex {
+                Complex::new((*self as f64) * rhs.re, (*self as f64) * rhs.im)
+            }
+        }
+    )*};
+}
+complex_mul_scalar!(i64, f64);
+
 // ============================================================================
 // PYTHON STANDARD LIBRARY MODULES
 // ============================================================================
