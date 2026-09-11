@@ -5137,6 +5137,21 @@ fn str_format_with_runtime_kwargs_routes_to_the_runtime_formatter() {
 }
 
 #[test]
+fn utf16le_codec_encode_routes_and_typechecks() {
+    // issue #368 / codec coverage: `s.encode("utf-16-le")` lowers to the
+    // runtime encoder, not a conversion error.
+    let out = compile(
+        "def f(s: str) -> bytes:\n    return s.encode(\"utf-16-le\")\n",
+        "utf16le.py",
+    );
+    assert!(
+        out.contains("encode_utf16_le"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
 fn str_format_errors_are_loud_or_lower_to_variants() {
     // Mixing auto and manual numbering is Python's ValueError.
     let err = compile_err(

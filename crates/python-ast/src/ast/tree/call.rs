@@ -7729,6 +7729,12 @@ let mutating_self_field = boxed_self_ref_receiver
                                     #runtime::stdlib::codec::encode_by_name(&(#receiver), "latin-1", &(#errors))?
                                 ));
                             }
+                            "utf-16-le" | "utf_16_le" => {
+                                let runtime = crate::safe_ident(&options.stdpython);
+                                return Ok(quote!(
+                                    #runtime::stdlib::codec::encode_utf16_le(#receiver)
+                                ));
+                            }
                             other => {
                                 // A LITERAL codec outside the supported set
                                 // stays loud at CONVERSION (the port learns
@@ -7737,8 +7743,8 @@ let mutating_self_field = boxed_self_ref_receiver
                                 // a runtime NAME cannot be decided here and
                                 // routes through the registry above.
                                 return Err(format!(
-                                    "str.encode({}): only utf-8, ascii, punycode, and \
-                                     latin-1 are supported",
+                                    "str.encode({}): only utf-8, ascii, punycode, \
+                                     latin-1, and utf-16-le are supported",
                                     other
                                 )
                                 .into());
