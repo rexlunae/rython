@@ -19,7 +19,11 @@ use alloc::vec::Vec;
 /// an unterminated quote simply closes at end of input, as in Python. A
 /// newline in unquoted context with more data after it raises csv.Error
 /// with Python's message.
-pub fn reader<S: AsRef<str>>(lines: &[S]) -> Result<Vec<Vec<String>>, PyException> {
+pub fn reader<S: AsRef<str>>(
+    lines: &[S],
+    no_quote: bool,
+    escapechar: Option<u8>,
+) -> Result<Vec<Vec<String>>, PyException> {
     #[derive(PartialEq)]
     enum State {
         StartField,
@@ -34,6 +38,11 @@ pub fn reader<S: AsRef<str>>(lines: &[S]) -> Result<Vec<Vec<String>>, PyExceptio
             "new-line character seen in unquoted field - do you need to open the file with newline=''?",
         )
     };
+
+    // An escapechar was given: in QUOTE_NONE mode it escapes the
+    // delimiter / quote / newline / itself so the following char stays
+    // literal. When no escapechar is set, there is nothing to handle.
+    let has_esc = escapechar.is_some();
 
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut i = 0;
@@ -65,9 +74,26 @@ pub fn reader<S: AsRef<str>>(lines: &[S]) -> Result<Vec<Vec<String>>, PyExceptio
                     continue;
                 }
                 any_content = true;
+                // In QUOTE_NONE mode an escapechar lets the following char
+                // through literally (the escapechar is dropped), whether that
+                // char is the delimiter, a quote, a newline, or the escapechar
+                // itself.
+                if no_quote && has_esc && c == (escapechar.unwrap() as char) {
+                    if let Some(escaped) = chars.next() {
+                        field.push(escaped);
+                        continue;
+                    }
+                }
                 match state {
                     State::StartField => match c {
-                        '"' => state = State::InQuoted,
+                        '"' => {
+                            if no_quote {
+                                field.push('"');
+                                state = State::InField;
+                            } else {
+                                state = State::InQuoted;
+                            }
+                        }
                         ',' => row.push(core::mem::take(&mut field)),
                         c => {
                             field.push(c);

@@ -2337,7 +2337,7 @@ mod csv_module {
     use stdpython::csv::reader;
 
     fn rows(lines: &[&str]) -> Vec<Vec<String>> {
-        reader(lines).unwrap()
+        reader(lines, false, None).unwrap()
     }
 
     #[test]
@@ -2395,7 +2395,7 @@ mod csv_module {
         // readlines elements keeps it: python3 gives 'x\ny'.
         assert_eq!(rows(&["a,\"x\n", "y\"\n"]), vec![vec!["a", "x\ny"]]);
         // An unquoted newline with data after it is csv.Error.
-        let e = reader(&["a\nb,c"]).unwrap_err();
+        let e = reader(&["a\nb,c"], false, None).unwrap_err();
         assert_eq!(
             format!("{}", e),
             "csv.Error: new-line character seen in unquoted field - do you \
@@ -2791,7 +2791,7 @@ mod file_objects {
             w.writerow(&["a", "b,c", "say \"hi\""]).unwrap();
         }
         let text = buf.getvalue().unwrap();
-        let rows = csv::reader(&text.split("\r\n").collect::<Vec<_>>()).unwrap();
+        let rows = csv::reader(&text.split("\r\n").collect::<Vec<_>>(), false, None).unwrap();
         assert_eq!(rows[0], vec!["a", "b,c", "say \"hi\""]);
     }
 }
@@ -4352,4 +4352,19 @@ fn str_format_with_runtime_kwargs_matches_cpython() {
     let err = str_format_kwargs("a {missing} b", &kwargs).err().unwrap();
     assert!(err.matches("KeyError"), "{:?}", err);
     assert_eq!(err.message, "'missing'");
+}
+
+#[test]
+fn csv_reader_quote_none_with_escapechar_matches_cpython() {
+    use stdpython::stdlib::csv::reader;
+    // Verified against CPython 3.14.1: QUOTE_NONE + escapechar makes the
+    // delimiter/quote/newline literal (escapechar dropped).
+    let r = reader(&["a\\,b,c\\\"d,e\\\nf"], true, Some::<u8>(b'\\')).unwrap();
+    assert_eq!(r[0], vec!["a,b", "c\"d", "e\nf"]);
+    // QUOTE_NONE WITHOUT escapechar: `"` is literal data.
+    let r2 = reader(&["\"plain\",\"has,comma\""], true, None).unwrap();
+    assert_eq!(r2[0], vec!["\"plain\"", "\"has", "comma\""]);
+    // Default (quoting on): quotes strip.
+    let r3 = reader(&["\"a,b\",c"], false, None).unwrap();
+    assert_eq!(r3[0], vec!["a,b", "c"]);
 }

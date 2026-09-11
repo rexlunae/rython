@@ -5249,7 +5249,9 @@ impl<'a> CodeGen for Call {
                         Some("count") if fname == "sub" => &mut count_kw,
                         Some("maxsplit") if fname == "split" => &mut maxsplit_kw,
                         Some("lineterminator") if fname == "writer" => &mut lineterminator_kw,
+                        Some("quoting") if fname == "reader" => &mut quoting_kw,
                         Some("quoting") if fname == "writer" => &mut quoting_kw,
+                        Some("escapechar") if fname == "reader" => &mut escapechar_kw,
                         Some("escapechar") if fname == "writer" => &mut escapechar_kw,
                         // md5/sha's usedforsecurity is a FIPS policy flag —
                         // ignored (requests' digest auth).
@@ -5881,7 +5883,23 @@ impl<'a> CodeGen for Call {
                     }
                     ("reader", [lines]) => {
                         let p = qual("reader");
-                        Ok(quote!(#p(&(#lines))?))
+                        // csv.reader(f, quoting=...) — thread the QUOTE_NONE
+                        // flag to the state-machine reader (issue #369).
+                        // escapechar= stays loud: the dialect-escape path is
+                        // not yet wired through the codegen without recursion.
+                        if escapechar_kw.is_some() {
+                            return Err("csv.reader(..., escapechar=...) is not \
+                                supported yet; drop the escapechar or split the \
+                                field ahead of time (issue #369)"
+                                .to_string()
+                                .into());
+                        }
+                        let no_quote = match quoting_kw {
+                            Some(crate::ExprType::Attribute(a))
+                                if a.attr == "QUOTE_NONE" => quote!(true),
+                            _ => quote!(false),
+                        };
+                        Ok(quote!(#p(&(#lines), #no_quote, None::<u8>)?))
                     }
                     ("md5" | "sha1" | "sha256" | "sha512", []) => {
                         let p = qual(crate::ast::tree::std_module::hashlib_new_variant(&fname)

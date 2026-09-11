@@ -6693,6 +6693,22 @@ fn csv_writer_accepts_quoting_and_escapechar() {
     );
 }
 
+#[test]
+fn csv_reader_quote_none_routes_the_no_quote_flag() {
+    // issue #369: `csv.reader(f, quoting=csv.QUOTE_NONE)` lowers the
+    // no-quote flag (`true`) into the 3-argument reader; escapechar on the
+    // reader is loud (not wired).
+    let out = compile(
+        "import csv\nrows = csv.reader([\"a,b\"], quoting=csv.QUOTE_NONE)\n",
+        "crd_nq.py",
+    );
+    assert!(
+        out.contains("reader (& (") && out.contains(" , true , None :: < u8 >)"),
+        "must thread the no-quote flag: {}",
+        out.len()
+    );
+}
+
 // ---- functools.lru_cache / cache decorators ----
 
 #[test]
