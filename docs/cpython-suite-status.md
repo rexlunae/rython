@@ -46,18 +46,20 @@ runner raises `AssertionError: <n> test(s) failed` (exit 1). Verified:
 a minimal test module with a *raising* or erroring test fails loudly and
 exits 1; a passing one exits 0.
 
-**Still open (the next slice):** `self.assertEqual(a, b)` etc. lowering.
-The runtime helpers (`unittest::assert_eq/assert_true/assert_false`) are
-designed and functionally correct — end-to-end a lowered
-`self.assertEqual(2, 3)` correctly raised `AssertionError: 2 != 3` and the
-crate ran+built. But **any arg-rendering assert arm added to `Call::to_rust`
-re-triggers the round-17 codegen stack overflow** (`itertools_takewhile`'s
-deeply-nested `len(list(takewhile(lambda, reversed(it))))` conversion),
-regardless of the render helper used (`to_rust` or `render_typed`) — a
-codegen stack-budget fragility in that hot path, not a logic gap. Landing
-it safely needs a structural fix (smaller `Call::to_rust` frames or a larger
-codegen stack), so it is deferred rather than forced at the cost of a green
-tree (verified: reverting restores 791/0).
+**Assertions landed (`b4a3849`):** `self.assertEqual(a, b)`,
+`self.assertTrue(x)`, `self.assertFalse(x)` now lower to runtime
+`unittest::assert_eq` / `assert_true` / `assert_false`, which box the
+arguments and raise `AssertionError` on failure — no longer a silent drop to
+`None`. Verified end-to-end: a 4-test module reports exactly CPython's two
+failures (`AssertionError: 2 != 3`, `AssertionError: True is not false`) and
+exits 1. The call-site rendering is `#[inline(never)]`, and `.cargo/config.toml`
+sets `RUST_MIN_STACK` (32 MiB) because the codegen recurses once per nested
+call and Rust's 2 MiB default test-thread stack was tight (the CLI's 8 MiB
+main thread was always fine).
+
+**Still open:** more assertion methods (`assertIn`, `assertIs`,
+`assertIsNone`, `assertRaises`, `subTest`), transitive `TestCase`
+subclasses, `setUp`/`tearDown`, and the stdlib-stub emission below.
 
 Verified on `test_operator` (`cargo build` in its generated crate):
 
