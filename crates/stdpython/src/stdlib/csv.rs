@@ -19,7 +19,11 @@ use alloc::vec::Vec;
 /// an unterminated quote simply closes at end of input, as in Python. A
 /// newline in unquoted context with more data after it raises csv.Error
 /// with Python's message.
-pub fn reader<S: AsRef<str>>(lines: &[S]) -> Result<Vec<Vec<String>>, PyException> {
+pub fn reader<S: AsRef<str>>(
+    lines: &[S],
+    no_quote: bool,
+    escapechar: Option<u8>,
+) -> Result<Vec<Vec<String>>, PyException> {
     #[derive(PartialEq)]
     enum State {
         StartField,
@@ -34,6 +38,11 @@ pub fn reader<S: AsRef<str>>(lines: &[S]) -> Result<Vec<Vec<String>>, PyExceptio
             "new-line character seen in unquoted field - do you need to open the file with newline=''?",
         )
     };
+
+    // An escapechar was given: in QUOTE_NONE mode it escapes the
+    // delimiter / quote / newline / itself so the following char stays
+    // literal. When no escapechar is set, there is nothing to handle.
+    let has_esc = escapechar.is_some();
 
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut i = 0;
@@ -65,9 +74,26 @@ pub fn reader<S: AsRef<str>>(lines: &[S]) -> Result<Vec<Vec<String>>, PyExceptio
                     continue;
                 }
                 any_content = true;
+                // In QUOTE_NONE mode an escapechar lets the following char
+                // through literally (the escapechar is dropped), whether that
+                // char is the delimiter, a quote, a newline, or the escapechar
+                // itself.
+                if no_quote && has_esc && c == (escapechar.unwrap() as char) {
+                    if let Some(escaped) = chars.next() {
+                        field.push(escaped);
+                        continue;
+                    }
+                }
                 match state {
                     State::StartField => match c {
-                        '"' => state = State::InQuoted,
+                        '"' => {
+                            if no_quote {
+                                field.push('"');
+                                state = State::InField;
+                            } else {
+                                state = State::InQuoted;
+                            }
+                        }
                         ',' => row.push(core::mem::take(&mut field)),
                         c => {
                             field.push(c);
@@ -125,25 +151,71 @@ pub fn reader<S: AsRef<str>>(lines: &[S]) -> Result<Vec<Vec<String>>, PyExceptio
     Ok(rows)
 }
 
-/// csv.writer(f) with CPython's default "excel" dialect: comma
-/// delimiter, QUOTE_MINIMAL (a field is quoted only when it contains
-/// the delimiter, a quote, or a newline), "" quote doubling, and \r\n
-/// as the row terminator. Rows stringify their elements through
-/// PyDisplay — Python's writer calls str() — so ints, floats, and
-/// bools render exactly as Python prints them (True, 2.5, 1e+16).
-/// Only available with the std feature: it writes through PyFile.
+/// csv.writer(f, lineterminator=..., quoting=..., escapechar=...) with
+/// CPython's default "excel" dialect: comma delimiter, and by default
+/// QUOTE_MINIMAL (a field is quoted only when it contains the delimiter, a
+/// quote, or a newline), "" quote doubling, and — by default — \r\n as the
+/// row terminator. The `lineterminator` (issue #369), `quoting` and
+/// `escapechar` keywords (issue #369) are supported as value-shaped seams,
+/// exactly as CPython's writer accepts them. CPython's quote MODES:
+/// minimal quotes only when needed; all quotes every field; none never
+/// quotes and escapes the delimiter/quote/newline with `escapechar`. Rows
+/// stringify their elements through PyDisplay — Python's writer calls str()
+/// — so ints, floats, and bools render exactly as Python prints them
+/// (True, 2.5, 1e+16). Only available with the std feature: it writes
+/// through PyFile.
 #[cfg(feature = "std")]
 pub struct Writer<'a> {
     file: &'a mut crate::PyFile,
+    lineterminator: String,
+    all_quote: bool,
+    escapechar: Option<u8>,
 }
 
 #[cfg(feature = "std")]
-pub fn writer(file: &mut crate::PyFile) -> Writer<'_> {
-    Writer { file }
+pub fn writer(
+    file: &mut crate::PyFile,
+    lineterminator: String,
+    all_quote: bool,
+    escapechar: Option<u8>,
+) -> Writer<'_> {
+    Writer { file, lineterminator, all_quote, escapechar }
 }
 
 #[cfg(feature = "std")]
 impl Writer<'_> {
+    /// Emit one field: QUOTE_MINIMAL (quote only when needed) or QUOTE_ALL
+    /// (always quote) quote the field; QUOTE_NONE never quotes and instead
+    /// escapes the delimiter/quote/CR/LF with the escapechar.
+    fn write_field(&self, out: &mut String, text: &str) {
+        let needs_escape = text.contains(',') || text.contains('"') || text.contains('\n')
+            || text.contains('\r');
+        if self.all_quote {
+            out.push('"');
+            out.push_str(&text.replace('"', "\"\""));
+            out.push('"');
+        } else if needs_escape {
+            if let Some(esc) = self.escapechar {
+                let mut escaped = String::new();
+                for c in text.chars() {
+                    if c == ',' || c == '"' || c == '\n' || c == '\r' {
+                        escaped.push(esc as char);
+                        escaped.push(c);
+                    } else {
+                        escaped.push(c);
+                    }
+                }
+                out.push_str(&escaped);
+            } else {
+                out.push('"');
+                out.push_str(&text.replace('"', "\"\""));
+                out.push('"');
+            }
+        } else {
+            out.push_str(text);
+        }
+    }
+
     pub fn writerow<T: crate::PyDisplay>(&mut self, row: &[T]) -> Result<(), PyException> {
         let mut out = String::new();
         for (i, field) in row.iter().enumerate() {
@@ -151,16 +223,9 @@ impl Writer<'_> {
                 out.push(',');
             }
             let text = field.py_display();
-            if text.contains(',') || text.contains('"') || text.contains('\n') || text.contains('\r')
-            {
-                out.push('"');
-                out.push_str(&text.replace('"', "\"\""));
-                out.push('"');
-            } else {
-                out.push_str(&text);
-            }
+            self.write_field(&mut out, text.as_ref());
         }
-        out.push_str("\r\n");
+        out.push_str(&self.lineterminator);
         self.file.write(out)?;
         Ok(())
     }

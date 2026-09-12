@@ -93,11 +93,37 @@ pub fn encode_by_name<S: AsRef<str>>(s: S, name: &str, errors: &str) -> Result<V
             })
         }
         "punycode" => Ok(encode_punycode(s)),
+        "utf_16_le" | "utf_16le" => Ok(encode_utf16_le(s)),
         other => Err(PyException::new(
             "LookupError",
             format!("unknown encoding: {}", other),
         )),
     }
+}
+
+/// str.encode("utf-16-le"): each code point as a UTF-16 code unit, two
+/// little-endian bytes (NO byte-order mark — CPython's utf-16-le encodes
+/// without the BOM; `utf-16` adds it, which is not modeled here). An
+/// astral code point (>= 0x10000) becomes its surrogate pair. Verified
+/// against python3 3.14.1.
+pub fn encode_utf16_le<S: AsRef<str>>(s: S) -> Vec<u8> {
+    let mut out = Vec::<u8>::new();
+    for c in s.as_ref().chars() {
+        let cp = c as u32;
+        if cp <= 0xFFFF {
+            out.push((cp & 0xFF) as u8);
+            out.push(((cp >> 8) & 0xFF) as u8);
+        } else {
+            let v = cp - 0x10000;
+            let hi = 0xD800u32 + (v >> 10);
+            let lo = 0xDC00u32 + (v & 0x3FF);
+            out.push((hi & 0xFF) as u8);
+            out.push(((hi >> 8) & 0xFF) as u8);
+            out.push((lo & 0xFF) as u8);
+            out.push(((lo >> 8) & 0xFF) as u8);
+        }
+    }
+    out
 }
 
 /// The strict/replace/ignore error handlers around a PER-CHARACTER codec

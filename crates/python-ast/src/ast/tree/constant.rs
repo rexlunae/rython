@@ -79,11 +79,29 @@ pub fn try_int(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
 
 pub fn try_float(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
     let v: f64 = value.extract()?;
+    // A NON-FINITE float constant (`1e1000` → inf, `0/0`-free literals →
+    // nan) has no Rust float-LITERAL form: "inf"/"nan" are not valid Rust
+    // literals, so Literal::parse would panic. Carry it as a NUL-prefixed
+    // sentinel (like complex/Ellipsis) and render as the f64 EXPRESSION at
+    // codegen (issue #372).
+    if !v.is_finite() {
+        let kind = if v.is_nan() {
+            "nan"
+        } else if v.is_sign_negative() {
+            "ninf"
+        } else {
+            "inf"
+        };
+        return Ok(Some(Literal::parse(
+            format!("\"\u{0}RYTHON_NONFINITE:{}\"", kind)
+        )
+        .expect("non-finite sentinel literal")));
+    }
     // Rust's Display for integral floats drops the ".0" ("2.0" becomes
     // "2"), which would re-parse as an INTEGER literal and silently change
     // the generated type (and semantics — Python's 2.0 / 4 is 0.5).
     let mut s = format!("{}", v);
-    if v.is_finite() && !s.contains('.') && !s.contains('e') && !s.contains('E') {
+    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
         s.push_str(".0");
     }
     let l = Literal::parse(s).expect("[4] Parsing the literal");
@@ -91,11 +109,110 @@ pub fn try_float(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
     Ok(Some(l))
 }
 
+/// True when `l` is a non-finite float constant sentinel (issue #372).
+pub fn is_nonfinite_literal(l: &Literal<String>) -> bool {
+    l.to_string().starts_with("\"\u{0}RYTHON_NONFINITE:")
+}
+
+/// The Rust EXPRESSION tokens for a non-finite float constant
+/// (`f64::INFINITY` / `f64::NEG_INFINITY` / `f64::NAN`), or None when `l`
+/// is not a non-finite sentinel.
+pub fn nonfinite_expression(l: &Literal<String>) -> Option<TokenStream> {
+    let s = l.to_string();
+    let raw: &str = s.as_ref();
+    if !raw.starts_with("\"\u{0}RYTHON_NONFINITE:") {
+        return None;
+    }
+    match raw {
+        _ if raw.contains("\u{0}RYTHON_NONFINITE:nan") => Some(quote!(f64::NAN)),
+        _ if raw.contains("\u{0}RYTHON_NONFINITE:ninf") => {
+            Some(quote!(f64::NEG_INFINITY))
+        }
+        _ => Some(quote!(f64::INFINITY)),
+    }
+}
+
 pub fn try_bool(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
     let v: bool = value.extract()?;
     let l = Literal::parse(format!("{}", v)).expect("[4] Parsing the literal");
 
     Ok(Some(l))
+}
+
+/// A Rust float-literal token for an `f64`, mirroring `try_float`: Rust's
+/// Display drops the ".0" of an integral float, which would re-parse as an
+/// INTEGER literal and change the type.
+pub fn f64_token(v: f64) -> String {
+    let mut s = format!("{}", v);
+    if v.is_finite() && !s.contains('.') && !s.contains('e') && !s.contains('E') {
+        s.push_str(".0");
+    }
+    s
+}
+
+/// The NUL-prefixed sentinel marker used to carry a Python `complex` value
+/// through the `Literal<String>` (there is no `Literal` complex variant).
+/// A NUL byte cannot appear in a real Python source literal, so this cannot
+/// collide with a genuine string constant (the same rationale as the
+/// Ellipsis sentinel).
+const COMPLEX_MARKER: &'static str = "\u{0}RYTHON_COMPLEX:";
+
+pub fn complex_sentinel_literal(re: f64, im: f64) -> Literal<String> {
+    Literal::parse(
+        format!("\"{}{}:{}\"", COMPLEX_MARKER, re.to_bits(), im.to_bits())
+    )
+    .expect("complex sentinel literal")
+}
+
+/// True when `l` is a complex sentinel (a real Python string can never
+/// start with the NUL marker plus its opening quote).
+pub fn is_complex_literal(l: &Literal<String>) -> bool {
+    l.to_string().starts_with("\"\u{0}RYTHON_COMPLEX:")
+}
+
+/// The stored (re, im) f64s from a complex sentinel, or None when `l` is
+/// not a complex literal.
+pub fn complex_parts(l: &Literal<String>) -> Option<(f64, f64)> {
+    let s = l.to_string();
+    let raw: &str = s.as_ref();
+    // raw == "\u{0}RYTHON_COMPLEX:<re_bits>:<im_bits>"
+    let marker = "\"\u{0}RYTHON_COMPLEX:";
+    if !raw.starts_with(marker) {
+        return None;
+    }
+    // Strip the leading quote + marker (marker includes the opening quote).
+    let inner = &raw[marker.len()..];
+    let body = if inner.ends_with('"') {
+        &inner[..inner.len() - 1]
+    } else {
+        inner
+    };
+    // body == "<re_bits>:<im_bits>"
+    let Some(i) = body.find(':') else {
+        return None;
+    };
+    let re: u64 = (&body[..i]).parse::<u64>().unwrap();
+    let im: u64 = (&body[i + 1..]).parse::<u64>().unwrap();
+    Some((f64::from_bits(re), f64::from_bits(im)))
+}
+
+/// Python `complex` constant extraction. The caller's `if let Ok` chain
+/// treats an `Err` as "not this kind", so a value without `.real`/`.imag`
+/// (a string, Ellipsis, None, ...) simply falls through; only a real
+/// `complex` has both, plus the earlier try_* arms already rejected
+/// int/float/bool (which also answer `.real`).
+pub fn try_complex(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
+    let re: f64 = value
+        .getattr("real")
+        .map_err(|e| crate::extraction_failure("complex real", value, e))?
+        .extract::<f64>()
+        .map_err(|e| crate::extraction_failure("complex real", value, e))?;
+    let im: f64 = value
+        .getattr("imag")
+        .map_err(|e| crate::extraction_failure("complex imag", value, e))?
+        .extract::<f64>()
+        .map_err(|e| crate::extraction_failure("complex imag", value, e))?;
+    Ok(Some(complex_sentinel_literal(re, im)))
 }
 
 // Sentinel literal stored for Python's `...` (Ellipsis): the extraction
@@ -165,6 +282,8 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Constant {
             l
         } else if let Ok(l) = try_float(&value) {
             l
+        } else if let Ok(l) = try_complex(&value) {
+            l
         } else if let Ok(l) = try_ellipsis(&value) {
             l
         } else if let Ok(l) = try_option(&value) {
@@ -193,6 +312,23 @@ impl CodeGen for Constant {
         _symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
         match self.0 {
+            Some(c) if is_nonfinite_literal(&c) => {
+                // `1e1000` → f64::INFINITY etc.: the f64 EXPRESSION, not a
+                // literal (safe then, is_finite true for typical constants).
+                Ok(nonfinite_expression(&c).expect(
+                    "matched a non-finite sentinel, so the expression exists"
+                ))
+            }
+            Some(c) if is_complex_literal(&c) => {
+                let (re, im) = complex_parts(&c).expect("complex literal parts");
+                let re_tok: TokenStream = f64_token(re).parse().map_err(
+                    |e| format!("cannot render complex real `{}` as Rust tokens: {}", re, e),
+                )?;
+                let im_tok: TokenStream = f64_token(im).parse().map_err(
+                    |e| format!("cannot render complex imag `{}` as Rust tokens: {}", im, e),
+                )?;
+                Ok(quote!(Complex::new(#re_tok, #im_tok)))
+            }
             Some(c) if is_ellipsis_literal(&c) => Err(
                 "`...` (Ellipsis) as a VALUE is not supported by rython; it is only \
                  accepted as a bare statement (a no-op, like `pass`) — Protocol \

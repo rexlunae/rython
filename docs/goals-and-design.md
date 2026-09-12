@@ -261,6 +261,59 @@ modes) is ordered by what unblocks real programs, but no feature ships in
 a half-state where some uses silently misbehave. "Supported" is a binary
 property of a construct, and the test suite is its definition.
 
+### P9. Preserve the static lowering; insert dynamic behavior only where it must exist
+
+Rython's whole premise is replacing Python's dynamic runtime with
+equivalent *compile-time* behavior. That goal is served best when each
+construct stays a static lowering (plain `struct`/`impl`/`enum`,
+monomorphized, readable, no interpreter) as far as it possibly can, and a
+runtime simulation is introduced **only at the exact point a dynamic
+behavior genuinely survives the static model** — never by defaulting the
+whole construct to dynamism.
+
+Concretely, when a Python feature has a static core plus a few knobs a
+Python value can change at runtime, keep the core static and thread each
+knob as a *value parameter* (or a narrow, typed runtime union), rather
+than replacing the whole construct with a boxed any-value:
+
+- **`complex` (#366)** — a real `Complex { real, imag }` struct with typed
+  `+ − × ÷`, `abs`, `conjugate`, `real`/`imag`, and CPython-exact
+  `repr`/`str`. It is not a `PyValue` bag. The few behaviors Python's
+  complex has that a typed pair cannot reproduce statically (ordering —
+  which is a `TypeError` in CPython) are kept out of the trait surface and
+  left for codegen to refuse loudly, not silently re-typed.
+- **test-runner gate decorators (#371)** — the decorated method/class
+  stays a *static* definition; the gate (`@skipUnless`, `@cpython_only`,
+  …) is a dynamic test-runner directive with no static meaning, so it is
+  consumed as a no-op **plus a `-W` warning** — not modeled as a runtime
+  gate object.
+- **`csv.writer(lineterminator=...)` (#369)** — the writer stays a plain
+  `struct Writer { file, lineterminator }` with `impl`s; the one dynamic
+  knob Python's constructor accepts is threaded as a `String` value
+  parameter (default `"\r\n"`), exactly in the constructor, instead of
+  keeping a runtime dialect registry Python could mutate.
+- **empty `list()`** — rather than force the whole list hierarchy
+  dynamic, the item type is inferred from its assignment/use context and
+  the empty vector is statically typed.
+
+The decision test for every such insertion (extending the P1 checklist):
+
+1. Can the *core* build statically (typed, readable, monomorphized)?
+2. Is the *dynamic* part precisely the knob(s) Python exposes at runtime,
+   and is each threaded as a value (typed parameter / narrow union / a
+   documented no-op-with-warning), never an untypeable bag?
+3. Is the split **loud** — a codegen refusal (complex ordering), a `-W`
+   warning (#371 gates), or a value default (#369) — at exactly the
+   divergence point, with a `docs/spec.md` §12 ledger row, not a silent
+   behavior change?
+4. Is the whole feature pinned by transcript against `python3`?
+
+Prefer a static core + a small value-shaped dynamic seam every time;
+reach for boxed dynamism (`PyValue`, a runtime interpreter slice) only
+when the dynamic surface is genuinely open-ended (heterogeneous
+containers, callables, `eval`), and even then gate it behind an explicit
+opt-in (#334 — the callables model — is the roadmap for those).
+
 ## Future directions
 
 Recorded here so they read as intentions, not accidents. Each will land
@@ -316,6 +369,8 @@ agent) weighing an addition:
 4. Does it keep working under the kernel and `no_std` targets' rules, or
    is it correctly rejected there?
 5. Is there an end-to-end test that diffs against `python3`?
+6. Does it keep a static core and thread the dynamic part as a typed seam
+   (P9), instead of defaulting the construct to boxed dynamism?
 
 If the answer to (1) is no on both counts, the feature is not added — it
 is documented as a boundary instead.

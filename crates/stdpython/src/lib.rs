@@ -7097,6 +7097,238 @@ pub fn not_a_directory_error<M: AsRef<str>>(message: M) -> PyException {
 }
 
 // ============================================================================
+// COMPLEX (issue #366)
+// ============================================================================
+// Python's `complex` type, as an `f64` real+imaginary pair, matched to
+// CPython's observable behavior and pinned against `python3` (3.14.1):
+//
+// - `str(z)` and `repr(z)` are the SAME, using CPython's complex formatter
+//   (shared `complex_repr` below): a pure imaginary (real == +0.0) prints
+//   as a bare `"Xj"`; otherwise `"(<real><sign><|imag|>j)"`. An integral
+//   component drops its trailing `.0` (`3+0j`, `-0-1j`, `1e+16+1j`).
+// - `bool(z)` is False only for `0+0j` (signed zeros included).
+// - Equality is derived (complex-vs-complex by re & im); cross-type
+//   equality against int/float is the codegen slice (#366 slice 3).
+// - Ordering (`<`, `<=`, `>`, `>=`) and complex division are NOT lowered
+//   yet; codegen refuses them loudly until the #366 arithmetic slice lands.
+
+#[derive(Clone, Debug, PartialEq)]
+/// A Python `complex`: real and imaginary `f64` parts.
+pub struct Complex {
+    pub real: f64,
+    pub imag: f64,
+}
+
+impl Complex {
+    pub fn new(re: f64, im: f64) -> Complex {
+        Complex { real: re, imag: im }
+    }
+    /// The real part.
+    pub fn re(&self) -> f64 {
+        self.real
+    }
+    /// The imaginary part.
+    pub fn im(&self) -> f64 {
+        self.imag
+    }
+    /// The complex conjugate: `(a+bj).conjugate()` is `(a-bj)`.
+    pub fn conjugate(&self) -> Complex {
+        Complex::new(self.real, -self.imag)
+    }
+}
+
+/// The imaginary-part coefficient of an `a+bj` component, matched to
+/// CPython: `py_float_repr`, but with the trailing `.0` of an integral
+/// finite value dropped (`3.0` → `3`, `-0.0` → `-0`, `2.5` stays `2.5`,
+/// `1e+16` stays `1e+16`).
+fn complex_component_repr(x: f64) -> String {
+    if x.is_nan() {
+        return "nan".to_string();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
+    let mut s = py_float_repr(x);
+    // CPython prints an integral component without the fraction: "3" not
+    // "3.0", "-0" not "-0.0". Only strip when the repr is a plain decimal
+    // ending ".0" (never an exponent form like "1e+16").
+    if s.ends_with(".0") && !s.contains('e') && !s.contains('E') {
+        s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+    }
+    s
+}
+
+/// CPython's complex formatter, shared by `str`, `repr` and f-string `!r`:
+///
+/// - If `real` is EXACTLY `+0.0` (positive zero; `-0.0` does NOT qualify),
+///   the result is a bare imaginary `"Xj"` — no parentheses, real dropped
+///   (`1j`, `-2.5j`, `0j`, `-0j`).
+/// - Otherwise `"(<real><sign><|imag|>j)"`, where `<sign>` is `+` when the
+///   imaginary part is `>= 0` (including `+0.0`) and `-` when it is
+///   negative or `-0.0` (`(1+2j)`, `(1-2j)`, `(-0-1j)`, `(3+0j)`).
+pub fn complex_repr(re: f64, im: f64) -> String {
+    if re == 0.0 && !re.is_sign_negative() {
+        // Pure imaginary: keep the imaginary part's own sign and coercion.
+        return format!("{}j", complex_component_repr(im));
+    }
+    let sign = if im < 0.0 || (im == 0.0 && im.is_sign_negative()) {
+        "-"
+    } else {
+        "+"
+    };
+    format!("({}{}{}j)", complex_component_repr(re), sign, complex_component_repr(im.abs()))
+}
+
+impl PyBool for Complex {
+    fn py_bool(self) -> bool {
+        // bool(z) is False only for 0+0j (signed zero makes no difference).
+        self.real != 0.0 || self.imag != 0.0
+    }
+}
+
+impl PyToString for Complex {
+    fn py_str(self) -> String {
+        // str(complex) IS repr(complex).
+        complex_repr(self.real, self.imag)
+    }
+}
+
+impl PyRepr for Complex {
+    fn py_repr(&self) -> String {
+        complex_repr(self.real, self.imag)
+    }
+}
+
+impl PyDisplay for Complex {
+    fn py_display(&self) -> String {
+        complex_repr(self.real, self.imag)
+    }
+}
+
+/// Addition: `(a+bj) + (c+dj) = (a+c) + (b+d)j`.
+impl PyAdd<Complex> for Complex {
+    type Output = Complex;
+    fn py_add(&self, rhs: &Complex) -> Complex {
+        Complex::new(self.real + rhs.real, self.imag + rhs.imag)
+    }
+}
+
+/// Subtraction: `(a+bj) - (c+dj) = (a-c) + (b-d)j`.
+impl PySub<Complex> for Complex {
+    type Output = Complex;
+    fn py_sub(&self, rhs: &Complex) -> Complex {
+        Complex::new(self.real - rhs.real, self.imag - rhs.imag)
+    }
+}
+
+/// Multiplication: `(a+bj)(c+dj) = (ac-bd) + (ad+bc)j`.
+impl PyMul<Complex> for Complex {
+    type Output = Complex;
+    fn py_mul(&self, rhs: &Complex) -> Complex {
+        Complex::new(
+            self.real * rhs.real - self.imag * rhs.imag,
+            self.real * rhs.imag + self.imag * rhs.real,
+        )
+    }
+}
+
+/// Division: `(a+bj)/(c+dj) = ((ac+bd) + (bc-ad)j)/(c^2+d^2)`. A zero
+/// divisor raises CPython's `ZeroDivisionError: division by zero`.
+impl PyDiv<Complex> for Complex {
+    type Output = Complex;
+    fn py_div(&self, rhs: &Complex) -> Result<Complex, PyException> {
+        let denom = rhs.real * rhs.real + rhs.imag * rhs.imag;
+        if denom == 0.0 {
+            return Err(PyException::new("ZeroDivisionError", "division by zero"));
+        }
+        Ok(Complex::new(
+            (self.real * rhs.real + self.imag * rhs.imag) / denom,
+            (self.imag * rhs.real - self.real * rhs.imag) / denom,
+        ))
+    }
+}
+
+/// `abs(complex)`: the Euclidean modulus `sqrt(re^2 + im^2)`, an `f64` —
+/// CPython returns a real `float`, not a `complex`. std-gated: `f64::sqrt`
+/// (the Euclidean modulus) needs libm's float intrinsics, which only exist
+/// on the std tier — the alloc tier (`--no-default-features --features
+/// alloc`, CI's nostd job) has no `f64::sqrt`. `abs(complex)` is therefore
+/// absent on the alloc tier, exactly like `math.sqrt`.
+#[cfg(feature = "std")]
+impl PyAbs for Complex {
+    type Output = f64;
+    fn py_abs(self) -> f64 {
+        (self.real * self.real + self.imag * self.imag).sqrt()
+    }
+}
+
+// Cross-type arithmetic: `complex` with an int (`i64`) or float (`f64`)
+// promotes the WHOLE expression to `complex` — `1 - 3j` is `(1-3j)`,
+// `2 * (1+2j)` is `(2+4j)`, matching CPython. Both orders are covered
+// because the generated receiver for `1 - 3j` is the i64 (`i64.py_sub`)
+// while `3j - 1` has the Complex receiver. The scalar converts to a
+// complex with imag `0.0` (the boundary is the usual i64→f64 integer
+// precision loss above 2^53, same as `float(int)`).
+
+// (a+bj) + s = (a+s) + bj, where s is i64 or f64 (receiver Complex).
+macro_rules! complex_add_scalar {
+    ($($t:ty),* $(,)?) => {$(
+        impl PyAdd<$t> for Complex {
+            type Output = Complex;
+            fn py_add(&self, rhs: &$t) -> Complex {
+                Complex::new(self.real + (*rhs as f64), self.imag)
+            }
+        }
+        // s + (a+bj) = (s+a) + bj (receiver scalar, rhs Complex).
+        impl PyAdd<Complex> for $t {
+            type Output = Complex;
+            fn py_add(&self, rhs: &Complex) -> Complex {
+                Complex::new((*self as f64) + rhs.real, rhs.imag)
+            }
+        }
+    )*};
+}
+complex_add_scalar!(i64, f64);
+
+// (a+bj) - s = (a-s) + bj ;  s - (a+bj) = (s-a) - bj.
+macro_rules! complex_sub_scalar {
+    ($($t:ty),* $(,)?) => {$(
+        impl PySub<$t> for Complex {
+            type Output = Complex;
+            fn py_sub(&self, rhs: &$t) -> Complex {
+                Complex::new(self.real - (*rhs as f64), self.imag)
+            }
+        }
+        impl PySub<Complex> for $t {
+            type Output = Complex;
+            fn py_sub(&self, rhs: &Complex) -> Complex {
+                Complex::new((*self as f64) - rhs.real, -rhs.imag)
+            }
+        }
+    )*};
+}
+complex_sub_scalar!(i64, f64);
+
+// (a+bj) * s = (a*s) + (b*s)j ;  s * (a+bj) = (s*a) + (s*b)j.
+macro_rules! complex_mul_scalar {
+    ($($t:ty),* $(,)?) => {$(
+        impl PyMul<$t> for Complex {
+            type Output = Complex;
+            fn py_mul(&self, rhs: &$t) -> Complex {
+                Complex::new(self.real * (*rhs as f64), self.imag * (*rhs as f64))
+            }
+        }
+        impl PyMul<Complex> for $t {
+            type Output = Complex;
+            fn py_mul(&self, rhs: &Complex) -> Complex {
+                Complex::new((*self as f64) * rhs.real, (*self as f64) * rhs.imag)
+            }
+        }
+    )*};
+}
+complex_mul_scalar!(i64, f64);
+
+// ============================================================================
 // PYTHON STANDARD LIBRARY MODULES
 // ============================================================================
 
@@ -7202,6 +7434,8 @@ pub use stdlib::copy;
 pub use stdlib::textwrap;
 pub use stdlib::hashlib;
 pub use stdlib::csv;
+#[cfg(feature = "std")]
+pub use stdlib::unittest;
 #[cfg(feature = "std")]
 pub use stdlib::pathlib;
 #[cfg(feature = "std")]
@@ -8233,6 +8467,77 @@ pub fn format_string<T: AsRef<str>>(template: T, args: &[&dyn Display]) -> Strin
         result = result.replace(&placeholder, &format!("{}", arg));
     }
     result
+}
+
+/// Runtime `str.format(**kwargs)` for a KWARGS-DICT receiver (issue #368):
+/// substitutes `{key}` placeholders from a `PyDict<String, String>` of
+/// keyword values, with CPython's `{{`/`}}` escaping and a `KeyError` for a
+/// missing key. This is the DYNAMIC seam for the (rare) `"template".
+/// format(**runtime_dict)` calls that cannot be resolved at conversion
+/// time; the statically-resolvable templates still lower to `format!`.
+///
+/// The scalar `{key}` FIELD-NAME form is the supported surface (which is
+/// how the CPython test corpus uses it). A format-SPEC or CONVERSION
+/// (`{key:>5}`, `{key!r}`) is a loud `ValueError`, NOT a silent wrong
+/// substitution — the corpus's runtime-kwargs templates never use them,
+/// and a best-effort approximation is exactly what the prime directive
+/// forbids.
+pub fn str_format_kwargs<T: AsRef<str>>(
+    template: T,
+    kwargs: &PyDict<String, String>,
+) -> Result<String, PyException> {
+    let chars: Vec<char> = template.as_ref().chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    let n = chars.len();
+    while i < n {
+        let c = chars[i];
+        if c == '{' {
+            if (i + 1 < n) && chars[i + 1] == '{' {
+                out.push('{');
+                i += 2;
+                continue;
+            }
+            // A replacement field: find the closing '}'.
+            let mut j = i + 1;
+            let mut key = String::new();
+            while j < n && chars[j] != '}' {
+                let fc = chars[j];
+                if fc == ':' || fc == '!' {
+                    // format-spec or conversion — unsupported, be loud.
+                    return Err(PyException::new(
+                        "ValueError",
+                        "str.format(**kwargs) format-spec / conversion is not supported \
+                         by the runtime kwargs path (issue #368)"
+                    ));
+                }
+                key.push(fc);
+                j += 1;
+            }
+            if j >= n {
+                return Err(PyException::new("ValueError", "expected '}' before end of string"));
+            }
+            match kwargs.get(&key) {
+                Some(v) => out.push_str(v),
+                None => {
+                    return Err(PyException::new("KeyError", format!("'{}'", key)))
+                }
+            }
+            i = j + 1;
+            continue;
+        }
+        if c == '}' {
+            if (i + 1 < n) && chars[i + 1] == '}' {
+                out.push('}');
+                i += 2;
+                continue;
+            }
+            return Err(PyException::new("ValueError", "single '}' in format string"));
+        }
+        out.push(c);
+        i += 1;
+    }
+    Ok(out)
 }
 
 /// Helper for range() function with optional parameters - more flexible than the basic range

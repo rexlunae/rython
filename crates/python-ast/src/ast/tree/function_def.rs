@@ -1425,6 +1425,19 @@ fn parse_method_decorator(
             )
             .into())
         }
+        // A test-runner gate (`@skipUnless(...)`, `@cpython_only`,
+        // `@support.requires_*`, `@unittest.mock.patch(...)`, ...): a
+        // no-op for the converted function body — the definition lowers as
+        // a plain method/function — but it is LOUD (a -W definition
+        // warning), never silently ignored.
+        Some(crate::Decorator::TestGate(_)) => {
+            options.definition_warnings.borrow_mut().push(format!(
+                "test-runner gate decorator consumed as a no-op (the converted body \
+                 runs unconditionally; the skip/mark/patch condition is a test-RUNNER \
+                 directive that rython does not model)"
+            ));
+            Ok(MethodDecorator::None)
+        }
         Some(d) => d.as_method_decorator().ok_or_else(|| {
             format!(
                 "decorator `{}` does not apply to a function definition (only \
@@ -4286,6 +4299,9 @@ fn renderable_return_typeinfo(t: &crate::TypeInfo) -> bool {
 pub(crate) fn simple_expr_typeinfo(expr: &ExprType) -> Option<crate::TypeInfo> {
     match expr {
         ExprType::Constant(c) => match &c.0 {
+            Some(l0) if crate::ast::tree::constant::is_nonfinite_literal(&l0) => {
+                Some(crate::TypeInfo::Float)
+            }
             Some(litrs::Literal::Integer(_)) => Some(crate::TypeInfo::Int),
             Some(litrs::Literal::Float(_)) => Some(crate::TypeInfo::Float),
             Some(litrs::Literal::Bool(_)) => Some(crate::TypeInfo::Bool),
@@ -4319,6 +4335,12 @@ pub(crate) fn simple_expr_typeinfo(expr: &ExprType) -> Option<crate::TypeInfo> {
 
 pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {    match expr {
         ExprType::Constant(c) => match &c.0 {
+            Some(l0) if crate::ast::tree::constant::is_complex_literal(&l0) => {
+                Some(quote!(Complex))
+            }
+            Some(l0) if crate::ast::tree::constant::is_nonfinite_literal(&l0) => {
+                Some(quote!(f64))
+            }
             Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
             Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
             Some(litrs::Literal::Bool(_)) => Some(quote!(bool)),

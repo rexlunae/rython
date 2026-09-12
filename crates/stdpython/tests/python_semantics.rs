@@ -2337,7 +2337,7 @@ mod csv_module {
     use stdpython::csv::reader;
 
     fn rows(lines: &[&str]) -> Vec<Vec<String>> {
-        reader(lines).unwrap()
+        reader(lines, false, None).unwrap()
     }
 
     #[test]
@@ -2395,7 +2395,7 @@ mod csv_module {
         // readlines elements keeps it: python3 gives 'x\ny'.
         assert_eq!(rows(&["a,\"x\n", "y\"\n"]), vec![vec!["a", "x\ny"]]);
         // An unquoted newline with data after it is csv.Error.
-        let e = reader(&["a\nb,c"]).unwrap_err();
+        let e = reader(&["a\nb,c"], false, None).unwrap_err();
         assert_eq!(
             format!("{}", e),
             "csv.Error: new-line character seen in unquoted field - do you \
@@ -2762,7 +2762,7 @@ mod file_objects {
         // 'a,"b,c","say ""hi""",\r\n1,2,3\r\n\r\n"line\nbreak",tab\there\r\n'
         let mut buf = io::StringIO();
         {
-            let mut w = csv::writer(&mut buf);
+            let mut w = csv::writer(&mut buf, "\r\n".to_string(), false, None);
             w.writerow(&["a", "b,c", "say \"hi\"", ""]).unwrap();
             w.writerow(&[1i64, 2, 3]).unwrap();
             w.writerow(&[] as &[&str]).unwrap();
@@ -2777,7 +2777,7 @@ mod file_objects {
         // and floats render as Python prints them.
         let mut buf = io::StringIO();
         {
-            let mut w = csv::writer(&mut buf);
+            let mut w = csv::writer(&mut buf, "\r\n".to_string(), false, None);
             w.writerow(&[stdpython::py_display(&true), stdpython::py_display(&2.5f64)])
                 .unwrap();
             w.writerows(&[vec!["x", "y"], vec!["z", "w"]]).unwrap();
@@ -2787,11 +2787,11 @@ mod file_objects {
         // writer output round-trips through the reader.
         let mut buf = io::StringIO();
         {
-            let mut w = csv::writer(&mut buf);
+            let mut w = csv::writer(&mut buf, "\r\n".to_string(), false, None);
             w.writerow(&["a", "b,c", "say \"hi\""]).unwrap();
         }
         let text = buf.getvalue().unwrap();
-        let rows = csv::reader(&text.split("\r\n").collect::<Vec<_>>()).unwrap();
+        let rows = csv::reader(&text.split("\r\n").collect::<Vec<_>>(), false, None).unwrap();
         assert_eq!(rows[0], vec!["a", "b,c", "say \"hi\""]);
     }
 }
@@ -4196,4 +4196,175 @@ fn open_binary_validates_the_mode_before_touching_the_path() {
     assert!(err.matches("FileExistsError"), "{:?}", err);
     assert!(err.message.starts_with("[Errno 17] File exists: "), "{:?}", err);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ============================================================================
+// complex (issue #366) — pinned against CPython 3.14.1
+// ============================================================================
+
+#[test]
+fn complex_repr_matches_cpython() {
+    use stdpython::PyToString;
+    use stdpython::PyRepr;
+    // Verified against python3 3.14.1 (repr is str for complex).
+    let c = |re, im| Complex::new(re, im);
+    assert_eq!(c(1.0, 2.0).py_repr(), "(1+2j)");
+    assert_eq!(c(0.0, 1.0).py_repr(), "1j");
+    assert_eq!(c(0.0, 2.0).py_repr(), "2j");
+    assert_eq!(c(-0.0, -1.0).py_repr(), "(-0-1j)");
+    assert_eq!(c(0.0, -1.0).py_repr(), "-1j");
+    assert_eq!(c(-1.0, 2.0).py_repr(), "(-1+2j)");
+    assert_eq!(c(1.0, -2.0).py_repr(), "(1-2j)");
+    assert_eq!(c(0.5, 0.25).py_repr(), "(0.5+0.25j)");
+    assert_eq!(c(0.0, 0.0).py_repr(), "0j");
+    assert_eq!(c(0.0, -0.0).py_repr(), "-0j");
+    assert_eq!(c(3.0, 0.0).py_repr(), "(3+0j)");
+    assert_eq!(c(1.0, 1.0).py_repr(), "(1+1j)");
+    assert_eq!(c(1e16, 1.0).py_repr(), "(1e+16+1j)");
+    assert_eq!(c(0.1, 0.2).py_repr(), "(0.1+0.2j)");
+    assert_eq!(c(100.0, 0.0).py_repr(), "(100+0j)");
+    assert_eq!(c(1234567.0, 1234567.0).py_repr(), "(1234567+1234567j)");
+    // str is repr for complex.
+    assert_eq!(c(1.0, 2.0).py_str(), "(1+2j)");
+    assert_eq!(c(0.0, 2.5).py_str(), "2.5j");
+}
+
+#[test]
+fn complex_bool_and_eq_matches_cpython() {
+    use stdpython::PyBool;
+    assert!(!Complex::new(0.0, 0.0).py_bool());
+    assert!(!Complex::new(0.0, -0.0).py_bool());
+    assert!(Complex::new(1.0, 2.0).py_bool());
+    assert!(Complex::new(0.0, 1.0).py_bool());
+    // PartialEq: complex-vs-complex equality by re & im.
+    assert_eq!(Complex::new(1.0, 2.0), Complex::new(1.0, 2.0));
+    assert_ne!(Complex::new(1.0, 2.0), Complex::new(2.0, 1.0));
+    assert_ne!(Complex::new(0.0, 1.0), Complex::new(0.0, 2.0));
+}
+
+#[test]
+fn complex_arithmetic_matches_cpython() {
+    use stdpython::{PyAdd, PySub, PyMul};
+    // (1+2j) + (3+4j) = (4+6j)
+    assert_eq!(
+        Complex::new(1.0, 2.0).py_add(&Complex::new(3.0, 4.0)),
+        Complex::new(4.0, 6.0)
+    );
+    // (1+2j) - (3-1j) = (-2+3j)
+    assert_eq!(
+        Complex::new(1.0, 2.0).py_sub(&Complex::new(3.0, -1.0)),
+        Complex::new(-2.0, 3.0)
+    );
+    // (1+2j) * (3+4j) = (-5+10j)
+    assert_eq!(
+        Complex::new(1.0, 2.0).py_mul(&Complex::new(3.0, 4.0)),
+        Complex::new(-5.0, 10.0)
+    );
+    // conjugate
+    assert_eq!(Complex::new(3.0, 4.0).conjugate(), Complex::new(3.0, -4.0));
+}
+
+#[test]
+fn complex_accessors() {
+    let z = Complex::new(3.0, 4.0);
+    assert_eq!(z.re(), 3.0);
+    assert_eq!(z.im(), 4.0);
+    // Public fields: codegen lowers `z.real` / `z.imag` to field access.
+    assert_eq!(z.real, 3.0);
+    assert_eq!(z.imag, 4.0);
+}
+
+#[test]
+fn complex_division_matches_cpython() {
+    use stdpython::PyDiv;
+    // (1+2j)/(3+4j) = 0.44+0.08j
+    let q = Complex::new(1.0, 2.0).py_div(&Complex::new(3.0, 4.0)).unwrap();
+    assert_eq!(q.re(), 0.44);
+    assert_eq!(q.im(), 0.08);
+    // (1+2j)/2 == (0.5+1j)
+    let q2 = Complex::new(1.0, 2.0).py_div(&Complex::new(2.0, 0.0)).unwrap();
+    assert_eq!(q2.re(), 0.5);
+    assert_eq!(q2.im(), 1.0);
+    // 1j/0 == ZeroDivisionError: division by zero
+    let err = Complex::new(0.0, 1.0).py_div(&Complex::new(0.0, 0.0)).err().unwrap();
+    assert!(err.matches("ZeroDivisionError"), "{:?}", err);
+    assert_eq!(err.message, "division by zero");
+    // 1j/0j also raises (0j IS complex(0,0))
+    let err2 = Complex::new(0.0, 1.0).py_div(&Complex::new(0.0, 0.0)).err().unwrap();
+    assert!(err2.matches("ZeroDivisionError"), "{:?}", err2);
+}
+
+#[test]
+fn complex_abs_matches_cpython() {
+    use stdpython::PyAbs;
+    // abs(3+4j) == 5.0, abs(0j) == 0.0 (an f64)
+    assert_eq!(Complex::new(3.0, 4.0).py_abs(), 5.0);
+    assert_eq!(Complex::new(0.0, 0.0).py_abs(), 0.0);
+    assert_eq!(Complex::new(1.0, 1.0).py_abs(), 2.0f64.sqrt());
+}
+
+#[test]
+fn complex_cross_type_arithmetic_matches_cpython() {
+    use stdpython::{PyAdd, PySub, PyMul};
+    // 1 - 3.5j == (1-3.5j)   (i64 receiver, Complex rhs)
+    let r1 = (1i64).py_sub(&Complex::new(0.0, 3.5));
+    assert_eq!(r1, Complex::new(1.0, -3.5));
+    // 3j - 1 == (-1+3j)      (Complex receiver, i64 rhs)
+    let r2 = Complex::new(0.0, 3.0).py_sub(&1i64);
+    assert_eq!(r2, Complex::new(-1.0, 3.0));
+    // 2 * (1+2j) == (2+4j)   (i64 receiver, Complex rhs)
+    let r3 = (2i64).py_mul(&Complex::new(1.0, 2.0));
+    assert_eq!(r3, Complex::new(2.0, 4.0));
+    // (1+2j) * 2 == (2+4j)   (Complex receiver, i64 rhs)
+    let r4 = Complex::new(1.0, 2.0).py_mul(&2i64);
+    assert_eq!(r4, Complex::new(2.0, 4.0));
+    // 1.5 + (2+3j) == (3.5+3j)  (f64 receiver, Complex rhs)
+    let r5 = (1.5f64).py_add(&Complex::new(2.0, 3.0));
+    assert_eq!(r5, Complex::new(3.5, 3.0));
+    // (2+3j) + 1.5 == (3.5+3j)  (Complex receiver, f64 rhs)
+    let r6 = Complex::new(2.0, 3.0).py_add(&1.5f64);
+    assert_eq!(r6, Complex::new(3.5, 3.0));
+    // 1j + 2 == (2+1j)
+    let r7 = Complex::new(0.0, 1.0).py_add(&2i64);
+    assert_eq!(r7, Complex::new(2.0, 1.0));
+}
+
+#[test]
+fn str_format_with_runtime_kwargs_matches_cpython() {
+    // issue #368: the runtime `str.format(**kwargs)` path for templates
+    // that cannot be resolved at conversion time. Verified against CPython
+    // 3.14.1.
+    let kwargs = PyDict::<String, String>::from([
+        ("year".to_string(), "Y".to_string()),
+        ("month".to_string(), "M".to_string()),
+        ("encoding".to_string(), "utf-8".to_string()),
+    ]);
+    assert_eq!(
+        str_format_kwargs("hello {year} and {month}", &kwargs).unwrap(),
+        "hello Y and M"
+    );
+    // `{{`/`}}` escape to a literal brace.
+    assert_eq!(
+        str_format_kwargs("{{lit}} {year}", &kwargs).unwrap(),
+        "{lit} Y"
+    );
+    // Missing key raises KeyError with the quoted name.
+    let err = str_format_kwargs("a {missing} b", &kwargs).err().unwrap();
+    assert!(err.matches("KeyError"), "{:?}", err);
+    assert_eq!(err.message, "'missing'");
+}
+
+#[test]
+fn csv_reader_quote_none_with_escapechar_matches_cpython() {
+    use stdpython::stdlib::csv::reader;
+    // Verified against CPython 3.14.1: QUOTE_NONE + escapechar makes the
+    // delimiter/quote/newline literal (escapechar dropped).
+    let r = reader(&["a\\,b,c\\\"d,e\\\nf"], true, Some::<u8>(b'\\')).unwrap();
+    assert_eq!(r[0], vec!["a,b", "c\"d", "e\nf"]);
+    // QUOTE_NONE WITHOUT escapechar: `"` is literal data.
+    let r2 = reader(&["\"plain\",\"has,comma\""], true, None).unwrap();
+    assert_eq!(r2[0], vec!["\"plain\"", "\"has", "comma\""]);
+    // Default (quoting on): quotes strip.
+    let r3 = reader(&["\"a,b\",c"], false, None).unwrap();
+    assert_eq!(r3[0], vec!["a,b", "c"]);
 }

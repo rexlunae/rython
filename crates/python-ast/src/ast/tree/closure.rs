@@ -836,7 +836,14 @@ pub(crate) fn header_runs_code(def: &FunctionDef) -> Option<String> {
         ));
     }
     let evaluates = |e: &ExprType| {
-        !matches!(e, ExprType::Constant(_) | ExprType::NoneType(_))
+        // A bare NAME default (`func=list`, `_algorithm=algorithm`) resolves
+        // to a reference at def-site with NO side effects / output / mutation
+        // / exception — "runs code" only in the trivial reference sense. The
+        // closure model captures what the nested def reads, so a Name default
+        // is allowed through header_runs_code and typed by the capture. Only a
+        // genuine EXPRESSION (a call, a subscript, an operation) evaluates
+        // meaningfully at def-site and stays a loud refusal.
+        !matches!(e, ExprType::Constant(_) | ExprType::NoneType(_) | ExprType::Name(_))
     };
     if def.args.defaults.iter().any(|d| evaluates(d))
         || def

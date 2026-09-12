@@ -62,6 +62,12 @@ const FALLIBLE_STDLIB_FN: &[&str] = &[
     "MemoryBIO",
     // urllib.request.urlopen raises URLError/HTTPError.
     "urlopen",
+    // unittest.main() — the test-runner entry (issue #334). Its Result
+    // carries the runner's status: until codegen lowers a real runner, the
+    // runtime stub returns a loud NotImplementedError rather than silently
+    // passing, and threading `?` makes that surface instead of being
+    // swallowed by the statement.
+    "main",
 ];
 
 /// Issue #111: keyword-argument signatures of stdpython runtime functions
@@ -4237,9 +4243,23 @@ impl<'a> CodeGen for Call {
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
-                        if rendered.len() != 1 {
-                            return Err("list() requires an iterable argument in rython (an \
-                                 empty list has no inferable element type; use [])"
+                        // `list()` with NO arguments is Python's empty list —
+                        // the `[]` shape (issue #370). Like an untyped `[]`,
+                        // it lowers to a boxed EMPTY vector with a -W warning
+                        // when no element type is inferable from context; a
+                        // mismatching use fails loudly at rustc, never a
+                        // silently wrong container.
+                        if rendered.is_empty() {
+                            options.definition_warnings.borrow_mut().push(
+                                "list() with no arguments has no inferable element \
+                                 type; lowering as Vec<PyValue> (the empty-container \
+                                 documented divergence; annotate or pass an iterable)"
+                                    .to_string(),
+                            );
+                            return Ok(quote!(Vec::<stdpython::PyValue>::new()));
+                        }
+                        if rendered.len() > 1 {
+                            return Err("list() takes at most 1 positional argument"
                                 .to_string()
                                 .into());
                         }
@@ -5239,12 +5259,20 @@ impl<'a> CodeGen for Call {
                 let mut count_kw: Option<crate::ExprType> = None;
                 let mut maxsplit_kw: Option<crate::ExprType> = None;
                 let mut _usedforsecurity_kw: Option<crate::ExprType> = None;
+                let mut lineterminator_kw: Option<crate::ExprType> = None;
+                let mut quoting_kw: Option<crate::ExprType> = None;
+                let mut escapechar_kw: Option<crate::ExprType> = None;
                 for kw in &self.keywords {
                     let slot = match kw.arg.as_deref() {
                         Some("width") if matches!(fname.as_str(), "wrap" | "fill") => &mut width_kw,
                         Some("flags") if is_re_fn => &mut flags_kw,
                         Some("count") if fname == "sub" => &mut count_kw,
                         Some("maxsplit") if fname == "split" => &mut maxsplit_kw,
+                        Some("lineterminator") if fname == "writer" => &mut lineterminator_kw,
+                        Some("quoting") if fname == "reader" => &mut quoting_kw,
+                        Some("quoting") if fname == "writer" => &mut quoting_kw,
+                        Some("escapechar") if fname == "reader" => &mut escapechar_kw,
+                        Some("escapechar") if fname == "writer" => &mut escapechar_kw,
                         // md5/sha's usedforsecurity is a FIPS policy flag —
                         // ignored (requests' digest auth).
                         Some("usedforsecurity")
@@ -5836,11 +5864,102 @@ impl<'a> CodeGen for Call {
                     // writer's lifetime (scope analysis marks f mut).
                     ("writer", [f]) => {
                         let p = qual("writer");
-                        Ok(quote!(#p(&mut (#f))))
+                        // csv.writer(f, lineterminator=..., quoting=...,
+                        // escapechar=...) — the excel-dialect writer with the
+                        // value-shaped dialect seams (issue #369); the
+                        // defaults are CPython's "\r\n", QUOTE_MINIMAL, no
+                        // escapechar.
+                        let term = match lineterminator_kw {
+                            Some(e) => {
+                                let t = e.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                quote!((#t).to_string())
+                            }
+                            None => quote!("\r\n".to_string()),
+                        };
+                        // quoting= maps csv.QUOTE_ALL / QUOTE_NONE / other to
+                        // "quote every field" / "never quote" booleans.
+                        let all_quote = match quoting_kw {
+                            Some(crate::ExprType::Attribute(a))
+                                if a.attr == "QUOTE_ALL" =>
+                            {
+                                quote!(true)
+                            }
+                            Some(crate::ExprType::Attribute(a))
+                                if a.attr == "QUOTE_NONE" => quote!(false),
+                            Some(crate::ExprType::Attribute(a))
+                                if a.attr == "QUOTE_MINIMAL" => quote!(false),
+                            _ => quote!(false),
+                        };
+                        let esc = match escapechar_kw {
+                            Some(e) => {
+                                let c = e.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                                // A single-char escapechar: its code point as
+                                // Option<u8> (the writer escapes with it).
+                                quote!(Some::<u8>((#c).as_bytes()[0]))
+                            }
+                            None => quote!(None::<u8>),
+                        };
+                        Ok(quote!(#p(&mut (#f), #term, #all_quote, #esc)))
                     }
                     ("reader", [lines]) => {
                         let p = qual("reader");
-                        Ok(quote!(#p(&(#lines))?))
+                        // csv.reader(f, quoting=csv.QUOTE_NONE, escapechar=...):
+                        // thread the no-quote flag and the escapechar to the
+                        // state-machine reader (issue #369). The runtime
+                        // reader(lines, no_quote, Option<u8> escapechar) already
+                        // honours an escapechar in QUOTE_NONE mode (it drops the
+                        // escapechar and lets the next char through literally).
+                        // The escapechar MUST be a single-character STRING
+                        // LITERAL, rendered at CODE-GEN time as its code point —
+                        // deliberately NOT via `#c.to_rust(...)`, which overflowed
+                        // the codegen stack in this exact arm (round-17; a
+                        // non-literal would render through the expression path the
+                        // test suite already exercises, so keep a literal-only seam).
+                        let no_quote = match quoting_kw {
+                            Some(crate::ExprType::Attribute(a))
+                                if a.attr == "QUOTE_NONE" => quote!(true),
+                            _ => quote!(false),
+                        };
+                        let esc = match escapechar_kw {
+                            None => quote!(None::<u8>),
+                            Some(crate::ExprType::Constant(c)) => {
+                                // `c.0` is Option<Literal<String>>; the
+                                // escapechar must be a single-character string
+                                // literal, rendered at code-GEN time as its code
+                                // point.
+                                match &c.0 {
+                                    Some(litrs::Literal::String(s))
+                                        if s.value().len() == 1 =>
+                                    {
+                                        let byte = s.value().as_bytes()[0];
+                                        quote!(Some::<u8>(#byte))
+                                    }
+                                    _ => {
+                                        return Err(
+                                            "csv.reader(... escapechar=...) needs a \
+                                             single-character string literal (e.g. \
+                                             escapechar=\"^\"); rython refuses to \
+                                             silently ignore a non-literal escapechar \
+                                             (issue #369)"
+                                                .to_string()
+                                                .into()
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {
+                                return Err(
+                                    "csv.reader(... escapechar=...) needs a \
+                                     single-character string literal (e.g. \
+                                     escapechar=\"^\"); rython refuses to \
+                                     silently ignore a non-literal escapechar \
+                                     (issue #369)"
+                                        .to_string()
+                                        .into()
+                                );
+                            }
+                        };
+                        Ok(quote!(#p(&(#lines), #no_quote, #esc)?))
                     }
                     ("md5" | "sha1" | "sha256" | "sha512", []) => {
                         let p = qual(crate::ast::tree::std_module::hashlib_new_variant(&fname)
@@ -7717,6 +7836,12 @@ let mutating_self_field = boxed_self_ref_receiver
                                     #runtime::stdlib::codec::encode_by_name(&(#receiver), "latin-1", &(#errors))?
                                 ));
                             }
+                            "utf-16-le" | "utf_16_le" => {
+                                let runtime = crate::safe_ident(&options.stdpython);
+                                return Ok(quote!(
+                                    #runtime::stdlib::codec::encode_utf16_le(#receiver)
+                                ));
+                            }
                             other => {
                                 // A LITERAL codec outside the supported set
                                 // stays loud at CONVERSION (the port learns
@@ -7725,8 +7850,8 @@ let mutating_self_field = boxed_self_ref_receiver
                                 // a runtime NAME cannot be decided here and
                                 // routes through the registry above.
                                 return Err(format!(
-                                    "str.encode({}): only utf-8, ascii, punycode, and \
-                                     latin-1 are supported",
+                                    "str.encode({}): only utf-8, ascii, punycode, \
+                                     latin-1, and utf-16-le are supported",
                                     other
                                 )
                                 .into());
@@ -9742,9 +9867,15 @@ fn lower_str_format(
                 _ => {}
             }
             if entries.is_empty() {
-                return Err("str.format with **kwargs is not supported yet"
-                    .to_string()
-                    .into());
+                // A `**runtime_bag` spread with DYNAMIC keys (test_calendar's
+                // `format_` — a runtime dict from default_format.copy() plus a
+                // dynamic key): not statically resolvable. Route to the
+                // runtime field-name formatter (issue #368), which substitutes
+                // `{key}` from the bag at runtime and refuses loudly on a
+                // format-spec/conversion it cannot render. The static-core
+                // `format!` path stays for resolvable templates.
+                let bag = kw.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                return Ok(quote!(stdpython::str_format_kwargs(#template, &(#bag))?));
             }
             for (ename, evalue) in entries {
                 resolved_keywords.push(crate::Keyword {
@@ -10667,6 +10798,12 @@ fn check_default_constant(
         {
             Ok(())
         }
+        // A NESTED constant binary expression (`(2.0*pi)**0.5` — random's
+        // sqrt2pi default, a Pow whose left is itself a Mul of constant and
+        // a module constant): both operands are PURE scalars, so the whole
+        // default is a constant expression and re-evaluating it at each call
+        // site is observably identical (no mutation, no side effects).
+        ExprType::BinOp(op) if scalar(&op.left) && scalar(&op.right) => Ok(()),
         ExprType::UnaryOp(u) if matches!(u.operand.as_ref(), ExprType::Constant(_)) => Ok(()),
         // A CLASS-REFERENCE default (`executor_cls=concurrent.futures.
         // ThreadPoolExecutor` — s3transfer): a module-path attribute naming

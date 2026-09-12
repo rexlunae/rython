@@ -1896,6 +1896,34 @@ fn sibling_from_import_anchors_to_crate() {
 }
 
 #[test]
+fn empty_where_bound_does_not_emit_a_stray_comma() {
+    // A generic function whose inferred `where` clause gains an EMPTY bound
+    // (a duck-typed member it cannot bound — the `ParamReq::Method` unknown
+    // arm emits `quote!()` for it) rendered as `where , B: Clone`, which is
+    // not valid Rust and broke every such generated crate. The
+    // where-bounds collector must drop empty bounds so the join can never
+    // leave a leading comma. (test_heapq and its siblings all define a
+    // `load_tests(loader, tests, ignore)`; a nested class inside the body
+    // provokes the unbound member.)
+    let out = compile(
+        concat!(
+            "def load_tests(loader, tests, ignore):\n",
+            "    class Finder:\n",
+            "        def find(self, *args, **kwargs):\n",
+            "            return tests\n",
+            "    return tests\n",
+        ),
+        "load_tests_generic.rs",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !flat.contains("where,"),
+        "a `where ,` must not survive: {}",
+        out
+    );
+}
+
+#[test]
 fn defaulted_annotated_parameter_maps_type() {
     // Defaulted parameters lower to plain required parameters with mapped
     // types (never the raw Python name, and no Option wrapper, which
@@ -2794,6 +2822,58 @@ fn omitted_defaults_must_be_constant() {
         .unwrap()
         .to_string();
     assert!(out.contains("h (7)"), "generated: {out}");
+}
+
+#[test]
+fn nested_def_bare_name_default_converts() {
+    // A nested def whose default is a bare NAME resolves to a reference at
+    // def-site with NO side effects / output / mutation / exception, so it
+    // "runs code" only in the trivial reference sense the closure capture
+    // model already threads. header_runs_code used to refuse *any*
+    // expression default; a Name default is now allowed through and its
+    // value captured by the enclosing scope. (A mutable-list or genuine
+    // expression default still stays loud — see
+    // omitted_defaults_must_be_constant.)
+    let module = crate::parse(
+        "sep = \"-\"\ndef join(words):\n    def glue(a=x, b=sep):\n        return a + b\n    return [glue() for _ in words]\n",
+        "nestednamedefault.py",
+    )
+    .unwrap();
+    let symbols = module.clone().find_symbols(crate::SymbolTableScopes::new());
+    let out = module
+        .to_rust(
+            crate::CodeGenContext::Module("nestednamedefault".to_string()),
+            crate::PythonOptions::default(),
+            symbols,
+        )
+        .unwrap()
+        .to_string();
+    assert!(out.contains("glue"), "generated: {out}");
+
+    // The mutable-list sibling is still a loud refusal.
+    let err = compile_err(
+        "def outer():\n    def grade(breakpoints=[60, 70]):\n        return breakpoints\n    return grade()\n",
+        "nestedmutlist.py",
+    );
+    assert!(
+        err.contains("default") && err.contains("EVALUATES"),
+        "error: {err}",
+    );
+}
+
+#[test]
+fn nested_constant_binary_defaults_are_accepted() {
+    // A default that is a NESTED constant binary expression
+    // (`(2.0*pi)**0.5` — random's sqrt2pi, a Pow whose left is itself a
+    // Mul of a literal and a module constant `pi`) is a pure constant
+    // expression: re-evaluating it at an omitted call site is observably
+    // identical, so it must convert (issue #80 / #370) rather than a
+    // "non-constant default" error.
+    let out = compile(
+        "from math import pi\ndef gamma(z, sqrt2pi=(2.0*pi)**0.5):\n    return sqrt2pi\ngamma(1)\n",
+        "cst_nested_default.py",
+    );
+    assert!(out.contains("sqrt2pi"), "generated: {out}");
 }
 
 #[test]
@@ -5106,6 +5186,37 @@ fn str_format_lowers_to_format_macro() {
 }
 
 #[test]
+fn str_format_with_runtime_kwargs_routes_to_the_runtime_formatter() {
+    // issue #368: a `"t".format(**bag)` whose bag is a runtime dict (not
+    // statically resolvable) routes to the runtime field-name formatter,
+    // NOT a "not supported" conversion error.
+    let out = compile(
+        "def f(**kw) -> str:\n    return \"hi {a} and {b}\".format(**kw)\n",
+        "fmt_kw.py",
+    );
+    assert!(
+        out.contains("str_format_kwargs"),
+        "must route to the runtime formatter: {}",
+        out
+    );
+}
+
+#[test]
+fn utf16le_codec_encode_routes_and_typechecks() {
+    // issue #368 / codec coverage: `s.encode("utf-16-le")` lowers to the
+    // runtime encoder, not a conversion error.
+    let out = compile(
+        "def f(s: str) -> bytes:\n    return s.encode(\"utf-16-le\")\n",
+        "utf16le.py",
+    );
+    assert!(
+        out.contains("encode_utf16_le"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
 fn str_format_errors_are_loud_or_lower_to_variants() {
     // Mixing auto and manual numbering is Python's ValueError.
     let err = compile_err(
@@ -5288,6 +5399,47 @@ fn value_returning_main_gets_a_wrapper_entry_point() {
 }
 
 #[test]
+fn unittest_main_emits_a_test_runner() {
+    // issue #334: `unittest.main()` in a `__main__` block lowers to an
+    // emitted runner that constructs each *TestCase subclass and calls its
+    // test_* methods, counting failures (and raising AssertionError when
+    // any test fails) instead of the runtime's loud stub.
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "\n",
+            "class TestAdd(unittest.TestCase):\n",
+            "    def test_one_plus_one(self):\n",
+            "        self.assertEqual(1 + 1, 2)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+        "runner_test.py",
+    );
+    assert!(
+        out.contains("TestAdd :: new ()"),
+        "the runner must construct the TestCase: {}",
+        out
+    );
+    assert!(
+        out.contains("test_one_plus_one ()"),
+        "the runner must call the test method: {}",
+        out
+    );
+    assert!(
+        out.contains("__rython_ntest_failures"),
+        "the runner must count failures: {}",
+        out
+    );
+    assert!(
+        !out.contains("unittest :: main () ;"),
+        "unittest.main() must be replaced by the runner: {}",
+        out
+    );
+}
+
+#[test]
 fn integral_float_literals_keep_their_float_type() {
     // 2.0 must stay a float literal: Rust's Display drops the ".0" and the
     // re-parse would silently produce an integer (2.0 / 4 is 0.5 in
@@ -5295,6 +5447,118 @@ fn integral_float_literals_keep_their_float_type() {
     let out = compile("def f() -> float:\n    y = 2.0\n    return y\n", "flit.py");
     assert!(out.contains("y = 2.0"), "generated: {}", out);
     assert!(!out.contains("y = 2 ;"), "generated: {}", out);
+}
+
+#[test]
+fn non_finite_float_literals_lower_to_f64_expressions() {
+    // issue #372: `1e400` (-> inf) has no Rust float LITERAL form ("inf"
+    // is not a valid Rust literal, which used to panic Literal::parse). It
+    // must lower to the f64 EXPRESSION and type as f64, not a string.
+    let out = compile("def f():\n    x = 1e400\n    return x\n", "inf_lit.py");
+    assert!(out.contains("f64 :: INFINITY"), "generated: {}", out);
+    assert!(!out.contains("& 'static str"), "inf must not type as str: {}", out);
+    let out2 = compile("def g():\n    y = -1e400\n    return y\n", "ninf_lit.py");
+    assert!(out2.contains("- f64 :: INFINITY"), "generated: {}", out2);
+}
+
+#[test]
+fn complex_literals_render_as_complex_values() {
+    // `2j`, `3.5j` must lower to `Complex::new(re, im)` with f64 tokens
+    // (issue #366) — a plain (possibly quoted-string) fallback would be a
+    // silent divergence.
+    let out = compile("def f():\n    y = 2j\n    return y\n", "complex_lit.py");
+    assert!(out.contains("Complex :: new (0.0 , 2.0)"), "generated: {}", out);
+    assert!(!out.contains("Complex :: new (\""), "float tokens must not be quoted: {}", out);
+    let out2 = compile("def g():\n    z = 3.5j\n    return z\n", "complex_lit2.py");
+    assert!(out2.contains("Complex :: new (0.0 , 3.5)"), "generated: {}", out2);
+}
+
+#[test]
+fn test_runner_gate_decorators_convert_with_a_warning() {
+    // issue #371: `@skipUnless(...)`, `@unittest.skipIf(...)`,
+    // `@cpython_only`, `@test.support.requires_*` are test-RUNNER gates —
+    // consumed as no-ops so the definition converts, but LOUDLY (a -W
+    // definition warning), never silently ignored and never re-shaping.
+    let (_, w1) = compile_with_warnings(
+        "class T:\n    @skipUnless(hasattr(t, 'x'), 'msg')\n    def m(self):\n        return 1\n",
+        "gate_skip.py",
+    );
+    assert!(
+        w1.iter().any(|x| x.contains("test-runner gate decorator consumed as a no-op")),
+        "a skipUnless gate must warn ({} warnings)",
+        w1.len()
+    );
+
+    let (_, w2) = compile_with_warnings(
+        "import support\n@support.requires_docstrings\nclass C:\n    pass\n",
+        "gate_support.py",
+    );
+    assert!(
+        w2.iter().any(|x| x.contains("test-runner gate decorator")),
+        "a test.support gate must warn ({} warnings)",
+        w2.len()
+    );
+}
+
+#[test]
+fn chained_class_level_literal_constants_lower_per_target() {
+    // issue #367: a class-level CHAINED assignment (`tol = rel = 0` —
+    // statistics' NumericTestCase) must lower one associated const per
+    // target, not error as an unsupported class-body statement.
+    let out = compile(
+        "class C:\n    tol = rel = 0\n    def m(self):\n        return 1\n",
+        "chained_const.py",
+    );
+    assert!(out.contains("pub const tol : i64 = 0"), "generated: {}", out);
+    assert!(out.contains("pub const rel : i64 = 0"), "generated: {}", out);
+}
+
+#[test]
+fn method_alias_chain_is_a_loud_noop() {
+    // issue #367: `__ne__ = __lt__ = __eq__` (heapq's CmpErr) aliases
+    // comparison dunders rython does not wire onto user classes — consumed
+    // as a no-op WITH a warning, never a hard error and never silent.
+    let (out, warnings) = compile_with_warnings(
+        "class C:\n    def __eq__(self):\n        return 1\n    __ne__ = __lt__ = __eq__\n",
+        "method_alias.py",
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("method-alias chain")),
+        "must warn loudly: {}",
+        warnings.len()
+    );
+    let _ = out;
+}
+
+#[test]
+fn dynamic_call_base_is_a_loud_drop() {
+    // issue #367: `class Point(namedtuple('_Point', [...]))` — a base that
+    // is a CALL result rython cannot inherit from — lowers as if
+    // object-based WITH a warning (never a silent divergence, never a hard
+    // class-body error when the body doesn't depend on the base).
+    let (out, warnings) = compile_with_warnings(
+        "def nt(name, flds):\n    return 1\nclass Point(nt('_Point', ['x'])):\n    pass\n",
+        "dyn_base.py",
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("dynamic base")),
+        "must warn loudly: {}",
+        warnings.len()
+    );
+    let _ = out;
+
+    // A base NAME that does not resolve to a module class (a loop variable
+    // `class MyClass(T)` inside `for T in (...)`) is the same loud drop.
+    let (out2, warnings2) = compile_with_warnings(
+        "def f():\n    for T in (1, 2):\n        class MyClass(T):\n            pass\n",
+        "loopvar_base.py",
+    );
+    assert!(
+        warnings2.iter().any(|w| w.contains("does not resolve to a class")),
+        "must warn loudly: {}",
+        warnings2.len()
+    );
+    let _ = out2;
 }
 
 #[test]
@@ -5930,9 +6194,20 @@ fn map_filter_dispatch_on_the_function_arguments_shape() {
     let out = compile("ys = filter(None, [0, 1, 2])\n", "mf4.py");
     assert!(out.contains("filter_truthy ("), "generated: {}", out);
 
-    // list() with no argument has no inferable type: loud.
-    let err = compile_err("ys = list()\n", "mf5.py");
-    assert!(err.contains("iterable argument"), "error: {}", err);
+    // list() with no argument has no inferable type: like an untyped `[]`,
+    // it lowers to a boxed empty vector WITH a warning (issue #370) rather
+    // than a conversion error.
+    let (out, warnings) = compile_with_warnings("ys = list()\n", "mf5.py");
+    assert!(
+        warnings.iter().any(|w| w.contains("no inferable element type")),
+        "must warn loudly: {}",
+        warnings.len()
+    );
+    assert!(
+        out.contains("PyValue"),
+        "must lower to a boxed empty vector: {}",
+        out.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -6488,7 +6763,7 @@ fn stringio_and_csv_writer_lower_with_mut_borrows() {
     let out = compile(src, "csw1.py");
     assert!(out.contains("io :: StringIO ()"), "generated: {}", out);
     assert!(
-        out.contains("csv :: writer (& mut (buf))"),
+        out.contains("csv :: writer (& mut (buf) , \"\\r\\n\" . to_string () , false , None :: < u8 >)"),
         "generated: {}",
         out
     );
@@ -6519,6 +6794,108 @@ fn stringio_and_csv_writer_lower_with_mut_borrows() {
         out
     );
 }
+
+#[test]
+fn csv_writer_accepts_the_lineterminator_keyword() {
+    // issue #369: `csv.writer(f, lineterminator=X)` (and the default
+    // `\r\n`) lower to the 2-argument stdpython writer.
+    let out = compile(
+        concat!(
+            "import io\n",
+            "import csv\n",
+            "\n",
+            "def f() -> str:\n",
+            "    b = io.StringIO()\n",
+            "    w = csv.writer(b, lineterminator=\"\\n\")\n",
+            "    return b.getvalue()\n",
+        ),
+        "csw_lt.py",
+    );
+    assert!(
+        out.contains("csv :: writer (& mut (b) , (\"\\n\") . to_string () , false , None :: < u8 >)"),
+        "generated: {}",
+        out
+    );
+    let out2 = compile(
+        concat!(
+            "import io\n",
+            "import csv\n",
+            "\n",
+            "def f() -> str:\n",
+            "    b = io.StringIO()\n",
+            "    w = csv.writer(b)\n",
+            "    return b.getvalue()\n",
+        ),
+        "csw_default.py",
+    );
+    assert!(
+        out2.contains("\"\\r\\n\" . to_string ()"),
+        "the default lineterminator must be '\\r\\n': {}",
+        out2
+    );
+}
+
+#[test]
+fn csv_writer_accepts_quoting_and_escapechar() {
+    // issue #369: `csv.writer(f, quoting=csv.QUOTE_ALL, escapechar="\\")`
+    // lower the dialect seams through the 4-argument writer.
+    let out = compile(
+        concat!(
+            "import io\n",
+            "import csv\n",
+            "\n",
+            "def f() -> str:\n",
+            "    b = io.StringIO()\n",
+            "    w = csv.writer(b, quoting=csv.QUOTE_ALL, escapechar=\"\\\\\")\n",
+            "    return b.getvalue()\n",
+        ),
+        "csw_quote.py",
+    );
+    assert!(
+        out.contains("csv :: writer (& mut (b) , \"\\r\\n\" . to_string () , true , Some :: < u8 > ((\"\\\\\") . as_bytes () [0]))"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
+fn csv_reader_quote_none_routes_the_no_quote_flag() {
+    // issue #369: `csv.reader(f, quoting=csv.QUOTE_NONE)` lowers the
+    // no-quote flag (`true`) into the 3-argument reader; without an
+    // escapechar the escape seam is `None::<u8>`.
+    let out = compile(
+        "import csv\nrows = csv.reader([\"a,b\"], quoting=csv.QUOTE_NONE)\n",
+        "crd_nq.py",
+    );
+    assert!(
+        out.contains("reader (& (") && out.contains(" , true , None :: < u8 >)"),
+        "must thread the no-quote flag: {}",
+        out.len()
+    );
+}
+
+#[test]
+fn csv_reader_escapechar_wires_through_like_the_writer() {
+    // issue #369: `csv.reader(f, quoting=csv.QUOTE_NONE, escapechar="\\")` must
+    // no longer be a loud refusal — the runtime reader already honours the
+    // escapechar in QUOTE_NONE mode, so the reader threads it through the same
+    // `Option<u8>` code-point seam the writer uses, wrapped in `Some::<u8>`.
+    let out = compile(
+        concat!(
+            "import csv\n",
+            "rows = csv.reader([\"a\\\\b\"], quoting=csv.QUOTE_NONE, escapechar=\"\\\\\")\n",
+        ),
+        "crd_esc.py",
+    );
+    assert!(
+        out.contains("csv :: reader")
+            && out.contains("Some :: < u8 >")
+            && !out.contains("not supported yet"),
+        "must thread the reader escapechar via Some::<u8>: {:}",
+        out
+    );
+}
+
 
 // ---- functools.lru_cache / cache decorators ----
 
@@ -8964,6 +9341,21 @@ fn self_recursive_receiver_gets_a_pyadd_self_bound() {
 }
 
 #[test]
+fn recursion_base_under_ifexp_infers_concrete_int() {
+    // `return 1 + count_set_bits(n & n - 1) if n else 0`: the recursive
+    // arm's call sits on ONE branch of an if-expression, but the `else`
+    // base `0` still pins the recursion to i64. collect_non_self_returns
+    // used to drop the whole return because one branch recursed; it now
+    // expands into the non-recursive leaf branches. (test_math's
+    // count_set_bits.)
+    let out = compile(
+        "def count_set_bits(n):\n    return 1 + count_set_bits(n & n - 1) if n else 0\n",
+        "countsetbits.py",
+    );
+    assert!(out.contains("-> Result < i64 , PyException >"), "generated: {}", out);
+}
+
+#[test]
 fn definitionally_unsatisfiable_bounds_warn_but_convert() {
     // M5: `p.upper()` + `p.pop()` — no known type satisfies
     // PyStrOps + PyPop. A well-formed Python definition: it converts, with
@@ -9021,6 +9413,35 @@ fn join_on_a_string_literal_infers_a_string_return() {
         out
     );
     assert!(out.contains("B : AsRef < str >"), "generated: {}", out);
+}
+
+#[test]
+fn format_on_a_string_literal_local_infers_a_string_return() {
+    // `fmt.format(...)` where fmt is a String literal local returns an owned
+    // String — like the join arm, the concrete receiver's return is the
+    // method's String result. This closes the None|String union in test_math's
+    // ulp_abs_check (`return None` vs `return fmt.format(...)` -> Option<String>).
+    let out = compile(
+        concat!(
+            "def f(x):\n",
+            "    if x:\n",
+            "        return None\n",
+            "    else:\n",
+            "        fmt = \"hello {}\"\n",
+            "        return fmt.format(1)\n",
+        ),
+        "inf_fmt_union.py",
+    );
+    assert!(
+        out.contains("-> Result < Option < String > , PyException >"),
+        "the union must unify to Option<String>: {}",
+        out
+    );
+    assert!(
+        out.contains("return Ok (None)") && out.contains("format ! ("),
+        "the Option None/Some arms must construct correctly: {}",
+        out
+    );
 }
 
 #[test]

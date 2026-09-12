@@ -228,11 +228,24 @@ impl InferredSignature {
     }
 
     /// The `where A: ..., B: ...` clause, or empty when there are no bounds.
+    ///
+    /// A bound can be an EMPTY token stream — e.g. `ParamReq::Method` on an
+    /// unknown duck-typed member (`quote!()` at the ParamReq::Method arm)
+    /// emits no bound at all. Emitting it as-is would render `where , B:
+    /// Clone`, which is not valid Rust, so empty bounds are dropped here.
+    /// (They documented that no bound can be generated; contributing nothing
+    /// is the intended meaning, and dropping them cannot change semantics.)
     pub fn where_clause(&self) -> TokenStream {
-        if self.where_bounds.is_empty() {
+        // The dedupe below keeps the first of duplicate bounds; retain order.
+        let bounds: Vec<TokenStream> = self
+            .where_bounds
+            .iter()
+            .filter(|b| !b.to_string().trim().is_empty())
+            .map(|b| b.clone())
+            .collect();
+        if bounds.is_empty() {
             return TokenStream::new();
         }
-        let bounds = &self.where_bounds;
         quote!(where #(#bounds),*)
     }
 
@@ -1573,12 +1586,13 @@ fn return_type_of(
                     return Ok(quote!(stdpython::PyValue));
                 }
             }
-            // `"sep".join(...)` on a string literal (or a String/&str
-            // local) returns an owned String — the method table omits join
-            // (its bound needs a compound IntoIterator), but the concrete
-            // receiver's return is a plain String (issue #116).
+            // `"sep".join(...)` / `"fmt".format(...)` on a string literal (or
+            // a String/&str local) returns an owned String — the method table
+            // omits join (its bound needs a compound IntoIterator) and format,
+            // but the concrete receiver's return is a plain String (issues
+            // #116 / `fmt.format(...)` in test_math's ulp_abs_check).
             if let ExprType::Attribute(a) = c.func.as_ref()
-                && a.attr == "join"
+                && (a.attr == "join" || a.attr == "format")
                 && (matches!(
                     a.value.as_ref(),
                     ExprType::Constant(c)
@@ -2334,12 +2348,25 @@ fn collect_return_exprs(body: &[Statement], out: &mut Vec<ExprType>) {
 /// call (`regex_opt_inner(strings[1:], '(?:')` and BinOps around it —
 /// pygments' regexopt): only the recursion's concrete base returns. A
 /// return inside a nested def is not this function's.
+/// Push the non-recursive branches of a return expression into `out`.
+///
+/// A return may be a single expression with an `if`-expression that recurses
+/// on ONE branch only (`return 1 + count_set_bits(n & n - 1) if n else 0` —
+/// the base `0` carries the recursion's concrete type). Rather than drop the
+/// whole expression because some branch recurses, we expand it into its leaf
+/// branches (`collect_expr_branches` flattens nested IfExps) and push only
+/// the leaves that contain NO self-call. For a return with no recursion at
+/// all this is the identity — the branch set of a non-IfExp is itself.
 fn collect_non_self_returns(body: &[Statement], self_name: &str, out: &mut Vec<ExprType>) {
     walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
-        if let StatementType::Return(Some(e)) = &stmt.statement
-            && !expr_contains_call_to(&e.value, self_name)
-        {
-            out.push(e.value.clone());
+        if let StatementType::Return(Some(e)) = &stmt.statement {
+            let mut leaves: Vec<&ExprType> = Vec::new();
+            collect_expr_branches(&e.value, &mut leaves);
+            for leaf in leaves {
+                if !expr_contains_call_to(leaf, self_name) {
+                    out.push(leaf.clone());
+                }
+            }
         }
         Flow::Continue
     });

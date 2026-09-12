@@ -3296,6 +3296,17 @@ impl CodeGen for ClassDef {
                 // A metadata class decorator (`@functools.total_ordering` —
                 // pip's Link): no runtime effect in the lowered struct.
                 Some(crate::Decorator::Property) => {}
+                // A test-runner gate on the class (`@support.cpython_only`,
+                // `@skipUnless(...)`, ...): a no-op for the lowered class,
+                // but LOUD — a -W warning, never silently ignored.
+                Some(crate::Decorator::TestGate(_)) => {
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "test-runner gate decorator on a class consumed as a no-op \
+                         (the converted class body runs unconditionally; the \
+                         skip/mark/patch condition is a test-RUNNER directive that \
+                         rython does not model)"
+                    ));
+                }
                 Some(other) => {
                     return Err(format!(
                         "class `{}` uses the decorator `{}`, which is not supported \
@@ -3409,13 +3420,19 @@ impl CodeGen for ClassDef {
                 && !is_typing_base(b)
                 && !external_attr_base(b)
         }) {
-            return Err(format!(
-                "class `{}` inherits from a base rython cannot lower (only single \
-                 inheritance from classes defined in this module is supported); \
-                 restructure the class hierarchy (issue: the PyPI sweep)",
+            // A DYNAMIC base (a call result: `class Point(namedtuple('_Point',
+            // [...]))` — collections' test fixture; a call-producing base):
+            // rython cannot inherit from a runtime value. Per P9 the class
+            // lowers as if OBJECT-based (the base's methods/fields are not
+            // inherited) but it is LOUD — a -W warning — never a silently
+            // different class and never a hard class-body error when the
+            // body does not depend on the dynamic base.
+            options.definition_warnings.borrow_mut().push(format!(
+                "class `{}`: dynamic base (a call result) is dropped; the \
+                 class lowers as if object-based. If the class body reads \
+                 base methods/fields, pass them explicitly (issue #367)",
                 self.name
-            )
-            .into());
+            ));
         }
         // `object`, `Enum`/`IntEnum`/`Flag` (and `typing.NamedTuple`,
         // filtered above) are metadata, not structural bases: the class
@@ -3548,13 +3565,23 @@ impl CodeGen for ClassDef {
                     .into());
                 }
                 _ => {
-                    return Err(format!(
-                        "class `{}` inherits from `{}`, which is not a class defined \
-                         in this module; imported bases and built-in bases are not \
-                         supported yet",
+                    // A base Name that does NOT resolve to a class defined
+                    // in this module (a LOOP VARIABLE `class MyClass(T)`
+                    // inside `for T in (...)` — statistics; an unmodeled
+                    // user ot stdlib class): per P9 the class lowers as if
+                    // OBJECT-based (the inherited behavior is the documented
+                    // divergence) and a -W warning is emitted — never a
+                    // silently different class, never the hard class-body
+                    // error that would block a class whose body does not
+                    // depend on the dynamic base.
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "class `{}`: base `{}` does not resolve to a class \
+                         defined in this module (a loop variable or unmodeled \
+                         class); the class lowers as if object-based — inherited \
+                         behavior is not copied (issue #367)",
                         self.name, base_name,
-                    )
-                    .into());
+                    ));
+                    None
                 }
             },
         };
@@ -3582,19 +3609,57 @@ impl CodeGen for ClassDef {
         for stmt in self.body.iter().skip(body_start) {
             match &stmt.statement {
                 StatementType::FunctionDef(_) | StatementType::Pass => {}
-                // A class-level literal constant assignment (int/float/
-                // bool/string): an associated const, not a struct field.
+                // A class-level literal constant assignment (int/float/bool/string),
+// possibly CHAINED (`tol = rel = 0` — statistics' NumericTestCase):
+// an associated const per target, not a struct field.
+StatementType::Assign(a)
+    if let Some(ty) = crate::ast::tree::module::const_static_type(&a.value)
+        && a
+            .targets
+            .iter()
+            .all(|t| matches!(t, ExprType::Name(_))) =>
+{
+    for t in &a.targets {
+        let ExprType::Name(n) = t else {
+            continue;
+        };
+        let ident = crate::safe_ident(&n.id);
+        let value = a
+            .value
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        class_constants.extend(quote!(pub const #ident: #ty = #value;));
+    }
+}
+                // A class-level METHOD-ALIAS chain (`__ne__ = __lt__ = __eq__`
+                // — heapq's CmpErr): each target aliases a method defined in
+                // THIS class. rython does not wire Python's dunder-operator
+                // protocol onto user classes (comparison operators on user
+                // classes are not lowered), so these aliases have no OBSERVABLE
+                // runtime effect here — they are consumed as a no-op WITH a -W
+                // warning (the same loud-no-op the test-runner gates get),
+                // never silently dropped and never re-shaped.
                 StatementType::Assign(a)
-                    if a.targets.len() == 1
-                        && let ExprType::Name(n) = &a.targets[0]
-                        && let Some(ty) = crate::ast::tree::module::const_static_type(&a.value) =>
+                    if a
+                        .targets
+                        .iter()
+                        .all(|t| matches!(t, ExprType::Name(_)))
+                        && let ExprType::Name(valuename) = &a.value
+                        && self.methods().any(|m| m.name == valuename.id) =>
                 {
-                    let ident = crate::safe_ident(&n.id);
-                    let value = a
-                        .value
-                        .clone()
-                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    class_constants.extend(quote!(pub const #ident: #ty = #value;));
+                    let first_target = match a.targets.first() {
+                        Some(ExprType::Name(n)) => n.id.clone(),
+                        _ => String::new(),
+                    };
+                    options.definition_warnings.borrow_mut().push(format!(
+                        "class `{}`: method-alias chain binding `{}` to the \
+                         method `{}` aliases a comparison dunder rython does not \
+                         wire onto user classes (no observable effect); the \
+                         aliases are dropped (documented divergence)",
+                        self.name,
+                        first_target,
+                        valuename.id,
+                    ));
                 }
                 // A class-level COMPUTED constant: single-store name
                 // assigned a non-literal value (frozenset/dict/list/set
