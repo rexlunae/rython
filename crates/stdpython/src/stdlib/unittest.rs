@@ -10,7 +10,6 @@
 //! LOUD error (never a silent pass): a test module whose `unittest.main()`
 //! is not yet lowered by codegen must not pretend its tests ran.
 use crate::PyException;
-use alloc::string::String;
 
 pub fn main() -> Result<(), PyException> {
     Err(PyException::new(

@@ -133,7 +133,7 @@ impl Decorator {
 /// modules in rython's model (not `StdModule` variants), so any decorator
 /// bound to one is a gate regardless of the attribute name.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum TestGate {
+pub enum TestGate {
     /// `@skip`, `@skipIf(...)`, `@skipUnless(...)` (and `@unittest.*`).
     Skip,
     /// `@expectedFailure`, `@expectedFailureIf(...)`.
