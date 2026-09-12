@@ -60,18 +60,16 @@ exit 1), and the fixture order matches CPython
 because the codegen recurses once per nested call and Rust's 2 MiB default
 test-thread stack was tight (the CLI's 8 MiB main thread was always fine).
 
-**Assert-argument limit (correct-or-loud):** the lowering only fires when
-every asserted argument is unambiguously boxable (int/float/bool/str/bytes/
-PyValue/None). A **container** argument (list/tuple/set/dict) keeps the
-pre-existing loud drop, because `PyValue::from` maps `Vec<u8>` to `Bytes` —
-a list would be silently boxed as bytes or fail to compile. A list-aware
-boxing (list → `PyValue::Tuple`, the documented list-as-tuple divergence) is
-the follow-up that lifts this.
+**Assert-argument boxing:** a **list** argument (`Vec<i64>`, `Vec<String>`,
+…) boxes through `unittest::list_to_pyvalue` as `PyValue::Tuple` (the
+documented list-as-tuple divergence); scalars and `bytes` use
+`PyValue::from`. Only an argument whose element type does not convert into
+`PyValue` (a nested list, tuple/set/dict/option/class) keeps the loud drop —
+never a silently wrong comparison.
 
-**Still open:** list/container boxing (above), `assertIs`/`assertGreater`/
-`assertLess`/`assertAlmostEqual`, `assertRaises`/`subTest` (context
-managers), transitive `TestCase` subclasses, and the stdlib-stub emission
-below.
+**Still open:** `assertIs`/`assertGreater`/`assertLess`/`assertAlmostEqual`,
+`assertRaises`/`subTest` (context managers), transitive `TestCase`
+subclasses, and the stdlib-stub emission below.
 
 Verified on `test_operator` (`cargo build` in its generated crate):
 
