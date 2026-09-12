@@ -181,10 +181,13 @@ fn lower_unittest_assert(
     options: crate::PythonOptions,
     symbols: crate::SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-    let helper = match method {
-        "assertEqual" => "assert_eq",
-        "assertTrue" => "assert_true",
-        "assertFalse" => "assert_false",
+    let (helper, two_arg) = match method {
+        "assertEqual" => ("assert_eq", true),
+        "assertNotEqual" => ("assert_not_eq", true),
+        "assertTrue" => ("assert_true", false),
+        "assertFalse" => ("assert_false", false),
+        "assertIsNone" => ("assert_is_none", false),
+        "assertIsNotNone" => ("assert_is_not_none", false),
         _ => unreachable!(),
     };
     let helper_ident = quote::format_ident!("{}", helper);
@@ -199,7 +202,7 @@ fn lower_unittest_assert(
         }
         None => quote!("".to_string()),
     };
-    if method == "assertEqual" {
+    if two_arg {
         let a = {
             let r = call.args[0].clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             quote!(PyValue::from(#r))
@@ -9047,8 +9050,11 @@ let mutating_self_field = boxed_self_ref_receiver
         // and the recursive deep-nesting conversions keep their stack budget.
         if let ExprType::Attribute(attr) = self.func.as_ref()
             && (attr.attr == "assertEqual"
+                || attr.attr == "assertNotEqual"
                 || attr.attr == "assertTrue"
-                || attr.attr == "assertFalse")
+                || attr.attr == "assertFalse"
+                || attr.attr == "assertIsNone"
+                || attr.attr == "assertIsNotNone")
         {
             return lower_unittest_assert(
                 self.clone(),

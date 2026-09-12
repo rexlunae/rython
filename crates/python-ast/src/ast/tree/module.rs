@@ -6254,10 +6254,25 @@ fn emit_test_runner(
     let mut stmts = TokenStream::new();
     for c in test_classes {
         let cname = quote::format_ident!("{}", c.name);
+        // `setUp`/`tearDown` are per-test fixtures (CPython runs setUp before
+        // and tearDown after every test method). Emit them only when the
+        // class defines them; a fixture error is threaded with `?` — loud,
+        // never silently skipped.
+        let setup = if class_defines_method(c, "setUp") {
+            quote!(__rython_tc.setUp()?;)
+        } else {
+            quote!()
+        };
+        let teardown = if class_defines_method(c, "tearDown") {
+            quote!(__rython_tc.tearDown()?;)
+        } else {
+            quote!()
+        };
         for m in test_method_names(c) {
             let mident = quote::format_ident!("{}", m);
             stmts.extend(quote! {
-                let __rython_tc = #cname::new()?;
+                let mut __rython_tc = #cname::new()?;
+                #setup
                 match __rython_tc.#mident() {
                     Ok(__rython_v) => __rython_v,
                     Err(__rython_e) => {
@@ -6265,6 +6280,7 @@ fn emit_test_runner(
                         __rython_ntest_failures += 1;
                     }
                 };
+                #teardown
             });
         }
     }
@@ -6277,6 +6293,18 @@ fn emit_test_runner(
                 format!("{__rython_ntest_failures} test(s) failed"),
             ));
         }
+    })
+}
+
+/// Whether the class defines a method with this exact name in its own body
+/// (`setUp`/`tearDown` — the per-test fixtures the runner calls).
+fn class_defines_method(class_def: &crate::ClassDef, name: &str) -> bool {
+    class_def.body.iter().any(|s| {
+        matches!(
+            &s.statement,
+            crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f)
+                if f.name == name
+        )
     })
 }
 

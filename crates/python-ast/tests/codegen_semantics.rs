@@ -5409,6 +5409,10 @@ fn unittest_main_emits_a_test_runner() {
             "import unittest\n",
             "\n",
             "class TestAdd(unittest.TestCase):\n",
+            "    def setUp(self):\n",
+            "        pass\n",
+            "    def tearDown(self):\n",
+            "        pass\n",
             "    def test_one_plus_one(self):\n",
             "        self.assertEqual(1 + 1, 2)\n",
             "\n",
@@ -5433,6 +5437,11 @@ fn unittest_main_emits_a_test_runner() {
         out
     );
     assert!(
+        out.contains(". setUp ()") && out.contains(". tearDown ()"),
+        "the runner must call the per-test fixtures: {}",
+        out
+    );
+    assert!(
         !out.contains("unittest :: main () ;"),
         "unittest.main() must be replaced by the runner: {}",
         out
@@ -5453,8 +5462,11 @@ fn unittest_asserts_lower_to_runtime_assert_helpers() {
             "class T(unittest.TestCase):\n",
             "    def t(self):\n",
             "        self.assertEqual(1 + 1, 2)\n",
+            "        self.assertNotEqual(1, 2)\n",
             "        self.assertTrue(True)\n",
             "        self.assertFalse(False)\n",
+            "        self.assertIsNone(None)\n",
+            "        self.assertIsNotNone(5)\n",
         ),
         "assert_ok.py",
     );
@@ -5464,8 +5476,16 @@ fn unittest_asserts_lower_to_runtime_assert_helpers() {
         out
     );
     assert!(
-        out.contains("unittest :: assert_true (") && out.contains("unittest :: assert_false ("),
-        "assertTrue/assertFalse must lower: {}",
+        out.contains("unittest :: assert_not_eq (")
+            && out.contains("unittest :: assert_true (")
+            && out.contains("unittest :: assert_false ("),
+        "assertNotEqual/assertTrue/assertFalse must lower: {}",
+        out
+    );
+    assert!(
+        out.contains("unittest :: assert_is_none (")
+            && out.contains("unittest :: assert_is_not_none ("),
+        "assertIsNone/assertIsNotNone must lower: {}",
         out
     );
     assert!(

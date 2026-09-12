@@ -55,6 +55,44 @@ pub fn assert_false(x: &PyValue, ctx: alloc::string::String) -> Result<(), PyExc
     }
 }
 
+/// `self.assertNotEqual(a, b)` — raise AssertionError when they ARE equal.
+pub fn assert_not_eq(a: &PyValue, b: &PyValue, ctx: alloc::string::String) -> Result<(), PyException> {
+    if !crate::py_value_eq(a, b) {
+        Ok(())
+    } else if ctx.is_empty() {
+        assertion_failed(format!("{} == {}", crate::py_display(a), crate::py_display(b)))
+    } else {
+        assertion_failed(format!(
+            "{}: {} == {}",
+            ctx,
+            crate::py_display(a),
+            crate::py_display(b)
+        ))
+    }
+}
+
+/// `self.assertIsNone(x)` — raise AssertionError when x is not None.
+pub fn assert_is_none(x: &PyValue, ctx: alloc::string::String) -> Result<(), PyException> {
+    if crate::PyIsNone::py_is_none(x) {
+        Ok(())
+    } else if ctx.is_empty() {
+        assertion_failed(format!("{} is not None", crate::py_display(x)))
+    } else {
+        assertion_failed(format!("{}: {} is not None", ctx, crate::py_display(x)))
+    }
+}
+
+/// `self.assertIsNotNone(x)` — raise AssertionError when x is None.
+pub fn assert_is_not_none(x: &PyValue, ctx: alloc::string::String) -> Result<(), PyException> {
+    if !crate::PyIsNone::py_is_none(x) {
+        Ok(())
+    } else if ctx.is_empty() {
+        assertion_failed("unexpectedly None".to_string())
+    } else {
+        assertion_failed(format!("{ctx}: unexpectedly None"))
+    }
+}
+
 pub fn main() -> Result<(), PyException> {
     Err(PyException::new(
         "NotImplementedError",
