@@ -8,6 +8,44 @@ use crate::{
     SymbolTableScopes, extract_list, WithItem,
 };
 
+/// The exception NAME of a `self.assertRaises(Exc)` context manager — the
+/// `with self.assertRaises(Exc):` form (issue #334). None when the shape is
+/// not that CM or the exception is not a statically-known name (a tuple of
+/// exceptions, or a dynamic `self.failureException`).
+fn assert_raises_cm_name(expr: &ExprType) -> Option<String> {
+    let ExprType::Call(c) = expr else {
+        return None;
+    };
+    let ExprType::Attribute(a) = c.func.as_ref() else {
+        return None;
+    };
+    if a.attr != "assertRaises" || c.args.len() != 1 {
+        return None;
+    }
+    match &c.args[0] {
+        ExprType::Name(n) => Some(n.id.clone()),
+        ExprType::Attribute(ea) => Some(ea.attr.clone()),
+        _ => None,
+    }
+}
+
+/// Whether a `with` body contains a `return`/`break`/`continue` that would
+/// have to escape the closure the assertRaises lowering wraps it in.
+fn body_escapes_a_closure(body: &[Statement]) -> bool {
+    crate::ast::tree::visit::any_stmt(
+        body,
+        crate::ast::tree::visit::Descend::SkipDefs,
+        |s| {
+            matches!(
+                s.statement,
+                crate::StatementType::Return(_)
+                    | crate::StatementType::Break
+                    | crate::StatementType::Continue
+            )
+        },
+    )
+}
+
 /// Whether a with-item's context expression is a threading synchronization
 /// object (Lock/RLock/Semaphore) — constructed inline
 /// (`with threading.Lock():`), a name assigned from such a construction,
@@ -126,6 +164,35 @@ impl CodeGen for With {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // `with self.assertRaises(Exc):` — the unittest context-manager form
+        // (issue #334). The body runs inside a closure whose `Result` is
+        // asserted to have raised `Exc` (matching `assert_raises`): a raised
+        // `Exc` passes, no raise is an AssertionError, a different exception
+        // propagates. A body with `return`/`break`/`continue` would have to
+        // escape the closure, so that shape keeps the plain (loud-drop)
+        // lowering instead.
+        if self.items.len() == 1
+            && self.items[0].optional_vars.is_none()
+            && !body_escapes_a_closure(&self.body)
+            && let Some(exc) = assert_raises_cm_name(&self.items[0].context_expr)
+        {
+            let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
+                .body
+                .iter()
+                .map(|stmt| {
+                    stmt.clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                })
+                .collect();
+            let body_tokens = body_tokens?;
+            let exc_lit = quote!(#exc);
+            return Ok(quote! {
+                unittest::assert_raises(#exc_lit, || -> Result<(), PyException> {
+                    #(#body_tokens;)*
+                    Ok(())
+                })?;
+            });
+        }
         // Evaluate each context manager and bind its `as` target (or a
         // throwaway binding when there is none, so side effects still run).
         // The general __enter__/__exit__ protocol is not modeled yet

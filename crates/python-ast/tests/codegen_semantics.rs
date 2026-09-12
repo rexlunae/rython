@@ -5609,6 +5609,48 @@ fn unittest_assert_raises_context_manager_form_stays_a_loud_drop() {
 }
 
 #[test]
+fn unittest_assert_raises_with_statement_lowers() {
+    // `with self.assertRaises(Exc): body` lowers the body into a closure
+    // whose Result is asserted to have raised Exc.
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        with self.assertRaises(ValueError):\n",
+            "            int(\"x\")\n",
+        ),
+        "assert_raises_with.py",
+    );
+    assert!(
+        out.contains("assert_raises (\"ValueError\""),
+        "the with-form must lower with the exception name: {}",
+        out
+    );
+}
+
+#[test]
+fn unittest_assert_raises_with_a_returning_body_stays_a_loud_drop() {
+    // A body whose `return` would have to escape the closure cannot use the
+    // closure lowering — it keeps the plain (loud-drop) with lowering.
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        with self.assertRaises(ValueError):\n",
+            "            return\n",
+        ),
+        "assert_raises_with_ret.py",
+    );
+    assert!(
+        !out.contains("assert_raises ("),
+        "a returning body must not use the closure lowering: {}",
+        out
+    );
+}
+
+#[test]
 fn integral_float_literals_keep_their_float_type() {
     // 2.0 must stay a float literal: Rust's Display drops the ".0" and the
     // re-parse would silently produce an integer (2.0 / 4 is 0.5 in
