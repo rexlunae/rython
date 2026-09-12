@@ -28,6 +28,26 @@ fn assertion_failed(msg: alloc::string::String) -> Result<(), PyException> {
     Err(PyException::new("AssertionError", msg))
 }
 
+/// `self.assertRaises(Exc, fn, *args)` — CPython's callable form: run
+/// `fn(*args)` and assert it raised `expected`. The closure returns the
+/// callee's `Result`, so a raising call is an `Err` whose type must match.
+pub fn assert_raises<T, F>(expected: &str, run: F) -> Result<(), PyException>
+where
+    F: FnOnce() -> Result<T, PyException>,
+{
+    match run() {
+        Err(e) if e.matches(expected) => Ok(()),
+        // A DIFFERENT exception propagates, exactly as CPython lets it out of
+        // assertRaises (the test then errors rather than failing an
+        // assertion) — the unexpected exception surfaces, not a rewrite.
+        Err(e) => Err(e),
+        Ok(_) => Err(PyException::new(
+            "AssertionError",
+            format!("{expected} not raised"),
+        )),
+    }
+}
+
 /// `self.assertEqual(a, b)` — raise AssertionError when the two values are
 /// not equal under CPython's `==` (including int/float/bool cross-type).
 pub fn assert_eq(a: &PyValue, b: &PyValue, ctx: alloc::string::String) -> Result<(), PyException> {

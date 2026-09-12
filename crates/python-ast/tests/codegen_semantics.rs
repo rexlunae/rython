@@ -5557,6 +5557,58 @@ fn unittest_assert_with_an_unboxable_argument_stays_a_loud_drop() {
 }
 
 #[test]
+fn unittest_assert_raises_callable_form_lowers() {
+    // CPython's callable form `self.assertRaises(Exc, fn, *args)` lowers to
+    // `unittest::assert_raises("Exc", || fn(args))` — the callee's trailing
+    // `?` is stripped so the closure returns the `Result` the helper
+    // inspects.
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        self.assertRaises(ValueError, int, \"x\")\n",
+        ),
+        "assert_raises.py",
+    );
+    assert!(
+        out.contains("assert_raises (\"ValueError\""),
+        "the callable form must lower with the exception name: {}",
+        out
+    );
+    assert!(
+        !out.contains("int (\"x\") ?"),
+        "the callee's trailing ? must be stripped inside the closure: {}",
+        out
+    );
+}
+
+#[test]
+fn unittest_assert_raises_context_manager_form_stays_a_loud_drop() {
+    // `self.assertRaises(Exc)` with a single argument is the context-manager
+    // form — not a call statement — so it keeps the loud drop.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        self.assertRaises(ValueError)\n",
+        ),
+        "assert_raises_cm.py",
+    );
+    assert!(
+        !out.contains("assert_raises ("),
+        "the context-manager form must not lower as the callable form: {}",
+        out
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("dropped")),
+        "the drop must be loud through -W: {:?}",
+        warnings
+    );
+}
+
+#[test]
 fn integral_float_literals_keep_their_float_type() {
     // 2.0 must stay a float literal: Rust's Display drops the ".0" and the
     // re-parse would silently produce an integer (2.0 / 4 is 0.5 in

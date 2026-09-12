@@ -262,6 +262,60 @@ fn lower_unittest_assert(
     }
 }
 
+/// Lower CPython's CALLABLE form of `self.assertRaises(Exc, fn, *args)`:
+/// `unittest::assert_raises("Exc", || fn(args))?`. Returns `None` (leaving
+/// the pre-existing loud drop) for the context-manager form (a single
+/// argument), a non-name exception specifier (a tuple / dynamic value), or
+/// a non-callable second argument.
+#[inline(never)]
+fn lower_assert_raises(
+    call: crate::Call,
+    ctx: crate::CodeGenContext,
+    options: crate::PythonOptions,
+    symbols: crate::SymbolTableScopes,
+) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+    // `self.assertRaises(Exc, fn, *args)`: at least the exception and the
+    // callable. The `with self.assertRaises(Exc):` form passes only the
+    // exception and is not a call statement — drop it.
+    if call.args.len() < 2 {
+        return Ok(None);
+    }
+    // The expected exception's NAME must be statically known. A bare
+    // `TypeError` or a dotted `unittest.SkipTest` yield a name; a tuple of
+    // exceptions or a dynamic `self.failureException` do not (drop).
+    let exc_name = match &call.args[0] {
+        crate::ExprType::Name(n) => n.id.clone(),
+        crate::ExprType::Attribute(a) => a.attr.clone(),
+        _ => return Ok(None),
+    };
+    // The callable and its arguments become the invoked call. Keywords other
+    // than `msg=` belong to the callee (CPython forwards **kwds to it).
+    let inner = crate::Call {
+        func: Box::new(call.args[1].clone()),
+        args: call.args[2..].to_vec(),
+        keywords: call
+            .keywords
+            .iter()
+            .filter(|k| k.arg.as_deref() != Some("msg"))
+            .cloned()
+            .collect(),
+    };
+    let rendered = inner.to_rust(ctx, options, symbols)?;
+    // The callee lowers with a trailing `?` (it returns `Result`), which
+    // unwraps the value — but `assert_raises` needs the `Result` itself, to
+    // inspect the raised exception. Strip the `?`; an infallible callee
+    // (rendered without one) is wrapped in `Ok` so the closure returns a
+    // `Result` either way.
+    let stripped = strip_trailing_question(&rendered);
+    let body = if stripped.to_string() != rendered.to_string() {
+        stripped
+    } else {
+        quote!(Ok(#rendered))
+    };
+    let exc = quote!(#exc_name);
+    Ok(Some(quote!(unittest::assert_raises(#exc, || #body)?)))
+}
+
 /// A Name resolving (through ImportFrom re-export chains) to a module-level
 /// LITERAL constant (`DEFAULT_POOLSIZE = 10` — requests/adapters, used as a
 /// dropped DEFAULT in sessions.py's `HTTPAdapter()` call): render the
@@ -9111,6 +9165,21 @@ let mutating_self_field = boxed_self_ref_receiver
             // Argument type not unambiguously boxable: fall through to the
             // callable-as-value drop below (a loud -W warning), never a
             // silently wrong comparison.
+        }
+
+        // CPython's callable form of `self.assertRaises(Exc, fn, *args)`.
+        // Returns None for the context-manager form / non-name exception,
+        // which then hits the drop below.
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && attr.attr == "assertRaises"
+            && let Some(tokens) = lower_assert_raises(
+                self.clone(),
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )?
+        {
+            return Ok(tokens);
         }
 
         // A call through a SELF member that is neither a method nor a
