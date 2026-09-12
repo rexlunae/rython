@@ -46,22 +46,32 @@ runner raises `AssertionError: <n> test(s) failed` (exit 1). Verified:
 a minimal test module with a *raising* or erroring test fails loudly and
 exits 1; a passing one exits 0.
 
-**Assertions landed (`b4a3849`, `e7a61dd`):** `self.assertEqual`,
-`assertNotEqual`, `assertTrue`, `assertFalse`, `assertIsNone`,
-`assertIsNotNone` now lower to runtime `unittest::assert_*` helpers, which
-box the arguments and raise `AssertionError` on failure — no longer a silent
-drop to `None`. The emitted runner also calls `setUp()`/`tearDown()` around
-every `test_*` method when the class defines them. Verified end-to-end: a
-two-test module prints exactly CPython's `setup / test_a / teardown / setup /
-test_b / teardown`, reports the same single failure (`AssertionError: 1 == 1`),
-and exits 1. The call-site rendering is `#[inline(never)]`, and
-`.cargo/config.toml` sets `RUST_MIN_STACK` (32 MiB) because the codegen
-recurses once per nested call and Rust's 2 MiB default test-thread stack was
-tight (the CLI's 8 MiB main thread was always fine).
+**Assertions landed (`b4a3849`, `e7a61dd`, `f3253b1`):** `self.assertEqual`,
+`assertNotEqual`, `assertIn`, `assertNotIn`, `assertTrue`, `assertFalse`,
+`assertIsNone`, `assertIsNotNone` now lower to runtime `unittest::assert_*`
+helpers, which box the arguments and raise `AssertionError` on failure — no
+longer a silent drop to `None`. The emitted runner also calls
+`setUp()`/`tearDown()` around every `test_*` method when the class defines
+them. Verified end-to-end: a scalar-asserting module reports CPython's exact
+failures (`AssertionError: 2 != 3`, `AssertionError: z not found in abc`,
+exit 1), and the fixture order matches CPython
+(`setup / test_a / teardown / …`). The call-site rendering is
+`#[inline(never)]`, and `.cargo/config.toml` sets `RUST_MIN_STACK` (32 MiB)
+because the codegen recurses once per nested call and Rust's 2 MiB default
+test-thread stack was tight (the CLI's 8 MiB main thread was always fine).
 
-**Still open:** `assertIn`/`assertIs`/`assertGreater`/`assertLess`,
-`assertRaises`/`subTest` (context managers), transitive `TestCase`
-subclasses, and the stdlib-stub emission below.
+**Assert-argument limit (correct-or-loud):** the lowering only fires when
+every asserted argument is unambiguously boxable (int/float/bool/str/bytes/
+PyValue/None). A **container** argument (list/tuple/set/dict) keeps the
+pre-existing loud drop, because `PyValue::from` maps `Vec<u8>` to `Bytes` —
+a list would be silently boxed as bytes or fail to compile. A list-aware
+boxing (list → `PyValue::Tuple`, the documented list-as-tuple divergence) is
+the follow-up that lifts this.
+
+**Still open:** list/container boxing (above), `assertIs`/`assertGreater`/
+`assertLess`/`assertAlmostEqual`, `assertRaises`/`subTest` (context
+managers), transitive `TestCase` subclasses, and the stdlib-stub emission
+below.
 
 Verified on `test_operator` (`cargo build` in its generated crate):
 
