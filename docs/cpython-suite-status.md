@@ -46,16 +46,17 @@ runner raises `AssertionError: <n> test(s) failed` (exit 1). Verified:
 a minimal test module with a *raising* or erroring test fails loudly and
 exits 1; a passing one exits 0.
 
-**Assertions landed (`b4a3849`, `e7a61dd`, `f3253b1`):** `self.assertEqual`,
-`assertNotEqual`, `assertIn`, `assertNotIn`, `assertTrue`, `assertFalse`,
-`assertIsNone`, `assertIsNotNone` now lower to runtime `unittest::assert_*`
-helpers, which box the arguments and raise `AssertionError` on failure — no
-longer a silent drop to `None`. The emitted runner also calls
-`setUp()`/`tearDown()` around every `test_*` method when the class defines
-them. Verified end-to-end: a scalar-asserting module reports CPython's exact
-failures (`AssertionError: 2 != 3`, `AssertionError: z not found in abc`,
-exit 1), and the fixture order matches CPython
-(`setup / test_a / teardown / …`). The call-site rendering is
+**Assertions landed (`b4a3849`, `e7a61dd`, `f3253b1`, `fea6a8c`):**
+`self.assertEqual`, `assertNotEqual`, `assertIn`, `assertNotIn`,
+`assertTrue`, `assertFalse`, `assertIsNone`, `assertIsNotNone` lower to
+runtime `unittest::assert_*` helpers, and the **callable form** of
+`assertRaises(Exc, fn, *args)` lowers to `unittest::assert_raises` (a
+matching raise passes; no raise is an `AssertionError`; a different
+exception propagates, as CPython lets it out). The emitted runner also
+calls `setUp()`/`tearDown()` around every `test_*` method when the class
+defines them. Verified end-to-end (scalar/list asserts and `assertRaises`
+all match CPython's failure count and messages modulo the documented
+list-as-tuple display; fixture order matches). The call-site rendering is
 `#[inline(never)]`, and `.cargo/config.toml` sets `RUST_MIN_STACK` (32 MiB)
 because the codegen recurses once per nested call and Rust's 2 MiB default
 test-thread stack was tight (the CLI's 8 MiB main thread was always fine).
@@ -68,8 +69,9 @@ documented list-as-tuple divergence); scalars and `bytes` use
 never a silently wrong comparison.
 
 **Still open:** `assertIs`/`assertGreater`/`assertLess`/`assertAlmostEqual`,
-`assertRaises`/`subTest` (context managers), transitive `TestCase`
-subclasses, and the stdlib-stub emission below.
+`assertRaisesRegex`, the `with self.assertRaises(Exc):` context-manager form
+and `subTest`, transitive `TestCase` subclasses, and the stdlib-stub
+emission below.
 
 Verified on `test_operator` (`cargo build` in its generated crate):
 
