@@ -5467,6 +5467,8 @@ fn unittest_asserts_lower_to_runtime_assert_helpers() {
             "        self.assertFalse(False)\n",
             "        self.assertIsNone(None)\n",
             "        self.assertIsNotNone(5)\n",
+            "        self.assertIn(\"b\", \"abc\")\n",
+            "        self.assertNotIn(\"z\", \"abc\")\n",
         ),
         "assert_ok.py",
     );
@@ -5489,9 +5491,41 @@ fn unittest_asserts_lower_to_runtime_assert_helpers() {
         out
     );
     assert!(
+        out.contains("unittest :: assert_in (") && out.contains("unittest :: assert_not_in ("),
+        "assertIn/assertNotIn must lower: {}",
+        out
+    );
+    assert!(
         !out.contains("is neither a method nor a field"),
         "unittest asserts must not drop: {}",
         out
+    );
+}
+
+#[test]
+fn unittest_assert_with_a_container_argument_stays_a_loud_drop() {
+    // A list argument has no unambiguous `PyValue` conversion — `PyValue::from`
+    // maps `Vec<u8>` to `Bytes`, and a Python list (`Vec<i64>`) has no `From`
+    // at all — so the assert keeps the pre-existing loud callable-as-value
+    // drop rather than silently boxing the list as bytes (correct-or-loud).
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        self.assertEqual([1, 2], [1, 2])\n",
+        ),
+        "assert_list.py",
+    );
+    assert!(
+        !out.contains("unittest :: assert_eq ("),
+        "a list argument must not be boxed via PyValue::from: {}",
+        out
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("dropped")),
+        "the drop must be loud through -W: {:?}",
+        warnings
     );
 }
 

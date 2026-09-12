@@ -93,6 +93,56 @@ pub fn assert_is_not_none(x: &PyValue, ctx: alloc::string::String) -> Result<(),
     }
 }
 
+/// `self.assertIn(member, container)` — raise AssertionError when the
+/// container does not contain the member (CPython `member in container`).
+pub fn assert_in(
+    member: &PyValue,
+    container: &PyValue,
+    ctx: alloc::string::String,
+) -> Result<(), PyException> {
+    if crate::PyContains::py_contains(container, member) {
+        Ok(())
+    } else if ctx.is_empty() {
+        assertion_failed(format!(
+            "{} not found in {}",
+            crate::py_display(member),
+            crate::py_display(container)
+        ))
+    } else {
+        assertion_failed(format!(
+            "{}: {} not found in {}",
+            ctx,
+            crate::py_display(member),
+            crate::py_display(container)
+        ))
+    }
+}
+
+/// `self.assertNotIn(member, container)` — raise AssertionError when the
+/// container DOES contain the member.
+pub fn assert_not_in(
+    member: &PyValue,
+    container: &PyValue,
+    ctx: alloc::string::String,
+) -> Result<(), PyException> {
+    if !crate::PyContains::py_contains(container, member) {
+        Ok(())
+    } else if ctx.is_empty() {
+        assertion_failed(format!(
+            "{} unexpectedly found in {}",
+            crate::py_display(member),
+            crate::py_display(container)
+        ))
+    } else {
+        assertion_failed(format!(
+            "{}: {} unexpectedly found in {}",
+            ctx,
+            crate::py_display(member),
+            crate::py_display(container)
+        ))
+    }
+}
+
 pub fn main() -> Result<(), PyException> {
     Err(PyException::new(
         "NotImplementedError",

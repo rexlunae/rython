@@ -180,16 +180,50 @@ fn lower_unittest_assert(
     ctx: crate::CodeGenContext,
     options: crate::PythonOptions,
     symbols: crate::SymbolTableScopes,
-) -> Result<TokenStream, Box<dyn std::error::Error>> {
+) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
     let (helper, two_arg) = match method {
         "assertEqual" => ("assert_eq", true),
         "assertNotEqual" => ("assert_not_eq", true),
+        "assertIn" => ("assert_in", true),
+        "assertNotIn" => ("assert_not_in", true),
         "assertTrue" => ("assert_true", false),
         "assertFalse" => ("assert_false", false),
         "assertIsNone" => ("assert_is_none", false),
         "assertIsNotNone" => ("assert_is_not_none", false),
         _ => unreachable!(),
     };
+    let nargs = if two_arg { 2 } else { 1 };
+    // Only lower when every asserted argument has an UNAMBIGUOUS `PyValue`
+    // conversion. `PyValue::from` maps `Vec<u8>` to `Bytes`; a Python LIST
+    // (`Vec<i64>`/`Vec<String>`/…) has no `From`, so the compiler would
+    // either pick `Vec<u8>` (silently boxing a list as bytes) or fail to
+    // compile. Containers (and tuples/options/classes) therefore keep the
+    // pre-existing loud drop (the callable-as-value warning) rather than a
+    // silently wrong comparison — correct-or-loud until a list-aware boxing
+    // exists.
+    for arg in call.args.iter().take(nargs) {
+        // A bare `None` lowers to `PyValue::None_`, which boxes reflexively:
+        // always safe. The parser yields `Constant(None)` for a literal
+        // `None` and `NoneType` for synthesized ones — accept both.
+        if matches!(arg, crate::ExprType::NoneType(_))
+            || matches!(arg, crate::ExprType::Constant(c) if c.0.is_none())
+        {
+            continue;
+        }
+        let t = crate::infer_type(Some(&ctx), arg, &options, &symbols);
+        if !matches!(
+            t,
+            crate::TypeInfo::Int
+                | crate::TypeInfo::Float
+                | crate::TypeInfo::Bool
+                | crate::TypeInfo::StrRef
+                | crate::TypeInfo::String
+                | crate::TypeInfo::Bytes
+                | crate::TypeInfo::PyValue
+        ) {
+            return Ok(None);
+        }
+    }
     let helper_ident = quote::format_ident!("{}", helper);
     // The msg= context (a String), or an empty string when absent.
     let msg = match call
@@ -211,13 +245,13 @@ fn lower_unittest_assert(
             let r = call.args[1].clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             quote!(PyValue::from(#r))
         };
-        Ok(quote!(unittest::#helper_ident(&#a, &#b, #msg)?))
+        Ok(Some(quote!(unittest::#helper_ident(&#a, &#b, #msg)?)))
     } else {
         let x = {
             let r = call.args[0].clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
             quote!(PyValue::from(#r))
         };
-        Ok(quote!(unittest::#helper_ident(&#x, #msg)?))
+        Ok(Some(quote!(unittest::#helper_ident(&#x, #msg)?)))
     }
 }
 
@@ -9051,18 +9085,25 @@ let mutating_self_field = boxed_self_ref_receiver
         if let ExprType::Attribute(attr) = self.func.as_ref()
             && (attr.attr == "assertEqual"
                 || attr.attr == "assertNotEqual"
+                || attr.attr == "assertIn"
+                || attr.attr == "assertNotIn"
                 || attr.attr == "assertTrue"
                 || attr.attr == "assertFalse"
                 || attr.attr == "assertIsNone"
                 || attr.attr == "assertIsNotNone")
         {
-            return lower_unittest_assert(
+            if let Some(tokens) = lower_unittest_assert(
                 self.clone(),
                 &attr.attr,
                 ctx.clone(),
                 options.clone(),
                 symbols.clone(),
-            );
+            )? {
+                return Ok(tokens);
+            }
+            // Argument type not unambiguously boxable: fall through to the
+            // callable-as-value drop below (a loud -W warning), never a
+            // silently wrong comparison.
         }
 
         // A call through a SELF member that is neither a method nor a
