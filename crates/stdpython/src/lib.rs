@@ -7249,7 +7249,12 @@ impl PyDiv<Complex> for Complex {
 }
 
 /// `abs(complex)`: the Euclidean modulus `sqrt(re^2 + im^2)`, an `f64` —
-/// CPython returns a real `float`, not a `complex`.
+/// CPython returns a real `float`, not a `complex`. std-gated: `f64::sqrt`
+/// (the Euclidean modulus) needs libm's float intrinsics, which only exist
+/// on the std tier — the alloc tier (`--no-default-features --features
+/// alloc`, CI's nostd job) has no `f64::sqrt`. `abs(complex)` is therefore
+/// absent on the alloc tier, exactly like `math.sqrt`.
+#[cfg(feature = "std")]
 impl PyAbs for Complex {
     type Output = f64;
     fn py_abs(self) -> f64 {
