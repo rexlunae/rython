@@ -11,6 +11,18 @@
 //! is not yet lowered by codegen must not pretend its tests ran.
 use crate::{PyException, PyValue, Truthy};
 
+/// Box a lowered Python LIST (`Vec<T>`) as `PyValue::Tuple` — the boxed
+/// model's documented list-as-tuple divergence — for the assert helpers.
+///
+/// Distinct from `PyValue::from`, which maps `Vec<u8>` to `Bytes` (a list of
+/// small ints would be silently boxed as bytes). Codegen emits this only for
+/// `Vec<T>` arguments whose element type converts into `PyValue`.
+pub fn list_to_pyvalue<T: Into<PyValue>>(items: alloc::vec::Vec<T>) -> PyValue {
+    PyValue::Tuple(alloc::sync::Arc::new(
+        items.into_iter().map(Into::into).collect(),
+    ))
+}
+
 /// A failed `assertX` — a CPython `AssertionError`.
 fn assertion_failed(msg: alloc::string::String) -> Result<(), PyException> {
     Err(PyException::new("AssertionError", msg))

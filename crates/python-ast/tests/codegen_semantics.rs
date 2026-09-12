@@ -5503,23 +5503,50 @@ fn unittest_asserts_lower_to_runtime_assert_helpers() {
 }
 
 #[test]
-fn unittest_assert_with_a_container_argument_stays_a_loud_drop() {
-    // A list argument has no unambiguous `PyValue` conversion — `PyValue::from`
-    // maps `Vec<u8>` to `Bytes`, and a Python list (`Vec<i64>`) has no `From`
-    // at all — so the assert keeps the pre-existing loud callable-as-value
-    // drop rather than silently boxing the list as bytes (correct-or-loud).
-    let (out, warnings) = compile_with_warnings(
+fn unittest_assert_on_a_list_boxes_via_list_to_pyvalue() {
+    // A list argument (`Vec<i64>`/`Vec<String>`) boxes through
+    // `unittest::list_to_pyvalue` (list -> PyValue::Tuple, the documented
+    // list-as-tuple divergence) — NOT `PyValue::from`, which would map the
+    // `Vec<u8>` impl and silently box the list as bytes.
+    let out = compile(
         concat!(
             "import unittest\n",
             "class T(unittest.TestCase):\n",
             "    def t(self):\n",
             "        self.assertEqual([1, 2], [1, 2])\n",
+            "        self.assertIn(\"b\", [\"a\", \"b\"])\n",
         ),
         "assert_list.py",
     );
     assert!(
+        out.contains("unittest :: list_to_pyvalue (") && out.contains("unittest :: assert_eq ("),
+        "a list argument must box via list_to_pyvalue: {}",
+        out
+    );
+    assert!(
+        !out.contains("PyValue :: from (vec !"),
+        "the list must not be boxed via PyValue::from: {}",
+        out
+    );
+}
+
+#[test]
+fn unittest_assert_with_an_unboxable_argument_stays_a_loud_drop() {
+    // A NESTED list (`Vec<Vec<i64>>`) has an element type that does not
+    // convert into `PyValue`, so the assert keeps the pre-existing loud
+    // callable-as-value drop rather than failing to compile or boxing wrong.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        self.assertEqual([[1], [2]], [[1], [2]])\n",
+        ),
+        "assert_nested.py",
+    );
+    assert!(
         !out.contains("unittest :: assert_eq ("),
-        "a list argument must not be boxed via PyValue::from: {}",
+        "an unboxable nested list must not lower: {}",
         out
     );
     assert!(

@@ -193,36 +193,52 @@ fn lower_unittest_assert(
         _ => unreachable!(),
     };
     let nargs = if two_arg { 2 } else { 1 };
-    // Only lower when every asserted argument has an UNAMBIGUOUS `PyValue`
-    // conversion. `PyValue::from` maps `Vec<u8>` to `Bytes`; a Python LIST
-    // (`Vec<i64>`/`Vec<String>`/…) has no `From`, so the compiler would
-    // either pick `Vec<u8>` (silently boxing a list as bytes) or fail to
-    // compile. Containers (and tuples/options/classes) therefore keep the
-    // pre-existing loud drop (the callable-as-value warning) rather than a
-    // silently wrong comparison — correct-or-loud until a list-aware boxing
-    // exists.
+    // Box each asserted argument. `PyValue::from` is right for the scalar
+    // shapes, but it maps `Vec<u8>` to `Bytes` — a Python LIST (`Vec<i64>`,
+    // `Vec<String>`, …) must go through `unittest::list_to_pyvalue`
+    // (list → `PyValue::Tuple`, the documented list-as-tuple divergence).
+    // Any argument whose type is neither a boxable scalar nor a list of
+    // them (a tuple/set/dict/option/class/nested list) keeps the
+    // pre-existing loud drop — never a silently wrong comparison.
+    let mut rendered: Vec<TokenStream> = Vec::new();
     for arg in call.args.iter().take(nargs) {
-        // A bare `None` lowers to `PyValue::None_`, which boxes reflexively:
-        // always safe. The parser yields `Constant(None)` for a literal
-        // `None` and `NoneType` for synthesized ones — accept both.
+        let r = arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        // A bare `None` lowers to `PyValue::None_`, which boxes reflexively.
+        // The parser yields `Constant(None)` for a literal `None` and
+        // `NoneType` for synthesized ones — accept both.
         if matches!(arg, crate::ExprType::NoneType(_))
             || matches!(arg, crate::ExprType::Constant(c) if c.0.is_none())
         {
+            rendered.push(quote!(PyValue::from(#r)));
             continue;
         }
-        let t = crate::infer_type(Some(&ctx), arg, &options, &symbols);
-        if !matches!(
-            t,
+        let boxed = match crate::infer_type(Some(&ctx), arg, &options, &symbols) {
+            // A list: box as a tuple of boxed elements. Only when the element
+            // itself converts into `PyValue` (a nested list does not, yet).
+            crate::TypeInfo::Vec(inner)
+                if matches!(
+                    *inner,
+                    crate::TypeInfo::Int
+                        | crate::TypeInfo::Float
+                        | crate::TypeInfo::Bool
+                        | crate::TypeInfo::StrRef
+                        | crate::TypeInfo::String
+                        | crate::TypeInfo::Bytes
+                        | crate::TypeInfo::PyValue
+                ) =>
+            {
+                quote!(unittest::list_to_pyvalue(#r))
+            }
             crate::TypeInfo::Int
-                | crate::TypeInfo::Float
-                | crate::TypeInfo::Bool
-                | crate::TypeInfo::StrRef
-                | crate::TypeInfo::String
-                | crate::TypeInfo::Bytes
-                | crate::TypeInfo::PyValue
-        ) {
-            return Ok(None);
-        }
+            | crate::TypeInfo::Float
+            | crate::TypeInfo::Bool
+            | crate::TypeInfo::StrRef
+            | crate::TypeInfo::String
+            | crate::TypeInfo::Bytes
+            | crate::TypeInfo::PyValue => quote!(PyValue::from(#r)),
+            _ => return Ok(None),
+        };
+        rendered.push(boxed);
     }
     let helper_ident = quote::format_ident!("{}", helper);
     // The msg= context (a String), or an empty string when absent.
@@ -237,20 +253,11 @@ fn lower_unittest_assert(
         None => quote!("".to_string()),
     };
     if two_arg {
-        let a = {
-            let r = call.args[0].clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            quote!(PyValue::from(#r))
-        };
-        let b = {
-            let r = call.args[1].clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            quote!(PyValue::from(#r))
-        };
+        let a = &rendered[0];
+        let b = &rendered[1];
         Ok(Some(quote!(unittest::#helper_ident(&#a, &#b, #msg)?)))
     } else {
-        let x = {
-            let r = call.args[0].clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-            quote!(PyValue::from(#r))
-        };
+        let x = &rendered[0];
         Ok(Some(quote!(unittest::#helper_ident(&#x, #msg)?)))
     }
 }
