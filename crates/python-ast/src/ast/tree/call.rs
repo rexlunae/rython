@@ -163,6 +163,61 @@ pub(crate) fn strip_trailing_question(tokens: &proc_macro2::TokenStream) -> proc
     tokens.clone()
 }
 
+/// Lower a `self.assertEqual(a, b)` / `self.assertTrue(x)` /
+/// `self.assertFalse(x)` call to the runtime unittest::assert_* helpers
+/// (issue #334): box the arguments and call the stdpython helper, which
+/// raises AssertionError on failure.
+///
+/// `#[inline(never)]` is load-bearing: `Call::to_rust` recurses once per
+/// nested call, so its own stack FRAME size bounds the total depth. If this
+/// rendering were inlined into that match, every recursive frame would grow
+/// and deeply-nested conversions (`len(list(takewhile(lambda, reversed(it))))`)
+/// would overflow the codegen stack (the round-17 hazard).
+#[inline(never)]
+fn lower_unittest_assert(
+    call: crate::Call,
+    method: &str,
+    ctx: crate::CodeGenContext,
+    options: crate::PythonOptions,
+    symbols: crate::SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    let helper = match method {
+        "assertEqual" => "assert_eq",
+        "assertTrue" => "assert_true",
+        "assertFalse" => "assert_false",
+        _ => unreachable!(),
+    };
+    let helper_ident = quote::format_ident!("{}", helper);
+    // The msg= context (a String), or an empty string when absent.
+    let msg = match call
+        .keywords
+        .iter()
+        .find(|k| k.arg.as_deref() == Some("msg")) {
+        Some(k) => {
+            let r = k.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            quote!(#r.to_string())
+        }
+        None => quote!("".to_string()),
+    };
+    if method == "assertEqual" {
+        let a = {
+            let r = call.args[0].clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            quote!(PyValue::from(#r))
+        };
+        let b = {
+            let r = call.args[1].clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            quote!(PyValue::from(#r))
+        };
+        Ok(quote!(unittest::#helper_ident(&#a, &#b, #msg)?))
+    } else {
+        let x = {
+            let r = call.args[0].clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            quote!(PyValue::from(#r))
+        };
+        Ok(quote!(unittest::#helper_ident(&#x, #msg)?))
+    }
+}
+
 /// A Name resolving (through ImportFrom re-export chains) to a module-level
 /// LITERAL constant (`DEFAULT_POOLSIZE = 10` — requests/adapters, used as a
 /// dropped DEFAULT in sessions.py's `HTTPAdapter()` call): render the
@@ -8980,6 +9035,28 @@ let mutating_self_field = boxed_self_ref_receiver
                 callee_name.id
             ));
             return Ok(quote!(stdpython::PyValue::None_));
+        }
+
+        // A unittest assertion on a receiver (`self.assertEqual(a, b)`,
+        // `self.assertTrue(x)`, `self.assertFalse(x)`): the members are
+        // inherited from `unittest.TestCase` — not methods/fields of the
+        // receiver's class — so they otherwise hit the callable-as-value
+        // drop below. Lower them to the runtime assert helpers instead
+        // (issue #334). The rendering lives in `lower_unittest_assert`
+        // (`#[inline(never)]`) so `Call::to_rust`'s own frame does not grow
+        // and the recursive deep-nesting conversions keep their stack budget.
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && (attr.attr == "assertEqual"
+                || attr.attr == "assertTrue"
+                || attr.attr == "assertFalse")
+        {
+            return lower_unittest_assert(
+                self.clone(),
+                &attr.attr,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            );
         }
 
         // A call through a SELF member that is neither a method nor a

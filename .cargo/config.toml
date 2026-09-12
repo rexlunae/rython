@@ -1,0 +1,13 @@
+# Codegen recurses once per nested call expression. A deeply-nested call
+# (`len(list(takewhile(lambda x: x > 0, reversed(items))))` — the idiom in
+# the codegen tests) needs more stack than Rust's 2 MiB default for
+# test-harness threads. The `rypip`/`rythonc` CLIs run codegen on the main
+# thread (8 MiB on Linux/macOS) and are unaffected; only `cargo test`'s
+# threaded harness was tight enough to overflow once an arm was added to
+# `Call::to_rust`. rustc bumps its own stack for exactly this reason.
+#
+# `[env]` entries do not override a value already present in the
+# environment (cargo's default `force = false`), so an explicit
+# `RUST_MIN_STACK=…` on the command line still wins.
+[env]
+RUST_MIN_STACK = "33554432"

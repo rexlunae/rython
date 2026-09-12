@@ -5440,6 +5440,42 @@ fn unittest_main_emits_a_test_runner() {
 }
 
 #[test]
+fn unittest_asserts_lower_to_runtime_assert_helpers() {
+    // issue #334: `self.assertEqual(a, b)` / `self.assertTrue(x)` /
+    // `self.assertFalse(x)` are inherited TestCase members — not methods or
+    // fields of the concrete class — so they used to be a loud drop to
+    // None. They now lower to the runtime unittest::assert_* helpers, so the
+    // generated test method performs a REAL check (raising AssertionError on
+    // mismatch) that the runner records.
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        self.assertEqual(1 + 1, 2)\n",
+            "        self.assertTrue(True)\n",
+            "        self.assertFalse(False)\n",
+        ),
+        "assert_ok.py",
+    );
+    assert!(
+        out.contains("unittest :: assert_eq (") && out.contains("PyValue :: from"),
+        "assertEqual must box and call assert_eq: {}",
+        out
+    );
+    assert!(
+        out.contains("unittest :: assert_true (") && out.contains("unittest :: assert_false ("),
+        "assertTrue/assertFalse must lower: {}",
+        out
+    );
+    assert!(
+        !out.contains("is neither a method nor a field"),
+        "unittest asserts must not drop: {}",
+        out
+    );
+}
+
+#[test]
 fn integral_float_literals_keep_their_float_type() {
     // 2.0 must stay a float literal: Rust's Display drops the ".0" and the
     // re-parse would silently produce an integer (2.0 / 4 is 0.5 in
