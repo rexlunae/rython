@@ -5754,6 +5754,37 @@ fn unittest_assert_is_instance_with_a_tuple_specifier_stays_a_loud_drop() {
 }
 
 #[test]
+fn unittest_assert_order_comparisons_lower() {
+    // `self.assertGreater/assertGreaterEqual/assertLess/assertLessEqual` lower
+    // to their runtime order helpers (2 boxed args + msg).
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        self.assertGreater(2, 1)\n",
+            "        self.assertGreaterEqual(2, 2)\n",
+            "        self.assertLess(1, 2)\n",
+            "        self.assertLessEqual(1, 1)\n",
+        ),
+        "assert_order.py",
+    );
+    assert!(
+        out.contains("unittest :: assert_greater (")
+            && out.contains("unittest :: assert_greater_equal (")
+            && out.contains("unittest :: assert_less (")
+            && out.contains("unittest :: assert_less_equal ("),
+        "assertGreater/Less family must lower: {}",
+        out
+    );
+    assert!(
+        !out.contains("is neither a method nor a field"),
+        "assert order comparisons must not drop: {}",
+        out
+    );
+}
+
+#[test]
 fn unittest_assert_almost_equal_lowers() {
     // `self.assertAlmostEqual(a, b [, places= | delta=] [, msg=])` lowers to
     // the runtime helper with `places` as an i64 and `delta` boxed into an

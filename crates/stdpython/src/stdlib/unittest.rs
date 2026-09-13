@@ -419,6 +419,125 @@ fn round_to_places(x: f64, places: i64) -> f64 {
     (x * scale).round()
 }
 
+/// CPython's `==`/`<`/etc. use the value protocol; for the boxed subset we
+/// support NUMERIC ordering (int/float/bool, which compare across the numeric
+/// tower like CPython) and STRING ordering (lexicographic). Anything else is
+/// incomparable — return `None` and let the caller fail loudly rather than
+/// guess.
+///
+/// Returns -1 / 0 / +1 for `a < b` / `a == b` / `a > b`, or `None` when the
+/// two boxed values are not comparable in the subset.
+fn py_boxed_cmp(a: &PyValue, b: &PyValue) -> Option<i64> {
+    let af = as_f64(a);
+    let bf = as_f64(b);
+    if let (Some(af), Some(bf)) = (af, bf) {
+        return if af < bf {
+            Some(-1)
+        } else if af > bf {
+            Some(1)
+        } else {
+            Some(0)
+        };
+    }
+    // String ordering (lexicographic by code point, like CPython str `<`).
+    if let (Some(sa), Some(sb)) = (a.as_str(), b.as_str()) {
+        return if sa < sb {
+            Some(-1)
+        } else if sa > sb {
+            Some(1)
+        } else {
+            Some(0)
+        };
+    }
+    None
+}
+
+/// One of `assertGreater`/`assertGreaterEqual`/`assertLess`/`assertLessEqual`.
+/// `verdict(a, b)` returns whether the ord compare is a PASS. Neither the
+/// comparands nor the boxed comparison are silently guessed: an incomparable
+/// pair (mixed number/str, etc.) is a LOUD failure.
+fn assert_ord(
+    a: &PyValue,
+    b: &PyValue,
+    kind: &str,
+    ctx: alloc::string::String,
+) -> Result<(), PyException> {
+    let pass = match py_boxed_cmp(a, b) {
+        Some(c) => match kind {
+            "assertGreater" => c > 0,
+            "assertGreaterEqual" => c >= 0,
+            "assertLess" => c < 0,
+            "assertLessEqual" => c <= 0,
+            _ => unreachable!(),
+        },
+        None => false,
+    };
+    // The CPython message shape: `{a!r} not {op} {b!r}` (the `!r` is the boxed
+    // display; the ordering phrase embeds the second operand).
+    let phrase = format!(
+        "not {} {}",
+        match kind {
+            "assertGreater" => "greater than",
+            "assertGreaterEqual" => "greater than or equal to",
+            "assertLess" => "less than",
+            "assertLessEqual" => "less than or equal to",
+            _ => unreachable!(),
+        },
+        crate::py_display(b)
+    );
+    if pass {
+        Ok(())
+    } else if py_boxed_cmp(a, b).is_none() {
+        // Incomparable operands: loud, never a silent wrong comparison.
+        assertion_failed(format!(
+            "{}: cannot order {} and {}",
+            kind,
+            crate::py_display(a),
+            crate::py_display(b)
+        ))
+    } else if ctx.is_empty() {
+        assertion_failed(format!("{} {}", crate::py_display(a), phrase))
+    } else {
+        assertion_failed(format!("{}: {} {}", ctx, crate::py_display(a), phrase))
+    }
+}
+
+/// `self.assertGreater(a, b)` — AssertionError unless `a > b`.
+pub fn assert_greater(
+    a: &PyValue,
+    b: &PyValue,
+    ctx: alloc::string::String,
+) -> Result<(), PyException> {
+    assert_ord(a, b, "assertGreater", ctx)
+}
+
+/// `self.assertGreaterEqual(a, b)` — AssertionError unless `a >= b`.
+pub fn assert_greater_equal(
+    a: &PyValue,
+    b: &PyValue,
+    ctx: alloc::string::String,
+) -> Result<(), PyException> {
+    assert_ord(a, b, "assertGreaterEqual", ctx)
+}
+
+/// `self.assertLess(a, b)` — AssertionError unless `a < b`.
+pub fn assert_less(
+    a: &PyValue,
+    b: &PyValue,
+    ctx: alloc::string::String,
+) -> Result<(), PyException> {
+    assert_ord(a, b, "assertLess", ctx)
+}
+
+/// `self.assertLessEqual(a, b)` — AssertionError unless `a <= b`.
+pub fn assert_less_equal(
+    a: &PyValue,
+    b: &PyValue,
+    ctx: alloc::string::String,
+) -> Result<(), PyException> {
+    assert_ord(a, b, "assertLessEqual", ctx)
+}
+
 pub fn main() -> Result<(), PyException> {
     Err(PyException::new(
         "NotImplementedError",

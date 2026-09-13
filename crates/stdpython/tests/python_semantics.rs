@@ -4430,3 +4430,65 @@ fn unittest_assert_almost_eq_matches_cpython() {
         .err()
         .unwrap();
 }
+
+#[test]
+fn unittest_assert_order_comparisons_match_cpython() {
+    // Verified against CPython 3.14.1 (`assertGreater`/`assertGreaterEqual`/
+    // `assertLess`/`assertLessEqual`) for int/float/bool numeric ordering and
+    // str lexicographic ordering.
+    use stdpython::stdlib::unittest::{
+        assert_greater,
+        assert_greater_equal,
+        assert_less,
+        assert_less_equal,
+    };
+    use stdpython::PyValue;
+
+    assert_greater(&PyValue::from(2i64), &PyValue::from(1i64), "".to_string()).unwrap();
+    assert_greater(&PyValue::from(2.5), &PyValue::from(2), "".to_string()).unwrap();
+    // bool orders numerically (CPython: 2 > True, since True == 1).
+    assert_greater(&PyValue::from(2i64), &PyValue::from(true), "".to_string()).unwrap();
+    assert_greater_equal(&PyValue::from(2i64), &PyValue::from(2i64), "".to_string()).unwrap();
+    assert_less(&PyValue::from(1i64), &PyValue::from(2i64), "".to_string()).unwrap();
+    assert_less(&PyValue::from("a".to_string()), &PyValue::from("b".to_string()), "".to_string())
+        .unwrap();
+    assert_less_equal(&PyValue::from(1i64), &PyValue::from(1i64), "".to_string()).unwrap();
+
+    // Failures carry the ordering phrase.
+    assert_eq!(
+        assert_greater(&PyValue::from(1i64), &PyValue::from(2i64), "".to_string())
+            .err()
+            .unwrap()
+            .message,
+        "1 not greater than 2"
+    );
+    assert_eq!(
+        assert_greater_equal(&PyValue::from(1i64), &PyValue::from(2i64), "".to_string())
+            .err()
+            .unwrap()
+            .message,
+        "1 not greater than or equal to 2"
+    );
+    assert_eq!(
+        assert_less(&PyValue::from(2i64), &PyValue::from(1i64), "".to_string())
+            .err()
+            .unwrap()
+            .message,
+        "2 not less than 1"
+    );
+    // The msg= context prefixes the message.
+    assert_eq!(
+        assert_less_equal(&PyValue::from(2i64), &PyValue::from(1i64), "ctx".to_string())
+            .err()
+            .unwrap()
+            .message,
+        "ctx: 2 not less than or equal to 1"
+    );
+    // Incomparable operands fail loudly rather than silently guessing.
+    assert!(
+        assert_greater(&PyValue::from("a".to_string()), &PyValue::from(1i64), "".to_string())
+            .err()
+            .unwrap()
+            .matches("AssertionError")
+    );
+}

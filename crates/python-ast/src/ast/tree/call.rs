@@ -237,6 +237,10 @@ fn lower_unittest_assert(
         "assertFalse" => ("assert_false", false),
         "assertIsNone" => ("assert_is_none", false),
         "assertIsNotNone" => ("assert_is_not_none", false),
+        "assertGreater" => ("assert_greater", true),
+        "assertGreaterEqual" => ("assert_greater_equal", true),
+        "assertLess" => ("assert_less", true),
+        "assertLessEqual" => ("assert_less_equal", true),
         _ => unreachable!(),
     };
     let nargs = if two_arg { 2 } else { 1 };
@@ -9283,7 +9287,11 @@ let mutating_self_field = boxed_self_ref_receiver
                 || attr.attr == "assertTrue"
                 || attr.attr == "assertFalse"
                 || attr.attr == "assertIsNone"
-                || attr.attr == "assertIsNotNone")
+                || attr.attr == "assertIsNotNone"
+                || attr.attr == "assertGreater"
+                || attr.attr == "assertGreaterEqual"
+                || attr.attr == "assertLess"
+                || attr.attr == "assertLessEqual")
         {
             if let Some(tokens) = lower_unittest_assert(
                 self.clone(),
