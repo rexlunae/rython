@@ -219,11 +219,17 @@ negative-test data / `assertRaises(TypeError, op, x, y)` inputs).
   lowers through the runtime `str<T: PyToString>` (Complex implements
   PyToString) — `def f(): a = 1j; t = str(a); return 1j` is `Result<String>`,
   builds with 0 errors, and runs to `1j` (matches CPython).
-- **Still open (one item):** a function returning a TUPLE containing a complex
-  member collapses to `Result<()>` — the tuple-return element-type unification
-  (the signature-typing path) does not yet resolve complex members, nor
-  operator-result returns (`return a + b`), nor `abs`/`.conjugate()` returns;
-  so complex *arithmetic* in return/assignment-to-return position still cannot
-  leave a function's signature. Also `Complex` is not yet a `PyValue` member,
-  so `self.assertEqual(z, w)` with complex operands still drops (the boxed
-  assert cannot hold a complex). These are separate rounds.
+- **Complex RETURNS now infer their true type** (PR: "type complex
+  operator/conjugate/abs RETURNS correctly"): `operand_is_complex` (a
+  complex literal / Complex local / binop of complex operands) drives
+  `inferred_return_type` so `return a + b`, `return a * 2j`, `return a / b`
+  (complex), `return (1+2j).conjugate()` → `Result<Complex>`, and
+  `return abs(3j)` → `Result<f64>`. Verified end-to-end against CPython:
+  `(3j, (-2+0j), (0.5+0j), (1-2j), 3.0)` build and run byte-identical.
+  Pin: `complex_return_types_infer_complex` (now covers binop/conjugate/abs).
+- **Still open:** (1) a complex *binop→local* then TUPLE-return
+  (`z = a+2j; return (z, 5)`) collapses to `Result<()>`, because
+  `collect_local_types` does not propagate the complex type through a complex
+  binop into the new local's entry; (2) `Complex` is not yet a `PyValue`
+  member, so `self.assertEqual(z, w)` with complex operands still loud-drops.
+  Both are follow-on rounds.
