@@ -372,6 +372,82 @@ fn lower_assert_is_instance(
     }
 }
 
+/// `self.assertAlmostEqual(a, b, places=7, delta=None, msg=None)` (and the
+/// `assertNotAlmostEqual` negation): lower to the runtime helper. Both operand
+/// args are boxed (`box_assert_argument`); a non-boxable operand keeps the
+/// loud drop. `places` is an i64 expression (default 7); `delta` is boxed as
+/// an `Option<PyValue>` (runtime coerces it to float).
+#[inline(never)]
+fn lower_assert_almost(
+    call: crate::Call,
+    negate: bool,
+    ctx: crate::CodeGenContext,
+    options: crate::PythonOptions,
+    symbols: crate::SymbolTableScopes,
+) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+    if call.args.len() != 2 {
+        return Ok(None);
+    }
+    let mut rendered: Vec<TokenStream> = Vec::new();
+    for arg in call.args.iter() {
+        if let Some(boxed) = box_assert_argument(
+            arg,
+            ctx.clone(),
+            options.clone(),
+            symbols.clone(),
+        )? {
+            rendered.push(boxed);
+        } else {
+            return Ok(None);
+        }
+    }
+    // `places=` (i64, default 7) and `delta=` (boxed PyValue, default None).
+    // Unknown keywords (other than msg=) are not lowered.
+    let mut places = quote!(7i64);
+    let mut delta = quote!(None::<PyValue>);
+    for k in call.keywords.iter() {
+        let name = k.arg.as_deref();
+        if name == Some("places") {
+            let v = k.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            places = quote!(#v);
+        } else if name == Some("delta") {
+            if let Some(boxed) = box_assert_argument(
+                &k.value,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )? {
+                delta = quote!(Some::<PyValue>(#boxed));
+            } else {
+                return Ok(None);
+            }
+        } else if name != Some("msg") {
+            // Unknown keyword (e.g. a dynamic msg) — not lowered.
+            return Ok(None);
+        }
+    }
+    // `msg=` context (a String), empty when absent.
+    let msg = match call
+        .keywords
+        .iter()
+        .find(|k| k.arg.as_deref() == Some("msg")) {
+        Some(k) => {
+            let v = k.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            quote!(#v.to_string())
+        }
+        None => quote!("".to_string()),
+    };
+    let helper = if negate {
+        "assert_not_almost_eq"
+    } else {
+        "assert_almost_eq"
+    };
+    let helper_ident = quote::format_ident!("{}", helper);
+    let a = &rendered[0];
+    let b = &rendered[1];
+    Ok(Some(quote!(unittest::#helper_ident(&#a, &#b, #places, &#delta, #msg)?)))
+}
+
 /// A Name resolving (through ImportFrom re-export chains) to a module-level
 /// LITERAL constant (`DEFAULT_POOLSIZE = 10` — requests/adapters, used as a
 /// dropped DEFAULT in sessions.py's `HTTPAdapter()` call): render the
@@ -9245,6 +9321,25 @@ let mutating_self_field = boxed_self_ref_receiver
         {
             let negate = attr.attr == "assertNotIsInstance";
             if let Some(tokens) = lower_assert_is_instance(
+                self.clone(),
+                negate,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )?
+            {
+                return Ok(tokens);
+            }
+        }
+
+        // `self.assertAlmostEqual(a, b, places=, delta=, msg=)` and the
+        // `assertNotAlmostEqual` negation. Returns None (the loud drop) for a
+        // non-boxable operand / delta or an unknown keyword.
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && (attr.attr == "assertAlmostEqual" || attr.attr == "assertNotAlmostEqual")
+        {
+            let negate = attr.attr == "assertNotAlmostEqual";
+            if let Some(tokens) = lower_assert_almost(
                 self.clone(),
                 negate,
                 ctx.clone(),

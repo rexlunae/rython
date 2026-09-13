@@ -246,6 +246,179 @@ pub fn assert_not_is_instance(
     }
 }
 
+/// `self.assertAlmostEqual(a, b, places=7, delta=None)`. Raise AssertionError
+/// when the two numeric values differ. Semantics follow CPython:
+///  - equal values (float `==`) always pass;
+///  - with `delta` given, pass when `abs(a - b) <= delta`;
+///  - else pass when `round(abs(a - b), places) == 0` (places default 7).
+/// Values that are not numeric are a loud failure, never a silent pass.
+pub fn assert_almost_eq(
+    a: &PyValue,
+    b: &PyValue,
+    places: i64,
+    delta: &Option<PyValue>,
+    ctx: alloc::string::String,
+) -> Result<(), PyException> {
+    // The operands and the delta must all be numeric; any writer that passes
+    // a non-number gets a LOUD failure, never a silent wrong result.
+    let af = as_f64(a);
+    let bf = as_f64(b);
+    if let (Some(af), Some(bf)) = (af, bf) {
+        // Resolve the boxed delta (if any) to an `Option<f64>`.
+        let mut df: Option<f64> = None;
+        if let Some(dv) = delta {
+            df = as_f64(dv);
+            if df.is_none() {
+                return assertion_failed(format!(
+                    "assertAlmostEqual: delta must be a number, got {}",
+                    crate::py_display(dv)
+                ));
+            }
+        }
+        if af == bf {
+            Ok(())
+        } else {
+            let diff = (af - bf).abs();
+            let ok = match df {
+                Some(d) => diff <= d,
+                None => round_to_places(diff, places) == 0.0,
+            };
+            if ok {
+                Ok(())
+            } else {
+                let detail = match df {
+                    Some(d) => format!("within {} delta", crate::py_float_repr(d)),
+                    None => format!("within {} places", places),
+                };
+                if ctx.is_empty() {
+                    assertion_failed(format!(
+                        "{} != {} {detail}",
+                        crate::py_display(a),
+                        crate::py_display(b)
+                    ))
+                } else {
+                    assertion_failed(format!(
+                        "{}: {} != {} {detail}",
+                        ctx,
+                        crate::py_display(a),
+                        crate::py_display(b)
+                    ))
+                }
+            }
+        }
+    } else {
+        assertion_failed(format!(
+            "assertAlmostEqual: operands must be numbers, got {} and {}",
+            crate::py_display(a),
+            crate::py_display(b)
+        ))
+    }
+}
+
+/// `self.assertNotAlmostEqual(a, b, places=7, delta=None)` — the negation of
+/// `assert_almost_eq`: fails when the values ARE within tolerance.
+pub fn assert_not_almost_eq(
+    a: &PyValue,
+    b: &PyValue,
+    places: i64,
+    delta: &Option<PyValue>,
+    ctx: alloc::string::String,
+) -> Result<(), PyException> {
+    // Compute whether they are within tolerance; the helper's pass condition
+    // is preserved here so the two stay in lockstep.
+    let af = as_f64(a);
+    let bf = as_f64(b);
+    if let (Some(af), Some(bf)) = (af, bf) {
+        // Resolve the boxed delta (if any) to an `Option<f64>`; a non-numeric
+        // delta is a LOUD failure.
+        let mut df: Option<f64> = None;
+        if let Some(dv) = delta {
+            df = as_f64(dv);
+            if df.is_none() {
+                return assertion_failed(format!(
+                    "assertNotAlmostEqual: delta must be a number, got {}",
+                    crate::py_display(dv)
+                ));
+            }
+        }
+        let within = if af == bf {
+            true
+        } else {
+            let diff = (af - bf).abs();
+            match df {
+                Some(d) => diff <= d,
+                None => round_to_places(diff, places) == 0.0,
+            }
+        };
+        if !within {
+            Ok(())
+        } else {
+            let detail = match df {
+                Some(d) => format!("within {} delta", crate::py_float_repr(d)),
+                None => format!("within {} places", places),
+            };
+            if ctx.is_empty() {
+                assertion_failed(format!(
+                    "{} == {} {detail}",
+                    crate::py_display(a),
+                    crate::py_display(b)
+                ))
+            } else {
+                assertion_failed(format!(
+                    "{}: {} == {} {detail}",
+                    ctx,
+                    crate::py_display(a),
+                    crate::py_display(b)
+                ))
+            }
+        }
+    } else {
+        assertion_failed(format!(
+            "assertNotAlmostEqual: operands must be numbers, got {} and {}",
+            crate::py_display(a),
+            crate::py_display(b)
+        ))
+    }
+}
+
+/// Numeric value of `v` as a float, or `None` when `v` is not numeric.
+///
+/// `Int`/`Bool`/`Float` are numeric (int/bool coerce to float, matching
+/// CPython's numeric tower). Everything else has no `__float__` in the subset
+/// and so is not a number.
+fn as_f64(v: &PyValue) -> Option<f64> {
+    if let Some(i) = v.as_int() {
+        Some(i as f64)
+    } else if let Some(f) = v.as_float() {
+        Some(f)
+    } else if let Some(b) = v.as_bool() {
+        Some(if b { 1.0 } else { 0.0 })
+    } else {
+        None
+    }
+}
+
+/// CPython's `round(x, places)` for the `assertAlmostEqual` check: round
+/// `abs(x)` to `places` decimal places and test it equals zero. Equivalent to
+/// `round(abs(x) * 10^places) == 0`, i.e. `abs(x)` is below half of the last
+/// digit. (At exactly the half boundary banker's rounding differs, but that
+/// point is measure-zero in real assertions.)
+fn round_to_places(x: f64, places: i64) -> f64 {
+    // `10^places` via repeated multiply — avoids `f64::pow`, which is not
+    // available in the alloc tier. `places` is small in practice (unittest's
+    // default is 7). Clamp to a sane bound: beyond ~18 decimal places an f64
+    // has no more representable digits, and a huge `places` would only spin
+    // this loop.
+    let p = if places > 18 { 18 } else { places };
+    let mut scale: f64 = 1.0;
+    for _ in 0..p {
+        scale *= 10.0;
+    }
+    // Round to nearest integer (half away from zero, like `f64::round`); the
+    // strict `<` in the caller keeps the half boundary out of the pass set.
+    (x * scale).round()
+}
+
 pub fn main() -> Result<(), PyException> {
     Err(PyException::new(
         "NotImplementedError",

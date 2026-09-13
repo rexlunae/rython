@@ -5702,6 +5702,45 @@ fn unittest_assert_is_instance_with_a_tuple_specifier_stays_a_loud_drop() {
 }
 
 #[test]
+fn unittest_assert_almost_equal_lowers() {
+    // `self.assertAlmostEqual(a, b [, places= | delta=] [, msg=])` lowers to
+    // the runtime helper with `places` as an i64 and `delta` boxed into an
+    // `Option<PyValue>`; `assertNotAlmostEqual` lowers to its negated sibling.
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        self.assertAlmostEqual(1.0, 1.0)\n",
+            "        self.assertAlmostEqual(1.0, 1.0000001, places=5, msg=\"ctx\")\n",
+            "        self.assertAlmostEqual(1.0, 1.01, delta=0.1)\n",
+            "        self.assertNotAlmostEqual(1.0, 2.0)\n",
+        ),
+        "assert_almost.py",
+    );
+    assert!(
+        out.contains("unittest :: assert_almost_eq (") && out.contains("Some :: < PyValue"),
+        "assertAlmostEqual must lower with a boxed delta Option: {}",
+        out
+    );
+    assert!(
+        out.contains("unittest :: assert_not_almost_eq ("),
+        "assertNotAlmostEqual must lower: {}",
+        out
+    );
+    assert!(
+        out.contains("7 i64") || out.contains("7i64") || out.contains("places"),
+        "default places must be present: {}",
+        out
+    );
+    assert!(
+        !out.contains("is neither a method nor a field"),
+        "assertAlmostEqual must not drop: {}",
+        out
+    );
+}
+
+#[test]
 fn integral_float_literals_keep_their_float_type() {
     // 2.0 must stay a float literal: Rust's Display drops the ".0" and the
     // re-parse would silently produce an integer (2.0 / 4 is 0.5 in

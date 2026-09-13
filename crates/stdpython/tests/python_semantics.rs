@@ -4368,3 +4368,65 @@ fn csv_reader_quote_none_with_escapechar_matches_cpython() {
     let r3 = reader(&["\"a,b\",c"], false, None).unwrap();
     assert_eq!(r3[0], vec!["a,b", "c"]);
 }
+
+#[test]
+fn unittest_assert_almost_eq_matches_cpython() {
+    // Verified against CPython 3.14.1 (`assertAlmostEqual`/`assertNotAlmostEqual`).
+    // `PyValue` boxes ints/floats; `places` is an i64 (default 7), `delta` an
+    // `Option<PyValue>` (runtime coerces to float).
+    use stdpython::stdlib::unittest::{assert_almost_eq, assert_not_almost_eq};
+    use stdpython::PyValue;
+
+    // Equal values pass regardless of places.
+    assert_almost_eq(&PyValue::from(1.0), &PyValue::from(1.0), 7, &None, "".to_string()).unwrap();
+    // A tiny diff passes at the default 7 places.
+    assert_almost_eq(
+        &PyValue::from(1.0),
+        &PyValue::from(1.0 + 1e-12),
+        7,
+        &None,
+        "".to_string(),
+    )
+    .unwrap();
+    // `0.0000001` is NOT within 7 places: round(1e-7, 7) == 1e-7 != 0 -> fail.
+    assert_almost_eq(&PyValue::from(1.0), &PyValue::from(1.0000001), 7, &None, "".to_string())
+        .err()
+        .unwrap();
+    // At 5 places the same diff passes (round(1e-7, 5) == 0).
+    assert_almost_eq(&PyValue::from(1.0), &PyValue::from(1.0000001), 5, &None, "".to_string())
+        .unwrap();
+    // `delta=` tolerance: abs(1.01 - 1.0) == 0.01 <= 0.1 -> pass.
+    assert_almost_eq(
+        &PyValue::from(1.0),
+        &PyValue::from(1.01),
+        7,
+        &Some::<PyValue>(PyValue::from(0.1)),
+        "".to_string(),
+    )
+    .unwrap();
+    // An int delta is coerced: abs(2 - 1) == 1 <= 1 -> pass.
+    assert_almost_eq(
+        &PyValue::from(1i64),
+        &PyValue::from(2i64),
+        7,
+        &Some::<PyValue>(PyValue::from(1i64)),
+        "".to_string(),
+    )
+    .unwrap();
+    // 1 vs 5 differs well beyond 7 places -> fail.
+    assert_almost_eq(&PyValue::from(1i64), &PyValue::from(5i64), 7, &None, "".to_string())
+        .err()
+        .unwrap();
+    // assertNotAlmostEqual is the negation.
+    assert_not_almost_eq(
+        &PyValue::from(1.0),
+        &PyValue::from(1.0000001),
+        7,
+        &None,
+        "".to_string(),
+    )
+    .unwrap();
+    assert_not_almost_eq(&PyValue::from(1.0), &PyValue::from(1.0), 7, &None, "".to_string())
+        .err()
+        .unwrap();
+}
