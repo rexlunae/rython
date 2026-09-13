@@ -215,8 +215,15 @@ negative-test data / `assertRaises(TypeError, op, x, y)` inputs).
   **`cargo build`s with 0 errors**. Pins:
   `complex_literals_and_arithmetic_lower_to_the_complex_runtime`,
   `complex_return_types_infer_complex`.
-- **Still open:** a function returning a TUPLE containing a complex member
-  collapses to `Result<()>` (the tuple-return element-type unification does
-  not yet resolve complex), and `str(complex)` has no lowerer. Both matter
-  for complex-returning helpers in the 7 files (low frequency in negative-test
-  data), and are separate rounds.
+- **`str(complex)` works** (verified on main): `t = str(a)` for a complex `a`
+  lowers through the runtime `str<T: PyToString>` (Complex implements
+  PyToString) — `def f(): a = 1j; t = str(a); return 1j` is `Result<String>`,
+  builds with 0 errors, and runs to `1j` (matches CPython).
+- **Still open (one item):** a function returning a TUPLE containing a complex
+  member collapses to `Result<()>` — the tuple-return element-type unification
+  (the signature-typing path) does not yet resolve complex members, nor
+  operator-result returns (`return a + b`), nor `abs`/`.conjugate()` returns;
+  so complex *arithmetic* in return/assignment-to-return position still cannot
+  leave a function's signature. Also `Complex` is not yet a `PyValue` member,
+  so `self.assertEqual(z, w)` with complex operands still drops (the boxed
+  assert cannot hold a complex). These are separate rounds.
