@@ -46,21 +46,26 @@ runner raises `AssertionError: <n> test(s) failed` (exit 1). Verified:
 a minimal test module with a *raising* or erroring test fails loudly and
 exits 1; a passing one exits 0.
 
-**Assertions landed (`b4a3849`, `e7a61dd`, `f3253b1`, `fea6a8c`, `6cff5f1`):**
+**Assertions landed (`b4a3849`, `e7a61dd`, `f3253b1`, `fea6a8c`, `6cff5f1`,
+`dfa40d1`):**
 `self.assertEqual`, `assertNotEqual`, `assertIn`, `assertNotIn`,
-`assertTrue`, `assertFalse`, `assertIsNone`, `assertIsNotNone` lower to
-runtime `unittest::assert_*` helpers; `assertRaises` lowers in **both**
-forms — the callable `assertRaises(Exc, fn, *args)` and the context manager
+`assertTrue`, `assertFalse`, `assertIsNone`, `assertIsNotNone`,
+`assertIsInstance`/`assertNotIsInstance` lower to runtime
+`unittest::assert_*` helpers (`isinstance`: `bool` is a subclass of `int`,
+matching CPython; `list` matches a boxed tuple per the documented
+divergence). `assertRaises` lowers in **both** forms — the callable
+`assertRaises(Exc, fn, *args)` and the context manager
 `with self.assertRaises(Exc):` — via `unittest::assert_raises` (a matching
 raise passes; no raise is an `AssertionError`; a different exception
 propagates, as CPython lets it out). The emitted runner also calls
 `setUp()`/`tearDown()` around every `test_*` method when the class defines
-them. Verified end-to-end (scalar/list asserts and both `assertRaises`
-forms match CPython's failure count and messages modulo the documented
-list-as-tuple display; fixture order matches). The call-site rendering is
-`#[inline(never)]`, and `.cargo/config.toml` sets `RUST_MIN_STACK` (32 MiB)
-because the codegen recurses once per nested call and Rust's 2 MiB default
-test-thread stack was tight (the CLI's 8 MiB main thread was always fine).
+them. Verified end-to-end (scalar/list asserts, `assertIsInstance`, and both
+`assertRaises` forms match CPython's failure count and messages modulo the
+documented list-as-tuple display; fixture order matches). The call-site
+rendering is `#[inline(never)]`, and `.cargo/config.toml` sets
+`RUST_MIN_STACK` (32 MiB) because the codegen recurses once per nested call
+and Rust's 2 MiB default test-thread stack was tight (the CLI's 8 MiB main
+thread was always fine).
 
 **Assert-argument boxing:** a **list** argument (`Vec<i64>`, `Vec<String>`,
 …) boxes through `unittest::list_to_pyvalue` as `PyValue::Tuple` (the
