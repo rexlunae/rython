@@ -5557,6 +5557,45 @@ fn unittest_assert_with_an_unboxable_argument_stays_a_loud_drop() {
 }
 
 #[test]
+fn unittest_assert_boxes_unknown_typed_loop_and_call_args() {
+    // Issue #377: an argument whose TYPE INFERENCE returns `PyObject` (a loop
+    // variable, a function-call result, a builtin name) renders to a concrete
+    // Rust value that `PyValue::from(_)` boxes — int/bool/float/str/bytes —
+    // so the assert LOWERS instead of silently no-oping with `-W`. A
+    // genuinely non-boxable container (nested list) still drops (see the
+    // pin above); a wrong assumption would be a BUILD error, not silent.
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        for i in (1, 2):\n",
+            "            self.assertTrue(i)\n",
+            "            x = 1 + i\n",
+            "            self.assertEqual(x, i)\n",
+            "        self.assertAlmostEqual(sum, 0.0)\n",
+        ),
+        "assert_unknown.py",
+    );
+    assert!(
+        out.contains("unittest :: assert_true (& PyValue :: from (i)")
+            && out.contains("unittest :: assert_eq (& PyValue :: from (x)"),
+        "a PyObject-typed loop var / call result must box and lower: {}",
+        out
+    );
+    assert!(
+        out.contains("unittest :: assert_almost_eq (& PyValue :: from (sum)"),
+        "a PyObject-typed name must box and lower: {}",
+        out
+    );
+    assert!(
+        !out.contains("dropped"),
+        "unknown-typed assert args must not drop: {}",
+        out
+    );
+}
+
+#[test]
 fn unittest_assert_raises_callable_form_lowers() {
     // CPython's callable form `self.assertRaises(Exc, fn, *args)` lowers to
     // `unittest::assert_raises("Exc", || fn(args))` — the callee's trailing

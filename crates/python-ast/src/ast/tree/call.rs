@@ -217,6 +217,15 @@ fn box_assert_argument(
         | crate::TypeInfo::String
         | crate::TypeInfo::Bytes
         | crate::TypeInfo::PyValue => Ok(Some(quote!(PyValue::from(#r)))),
+        // An UNKNOWN-typed but already-concrete Rust expression (issue #377):
+        // a loop variable whose element type the inference maps don't record,
+        // a function-call result, or a subscript. These render to a real Rust
+        // value (`i`, `f(x)`, `a[0]`) that `PyValue::from(_)` boxes when its
+        // type has a `From<_> for PyValue` impl — int/bool/float/str/bytes —
+        // and a hard BUILD error when it does not (a LOUD failure, never a
+        // silent no-op). A concrete non-boxable container (nested `Vec`)
+        // infers as `Vec(…)`, not `PyObject`, and still hits the drop below.
+        crate::TypeInfo::PyObject => Ok(Some(quote!(PyValue::from(#r)))),
         _ => Ok(None),
     }
 }
