@@ -68,6 +68,12 @@ pub enum TypeInfo {
     /// `numpy::NdArray`
     /// `numpy::NdArray`
     NdArray,
+    /// `stdpython::Complex` — a complex number (real+imag f64). A Python
+    /// `1j`/`3.5j` literal, or the result of complex arithmetic (`2j * (1+2j)`).
+    /// Modeled distinctly from the numeric scalars so complex results stay
+    /// `Complex` (never coerce to i64/f64) and complex receivers dispatch
+    /// their real/imag/conjugate methods.
+    Complex,
     /// `stdpython::StrOrBytes` — the `str | bytes` heterogeneous union
     /// (issue #121): a value that is either a String or Vec<u8>, narrowed
     /// by isinstance checks.
@@ -311,6 +317,7 @@ impl TypeInfo {
             }
             TypeInfo::Threading(t) => t.rust_path(),
             TypeInfo::Socket => quote!(socket::Socket),
+            TypeInfo::Complex => quote!(Complex),
             TypeInfo::ClassValue => quote!(Option<()>),
             TypeInfo::Callable(params, ret) => {
                 let args = TypeInfo::Tuple(params.clone()).to_rust_type();
@@ -337,6 +344,7 @@ impl TypeInfo {
             TypeInfo::Option(_) => "Optional".into(),
             TypeInfo::Range => "range".into(),
             TypeInfo::NdArray => "ndarray".into(),
+            TypeInfo::Complex => "complex".into(),
             TypeInfo::StrOrBytes => "str | bytes".into(),
             TypeInfo::PyValue => "any".into(),
             TypeInfo::PyValueMember(_) => "any member".into(),
@@ -716,16 +724,26 @@ fn infer_type_inner(
     symbols: &SymbolTableScopes,
 ) -> TypeInfo {
     match expr {
-        ExprType::Constant(c) => match &c.0 {
-            Some(litrs::Literal::Integer(_)) => TypeInfo::Int,
-            Some(litrs::Literal::Float(_)) => TypeInfo::Float,
-            Some(litrs::Literal::Bool(_)) => TypeInfo::Bool,
-            Some(litrs::Literal::String(_)) => TypeInfo::StrRef,
-            Some(litrs::Literal::Byte(_)) | Some(litrs::Literal::ByteString(_)) => {
-                TypeInfo::Bytes
+        ExprType::Constant(c) => {
+            // A complex sentinel (`\0RYTHON_COMPLEX:...`) is carried in a
+            // String literal, but is a COMPLEX number — type it so codegen
+            // never coercses `1j`/`2j * (1+2j)` to i64/f64.
+            if let Some(lit) = &c.0
+                && crate::ast::tree::constant::is_complex_literal(&*lit)
+            {
+                return TypeInfo::Complex;
             }
-            None => TypeInfo::PyObject, // None literal
-            _ => TypeInfo::PyObject,
+            match &c.0 {
+                Some(litrs::Literal::Integer(_)) => TypeInfo::Int,
+                Some(litrs::Literal::Float(_)) => TypeInfo::Float,
+                Some(litrs::Literal::Bool(_)) => TypeInfo::Bool,
+                Some(litrs::Literal::String(_)) => TypeInfo::StrRef,
+                Some(litrs::Literal::Byte(_)) | Some(litrs::Literal::ByteString(_)) => {
+                    TypeInfo::Bytes
+                }
+                None => TypeInfo::PyObject, // None literal
+                _ => TypeInfo::PyObject,
+            }
         },
         ExprType::Name(n) => {
             // 1. The per-function annotation map (params + literal assigns).
@@ -3583,15 +3601,22 @@ fn is_empty_container(expr: &ExprType) -> bool {
 /// while building them).
 pub(crate) fn syntactic_type(expr: &ExprType) -> TypeInfo {
     match expr {
-        ExprType::Constant(c) => match &c.0 {
-            Some(litrs::Literal::Integer(_)) => TypeInfo::Int,
-            Some(litrs::Literal::Float(_)) => TypeInfo::Float,
-            Some(litrs::Literal::Bool(_)) => TypeInfo::Bool,
-            Some(litrs::Literal::String(_)) => TypeInfo::StrRef,
-            Some(litrs::Literal::Byte(_)) | Some(litrs::Literal::ByteString(_)) => {
-                TypeInfo::Bytes
+        ExprType::Constant(c) => {
+            // A complex sentinel (`\0RYTHON_COMPLEX:...`) is String-carrying
+            // but is a COMPLEX number, never a str.
+            if let Some(lit) = &c.0 && crate::ast::tree::constant::is_complex_literal(lit) {
+                return TypeInfo::Complex;
             }
-            _ => TypeInfo::PyObject,
+            match &c.0 {
+                Some(litrs::Literal::Integer(_)) => TypeInfo::Int,
+                Some(litrs::Literal::Float(_)) => TypeInfo::Float,
+                Some(litrs::Literal::Bool(_)) => TypeInfo::Bool,
+                Some(litrs::Literal::String(_)) => TypeInfo::StrRef,
+                Some(litrs::Literal::Byte(_)) | Some(litrs::Literal::ByteString(_)) => {
+                    TypeInfo::Bytes
+                }
+                _ => TypeInfo::PyObject,
+            }
         },
         ExprType::JoinedStr(_) | ExprType::FormattedValue(_) => TypeInfo::String,
         ExprType::List(l) => {

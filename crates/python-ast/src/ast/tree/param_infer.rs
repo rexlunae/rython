@@ -1387,16 +1387,22 @@ fn return_type_of(
             }
             Ok(quote!((#(#elts),*)))
         }
-        ExprType::Constant(c) => match &c.0 {
-            Some(litrs::Literal::Integer(_)) => Ok(quote!(i64)),
-            Some(litrs::Literal::Float(_)) => Ok(quote!(f64)),
-            Some(litrs::Literal::String(_)) => Ok(quote!(String)),
-            Some(litrs::Literal::Bool(_)) => Ok(quote!(bool)),
-            // `return None` — the None constant arrives with no literal
-            // payload (`Constant(None)`); the unit value (s3transfer's
-            // set_default_checksum_algorithm).
-            None => Ok(quote!(())),
-            _ => Err(err()),
+        ExprType::Constant(c) => {
+            // A complex sentinel (`\0RYTHON_COMPLEX:...`) is a Complex value.
+            if let Some(lit) = &c.0 && crate::ast::tree::constant::is_complex_literal(lit) {
+                return Ok(quote!(Complex));
+            }
+            match &c.0 {
+                Some(litrs::Literal::Integer(_)) => Ok(quote!(i64)),
+                Some(litrs::Literal::Float(_)) => Ok(quote!(f64)),
+                Some(litrs::Literal::String(_)) => Ok(quote!(String)),
+                Some(litrs::Literal::Bool(_)) => Ok(quote!(bool)),
+                // `return None` — the None constant arrives with no literal
+                // payload (`Constant(None)`); the unit value (s3transfer's
+                // set_default_checksum_algorithm).
+                None => Ok(quote!(())),
+                _ => Err(err()),
+            }
         },
         ExprType::Call(c) => {
             // A call to a user function (M4): its return annotation, or —
@@ -2071,14 +2077,20 @@ fn operand_type(
                 return Err(err());
             }
         }
-        ExprType::Constant(c) => match &c.0 {
-            Some(litrs::Literal::Integer(_)) => quote!(i64),
-            Some(litrs::Literal::Float(_)) => quote!(f64),
-            // 'static: a literal is &'static str, and a return-position
-            // associated type needs a named lifetime.
-            Some(litrs::Literal::String(_)) => quote!(&'static str),
-            Some(litrs::Literal::Bool(_)) => quote!(bool),
-            _ => return Err(err()),
+        ExprType::Constant(c) => {
+            // A complex sentinel (`\0RYTHON_COMPLEX:...`) is a Complex value.
+            if let Some(lit) = &c.0 && crate::ast::tree::constant::is_complex_literal(lit) {
+                return Ok(quote!(Complex));
+            }
+            match &c.0 {
+                Some(litrs::Literal::Integer(_)) => quote!(i64),
+                Some(litrs::Literal::Float(_)) => quote!(f64),
+                // 'static: a literal is &'static str, and a return-position
+                // associated type needs a named lifetime.
+                Some(litrs::Literal::String(_)) => quote!(&'static str),
+                Some(litrs::Literal::Bool(_)) => quote!(bool),
+                _ => return Err(err()),
+            }
         },
         // Conversion builtins give concrete operand types (`"v=" + str(x)`
         // needs String on the right).
@@ -2449,6 +2461,7 @@ fn type_display(ty: &TypeInfo) -> String {
         TypeInfo::Option(_) => "optional".to_string(),
         TypeInfo::Range => "range".to_string(),
         TypeInfo::NdArray => "array".to_string(),
+        TypeInfo::Complex => "complex".to_string(),
         TypeInfo::StrOrBytes => "str | bytes".to_string(),
         TypeInfo::PyValue => "any".to_string(),
         TypeInfo::PyValueMember(_) => "any".to_string(),
