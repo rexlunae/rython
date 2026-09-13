@@ -195,3 +195,28 @@ inside (or leads to) the unittest harness:
 - These recede pure-language walls (math advances past `count_set_bits`), but
   the *count* moves only when the #334 harness lands, because that is the
   shared gate for all 17 files.
+
+## Complex (#366) — the biggest single-file unblocker, status
+
+`complex` literals were the #1 root cause for CONVERT failure (7/17 files:
+`test_operator`, `test_struct`, `test_itertools`, `test_collections`,
+`test_fractions`, `test_random`, `test_math` — all at a `Nj` literal in
+negative-test data / `assertRaises(TypeError, op, x, y)` inputs).
+
+- **Literals already parse & render** (`1j` → `Complex::new(0.0, 1.0)`;
+  the complex value is carried through a `Literal<String>` sentinel).
+- **PR landed (complex codegen typing):** `complex` is now a real codegen
+  type (`TypeInfo::Complex`); `infer_type_inner`, `syntactic_type` and
+  `simple_expr_typeinfo` recognize the sentinel (a complex literal is NOT a
+  `str`, so it no longer coerces to i64/f64 or feeds the `*` string-repetition
+  heuristic). Complex arithmetic (`2j*(1+2j)` → `Complex::py_mul`, `3j+1j` →
+  `py_add`), `.real`/`.imag`/`.conjugate()`, and single-value complex returns
+  (`def f(): a = 1j; return a` → `Result<Complex>`) now lower to Rust that
+  **`cargo build`s with 0 errors**. Pins:
+  `complex_literals_and_arithmetic_lower_to_the_complex_runtime`,
+  `complex_return_types_infer_complex`.
+- **Still open:** a function returning a TUPLE containing a complex member
+  collapses to `Result<()>` (the tuple-return element-type unification does
+  not yet resolve complex), and `str(complex)` has no lowerer. Both matter
+  for complex-returning helpers in the 7 files (low frequency in negative-test
+  data), and are separate rounds.
