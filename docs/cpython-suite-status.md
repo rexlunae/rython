@@ -227,14 +227,14 @@ negative-test data / `assertRaises(TypeError, op, x, y)` inputs).
   `return abs(3j)` → `Result<f64>`. Verified end-to-end against CPython:
   `(3j, (-2+0j), (0.5+0j), (1-2j), 3.0)` build and run byte-identical.
   Pin: `complex_return_types_infer_complex` (now covers binop/conjugate/abs).
-- **Still open:** (1) a returned TUPLE mixing a Complex member with an f64
-  member (`return (s, abs(z))`) still collapses to `Result<()>` — the
-  heterogeneous Complex/f64 tuple-return unification does not resolve the mix;
-  (2) `Complex` is not yet a `PyValue` member, so `self.assertEqual(z, w)`
-  with complex operands still loud-drops. Both are follow-on rounds.
+- **Still open:** `Complex` is not yet a `PyValue` member, so
+  `self.assertEqual(z, w)` with complex operands still loud-drops. (A follow-on
+  round: adding a `PyValue::Complex` variant touches every exhaustive match on
+  the boxed value and the `py_value_eq`/display surface.)
 
   (Resolved this round: complex values that flow through a LOCAL before a
   tuple-return — `z = a+2j; return (z, 5)`, `c = z.conjugate(); return (c,)`,
-  `d = a/b; return (d,)` — are now recorded by `collect_local_types`
-  (`complex_binop_literal` / `complex_unary_local`), so the tuple members
-  type instead of collapsing. Pin: `complex_local_tuple_returns_infer_complex_members`.)
+  `d = a/b; return (d,)` — are recorded by `collect_local_types`
+  (`complex_binop_literal` / `complex_unary_local`); and MIXED complex/scalar
+  tuple returns (`return (z, r)` with r = abs(z) → `(Complex, f64)`) no longer
+  collapse. Pin: `complex_local_tuple_returns_infer_complex_members`.)
