@@ -74,9 +74,20 @@ documented list-as-tuple divergence); scalars and `bytes` use
 `PyValue` (a nested list, tuple/set/dict/option/class) keeps the loud drop —
 never a silently wrong comparison.
 
-**Still open:** `assertIs`/`assertGreater`/`assertLess`/`assertAlmostEqual`,
-`assertRaisesRegex`, `subTest`, transitive `TestCase` subclasses, and the
-stdlib-stub emission below.
+**Later landed (`#376`):** `assertAlmostEqual`/`assertNotAlmostEqual`
+(`places=` / `delta=` / `msg=`; numeric cross-tower), the order comparisons
+`assertGreater`/`assertGreaterEqual`/`assertLess`/`assertLessEqual` (numeric
+and lexicographic-str ordering with CPython's message text; incomparable
+operands fail loudly), and the `subTest(...)` reporting context manager —
+which only reframes per-iteration reporting (no exception suppression), so it
+lowers to running its body directly (a subTest body may legitimately
+return/break/continue, so no closure). Each is pinned for codegen shape and
+CPython-verified message/outcome.
+
+77: **Still open:** `assertIs`/`assertRaisesRegex`, transitive `TestCase`
+78: subclasses, `#377` (asserts on unknown-typed args — loop vars, builtins,
+79: subscripts — still loud-drop rather than box), and the stdlib-stub emission
+80: below.
 
 Verified on `test_operator` (`cargo build` in its generated crate):
 
@@ -118,7 +129,7 @@ and `test.*` stdlib references, and asserts are dropped.
 | `test_functools` | BLOCKED | nested `class` at class level |
 | `test_statistics` | BLOCKED | `_make_std_err_msg` arity — **verified CPython-consistent**: `self._make_std_err_msg(a,b,c,d,e)` on a 5-param `def _make_std_err_msg(first,second,tol,rel,idx)` is a genuine `takes 5 … but 6 were given` TypeError under CPython too; rython's loud conversion error (reports 4/5) is correct-or-loud, only the *counts* differ. Then the harness. |
 | `test_re` | BLOCKED | `assertRaisesRegex` of an *intentional* runtime `TypeError` from `re.sub(...)` (error is correctly loud at compile time; needs harness to catch at runtime) |
-| `test_hmac` | BLOCKED | `with self.subTest(...)` harness, then compare/binding issues |
+| `test_hmac` | BLOCKED | compare/binding issues (the `with self.subTest(...)` harness now lowers, #376) |
 | `test_hashlib` | BLOCKED | `isinstance(x, class)` with a class second arg (classes not yet supported) — reached in `__init__`, before any harness |
 
 ## Reasons a file cannot (yet) convert — root causes
