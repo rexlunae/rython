@@ -163,6 +163,159 @@ pub(crate) fn strip_trailing_question(tokens: &proc_macro2::TokenStream) -> proc
     tokens.clone()
 }
 
+/// Lower a `self.assertEqual(a, b)` / `self.assertTrue(x)` /
+/// `self.assertFalse(x)` call to the runtime unittest::assert_* helpers
+/// (issue #334): box the arguments and call the stdpython helper, which
+/// raises AssertionError on failure.
+///
+/// `#[inline(never)]` is load-bearing: `Call::to_rust` recurses once per
+/// nested call, so its own stack FRAME size bounds the total depth. If this
+/// rendering were inlined into that match, every recursive frame would grow
+/// and deeply-nested conversions (`len(list(takewhile(lambda, reversed(it))))`)
+/// would overflow the codegen stack (the round-17 hazard).
+#[inline(never)]
+fn lower_unittest_assert(
+    call: crate::Call,
+    method: &str,
+    ctx: crate::CodeGenContext,
+    options: crate::PythonOptions,
+    symbols: crate::SymbolTableScopes,
+) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+    let (helper, two_arg) = match method {
+        "assertEqual" => ("assert_eq", true),
+        "assertNotEqual" => ("assert_not_eq", true),
+        "assertIn" => ("assert_in", true),
+        "assertNotIn" => ("assert_not_in", true),
+        "assertTrue" => ("assert_true", false),
+        "assertFalse" => ("assert_false", false),
+        "assertIsNone" => ("assert_is_none", false),
+        "assertIsNotNone" => ("assert_is_not_none", false),
+        _ => unreachable!(),
+    };
+    let nargs = if two_arg { 2 } else { 1 };
+    // Box each asserted argument. `PyValue::from` is right for the scalar
+    // shapes, but it maps `Vec<u8>` to `Bytes` — a Python LIST (`Vec<i64>`,
+    // `Vec<String>`, …) must go through `unittest::list_to_pyvalue`
+    // (list → `PyValue::Tuple`, the documented list-as-tuple divergence).
+    // Any argument whose type is neither a boxable scalar nor a list of
+    // them (a tuple/set/dict/option/class/nested list) keeps the
+    // pre-existing loud drop — never a silently wrong comparison.
+    let mut rendered: Vec<TokenStream> = Vec::new();
+    for arg in call.args.iter().take(nargs) {
+        let r = arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        // A bare `None` lowers to `PyValue::None_`, which boxes reflexively.
+        // The parser yields `Constant(None)` for a literal `None` and
+        // `NoneType` for synthesized ones — accept both.
+        if matches!(arg, crate::ExprType::NoneType(_))
+            || matches!(arg, crate::ExprType::Constant(c) if c.0.is_none())
+        {
+            rendered.push(quote!(PyValue::from(#r)));
+            continue;
+        }
+        let boxed = match crate::infer_type(Some(&ctx), arg, &options, &symbols) {
+            // A list: box as a tuple of boxed elements. Only when the element
+            // itself converts into `PyValue` (a nested list does not, yet).
+            crate::TypeInfo::Vec(inner)
+                if matches!(
+                    *inner,
+                    crate::TypeInfo::Int
+                        | crate::TypeInfo::Float
+                        | crate::TypeInfo::Bool
+                        | crate::TypeInfo::StrRef
+                        | crate::TypeInfo::String
+                        | crate::TypeInfo::Bytes
+                        | crate::TypeInfo::PyValue
+                ) =>
+            {
+                quote!(unittest::list_to_pyvalue(#r))
+            }
+            crate::TypeInfo::Int
+            | crate::TypeInfo::Float
+            | crate::TypeInfo::Bool
+            | crate::TypeInfo::StrRef
+            | crate::TypeInfo::String
+            | crate::TypeInfo::Bytes
+            | crate::TypeInfo::PyValue => quote!(PyValue::from(#r)),
+            _ => return Ok(None),
+        };
+        rendered.push(boxed);
+    }
+    let helper_ident = quote::format_ident!("{}", helper);
+    // The msg= context (a String), or an empty string when absent.
+    let msg = match call
+        .keywords
+        .iter()
+        .find(|k| k.arg.as_deref() == Some("msg")) {
+        Some(k) => {
+            let r = k.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            quote!(#r.to_string())
+        }
+        None => quote!("".to_string()),
+    };
+    if two_arg {
+        let a = &rendered[0];
+        let b = &rendered[1];
+        Ok(Some(quote!(unittest::#helper_ident(&#a, &#b, #msg)?)))
+    } else {
+        let x = &rendered[0];
+        Ok(Some(quote!(unittest::#helper_ident(&#x, #msg)?)))
+    }
+}
+
+/// Lower CPython's CALLABLE form of `self.assertRaises(Exc, fn, *args)`:
+/// `unittest::assert_raises("Exc", || fn(args))?`. Returns `None` (leaving
+/// the pre-existing loud drop) for the context-manager form (a single
+/// argument), a non-name exception specifier (a tuple / dynamic value), or
+/// a non-callable second argument.
+#[inline(never)]
+fn lower_assert_raises(
+    call: crate::Call,
+    ctx: crate::CodeGenContext,
+    options: crate::PythonOptions,
+    symbols: crate::SymbolTableScopes,
+) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+    // `self.assertRaises(Exc, fn, *args)`: at least the exception and the
+    // callable. The `with self.assertRaises(Exc):` form passes only the
+    // exception and is not a call statement — drop it.
+    if call.args.len() < 2 {
+        return Ok(None);
+    }
+    // The expected exception's NAME must be statically known. A bare
+    // `TypeError` or a dotted `unittest.SkipTest` yield a name; a tuple of
+    // exceptions or a dynamic `self.failureException` do not (drop).
+    let exc_name = match &call.args[0] {
+        crate::ExprType::Name(n) => n.id.clone(),
+        crate::ExprType::Attribute(a) => a.attr.clone(),
+        _ => return Ok(None),
+    };
+    // The callable and its arguments become the invoked call. Keywords other
+    // than `msg=` belong to the callee (CPython forwards **kwds to it).
+    let inner = crate::Call {
+        func: Box::new(call.args[1].clone()),
+        args: call.args[2..].to_vec(),
+        keywords: call
+            .keywords
+            .iter()
+            .filter(|k| k.arg.as_deref() != Some("msg"))
+            .cloned()
+            .collect(),
+    };
+    let rendered = inner.to_rust(ctx, options, symbols)?;
+    // The callee lowers with a trailing `?` (it returns `Result`), which
+    // unwraps the value — but `assert_raises` needs the `Result` itself, to
+    // inspect the raised exception. Strip the `?`; an infallible callee
+    // (rendered without one) is wrapped in `Ok` so the closure returns a
+    // `Result` either way.
+    let stripped = strip_trailing_question(&rendered);
+    let body = if stripped.to_string() != rendered.to_string() {
+        stripped
+    } else {
+        quote!(Ok(#rendered))
+    };
+    let exc = quote!(#exc_name);
+    Ok(Some(quote!(unittest::assert_raises(#exc, || #body)?)))
+}
+
 /// A Name resolving (through ImportFrom re-export chains) to a module-level
 /// LITERAL constant (`DEFAULT_POOLSIZE = 10` — requests/adapters, used as a
 /// dropped DEFAULT in sessions.py's `HTTPAdapter()` call): render the
@@ -8980,6 +9133,53 @@ let mutating_self_field = boxed_self_ref_receiver
                 callee_name.id
             ));
             return Ok(quote!(stdpython::PyValue::None_));
+        }
+
+        // A unittest assertion on a receiver (`self.assertEqual(a, b)`,
+        // `self.assertTrue(x)`, `self.assertFalse(x)`): the members are
+        // inherited from `unittest.TestCase` — not methods/fields of the
+        // receiver's class — so they otherwise hit the callable-as-value
+        // drop below. Lower them to the runtime assert helpers instead
+        // (issue #334). The rendering lives in `lower_unittest_assert`
+        // (`#[inline(never)]`) so `Call::to_rust`'s own frame does not grow
+        // and the recursive deep-nesting conversions keep their stack budget.
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && (attr.attr == "assertEqual"
+                || attr.attr == "assertNotEqual"
+                || attr.attr == "assertIn"
+                || attr.attr == "assertNotIn"
+                || attr.attr == "assertTrue"
+                || attr.attr == "assertFalse"
+                || attr.attr == "assertIsNone"
+                || attr.attr == "assertIsNotNone")
+        {
+            if let Some(tokens) = lower_unittest_assert(
+                self.clone(),
+                &attr.attr,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )? {
+                return Ok(tokens);
+            }
+            // Argument type not unambiguously boxable: fall through to the
+            // callable-as-value drop below (a loud -W warning), never a
+            // silently wrong comparison.
+        }
+
+        // CPython's callable form of `self.assertRaises(Exc, fn, *args)`.
+        // Returns None for the context-manager form / non-name exception,
+        // which then hits the drop below.
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && attr.attr == "assertRaises"
+            && let Some(tokens) = lower_assert_raises(
+                self.clone(),
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )?
+        {
+            return Ok(tokens);
         }
 
         // A call through a SELF member that is neither a method nor a

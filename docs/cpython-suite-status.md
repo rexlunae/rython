@@ -46,18 +46,32 @@ runner raises `AssertionError: <n> test(s) failed` (exit 1). Verified:
 a minimal test module with a *raising* or erroring test fails loudly and
 exits 1; a passing one exits 0.
 
-**Still open (the next slice):** `self.assertEqual(a, b)` etc. lowering.
-The runtime helpers (`unittest::assert_eq/assert_true/assert_false`) are
-designed and functionally correct — end-to-end a lowered
-`self.assertEqual(2, 3)` correctly raised `AssertionError: 2 != 3` and the
-crate ran+built. But **any arg-rendering assert arm added to `Call::to_rust`
-re-triggers the round-17 codegen stack overflow** (`itertools_takewhile`'s
-deeply-nested `len(list(takewhile(lambda, reversed(it))))` conversion),
-regardless of the render helper used (`to_rust` or `render_typed`) — a
-codegen stack-budget fragility in that hot path, not a logic gap. Landing
-it safely needs a structural fix (smaller `Call::to_rust` frames or a larger
-codegen stack), so it is deferred rather than forced at the cost of a green
-tree (verified: reverting restores 791/0).
+**Assertions landed (`b4a3849`, `e7a61dd`, `f3253b1`, `fea6a8c`, `6cff5f1`):**
+`self.assertEqual`, `assertNotEqual`, `assertIn`, `assertNotIn`,
+`assertTrue`, `assertFalse`, `assertIsNone`, `assertIsNotNone` lower to
+runtime `unittest::assert_*` helpers; `assertRaises` lowers in **both**
+forms — the callable `assertRaises(Exc, fn, *args)` and the context manager
+`with self.assertRaises(Exc):` — via `unittest::assert_raises` (a matching
+raise passes; no raise is an `AssertionError`; a different exception
+propagates, as CPython lets it out). The emitted runner also calls
+`setUp()`/`tearDown()` around every `test_*` method when the class defines
+them. Verified end-to-end (scalar/list asserts and both `assertRaises`
+forms match CPython's failure count and messages modulo the documented
+list-as-tuple display; fixture order matches). The call-site rendering is
+`#[inline(never)]`, and `.cargo/config.toml` sets `RUST_MIN_STACK` (32 MiB)
+because the codegen recurses once per nested call and Rust's 2 MiB default
+test-thread stack was tight (the CLI's 8 MiB main thread was always fine).
+
+**Assert-argument boxing:** a **list** argument (`Vec<i64>`, `Vec<String>`,
+…) boxes through `unittest::list_to_pyvalue` as `PyValue::Tuple` (the
+documented list-as-tuple divergence); scalars and `bytes` use
+`PyValue::from`. Only an argument whose element type does not convert into
+`PyValue` (a nested list, tuple/set/dict/option/class) keeps the loud drop —
+never a silently wrong comparison.
+
+**Still open:** `assertIs`/`assertGreater`/`assertLess`/`assertAlmostEqual`,
+`assertRaisesRegex`, `subTest`, transitive `TestCase` subclasses, and the
+stdlib-stub emission below.
 
 Verified on `test_operator` (`cargo build` in its generated crate):
 

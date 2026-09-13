@@ -6549,7 +6549,7 @@ impl PyContains<str> for PyValue {
 /// Python's `==` on boxed members: numeric kinds compare by value across
 /// int/float/bool (CPython: `1 == 1.0`, `True == 1`); everything else is
 /// structural.
-fn py_value_eq(a: &PyValue, b: &PyValue) -> bool {
+pub(crate) fn py_value_eq(a: &PyValue, b: &PyValue) -> bool {
     match (a, b) {
         (PyValue::Int(x), PyValue::Float(y)) => (*x as f64) == *y,
         (PyValue::Float(x), PyValue::Int(y)) => *x == (*y as f64),
