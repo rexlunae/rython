@@ -5651,6 +5651,58 @@ fn unittest_assert_raises_with_a_returning_body_stays_a_loud_drop() {
 }
 
 #[test]
+fn unittest_subtest_context_manager_runs_body_directly() {
+    // `with self.subTest(**kw): body` — the unittest reporting CM. It only
+    // reframes per-iteration reporting (no exception suppression, no control
+    // flow change), so the body runs directly: a passing subTest passes and a
+    // failing one fails, exactly the observable test outcome. No closure is
+    // allowed (a subTest body may legitimately return/break/continue).
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        with self.subTest(step=1):\n",
+            "            if 1 == 2:\n",
+            "                return\n",
+            "            self.assertEqual(1, 1)\n",
+        ),
+        "subtest.py",
+    );
+    assert!(
+        out.contains("unittest :: assert_eq (") && out.contains("return Ok (())"),
+        "the subTest body must run directly (real asserts, real return): {}",
+        out
+    );
+    assert!(
+        !out.contains("subTest") && !out.contains("assert_raises ("),
+        "subTest must not become a closure/assertRaises lowering: {}",
+        out
+    );
+}
+
+#[test]
+fn unittest_subtest_does_not_suppress_a_failing_body() {
+    // A body that raises keeps raising (subTest does not suppress) — the
+    // lowering must NOT wrap it in a closure that turns the error into a pass.
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        with self.subTest(step=1):\n",
+            "            raise ValueError(\"boom\")\n",
+        ),
+        "subtest_raise.py",
+    );
+    assert!(
+        out.contains("Err (") && !out.contains("assert_raises ("),
+        "a failing subTest body must keep its failure: {}",
+        out
+    );
+}
+
+#[test]
 fn unittest_assert_is_instance_lowers() {
     // `self.assertIsInstance(obj, cls)` lowers to the runtime helper with the
     // type NAME as a string; `assertNotIsInstance` to its negated sibling.
