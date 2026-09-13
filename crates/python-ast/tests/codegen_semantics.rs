@@ -6029,6 +6029,37 @@ fn textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error() {
 }
 
 #[test]
+fn abstract_stub_method_call_with_more_args_does_not_error() {
+    // #334/#367: a NotImplementedError abstract-method STUB declared with
+    // its params (`def compare_digest(a, b)` — first param treated as self)
+    // and overridden by a most-derived subclass. A call `self.m(a, b)` must
+    // NOT hard-error on the superset arity — it dispatches VIRTUALLY to the
+    // override (the same leniency the too-FEW stub case already grants).
+    // hmac's CompareDigestMixin triggers this; converting test_hmac.
+    let out = compile(
+        concat!(
+            "class CompareDigestMixin:\n",
+            "    def compare_digest(a, b):\n",
+            "        \"\"\"Implementation of 'a == b' to test.\"\"\"\n",
+            "        raise NotImplementedError\n",
+            "    def assert_digest_equal(self, a, b):\n",
+            "        self.assertTrue(self.compare_digest(a, b))\n",
+        ),
+        "stub_arity.py",
+    );
+    assert!(
+        !out.contains("takes 1 positional argument") && !out.contains("takes 2 positional"),
+        "an abstract-stub method call with a superset arity must not error: {}",
+        out
+    );
+    assert!(
+        out.contains("compare_digest") && out.contains("assert_true"),
+        "the stub call must lower (dispatch to the override) and the assert must lower: {}",
+        out
+    );
+}
+
+#[test]
 fn integral_float_literals_keep_their_float_type() {
     // 2.0 must stay a float literal: Rust's Display drops the ".0" and the
     // re-parse would silently produce an integer (2.0 / 4 is 0.5 in
