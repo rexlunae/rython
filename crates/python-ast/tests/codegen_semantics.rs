@@ -6001,6 +6001,34 @@ fn complex_local_tuple_returns_infer_complex_members() {
 }
 
 #[test]
+fn textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error() {
+    // #368: `wrap(text, width, **kwargs)` (test_textwrap's check_wrap
+    // forwarding its **kwargs, which may carry initial_indent/drop_whitespace)
+    // must be a LOUD drop — never a hard "unexpected keyword argument" — since
+    // rython's textwrap.wrap(text, width) models only the width. The spread
+    // keys are dynamic at this lowering (the dynamic-kwargs divergence).
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "from textwrap import wrap\n",
+            "class T:\n",
+            "    def check_wrap(self, text, width, **kwargs):\n",
+            "        return wrap(text, width, **kwargs)\n",
+        ),
+        "kw_spread.py",
+    );
+    assert!(
+        out.contains("textwrap :: wrap") || out.contains("wrap ("),
+        "the wrap call itself must still lower: {}",
+        out
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("kwargs") && w.contains("dropped")),
+        "the **kwargs spread must be a loud drop: {:?}",
+        warnings
+    );
+}
+
+#[test]
 fn integral_float_literals_keep_their_float_type() {
     // 2.0 must stay a float literal: Rust's Display drops the ".0" and the
     // re-parse would silently produce an integer (2.0 / 4 is 0.5 in
