@@ -5953,6 +5953,45 @@ fn complex_return_types_infer_complex() {
 }
 
 #[test]
+fn complex_local_tuple_returns_infer_complex_members() {
+    // #366: a complex BINOP assigned to a local (`z = a + 2j`), an `abs`
+    // of a complex (`r = abs(3j)` → f64), and a `.conjugate()` (`c = ...`)
+    // must be recorded as the local's type, so a function returning them as
+    // a TUPLE (`return (z, ...)`) types the members instead of collapsing
+    // to unit.
+    let out = compile(
+        concat!(
+            "def f():\n",
+            "    a = 1j\n",
+            "    z = a + 2j\n",
+            "    return (z, 5)\n",
+            "def g():\n",
+            "    cz = (1 + 2j).conjugate()\n",
+            "    return (cz,)\n",
+            "def h():\n",
+            "    d = 4j / 2j\n",
+            "    return (d,)\n",
+        ),
+        "complex_tuple_ret.py",
+    );
+    assert!(
+        out.contains("f () -> Result < (Complex , i64)"),
+        "a tuple of a complex binop local + int must infer (Complex, i64): {}",
+        out
+    );
+    assert!(
+        out.contains("g () -> Result < (Complex ,)"),
+        "a 1-tuple of .conjugate() must infer (Complex,): {}",
+        out
+    );
+    assert!(
+        out.contains("h () -> Result < (Complex ,)"),
+        "a 1-tuple of complex division must infer (Complex,): {}",
+        out
+    );
+}
+
+#[test]
 fn integral_float_literals_keep_their_float_type() {
     // 2.0 must stay a float literal: Rust's Display drops the ".0" and the
     // re-parse would silently produce an integer (2.0 / 4 is 0.5 in
