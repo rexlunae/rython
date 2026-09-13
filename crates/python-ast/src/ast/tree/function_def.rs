@@ -4293,6 +4293,30 @@ fn renderable_return_typeinfo(t: &crate::TypeInfo) -> bool {
     }
 }
 
+/// Whether a binop OPERAND is a complex value — a complex literal, or a
+/// local whose recorded type is Complex. Drives complex binop RETURN typing
+/// (`return a + b` with a=1j,b=2j → Result<Complex>): `simple_expr_typeinfo`
+/// deliberately has no Name arm, so a complex local operand would otherwise
+/// fall to `other => None` and the whole return collapsed to unit.
+fn operand_is_complex(e: &ExprType, locals: &std::collections::HashMap<String, crate::TypeInfo>) -> bool {
+    match e {
+        ExprType::Constant(c) => {
+            if let Some(l0) = &c.0 && crate::ast::tree::constant::is_complex_literal(l0) {
+                return true;
+            }
+            false
+        }
+        ExprType::Name(n) => matches!(locals.get(&n.id), Some(crate::TypeInfo::Complex)),
+        // A binop on complex operands is complex (`(1+2j)`, `a + 2j`, `a*b`
+        // where a,b are complex): recurse so `(1+2j).conjugate()` and a
+        // complex-typed binop used in a tuple/attribute return resolve.
+        ExprType::BinOp(op) => {
+            operand_is_complex(&op.left, locals) || operand_is_complex(&op.right, locals)
+        }
+        _ => false,
+    }
+}
+
 /// The TypeInfo twin of [`simple_expr_type`] — the field-inference layer
 /// (issue #137's review: `infer_fields` carries TypeInfo, not tokens, so
 /// field types are structural and the coercion layers can match on them).
@@ -6453,6 +6477,76 @@ impl FunctionDef {
                             None => return None,
                         },
                     },
+                },
+                ExprType::BinOp(op) => {
+                    // A binop whose operands are both COMPLEX (or one is) is a
+                    // complex result (`return a + b` with a=1j,b=2j → Complex).
+                    // Numeric/int/float binops are covered by
+                    // simple_expr_typeinfo's `other` fall-through; only the
+                    // complex case needs an explicit arm (the operand types
+                    // come from the locals map / a complex literal), mirroring
+                    // infer_type's numeric_join which now promotes complex.
+                    if operand_is_complex(&op.left, &locals)
+                        || operand_is_complex(&op.right, &locals)
+                    {
+                        crate::TypeInfo::Complex
+                    } else {
+                        crate::simple_expr_typeinfo(&ExprType::BinOp(op.clone()))?
+                    }
+                },
+                ExprType::Tuple(t) => {
+                    // A tuple return with a complex element (`return (z, 5)`
+                    // where z = a + b is complex): build the tuple of each
+                    // element's type (a complex element → Complex). Falls to
+                    // `other` (None) for a non-complex tuple it cannot type.
+                    let mut elts = Vec::new();
+                    let mut ok = true;
+                    for e in &t.elts {
+                        if operand_is_complex(e, &locals) {
+                            elts.push(crate::TypeInfo::Complex);
+                        } else if let Some(ty) = crate::simple_expr_typeinfo(&*e) {
+                            elts.push(ty);
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        crate::TypeInfo::Tuple(elts)
+                    } else {
+                        crate::simple_expr_typeinfo(&value)?
+                    }
+                },
+                ExprType::Call(call) => {
+                    // `abs(z)` of a complex is a float (CPython abs(3j) == 3.0);
+                    // `abs` of a complex local is likewise a float result.
+                    if let ExprType::Name(f) = call.func.as_ref()
+                        && f.id == "abs"
+                        && call.args.len() == 1
+                        && operand_is_complex(&call.args[0], &locals)
+                    {
+                        crate::TypeInfo::Float
+                    // `(1+2j).conjugate()` is a Call of an Attribute whose
+                    // receiver is complex → Complex.
+                    } else if let ExprType::Attribute(am) = call.func.as_ref()
+                        && am.attr.as_str() == "conjugate"
+                        && call.args.is_empty()
+                        && operand_is_complex(&am.value, &locals)
+                    {
+                        crate::TypeInfo::Complex
+                    } else {
+                        crate::simple_expr_typeinfo(&ExprType::Call(call.clone()))?
+                    }
+                },
+                ExprType::Attribute(a) => {
+                    // `.conjugate()` / `.real` / `.imag` on a complex
+                    // receiver: conjugate is complex; real/imag are floats.
+                    let recv_complex = operand_is_complex(&a.value, &locals);
+                    match a.attr.as_str() {
+                        "conjugate" if recv_complex => crate::TypeInfo::Complex,
+                        "real" | "imag" if recv_complex => crate::TypeInfo::Float,
+                        _ => crate::simple_expr_typeinfo(&ExprType::Attribute(a.clone()))?,
+                    }
                 },
                 other => crate::simple_expr_typeinfo(other)?,
             };

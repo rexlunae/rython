@@ -5904,8 +5904,9 @@ fn complex_literals_and_arithmetic_lower_to_the_complex_runtime() {
 #[test]
 fn complex_return_types_infer_complex() {
     // #366: a function returning a complex value (a literal or a complex
-    // local) infers Result<Complex, PyException> — it must NOT be coerced to
-    // Result<&str> (the complex sentinel's String-carrying representation).
+    // local, or the result of complex arithmetic / .conjugate() / abs)
+    // infers the CORRECT static type — never coerced to Result<&str> (the
+    // complex sentinel's String-carrying representation) nor collapsed to ().
     let out = compile(
         concat!(
             "def f():\n",
@@ -5913,12 +5914,35 @@ fn complex_return_types_infer_complex() {
             "def g():\n",
             "    a = 3.5j\n",
             "    return a\n",
+            "def h():\n",
+            "    a = 1j\n",
+            "    b = 2j\n",
+            "    return a + b\n",
+            "def c():\n",
+            "    return (1 + 2j).conjugate()\n",
+            "def d():\n",
+            "    return abs(3j)\n",
         ),
         "complex_ret.py",
     );
     assert!(
         out.contains("f () -> Result < Complex") && out.contains("g () -> Result < Complex"),
         "a complex-returning function must infer Result<Complex>: {}",
+        out
+    );
+    assert!(
+        out.contains("h () -> Result < Complex"),
+        "a complex binop return (a + b) must infer Result<Complex>: {}",
+        out
+    );
+    assert!(
+        out.contains("c () -> Result < Complex"),
+        ".conjugate() on a complex must infer Result<Complex>: {}",
+        out
+    );
+    assert!(
+        out.contains("d () -> Result < f64"),
+        "abs(complex) returns a float: {}",
         out
     );
     assert!(
