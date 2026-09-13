@@ -5863,6 +5863,72 @@ fn unittest_assert_almost_equal_lowers() {
 }
 
 #[test]
+fn complex_literals_and_arithmetic_lower_to_the_complex_runtime() {
+    // #366: a complex literal (`1j`/`3.5j`) lowers to `Complex::new(re, im)`.
+    // Crucially, a complex literal is carried in a `Literal<String>` (the
+    // `\0RYTHON_COMPLEX:` sentinel), so `*` must NOT route a complex operand
+    // to the string-repetition heuristic — `2j * (1+2j)` is numeric
+    // (complex multiplication), and `3j + 1j` is Complex complex +.
+    let out = compile(
+        concat!(
+            "def f():\n",
+            "    z = 2j * (1 + 2j)\n",
+            "    w = 3j + 1j\n",
+            "    a = 1j\n",
+            "    return z, w\n",
+        ),
+        "complex_arith.py",
+    );
+    assert!(
+        out.contains("Complex :: new (0.0 , 2.0)") && out.contains("py_mul ("),
+        "complex multiplication must lower to Complex::py_mul: {}",
+        out
+    );
+    assert!(
+        out.contains("Complex :: new (0.0 , 3.0)") && out.contains("py_add ("),
+        "complex addition must lower to Complex::py_add: {}",
+        out
+    );
+    assert!(
+        !out.contains("multiply_string ("),
+        "a complex operand must not be mistaken for a string in `*`: {}",
+        out
+    );
+    assert!(
+        out.contains("Complex :: new (0.0 , 1.0)"),
+        "a bare complex literal must render Complex::new: {}",
+        out
+    );
+}
+
+#[test]
+fn complex_return_types_infer_complex() {
+    // #366: a function returning a complex value (a literal or a complex
+    // local) infers Result<Complex, PyException> — it must NOT be coerced to
+    // Result<&str> (the complex sentinel's String-carrying representation).
+    let out = compile(
+        concat!(
+            "def f():\n",
+            "    return 1j\n",
+            "def g():\n",
+            "    a = 3.5j\n",
+            "    return a\n",
+        ),
+        "complex_ret.py",
+    );
+    assert!(
+        out.contains("f () -> Result < Complex") && out.contains("g () -> Result < Complex"),
+        "a complex-returning function must infer Result<Complex>: {}",
+        out
+    );
+    assert!(
+        !out.contains("Result < & 'static str") && !out.contains("Result < &'static str"),
+        "a complex return must not be typed as a string: {}",
+        out
+    );
+}
+
+#[test]
 fn integral_float_literals_keep_their_float_type() {
     // 2.0 must stay a float literal: Rust's Display drops the ".0" and the
     // re-parse would silently produce an integer (2.0 / 4 is 0.5 in

@@ -203,10 +203,24 @@ impl CodeGen for BinOp {
         // stdpython multiply_string helper (numeric multiplication keeps
         // the plain operator below).
         if matches!(self.op, BinOps::Mult) {
-            let left_is_str = matches!(&*self.left, ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::String(_))))
-                || matches!(&*self.left, ExprType::JoinedStr(_));
-            let right_is_str = matches!(&*self.right, ExprType::Constant(c) if matches!(&c.0, Some(litrs::Literal::String(_))))
-                || matches!(&*self.right, ExprType::JoinedStr(_));
+            // A literal String operand means sequence repetition ("!" * 3).
+            // A COMPLEX literal is also carried in a `Literal<String>`
+            // (the `\0RYTHON_COMPLEX:` sentinel), so it must be excluded —
+            // complex multiplication is numeric, not sequence repetition.
+            let is_str_lit = |e: &crate::ExprType| {
+                if let ExprType::Constant(c) = e {
+                    if let Some(lit) = &c.0 {
+                        !crate::ast::tree::constant::is_complex_literal(lit)
+                            && matches!(lit, litrs::Literal::String(_))
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            let left_is_str = is_str_lit(&*self.left) || matches!(&*self.left, ExprType::JoinedStr(_));
+            let right_is_str = is_str_lit(&*self.right) || matches!(&*self.right, ExprType::JoinedStr(_));
             if left_is_str || right_is_str {
                 let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
                 let right = self.right.clone().to_rust(ctx, options, symbols)?;
