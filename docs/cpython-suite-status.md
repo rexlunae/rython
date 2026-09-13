@@ -18,6 +18,14 @@ asserting (the harness calls are dropped as loud `-W` warnings), so they do
 not yet exhibit CPython-equal behavior.
 
 **Frontier: 6/17 CONVERT; 0/17 BUILD; 0/17 RUN** (see the BUILD analysis below).
+**Re-measured (this round):** on the actual 17 `stripped/test_*.py` files,
+CONVERT = test_calendar, test_fractions, test_heapq, test_operator, test_random,
+test_struct. BUILD of even the CONVERT files fails with **208–1388 rustc errors**
+each, dominated by `use crate::decimal/fractions/inspect/pickle` (stdlib modules
+rython does not emit as runtime modules) and `use crate::test::support` (CPython's
+own test scaffolding — `from test import support` is imported by ~all 17 files).
+That's the largest single BUILD wall: no file builds until `test.support` (and the
+few unprovided stdlib modules) are provided/emitted.
 
 ## Why "CONVERT" ≠ "BUILD" (corrected this session)
 
@@ -123,7 +131,7 @@ and `test.*` stdlib references, and asserts are dropped.
 | `test_math` | BLOCKED | `count_set_bits` recursion (FIXED → advanced); `ulp_abs_check` union FIXED (this round: `local_str.format(...)` now infers String, so `None` vs `fmt.format(...)` unifies to `Option<String>`); test_math now advances from line 107 to line 744 — the heterogeneous `[float, FloatLike]` list-literal wall |
 | `test_bisect` | BLOCKED | nested `def grade(breakpoints=[60,70,80,90])` — a **mutable-list default**, deliberately loud (Python evaluates-and-shares it; cannot be lowered correctly) |
 | `test_csv` | BLOCKED | `csv.reader(..., escapechar=…)` reader feature FIXED (this round, now threads `Some::<u8>`); advances to the **dialect-registry** wall (`csv.reader([...], name)` / `register_dialect`), reached inside harness blocks |
-| `test_textwrap` | BLOCKED | `wrap(text, width, **kwargs)` — issue #368 `**kwargs`; reached only inside unittest `TestTextWrap` methods |
+| `test_textwrap` | BLOCKED | `wrap(text, width, **kwargs)` was issue #368; the `**kwargs` SPREAD is now a loud `-W` drop (PR, `textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error`), so it advances to line 541 — the next wall is literal keyword OPTIONS to `wrap(..., initial_indent=..., max_lines=..., placeholder=...)`, which rython's `wrap(text, width)` does not model |
 | `test_itertools` | BLOCKED | heterogeneous list literal `['abc', range(6)]` (str/range mix) |
 | `test_collections` | BLOCKED | heterogeneous list literal `[None, int(), gen(), object(), Bar()]` (int/Bar/mixed) |
 | `test_functools` | BLOCKED | nested `class` at class level |
