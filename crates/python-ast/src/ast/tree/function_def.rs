@@ -4317,6 +4317,52 @@ fn operand_is_complex(e: &ExprType, locals: &std::collections::HashMap<String, c
     }
 }
 
+/// Whether an ASSIGNMENT value is a binop with a complex operand (a complex
+/// literal or a Complex-typed core-local recorded so far). Lets
+/// `collect_local_types` record `z = a + 2j` (a Complex local) as Complex,
+/// so a later tuple-return `return (z, 5)` types `z` correctly (issue #366).
+fn complex_binop_literal(
+    e: &ExprType,
+    locals: &std::collections::HashMap<String, crate::TypeInfo>,
+) -> bool {
+    let ExprType::BinOp(op) = e else {
+        return false;
+    };
+    operand_is_complex(&op.left, locals) || operand_is_complex(&op.right, locals)
+}
+
+/// The result type of a complex UNARY-ish call assigned to a local:
+/// `abs(z)` of a complex is a float; `z.conjugate()` on a complex is Complex.
+/// Returns `None` when `e` is not one of these shapes, so `collect_local_types`
+/// can record `r = abs(z)` / `c = z.conjugate()` (issue #366).
+fn complex_unary_local(
+    e: &ExprType,
+    locals: &std::collections::HashMap<String, crate::TypeInfo>,
+) -> Option<crate::TypeInfo> {
+    let ExprType::Call(call) = e else {
+        return None;
+    };
+    match call.func.as_ref() {
+        // abs(z) on a complex → f64 (CPython abs(3j) == 3.0).
+        ExprType::Name(f) if f.id == "abs" && call.args.len() == 1 => {
+            if operand_is_complex(&call.args[0], locals) {
+                Some(crate::TypeInfo::Float)
+            } else {
+                None
+            }
+        }
+        // z.conjugate() on a complex → Complex.
+        ExprType::Attribute(am) if am.attr.as_str() == "conjugate" && call.args.is_empty() => {
+            if operand_is_complex(&am.value, locals) {
+                Some(crate::TypeInfo::Complex)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// The TypeInfo twin of [`simple_expr_type`] — the field-inference layer
 /// (issue #137's review: `infer_fields` carries TypeInfo, not tokens, so
 /// field types are structural and the coercion layers can match on them).
@@ -4881,6 +4927,17 @@ pub(crate) fn collect_local_types(
                 {
                     out.insert(name.id.clone(), t);
                 } else if let Some(ty) = simple_expr_typeinfo(&assign.value) {
+                    out.insert(name.id.clone(), ty);
+                } else if complex_binop_literal(&assign.value, out) {
+                    // `z = a + 2j` where `a` is a recorded Complex local (or a
+                    // complex literal operand): the binop's a Complex local's
+                    // value — record it so a later `return (z, ...)`/use types
+                    // the local as Complex (issue #366).
+                    out.insert(name.id.clone(), crate::TypeInfo::Complex);
+                } else if let Some(ty) = complex_unary_local(&assign.value, out) {
+                    // `r = abs(z)` (→ f64) / `c = z.conjugate()` (→ Complex)
+                    // where `z` is a complex value: record so a later
+                    // `return (…, r, c)` types the tuple (issue #366).
                     out.insert(name.id.clone(), ty);
                 } else {
                     // A CONTAINER literal local types like the literal
