@@ -5651,6 +5651,57 @@ fn unittest_assert_raises_with_a_returning_body_stays_a_loud_drop() {
 }
 
 #[test]
+fn unittest_assert_is_instance_lowers() {
+    // `self.assertIsInstance(obj, cls)` lowers to the runtime helper with the
+    // type NAME as a string; `assertNotIsInstance` to its negated sibling.
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        self.assertIsInstance(5, int)\n",
+            "        self.assertNotIsInstance(5, str)\n",
+        ),
+        "assert_isinstance.py",
+    );
+    assert!(
+        out.contains("assert_is_instance (") && out.contains("\"int\""),
+        "assertIsInstance must lower with the type name: {}",
+        out
+    );
+    assert!(
+        out.contains("assert_not_is_instance ("),
+        "assertNotIsInstance must lower: {}",
+        out
+    );
+}
+
+#[test]
+fn unittest_assert_is_instance_with_a_tuple_specifier_stays_a_loud_drop() {
+    // `assertIsInstance(obj, (int, str))` — a tuple of types — is not a
+    // statically-known single builtin NAME, so it keeps the loud drop.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        self.assertIsInstance(5, (int, str))\n",
+        ),
+        "assert_isinstance_tuple.py",
+    );
+    assert!(
+        !out.contains("assert_is_instance ("),
+        "a tuple specifier must not lower: {}",
+        out
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("dropped")),
+        "the drop must be loud through -W: {:?}",
+        warnings
+    );
+}
+
+#[test]
 fn integral_float_literals_keep_their_float_type() {
     // 2.0 must stay a float literal: Rust's Display drops the ".0" and the
     // re-parse would silently produce an integer (2.0 / 4 is 0.5 in

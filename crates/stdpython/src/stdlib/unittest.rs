@@ -175,6 +175,77 @@ pub fn assert_not_in(
     }
 }
 
+/// Whether a boxed value is an instance of the given builtin type NAME
+/// (`self.assertIsInstance(obj, int)`). `bool` is a subclass of `int`,
+/// matching CPython; `list` matches a boxed tuple (the list-as-tuple
+/// divergence, so `isinstance([…], list)` and `isinstance([…], tuple)`
+/// cannot be told apart at the boxed level). Unknown / non-builtin type
+/// names never match.
+fn pyvalue_isinstance(v: &PyValue, t: &str) -> bool {
+    match t {
+        "int" => matches!(v, PyValue::Int(_) | PyValue::Bool(_)),
+        "bool" => matches!(v, PyValue::Bool(_)),
+        "float" => matches!(v, PyValue::Float(_)),
+        "str" => matches!(v, PyValue::Str(_)),
+        "bytes" => matches!(v, PyValue::Bytes(_)),
+        "dict" => matches!(v, PyValue::Dict(_)),
+        "tuple" => matches!(v, PyValue::Tuple(_)),
+        "list" => matches!(v, PyValue::Tuple(_)),
+        "NoneType" => matches!(v, PyValue::None_),
+        _ => false,
+    }
+}
+
+/// `self.assertIsInstance(obj, cls)` — raise AssertionError when obj is not
+/// an instance of the builtin type NAME `cls`.
+pub fn assert_is_instance(
+    obj: &PyValue,
+    type_name: &str,
+    ctx: alloc::string::String,
+) -> Result<(), PyException> {
+    if pyvalue_isinstance(obj, type_name) {
+        Ok(())
+    } else if ctx.is_empty() {
+        assertion_failed(format!(
+            "{} is not an instance of {}",
+            crate::py_display(obj),
+            type_name
+        ))
+    } else {
+        assertion_failed(format!(
+            "{}: {} is not an instance of {}",
+            ctx,
+            crate::py_display(obj),
+            type_name
+        ))
+    }
+}
+
+/// `self.assertNotIsInstance(obj, cls)` — raise AssertionError when obj IS
+/// an instance of `cls`.
+pub fn assert_not_is_instance(
+    obj: &PyValue,
+    type_name: &str,
+    ctx: alloc::string::String,
+) -> Result<(), PyException> {
+    if !pyvalue_isinstance(obj, type_name) {
+        Ok(())
+    } else if ctx.is_empty() {
+        assertion_failed(format!(
+            "{} is an instance of {}",
+            crate::py_display(obj),
+            type_name
+        ))
+    } else {
+        assertion_failed(format!(
+            "{}: {} is an instance of {}",
+            ctx,
+            crate::py_display(obj),
+            type_name
+        ))
+    }
+}
+
 pub fn main() -> Result<(), PyException> {
     Err(PyException::new(
         "NotImplementedError",
