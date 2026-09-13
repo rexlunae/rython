@@ -6563,6 +6563,18 @@ impl FunctionDef {
                             elts.push(crate::TypeInfo::Complex);
                         } else if let Some(ty) = crate::simple_expr_typeinfo(&*e) {
                             elts.push(ty);
+                        } else if let Some(ty) =
+                            // A non-complex LOCAL (float/int/… from `r =
+                            // abs(z)`, `i = 5`, so a tuple mixing a complex
+                            // with a scalar types each member instead of
+                            // collapsing) — simple_expr_typeinfo has no Name
+                            // arm, so look the local up directly.
+                            match e {
+                                ExprType::Name(n) => locals.get(&n.id).cloned(),
+                                _ => None,
+                            }
+                        {
+                            elts.push(ty);
                         } else {
                             ok = false;
                             break;

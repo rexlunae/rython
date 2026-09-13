@@ -5971,6 +5971,10 @@ fn complex_local_tuple_returns_infer_complex_members() {
             "def h():\n",
             "    d = 4j / 2j\n",
             "    return (d,)\n",
+            "def k():\n",
+            "    z = 1j + 2j\n",
+            "    r = abs(3j)\n",
+            "    return (z, r)\n",
         ),
         "complex_tuple_ret.py",
     );
@@ -5987,6 +5991,11 @@ fn complex_local_tuple_returns_infer_complex_members() {
     assert!(
         out.contains("h () -> Result < (Complex ,)"),
         "a 1-tuple of complex division must infer (Complex,): {}",
+        out
+    );
+    assert!(
+        out.contains("k () -> Result < (Complex , f64)"),
+        "a tuple mixing a complex local and an f64 (abs) local must infer (Complex, f64): {}",
         out
     );
 }
