@@ -17,11 +17,11 @@ missing *earlier* in a file, the file can only **convert and run** once the
 asserting (the harness calls are dropped as loud `-W` warnings), so they do
 not yet exhibit CPython-equal behavior.
 
-**Frontier: 6/17 CONVERT; 0/17 BUILD; 0/17 RUN** (see the BUILD analysis below).
+**Frontier: 7/17 CONVERT; 0/17 BUILD; 0/17 RUN** (see the BUILD analysis below).
 **Re-measured (this round):** on the actual 17 `stripped/test_*.py` files,
-CONVERT = test_calendar, test_fractions, test_heapq, test_operator, test_random,
-test_struct. BUILD of even the CONVERT files fails with **208–1388 rustc errors**
-each, dominated by `use crate::decimal/fractions/inspect/pickle` (stdlib modules
+CONVERT = test_calendar, test_fractions, test_heapq, test_hmac,
+test_operator, test_random, test_struct. BUILD of even the CONVERT files fails
+with **208–1388 rustc errors** each, dominated by `use crate::decimal/fractions/inspect/pickle` (stdlib modules
 rython does not emit as runtime modules) and `use crate::test::support` (CPython's
 own test scaffolding — `from test import support` is imported by ~all 17 files).
 That's the largest single BUILD wall: no file builds until `test.support` (and the
@@ -137,7 +137,7 @@ and `test.*` stdlib references, and asserts are dropped.
 | `test_functools` | BLOCKED | nested `class` at class level |
 | `test_statistics` | BLOCKED | `_make_std_err_msg` arity — **verified CPython-consistent**: `self._make_std_err_msg(a,b,c,d,e)` on a 5-param `def _make_std_err_msg(first,second,tol,rel,idx)` is a genuine `takes 5 … but 6 were given` TypeError under CPython too; rython's loud conversion error (reports 4/5) is correct-or-loud, only the *counts* differ. Then the harness. |
 | `test_re` | BLOCKED | `assertRaisesRegex` of an *intentional* runtime `TypeError` from `re.sub(...)` (error is correctly loud at compile time; needs harness to catch at runtime) |
-| `test_hmac` | BLOCKED | compare/binding issues (the `with self.subTest(...)` harness now lowers, #376) |
+| `test_hmac` | CONVERT | the `with self.subTest(...)` harness (now lowers) + the abstract-stub superset-arity method call (now LOWERS via the NotImplementedError-stub leniency — `CompareDigestMixin.compare_digest`, PR) |
 | `test_hashlib` | BLOCKED | `isinstance(x, class)` with a class second arg (classes not yet supported) — reached in `__init__`, before any harness |
 
 ## Reasons a file cannot (yet) convert — root causes

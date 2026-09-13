@@ -10612,6 +10612,21 @@ fn is_notimpl_stub(f: &crate::FunctionDef) -> bool {
         )
 }
 
+/// Like [`is_notimpl_stub`], but also accepts a leading DOCSTRING statement
+/// (`def m(a, b):\n    "abstract stub"\n    raise NotImplementedError` —
+/// hmac's `CompareDigestMixin.compare_digest`). Such a stub's single real
+/// statement is the raise.
+fn is_docstring_notimpl_stub(f: &crate::FunctionDef) -> bool {
+    let raises = |i: usize| matches!(&f.body[i].statement, crate::StatementType::Raise(_));
+    if raises(0) {
+        return f.body.len() == 1;
+    }
+    // A leading docstring (`Expr` of a String constant) then the raise.
+    f.body.len() == 2
+        && matches!(&f.body[0].statement, crate::StatementType::Expr(_))
+        && raises(1)
+}
+
 /// The class of a method-call receiver, when it is statically known:
 /// `self` inside a class's method body, or a local/module name whose
 /// (symbol-table-recorded) assignment constructs a known class. Unknown
@@ -12316,13 +12331,22 @@ fn map_call_arguments_inner(
         .map(|v| crate::ast::tree::arguments::vararg_element_type(v, &symbols, &options))
         .unwrap_or(crate::TypeInfo::PyValue);
     if args.len() > n && vararg_param.is_none() {
-        return Err(format!(
-            "{}() takes {} positional argument(s) but {} were given",
-            fname,
-            n,
-            args.len()
-        )
-        .into());
+        // A NotImplementedError STUB abstract method (`def m(a, b)` with only
+        // `raise NotImplementedError`, whose first param is treated as self)
+        // is overridden by a most-derived subclass at runtime. Rejecting a
+        // superset-arity call here would be a false positive: the call
+        // dispatches VIRTUALLY to the override. Skip the arity error so the
+        // override's signature governs (the same leniency the too-FEW case
+        // already grants a stub at the receiver-class drop above).
+        if !is_notimpl_stub(func) && !is_docstring_notimpl_stub(func) {
+            return Err(format!(
+                "{}() takes {} positional argument(s) but {} were given",
+                fname,
+                n,
+                args.len()
+            )
+            .into());
+        }
     }
 
     // Rendered values in Python's source evaluation order (positionals,
