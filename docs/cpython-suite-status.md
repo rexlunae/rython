@@ -17,9 +17,9 @@ missing *earlier* in a file, the file can only **convert and run** once the
 asserting (the harness calls are dropped as loud `-W` warnings), so they do
 not yet exhibit CPython-equal behavior.
 
-**Frontier: 7/17 CONVERT; 0/17 BUILD; 0/17 RUN** (see the BUILD analysis below).
+**Frontier: 8/17 CONVERT; 0/17 BUILD; 0/17 RUN** (see the BUILD analysis below).
 **Re-measured (this round):** on the actual 17 `stripped/test_*.py` files,
-CONVERT = test_calendar, test_fractions, test_heapq, test_hmac,
+CONVERT = test_calendar, test_fractions, test_hashlib, test_heapq, test_hmac,
 test_operator, test_random, test_struct. BUILD of even the CONVERT files fails
 with **208–1388 rustc errors** each, dominated by `use crate::decimal/fractions/inspect/pickle` (stdlib modules
 rython does not emit as runtime modules) and `use crate::test::support` (CPython's
@@ -138,7 +138,7 @@ and `test.*` stdlib references, and asserts are dropped.
 | `test_statistics` | BLOCKED | `_make_std_err_msg` arity — rython's `strip_self` correctly treats the receiver as the first param (`def _make_std_err_msg(first,second,tol,rel,idx)`, so 5 explicit args → too many, matching CPython's own `takes 5 … but 6 were given`). The enclosing `_check_approx_num` is NEVER invoked by any test, so the call is latent and CPython passes; rython over-rejects at CONVERT. A correct resolution is a debatable class-model decision, not a bounded fix |
 | `test_re` | BLOCKED | `assertRaisesRegex` of an *intentional* runtime `TypeError` from `re.sub(...)` (error is correctly loud at compile time; needs harness to catch at runtime) |
 | `test_hmac` | CONVERT | the `with self.subTest(...)` harness (now lowers) + the abstract-stub superset-arity method call (now LOWERS via the NotImplementedError-stub leniency — `CompareDigestMixin.compare_digest`, PR) |
-| `test_hashlib` | BLOCKED | `isinstance(x, class)` with a class second arg (classes not yet supported) — reached in `__init__`, before any harness |
+| `test_hashlib` | CONVERT | `isinstance(x, HASH)` with a DYNAMIC class is now a loud statically-true (class-as-value divergence, not an error) — but the crate needs hashlib_constructor + record/format support to BUILD |
 
 ## Reasons a file cannot (yet) convert — root causes
 
