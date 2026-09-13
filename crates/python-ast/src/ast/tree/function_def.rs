@@ -4298,20 +4298,26 @@ fn renderable_return_typeinfo(t: &crate::TypeInfo) -> bool {
 /// field types are structural and the coercion layers can match on them).
 pub(crate) fn simple_expr_typeinfo(expr: &ExprType) -> Option<crate::TypeInfo> {
     match expr {
-        ExprType::Constant(c) => match &c.0 {
-            Some(l0) if crate::ast::tree::constant::is_nonfinite_literal(&l0) => {
-                Some(crate::TypeInfo::Float)
+        ExprType::Constant(c) => {
+            // A complex sentinel (`\0RYTHON_COMPLEX:...`) is a Complex value.
+            if let Some(l0) = &c.0 && crate::ast::tree::constant::is_complex_literal(&*l0) {
+                return Some(crate::TypeInfo::Complex);
             }
-            Some(litrs::Literal::Integer(_)) => Some(crate::TypeInfo::Int),
-            Some(litrs::Literal::Float(_)) => Some(crate::TypeInfo::Float),
-            Some(litrs::Literal::Bool(_)) => Some(crate::TypeInfo::Bool),
-            // A string constant lowers to a &'static str literal (the
-            // field layer converts to owned String where fields need it).
-            Some(litrs::Literal::String(_)) => Some(crate::TypeInfo::StrRef),
-            Some(litrs::Literal::Byte(_)) | Some(litrs::Literal::ByteString(_)) => {
-                Some(crate::TypeInfo::Bytes)
+            match &c.0 {
+                Some(l0) if crate::ast::tree::constant::is_nonfinite_literal(&l0) => {
+                    Some(crate::TypeInfo::Float)
+                }
+                Some(litrs::Literal::Integer(_)) => Some(crate::TypeInfo::Int),
+                Some(litrs::Literal::Float(_)) => Some(crate::TypeInfo::Float),
+                Some(litrs::Literal::Bool(_)) => Some(crate::TypeInfo::Bool),
+                // A string constant lowers to a &'static str literal (the
+                // field layer converts to owned String where fields need it).
+                Some(litrs::Literal::String(_)) => Some(crate::TypeInfo::StrRef),
+                Some(litrs::Literal::Byte(_)) | Some(litrs::Literal::ByteString(_)) => {
+                    Some(crate::TypeInfo::Bytes)
+                }
+                _ => None,
             }
-            _ => None,
         },
         ExprType::JoinedStr(_) => Some(crate::TypeInfo::String),
         // `"sep".join(iterable)` — yields an owned String.

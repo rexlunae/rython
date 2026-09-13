@@ -5902,6 +5902,33 @@ fn complex_literals_and_arithmetic_lower_to_the_complex_runtime() {
 }
 
 #[test]
+fn complex_return_types_infer_complex() {
+    // #366: a function returning a complex value (a literal or a complex
+    // local) infers Result<Complex, PyException> — it must NOT be coerced to
+    // Result<&str> (the complex sentinel's String-carrying representation).
+    let out = compile(
+        concat!(
+            "def f():\n",
+            "    return 1j\n",
+            "def g():\n",
+            "    a = 3.5j\n",
+            "    return a\n",
+        ),
+        "complex_ret.py",
+    );
+    assert!(
+        out.contains("f () -> Result < Complex") && out.contains("g () -> Result < Complex"),
+        "a complex-returning function must infer Result<Complex>: {}",
+        out
+    );
+    assert!(
+        !out.contains("Result < & 'static str") && !out.contains("Result < &'static str"),
+        "a complex return must not be typed as a string: {}",
+        out
+    );
+}
+
+#[test]
 fn integral_float_literals_keep_their_float_type() {
     // 2.0 must stay a float literal: Rust's Display drops the ".0" and the
     // re-parse would silently produce an integer (2.0 / 4 is 0.5 in
