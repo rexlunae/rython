@@ -173,6 +173,53 @@ pub(crate) fn strip_trailing_question(tokens: &proc_macro2::TokenStream) -> proc
 /// rendering were inlined into that match, every recursive frame would grow
 /// and deeply-nested conversions (`len(list(takewhile(lambda, reversed(it))))`)
 /// would overflow the codegen stack (the round-17 hazard).
+
+/// Box one asserted argument as a `PyValue`, for the runtime `unittest`
+/// helpers. Returns `None` when the argument's type is not unambiguously
+/// boxable.
+#[inline(never)]
+fn box_assert_argument(
+    arg: &crate::ExprType,
+    ctx: crate::CodeGenContext,
+    options: crate::PythonOptions,
+    symbols: crate::SymbolTableScopes,
+) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+    let r = arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+    // A bare `None` lowers to `PyValue::None_`, which boxes reflexively. The
+    // parser yields `Constant(None)` for a literal `None` and `NoneType` for
+    // synthesized ones — accept both.
+    if matches!(arg, crate::ExprType::NoneType(_))
+        || matches!(arg, crate::ExprType::Constant(c) if c.0.is_none())
+    {
+        return Ok(Some(quote!(PyValue::from(#r))));
+    }
+    match crate::infer_type(Some(&ctx), arg, &options, &symbols) {
+        // A list: box as a tuple of boxed elements. Only when the element
+        // itself converts into `PyValue` (a nested list does not, yet).
+        crate::TypeInfo::Vec(inner)
+            if matches!(
+                *inner,
+                crate::TypeInfo::Int
+                    | crate::TypeInfo::Float
+                    | crate::TypeInfo::Bool
+                    | crate::TypeInfo::StrRef
+                    | crate::TypeInfo::String
+                    | crate::TypeInfo::Bytes
+                    | crate::TypeInfo::PyValue
+            ) =>
+        {
+            Ok(Some(quote!(unittest::list_to_pyvalue(#r))))
+        }
+        crate::TypeInfo::Int
+        | crate::TypeInfo::Float
+        | crate::TypeInfo::Bool
+        | crate::TypeInfo::StrRef
+        | crate::TypeInfo::String
+        | crate::TypeInfo::Bytes
+        | crate::TypeInfo::PyValue => Ok(Some(quote!(PyValue::from(#r)))),
+        _ => Ok(None),
+    }
+}
 #[inline(never)]
 fn lower_unittest_assert(
     call: crate::Call,
@@ -190,55 +237,28 @@ fn lower_unittest_assert(
         "assertFalse" => ("assert_false", false),
         "assertIsNone" => ("assert_is_none", false),
         "assertIsNotNone" => ("assert_is_not_none", false),
+        "assertGreater" => ("assert_greater", true),
+        "assertGreaterEqual" => ("assert_greater_equal", true),
+        "assertLess" => ("assert_less", true),
+        "assertLessEqual" => ("assert_less_equal", true),
         _ => unreachable!(),
     };
     let nargs = if two_arg { 2 } else { 1 };
-    // Box each asserted argument. `PyValue::from` is right for the scalar
-    // shapes, but it maps `Vec<u8>` to `Bytes` — a Python LIST (`Vec<i64>`,
-    // `Vec<String>`, …) must go through `unittest::list_to_pyvalue`
-    // (list → `PyValue::Tuple`, the documented list-as-tuple divergence).
-    // Any argument whose type is neither a boxable scalar nor a list of
-    // them (a tuple/set/dict/option/class/nested list) keeps the
-    // pre-existing loud drop — never a silently wrong comparison.
+    // Box each asserted argument (see `box_assert_argument`); any argument
+    // that is not unambiguously boxable keeps the pre-existing loud drop —
+    // never a silently wrong comparison.
     let mut rendered: Vec<TokenStream> = Vec::new();
     for arg in call.args.iter().take(nargs) {
-        let r = arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        // A bare `None` lowers to `PyValue::None_`, which boxes reflexively.
-        // The parser yields `Constant(None)` for a literal `None` and
-        // `NoneType` for synthesized ones — accept both.
-        if matches!(arg, crate::ExprType::NoneType(_))
-            || matches!(arg, crate::ExprType::Constant(c) if c.0.is_none())
-        {
-            rendered.push(quote!(PyValue::from(#r)));
-            continue;
+        if let Some(boxed) = box_assert_argument(
+            arg,
+            ctx.clone(),
+            options.clone(),
+            symbols.clone(),
+        )? {
+            rendered.push(boxed);
+        } else {
+            return Ok(None);
         }
-        let boxed = match crate::infer_type(Some(&ctx), arg, &options, &symbols) {
-            // A list: box as a tuple of boxed elements. Only when the element
-            // itself converts into `PyValue` (a nested list does not, yet).
-            crate::TypeInfo::Vec(inner)
-                if matches!(
-                    *inner,
-                    crate::TypeInfo::Int
-                        | crate::TypeInfo::Float
-                        | crate::TypeInfo::Bool
-                        | crate::TypeInfo::StrRef
-                        | crate::TypeInfo::String
-                        | crate::TypeInfo::Bytes
-                        | crate::TypeInfo::PyValue
-                ) =>
-            {
-                quote!(unittest::list_to_pyvalue(#r))
-            }
-            crate::TypeInfo::Int
-            | crate::TypeInfo::Float
-            | crate::TypeInfo::Bool
-            | crate::TypeInfo::StrRef
-            | crate::TypeInfo::String
-            | crate::TypeInfo::Bytes
-            | crate::TypeInfo::PyValue => quote!(PyValue::from(#r)),
-            _ => return Ok(None),
-        };
-        rendered.push(boxed);
     }
     let helper_ident = quote::format_ident!("{}", helper);
     // The msg= context (a String), or an empty string when absent.
@@ -314,6 +334,122 @@ fn lower_assert_raises(
     };
     let exc = quote!(#exc_name);
     Ok(Some(quote!(unittest::assert_raises(#exc, || #body)?)))
+}
+
+/// Lower `self.assertIsInstance(obj, cls)` (or `assertNotIsInstance`) to the
+/// runtime helpers. `cls` must be a statically-known builtin type NAME; a
+/// tuple of types or an unknown class keeps the loud drop.
+#[inline(never)]
+fn lower_assert_is_instance(
+    call: crate::Call,
+    negate: bool,
+    ctx: crate::CodeGenContext,
+    options: crate::PythonOptions,
+    symbols: crate::SymbolTableScopes,
+) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+    if call.args.len() != 2 {
+        return Ok(None);
+    }
+    let type_name = match &call.args[1] {
+        crate::ExprType::Name(n) => n.id.clone(),
+        _ => return Ok(None),
+    };
+    let obj = box_assert_argument(
+        &call.args[0],
+        ctx.clone(),
+        options.clone(),
+        symbols.clone(),
+    )?;
+    if let Some(obj_box) = obj {
+        let helper = if negate {
+            "assert_not_is_instance"
+        } else {
+            "assert_is_instance"
+        };
+        let helper_ident = quote::format_ident!("{}", helper);
+        // CPython's `assertIsInstance(obj, int)` has no `msg=` (it is a
+        // positional-only signature check), so no message thread here.
+        let tname = quote!(#type_name);
+        Ok(Some(quote!(unittest::#helper_ident(&#obj_box, #tname, "".to_string())?)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// `self.assertAlmostEqual(a, b, places=7, delta=None, msg=None)` (and the
+/// `assertNotAlmostEqual` negation): lower to the runtime helper. Both operand
+/// args are boxed (`box_assert_argument`); a non-boxable operand keeps the
+/// loud drop. `places` is an i64 expression (default 7); `delta` is boxed as
+/// an `Option<PyValue>` (runtime coerces it to float).
+#[inline(never)]
+fn lower_assert_almost(
+    call: crate::Call,
+    negate: bool,
+    ctx: crate::CodeGenContext,
+    options: crate::PythonOptions,
+    symbols: crate::SymbolTableScopes,
+) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+    if call.args.len() != 2 {
+        return Ok(None);
+    }
+    let mut rendered: Vec<TokenStream> = Vec::new();
+    for arg in call.args.iter() {
+        if let Some(boxed) = box_assert_argument(
+            arg,
+            ctx.clone(),
+            options.clone(),
+            symbols.clone(),
+        )? {
+            rendered.push(boxed);
+        } else {
+            return Ok(None);
+        }
+    }
+    // `places=` (i64, default 7) and `delta=` (boxed PyValue, default None).
+    // Unknown keywords (other than msg=) are not lowered.
+    let mut places = quote!(7i64);
+    let mut delta = quote!(None::<PyValue>);
+    for k in call.keywords.iter() {
+        let name = k.arg.as_deref();
+        if name == Some("places") {
+            let v = k.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            places = quote!(#v);
+        } else if name == Some("delta") {
+            if let Some(boxed) = box_assert_argument(
+                &k.value,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )? {
+                delta = quote!(Some::<PyValue>(#boxed));
+            } else {
+                return Ok(None);
+            }
+        } else if name != Some("msg") {
+            // Unknown keyword (e.g. a dynamic msg) — not lowered.
+            return Ok(None);
+        }
+    }
+    // `msg=` context (a String), empty when absent.
+    let msg = match call
+        .keywords
+        .iter()
+        .find(|k| k.arg.as_deref() == Some("msg")) {
+        Some(k) => {
+            let v = k.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            quote!(#v.to_string())
+        }
+        None => quote!("".to_string()),
+    };
+    let helper = if negate {
+        "assert_not_almost_eq"
+    } else {
+        "assert_almost_eq"
+    };
+    let helper_ident = quote::format_ident!("{}", helper);
+    let a = &rendered[0];
+    let b = &rendered[1];
+    Ok(Some(quote!(unittest::#helper_ident(&#a, &#b, #places, &#delta, #msg)?)))
 }
 
 /// A Name resolving (through ImportFrom re-export chains) to a module-level
@@ -9151,7 +9287,11 @@ let mutating_self_field = boxed_self_ref_receiver
                 || attr.attr == "assertTrue"
                 || attr.attr == "assertFalse"
                 || attr.attr == "assertIsNone"
-                || attr.attr == "assertIsNotNone")
+                || attr.attr == "assertIsNotNone"
+                || attr.attr == "assertGreater"
+                || attr.attr == "assertGreaterEqual"
+                || attr.attr == "assertLess"
+                || attr.attr == "assertLessEqual")
         {
             if let Some(tokens) = lower_unittest_assert(
                 self.clone(),
@@ -9180,6 +9320,43 @@ let mutating_self_field = boxed_self_ref_receiver
             )?
         {
             return Ok(tokens);
+        }
+
+        // `self.assertIsInstance(obj, cls)` / `assertNotIsInstance`. Returns
+        // None (the loud drop) for a tuple/unknown class or an unboxable obj.
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && (attr.attr == "assertIsInstance" || attr.attr == "assertNotIsInstance")
+        {
+            let negate = attr.attr == "assertNotIsInstance";
+            if let Some(tokens) = lower_assert_is_instance(
+                self.clone(),
+                negate,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )?
+            {
+                return Ok(tokens);
+            }
+        }
+
+        // `self.assertAlmostEqual(a, b, places=, delta=, msg=)` and the
+        // `assertNotAlmostEqual` negation. Returns None (the loud drop) for a
+        // non-boxable operand / delta or an unknown keyword.
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && (attr.attr == "assertAlmostEqual" || attr.attr == "assertNotAlmostEqual")
+        {
+            let negate = attr.attr == "assertNotAlmostEqual";
+            if let Some(tokens) = lower_assert_almost(
+                self.clone(),
+                negate,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+            )?
+            {
+                return Ok(tokens);
+            }
         }
 
         // A call through a SELF member that is neither a method nor a

@@ -5651,6 +5651,179 @@ fn unittest_assert_raises_with_a_returning_body_stays_a_loud_drop() {
 }
 
 #[test]
+fn unittest_subtest_context_manager_runs_body_directly() {
+    // `with self.subTest(**kw): body` — the unittest reporting CM. It only
+    // reframes per-iteration reporting (no exception suppression, no control
+    // flow change), so the body runs directly: a passing subTest passes and a
+    // failing one fails, exactly the observable test outcome. No closure is
+    // allowed (a subTest body may legitimately return/break/continue).
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        with self.subTest(step=1):\n",
+            "            if 1 == 2:\n",
+            "                return\n",
+            "            self.assertEqual(1, 1)\n",
+        ),
+        "subtest.py",
+    );
+    assert!(
+        out.contains("unittest :: assert_eq (") && out.contains("return Ok (())"),
+        "the subTest body must run directly (real asserts, real return): {}",
+        out
+    );
+    assert!(
+        !out.contains("subTest") && !out.contains("assert_raises ("),
+        "subTest must not become a closure/assertRaises lowering: {}",
+        out
+    );
+}
+
+#[test]
+fn unittest_subtest_does_not_suppress_a_failing_body() {
+    // A body that raises keeps raising (subTest does not suppress) — the
+    // lowering must NOT wrap it in a closure that turns the error into a pass.
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        with self.subTest(step=1):\n",
+            "            raise ValueError(\"boom\")\n",
+        ),
+        "subtest_raise.py",
+    );
+    assert!(
+        out.contains("Err (") && !out.contains("assert_raises ("),
+        "a failing subTest body must keep its failure: {}",
+        out
+    );
+}
+
+#[test]
+fn unittest_assert_is_instance_lowers() {
+    // `self.assertIsInstance(obj, cls)` lowers to the runtime helper with the
+    // type NAME as a string; `assertNotIsInstance` to its negated sibling.
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        self.assertIsInstance(5, int)\n",
+            "        self.assertNotIsInstance(5, str)\n",
+        ),
+        "assert_isinstance.py",
+    );
+    assert!(
+        out.contains("assert_is_instance (") && out.contains("\"int\""),
+        "assertIsInstance must lower with the type name: {}",
+        out
+    );
+    assert!(
+        out.contains("assert_not_is_instance ("),
+        "assertNotIsInstance must lower: {}",
+        out
+    );
+}
+
+#[test]
+fn unittest_assert_is_instance_with_a_tuple_specifier_stays_a_loud_drop() {
+    // `assertIsInstance(obj, (int, str))` — a tuple of types — is not a
+    // statically-known single builtin NAME, so it keeps the loud drop.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        self.assertIsInstance(5, (int, str))\n",
+        ),
+        "assert_isinstance_tuple.py",
+    );
+    assert!(
+        !out.contains("assert_is_instance ("),
+        "a tuple specifier must not lower: {}",
+        out
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("dropped")),
+        "the drop must be loud through -W: {:?}",
+        warnings
+    );
+}
+
+#[test]
+fn unittest_assert_order_comparisons_lower() {
+    // `self.assertGreater/assertGreaterEqual/assertLess/assertLessEqual` lower
+    // to their runtime order helpers (2 boxed args + msg).
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        self.assertGreater(2, 1)\n",
+            "        self.assertGreaterEqual(2, 2)\n",
+            "        self.assertLess(1, 2)\n",
+            "        self.assertLessEqual(1, 1)\n",
+        ),
+        "assert_order.py",
+    );
+    assert!(
+        out.contains("unittest :: assert_greater (")
+            && out.contains("unittest :: assert_greater_equal (")
+            && out.contains("unittest :: assert_less (")
+            && out.contains("unittest :: assert_less_equal ("),
+        "assertGreater/Less family must lower: {}",
+        out
+    );
+    assert!(
+        !out.contains("is neither a method nor a field"),
+        "assert order comparisons must not drop: {}",
+        out
+    );
+}
+
+#[test]
+fn unittest_assert_almost_equal_lowers() {
+    // `self.assertAlmostEqual(a, b [, places= | delta=] [, msg=])` lowers to
+    // the runtime helper with `places` as an i64 and `delta` boxed into an
+    // `Option<PyValue>`; `assertNotAlmostEqual` lowers to its negated sibling.
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self):\n",
+            "        self.assertAlmostEqual(1.0, 1.0)\n",
+            "        self.assertAlmostEqual(1.0, 1.0000001, places=5, msg=\"ctx\")\n",
+            "        self.assertAlmostEqual(1.0, 1.01, delta=0.1)\n",
+            "        self.assertNotAlmostEqual(1.0, 2.0)\n",
+        ),
+        "assert_almost.py",
+    );
+    assert!(
+        out.contains("unittest :: assert_almost_eq (") && out.contains("Some :: < PyValue"),
+        "assertAlmostEqual must lower with a boxed delta Option: {}",
+        out
+    );
+    assert!(
+        out.contains("unittest :: assert_not_almost_eq ("),
+        "assertNotAlmostEqual must lower: {}",
+        out
+    );
+    assert!(
+        out.contains("7 i64") || out.contains("7i64") || out.contains("places"),
+        "default places must be present: {}",
+        out
+    );
+    assert!(
+        !out.contains("is neither a method nor a field"),
+        "assertAlmostEqual must not drop: {}",
+        out
+    );
+}
+
+#[test]
 fn integral_float_literals_keep_their_float_type() {
     // 2.0 must stay a float literal: Rust's Display drops the ".0" and the
     // re-parse would silently produce an integer (2.0 / 4 is 0.5 in

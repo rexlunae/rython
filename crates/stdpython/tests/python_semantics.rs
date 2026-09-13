@@ -4368,3 +4368,127 @@ fn csv_reader_quote_none_with_escapechar_matches_cpython() {
     let r3 = reader(&["\"a,b\",c"], false, None).unwrap();
     assert_eq!(r3[0], vec!["a,b", "c"]);
 }
+
+#[test]
+fn unittest_assert_almost_eq_matches_cpython() {
+    // Verified against CPython 3.14.1 (`assertAlmostEqual`/`assertNotAlmostEqual`).
+    // `PyValue` boxes ints/floats; `places` is an i64 (default 7), `delta` an
+    // `Option<PyValue>` (runtime coerces to float).
+    use stdpython::stdlib::unittest::{assert_almost_eq, assert_not_almost_eq};
+    use stdpython::PyValue;
+
+    // Equal values pass regardless of places.
+    assert_almost_eq(&PyValue::from(1.0), &PyValue::from(1.0), 7, &None, "".to_string()).unwrap();
+    // A tiny diff passes at the default 7 places.
+    assert_almost_eq(
+        &PyValue::from(1.0),
+        &PyValue::from(1.0 + 1e-12),
+        7,
+        &None,
+        "".to_string(),
+    )
+    .unwrap();
+    // `0.0000001` is NOT within 7 places: round(1e-7, 7) == 1e-7 != 0 -> fail.
+    assert_almost_eq(&PyValue::from(1.0), &PyValue::from(1.0000001), 7, &None, "".to_string())
+        .err()
+        .unwrap();
+    // At 5 places the same diff passes (round(1e-7, 5) == 0).
+    assert_almost_eq(&PyValue::from(1.0), &PyValue::from(1.0000001), 5, &None, "".to_string())
+        .unwrap();
+    // `delta=` tolerance: abs(1.01 - 1.0) == 0.01 <= 0.1 -> pass.
+    assert_almost_eq(
+        &PyValue::from(1.0),
+        &PyValue::from(1.01),
+        7,
+        &Some::<PyValue>(PyValue::from(0.1)),
+        "".to_string(),
+    )
+    .unwrap();
+    // An int delta is coerced: abs(2 - 1) == 1 <= 1 -> pass.
+    assert_almost_eq(
+        &PyValue::from(1i64),
+        &PyValue::from(2i64),
+        7,
+        &Some::<PyValue>(PyValue::from(1i64)),
+        "".to_string(),
+    )
+    .unwrap();
+    // 1 vs 5 differs well beyond 7 places -> fail.
+    assert_almost_eq(&PyValue::from(1i64), &PyValue::from(5i64), 7, &None, "".to_string())
+        .err()
+        .unwrap();
+    // assertNotAlmostEqual is the negation.
+    assert_not_almost_eq(
+        &PyValue::from(1.0),
+        &PyValue::from(1.0000001),
+        7,
+        &None,
+        "".to_string(),
+    )
+    .unwrap();
+    assert_not_almost_eq(&PyValue::from(1.0), &PyValue::from(1.0), 7, &None, "".to_string())
+        .err()
+        .unwrap();
+}
+
+#[test]
+fn unittest_assert_order_comparisons_match_cpython() {
+    // Verified against CPython 3.14.1 (`assertGreater`/`assertGreaterEqual`/
+    // `assertLess`/`assertLessEqual`) for int/float/bool numeric ordering and
+    // str lexicographic ordering.
+    use stdpython::stdlib::unittest::{
+        assert_greater,
+        assert_greater_equal,
+        assert_less,
+        assert_less_equal,
+    };
+    use stdpython::PyValue;
+
+    assert_greater(&PyValue::from(2i64), &PyValue::from(1i64), "".to_string()).unwrap();
+    assert_greater(&PyValue::from(2.5), &PyValue::from(2), "".to_string()).unwrap();
+    // bool orders numerically (CPython: 2 > True, since True == 1).
+    assert_greater(&PyValue::from(2i64), &PyValue::from(true), "".to_string()).unwrap();
+    assert_greater_equal(&PyValue::from(2i64), &PyValue::from(2i64), "".to_string()).unwrap();
+    assert_less(&PyValue::from(1i64), &PyValue::from(2i64), "".to_string()).unwrap();
+    assert_less(&PyValue::from("a".to_string()), &PyValue::from("b".to_string()), "".to_string())
+        .unwrap();
+    assert_less_equal(&PyValue::from(1i64), &PyValue::from(1i64), "".to_string()).unwrap();
+
+    // Failures carry the ordering phrase.
+    assert_eq!(
+        assert_greater(&PyValue::from(1i64), &PyValue::from(2i64), "".to_string())
+            .err()
+            .unwrap()
+            .message,
+        "1 not greater than 2"
+    );
+    assert_eq!(
+        assert_greater_equal(&PyValue::from(1i64), &PyValue::from(2i64), "".to_string())
+            .err()
+            .unwrap()
+            .message,
+        "1 not greater than or equal to 2"
+    );
+    assert_eq!(
+        assert_less(&PyValue::from(2i64), &PyValue::from(1i64), "".to_string())
+            .err()
+            .unwrap()
+            .message,
+        "2 not less than 1"
+    );
+    // The msg= context prefixes the message.
+    assert_eq!(
+        assert_less_equal(&PyValue::from(2i64), &PyValue::from(1i64), "ctx".to_string())
+            .err()
+            .unwrap()
+            .message,
+        "ctx: 2 not less than or equal to 1"
+    );
+    // Incomparable operands fail loudly rather than silently guessing.
+    assert!(
+        assert_greater(&PyValue::from("a".to_string()), &PyValue::from(1i64), "".to_string())
+            .err()
+            .unwrap()
+            .matches("AssertionError")
+    );
+}

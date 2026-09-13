@@ -29,6 +29,25 @@ fn assert_raises_cm_name(expr: &ExprType) -> Option<String> {
     }
 }
 
+/// Whether a `with` expression is the unittest `self.subTest(...)` context
+/// manager. CPython's subTest(**) only REFRAMES reporting (each iteration is
+/// recorded as its own sub-result); it does not suppress exceptions or alter
+/// control flow — a passing subTest passes and a failing one fails. So the
+/// lowering runs the body directly, which reproduces the exact pass/fail
+/// outcome (exit code / recorded failure). The per-subtest-named reporting
+/// granularity of CPython's runner is not reproduced (rython's runner counts
+/// whole test methods); that is a runner-visibility difference, not an
+/// observable pass/fail divergence, and is documented at the call site.
+fn is_subtest_cm(expr: &ExprType) -> bool {
+    let ExprType::Call(c) = expr else {
+        return false;
+    };
+    let ExprType::Attribute(a) = c.func.as_ref() else {
+        return false;
+    };
+    a.attr == "subTest"
+}
+
 /// Whether a `with` body contains a `return`/`break`/`continue` that would
 /// have to escape the closure the assertRaises lowering wraps it in.
 fn body_escapes_a_closure(body: &[Statement]) -> bool {
@@ -164,6 +183,29 @@ impl CodeGen for With {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // `with self.subTest(...):` — the unittest reporting CM (issue #334).
+        // It only reframes per-iteration REPORTING; for the observable test
+        // outcome the body's pass/fail is unchanged, so run the body directly
+        // (a closure would be WRONG here — a subTest body may legitimately
+        // return/break/continue, and subTest does not suppress exceptions).
+        // See `is_subtest_cm` for the reporting-only divergence note.
+        if self.items.len() == 1
+            && self.items[0].optional_vars.is_none()
+            && is_subtest_cm(&self.items[0].context_expr)
+        {
+            let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
+                .body
+                .iter()
+                .map(|stmt| {
+                    stmt.clone()
+                        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                })
+                .collect();
+            let body_tokens = body_tokens?;
+            return Ok(quote! {
+                #(#body_tokens;)*
+            });
+        }
         // `with self.assertRaises(Exc):` — the unittest context-manager form
         // (issue #334). The body runs inside a closure whose `Result` is
         // asserted to have raised `Exc` (matching `assert_raises`): a raised
