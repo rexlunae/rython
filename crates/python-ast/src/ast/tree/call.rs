@@ -5623,6 +5623,26 @@ impl<'a> CodeGen for Call {
                             );
                             continue;
                         }
+                        // textwrap wrap/fill/indent/shorten/dedent: a `**kwargs`
+                        // SPREAD (`wrap(text, width, **kwargs)` — test_textwrap's
+                        // check_wrap forwards its **kwargs on, e.g. carrying
+                        // initial_indent/drop_whitespace). The spread's keys are
+                        // dynamic at this lowering, and rython's wrap(text,
+                        // width) models only the width — the forwarded options
+                        // are dropped (the dynamic-kwargs divergence), loudly.
+                        None if matches!(
+                            fname.as_str(),
+                            "wrap" | "fill" | "indent" | "shorten" | "dedent"
+                        ) => {
+                            options.definition_warnings.borrow_mut().push(format!(
+                                "{}() `**kwargs`-spread options are dropped (rython's \
+                                 {} lowers only its positional form; the dynamic \
+                                 keyword options are the dynamic-kwargs divergence)",
+                                fname,
+                                fname
+                            ));
+                            continue;
+                        }
                         _ => {
                             return Err(format!(
                                 "{}() got an unexpected keyword argument '{}'",
