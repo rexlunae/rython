@@ -3254,6 +3254,36 @@ fn isinstance_type_call_unknown_argument_warns_divergence() {
 }
 
 #[test]
+fn isinstance_with_a_dynamic_class_is_a_loud_statically_true() {
+    // issue #367: `isinstance(x, HASH)` where HASH is a DYNAMIC class value
+    // (hashlib's `HASH = getattr(_hashlib, 'HASH', None)`). rython has no
+    // predicate for an arbitrary class value, so — as with a type-class
+    // parameter — the check lowers to STATICALLY TRUE with a loud -W warning
+    // (the class-as-value divergence), not a conversion error. This unblocks
+    // test_hashlib's CONVERT.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "HASH = getattr(_hashlib, 'HASH')\n",
+            "def f(h):\n",
+            "    if HASH is not None and isinstance(h, HASH):\n",
+            "        return 1\n",
+            "    return 0\n",
+        ),
+        "isinstance_dyn.py",
+    );
+    assert!(
+        out.contains("true") && !out.contains("cannot convert"),
+        "a dynamic-class isinstance must lower to statically true (not error): {}",
+        out
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("statically true") || w.contains("class-as-value divergence")),
+        "the drop must be loud through -W: {:?}",
+        warnings
+    );
+}
+
+#[test]
 fn nonself_receiver_is_renamed_through_the_body_and_nested_scopes() {
     // Python binds the instance to the FIRST parameter whatever its name
     // (issue #132, boto3's factory_self): body references rename to the

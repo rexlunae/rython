@@ -3720,13 +3720,23 @@ impl<'a> CodeGen for Call {
                                     ));
                                     return Ok(quote!(true));
                                 } else {
-                                    return Err(format!(
-                                        "isinstance() second argument must be int, float, \
-                                         str, bool, bytes, bytearray, tuple, or a tuple of \
-                                         those (got `{:?}`); classes are not supported yet",
+                                    // An UNKNOWN class name (`isinstance(x,
+                                    // HASH)` where HASH is a dynamic class —
+                                    // hashlib's `getattr(_hashlib, 'HASH')`,
+                                    // issue #367). rython has no predicate for
+                                    // an arbitrary class value, so, as with a
+                                    // TYPE-CLASS PARAMETER above, the check is
+                                    // treated as STATICALLY TRUE (loud, the
+                                    // class-as-value divergence) rather than a
+                                    // conversion error.
+                                    options.definition_warnings.borrow_mut().push(format!(
+                                        "isinstance with a dynamic/unknown class \
+                                         (`{:?}`) is statically true: rython cannot \
+                                         predicate an arbitrary class value (the \
+                                         class-as-value divergence)",
                                         t
-                                    )
-                                    .into());
+                                    ));
+                                    return Ok(quote!(true));
                                 }
                             }
                             // A tuple of type names: `isinstance(x, (bytearray, bytes))`
