@@ -4689,6 +4689,39 @@ fn float_coercible_class_lowers_via_float_and_into() {
 }
 
 #[test]
+fn math_trunc_refuses_float_only_classes() {
+    // math.trunc dispatches via __trunc__ in CPython (not __float__), so a
+    // __float__-only class passed to math.trunc must NOT silently
+    // convert (CPython raises TypeError); rython models __float__-coercion
+    // but not __trunc__, so it is a LOUD refusal. Genuine scalars pass
+    // through.
+    let out = compile(
+        "import math\nr = math.trunc(1.5)\n",
+        "trunc_scalar.py",
+    );
+    assert!(
+        out.contains("math :: trunc (1.5)"),
+        "a scalar math.trunc must pass through: {}",
+        out
+    );
+    let err = compile_err(
+        concat!(
+            "import math\n",
+            "class A:\n",
+            "    def __float__(self):\n",
+            "        return 1.2\n",
+            "r = math.trunc(A())\n",
+        ),
+        "trunc_class.py",
+    );
+    assert!(
+        err.contains("__trunc__"),
+        "math.trunc of a __float__-only class must refuse loudly: {}",
+        err
+    );
+}
+
+#[test]
 fn user_methods_shadow_builtin_method_rewrites() {
     // A user-defined method named like a dict/list builtin must resolve to
     // the class, not the py_get rewrite.
