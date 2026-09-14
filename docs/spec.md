@@ -2007,7 +2007,10 @@ to CPython's MT19937), `os`/`os.path`, `sys`, `json`, `re`
 groups; backreferences/lookarounds are a loud `re.error`),
 `datetime`/`time` (incl. `strptime`, keyword `replace()`), `itertools`
 (lazy iterators), `functools` (`reduce`, `partial`, `lru_cache`),
-`heapq`, `copy`, `textwrap`, `hashlib`, `csv` (default excel dialect),
+`heapq`, `copy`, `textwrap`, `hashlib`, `csv` (default excel dialect; the
+reader/writer thread a literal `delimiter=` and a named dialect from a
+std-gated `register_dialect`/`get_dialect` registry — dialect OBJECTS,
+`DictReader`/`DictWriter`/`Sniffer`/`field_size_limit` stay unsupported),
 `collections` (`Counter`, `deque`, `defaultdict`, `OrderedDict`,
 `ChainMap`), `pathlib`, `glob`, `subprocess`, `tempfile`, `argparse`
 (conversion-time; §10.3), `string`, `io` (`StringIO`/`BytesIO`),

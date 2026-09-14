@@ -7413,7 +7413,7 @@ fn stringio_and_csv_writer_lower_with_mut_borrows() {
     let out = compile(src, "csw1.py");
     assert!(out.contains("io :: StringIO ()"), "generated: {}", out);
     assert!(
-        out.contains("csv :: writer (& mut (buf) , \"\\r\\n\" . to_string () , false , None :: < u8 >)"),
+        out.contains("csv :: writer (& mut (buf) , \"\\r\\n\" . to_string () , b',' , false , None :: < u8 >)"),
         "generated: {}",
         out
     );
@@ -7462,7 +7462,7 @@ fn csv_writer_accepts_the_lineterminator_keyword() {
         "csw_lt.py",
     );
     assert!(
-        out.contains("csv :: writer (& mut (b) , (\"\\n\") . to_string () , false , None :: < u8 >)"),
+        out.contains("csv :: writer (& mut (b) , (\"\\n\") . to_string () , b',' , false , None :: < u8 >)"),
         "generated: {}",
         out
     );
@@ -7502,9 +7502,60 @@ fn csv_writer_accepts_quoting_and_escapechar() {
         "csw_quote.py",
     );
     assert!(
-        out.contains("csv :: writer (& mut (b) , \"\\r\\n\" . to_string () , true , Some :: < u8 > ((\"\\\\\") . as_bytes () [0]))"),
+        out.contains("csv :: writer (& mut (b) , \"\\r\\n\" . to_string () , b',' , true , Some :: < u8 > ((\"\\\\\") . as_bytes () [0]))"),
         "generated: {}",
         out
+    );
+}
+
+#[test]
+fn csv_reader_dialect_name_and_delimiter_thread_the_separator() {
+    // issue #369: `csv.reader(f, 'a_dialect_name')` resolves the named
+    // dialect's delimiter through the std-gated runtime registry
+    // (`stdpython::csv::dialect_delimiter(name)`), and a literal
+    // `delimiter=';'` renders its code point — the seam that lets
+    // csv.reader honour a registered dialect (test_csv's
+    // TestDialectRegistry.test_register_kwargs).
+    let out = compile(
+        "import csv\nrows = csv.reader(['X;Y;Z'], 'unix')\n",
+        "crd_dialect.py",
+    );
+    assert!(
+        out.contains("csv :: reader (& (vec ! [(\"X;Y;Z\") . to_string ()]) , stdpython :: csv :: dialect_delimiter (& (\"unix\")) ? , false , None :: < u8 >) ?"),
+        "must resolve the named dialect's delimiter: {}",
+        out
+    );
+    let out2 = compile(
+        "import csv\nrows = csv.reader(['X;Y;Z'], delimiter=';')\n",
+        "crd_delim.py",
+    );
+    assert!(
+        out2.contains("csv :: reader (& (vec ! [(\"X;Y;Z\") . to_string ()]) , 59u8 , false , None :: < u8 >) ?"),
+        "the literal delimiter must render as its byte: {}",
+        out2
+    );
+    // A dialect NAME held in a VARIABLE (test_csv's test_register_kwargs:
+    // `csv.reader(['X;Y;Z'], name)`) resolves the runtime registry with the
+    // variable, not a hard-coded byte.
+    let out3 = compile(
+        "import csv\nname = 'semi'\nrows = csv.reader(['X;Y;Z'], name)\n",
+        "crd_dvarname.py",
+    );
+    assert!(
+        out3.contains("dialect_delimiter (& (name))"),
+        "the dialect-name variable must reach the runtime registry: {}",
+        out3
+    );
+    // More than two positional args is a loud refusal (fmtparams are
+    // keyword-only in CPython — correct-or-loud, never silently dropped).
+    let err = compile_err(
+        "import csv\nrows = csv.reader(['X;Y;Z'], 'unix', 'extra')\n",
+        "crd_toomany.py",
+    );
+    assert!(
+        err.contains("takes from 1 to 2 positional arguments"),
+        "a 3rd positional arg must be loud: {}",
+        err
     );
 }
 

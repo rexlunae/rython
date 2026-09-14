@@ -2337,7 +2337,7 @@ mod csv_module {
     use stdpython::csv::reader;
 
     fn rows(lines: &[&str]) -> Vec<Vec<String>> {
-        reader(lines, false, None).unwrap()
+        reader(lines, b',', false, None).unwrap()
     }
 
     #[test]
@@ -2395,12 +2395,62 @@ mod csv_module {
         // readlines elements keeps it: python3 gives 'x\ny'.
         assert_eq!(rows(&["a,\"x\n", "y\"\n"]), vec![vec!["a", "x\ny"]]);
         // An unquoted newline with data after it is csv.Error.
-        let e = reader(&["a\nb,c"], false, None).unwrap_err();
+        let e = reader(&["a\nb,c"], b',', false, None).unwrap_err();
         assert_eq!(
             format!("{}", e),
             "csv.Error: new-line character seen in unquoted field - do you \
              need to open the file with newline=''?"
         );
+    }
+}
+
+mod csv_dialect_registry {
+    use stdpython::stdlib::csv;
+
+    #[test]
+    fn delimiter_threads_through_reader_and_writer() {
+        // A non-comma delimiter splits (semicolon; python3's
+        // `list(csv.reader(['X;Y;Z'], delimiter=';'))`).
+        let r = csv::reader(&["X;Y;Z"], b';', false, None).unwrap();
+        assert_eq!(r[0], vec!["X", "Y", "Z"]);
+        // A tab delimiter.
+        let r = csv::reader(&["a\tb"], b'\t', false, None).unwrap();
+        assert_eq!(r[0], vec!["a", "b"]);
+    }
+
+    #[test]
+    fn register_get_unregister_list_round_trip() {
+        // Default registry is CPython's built-in dialects.
+        assert!(csv::list_dialects().contains(&"excel".to_string()));
+        assert!(csv::list_dialects().contains(&"excel-tab".to_string()));
+        // register_dialect(name, delimiter=...) then the delimiter resolves.
+        csv::register_dialect("semi_reg", Some(b';'), None, None, None, None, None, None, None)
+            .unwrap();
+        assert_eq!(csv::dialect_delimiter("semi_reg").unwrap(), b';');
+        // An unknown dialect name is csv.Error, not a silent default
+        // (verified against python3: `csv.reader(['a;b'], 'nonesuch')`
+        // raises `csv.Error: unknown dialect`).
+        let e = csv::dialect_delimiter("nonesuch").unwrap_err();
+        assert_eq!(format!("{}", e), "csv.Error: unknown dialect");
+        let d = csv::get_dialect("semi_reg").unwrap();
+        assert_eq!(d.delimiter, b';');
+        assert!(csv::get_dialect("nonesuch").is_err());
+        csv::unregister_dialect("semi_reg").unwrap();
+        assert!(csv::get_dialect("semi_reg").is_err());
+        // The built-in unix dialect is QUOTE_ALL (verified against python3).
+        assert_eq!(csv::get_dialect("unix").unwrap().quoting, csv::QUOTE_ALL);
+    }
+
+    #[test]
+    fn named_dialect_drives_the_reader_like_python() {
+        // python3: csv.register_dialect('semi', delimiter=';');
+        // list(csv.reader(['X;Y;Z'], 'semi')) == [['X','Y','Z']]
+        csv::register_dialect("semi_named", Some(b';'), None, None, None, None, None, None, None)
+            .unwrap();
+        let delim = csv::dialect_delimiter("semi_named").unwrap();
+        let r = csv::reader(&["X;Y;Z"], delim, false, None).unwrap();
+        assert_eq!(r[0], vec!["X", "Y", "Z"]);
+        csv::unregister_dialect("semi_named").unwrap();
     }
 }
 
@@ -2762,7 +2812,7 @@ mod file_objects {
         // 'a,"b,c","say ""hi""",\r\n1,2,3\r\n\r\n"line\nbreak",tab\there\r\n'
         let mut buf = io::StringIO();
         {
-            let mut w = csv::writer(&mut buf, "\r\n".to_string(), false, None);
+            let mut w = csv::writer(&mut buf, "\r\n".to_string(), b',', false, None);
             w.writerow(&["a", "b,c", "say \"hi\"", ""]).unwrap();
             w.writerow(&[1i64, 2, 3]).unwrap();
             w.writerow(&[] as &[&str]).unwrap();
@@ -2777,7 +2827,7 @@ mod file_objects {
         // and floats render as Python prints them.
         let mut buf = io::StringIO();
         {
-            let mut w = csv::writer(&mut buf, "\r\n".to_string(), false, None);
+            let mut w = csv::writer(&mut buf, "\r\n".to_string(), b',', false, None);
             w.writerow(&[stdpython::py_display(&true), stdpython::py_display(&2.5f64)])
                 .unwrap();
             w.writerows(&[vec!["x", "y"], vec!["z", "w"]]).unwrap();
@@ -2787,11 +2837,11 @@ mod file_objects {
         // writer output round-trips through the reader.
         let mut buf = io::StringIO();
         {
-            let mut w = csv::writer(&mut buf, "\r\n".to_string(), false, None);
+            let mut w = csv::writer(&mut buf, "\r\n".to_string(), b',', false, None);
             w.writerow(&["a", "b,c", "say \"hi\""]).unwrap();
         }
         let text = buf.getvalue().unwrap();
-        let rows = csv::reader(&text.split("\r\n").collect::<Vec<_>>(), false, None).unwrap();
+        let rows = csv::reader(&text.split("\r\n").collect::<Vec<_>>(), b',', false, None).unwrap();
         assert_eq!(rows[0], vec!["a", "b,c", "say \"hi\""]);
     }
 }
@@ -4359,13 +4409,13 @@ fn csv_reader_quote_none_with_escapechar_matches_cpython() {
     use stdpython::stdlib::csv::reader;
     // Verified against CPython 3.14.1: QUOTE_NONE + escapechar makes the
     // delimiter/quote/newline literal (escapechar dropped).
-    let r = reader(&["a\\,b,c\\\"d,e\\\nf"], true, Some::<u8>(b'\\')).unwrap();
+    let r = reader(&["a\\,b,c\\\"d,e\\\nf"], b',', true, Some::<u8>(b'\\')).unwrap();
     assert_eq!(r[0], vec!["a,b", "c\"d", "e\nf"]);
     // QUOTE_NONE WITHOUT escapechar: `"` is literal data.
-    let r2 = reader(&["\"plain\",\"has,comma\""], true, None).unwrap();
+    let r2 = reader(&["\"plain\",\"has,comma\""], b',', true, None).unwrap();
     assert_eq!(r2[0], vec!["\"plain\"", "\"has", "comma\""]);
     // Default (quoting on): quotes strip.
-    let r3 = reader(&["\"a,b\",c"], false, None).unwrap();
+    let r3 = reader(&["\"a,b\",c"], b',', false, None).unwrap();
     assert_eq!(r3[0], vec!["a,b", "c"]);
 }
 

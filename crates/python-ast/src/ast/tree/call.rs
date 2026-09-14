@@ -5570,6 +5570,7 @@ impl<'a> CodeGen for Call {
                 let mut lineterminator_kw: Option<crate::ExprType> = None;
                 let mut quoting_kw: Option<crate::ExprType> = None;
                 let mut escapechar_kw: Option<crate::ExprType> = None;
+                let mut delimiter_kw: Option<crate::ExprType> = None;
                 for kw in &self.keywords {
                     let slot = match kw.arg.as_deref() {
                         Some("width") if matches!(fname.as_str(), "wrap" | "fill") => &mut width_kw,
@@ -5581,6 +5582,8 @@ impl<'a> CodeGen for Call {
                         Some("quoting") if fname == "writer" => &mut quoting_kw,
                         Some("escapechar") if fname == "reader" => &mut escapechar_kw,
                         Some("escapechar") if fname == "writer" => &mut escapechar_kw,
+                        Some("delimiter") if fname == "reader" => &mut delimiter_kw,
+                        Some("delimiter") if fname == "writer" => &mut delimiter_kw,
                         // md5/sha's usedforsecurity is a FIPS policy flag —
                         // ignored (requests' digest auth).
                         Some("usedforsecurity")
@@ -6190,8 +6193,11 @@ impl<'a> CodeGen for Call {
                     }
                     // csv.writer(f) borrows the file mutably for the
                     // writer's lifetime (scope analysis marks f mut).
-                    ("writer", [f]) => {
+                    ("writer", [f, ..]) => {
                         let p = qual("writer");
+                        if self.args.len() > 2 {
+                            return Err(format!("writer() takes from 1 to 2 positional arguments but {} were given", self.args.len()).into());
+                        }
                         // csv.writer(f, lineterminator=..., quoting=...,
                         // escapechar=...) — the excel-dialect writer with the
                         // value-shaped dialect seams (issue #369); the
@@ -6227,15 +6233,55 @@ impl<'a> CodeGen for Call {
                             }
                             None => quote!(None::<u8>),
                         };
-                        Ok(quote!(#p(&mut (#f), #term, #all_quote, #esc)))
+                        // The delimiter: a literal `delimiter=` keyword, else the
+                        // excel default `,` (a dialect NAME second positional arg is
+                        // honoured like the reader's — resolved against the runtime
+                        // registry).
+                        let delim = if let Some(d) = &delimiter_kw {
+                            if let ExprType::Constant(cst) = d
+                                && let Some(litrs::Literal::String(s)) = &cst.0
+                                && s.value().len() == 1
+                            {
+                                let byte = s.value().as_bytes()[0];
+                                quote!(#byte)
+                            } else {
+                                return Err(
+                                    "csv.writer(... delimiter=...) needs a single-char \
+                                     string literal (e.g. delimiter=\"\\t\"); rython \
+                                     refuses to silently ignore a non-literal delimiter \
+                                     (issue #369)"
+                                        .to_string()
+                                        .into(),
+                                );
+                            }
+                        } else {
+                            // A second POSITIONAL arg is a dialect NAME (literal or
+                            // variable), resolved at runtime against the registry —
+                            // exactly like the reader's delimiter handling above.
+                            match self.args.get(1) {
+                                Some(dialect_arg) => {
+                                    let d = dialect_arg.clone().to_rust(
+                                        ctx.clone(),
+                                        options.clone(),
+                                        symbols.clone(),
+                                    )?;
+                                    quote!(stdpython::csv::dialect_delimiter(&(#d))?)
+                                }
+                                None => quote!(b','),
+                            }
+                        };
+                        Ok(quote!(#p(&mut (#f), #term, #delim, #all_quote, #esc)))
                     }
-                    ("reader", [lines]) => {
+                    ("reader", [lines, ..]) => {
                         let p = qual("reader");
+                        if self.args.len() > 2 {
+                            return Err(format!("reader() takes from 1 to 2 positional arguments but {} were given", self.args.len()).into());
+                        }
                         // csv.reader(f, quoting=csv.QUOTE_NONE, escapechar=...):
                         // thread the no-quote flag and the escapechar to the
                         // state-machine reader (issue #369). The runtime
-                        // reader(lines, no_quote, Option<u8> escapechar) already
-                        // honours an escapechar in QUOTE_NONE mode (it drops the
+                        // reader(lines, delimiter, no_quote, Option<u8> escapechar)
+                        // already honours an escapechar in QUOTE_NONE mode (it drops the
                         // escapechar and lets the next char through literally).
                         // The escapechar MUST be a single-character STRING
                         // LITERAL, rendered at CODE-GEN time as its code point —
@@ -6287,7 +6333,52 @@ impl<'a> CodeGen for Call {
                                 );
                             }
                         };
-                        Ok(quote!(#p(&(#lines), #no_quote, #esc)?))
+                        // The delimiter: a literal `delimiter=` keyword; else the excel default
+                        // `,`; else (a second positional dialect NAME, literal or
+                        // variable) resolved at RUNTIME via `dialect_delimiter`.
+                        let delim = if let Some(d) = &delimiter_kw {
+                            // A single-char string literal delimiter, rendered as
+                            // its code point.
+                            if let ExprType::Constant(cst) = d
+                                && let Some(litrs::Literal::String(s)) = &cst.0
+                                && s.value().len() == 1
+                            {
+                                let byte = s.value().as_bytes()[0];
+                                quote!(#byte)
+                            } else {
+                                return Err(
+                                    "csv.reader(... delimiter=...) needs a single-char \
+                                     string literal (e.g. delimiter=\"\\t\"); rython \
+                                     refuses to silently ignore a non-literal delimiter \
+                                     (issue #369)"
+                                        .to_string()
+                                        .into(),
+                                );
+                            }
+                        // A non-`delimiter=` path: CSV default `,` for the single-arg form; a
+                        // second POSITIONAL arg — a dialect NAME, whether a string
+                        // LITERAL (`csv.reader(f, 'unix')`) or a VARIABLE holding
+                        // the name (`csv.reader(f, name)` — test_csv's
+                        // TestDialectRegistry.test_register_kwargs) — is resolved
+                        // at RUNTIME against the std-gated named-dialect registry
+                        // via `dialect_delimiter(name)` (returns the byte; `,` for
+                        // an unknown name). A non-string second arg (a Dialect
+                        // OBJECT) renders but fails to compile — loud. Nothing is
+                        // silently dropped.
+                        } else {
+                            match self.args.get(1) {
+                                Some(dialect_arg) => {
+                                    let d = dialect_arg.clone().to_rust(
+                                        ctx.clone(),
+                                        options.clone(),
+                                        symbols.clone(),
+                                    )?;
+                                    quote!(stdpython::csv::dialect_delimiter(&(#d))?)
+                                }
+                                None => quote!(b','),
+                            }
+                        };
+                        Ok(quote!(#p(&(#lines), #delim, #no_quote, #esc)?))
                     }
                     ("md5" | "sha1" | "sha256" | "sha512", []) => {
                         let p = qual(crate::ast::tree::std_module::hashlib_new_variant(&fname)
