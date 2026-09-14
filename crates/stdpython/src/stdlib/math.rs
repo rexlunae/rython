@@ -658,71 +658,118 @@ python_function! {
     }
 }
 
-/// math.fsum(values) — a faithful port of CPython's `math_fsum.c`
-/// (Shewchuk's compensated summation / "partials" algorithm). Sums with
-/// error-free rounding so `fsum([0.1, 0.2, 0.3])` is exactly `0.6`, and a
-/// large + small magnitude pair keeps the small term (`fsum([1e100,
-/// -1e100, 1e-100])` is exactly `1e-100`). NaN returns NaN; ±inf returns
-/// the infinity immediately; an INTERMEDIATE overflow (a finite running
-/// total overflowing to ±inf inside the partials loop, e.g.
-/// `fsum([1e308, 1e308])`) raises `OverflowError: intermediate overflow
-/// in fsum`, exactly as CPython does. This is a raw `pub fn` (not the
-/// scalar `python_function!` macro) because it takes a SLICE of
-/// floats, like the list-taking stdlib functions.
+/// math.fsum(values) — a faithful port of CPython's `math_fsum` (Raymond
+/// Hettinger's msum partials algorithm, + Mark Dickinson's exact partials
+/// sum and roundoff). Sums with error-free rounding so `fsum([0.1, 0.2,
+/// 0.3])` is EXACTLY `0.6` and a small magnitude survives a large one
+/// (`fsum([1e100, -1e100, 1e-100])` is `1e-100`). Special values: a NaN
+/// propagates (after scanning ALL values, so `fsum([inf, nan])` is NaN);
+/// opposite infinities raise `ValueError: -inf + inf in fsum`; an
+/// INTERMEDIATE overflow of a finite running total (`fsum([1e308,
+/// 1e308])`) raises `OverflowError: intermediate overflow in fsum`. The
+/// final collapsed sum applies half-even rounding across multiple
+/// partials (`fsum([1e16, 1.0, 1e-16])` is `1.0000000000000002e16`).
+/// This is a raw `pub fn` (not the scalar `python_function!` macro)
+/// because it takes a SLICE of floats, like the list-taking stdlib
+/// functions.
 pub fn fsum(values: &[f64]) -> Result<f64, PyException> {
-    // CPython: NaN short-circuits to NaN, an infinity to that infinity.
-    let mut partials: alloc::vec::Vec<f64> = alloc::vec::Vec::new();
-    for &x in values {
-        if x.is_nan() {
-            return Ok(f64::NAN);
-        }
-        if x.is_infinite() {
-            return Ok(x);
-        }
-        // Zero contributes nothing to the compensated sum and is skipped
-        // (CPython skips it in the partials loop).
-        if x == 0.0 {
-            continue;
-        }
-        // Insert `x` into the (magnitude-ordered) partials, preserving
-        // each rounding error `lo = y - yr` as a lower partial. CPython's
-        // loop keeps a write index `i` distinct from the read index `j`:
-        // every element of the OLD partials is read, and an error term is
-        // written at `i` (advancing it); `i` then truncates the array to
-        // the surviving partials and the running `hi` is appended.
-        let mut hi = x;
-        let mut i = 0usize;
-        for j in 0..partials.len() {
-            let y = partials[j];
-            // Ensure the larger operand is `hi` (|hi| >= |y|).
-            let (h, smaller) = if hi.abs() < y.abs() { (y, hi) } else { (hi, y) };
-            let sum = h + smaller;
-            if sum.is_infinite() {
-                // CPython: an intermediate overflow of a FINITE running
-                // total is an error (`fsum([1e308, 1e308])`).
-                return Err(PyException::new(
-                    "OverflowError",
-                    "intermediate overflow in fsum",
-                ));
-            }
-            let yr = sum - h;
-            let lo = smaller - yr;
+    // The partials list (the msum algorithm); a non-empty Vec.
+    let mut p: alloc::vec::Vec<f64> = alloc::vec::Vec::new();
+    // CPython adds EVERY nonfinite value (inf AND NaN) to `special_sum`
+    // (so it is non-zero whenever any special value was seen), and
+    // accumulates only the infinities in `inf_sum` so `inf + -inf` = NaN
+    // detects opposite-sign infinities.
+    let mut special_sum = 0.0f64;
+    let mut inf_sum = 0.0f64;
+    let mut fsum_err: Option<PyException> = None;
+
+    for &xsave in values {
+        let mut x = xsave;
+        // for y in partials: merge x into the (magnitude-ordered)
+        // partials, preserving each rounding error `lo = y - yr`.
+        let mut write = 0usize;
+        for j in 0..p.len() {
+            let y = p[j];
+            let (big, small) = if x.abs() < y.abs() { (y, x) } else { (x, y) };
+            let hi = big + small;
+            let yr = hi - big;
+            let lo = small - yr;
             if lo != 0.0 {
-                partials[i] = lo;
-                i += 1;
+                p[write] = lo;
+                write += 1;
             }
-            hi = sum;
+            x = hi;
         }
-        partials.truncate(i);
-        if hi != 0.0 {
-            partials.push(hi);
+        p.truncate(write);
+        if x != 0.0 {
+            if !x.is_finite() {
+                // A nonfinite `x` here is either an intermediate overflow
+                // of a FINITE running total, or it is the inf/nan
+                // summand itself having flowed through the partials.
+                if xsave.is_finite() {
+                    fsum_err = Some(PyException::new(
+                        "OverflowError",
+                        "intermediate overflow in fsum",
+                    ));
+                    break;
+                }
+                if xsave.is_infinite() {
+                    inf_sum += xsave;
+                }
+                special_sum += xsave;
+                p.clear();
+            } else {
+                p.push(x);
+            }
         }
     }
-    // Sum the partials in magnitude order (each term is error-free within
-    // the partials), yielding CPython's exact total.
-    let mut total = 0.0f64;
-    for &p in &partials {
-        total += p;
+
+    if let Some(fe) = fsum_err {
+        return Err(fe);
     }
-    Ok(total)
+
+    // A special value (inf or NaN) was seen. Opposite-sign infinities are
+    // a ValueError; any other special value is the sum's result.
+    if special_sum != 0.0 {
+        if inf_sum.is_nan() {
+            return Err(PyException::new("ValueError", "-inf + inf in fsum"));
+        }
+        return Ok(special_sum);
+    }
+
+    // sum_exact: collapse the partials large-to-small and correctly round
+    // the final result (half-even), with CPython's multi-partial
+    // correction.
+    let mut hi = 0.0f64;
+    let mut n = p.len();
+    if n > 0 {
+        n -= 1;
+        hi = p[n];
+        let mut lo = 0.0f64;
+        while n > 0 {
+            let y = p[n - 1];
+            n -= 1;
+            // |y| < |hi| by the magnitude ordering above.
+            let x = hi;
+            hi = x + y;
+            let yr = hi - x;
+            let l = y - yr;
+            lo = l;
+            if l != 0.0 {
+                break;
+            }
+        }
+        // Half-even rounding across multiple partials: if the residual
+        // `lo` has the same sign as the next partial, check whether
+        // `2*lo` exactly hits the next representable float.
+        if n > 0 && ((lo < 0.0 && p[n - 1] < 0.0) || (lo > 0.0 && p[n - 1] > 0.0)) {
+            let y = lo * 2.0;
+            let x = hi + y;
+            let yr = x - hi;
+            if y == yr {
+                hi = x;
+            }
+        }
+    }
+    Ok(hi)
 }

@@ -239,6 +239,20 @@ fn math_fsum_compensates_and_matches_cpython() {
         format!("{}", e),
         "OverflowError: intermediate overflow in fsum"
     );
+    // Half-even rounding across multiple partials: fsum([1e16, 1.0,
+    // 1e-16]) rounds UP to 1.0000000000000002e16 (the 1e-16 makes the 1
+    // slightly closer to 2); a naive sum would give 1e16.
+    assert_eq!(fsum(&[1e16, 1.0, 1e-16]).unwrap(), 1.0000000000000002e16);
+    assert_eq!(fsum(&[1e-16, 1.0, 1e16]).unwrap(), 1.0000000000000002e16);
+    // Opposite infinities are ValueError (panics as the loud TypeError-
+    // style error), matching CPython's "-inf + inf in fsum". A NaN
+    // anywhere dominates an infinity.
+    let e = fsum(&[f64::INFINITY, f64::NEG_INFINITY]).unwrap_err();
+    assert_eq!(format!("{}", e), "ValueError: -inf + inf in fsum");
+    let e = fsum(&[f64::NEG_INFINITY, f64::INFINITY]).unwrap_err();
+    assert_eq!(format!("{}", e), "ValueError: -inf + inf in fsum");
+    assert!(fsum(&[f64::INFINITY, f64::NAN]).unwrap().is_nan());
+    assert!(fsum(&[f64::NAN, f64::INFINITY]).unwrap().is_nan());
 }
 
 #[test]
