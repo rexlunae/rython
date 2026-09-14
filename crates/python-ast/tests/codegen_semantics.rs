@@ -4648,6 +4648,80 @@ fn boxed_class_constructor_boxes_scalar_arguments() {
 }
 
 #[test]
+fn float_coercible_class_lowers_via_float_and_into() {
+    // #367: a class with `__float__` generates `From<Class> for f64`, so
+    // (1) it is usable where a float is expected (`math.ceil(FloatLike)`
+    // -> `(x).into()` against the `T: Into<f64>` math fns), and (2) a
+    // HETEROGENEOUS `[float, FloatLike, ...]` list unifies to `Vec<f64>`
+    // with each class element coerced via `.into()` — the test_math
+    // `math.fsum([1e100, FloatLike(1.0), ...])` shape.
+    let out = compile(
+        concat!(
+            "import math\n",
+            "class FloatLike:\n",
+            "    def __init__(self, value):\n",
+            "        self.value = value\n",
+            "    def __float__(self):\n",
+            "        return self.value\n",
+            "def f():\n",
+            "    return math.ceil(FloatLike(42.5))\n",
+            "def g():\n",
+            "    return math.fsum([1e100, FloatLike(1.0), -1e100])\n",
+        ),
+        "float_coerce.py",
+    );
+    assert!(
+        out.contains("impl std :: convert :: From < FloatLike > for f64"),
+        "a __float__ class must emit From<Class> for f64: {}",
+        out
+    );
+    assert!(
+        out.contains("math :: ceil ({ FloatLike :: new (PyValue :: from ((42.5))) ? }) . into ()")
+            || out.contains(". into ()"),
+        "a FloatLike arg to a math call must lower via Into<f64>: {}",
+        out
+    );
+    assert!(
+        out.contains("FloatLike :: new (PyValue :: from ((1.0))) ? }) . into ()"),
+        "a heterogeneous [float, FloatLike] list element must coerce via Into: {}",
+        out
+    );
+}
+
+#[test]
+fn math_trunc_refuses_float_only_classes() {
+    // math.trunc dispatches via __trunc__ in CPython (not __float__), so a
+    // __float__-only class passed to math.trunc must NOT silently
+    // convert (CPython raises TypeError); rython models __float__-coercion
+    // but not __trunc__, so it is a LOUD refusal. Genuine scalars pass
+    // through.
+    let out = compile(
+        "import math\nr = math.trunc(1.5)\n",
+        "trunc_scalar.py",
+    );
+    assert!(
+        out.contains("math :: trunc (1.5)"),
+        "a scalar math.trunc must pass through: {}",
+        out
+    );
+    let err = compile_err(
+        concat!(
+            "import math\n",
+            "class A:\n",
+            "    def __float__(self):\n",
+            "        return 1.2\n",
+            "r = math.trunc(A())\n",
+        ),
+        "trunc_class.py",
+    );
+    assert!(
+        err.contains("__trunc__"),
+        "math.trunc of a __float__-only class must refuse loudly: {}",
+        err
+    );
+}
+
+#[test]
 fn user_methods_shadow_builtin_method_rewrites() {
     // A user-defined method named like a dict/list builtin must resolve to
     // the class, not the py_get rewrite.

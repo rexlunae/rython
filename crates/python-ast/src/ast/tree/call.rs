@@ -5553,6 +5553,7 @@ impl<'a> CodeGen for Call {
                         | "TextIOWrapper"
                         | "DEFAULT_BUFFER_SIZE"
                         | "fsum"
+                        | "trunc"
                 )
             });
             if let (Some((fname, module_prefix, render_name)), true) = (target, known) {
@@ -6391,6 +6392,52 @@ impl<'a> CodeGen for Call {
                         Ok(quote!(#p(&(#xs))?))
                     }
                     ("fsum", _) => Err(arity("1")),
+                    ("trunc", [x]) => {
+                        // math.trunc dispatches via `__trunc__` in CPython
+                        // (NOT `__float__`): a class with only `__float__`
+                        // must raise `TypeError: ... doesn't define
+                        // __trunc__ method`, never silently convert. rython
+                        // models `__float__`-coercion but not `__trunc__`, so
+                        // a FLOAT-COERCIBLE-CLASS operand to math.trunc is a
+                        // loud refusal rather than a silent divergence
+                        // (issue #367). Genuine scalars (int/float) pass
+                        // through the `T: Into<f64>` runtime.
+                        let is_class = match &self.args[0] {
+                            crate::ExprType::Name(n) => {
+                                crate::resolve_class_referenced(&n.id, &symbols, &options)
+                                    .is_some()
+                            }
+                            crate::ExprType::Call(c) => {
+                                crate::resolve_construction_class(
+                                    match c.func.as_ref() {
+                                        crate::ExprType::Name(f) => &f.id,
+                                        crate::ExprType::Attribute(a) => &a.attr,
+                                        _ => "",
+                                    },
+                                    &symbols,
+                                    &options,
+                                )
+                                .is_some_and(|(cls, _)| {
+                                    crate::ast::tree::type_ctx::is_float_coercible_class(
+                                        &cls.name, &symbols, &options,
+                                    )
+                                })
+                            }
+                            _ => false,
+                        };
+                        if is_class {
+                            return Err(
+                                "math.trunc() requires __trunc__, which rython does not \
+                                 model for classes (a __float__-only class must raise \
+                                 TypeError, not silently convert)"
+                                    .to_string()
+                                    .into(),
+                            );
+                        }
+                        let p = qual("trunc");
+                        Ok(quote!(#p(#x)))
+                    }
+                    ("trunc", _) => Err(arity("1")),
                     ("md5" | "sha1" | "sha256" | "sha512", []) => {
                         let p = qual(crate::ast::tree::std_module::hashlib_new_variant(&fname)
                             .expect("the arm above names exactly the registry algos"));

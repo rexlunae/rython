@@ -15,6 +15,9 @@
     "detect": {
       "status": "pass"
     },
+    "float_coercion": {
+      "status": "pass"
+    },
     "fsum_compensation": {
       "status": "pass"
     },

@@ -128,7 +128,7 @@ and `test.*` stdlib references, and asserts are dropped.
 | `test_fractions` | CONVERT | — (same) |
 | `test_random` | CONVERT | — (same) |
 | `test_operator` | CONVERT | — (same) |
-| `test_math` | BLOCKED | `count_set_bits` recursion (FIXED → advanced); `ulp_abs_check` union FIXED (this round: `local_str.format(...)` now infers String, so `None` vs `fmt.format(...)` unifies to `Option<String>`); test_math now advances from line 107 to line 744 — the heterogeneous `[float, FloatLike]` list-literal wall. `math.fsum` runtime+codegen landed (compensated summation, `math::fsum(&(list))?` — the #369 surface test_math's fsum walls need) |
+| `test_math` | BLOCKED | `__float__`-coercion FIXED (this round: a `__float__`-class lowers via `From<Class> for f64`/`Into<f64>` into float contexts — `math.ceil(FloatLike(...))` AND heterogeneous `[float, FloatLike]` lists unify to `Vec<f64>` for `math.fsum`, so the line-744 wall falls). `math.fsum` runtime+codegen landed (compensated summation). test_math now advances from line 744 to **line 1307** — the `math.dist` heterogeneous-mixed-tuple-list wall (`[..., (Fraction..), (Decimal..), ...]` mixing int/float/Fraction/Decimal) |
 | `test_bisect` | BLOCKED | nested `def grade(breakpoints=[60,70,80,90])` — a **mutable-list default**, deliberately loud (Python evaluates-and-shares it; cannot be lowered correctly) |
 | `test_csv` | BLOCKED | dialect registry FIXED (this round: `csv.reader(f, name)` / `delimiter=` thread the separator via a std-gated `Dialect` registry; `csv::reader` takes a `delimiter: u8`). Advances to the **dialect-OBJECT / DictReader / Sniffer / field_size_limit** wall (`dialect=Dialect()` attribute access, `csv.DictReader`, `csv.Sniffer`) |
 | `test_textwrap` | BLOCKED | `wrap(text, width, **kwargs)` was issue #368; the `**kwargs` SPREAD is now a loud `-W` drop (PR, `textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error`), so it advances to line 541 — the next wall is literal keyword OPTIONS to `wrap(..., initial_indent=..., max_lines=..., placeholder=...)`, which rython's `wrap(text, width)` does not model |
@@ -245,6 +245,18 @@ inside (or leads to) the unittest harness:
   `[float, FloatLike]` wall and the `__float__`-coercion follow-on) builds on.
   Pins: `boxed_class_constructor_boxes_scalar_arguments` (codegen) and the
   `boxed_constructor` idiom (transcript).
+- **`__float__`-coercion** (#367): a class with a `__float__` method now
+  implements `From<Class> for f64` (its `__float__` returns the boxed
+  PyValue; `f64::from(PyValue)` converts), so the class is `Into<f64>` and
+  feeds any `T: Into<f64>` math function (`math.ceil(FloatLike(42.5))` →
+  `43`, `math.fabs(FloatLike(-2.25))` → `2.25`). Combined with a
+  HETEROGENEOUS-list unify rule, `[1e100, FloatLike(1.0), -1e100]` unifies
+  to `Vec<f64>` (each class element coerces via `.into()`), so test_math's
+  `math.fsum([1e100, FloatLike(1.0), -1e100, 1e-100])` — the line-744 wall —
+  now builds and runs to `1e-100`. test_math advances from line 744 to the
+  line-1307 `math.dist`/Fraction/Decimal mixed-tuple wall. Pins:
+  `float_coercible_class_lowers_via_float_and_into` (codegen) and the
+  `float_coercion` idiom (transcript).
 
 ## Complex (#366) — the biggest single-file unblocker, status
 
