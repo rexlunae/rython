@@ -130,7 +130,7 @@ and `test.*` stdlib references, and asserts are dropped.
 | `test_operator` | CONVERT | — (same) |
 | `test_math` | BLOCKED | `count_set_bits` recursion (FIXED → advanced); `ulp_abs_check` union FIXED (this round: `local_str.format(...)` now infers String, so `None` vs `fmt.format(...)` unifies to `Option<String>`); test_math now advances from line 107 to line 744 — the heterogeneous `[float, FloatLike]` list-literal wall |
 | `test_bisect` | BLOCKED | nested `def grade(breakpoints=[60,70,80,90])` — a **mutable-list default**, deliberately loud (Python evaluates-and-shares it; cannot be lowered correctly) |
-| `test_csv` | BLOCKED | `csv.reader(..., escapechar=…)` reader feature FIXED (this round, now threads `Some::<u8>`); advances to the **dialect-registry** wall (`csv.reader([...], name)` / `register_dialect`), reached inside harness blocks |
+| `test_csv` | BLOCKED | dialect registry FIXED (this round: `csv.reader(f, name)` / `delimiter=` thread the separator via a std-gated `Dialect` registry; `csv::reader` takes a `delimiter: u8`). Advances to the **dialect-OBJECT / DictReader / Sniffer / field_size_limit** wall (`dialect=Dialect()` attribute access, `csv.DictReader`, `csv.Sniffer`) |
 | `test_textwrap` | BLOCKED | `wrap(text, width, **kwargs)` was issue #368; the `**kwargs` SPREAD is now a loud `-W` drop (PR, `textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error`), so it advances to line 541 — the next wall is literal keyword OPTIONS to `wrap(..., initial_indent=..., max_lines=..., placeholder=...)`, which rython's `wrap(text, width)` does not model |
 | `test_itertools` | BLOCKED | a cross-method inference-STATE contamination: after certain earlier method bodies convert, `filter(isEven, count())` (line 741) rejects "takes a function and an iterable". Not reproducible in a standalone extraction of the exact method (a fresh minimal repro converts); only the full-module conversion triggers it. Deeply stateful; not a bounded fix |
 | `test_collections` | BLOCKED | heterogeneous list literal `[None, int(), gen(), object(), Bar()]` (int/Bar/mixed) |
@@ -194,6 +194,19 @@ inside (or leads to) the unittest harness:
   `Some::<u8>((c).as_bytes()[0])` seam. `test_csv` advances past its
   `escapechar` body to the dialect-registry wall (`csv.reader([...], name)`).
   Pin: `csv_reader_escapechar_wires_through_like_the_writer`.
+- **csv dialect registry + delimiter threading (`csv.reader(f, name)`,
+  `delimiter=`).** A std-gated `csv::Dialect` value type and a process-global
+  named registry (`register_dialect`/`get_dialect`/`unregister_dialect`/
+  `list_dialects`, pre-seeded with `excel`/`excel-tab`/`unix`) back the
+  alloc-tier `csv::reader`, which now takes a `delimiter: u8` (Excel default
+  `,`). Codegen resolves a dialect NAME argument (`csv.reader(['X;Y;Z]',
+  name)`) through `stdpython::csv::dialect_delimiter(name)` and a literal
+  `delimiter=';'` as its code point. `test_csv`'s `TestDialectRegistry`
+  dialect-name and delimiter bodies now lower; the file still sits behind the
+  dialect-OBJECT (`dialect=Dialect()` attribute access), `DictReader`/
+  `DictWriter`/`Sniffer`/`field_size_limit` walls. Pins:
+  `csv_reader_dialect_name_and_delimiter_thread_the_separator` (codegen) and
+  `csv_dialect_registry::*` (runtime).
 - **`local_str.format(...)` infers a `String` return**, mirroring the `join`
   arm's concrete-receiver logic (a string literal or String/&str local
   receiver). This lets a `None` vs `fmt.format(...)` union unify to

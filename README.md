@@ -258,9 +258,14 @@ line, never a silent behaviour change:
   byte. `choices`, `nargs` on options, `nargs="?"`, subcommands, a
   FileType default and update modes (`r+`) are loud errors; a parser
   touched under control flow or in a nested definition is refused.
-- **`csv.writer(f, lineterminator=...)`** implements the default excel
-  dialect with a CPython-matching overridable row terminator; other
-  dialect objects and `QUOTE_ALL`-style options are not supported yet.
+- **`csv.writer(f, lineterminator=...)`** implements the excel dialect with
+  a CPython-matching overridable row terminator, and the writer/reader accept
+  `quoting=` (`QUOTE_ALL`/`QUOTE_NONE`/`QUOTE_MINIMAL`), `escapechar=`, and a
+  literal `delimiter=` or a dialect NAME (a std-gated named-dialect registry
+  backs `csv.reader(f, name)` / `csv.register_dialect(name, ...)` /
+  `csv.get_dialect(name)`). Dialect OBJECTS (`dialect=Dialect()`),
+  `csv.DictReader`/`csv.DictWriter`, `csv.Sniffer`, and `field_size_limit`
+  are not supported yet.
 - **`re`** is backed by the `regex` crate: backreferences and lookarounds
   are a loud `re.error`; `findall` supports up to 3 capture groups.
 - **Typed-lowering edges**: places where Python produces `None` inside a
