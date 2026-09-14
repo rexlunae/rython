@@ -43,7 +43,7 @@ const ISINSTANCE_TARGET_NAMES: &[&str] = &[
 const FALLIBLE_STDLIB_FN: &[&str] = &[
     // math: domain/range errors and overflow.
     "sqrt", "pow", "log", "log2", "log10", "log1p", "asin", "acos", "acosh", "atanh",
-    "factorial", "fmod", "remainder", "ldexp",
+    "factorial", "fmod", "remainder", "ldexp", "fsum",
     // json: parse errors.
     "loads",
     // glob: filesystem access can fail.
@@ -5552,6 +5552,7 @@ impl<'a> CodeGen for Call {
                         | "BufferedWriter"
                         | "TextIOWrapper"
                         | "DEFAULT_BUFFER_SIZE"
+                        | "fsum"
                 )
             });
             if let (Some((fname, module_prefix, render_name)), true) = (target, known) {
@@ -6380,6 +6381,16 @@ impl<'a> CodeGen for Call {
                         };
                         Ok(quote!(#p(&(#lines), #delim, #no_quote, #esc)?))
                     }
+                    ("fsum", [xs]) => {
+                        let p = qual("fsum");
+                        // math.fsum(list) — the compensated summation over a
+                        // SLICE of floats (issue #369). The runtime takes
+                        // `&[f64]`, so the list arg renders by reference; the
+                        // call is fallible (it can raise OverflowError on an
+                        // INTERMEDIATE overflow), so `?` threads it.
+                        Ok(quote!(#p(&(#xs))?))
+                    }
+                    ("fsum", _) => Err(arity("1")),
                     ("md5" | "sha1" | "sha256" | "sha512", []) => {
                         let p = qual(crate::ast::tree::std_module::hashlib_new_variant(&fname)
                             .expect("the arm above names exactly the registry algos"));

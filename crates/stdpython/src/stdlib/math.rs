@@ -657,3 +657,119 @@ python_function! {
         Ok(libm::remainder(x, y))
     }
 }
+
+/// math.fsum(values) — a faithful port of CPython's `math_fsum` (Raymond
+/// Hettinger's msum partials algorithm, + Mark Dickinson's exact partials
+/// sum and roundoff). Sums with error-free rounding so `fsum([0.1, 0.2,
+/// 0.3])` is EXACTLY `0.6` and a small magnitude survives a large one
+/// (`fsum([1e100, -1e100, 1e-100])` is `1e-100`). Special values: a NaN
+/// propagates (after scanning ALL values, so `fsum([inf, nan])` is NaN);
+/// opposite infinities raise `ValueError: -inf + inf in fsum`; an
+/// INTERMEDIATE overflow of a finite running total (`fsum([1e308,
+/// 1e308])`) raises `OverflowError: intermediate overflow in fsum`. The
+/// final collapsed sum applies half-even rounding across multiple
+/// partials (`fsum([1e16, 1.0, 1e-16])` is `1.0000000000000002e16`).
+/// This is a raw `pub fn` (not the scalar `python_function!` macro)
+/// because it takes a SLICE of floats, like the list-taking stdlib
+/// functions.
+pub fn fsum(values: &[f64]) -> Result<f64, PyException> {
+    // The partials list (the msum algorithm); a non-empty Vec.
+    let mut p: alloc::vec::Vec<f64> = alloc::vec::Vec::new();
+    // CPython adds EVERY nonfinite value (inf AND NaN) to `special_sum`
+    // (so it is non-zero whenever any special value was seen), and
+    // accumulates only the infinities in `inf_sum` so `inf + -inf` = NaN
+    // detects opposite-sign infinities.
+    let mut special_sum = 0.0f64;
+    let mut inf_sum = 0.0f64;
+    let mut fsum_err: Option<PyException> = None;
+
+    for &xsave in values {
+        let mut x = xsave;
+        // for y in partials: merge x into the (magnitude-ordered)
+        // partials, preserving each rounding error `lo = y - yr`.
+        let mut write = 0usize;
+        for j in 0..p.len() {
+            let y = p[j];
+            let (big, small) = if x.abs() < y.abs() { (y, x) } else { (x, y) };
+            let hi = big + small;
+            let yr = hi - big;
+            let lo = small - yr;
+            if lo != 0.0 {
+                p[write] = lo;
+                write += 1;
+            }
+            x = hi;
+        }
+        p.truncate(write);
+        if x != 0.0 {
+            if !x.is_finite() {
+                // A nonfinite `x` here is either an intermediate overflow
+                // of a FINITE running total, or it is the inf/nan
+                // summand itself having flowed through the partials.
+                if xsave.is_finite() {
+                    fsum_err = Some(PyException::new(
+                        "OverflowError",
+                        "intermediate overflow in fsum",
+                    ));
+                    break;
+                }
+                if xsave.is_infinite() {
+                    inf_sum += xsave;
+                }
+                special_sum += xsave;
+                p.clear();
+            } else {
+                p.push(x);
+            }
+        }
+    }
+
+    if let Some(fe) = fsum_err {
+        return Err(fe);
+    }
+
+    // A special value (inf or NaN) was seen. Opposite-sign infinities are
+    // a ValueError; any other special value is the sum's result.
+    if special_sum != 0.0 {
+        if inf_sum.is_nan() {
+            return Err(PyException::new("ValueError", "-inf + inf in fsum"));
+        }
+        return Ok(special_sum);
+    }
+
+    // sum_exact: collapse the partials large-to-small and correctly round
+    // the final result (half-even), with CPython's multi-partial
+    // correction.
+    let mut hi = 0.0f64;
+    let mut n = p.len();
+    if n > 0 {
+        n -= 1;
+        hi = p[n];
+        let mut lo = 0.0f64;
+        while n > 0 {
+            let y = p[n - 1];
+            n -= 1;
+            // |y| < |hi| by the magnitude ordering above.
+            let x = hi;
+            hi = x + y;
+            let yr = hi - x;
+            let l = y - yr;
+            lo = l;
+            if l != 0.0 {
+                break;
+            }
+        }
+        // Half-even rounding across multiple partials: if the residual
+        // `lo` has the same sign as the next partial, check whether
+        // `2*lo` exactly hits the next representable float.
+        if n > 0 && ((lo < 0.0 && p[n - 1] < 0.0) || (lo > 0.0 && p[n - 1] > 0.0)) {
+            let y = lo * 2.0;
+            let x = hi + y;
+            let yr = x - hi;
+            if y == yr {
+                hi = x;
+            }
+        }
+    }
+    Ok(hi)
+}

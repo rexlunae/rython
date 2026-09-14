@@ -12,6 +12,9 @@
     "detect": {
       "status": "pass"
     },
+    "fsum_compensation": {
+      "status": "pass"
+    },
     "handoff": {
       "status": "pass"
     },

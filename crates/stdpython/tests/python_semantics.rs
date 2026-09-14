@@ -216,6 +216,46 @@ fn math_remainder_rounds_half_to_even() {
 }
 
 #[test]
+fn math_fsum_compensates_and_matches_cpython() {
+    // math.fsum (compensated summation). Every case pinned against
+    // python3 3.14.
+    use stdpython::math::fsum;
+    // Empty sums to 0.0.
+    assert_eq!(fsum(&[]).unwrap(), 0.0);
+    // Error-free rounding: fsum([0.1, 0.2, 0.3]) is EXACTLY 0.6, where
+    // the naive sum is 0.6000000000000001.
+    assert_eq!(fsum(&[0.1, 0.2, 0.3]).unwrap(), 0.6);
+    // A large term doesn't swallow a small one (python3: 1e-100).
+    assert_eq!(fsum(&[1e100, -1e100, 1e-100]).unwrap(), 1e-100);
+    assert_eq!(fsum(&[1e100, 1e-100, -1e100, 1e-100]).unwrap(), 2e-100);
+    // An infinity short-circuits; NaN propagates.
+    assert_eq!(fsum(&[1.0, f64::INFINITY]).unwrap(), f64::INFINITY);
+    assert_eq!(fsum(&[1.0, f64::NEG_INFINITY]).unwrap(), f64::NEG_INFINITY);
+    assert!(fsum(&[1.0, f64::NAN]).unwrap().is_nan());
+    // An INTERMEDIATE overflow (a finite running total overflows to inf:
+    // fsum([1e308, 1e308])) is OverflowError, exactly as in Python.
+    let e = fsum(&[1.0f64, 1e308, 1e308]).unwrap_err();
+    assert_eq!(
+        format!("{}", e),
+        "OverflowError: intermediate overflow in fsum"
+    );
+    // Half-even rounding across multiple partials: fsum([1e16, 1.0,
+    // 1e-16]) rounds UP to 1.0000000000000002e16 (the 1e-16 makes the 1
+    // slightly closer to 2); a naive sum would give 1e16.
+    assert_eq!(fsum(&[1e16, 1.0, 1e-16]).unwrap(), 1.0000000000000002e16);
+    assert_eq!(fsum(&[1e-16, 1.0, 1e16]).unwrap(), 1.0000000000000002e16);
+    // Opposite infinities are ValueError (panics as the loud TypeError-
+    // style error), matching CPython's "-inf + inf in fsum". A NaN
+    // anywhere dominates an infinity.
+    let e = fsum(&[f64::INFINITY, f64::NEG_INFINITY]).unwrap_err();
+    assert_eq!(format!("{}", e), "ValueError: -inf + inf in fsum");
+    let e = fsum(&[f64::NEG_INFINITY, f64::INFINITY]).unwrap_err();
+    assert_eq!(format!("{}", e), "ValueError: -inf + inf in fsum");
+    assert!(fsum(&[f64::INFINITY, f64::NAN]).unwrap().is_nan());
+    assert!(fsum(&[f64::NAN, f64::INFINITY]).unwrap().is_nan());
+}
+
+#[test]
 fn py_pow_matches_python() {
     // Python: 2 ** 10 == 1024 (int stays int)
     assert_eq!(py_pow(2i64, 10i64), 1024);
