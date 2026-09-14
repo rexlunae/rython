@@ -3,6 +3,9 @@
     "bank": {
       "status": "pass"
     },
+    "boxed_constructor": {
+      "status": "pass"
+    },
     "clauses": {
       "status": "pass"
     },

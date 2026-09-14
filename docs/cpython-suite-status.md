@@ -233,6 +233,18 @@ inside (or leads to) the unittest harness:
   `math::fsum(&(list))?` (borrowed + `?`, since it's fallible). Pins:
   `math_fsum_compensates_and_matches_cpython` (runtime),
   `math_fsum_lowers_by_reference_and_threads_the_result` (codegen).
+- **Boxed-class CONSTRUCTOR arguments now box** (#367 class model): a class
+  with an UNANNOTATED `__init__` param stores a boxed PyValue field
+  (`self.value = value`), so its `new(value: PyValue)` needs the call-site
+  argument boxed (`Box(42)` → `new(PyValue::from(42))`) — previously the
+  generated crate failed to build (E0308). The `fill` closure's expected-type
+  chain now boxes an unannotated type-var-less `__init__` param (scoped to
+  construction; a plain method/free-function call keeps its unannotated-param
+  handling, e.g. a `merge_setting(..., dict_class)` class-value must not box).
+  This is the foundation the FloatLike class-model gap (test_math's
+  `[float, FloatLike]` wall and the `__float__`-coercion follow-on) builds on.
+  Pins: `boxed_class_constructor_boxes_scalar_arguments` (codegen) and the
+  `boxed_constructor` idiom (transcript).
 
 ## Complex (#366) — the biggest single-file unblocker, status
 

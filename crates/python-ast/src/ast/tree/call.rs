@@ -12388,6 +12388,48 @@ fn map_call_arguments_inner(
                     } else {
                         None
                     }
+                })
+                // An unannotated METHOD param with NO inferred type-var is
+                // the boxed-PyValue fallback (`parameter_rust_type`'s
+                // `None` branch — issue #109, "an unannotated method
+                // param … a boxed PyValue"; e.g. `FloatLike.__init__(self,
+                // value): self.value = value`). The callee's `new(value:
+                // stdpython::PyValue)` then needs the call-site ARGUMENT
+                // boxed too, or `FloatLike(42.5)` renders
+                // `new(42.5)` against a PyValue param and the generated
+                // crate fails to build (E0308). Boxing a boxable scalar
+                // (`PyValue::from(42.5)`) is exactly the `Into<PyValue>`
+                // behaviour of a value-pinned free function, applied at
+                // the call site. Excludes `Into<PyValue>` params (whose
+                // call sites already pass the boxed value via the impl).
+                .or_else(|| {
+                    // An unannotated `__init__` param with NO inferred
+                    // type-var is the boxed-PyValue fallback
+                    // (`parameter_rust_type`'s `None` branch — issue
+                    // #109, "an unannotated method param … a boxed
+                    // PyValue"; e.g. `FloatLike.__init__(self, value):
+                    // self.value = value`). The callee's `new(value:
+                    // stdpython::PyValue)` needs the call-site ARGUMENT
+                    // boxed too, or `FloatLike(42.5)` renders `new(42.5)`
+                    // against a PyValue param and the generated crate
+                    // fails to build (E0308). Boxing a boxable scalar
+                    // (`PyValue::from(42.5)`) is exactly the
+                    // `Into<PyValue>` behaviour of a value-pinned free
+                    // function, applied at the call site. Scoped to CLASS
+                    // CONSTRUCTION only (a plain method/free-function
+                    // call keeps its unannotated-param handling — a
+                    // `merge_setting(..., dict_class)` class-value arg
+                    // must not box to None). Excludes `Into<PyValue>`
+                    // params (their call sites already box via the impl).
+                    if constructed_class.is_some()
+                        && param.annotation.is_none()
+                        && !options.param_type_vars.contains_key(&param.arg)
+                        && !options.pyvalue_into_params.contains(&param.arg)
+                    {
+                        Some(crate::TypeInfo::PyValue)
+                    } else {
+                        None
+                    }
                 });
             // A `str` parameter takes anything `Into<String>` (the
             // expected above stays None for it), but an OPTION-of-string
