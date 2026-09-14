@@ -6506,11 +6506,16 @@ impl<'a> CodeGen for Call {
                         Ok(quote!(#p(#n, #k)?))
                     }
                     ("comb", _) => Err(arity("2")),
-                    // math.perm(n, k); math.perm(n) defaults k to n
-                    // (CPython), so the 1-arg form passes k = n.
+                    // math.perm(n, k); math.perm(n) defaults k to n (CPython), so the
+                    // 1-arg form passes k = n. The rendered `n` must be
+                    // evaluated ONCE (a side-effecting arg like `next(it)`
+                    // must not run twice), so bind it to a temp first.
                     ("perm", [n]) => {
                         let p = qual("perm");
-                        Ok(quote!(#p(#n, #n)?))
+                        Ok(quote!({
+                            let __rython_perm_n = #n;
+                            #p(__rython_perm_n, __rython_perm_n)?
+                        }))
                     }
                     ("perm", [n, k]) => {
                         let p = qual("perm");

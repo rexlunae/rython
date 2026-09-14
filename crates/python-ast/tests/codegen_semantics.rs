@@ -6249,8 +6249,9 @@ fn math_comb_perm_route_and_default_perm_k() {
         out
     );
     assert!(
-        out.contains("math :: perm (5 , 5) ?"),
-        "1-arg math.perm must default k to n: {}",
+        out.contains("__rython_perm_n = 5 ;")
+            && out.contains("math :: perm (__rython_perm_n , __rython_perm_n) ?"),
+        "1-arg math.perm must bind n to a temp and default k to n (single eval): {}",
         out
     );
 }

@@ -851,8 +851,13 @@ pub fn sumprod_f64(a: &[f64], b: &[f64]) -> Result<f64, PyException> {
 }
 
 /// math.comb(n, k) — the binomial coefficient, as a Python int (i64 in
-/// rython). CPython returns 0 when k < 0 or k > n, and raises ValueError
-/// for a negative n. A result beyond i64 is OverflowError.
+/// rython). CPython returns 0 when k > n, and raises ValueError for a
+/// NEGATIVE n (`n must be a non-negative integer`) or a NEGATIVE k
+/// (`k must be a non-negative integer`). The recurrence cancels the
+/// divisor via gcd so the intermediate product never exceeds the final
+/// coefficient: `comb(62, 28)` is `349615716557887465` (fits i64) even
+/// though the uncancelled intermediate would overflow. A result genuinely
+/// beyond i64 is OverflowError.
 pub fn comb(n: i64, k: i64) -> Result<i64, PyException> {
     if n < 0 {
         return Err(PyException::new(
@@ -860,7 +865,13 @@ pub fn comb(n: i64, k: i64) -> Result<i64, PyException> {
             "n must be a non-negative integer",
         ));
     }
-    if k < 0 || k > n {
+    if k < 0 {
+        return Err(PyException::new(
+            "ValueError",
+            "k must be a non-negative integer",
+        ));
+    }
+    if k > n {
         return Ok(0);
     }
     // nCk = nC(n-k); use the smaller k for fewer multiplications.
@@ -869,17 +880,41 @@ pub fn comb(n: i64, k: i64) -> Result<i64, PyException> {
     for i in 0..k {
         let numerator = n - i;
         let divisor = i + 1;
-        result = result
-            .checked_mul(numerator)
-            .ok_or_else(|| PyException::new("OverflowError", "result too large"))?
-            / divisor;
+        // result' = result * numerator / divisor (exact). Cancel divisor
+        // against both factors via gcd so the checked multiplication is of
+        // the REDUCED factors — its overflow means the true coefficient is
+        // beyond i64 (a false intermediate overflow is never raised).
+        let g1 = gcd_i64(result, divisor);
+        let result_r = result / g1;
+        let div_r = divisor / g1;
+        let g2 = gcd_i64(numerator, div_r);
+        let num_r = numerator / g2;
+        let div_rem = div_r / g2; // == 1 (nCk is an integer)
+        result = result_r
+            .checked_mul(num_r)
+            .map(|v| v / div_rem)
+            .ok_or_else(|| PyException::new("OverflowError", "result too large"))?;
     }
     Ok(result)
 }
 
+/// Greatest common divisor (Euclid) for the comb recurrence's cancellation.
+fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    if a < 0 {
+        -a
+    } else {
+        a
+    }
+}
+
 /// math.perm(n, k=None) — the number of permutations of k items from n
-/// (k defaults to n). CPython returns 0 for k < 0 or k > n, raises
-/// ValueError for a negative n, and a result beyond i64 is overflow.
+/// (k defaults to n). CPython returns 0 for k > n, and raises ValueError
+/// for a negative n or k. A result beyond i64 is overflow.
 pub fn perm(n: i64, k: i64) -> Result<i64, PyException> {
     if n < 0 {
         return Err(PyException::new(
@@ -887,7 +922,13 @@ pub fn perm(n: i64, k: i64) -> Result<i64, PyException> {
             "n must be a non-negative integer",
         ));
     }
-    if k < 0 || k > n {
+    if k < 0 {
+        return Err(PyException::new(
+            "ValueError",
+            "k must be a non-negative integer",
+        ));
+    }
+    if k > n {
         return Ok(0);
     }
     let mut result: i64 = 1;
