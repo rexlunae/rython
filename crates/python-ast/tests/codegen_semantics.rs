@@ -6031,6 +6031,42 @@ fn complex_local_tuple_returns_infer_complex_members() {
 }
 
 #[test]
+fn complex_real_imag_locals_infer_f64_in_returns() {
+    // #366: a complex ATTRIBUTE-access assigned to a local — `re =
+    // (3+4j).real`, `im = z.imag` — records as f64, so a function returning
+    // them alongside complex binop/abs locals keeps its tuple type instead of
+    // collapsing to unit (the previous gap: `return s, r, re, im` typed ()).
+    let out = compile(
+        concat!(
+            "def f():\n",
+            "    a = 1j\n",
+            "    s = a + 2j\n",
+            "    r = abs(3j)\n",
+            "    re_part = (3 + 4j).real\n",
+            "    im_part = (3 + 4j).imag\n",
+            "    return s, r, re_part, im_part\n",
+            "def g():\n",
+            "    z = 2j\n",
+            "    re = z.real\n",
+            "    im = z.imag\n",
+            "    c = z.conjugate()\n",
+            "    return c, re, im\n",
+        ),
+        "complex_real_imag_ret.py",
+    );
+    assert!(
+        out.contains("f () -> Result < (Complex , f64 , f64 , f64)"),
+        "a tuple of complex binop + abs + .real + .imag locals must infer (Complex, f64, f64, f64): {}",
+        out
+    );
+    assert!(
+        out.contains("g () -> Result < (Complex , f64 , f64)"),
+        "a tuple of .conjugate + .real + .imag must infer (Complex, f64, f64): {}",
+        out
+    );
+}
+
+#[test]
 fn textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error() {
     // #368: `wrap(text, width, **kwargs)` (test_textwrap's check_wrap
     // forwarding its **kwargs, which may carry initial_indent/drop_whitespace)
