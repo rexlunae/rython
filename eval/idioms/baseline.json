@@ -48,6 +48,9 @@
     "shapes": {
       "status": "pass"
     },
+    "sumprod_pairs": {
+      "status": "pass"
+    },
     "text_stats": {
       "status": "pass"
     },

@@ -773,3 +773,36 @@ pub fn fsum(values: &[f64]) -> Result<f64, PyException> {
     }
     Ok(hi)
 }
+
+/// math.sumprod(a, b) — the dot product of two equal-length numeric
+/// sequences (CPython 3.12+). `sumprod(i64-a, i64-b)` where every element
+/// is an int returns an int (`sumprod([10, 20, 30], [1, 2, 3])` is `140`);
+/// any float involvement makes it a float. Keeps the pair-typed result so
+/// the codegen routes int×int to `sumprod_i64` and a float in either
+/// sequence to `sumprod_f64` (the list element types decide). Unequal
+/// lengths raise `ValueError: len(a) != len(b)`, exactly as CPython does.
+/// Raw `pub fn`s (not the scalar `python_function!` macro) because they
+/// take SLICES, like `fsum`.
+pub fn sumprod_i64(a: &[i64], b: &[i64]) -> Result<i64, PyException> {
+    if a.len() != b.len() {
+        return Err(PyException::new("ValueError", "len(a) != len(b)"));
+    }
+    let mut total = 0i64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        total += x * y;
+    }
+    Ok(total)
+}
+
+/// The float form: any float (or a single int list) routes here, dot-
+/// producting in f64 so `sumprod([1.5, 2.5], [3.5, 4.5])` is `16.5`.
+pub fn sumprod_f64(a: &[f64], b: &[f64]) -> Result<f64, PyException> {
+    if a.len() != b.len() {
+        return Err(PyException::new("ValueError", "len(a) != len(b)"));
+    }
+    let mut total = 0.0f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        total += x * y;
+    }
+    Ok(total)
+}

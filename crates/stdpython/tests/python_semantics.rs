@@ -256,6 +256,24 @@ fn math_fsum_compensates_and_matches_cpython() {
 }
 
 #[test]
+fn math_sumprod_preserves_int_and_float_types() {
+    // math.sumprod (CPython 3.12+): the dot product. int×int stays int,
+    // any float makes it float. Every case pinned against python3 3.14.
+    use stdpython::math::{sumprod_f64, sumprod_i64};
+    // All-int → int.
+    assert_eq!(sumprod_i64(&[10, 20, 30], &[1, 2, 3]).unwrap(), 140);
+    assert_eq!(sumprod_i64(&[1, 2], &[3, 4]).unwrap(), 11);
+    // Empty → the additive identity (0).
+    assert_eq!(sumprod_i64(&[], &[]).unwrap(), 0);
+    // Float (at least one float element) → float.
+    assert_eq!(sumprod_f64(&[1.5, 2.5], &[3.5, 4.5]).unwrap(), 16.5);
+    assert_eq!(sumprod_f64(&[-1.0], &[1.0]).unwrap(), -1.0);
+    // Unequal lengths raise ValueError (python3: `len(a) != len(b)`).
+    let e = sumprod_i64(&[1, 2, 3], &[1, 2]).unwrap_err();
+    assert_eq!(format!("{}", e), "ValueError: len(a) != len(b)");
+}
+
+#[test]
 fn py_pow_matches_python() {
     // Python: 2 ** 10 == 1024 (int stays int)
     assert_eq!(py_pow(2i64, 10i64), 1024);

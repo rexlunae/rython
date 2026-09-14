@@ -6192,6 +6192,39 @@ fn math_fsum_lowers_by_reference_and_threads_the_result() {
 }
 
 #[test]
+fn math_sumprod_routes_by_element_type_and_coerces_mixed() {
+    // #369: math.sumprod(a, b) routes to sumprod_i64 (all-int → i64) or
+    // sumprod_f64 (any float → f64), and a MIXED pair (~(~float, ~)...) —
+    // sumprod([-1], [1.]) — coerces the int list element-wise to f64 so
+    // sumprod_f64 accepts it. The lists pass by reference.
+    let out = compile(
+        concat!(
+            "import math\n",
+            "a = math.sumprod([10, 20, 30], [1, 2, 3])\n",
+            "b = math.sumprod([1.5, 2.5], [3.5, 4.5])\n",
+            "c = math.sumprod([-1], [1.])\n",
+        ),
+        "sumprod_cg.py",
+    );
+    assert!(
+        out.contains("math :: sumprod_i64 (& (vec ! [10 , 20 , 30]) , & (vec ! [1 , 2 , 3])) ?"),
+        "all-int sumprod must route to sumprod_i64: {}",
+        out
+    );
+    assert!(
+        out.contains("math :: sumprod_f64 (& (vec ! [1.5 , 2.5]) , & (vec ! [3.5 , 4.5])) ?"),
+        "a float sumprod must route to sumprod_f64: {}",
+        out
+    );
+    assert!(
+        out.contains(". into_iter () . map (| x | x as f64) . collect :: < Vec < f64 > >")
+            || out.contains("as f64) . collect"),
+        "a mixed int/float pair must coerce the int list to f64: {}",
+        out
+    );
+}
+
+#[test]
 fn textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error() {
     // #368: `wrap(text, width, **kwargs)` (test_textwrap's check_wrap
     // forwarding its **kwargs, which may carry initial_indent/drop_whitespace)
