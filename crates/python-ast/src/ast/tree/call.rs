@@ -5554,6 +5554,7 @@ impl<'a> CodeGen for Call {
                         | "DEFAULT_BUFFER_SIZE"
                         | "fsum"
                         | "trunc"
+                        | "sumprod"
                 )
             });
             if let (Some((fname, module_prefix, render_name)), true) = (target, known) {
@@ -6438,6 +6439,66 @@ impl<'a> CodeGen for Call {
                         Ok(quote!(#p(#x)))
                     }
                     ("trunc", _) => Err(arity("1")),
+                    ("sumprod", [a, b]) => {
+                        // math.sumprod(a, b) — dot product. The runtime has
+                        // an int pair (sumprod_i64 → i64) and a float pair
+                        // (sumprod_f64 → f64); which one depends on the
+                        // ELEMENT types of the two list arguments (any float
+                        // makes the result float, matching CPython's type
+                        // preservation). For a MIXED pair (int list with a
+                        // float list — `sumprod([-1], [1.])`), the int list
+                        // coerces element-wise to f64 so sumprod_f64 accepts
+                        // it. The rendered args `a`/`b` are the list EXPR
+                        // tokens; the inferred element types come from the
+                        // source ExprType.
+                        let elt_of = |e: &ExprType| {
+                            crate::ast::tree::type_ctx::infer_type(
+                                Some(&ctx), e, &options, &symbols,
+                            )
+                        };
+                        let is_int_vec = |e: &ExprType| {
+                            matches!(
+                                elt_of(e),
+                                crate::TypeInfo::Vec(inner) if matches!(*inner, crate::TypeInfo::Int)
+                            )
+                        };
+                        let is_float_vec = |e: &ExprType| {
+                            // A KNOWN-EMPTY list literal is NOT a
+                            // confirmed-float list: no float was consumed,
+                            // so an empty pair's result is the int additive
+                            // identity (0), matching CPython
+                            // (`sumprod([], [])` is int 0 even under a
+                            // list[float] annotation — issue #369).
+                            if matches!(e, ExprType::List(l) if l.is_empty()) {
+                                return false;
+                            }
+                            matches!(
+                                elt_of(e),
+                                crate::TypeInfo::Vec(inner) if matches!(*inner, crate::TypeInfo::Float)
+                            )
+                        };
+                        let e0 = &self.args[0];
+                        let e1 = &self.args[1];
+                        let any_float = is_float_vec(e0) || is_float_vec(e1);
+                        if any_float {
+                            let a0 = if is_int_vec(e0) {
+                                quote!((#a).into_iter().map(|x| x as f64).collect::<Vec<f64>>())
+                            } else {
+                                quote!(#a)
+                            };
+                            let b0 = if is_int_vec(e1) {
+                                quote!((#b).into_iter().map(|x| x as f64).collect::<Vec<f64>>())
+                            } else {
+                                quote!(#b)
+                            };
+                            let p = qual("sumprod_f64");
+                            Ok(quote!(#p(&(#a0), &(#b0))?))
+                        } else {
+                            let p = qual("sumprod_i64");
+                            Ok(quote!(#p(&(#a), &(#b))?))
+                        }
+                    }
+                    ("sumprod", _) => Err(arity("2")),
                     ("md5" | "sha1" | "sha256" | "sha512", []) => {
                         let p = qual(crate::ast::tree::std_module::hashlib_new_variant(&fname)
                             .expect("the arm above names exactly the registry algos"));

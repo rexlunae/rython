@@ -128,7 +128,7 @@ and `test.*` stdlib references, and asserts are dropped.
 | `test_fractions` | CONVERT | — (same) |
 | `test_random` | CONVERT | — (same) |
 | `test_operator` | CONVERT | — (same) |
-| `test_math` | BLOCKED | `__float__`-coercion FIXED (this round: a `__float__`-class lowers via `From<Class> for f64`/`Into<f64>` into float contexts — `math.ceil(FloatLike(...))` AND heterogeneous `[float, FloatLike]` lists unify to `Vec<f64>` for `math.fsum`, so the line-744 wall falls). `math.fsum` runtime+codegen landed (compensated summation). test_math now advances from line 744 to **line 1307** — the `math.dist` heterogeneous-mixed-tuple-list wall (`[..., (Fraction..), (Decimal..), ...]` mixing int/float/Fraction/Decimal) |
+| `test_math` | BLOCKED | `__float__`-coercion FIXED (this round: a `__float__`-class lowers via `From<Class> for f64`/`Into<f64>` into float contexts — `math.ceil(FloatLike(...))` AND heterogeneous `[float, FloatLike]` lists unify to `Vec<f64>` for `math.fsum`, so the line-744 wall falls). `math.fsum` + `math.sumprod` runtime+codegen landed. test_math now advances from line 744 to **line 1307** — the `math.dist` heterogeneous-mixed-tuple-list wall (`[..., (Fraction..), (Decimal..), ...]` mixing int/float/Fraction/Decimal) |
 | `test_bisect` | BLOCKED | nested `def grade(breakpoints=[60,70,80,90])` — a **mutable-list default**, deliberately loud (Python evaluates-and-shares it; cannot be lowered correctly) |
 | `test_csv` | BLOCKED | dialect registry FIXED (this round: `csv.reader(f, name)` / `delimiter=` thread the separator via a std-gated `Dialect` registry; `csv::reader` takes a `delimiter: u8`). Advances to the **dialect-OBJECT / DictReader / Sniffer / field_size_limit** wall (`dialect=Dialect()` attribute access, `csv.DictReader`, `csv.Sniffer`) |
 | `test_textwrap` | BLOCKED | `wrap(text, width, **kwargs)` was issue #368; the `**kwargs` SPREAD is now a loud `-W` drop (PR, `textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error`), so it advances to line 541 — the next wall is literal keyword OPTIONS to `wrap(..., initial_indent=..., max_lines=..., placeholder=...)`, which rython's `wrap(text, width)` does not model |
@@ -233,6 +233,20 @@ inside (or leads to) the unittest harness:
   `math::fsum(&(list))?` (borrowed + `?`, since it's fallible). Pins:
   `math_fsum_compensates_and_matches_cpython` (runtime),
   `math_fsum_lowers_by_reference_and_threads_the_result` (codegen).
+- **`math.sumprod`** now exists (runtime + codegen, #369 — another surface
+  test_math's `sumprod` walls need). Dot product, type-preserving:
+  all-int stays int (`sumprod([10,20,30],[1,2,3])` = `140`), any float
+  becomes float (`sumprod([1.5,2.5],[3.5,4.5])` = `16.5`), empty is the
+  additive identity, and a MIXED int/float pair coerces the int list to
+  f64 (`sumprod([-1],[1.])` = `-1.0`, matching CPython). Unequal lengths
+  raise `ValueError: Inputs are not the same length`. The float form uses
+  CPython's extended-precision `TripleLength`/`fma` accumulation so a
+  cancellation keeps the exact result (`sumprod([1e16, 1.0, -1e16],
+  [1.0, 1.0, 1.0])` is `1.0`). Codegen routes by element type:
+  `math::sumprod_i64` vs `math::sumprod_f64`, with the int list coerced
+  element-wise when mixed. Pins: `math_sumprod_preserves_int_and_float_types`
+  (runtime), `math_sumprod_routes_by_element_type_and_coerces_mixed`
+  (codegen), `sumprod_pairs` idiom.
 - **Boxed-class CONSTRUCTOR arguments now box** (#367 class model): a class
   with an UNANNOTATED `__init__` param stores a boxed PyValue field
   (`self.value = value`), so its `new(value: PyValue)` needs the call-site
