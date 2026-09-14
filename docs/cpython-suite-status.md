@@ -128,7 +128,7 @@ and `test.*` stdlib references, and asserts are dropped.
 | `test_fractions` | CONVERT | — (same) |
 | `test_random` | CONVERT | — (same) |
 | `test_operator` | CONVERT | — (same) |
-| `test_math` | BLOCKED | `count_set_bits` recursion (FIXED → advanced); `ulp_abs_check` union FIXED (this round: `local_str.format(...)` now infers String, so `None` vs `fmt.format(...)` unifies to `Option<String>`); test_math now advances from line 107 to line 744 — the heterogeneous `[float, FloatLike]` list-literal wall |
+| `test_math` | BLOCKED | `count_set_bits` recursion (FIXED → advanced); `ulp_abs_check` union FIXED (this round: `local_str.format(...)` now infers String, so `None` vs `fmt.format(...)` unifies to `Option<String>`); test_math now advances from line 107 to line 744 — the heterogeneous `[float, FloatLike]` list-literal wall. `math.fsum` runtime+codegen landed (compensated summation, `math::fsum(&(list))?` — the #369 surface test_math's fsum walls need) |
 | `test_bisect` | BLOCKED | nested `def grade(breakpoints=[60,70,80,90])` — a **mutable-list default**, deliberately loud (Python evaluates-and-shares it; cannot be lowered correctly) |
 | `test_csv` | BLOCKED | dialect registry FIXED (this round: `csv.reader(f, name)` / `delimiter=` thread the separator via a std-gated `Dialect` registry; `csv::reader` takes a `delimiter: u8`). Advances to the **dialect-OBJECT / DictReader / Sniffer / field_size_limit** wall (`dialect=Dialect()` attribute access, `csv.DictReader`, `csv.Sniffer`) |
 | `test_textwrap` | BLOCKED | `wrap(text, width, **kwargs)` was issue #368; the `**kwargs` SPREAD is now a loud `-W` drop (PR, `textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error`), so it advances to line 541 — the next wall is literal keyword OPTIONS to `wrap(..., initial_indent=..., max_lines=..., placeholder=...)`, which rython's `wrap(text, width)` does not model |
@@ -222,6 +222,17 @@ inside (or leads to) the unittest harness:
 - These recede pure-language walls (math advances past `count_set_bits`), but
   the *count* moves only when the #334 harness lands, because that is the
   shared gate for all 17 files.
+- **`math.fsum`** now exists (runtime + codegen, the #369 list-taking surface
+  test_math's `fsum` walls need). A faithful port of CPython's `math_fsum.c`
+  compensated-summation ("partials") algorithm: `fsum([0.1, 0.2, 0.3])` is
+  EXACTLY `0.6`, a small magnitude survives a large one (`fsum([1e100,
+  -1e100, 1e-100])` is `1e-100`), NaN/±inf short-circuit, and an INTERMEDIATE
+  overflow of a finite running total (`fsum([1e308, 1e308])`) raises
+  `OverflowError: intermediate overflow in fsum` — all pinned against
+  python3 3.14. Codegen lowers `math.fsum(list)` as the slice-taking
+  `math::fsum(&(list))?` (borrowed + `?`, since it's fallible). Pins:
+  `math_fsum_compensates_and_matches_cpython` (runtime),
+  `math_fsum_lowers_by_reference_and_threads_the_result` (codegen).
 
 ## Complex (#366) — the biggest single-file unblocker, status
 

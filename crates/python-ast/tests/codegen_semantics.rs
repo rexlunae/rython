@@ -6067,6 +6067,29 @@ fn complex_real_imag_locals_infer_f64_in_returns() {
 }
 
 #[test]
+fn math_fsum_lowers_by_reference_and_threads_the_result() {
+    // #369: math.fsum(list) lowers to the slice-taking runtime as a
+    // borrowed `&(list)` (a Vec<f64> cannot satisfy `&[f64]`), and the call
+    // is FALLIBLE (intermediate overflow raises OverflowError), so `?`
+    // threads its Result. The empty list is a valid empty float slice.
+    let out = compile(
+        "import math\nr = math.fsum([0.1, 0.2, 0.3])\n",
+        "fsum1.py",
+    );
+    assert!(
+        out.contains("math :: fsum (& (vec ! [0.1 , 0.2 , 0.3])) ?"),
+        "fsum must borrow its list arg and thread `?`: {}",
+        out
+    );
+    let out2 = compile("import math\nr = math.fsum([])\n", "fsum2.py");
+    assert!(
+        out2.contains("math :: fsum (& (vec ! [])) ?"),
+        "the empty list must lower as an empty float slice: {}",
+        out2
+    );
+}
+
+#[test]
 fn textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error() {
     // #368: `wrap(text, width, **kwargs)` (test_textwrap's check_wrap
     // forwarding its **kwargs, which may carry initial_indent/drop_whitespace)
