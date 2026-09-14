@@ -274,6 +274,33 @@ fn math_sumprod_preserves_int_and_float_types() {
 }
 
 #[test]
+fn math_comb_perm_match_cpython() {
+    // math.comb / math.perm (integer combinatorics), pinned against
+    // python3 3.14.
+    use stdpython::math::{comb, perm};
+    assert_eq!(comb(5, 2).unwrap(), 10);
+    assert_eq!(comb(10, 3).unwrap(), 120);
+    assert_eq!(comb(5, 0).unwrap(), 1);
+    assert_eq!(comb(0, 0).unwrap(), 1);
+    // k > n → 0 (CPython), k < 0 → 0.
+    assert_eq!(comb(5, 6).unwrap(), 0);
+    assert_eq!(comb(5, -1).unwrap(), 0);
+    // Negative n → ValueError.
+    let e = comb(-1, 2).unwrap_err();
+    assert_eq!(
+        format!("{}", e),
+        "ValueError: n must be a non-negative integer"
+    );
+    assert_eq!(perm(5, 2).unwrap(), 20);
+    assert_eq!(perm(5, 3).unwrap(), 60);
+    // k defaults to n at the codegen layer; here 2-arg is exact.
+    assert_eq!(perm(5, 5).unwrap(), 120);
+    assert_eq!(perm(0, 0).unwrap(), 1);
+    assert_eq!(perm(5, 6).unwrap(), 0);
+    assert_eq!(format!("{}", perm(-1, 2).unwrap_err()), "ValueError: n must be a non-negative integer");
+}
+
+#[test]
 fn py_pow_matches_python() {
     // Python: 2 ** 10 == 1024 (int stays int)
     assert_eq!(py_pow(2i64, 10i64), 1024);

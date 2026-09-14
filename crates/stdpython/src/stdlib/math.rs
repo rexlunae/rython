@@ -849,3 +849,52 @@ pub fn sumprod_f64(a: &[f64], b: &[f64]) -> Result<f64, PyException> {
     }
     Ok(tl_to_d(acc))
 }
+
+/// math.comb(n, k) — the binomial coefficient, as a Python int (i64 in
+/// rython). CPython returns 0 when k < 0 or k > n, and raises ValueError
+/// for a negative n. A result beyond i64 is OverflowError.
+pub fn comb(n: i64, k: i64) -> Result<i64, PyException> {
+    if n < 0 {
+        return Err(PyException::new(
+            "ValueError",
+            "n must be a non-negative integer",
+        ));
+    }
+    if k < 0 || k > n {
+        return Ok(0);
+    }
+    // nCk = nC(n-k); use the smaller k for fewer multiplications.
+    let k = if k > n - k { n - k } else { k };
+    let mut result: i64 = 1;
+    for i in 0..k {
+        let numerator = n - i;
+        let divisor = i + 1;
+        result = result
+            .checked_mul(numerator)
+            .ok_or_else(|| PyException::new("OverflowError", "result too large"))?
+            / divisor;
+    }
+    Ok(result)
+}
+
+/// math.perm(n, k=None) — the number of permutations of k items from n
+/// (k defaults to n). CPython returns 0 for k < 0 or k > n, raises
+/// ValueError for a negative n, and a result beyond i64 is overflow.
+pub fn perm(n: i64, k: i64) -> Result<i64, PyException> {
+    if n < 0 {
+        return Err(PyException::new(
+            "ValueError",
+            "n must be a non-negative integer",
+        ));
+    }
+    if k < 0 || k > n {
+        return Ok(0);
+    }
+    let mut result: i64 = 1;
+    for i in 0..k {
+        result = result
+            .checked_mul(n - i)
+            .ok_or_else(|| PyException::new("OverflowError", "result too large"))?;
+    }
+    Ok(result)
+}

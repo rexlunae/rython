@@ -43,7 +43,7 @@ const ISINSTANCE_TARGET_NAMES: &[&str] = &[
 const FALLIBLE_STDLIB_FN: &[&str] = &[
     // math: domain/range errors and overflow.
     "sqrt", "pow", "log", "log2", "log10", "log1p", "asin", "acos", "acosh", "atanh",
-    "factorial", "fmod", "remainder", "ldexp", "fsum",
+    "factorial", "fmod", "remainder", "ldexp", "fsum", "comb", "perm",
     // json: parse errors.
     "loads",
     // glob: filesystem access can fail.
@@ -5555,6 +5555,8 @@ impl<'a> CodeGen for Call {
                         | "fsum"
                         | "trunc"
                         | "sumprod"
+                        | "comb"
+                        | "perm"
                 )
             });
             if let (Some((fname, module_prefix, render_name)), true) = (target, known) {
@@ -6499,6 +6501,22 @@ impl<'a> CodeGen for Call {
                         }
                     }
                     ("sumprod", _) => Err(arity("2")),
+                    ("comb", [n, k]) => {
+                        let p = qual("comb");
+                        Ok(quote!(#p(#n, #k)?))
+                    }
+                    ("comb", _) => Err(arity("2")),
+                    // math.perm(n, k); math.perm(n) defaults k to n
+                    // (CPython), so the 1-arg form passes k = n.
+                    ("perm", [n]) => {
+                        let p = qual("perm");
+                        Ok(quote!(#p(#n, #n)?))
+                    }
+                    ("perm", [n, k]) => {
+                        let p = qual("perm");
+                        Ok(quote!(#p(#n, #k)?))
+                    }
+                    ("perm", _) => Err(arity("1 or 2")),
                     ("md5" | "sha1" | "sha256" | "sha512", []) => {
                         let p = qual(crate::ast::tree::std_module::hashlib_new_variant(&fname)
                             .expect("the arm above names exactly the registry algos"));
