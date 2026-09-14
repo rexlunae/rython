@@ -265,3 +265,12 @@ negative-test data / `assertRaises(TypeError, op, x, y)` inputs).
   (`complex_binop_literal` / `complex_unary_local`); and MIXED complex/scalar
   tuple returns (`return (z, r)` with r = abs(z) → `(Complex, f64)`) no longer
   collapse. Pin: `complex_local_tuple_returns_infer_complex_members`.)
+- **Bare complex `.real` / `.imag` locals now record as f64** (PR: "type complex
+  .real/.imag local returns"): a local assigned from the real/imaginary
+  COMPONENT of a complex — `re = (3+4j).real`, `im = z.imag` — was previously
+  unrecorded, so a tuple RETURN that mixes those with complex binop/abs locals
+  (`return s, r, re, im`) collapsed to `()`. `complex_unary_local` now also
+  handles a bare complex `Attribute` `.real`/`.imag` → `TypeInfo::Float`.
+  Verified end-to-end against CPython: `(s, m, d, r, c, re, im)` =
+  `(3j, -2+0j, 0.5+0j, 3.0, 1-2j, 3.0, 4.0)` build and run byte-identical.
+  Pin: `complex_real_imag_locals_infer_f64_in_returns`.

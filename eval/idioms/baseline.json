@@ -6,6 +6,9 @@
     "clauses": {
       "status": "pass"
     },
+    "complex_components": {
+      "status": "pass"
+    },
     "detect": {
       "status": "pass"
     },
@@ -45,10 +48,10 @@
     "tree": {
       "status": "pass"
     },
-    "views": {
+    "valueor": {
       "status": "pass"
     },
-    "valueor": {
+    "views": {
       "status": "pass"
     }
   }

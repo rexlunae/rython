@@ -4331,14 +4331,24 @@ fn complex_binop_literal(
     operand_is_complex(&op.left, locals) || operand_is_complex(&op.right, locals)
 }
 
-/// The result type of a complex UNARY-ish call assigned to a local:
-/// `abs(z)` of a complex is a float; `z.conjugate()` on a complex is Complex.
-/// Returns `None` when `e` is not one of these shapes, so `collect_local_types`
-/// can record `r = abs(z)` / `c = z.conjugate()` (issue #366).
+/// The result type of a complex UNARY-ish value assigned to a local:
+/// `abs(z)` of a complex is a float; `z.conjugate()` on a complex is Complex;
+/// and a bare complex ATTRIBUTE-access `z.real` / `z.imag` (issue #366) is a
+/// float. Returns `None` when `e` is not one of these shapes, so
+/// `collect_local_types` can record `r = abs(z)` / `c = z.conjugate()` /
+/// `re = (3+4j).real`.
 fn complex_unary_local(
     e: &ExprType,
     locals: &std::collections::HashMap<String, crate::TypeInfo>,
 ) -> Option<crate::TypeInfo> {
+    // A bare attribute access — `re = (3 + 4j).real` / `im = z.imag` — a
+    // complex `.real` / `.imag` is the real/imaginary component as a float.
+    if let ExprType::Attribute(am) = e
+        && matches!(am.attr.as_str(), "real" | "imag")
+        && operand_is_complex(&am.value, locals)
+    {
+        return Some(crate::TypeInfo::Float);
+    }
     let ExprType::Call(call) = e else {
         return None;
     };
