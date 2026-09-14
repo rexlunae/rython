@@ -400,6 +400,20 @@ impl ExprType {
                         // tuple/optional shapes this branch used to cover.
                         if distinct.iter().all(crate::is_boxable_value_type) {
                             expected = crate::TypeInfo::PyValue;
+                        } else if crate::ast::tree::type_ctx::is_float_coercible_mix(
+                            &distinct,
+                            &symbols,
+                            &options,
+                        ) {
+                            // A `[float, FloatLike, ...]` mix: the FloatLike
+                            // elements implement `Into<f64>` (their `__float__`
+                            // backs a `From<Class> for f64`), so the literal
+                            // unifies to `Vec<f64>` and each class element
+                            // coerces via the coercion layer (issue #367 —
+                            // test_math's `math.fsum([1e100, FloatLike(1.0),
+                            // ...])` wall). NOT a silent divergence: the class
+                            // genuinely is float-coercible.
+                            expected = crate::TypeInfo::Float;
                         } else {
                             let kinds = distinct
                                 .iter()

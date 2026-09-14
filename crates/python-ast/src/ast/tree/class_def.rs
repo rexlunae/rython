@@ -4192,6 +4192,30 @@ StatementType::Assign(a)
             quote!()
         };
 
+        // A class with `__float__` participates in the float-coercion
+        // protocol: `math.fabs(x)` / `math.ceil(x)` lower to the
+        // `T: Into<f64>` math functions, so a __float__-carrying class
+        // must implement `From<FloatLike> for f64` (via `Into<f64>`).
+        // The dunder returns the boxed PyValue; `f64::from(PyValue)`
+        // converts it, loudly panicking on a non-float member (§12.2 —
+        // Python fails at use, rython at the conversion). A raising
+        // `__float__` is the loud §12.2 panic. This is the foundation for
+        // FloatLike-style classes (test_math) and their heterogeneous
+        // `[float, FloatLike]` lists (issue #367).
+        let float_impl = if options.with_std_python
+            && self.methods().any(|m| m.name == "__float__")
+        {
+            quote! {
+                impl std::convert::From<#class_name> for f64 {
+                    fn from(value: #class_name) -> f64 {
+                        f64::from(value.__float__().expect("__float__ raised"))
+                    }
+                }
+            }
+        } else {
+            quote!()
+        };
+
         // An instance is never None (only None is None in Python), so `x
         // is None` on a class-typed value lowers through PyIsNone to a
         // constant false — the same never-None contract the scalar types
@@ -4564,6 +4588,7 @@ StatementType::Assign(a)
             #class_lazylock_constants
             #inherits_tree
             #len_impl
+            #float_impl
             #display_impl
             #trait_stream
             impl #class_name {

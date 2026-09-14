@@ -1833,6 +1833,19 @@ pub fn render_typed(
     } else {
         actual
     };
+    // A float-coercible CLASS value into a Float slot (`math.ceil(
+    // FloatLike(...))`; a `[1e100, FloatLike(1.0)]` list element whose
+    // literal unify resolved to Vec<f64>): codegen emits `From<Class> for
+    // f64` for a __float__-carrying class, so `Into<f64>` applies — the
+    // `.into()` is the conversion (issue #367). A class WITHOUT __float__
+    // emits no From impl, so the `.into()` is a loud build error (never a
+    // silent placeholder).
+    if matches!(expected, TypeInfo::Float)
+        && let TypeInfo::Class(cls) = &actual
+        && is_float_coercible_class(cls, &symbols, &options)
+    {
+        return Ok(quote!((#tokens).into()));
+    }
     match coerce_tokens(tokens.clone(), &actual, &expected) {
         Some(coerced) => Ok(coerced),
         None => {
@@ -2084,6 +2097,38 @@ pub fn is_builtin_type_annotation(ann: &ExprType) -> bool {
         ),
         _ => false,
     }
+}
+
+/// Whether a heterogeneous list's DISTINCT element types are a
+/// `Float` plus one-or-more FLOAT-COERCIBLE classes (`[1e100,
+/// FloatLike(1.0), ...]`): each class element implements `Into<f64>`
+/// (its `__float__` backs a `From<Class> for f64`), so the mix unifies to
+/// `Vec<f64>` and each class element coerces (issue #367).
+pub fn is_float_coercible_mix(
+    distinct: &[TypeInfo],
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    distinct.contains(&TypeInfo::Float)
+        && distinct.iter().all(|t| match t {
+            TypeInfo::Float => true,
+            TypeInfo::Class(name) => is_float_coercible_class(name, symbols, options),
+            _ => false,
+        })
+}
+
+/// Whether the named class is FLOAT-COERCIBLE — it (or its MRO) has a
+/// `__float__` method, so codegen emits `From<Class> for f64`, making
+/// `Class: Into<f64>` true. Drives the heterogeneous numeric-list unify
+/// (`[1e100, FloatLike(1.0), ...]` → `Vec<f64>`, issue #367) and the
+/// `math.<fn>`-argument coercion.
+pub fn is_float_coercible_class(
+    name: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    crate::resolve_class_referenced(name, symbols, options)
+        .is_some_and(|c| c.method_on_mro("__float__", symbols).is_some())
 }
 
 /// Whether a Rust-side element type can live inside the boxed
