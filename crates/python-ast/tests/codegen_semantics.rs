@@ -4620,6 +4620,34 @@ fn construction_and_method_calls_propagate_exceptions() {
 }
 
 #[test]
+fn boxed_class_constructor_boxes_scalar_arguments() {
+    // A class with an UNANNOTATED `__init__` param stores a boxed PyValue
+    // field (`self.value = value`), so `new(value: PyValue)`; the call
+    // site must BOX the scalar argument (`PyValue::from(42)`) or the
+    // generated crate fails to build with E0308. This is the
+    // `Into<PyValue>`-style boxing a value-pinned free function gets,
+    // applied to boxed-class construction (#367).
+    let out = compile(
+        concat!(
+            "class C:\n",
+            "    def __init__(self, value):\n",
+            "        self.value = value\n",
+            "def run():\n",
+            "    a = C(42)\n",
+            "    b = C(\"hi\")\n",
+            "    return a, b\n",
+        ),
+        "boxed_ctor.py",
+    );
+    assert!(
+        out.contains("C :: new (PyValue :: from ((42))) ?")
+            && out.contains("C :: new (PyValue :: from ((\"hi\"))) ?"),
+        "boxed-class construction must box scalar args: {}",
+        out
+    );
+}
+
+#[test]
 fn user_methods_shadow_builtin_method_rewrites() {
     // A user-defined method named like a dict/list builtin must resolve to
     // the class, not the py_get rewrite.
