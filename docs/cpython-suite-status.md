@@ -247,6 +247,15 @@ inside (or leads to) the unittest harness:
   element-wise when mixed. Pins: `math_sumprod_preserves_int_and_float_types`
   (runtime), `math_sumprod_routes_by_element_type_and_coerces_mixed`
   (codegen), `sumprod_pairs` idiom.
+- **`math.comb` / `math.perm`** now exist (integer combinatorics, #369).
+  `comb(n,k)` = binomial coefficient, `perm(n,k)` = permutations count,
+  with CPython's exact edges: `k > n` → `0`, `k < 0` → `0`, negative `n` →
+  `ValueError: n must be a non-negative integer`, and a result beyond i64 →
+  OverflowError. `math.perm(n)` defaults `k` to `n` (a single arg), so
+  `math.perm(5)` is `120`. Codegen routes them through the fallible
+  runtime (`math::comb(n, k)?` / `math::perm(n, n)?` for the 1-arg form).
+  Pins: `math_comb_perm_match_cpython` (runtime),
+  `math_comb_perm_route_and_default_perm_k` (codegen), `comb_perm` idiom.
 - **Boxed-class CONSTRUCTOR arguments now box** (#367 class model): a class
   with an UNANNOTATED `__init__` param stores a boxed PyValue field
   (`self.value = value`), so its `new(value: PyValue)` needs the call-site

@@ -9,6 +9,9 @@
     "clauses": {
       "status": "pass"
     },
+    "comb_perm": {
+      "status": "pass"
+    },
     "complex_components": {
       "status": "pass"
     },

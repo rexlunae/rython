@@ -6225,6 +6225,38 @@ fn math_sumprod_routes_by_element_type_and_coerces_mixed() {
 }
 
 #[test]
+fn math_comb_perm_route_and_default_perm_k() {
+    // #369: math.comb/perm lower to the fallible runtime. math.perm(n) with
+    // a single arg defaults k to n (math::perm(n, n)), matching CPython;
+    // the 2-arg forms pass through. Both thread `?` (fallible).
+    let out = compile(
+        concat!(
+            "import math\n",
+            "a = math.comb(5, 2)\n",
+            "b = math.perm(5, 3)\n",
+            "c = math.perm(5)\n",
+        ),
+        "combperm.py",
+    );
+    assert!(
+        out.contains("math :: comb (5 , 2) ?"),
+        "math.comb must lower with `?`: {}",
+        out
+    );
+    assert!(
+        out.contains("math :: perm (5 , 3) ?"),
+        "2-arg math.perm must pass through: {}",
+        out
+    );
+    assert!(
+        out.contains("__rython_perm_n = 5 ;")
+            && out.contains("math :: perm (__rython_perm_n , __rython_perm_n) ?"),
+        "1-arg math.perm must bind n to a temp and default k to n (single eval): {}",
+        out
+    );
+}
+
+#[test]
 fn textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error() {
     // #368: `wrap(text, width, **kwargs)` (test_textwrap's check_wrap
     // forwarding its **kwargs, which may carry initial_indent/drop_whitespace)
