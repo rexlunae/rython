@@ -214,6 +214,9 @@ pub fn default_dialects() -> alloc::collections::BTreeMap<String, Dialect> {
     m.insert("excel-tab".to_string(), tab);
     let mut unix = excel_dialect();
     unix.lineterminator = "\n".to_string();
+    // CPython's unix dialect quotes EVERY field (QUOTE_ALL), unlike excel's
+    // QUOTE_MINIMAL — verified against python3 (`csv.get_dialect('unix')`).
+    unix.quoting = QUOTE_ALL;
     m.insert("unix".to_string(), unix);
     m
 }
@@ -291,12 +294,13 @@ pub fn get_dialect(name: &str) -> Result<Dialect, PyException> {
     })
 }
 
-/// csv.get_dialect(name).delimiter (the codegen-resolved byte for the
-/// reader/writer), defaulting to `,` for an unknown name (datum-style,
-/// mirroring how the alloc-tier reader defaults).
+/// csv.get_dialect(name).delimiter — the byte the reader/writer split/join
+/// on. An UNKNOWN name raises csv.Error, exactly as CPython's named-dialect
+/// lookup does (never a silent default). Returns the byte for a registered
+/// name.
 #[cfg(feature = "std")]
-pub fn dialect_delimiter(name: &str) -> u8 {
-    registry().as_ref().unwrap().get(name).map(|d| d.delimiter).unwrap_or(b',')
+pub fn dialect_delimiter(name: &str) -> Result<u8, PyException> {
+    get_dialect(name).map(|d| d.delimiter)
 }
 
 /// csv.unregister_dialect(name).

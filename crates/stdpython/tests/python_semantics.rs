@@ -2424,27 +2424,33 @@ mod csv_dialect_registry {
         assert!(csv::list_dialects().contains(&"excel".to_string()));
         assert!(csv::list_dialects().contains(&"excel-tab".to_string()));
         // register_dialect(name, delimiter=...) then the delimiter resolves.
-        csv::register_dialect("semi", Some(b';'), None, None, None, None, None, None, None)
+        csv::register_dialect("semi_reg", Some(b';'), None, None, None, None, None, None, None)
             .unwrap();
-        assert_eq!(csv::dialect_delimiter("semi"), b';');
-        assert_eq!(csv::dialect_delimiter("nonesuch"), b',');
-        let d = csv::get_dialect("semi").unwrap();
+        assert_eq!(csv::dialect_delimiter("semi_reg").unwrap(), b';');
+        // An unknown dialect name is csv.Error, not a silent default
+        // (verified against python3: `csv.reader(['a;b'], 'nonesuch')`
+        // raises `csv.Error: unknown dialect`).
+        let e = csv::dialect_delimiter("nonesuch").unwrap_err();
+        assert_eq!(format!("{}", e), "csv.Error: unknown dialect");
+        let d = csv::get_dialect("semi_reg").unwrap();
         assert_eq!(d.delimiter, b';');
         assert!(csv::get_dialect("nonesuch").is_err());
-        csv::unregister_dialect("semi").unwrap();
-        assert!(csv::get_dialect("semi").is_err());
+        csv::unregister_dialect("semi_reg").unwrap();
+        assert!(csv::get_dialect("semi_reg").is_err());
+        // The built-in unix dialect is QUOTE_ALL (verified against python3).
+        assert_eq!(csv::get_dialect("unix").unwrap().quoting, csv::QUOTE_ALL);
     }
 
     #[test]
     fn named_dialect_drives_the_reader_like_python() {
         // python3: csv.register_dialect('semi', delimiter=';');
         // list(csv.reader(['X;Y;Z'], 'semi')) == [['X','Y','Z']]
-        csv::register_dialect("semi", Some(b';'), None, None, None, None, None, None, None)
+        csv::register_dialect("semi_named", Some(b';'), None, None, None, None, None, None, None)
             .unwrap();
-        let delim = csv::dialect_delimiter("semi");
+        let delim = csv::dialect_delimiter("semi_named").unwrap();
         let r = csv::reader(&["X;Y;Z"], delim, false, None).unwrap();
         assert_eq!(r[0], vec!["X", "Y", "Z"]);
-        csv::unregister_dialect("semi").unwrap();
+        csv::unregister_dialect("semi_named").unwrap();
     }
 }
 

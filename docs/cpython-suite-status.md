@@ -197,16 +197,22 @@ inside (or leads to) the unittest harness:
 - **csv dialect registry + delimiter threading (`csv.reader(f, name)`,
   `delimiter=`).** A std-gated `csv::Dialect` value type and a process-global
   named registry (`register_dialect`/`get_dialect`/`unregister_dialect`/
-  `list_dialects`, pre-seeded with `excel`/`excel-tab`/`unix`) back the
-  alloc-tier `csv::reader`, which now takes a `delimiter: u8` (Excel default
-  `,`). Codegen resolves a dialect NAME argument (`csv.reader(['X;Y;Z]',
-  name)`) through `stdpython::csv::dialect_delimiter(name)` and a literal
-  `delimiter=';'` as its code point. `test_csv`'s `TestDialectRegistry`
-  dialect-name and delimiter bodies now lower; the file still sits behind the
-  dialect-OBJECT (`dialect=Dialect()` attribute access), `DictReader`/
-  `DictWriter`/`Sniffer`/`field_size_limit` walls. Pins:
-  `csv_reader_dialect_name_and_delimiter_thread_the_separator` (codegen) and
-  `csv_dialect_registry::*` (runtime).
+  `list_dialects`, pre-seeded with `excel`/`excel-tab`/`unix` where unix is
+  QUOTE_ALL, matching CPython) back the alloc-tier `csv::reader`, which now
+  takes a `delimiter: u8` (Excel default `,`). Codegen resolves a dialect
+  NAME argument (`csv.reader(['X;Y;Z]', name)`) through
+  `stdpython::csv::dialect_delimiter(name)`, which raises `csv.Error:
+  unknown dialect` for an unregistered name (matching python3); a literal
+  `delimiter=';'` is emitted as its code point. **Boundary (correct-or-loud,
+  a KNOWN wall, not hidden):** only the DELIMITER of a named dialect is
+  honoured — a registered dialect that also differs in quoting/escapechar/
+  lineterminator/quotechar produces Excel-default output for those attributes
+  until the full dialect-attr reader/writer seam lands (a follow-up). The
+  delimiter-only cases are correct and pinned. `test_csv`'s
+  `TestDialectRegistry` delimiter/name bodies lower; richer dialect bodies and
+  `DictReader`/`DictWriter`/`Sniffer`/`field_size_limit` stay behind the wall.
+  Pins: `csv_reader_dialect_name_and_delimiter_thread_the_separator` (codegen)
+  and `csv_dialect_registry::*` (runtime).
 - **`local_str.format(...)` infers a `String` return**, mirroring the `join`
   arm's concrete-receiver logic (a string literal or String/&str local
   receiver). This lets a `None` vs `fmt.format(...)` union unify to

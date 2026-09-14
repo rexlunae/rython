@@ -6265,7 +6265,7 @@ impl<'a> CodeGen for Call {
                                         options.clone(),
                                         symbols.clone(),
                                     )?;
-                                    quote!(stdpython::csv::dialect_delimiter(&(#d)))
+                                    quote!(stdpython::csv::dialect_delimiter(&(#d))?)
                                 }
                                 None => quote!(b','),
                             }
@@ -6373,7 +6373,7 @@ impl<'a> CodeGen for Call {
                                         options.clone(),
                                         symbols.clone(),
                                     )?;
-                                    quote!(stdpython::csv::dialect_delimiter(&(#d)))
+                                    quote!(stdpython::csv::dialect_delimiter(&(#d))?)
                                 }
                                 None => quote!(b','),
                             }

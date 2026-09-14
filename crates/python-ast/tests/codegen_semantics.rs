@@ -7521,7 +7521,7 @@ fn csv_reader_dialect_name_and_delimiter_thread_the_separator() {
         "crd_dialect.py",
     );
     assert!(
-        out.contains("csv :: reader (& (vec ! [(\"X;Y;Z\") . to_string ()]) , stdpython :: csv :: dialect_delimiter (& (\"unix\")) , false , None :: < u8 >) ?"),
+        out.contains("csv :: reader (& (vec ! [(\"X;Y;Z\") . to_string ()]) , stdpython :: csv :: dialect_delimiter (& (\"unix\")) ? , false , None :: < u8 >) ?"),
         "must resolve the named dialect's delimiter: {}",
         out
     );
