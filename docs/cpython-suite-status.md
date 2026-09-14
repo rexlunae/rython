@@ -239,7 +239,10 @@ inside (or leads to) the unittest harness:
   becomes float (`sumprod([1.5,2.5],[3.5,4.5])` = `16.5`), empty is the
   additive identity, and a MIXED int/float pair coerces the int list to
   f64 (`sumprod([-1],[1.])` = `-1.0`, matching CPython). Unequal lengths
-  raise `ValueError: len(a) != len(b)`. Codegen routes by element type:
+  raise `ValueError: Inputs are not the same length`. The float form uses
+  CPython's extended-precision `TripleLength`/`fma` accumulation so a
+  cancellation keeps the exact result (`sumprod([1e16, 1.0, -1e16],
+  [1.0, 1.0, 1.0])` is `1.0`). Codegen routes by element type:
   `math::sumprod_i64` vs `math::sumprod_f64`, with the int list coerced
   element-wise when mixed. Pins: `math_sumprod_preserves_int_and_float_types`
   (runtime), `math_sumprod_routes_by_element_type_and_coerces_mixed`

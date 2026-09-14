@@ -6463,6 +6463,15 @@ impl<'a> CodeGen for Call {
                             )
                         };
                         let is_float_vec = |e: &ExprType| {
+                            // A KNOWN-EMPTY list literal is NOT a
+                            // confirmed-float list: no float was consumed,
+                            // so an empty pair's result is the int additive
+                            // identity (0), matching CPython
+                            // (`sumprod([], [])` is int 0 even under a
+                            // list[float] annotation — issue #369).
+                            if matches!(e, ExprType::List(l) if l.is_empty()) {
+                                return false;
+                            }
                             matches!(
                                 elt_of(e),
                                 crate::TypeInfo::Vec(inner) if matches!(*inner, crate::TypeInfo::Float)

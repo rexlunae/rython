@@ -268,9 +268,9 @@ fn math_sumprod_preserves_int_and_float_types() {
     // Float (at least one float element) → float.
     assert_eq!(sumprod_f64(&[1.5, 2.5], &[3.5, 4.5]).unwrap(), 16.5);
     assert_eq!(sumprod_f64(&[-1.0], &[1.0]).unwrap(), -1.0);
-    // Unequal lengths raise ValueError (python3: `len(a) != len(b)`).
+    // Unequal lengths raise ValueError (python3: `Inputs are not the same length`).
     let e = sumprod_i64(&[1, 2, 3], &[1, 2]).unwrap_err();
-    assert_eq!(format!("{}", e), "ValueError: len(a) != len(b)");
+    assert_eq!(format!("{}", e), "ValueError: Inputs are not the same length");
 }
 
 #[test]

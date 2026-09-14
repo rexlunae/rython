@@ -785,7 +785,7 @@ pub fn fsum(values: &[f64]) -> Result<f64, PyException> {
 /// take SLICES, like `fsum`.
 pub fn sumprod_i64(a: &[i64], b: &[i64]) -> Result<i64, PyException> {
     if a.len() != b.len() {
-        return Err(PyException::new("ValueError", "len(a) != len(b)"));
+        return Err(PyException::new("ValueError", "Inputs are not the same length"));
     }
     let mut total = 0i64;
     for (x, y) in a.iter().zip(b.iter()) {
@@ -796,13 +796,56 @@ pub fn sumprod_i64(a: &[i64], b: &[i64]) -> Result<i64, PyException> {
 
 /// The float form: any float (or a single int list) routes here, dot-
 /// producting in f64 so `sumprod([1.5, 2.5], [3.5, 4.5])` is `16.5`.
+/// Uses CPython's extended-precision accumulation (Ogita-Rump-Oishi
+/// `TripleLength` fast triple-double + `fma`) so cancellation keeps the
+/// exact result: `sumprod([1e16, 1.0, -1e16], [1.0, 1.0, 1.0])` is `1.0`,
+/// not a naive `0.0` (a naive `total += x*y` rounds after every op and
+/// discards the `1.0` term — a silent wrong answer, issue #369/#82).
 pub fn sumprod_f64(a: &[f64], b: &[f64]) -> Result<f64, PyException> {
     if a.len() != b.len() {
-        return Err(PyException::new("ValueError", "len(a) != len(b)"));
+        return Err(PyException::new("ValueError", "Inputs are not the same length"));
     }
-    let mut total = 0.0f64;
+    // TripleLength: {hi, lo, tiny} such that hi+lo+tiny is exact.
+    #[derive(Clone, Copy)]
+    struct TripleLength {
+        hi: f64,
+        lo: f64,
+        tiny: f64,
+    }
+    let zero = TripleLength { hi: 0.0, lo: 0.0, tiny: 0.0 };
+    fn dl_sum(a: f64, b: f64) -> (f64, f64) {
+        // Algorithm 3.1: error-free transformation of a sum.
+        let x = a + b;
+        let z = x - a;
+        ((x), (a - (x - z)) + (b - z))
+    }
+    fn tl_fma(x: f64, y: f64, total: TripleLength) -> TripleLength {
+        // Algorithm 5.10 with SumKVert for K=3; the exact product via
+        // fma (Rust f64::mul_add), then a triple-double accumulation.
+        let p_hi = x * y;
+        let p_lo = x.mul_add(y, -p_hi); // exact residual of the product
+        let (sm_hi, sm_lo) = dl_sum(total.hi, p_hi);
+        let (r1_hi, r1_lo) = dl_sum(total.lo, p_lo);
+        let (r2_hi, r2_lo) = dl_sum(r1_hi, sm_lo);
+        TripleLength {
+            hi: sm_hi,
+            lo: r2_hi,
+            tiny: total.tiny + r1_lo + r2_lo,
+        }
+    }
+    fn tl_to_d(total: TripleLength) -> f64 {
+        let (l_hi, l_lo) = dl_sum(total.lo, total.hi);
+        total.tiny + l_lo + l_hi
+    }
+    let mut acc = zero;
     for (x, y) in a.iter().zip(b.iter()) {
-        total += x * y;
+        acc = tl_fma(*x, *y, acc);
+        // Non-finite fallback: propagate inf/nan like CPython's normal
+        // path would (a NaN operand gives NaN; an infinite product
+        // accumulates to inf/nan).
+        if !acc.hi.is_finite() {
+            return Ok(acc.hi);
+        }
     }
-    Ok(total)
+    Ok(tl_to_d(acc))
 }
