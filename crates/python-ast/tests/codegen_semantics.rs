@@ -6257,6 +6257,35 @@ fn math_comb_perm_route_and_default_perm_k() {
 }
 
 #[test]
+fn math_scalar_extras_route_and_isqrt_threads_result() {
+    // #369: math.cbrt/fma/hypot/nextafter lower through the infallible
+    // `Into<f64>` runtime (math::cbrt(...)); math.isqrt is FALLIBLE (it
+    // returns Result — ValueError on a negative), so it threads `?`.
+    let out = compile(
+        concat!(
+            "import math\n",
+            "a = math.cbrt(27.0)\n",
+            "b = math.fma(3.0, 4.0, 5.0)\n",
+            "c = math.hypot(3.0, 4.0)\n",
+            "d = math.nextafter(1.0, 2.0)\n",
+            "e = math.isqrt(16)\n",
+        ),
+        "math_scalar_extra.py",
+    );
+    assert!(
+        out.contains("math :: cbrt (27.0)") && out.contains("math :: hypot (3.0 , 4.0)")
+            && out.contains("math :: fma (3.0 , 4.0 , 5.0)"),
+        "cbrt/fma/hypot must lower through the runtime: {}",
+        out
+    );
+    assert!(
+        out.contains("math :: isqrt (16) ?"),
+        "fallible math.isqrt must thread `?`: {}",
+        out
+    );
+}
+
+#[test]
 fn textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error() {
     // #368: `wrap(text, width, **kwargs)` (test_textwrap's check_wrap
     // forwarding its **kwargs, which may carry initial_indent/drop_whitespace)

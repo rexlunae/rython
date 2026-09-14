@@ -308,6 +308,24 @@ fn math_comb_perm_match_cpython() {
 }
 
 #[test]
+fn math_isqrt_cbrt_fma_hypot_nextafter_match_cpython() {
+    // pinned against python3 3.14.
+    use stdpython::math::{cbrt, fma, hypot, isqrt, nextafter};
+    assert_eq!(isqrt(16).unwrap(), 4);
+    assert_eq!(isqrt(15).unwrap(), 3);
+    assert_eq!(isqrt(0).unwrap(), 0);
+    assert_eq!(isqrt(1).unwrap(), 1);
+    let e = isqrt(-1).unwrap_err();
+    assert_eq!(format!("{}", e), "ValueError: isqrt() argument must be nonnegative");
+    assert_eq!(cbrt(27.0), 3.0);
+    assert_eq!(cbrt(-8.0), -2.0);
+    assert_eq!(fma(3.0, 4.0, 5.0), 17.0);
+    assert_eq!(hypot(3.0, 4.0), 5.0);
+    assert_eq!(hypot(0.0, 0.0), 0.0);
+    assert_eq!(nextafter(1.0, 2.0), 1.0000000000000002);
+}
+
+#[test]
 fn py_pow_matches_python() {
     // Python: 2 ** 10 == 1024 (int stays int)
     assert_eq!(py_pow(2i64, 10i64), 1024);

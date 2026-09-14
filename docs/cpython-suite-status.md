@@ -256,6 +256,15 @@ inside (or leads to) the unittest harness:
   runtime (`math::comb(n, k)?` / `math::perm(n, n)?` for the 1-arg form).
   Pins: `math_comb_perm_match_cpython` (runtime),
   `math_comb_perm_route_and_default_perm_k` (codegen), `comb_perm` idiom.
+- **`math.isqrt` / `math.cbrt` / `math.fma` / `math.hypot` / `math.nextafter`**
+  now exist (#369, test_math-missing scalars). `isqrt` is the EXACT integer
+  square root (Newton's method, never a lossy float; ValueError
+  `isqrt() argument must be nonnegative` for a negative n); `cbrt`/`fma`/
+  `hypot`/`nextafter` are libm-backed `Into<f64>` functions. All verified
+  byte-identical against python3 3.14. Pins:
+  `math_isqrt_cbrt_fma_hypot_nextafter_match_cpython` (runtime),
+  `math_scalar_extras_route_and_isqrt_threads_result` (codegen),
+  `math_scalar_extras` idiom.
 - **Boxed-class CONSTRUCTOR arguments now box** (#367 class model): a class
   with an UNANNOTATED `__init__` param stores a boxed PyValue field
   (`self.value = value`), so its `new(value: PyValue)` needs the call-site

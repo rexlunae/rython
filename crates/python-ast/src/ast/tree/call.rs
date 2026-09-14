@@ -43,7 +43,7 @@ const ISINSTANCE_TARGET_NAMES: &[&str] = &[
 const FALLIBLE_STDLIB_FN: &[&str] = &[
     // math: domain/range errors and overflow.
     "sqrt", "pow", "log", "log2", "log10", "log1p", "asin", "acos", "acosh", "atanh",
-    "factorial", "fmod", "remainder", "ldexp", "fsum", "comb", "perm",
+    "factorial", "fmod", "remainder", "ldexp", "fsum", "comb", "perm", "isqrt",
     // json: parse errors.
     "loads",
     // glob: filesystem access can fail.
