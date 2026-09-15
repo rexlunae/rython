@@ -264,7 +264,10 @@ inside (or leads to) the unittest harness:
   byte-identical against python3 3.14. Pins:
   `math_isqrt_cbrt_fma_hypot_nextafter_match_cpython` (runtime),
   `math_scalar_extras_route_and_isqrt_threads_result` (codegen),
-  `math_scalar_extras` idiom.
+  `math_scalar_extras` idiom. (`math.fma` is Python 3.13+; it is pinned in
+  the runtime/codegen tests but EXCLUDED from the idiom transcript, whose
+  3.11 oracle cannot produce it — the idiom corpus runs under the CI
+  python3.11.)
 - **Boxed-class CONSTRUCTOR arguments now box** (#367 class model): a class
   with an UNANNOTATED `__init__` param stores a boxed PyValue field
   (`self.value = value`), so its `new(value: PyValue)` needs the call-site
