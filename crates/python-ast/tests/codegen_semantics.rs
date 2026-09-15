@@ -6315,6 +6315,39 @@ fn math_hypot_and_nextafter_unsupported_arities_are_loud() {
 }
 
 #[test]
+fn bare_math_import_threads_exception_inside_try() {
+    // #369 / review: a BARE `from math import isqrt/fma` (direct or aliased)
+    // inside a `try:` must thread `?` so the exception reaches its `except`
+    // block instead of being swallowed. isqrt raises ValueError on a
+    // negative; fma raises OverflowError on finite overflow.
+    let out = compile(
+        concat!(
+            "from math import isqrt\n",
+            "from math import fma as fm\n",
+            "try:\n",
+            "    isqrt(-1)\n",
+            "except ValueError as e:\n",
+            "    pass\n",
+            "try:\n",
+            "    fm(1e308, 1e308, 0.0)\n",
+            "except OverflowError:\n",
+            "    pass\n",
+        ),
+        "bare_math.py",
+    );
+    assert!(
+        out.contains("isqrt (- 1) ?"),
+        "bare isqrt must thread `?` inside try: {}",
+        out
+    );
+    assert!(
+        out.contains("fm") && out.contains(") ?") && out.contains("OverflowError"),
+        "aliased bare fma must thread `?` and catch OverflowError: {}",
+        out
+    );
+}
+
+#[test]
 fn textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error() {
     // #368: `wrap(text, width, **kwargs)` (test_textwrap's check_wrap
     // forwarding its **kwargs, which may carry initial_indent/drop_whitespace)

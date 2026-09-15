@@ -73,6 +73,20 @@ const FALLIBLE_STDLIB_FN: &[&str] = &[
     "main",
 ];
 
+/// The canonical stdpython function name a BARE import binds to `bound`:
+/// for `from math import isqrt as iq`, `bound` is "iq" and this resolves
+/// the import's `Alias` (asname "iq") back to "isqrt"; for an unaliased
+/// `from math import isqrt`, `bound` is already "isqrt". Falls back to
+/// `bound` when no alias matches (the name may be an unaliased import).
+fn import_canonical_fn_name(import: &crate::ast::tree::import::ImportFrom, bound: &str) -> String {
+    import
+        .names
+        .iter()
+        .find(|a| a.asname.as_deref() == Some(bound))
+        .map(|a| a.name.clone())
+        .unwrap_or_else(|| bound.to_string())
+}
+
 /// Issue #111: keyword-argument signatures of stdpython runtime functions
 /// (module root, function, positional parameter names in order). Calls
 /// render through these signatures: keywords map to their slots, and
@@ -2303,19 +2317,36 @@ impl<'a> CodeGen for Call {
                         Some(SymbolTableNode::FunctionDef(_)) => true,
                         Some(SymbolTableNode::ImportFrom(import)) => {
                             let root = import.module.split('.').next().unwrap_or("");
-                            !crate::is_stdpython_module(root)
+                            if !crate::is_stdpython_module(root) {
+                                true
+                            } else {
+                                // A bare import from a stdpython runtime
+                                // module (`from math import isqrt/fma`, or
+                                // an alias) threads `?` exactly when the
+                                // qualified stdpython call would: the name's
+                                // canonical function is FALLIBLE (math.isqrt
+                                // raises ValueError, math.fma raises
+                                // OverflowError/ValueError). Without this a
+                                // bare import inside a `try:` swallows the
+                                // exception instead of reaching its `except`.
+                                let fname = import_canonical_fn_name(import, &name.id);
+                                FALLIBLE_STDLIB_FN.iter().any(|f| *f == fname)
+                            }
                         }
                         // `from pylev import wf as w` — an aliased import of
                         // a user-module function propagates exactly like the
-                        // unaliased spelling.
+                        // unaliased spelling; `from math import fma as fm`
+                        // (a bare stdpython alias) propagates when fma is
+                        // FALLIBLE, matching the qualified call.
                         Some(SymbolTableNode::Alias(canonical)) => {
-                            matches!(
-                                symbols.get(canonical),
-                                Some(SymbolTableNode::ImportFrom(import))
-                                    if !crate::is_stdpython_module(
-                                        import.module.split('.').next().unwrap_or("")
-                                    )
-                            )
+                            FALLIBLE_STDLIB_FN.iter().any(|f| *f == canonical)
+                                || matches!(
+                                    symbols.get(canonical),
+                                    Some(SymbolTableNode::ImportFrom(import))
+                                        if !crate::is_stdpython_module(
+                                            import.module.split('.').next().unwrap_or("")
+                                        )
+                                )
                         }
                         // A name bound to functools.partial(f, ...) is a
                         // closure returning f's Result: propagate.

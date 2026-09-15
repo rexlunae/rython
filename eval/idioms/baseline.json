@@ -33,6 +33,9 @@
     "ledger": {
       "status": "pass"
     },
+    "math_bare_imports": {
+      "status": "pass"
+    },
     "math_scalar_extras": {
       "status": "pass"
     },

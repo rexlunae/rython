@@ -260,13 +260,22 @@ inside (or leads to) the unittest harness:
   now exist (#369, test_math-missing scalars). `isqrt` is the EXACT integer
   square root (Newton's method, never a lossy float; ValueError
   `isqrt() argument must be nonnegative` for a negative n); `cbrt`/`fma`/
-  `hypot`/`nextafter` are libm-backed `Into<f64>` functions. All verified
-  byte-identical against python3 3.14. Pins:
+  `hypot`/`nextafter` are libm-backed `Into<f64>` runtime functions. `isqrt`
+  and `fma` are FALLIBLE: `isqrt` raises that ValueError and `fma` raises
+  CPython's `OverflowError("overflow in fma")` on finite overflow and
+  `ValueError("invalid operation in fma")` on 0*inf/inf*0 — both thread `?`
+  through QUALIFIED `math.<fn>(...)` calls AND BARE `from math import ...`
+  imports (direct or aliased), so an exception reaches a surrounding `try`.
+  Unsupported valid arities fail loudly at conversion: `hypot()` → `0.0` and
+  `hypot(x)` → `hypot(x, 0.0)` are modeled, the n-dimensional
+  `hypot(a,b,c…)` and `nextafter(x, y, steps)` are refused with a message.
+  All verified byte-identical against python3 3.14. Pins:
   `math_isqrt_cbrt_fma_hypot_nextafter_match_cpython` (runtime),
-  `math_scalar_extras_route_and_isqrt_threads_result` (codegen),
-  `math_scalar_extras` idiom. (`math.fma` is Python 3.13+; it is pinned in
-  the runtime/codegen tests but EXCLUDED from the idiom transcript, whose
-  3.11/3.12 oracle cannot produce it.)
+  `math_scalar_extras_route_and_isqrt_threads_result` +
+  `bare_math_import_threads_exception_inside_try` + hypoth/nextafter arities
+  (codegen), `math_scalar_extras` + `math_bare_imports` idioms. (`math.fma`
+  is Python 3.13+; it is pinned in the runtime/codegen tests but EXCLUDED
+  from the idiom transcripts, whose 3.11/3.12 oracle cannot produce it.)
 - **Divergence (model limit): `math.cbrt` is the Rust `libm` crate's fixed
   software cube root, correctly rounded for perfect cubes (`cbrt(-8.0)` =
   `-2.0`, `cbrt(27.0)` = `3.0`), deterministic on every ABI. CPython calls
