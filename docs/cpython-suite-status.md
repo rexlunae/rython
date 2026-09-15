@@ -128,7 +128,7 @@ and `test.*` stdlib references, and asserts are dropped.
 | `test_fractions` | CONVERT | — (same) |
 | `test_random` | CONVERT | — (same) |
 | `test_operator` | CONVERT | — (same) |
-| `test_math` | BLOCKED | `__float__`-coercion FIXED (this round: a `__float__`-class lowers via `From<Class> for f64`/`Into<f64>` into float contexts — `math.ceil(FloatLike(...))` AND heterogeneous `[float, FloatLike]` lists unify to `Vec<f64>` for `math.fsum`, so the line-744 wall falls). `math.fsum` + `math.sumprod` runtime+codegen landed. test_math now advances from line 744 to **line 1307** — the `math.dist` heterogeneous-mixed-tuple-list wall (`[..., (Fraction..), (Decimal..), ...]` mixing int/float/Fraction/Decimal) |
+| `test_math` | BLOCKED | `__float__`-coercion FIXED (`math.ceil(FloatLike(...))`, heterogeneous `[float, FloatLike]` → `Vec<f64>`), `math.fsum`/`math.sumprod`/`math.isqrt`/`math.cbrt`/`math.fma`/`math.hypot`/`math.nextafter` landed. test_math advances through the earlier sumprod region to **line 1319** — the strict-`zip` wall in `testSumProd`: `sum(p_i*q_i for p_i,q_i in zip(p, q, strict=True))`. `zip(strict=True)`'s lazy ValueError timing is not representable in rython's eager model, so the call is refused loudly (a lazy strict zip is the needed follow-on); the `<module>:1366` `sumprod([10, BadMultiply(), 30], ...)` heterogeneous `int`+non-float-class list awaits after |
 | `test_bisect` | BLOCKED | nested `def grade(breakpoints=[60,70,80,90])` — a **mutable-list default**, deliberately loud (Python evaluates-and-shares it; cannot be lowered correctly) |
 | `test_csv` | BLOCKED | dialect registry FIXED (this round: `csv.reader(f, name)` / `delimiter=` thread the separator via a std-gated `Dialect` registry; `csv::reader` takes a `delimiter: u8`). Advances to the **dialect-OBJECT / DictReader / Sniffer / field_size_limit** wall (`dialect=Dialect()` attribute access, `csv.DictReader`, `csv.Sniffer`) |
 | `test_textwrap` | BLOCKED | `wrap(text, width, **kwargs)` was issue #368; the `**kwargs` SPREAD is now a loud `-W` drop (PR, `textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error`), so it advances to line 541 — the next wall is literal keyword OPTIONS to `wrap(..., initial_indent=..., max_lines=..., placeholder=...)`, which rython's `wrap(text, width)` does not model |
@@ -276,6 +276,17 @@ inside (or leads to) the unittest harness:
   (codegen), `math_scalar_extras` + `math_bare_imports` idioms. (`math.fma`
   is Python 3.13+; it is pinned in the runtime/codegen tests but EXCLUDED
   from the idiom transcripts, whose 3.11/3.12 oracle cannot produce it.)
+- **`zip(a, b, strict=True)` is refused loudly** (CPython 3.10+). CPython's
+  strict zip is LAZY — it yields every common-prefix pair before raising
+  ValueError on unequal-length exhaustion — so an eager all-or-error `Vec`
+  would silently change the exception timing (e.g. `out.extend(zip(a, b,
+  strict=True))` under a try appends the prefix then raises). Because rython
+  materializes iterables eagerly and cannot sequence that, `strict=True` is
+  a loud conversion error naming the limitation; `strict=False` truncates
+  like plain `zip`. (Devin review: reject loudly rather than lower a wrong
+  verb.) Pins: `zip_keyword_strict_is_a_loud_conversion_error` (codegen).
+  test_math's testSumProd strict-zip pair lines therefore stay at the
+  line-1319 loud-strict wall — they need a lazy strict zip to run.
 - **Divergence (model limit): `math.cbrt` is the Rust `libm` crate's fixed
   software cube root, correctly rounded for perfect cubes (`cbrt(-8.0)` =
   `-2.0`, `cbrt(27.0)` = `3.0`), deterministic on every ABI. CPython calls

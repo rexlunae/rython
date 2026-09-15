@@ -2606,18 +2606,54 @@ fn string_union_and_option_inner_mixes_box() {
 
 #[test]
 fn zip_keyword_strict_is_a_loud_conversion_error() {
-    // Python 3.10+'s zip(strict=True) raises ValueError on unequal
-    // lengths; rython's zip truncates like the default zip, so the
-    // keyword is refused at conversion — never silently lowered as the
-    // truncating form (Devin review on round 101).
+    // CPython 3.10+'s `zip(a, b, strict=True)` is LAZY: it yields the
+    // common-prefix pairs and THEN raises ValueError on unequal-length
+    // exhaustion. rython materializes iterables eagerly, so that sequencing
+    // is not representable — an all-or-error Vec would silently raise before
+    // the prefix is observed (e.g. `out.extend(zip(a, b, strict=True))` under
+    // a try). So strict=True is refused loudly (correct-or-loud); strict=False
+    // truncates like plain zip.
     let err = compile_err(
-        "def z(a: str, b: str) -> int:\n    return len(list(zip(a, b, strict=True)))\n",
+        "def z(a: list, b: list) -> list[int]:\n    return list(zip(a, b, strict=True))\n",
         "zipstrict.py",
     );
     assert!(
-        err.contains("unexpected keyword argument 'strict'"),
+        err.contains("strict=True") && err.contains("not supported yet")
+            && err.contains("refuses to silently"),
         "error: {}",
         err
+    );
+    let outf = compile(
+        "def z(a: list, b: list) -> list[int]:\n    return list(zip(a, b, strict=False))\n",
+        "zipstrictf.py",
+    );
+    assert!(
+        outf.contains("zip ("),
+        "zip(strict=False) must lower to plain truncating zip: {}",
+        outf
+    );
+    // The STAR-args splat bypasses the two-argument arm: `zip(*rows,
+    // strict=True)` must be refused the same way, never silently truncated
+    // by zip_many (CPython raises ValueError after the common prefix).
+    let starred = compile_err(
+        "def z(m: list) -> list[int]:\n    return list(zip(*m, strict=True))\n",
+        "zsplat.py",
+    );
+    assert!(
+        starred.contains("strict=True") && starred.contains("not supported yet")
+            && starred.contains("refuses to silently"),
+        "zip(*..., strict=True) must be loud, not truncated: {}",
+        starred
+    );
+    // strict=False on the splat stays the truncating zip_many.
+    let starred_f = compile(
+        "def z(m: list) -> list[int]:\n    return list(zip(*m, strict=False))\n",
+        "zsplatz.py",
+    );
+    assert!(
+        starred_f.contains("zip_many"),
+        "zip(*..., strict=False) must lower to truncating zip_many: {}",
+        starred_f
     );
 }
 
