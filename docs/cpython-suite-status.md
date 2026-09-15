@@ -256,12 +256,13 @@ inside (or leads to) the unittest harness:
   runtime (`math::comb(n, k)?` / `math::perm(n, n)?` for the 1-arg form).
   Pins: `math_comb_perm_match_cpython` (runtime),
   `math_comb_perm_route_and_default_perm_k` (codegen), `comb_perm` idiom.
-- **`math.isqrt` / `math.cbrt` / `math.fma` / `math.hypot` / `math.nextafter`**
-  now exist (#369, test_math-missing scalars). `isqrt` is the EXACT integer
-  square root (Newton's method, never a lossy float; ValueError
+- **`math.isqrt` / `math.cbrt` / `math.fma` / `math.hypot` / `math.nextafter` /
+  `math.ulp`** now exist (#369, test_math-missing scalars). `isqrt` is the
+  EXACT integer square root (Newton's method, never a lossy float; ValueError
   `isqrt() argument must be nonnegative` for a negative n); `cbrt`/`fma`/
-  `hypot`/`nextafter` are libm-backed `Into<f64>` runtime functions. `isqrt`
-  and `fma` are FALLIBLE: `isqrt` raises that ValueError and `fma` raises
+  `hypot`/`nextafter`/`ulp` are libm-backed `Into<f64>` runtime functions
+  (`ulp` = `nextafter(|x|,+inf) − |x|`, unit in the last place). `isqrt` and
+  `fma` are FALLIBLE: `isqrt` raises that ValueError and `fma` raises
   CPython's `OverflowError("overflow in fma")` on finite overflow and
   `ValueError("invalid operation in fma")` on 0*inf/inf*0 — both thread `?`
   through QUALIFIED `math.<fn>(...)` calls AND BARE `from math import ...`
@@ -269,13 +270,17 @@ inside (or leads to) the unittest harness:
   Unsupported valid arities fail loudly at conversion: `hypot()` → `0.0` and
   `hypot(x)` → `hypot(x, 0.0)` are modeled, the n-dimensional
   `hypot(a,b,c…)` and `nextafter(x, y, steps)` are refused with a message.
-  All verified byte-identical against python3 3.14. Pins:
-  `math_isqrt_cbrt_fma_hypot_nextafter_match_cpython` (runtime),
+  **Int args to math `Into<f64>` scalars now coerce `(m) as f64`** — a
+  COMPUTED int (`m = 2 ** 52`) previously rendered as a bare `m` and failed
+  rustc (std has no `From<i64> for f64`); a small literal was already coerced
+  by inference. All verified byte-identical against python3 3.14. Pins:
+  `math_isqrt_cbrt_fma_hypot_nextafter_match_cpython` (runtime, incl. `ulp`),
   `math_scalar_extras_route_and_isqrt_threads_result` +
-  `bare_math_import_threads_exception_inside_try` + hypoth/nextafter arities
-  (codegen), `math_scalar_extras` + `math_bare_imports` idioms. (`math.fma`
-  is Python 3.13+; it is pinned in the runtime/codegen tests but EXCLUDED
-  from the idiom transcripts, whose 3.11/3.12 oracle cannot produce it.)
+  `bare_math_import_threads_exception_inside_try` + hypoth/nextafter arities +
+  `math_int_args_coerce_to_f64` (codegen), `math_scalar_extras` +
+  `math_bare_imports` + `math_int_coercion` idioms. (`math.fma` is Python
+  3.13+; it is pinned in the runtime/codegen tests but EXCLUDED from the
+  idiom transcripts, whose 3.11/3.12 oracle cannot produce it.)
 - **`zip(a, b, strict=True)` is refused loudly** (CPython 3.10+). CPython's
   strict zip is LAZY — it yields every common-prefix pair before raising
   ValueError on unequal-length exhaustion — so an eager all-or-error `Vec`

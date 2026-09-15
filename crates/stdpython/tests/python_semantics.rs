@@ -362,6 +362,26 @@ fn math_isqrt_cbrt_fma_hypot_nextafter_match_cpython() {
     assert_eq!(hypot(0.0, 0.0), 0.0);
     // Python: repr(math.nextafter(1.0, 2.0)) == '1.0000000000000002'
     assert_eq!(nextafter(1.0, 2.0), 1.0000000000000002);
+    // Python: math.ulp(x) is the unit in the last place. ulp(±1.0) ==
+    // sys.float_info.epsilon, ulp(0.0) == the min subnormal, ulp(2**52) ==
+    // 1.0, ulp(inf) == inf, ulp(nan) == nan. Implemented as
+    // `nextafter(|x|, +inf) - |x|` with inf/nan special cases.
+    use stdpython::math::ulp;
+    // Python: math.ulp(1.0) == sys.float_info.epsilon
+    assert_eq!(ulp(1.0), f64::EPSILON);
+    assert_eq!(ulp(-1.0), f64::EPSILON);
+    // Python: math.ulp(0.0) == 5e-324 (the minimum positive subnormal)
+    assert_eq!(ulp(0.0), f64::from_bits(1));
+    // Python: math.ulp(2**52) == 1.0, math.ulp(2**53) == 2.0
+    assert_eq!(ulp(4503599627370496.0), 1.0);
+    assert_eq!(ulp(9007199254740992.0), 2.0);
+    // Python: math.ulp(inf) == inf, math.ulp(nan) is nan
+    assert_eq!(ulp(f64::INFINITY), f64::INFINITY);
+    assert!(ulp(f64::NAN).is_nan());
+    // Python: math.ulp(1.7976931348623157e308) == 2.0**971 (the finite
+    // predecessor gap at the largest double — nextafter(|MAX|,+inf) would
+    // wrongly give inf).
+    assert_eq!(ulp(f64::MAX), 2.0f64.powi(971));
 }
 
 #[test]

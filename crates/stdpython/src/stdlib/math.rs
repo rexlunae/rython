@@ -56,6 +56,14 @@ python_function! {
     }
 }
 
+/// math.ceil of an EXACT integer — the ceiling of an integer is itself, so
+/// no float round-trip and no >=2^53 precision loss (CPython's integer
+/// rounding returns the argument unchanged). Selected by the codegen when
+/// the argument is a statically-known i64.
+pub fn ceil_i64(x: i64) -> i64 {
+    x
+}
+
 python_function! {
     /// math.floor - floor function
     pub fn floor<T>(x: T) -> i64
@@ -67,6 +75,12 @@ python_function! {
     }
 }
 
+/// math.floor of an EXACT integer (the argument, unchanged) — no >=2^53
+/// float precision loss (see ceil_i64).
+pub fn floor_i64(x: i64) -> i64 {
+    x
+}
+
 python_function! {
     /// math.trunc - truncate to integer
     pub fn trunc<T>(x: T) -> i64
@@ -76,6 +90,12 @@ python_function! {
     {
         to_py_int(x.into().trunc(), "trunc")
     }
+}
+
+/// math.trunc of an EXACT integer (the argument, unchanged) — no >=2^53
+/// float precision loss (see ceil_i64).
+pub fn trunc_i64(x: i64) -> i64 {
+    x
 }
 
 python_function! {
@@ -1031,5 +1051,34 @@ python_function! {
         let x = x.into();
         let y = y.into();
         libm::nextafter(x, y)
+    }
+}
+
+python_function! {
+    /// math.ulp(x) - the unit in the last place: the gap between the two
+    /// nearest representable floats bracketing |x|. `ulp(0.0)` is the
+    /// smallest positive double (the min subnormal, 5e-324); `ulp(±inf)` is
+    /// inf and `ulp(nan)` is nan. For any finite x it is
+    /// `nextafter(|x|, +inf) - |x|` — except at the LARGEST finite value,
+    /// where `nextafter(MAX, +inf)` is inf and the gap is measured toward
+    /// zero instead (`MAX - nextafter(MAX, 0)` == 2**971, matching CPython's
+    /// _Py_math_ulp endpoint handling).
+    pub fn ulp<T>(x: T) -> f64
+    where [T: Into<f64>]
+    [signature: (x)]
+    [concrete_types: (f64) -> f64]
+    {
+        let x = x.into();
+        if x.is_nan() {
+            return nan;
+        }
+        let a = x.abs();
+        if a.is_infinite() {
+            return inf;
+        }
+        if a == f64::MAX {
+            return f64::MAX - libm::nextafter(f64::MAX, 0.0);
+        }
+        libm::nextafter(a, inf) - a
     }
 }

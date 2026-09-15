@@ -6351,6 +6351,75 @@ fn math_hypot_and_nextafter_unsupported_arities_are_loud() {
 }
 
 #[test]
+fn math_int_args_coerce_to_f64() {
+    // #369: a COMPUTED int argument to a math `Into<f64>` scalar must
+    // coerce `(m) as f64` — std has no `From<i64> for f64`, so a bare
+    // `math::sqrt(m)` with m a computed i64 fails rustc (a small literal
+    // is coerced by inference already, but `m = 2 ** 52` is not).
+    for (src, needle) in [
+        ("import math\nm = 2 ** 52\na = math.sqrt(m)\n", "math :: sqrt ((m) as f64)"),
+        ("import math\nm = 2 ** 53\na = math.ulp(m)\n", "math :: ulp ((m) as f64)"),
+        ("import math\nm = 2 ** 12\na = math.cbrt(m)\n", "math :: cbrt ((m) as f64)"),
+        ("import math\nm = 2 ** 53\na = math.hypot(m, 3.0)\n", "math :: hypot ((m) as f64 , 3.0)"),
+        // bare import and module alias coerce too (resolved via symbol table)
+        ("from math import sqrt\nm = 2 ** 52\na = sqrt(m)\n", "sqrt ((m) as f64)"),
+        ("import math as mm\nm = 2 ** 52\na = mm.sqrt(m)\n", "mm :: sqrt ((m) as f64)"),
+        // isfinite/isinf/isnan have float-coercible first args
+        ("import math\nm = 2 ** 12\na = math.isfinite(m)\n", "math :: isfinite ((m) as f64)"),
+    ] {
+        let out = compile(src, "mathint.py");
+        assert!(out.contains(needle), "for `{}`: {}",
+            needle.split("::").next().unwrap(), out);
+    }
+    // ldexp's integer exponent is NOT coerced to f64 (runtime takes i32).
+    let l = compile("import math\na = math.ldexp(1.0, 1074)\n", "ldexp.py");
+    assert!(
+        l.contains("math :: ldexp (1.0 , 1074)") && !l.contains("as f64"),
+        "ldexp exponent must stay int: {}", l);
+}
+
+#[test]
+fn math_ceil_floor_trunc_int_use_exact_i64_overload() {
+    // #369 / review: math.ceil/floor/trunc of an integer is EXACT (the
+    // argument, unchanged) — routing it through f64 would lose precision
+    // at >=2^53 (`floor(2**53+1)` must be 9007199254740993, not ...92).
+    // An i64 argument routes to the runtime `<fn>_i64` overload; a float
+    // stays on the f64 path.
+    for (src, needle) in [
+        ("import math\nm = 2 ** 53 + 1\na = math.floor(m)\n", "stdpython :: math :: floor_i64"),
+        ("import math\nm = 2 ** 53 + 1\na = math.ceil(m)\n", "stdpython :: math :: ceil_i64"),
+        ("import math\nm = 2 ** 53 + 1\na = math.trunc(m)\n", "stdpython :: math :: trunc_i64"),
+    ] {
+        let out = compile(src, "exactint.py");
+        assert!(out.contains(needle), "for `{}`: {}", needle, out);
+    }
+    // a float arg still takes the f64 path
+    let f = compile("import math\na = math.floor(3.7)\n", "fl.py");
+    assert!(f.contains("math :: floor") && !f.contains("floor_i64"), "float floor: {}", f);
+}
+
+#[test]
+fn aliased_non_math_module_floor_is_not_hijacked() {
+    // #369 / review: an Alias whose canonical target is NOT the math module
+    // (e.g. a sibling `import geometry as g`) must not route g.floor/ceil/
+    // trunc into the math `<fn>_i64` overload — that would change the
+    // result. Only an alias that resolves to StdModule::Math classifies.
+    let src = concat!(
+        "import geometry as g\n",
+        "def main() -> int:\n",
+        "    n = 3\n",
+        "    return g.floor(n)\n",
+    );
+    let out = compile(src, "aliasg.py");
+    // The call must target the geometry module, not stdpython::math.
+    assert!(
+        !out.contains("stdpython :: math :: floor_i64") && !out.contains("math :: floor"),
+        "a non-math alias must not be hijacked: {}",
+        out
+    );
+}
+
+#[test]
 fn bare_math_import_threads_exception_inside_try() {
     // #369 / review: a BARE `from math import isqrt/fma` (direct or aliased)
     // inside a `try:` must thread `?` so the exception reaches its `except`

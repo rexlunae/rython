@@ -8,6 +8,7 @@ use crate::{
     extract_required_attr,
 };
 use crate::ast::tree::std_module::variant as rt_variant;
+use crate::ast::tree::MathFn;
 
 /// The type names isinstance() lowers against (a PyValue predicate or a
 /// static verdict exists for each). ONE list for the three consumers —
@@ -85,6 +86,103 @@ fn import_canonical_fn_name(import: &crate::ast::tree::import::ImportFrom, bound
         .find(|a| a.asname.as_deref() == Some(bound))
         .map(|a| a.name.clone())
         .unwrap_or_else(|| bound.to_string())
+}
+
+/// per-math-argument expected runtime shape, for deciding whether to coerce
+/// a computed i64 arg to the runtime's parameter type (CPython coerces an
+/// int arg to float in math calls; a computed `m = 2 ** 52` renders as a
+/// bare i64 and fails rustc — std has no `From<i64> for f64`).
+#[derive(Clone, Copy)]
+enum MathArg {
+    /// f64 parameter: coerce a computed i64 arg with `(m) as f64`.
+    Float,
+    /// integer parameter (e.g. math.ldexp's i32 exponent): leave as int.
+    Int,
+    /// Option<f64> parameter (math.log's optional base): leave uncoerced.
+    OptFloat,
+    /// An i64 arg is handled EXACTLY (no f64 round-trip, no >=2^53 loss):
+    /// ceil/floor/trunc of an integer is the integer itself, routed to the
+    /// runtime's `<fn>_i64` overload (CPython's integer rounding returns the
+    /// argument unchanged).
+    ExactInt,
+}
+
+/// The per-argument runtime shapes of the stdpython math scalar functions,
+/// keyed by the typed [`MathFn`] enum (the sole string→name mapping lives in
+/// `MathFn::from_name`; this is a typed signature authority, not a string
+/// list).
+fn math_arg_signature(f: MathFn) -> Option<&'static [MathArg]> {
+    use crate::ast::tree::MathFn::*;
+    use MathArg::*;
+    Some(match f {
+        Sqrt | Cbrt | Ulp | Exp | Exp2 | Expm1 | Log1p | Log2 | Log10 | Sin | Cos | Tan
+        | Asin | Acos | Atan | Sinh | Cosh | Tanh | Asinh | Acosh | Atanh | Degrees
+        | Radians | Isfinite | Isinf | Isnan | Fabs | Frexp | Modf => &[Float],
+        // ceil/floor/trunc of an integer are EXACT (the arg unchanged); only
+        // a float / FloatLike arg round-trips through f64.
+        Ceil | Floor | Trunc => &[ExactInt],
+        Hypot | Nextafter | Fmod | Remainder | Copysign | Atan2 | Pow | Isclose => &[Float, Float],
+        Fma => &[Float, Float, Float],
+        Ldexp => &[Float, Int],
+        Log => &[Float, OptFloat],
+    })
+}
+
+/// Resolve whether `func` names a STDPYTHON `math.<fn>` function (through
+/// the symbol table, NOT the AST spelling): handles `math.sqrt(x)`,
+/// `from math import sqrt` (and aliases, `as iq`), and `import math as m`
+/// (`m.sqrt(x)`); returns None for a user method whose receiver happens to
+/// be spelled `math` (a shadowing local) and for any other module.
+fn resolve_math_fn_name(
+    func: &crate::ExprType,
+    symbols: &SymbolTableScopes,
+) -> Option<String> {
+    match func {
+        crate::ExprType::Name(n) => {
+            let import_math = |import: &crate::ast::tree::import::ImportFrom| -> bool {
+                import.module.split('.').next().unwrap_or("") == "math"
+            };
+            match symbols.get(&n.id) {
+                Some(SymbolTableNode::ImportFrom(import)) if import_math(import) => {
+                    // canonical name (the unaliased function name).
+                    Some(
+                        import
+                            .names
+                            .iter()
+                            .find(|a| a.asname.as_deref() == Some(&n.id))
+                            .map(|a| a.name.clone())
+                            .unwrap_or_else(|| n.id.clone()),
+                    )
+                }
+                Some(SymbolTableNode::Alias(canonical)) => {
+                    match symbols.get(canonical) {
+                        Some(SymbolTableNode::ImportFrom(import)) if import_math(import) => {
+                            Some(canonical.clone())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        crate::ExprType::Attribute(a) => {
+            let root = root_name(&a.value).unwrap_or("");
+            let is_std_math = |name: &str| {
+                if crate::module_name_shadowed(name, symbols) {
+                    return false;
+                }
+                crate::StdModule::from_name(name) == Some(crate::StdModule::Math)
+            };
+            let math_module = is_std_math(root)
+                // `import math as m` / `import math` where the root's symbol
+                // is an Alias to the MATH module (an alias to any OTHER
+                // module — e.g. `import geometry as g` — must not hijack
+                // g.floor/ceil/trunc into the math runtime).
+                || matches!(symbols.get(root), Some(SymbolTableNode::Alias(canonical)) if is_std_math(canonical));
+            math_module.then(|| a.attr.clone())
+        }
+        _ => None,
+    }
 }
 
 /// Validate the keywords of `zip(*rows)` / `zip(a, b)` (the STAR-args
@@ -2183,7 +2281,6 @@ impl<'a> CodeGen for Call {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        
         // typing-module calls are compile-time-only: TypeVar, Protocol,
         // TypeAlias, runtime_checkable, Literal, ... exist only for
         // the type system (annotations are strings under `from __future__
@@ -5853,12 +5950,34 @@ impl<'a> CodeGen for Call {
                     }
                 }
                 let mut rendered = Vec::new();
-                for arg in &self.args {
-                    rendered.push(arg.clone().to_rust(
-                        ctx.clone(),
-                        options.clone(),
-                        symbols.clone(),
-                    )?);
+                let math_sig = crate::MathFn::from_name(&fname).and_then(math_arg_signature);
+                for (i, arg) in self.args.iter().enumerate() {
+                    // For a math `Into<f64>` scalar arg position, coerce a
+                    // computed i64 arg to f64 (`(m) as f64` — std has no
+                    // `From<i64> for f64`). Only coerce Int-typed args: a
+                    // FloatLike / float arg relies on its own `Into<f64>`.
+                    let coerce_float = math_sig
+                        .and_then(|sig| sig.get(i))
+                        .is_some_and(|a| matches!(a, MathArg::Float))
+                        && matches!(
+                            crate::infer_type(Some(&ctx), arg, &options, &symbols),
+                            crate::TypeInfo::Int
+                        );
+                    if coerce_float {
+                        rendered.push(crate::render_typed_reused(
+                            arg,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(crate::TypeInfo::Float),
+                        )?);
+                    } else {
+                        rendered.push(arg.clone().to_rust(
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                        )?);
+                    }
                 }
                 // The heap mutators take their first argument by &mut, so
                 // it must be lowered as a PLACE: `heappush(rows[i], v)`
@@ -6522,8 +6641,17 @@ impl<'a> CodeGen for Call {
                                     .into(),
                             );
                         }
+                        // math.trunc of an exact i64 is the argument, unchanged (no >=2^53 f64
+                        // precision loss): route to trunc_i64, fully qualified.
                         let p = qual("trunc");
-                        Ok(quote!(#p(#x)))
+                        if matches!(
+                            crate::infer_type(Some(&ctx), &self.args[0], &options, &symbols),
+                            crate::TypeInfo::Int
+                        ) {
+                            Ok(quote!(stdpython::math::trunc_i64(#x)))
+                        } else {
+                            Ok(quote!(#p(#x)))
+                        }
                     }
                     ("trunc", _) => Err(arity("1")),
                     ("sumprod", [a, b]) => {
@@ -9893,6 +10021,34 @@ let mutating_self_field = boxed_self_ref_receiver
         // receiver chain as a PLACE (`self.left.insert(k)` → the
         // `as_mut` unwrap mutates the REAL child through the Box; the
         // read form's clone would mutate a copy).
+        // A math-module `Into<f64>` scalar call (`math.sqrt(m)` / `math.ulp(n)`)
+        // falling through to this generic path (not in the `known` list):
+        // CPython coerces an int argument to f64, so a COMPUTED i64 arg
+        // (`m = 2 ** 52`) must emit `(m) as f64` below — std has no
+        // `From<i64> for f64` to satisfy the runtime's `T: Into<f64>` bound
+        // otherwise. Computed BEFORE `name = self.func.to_rust(...)` moves
+        // `self.func`, and resolved through the symbol table so bare
+        // imports / module aliases coerce too and a shadowed `math` local
+        // does not.
+        let math_fn_name = resolve_math_fn_name(self.func.as_ref(), &symbols);
+        let math_fn_sig = math_fn_name
+            .as_deref()
+            .and_then(crate::MathFn::from_name)
+            .and_then(math_arg_signature)
+            .map(|s| s.to_vec());
+        // math.ceil/floor/trunc with an INT argument is EXACT in CPython (the
+        // argument, unchanged); route it to the runtime `<fn>_i64` overload
+        // so a >=2^53 value is not rounded through f64.
+        let exact_int_route = math_fn_sig
+            .as_ref()
+            .and_then(|sig| sig.first())
+            .is_some_and(|a| matches!(a, MathArg::ExactInt))
+            && self.args.first().is_some_and(|a0| {
+                matches!(
+                    crate::infer_type(Some(&ctx), a0, &options, &symbols),
+                    crate::TypeInfo::Int
+                )
+            });
         let name = if let ExprType::Attribute(attr) = self.func.as_ref() {
             let is_user_mut = crate::TypeInfo::enum_receiver_class(
                 &attr.value, Some(&ctx), &options, &symbols,
@@ -10049,13 +10205,30 @@ let mutating_self_field = boxed_self_ref_receiver
                     // clone-on-reuse renderer user calls use, so a value
                     // read again later (`len(words)` after the join moved
                     // it — the idiom corpus's main) clones at the earlier
-                    // read. expected=None: no coercion, just the clone.
+                    // read. expected=None: no coercion, just the clone —
+                    // EXCEPT a math `Into<f64>` scalar arg position, which coerces a
+                    // computed i64 arg to f64 (CPython coerces int math
+                    // args); a FloatLike / float arg relies on its own
+                    // `Into<f64>` and must stay uncoerced.
+                    let math_here = math_fn_sig
+                        .as_ref()
+                        .and_then(|sig| sig.get(i))
+                        .is_some_and(|a| matches!(a, MathArg::Float))
+                        && matches!(
+                            crate::infer_type(Some(&ctx), &arg, &options, &symbols),
+                            crate::TypeInfo::Int
+                        );
+                    let expected = if math_here {
+                        Some(crate::TypeInfo::Float)
+                    } else {
+                        None
+                    };
                     crate::render_typed_reused(
                         &arg,
                         ctx.clone(),
                         options.clone(),
                         symbols.clone(),
-                        None,
+                        expected,
                     )?
                 }
             };
@@ -10069,6 +10242,16 @@ let mutating_self_field = boxed_self_ref_receiver
         }
 
         // Check if we're in an async context and if the function being called is async
+        // math.ceil/floor/trunc over an exact i64 route to the runtime
+        // `<fn>_i64` overload (no f64 round-trip / >=2^53 loss), fully
+        // qualified so a bare `from math import ceil` also resolves.
+        let name = if exact_int_route {
+            let base = math_fn_name.as_deref().unwrap_or("");
+            let fname = format_ident!("{base}_i64");
+            quote!(stdpython::math::#fname)
+        } else {
+            name
+        };
         let call_expr = quote!(#name(#(#all_args),*));
 
         // Check if this function returns a Result that should be unwrapped
