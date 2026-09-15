@@ -36,6 +36,12 @@
     "math_bare_imports": {
       "status": "pass"
     },
+    "math_exact_int_round": {
+      "status": "pass"
+    },
+    "math_int_coercion": {
+      "status": "pass"
+    },
     "math_scalar_extras": {
       "status": "pass"
     },
