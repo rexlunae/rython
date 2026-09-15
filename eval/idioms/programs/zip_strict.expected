@@ -1,5 +1,0 @@
-[(1, 4), (2, 5), (3, 6)]
-caught: zip() argument 2 is shorter than argument 1
-caught: zip() argument 2 is longer than argument 1
-[(1, 10), (2, 20)]
-[(1, 10), (2, 20)]

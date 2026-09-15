@@ -2796,12 +2796,18 @@ impl<'a> CodeGen for Call {
                     // guarded arm must not let the plain call fall to the
                     // builtin match's unreachable.
                     "zip" if self.args.len() == 2 => {
-                        // CPython 3.10+'s `zip(a, b, strict=True)` raises
-                        // ValueError on unequal lengths; `zip(a, b)` (and
-                        // strict=False) truncates like the default. Only
-                        // the boolean-literal strict keyword is modeled;
-                        // any other keyword is loud, never silently lowered
-                        // as the truncating zip (Devin review on round 101).
+                        // CPython 3.10+'s `zip(a, b, strict=True)` is LAZY:
+                        // it yields every common-prefix pair before raising
+                        // ValueError on the first unequal-length exhaustion
+                        // (so `out.extend(zip(a, b, strict=True))` under a
+                        // try appends the prefix, then raises). rython
+                        // materializes iterables eagerly, so it cannot
+                        // reproduce that sequencing — an all-or-error Vec
+                        // would silently raise before any pair is observed.
+                        // Since the lazy timing is not representable, refuse
+                        // strict loudly instead of lowering a wrong verb
+                        // (correct-or-loud; Devin review on the zip strict
+                        // round). strict=False truncates like plain zip.
                         let mut strict = false;
                         for kw in &self.keywords {
                             match kw.arg.as_deref() {
@@ -2809,22 +2815,21 @@ impl<'a> CodeGen for Call {
                                     if matches!(
                                         &kw.value,
                                         ExprType::Constant(c)
-                                            if matches!(&c.0, Some(litrs::Literal::Bool(_)))
-                                    ) =>
-                                {
-                                    strict = matches!(
-                                        &kw.value,
-                                        ExprType::Constant(c)
                                             if matches!(
                                                 &c.0,
-                                                Some(litrs::Literal::Bool(litrs::BoolLit::True))
+                                                Some(litrs::Literal::Bool(litrs::BoolLit::False))
                                             )
-                                    )
+                                    ) =>
+                                {
+                                    strict = false
                                 }
                                 Some("strict") => {
                                     return Err(
-                                        "zip() strict= must be a boolean literal (True/False); \
-                                         rython cannot model a runtime strict value"
+                                        "zip(..., strict=True) is not supported yet: CPython's \
+                                         strict zip is lazy (it yields the common prefix and then \
+                                         raises ValueError on unequal-length exhaustion), which \
+                                         rython's eager zip cannot sequence; rython refuses to \
+                                         silently lower it as an all-or-error form"
                                             .into(),
                                     )
                                 }
@@ -2865,11 +2870,7 @@ impl<'a> CodeGen for Call {
                         let b = &rendered[1];
                         let a = seq(&self.args[0], a);
                         let b = seq(&self.args[1], b);
-                        if strict {
-                            // zip(a, b, strict=True) raises ValueError on
-                            // unequal lengths — the Result threads `?`.
-                            return Ok(quote!(zip_strict(#a, #b)?));
-                        }
+                        let _ = strict; // only strict=False is accepted (truncating zip)
                         return Ok(quote!(zip(#a, #b)));
                     }
     "min" | "max" => {

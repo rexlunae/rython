@@ -1975,26 +1975,6 @@ mod itertools_gaps {
     }
 
     #[test]
-    fn zip_strict_raises_on_unequal_lengths() {
-        // Python 3.12: `list(zip([1,2,3],[1,2], strict=True))` raises
-        // ValueError("zip() argument 2 is shorter than argument 1") and the
-        // mirror with argument 2 longer. Equal lengths zip like `zip`.
-        use stdpython::zip_strict;
-        assert_eq!(
-            zip_strict(vec![1i64, 2].to_vec(), vec![10i64, 20].to_vec()).unwrap(),
-            vec![(1, 10), (2, 20)]
-        );
-        assert_eq!(
-            zip_strict(Vec::<i64>::new(), Vec::<i64>::new()).unwrap(),
-            Vec::<(i64, i64)>::new()
-        );
-        let e = zip_strict(vec![1i64, 2, 3], vec![10i64, 20]).unwrap_err();
-        assert_eq!(format!("{}", e), "ValueError: zip() argument 2 is shorter than argument 1");
-        let e2 = zip_strict(vec![1i64, 2], vec![10i64, 20, 30, 40]).unwrap_err();
-        assert_eq!(format!("{}", e2), "ValueError: zip() argument 2 is longer than argument 1");
-    }
-
-    #[test]
     fn groupby_groups_consecutive_runs_like_python() {
         // python3: [1,1,2,2,2,1] yields THREE groups — non-adjacent equal
         // elements do not merge.

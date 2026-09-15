@@ -2605,39 +2605,32 @@ fn string_union_and_option_inner_mixes_box() {
 }
 
 #[test]
-fn zip_strict_lowers_and_nonliterals_are_loud() {
-    // Python 3.10+'s zip(a, b, strict=True) raises ValueError on unequal
-    // lengths; rython lowers it to the fallible runtime zip_strict(...)?
-    // (the `?` threads so a surrounding try/except catches CPython's
-    // ValueError). strict=False truncates like plain zip.
-    let out = compile(
+fn zip_keyword_strict_is_a_loud_conversion_error() {
+    // CPython 3.10+'s `zip(a, b, strict=True)` is LAZY: it yields the
+    // common-prefix pairs and THEN raises ValueError on unequal-length
+    // exhaustion. rython materializes iterables eagerly, so that sequencing
+    // is not representable — an all-or-error Vec would silently raise before
+    // the prefix is observed (e.g. `out.extend(zip(a, b, strict=True))` under
+    // a try). So strict=True is refused loudly (correct-or-loud); strict=False
+    // truncates like plain zip.
+    let err = compile_err(
         "def z(a: list, b: list) -> list[int]:\n    return list(zip(a, b, strict=True))\n",
         "zipstrict.py",
     );
     assert!(
-        out.contains("zip_strict") && out.contains("?") ,
-        "zip(strict=True) must lower to zip_strict(...)?: {}",
-        out
+        err.contains("strict=True") && err.contains("not supported yet")
+            && err.contains("refuses to silently"),
+        "error: {}",
+        err
     );
     let outf = compile(
         "def z(a: list, b: list) -> list[int]:\n    return list(zip(a, b, strict=False))\n",
         "zipstrictf.py",
     );
     assert!(
-        !outf.contains("zip_strict") && outf.contains("zip ("),
-        "zip(strict=False) must lower to plain zip: {}",
+        outf.contains("zip ("),
+        "zip(strict=False) must lower to plain truncating zip: {}",
         outf
-    );
-    // A non-boolean-literal strict value is loud (rython cannot model a
-    // runtime strict flag) — never silently lowered as truncating zip.
-    let err = compile_err(
-        "def z(a: list, b: list, s: bool) -> list:\n    return list(zip(a, b, strict=s))\n",
-        "zipstrictdyn.py",
-    );
-    assert!(
-        err.contains("strict= must be a boolean literal"),
-        "error: {}",
-        err
     );
 }
 
