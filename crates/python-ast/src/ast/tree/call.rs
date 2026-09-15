@@ -87,6 +87,50 @@ fn import_canonical_fn_name(import: &crate::ast::tree::import::ImportFrom, bound
         .unwrap_or_else(|| bound.to_string())
 }
 
+/// Validate the keywords of `zip(*rows)` / `zip(a, b)` (the STAR-args
+/// splat and the two-argument forms share the same strict policy).
+/// Literal `strict=False` is accepted (matches truncating zip). `strict=True`
+/// and any other/dynamic strict value are refused loudly — CPython's strict
+/// zip is lazy (yields the common prefix, then raises ValueError on unequal
+/// exhaustion), which rython's eager zip cannot sequence; a wrong all-or-error
+/// form would silently change the exception timing. Any other keyword is also
+/// loud. Returns Err on the first offending keyword.
+fn reject_zip_keywords_for_many(
+    keywords: &[crate::Keyword],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for kw in keywords {
+        match kw.arg.as_deref() {
+            // Literal strict=False is fine (equals truncating zip).
+            Some("strict")
+                if matches!(
+                    &kw.value,
+                    ExprType::Constant(c)
+                        if matches!(
+                            &c.0,
+                            Some(litrs::Literal::Bool(litrs::BoolLit::False))
+                        )
+                ) => {}
+            // strict=True (or any dynamic/nonliteral strict value) is loud.
+            Some("strict") => {
+                return Err(
+                    "zip(..., strict=True) is not supported yet: CPython's strict zip is lazy \
+                     (it yields the common prefix and then raises ValueError on unequal-length \
+                     exhaustion), which rython's eager zip cannot sequence; rython refuses to \
+                     silently lower it as an all-or-error form"
+                        .into(),
+                )
+            }
+            Some(other) => {
+                return Err(format!("zip() got an unexpected keyword argument '{other}'").into())
+            }
+            None => {
+                return Err("zip() got an unexpected keyword argument '**kwargs'".into())
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Issue #111: keyword-argument signatures of stdpython runtime functions
 /// (module root, function, positional parameter names in order). Calls
 /// render through these signatures: keywords map to their slots, and
@@ -2787,6 +2831,14 @@ impl<'a> CodeGen for Call {
                     "zip" if self.args.len() == 1
                         && matches!(self.args.first(), Some(ExprType::Starred(_))) =>
                     {
+                        // The splat form's keywords must be validated too:
+                        // `zip(*rows, strict=True)` would otherwise silently
+                        // truncate via zip_many (CPython raises ValueError
+                        // after the common prefix). Reuse the strict/other
+                        // keyword policy of the two-argument arm: literal
+                        // strict=False is fine (truncating), strict=True and
+                        // dynamic strict are loud, anything else is loud.
+                        reject_zip_keywords_for_many(&self.keywords)?;
                         let a = &rendered[0];
                         return Ok(quote!(zip_many(#a)));
                     }
@@ -2807,42 +2859,10 @@ impl<'a> CodeGen for Call {
                         // Since the lazy timing is not representable, refuse
                         // strict loudly instead of lowering a wrong verb
                         // (correct-or-loud; Devin review on the zip strict
-                        // round). strict=False truncates like plain zip.
-                        let mut strict = false;
-                        for kw in &self.keywords {
-                            match kw.arg.as_deref() {
-                                Some("strict")
-                                    if matches!(
-                                        &kw.value,
-                                        ExprType::Constant(c)
-                                            if matches!(
-                                                &c.0,
-                                                Some(litrs::Literal::Bool(litrs::BoolLit::False))
-                                            )
-                                    ) =>
-                                {
-                                    strict = false
-                                }
-                                Some("strict") => {
-                                    return Err(
-                                        "zip(..., strict=True) is not supported yet: CPython's \
-                                         strict zip is lazy (it yields the common prefix and then \
-                                         raises ValueError on unequal-length exhaustion), which \
-                                         rython's eager zip cannot sequence; rython refuses to \
-                                         silently lower it as an all-or-error form"
-                                            .into(),
-                                    )
-                                }
-                                other => {
-                                    let kw = other.unwrap_or("**kwargs");
-                                    return Err(format!(
-                                        "zip() got an unexpected keyword argument '{}'",
-                                        kw
-                                    )
-                                    .into());
-                                }
-                            }
-                        }
+                        // round). strict=False truncates like plain zip. The
+                        // same keyword policy covers the starred `zip(*rows)`
+                        // splat arm above.
+                        reject_zip_keywords_for_many(&self.keywords)?;
                         // A STRING argument (`zip(self._buffer, range(0,
                         // len))` — charset_normalizer's md.py, which
                         // zips its accumulated `_buffer: str` with an
@@ -2870,7 +2890,6 @@ impl<'a> CodeGen for Call {
                         let b = &rendered[1];
                         let a = seq(&self.args[0], a);
                         let b = seq(&self.args[1], b);
-                        let _ = strict; // only strict=False is accepted (truncating zip)
                         return Ok(quote!(zip(#a, #b)));
                     }
     "min" | "max" => {
