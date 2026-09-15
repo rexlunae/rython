@@ -2605,17 +2605,37 @@ fn string_union_and_option_inner_mixes_box() {
 }
 
 #[test]
-fn zip_keyword_strict_is_a_loud_conversion_error() {
-    // Python 3.10+'s zip(strict=True) raises ValueError on unequal
-    // lengths; rython's zip truncates like the default zip, so the
-    // keyword is refused at conversion — never silently lowered as the
-    // truncating form (Devin review on round 101).
-    let err = compile_err(
-        "def z(a: str, b: str) -> int:\n    return len(list(zip(a, b, strict=True)))\n",
+fn zip_strict_lowers_and_nonliterals_are_loud() {
+    // Python 3.10+'s zip(a, b, strict=True) raises ValueError on unequal
+    // lengths; rython lowers it to the fallible runtime zip_strict(...)?
+    // (the `?` threads so a surrounding try/except catches CPython's
+    // ValueError). strict=False truncates like plain zip.
+    let out = compile(
+        "def z(a: list, b: list) -> list[int]:\n    return list(zip(a, b, strict=True))\n",
         "zipstrict.py",
     );
     assert!(
-        err.contains("unexpected keyword argument 'strict'"),
+        out.contains("zip_strict") && out.contains("?") ,
+        "zip(strict=True) must lower to zip_strict(...)?: {}",
+        out
+    );
+    let outf = compile(
+        "def z(a: list, b: list) -> list[int]:\n    return list(zip(a, b, strict=False))\n",
+        "zipstrictf.py",
+    );
+    assert!(
+        !outf.contains("zip_strict") && outf.contains("zip ("),
+        "zip(strict=False) must lower to plain zip: {}",
+        outf
+    );
+    // A non-boolean-literal strict value is loud (rython cannot model a
+    // runtime strict flag) — never silently lowered as truncating zip.
+    let err = compile_err(
+        "def z(a: list, b: list, s: bool) -> list:\n    return list(zip(a, b, strict=s))\n",
+        "zipstrictdyn.py",
+    );
+    assert!(
+        err.contains("strict= must be a boolean literal"),
         "error: {}",
         err
     );

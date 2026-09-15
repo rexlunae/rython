@@ -1525,6 +1525,24 @@ pub fn zip<T, U>(iter1: Vec<T>, iter2: Vec<U>) -> Vec<(T, U)> {
     iter1.into_iter().zip(iter2.into_iter()).collect()
 }
 
+/// Python `zip(iter1, iter2, strict=True)` — like `zip`, but raises
+/// ValueError when the two iterables differ in length (CPython 3.10+).
+/// CPython's message names argument 2 relative to argument 1: "shorter
+/// than argument 1" when iter2 is the shorter, "longer" when it is the
+/// longer. The `Result` threads `?` so the error reaches a surrounding
+/// try/except (FALLIBLE_STDLIB_FN has "zip_strict").
+pub fn zip_strict<T, U>(iter1: Vec<T>, iter2: Vec<U>) -> Result<Vec<(T, U)>, PyException> {
+    let (n1, n2) = (iter1.len(), iter2.len());
+    if n1 != n2 {
+        let rel = if n2 < n1 { "shorter" } else { "longer" };
+        return Err(PyException::new(
+            "ValueError",
+            &format!("zip() argument 2 is {rel} than argument 1"),
+        ));
+    }
+    Ok(iter1.into_iter().zip(iter2.into_iter()).collect())
+}
+
 /// Python's range object: LAZY, like Python's — `for i in range(10**9)`
 /// iterates in O(1) memory where the old Vec materialization allocated
 /// gigabytes. Iterating yields i64s; len/contains follow Python range

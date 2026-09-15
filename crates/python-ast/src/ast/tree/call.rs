@@ -2796,23 +2796,47 @@ impl<'a> CodeGen for Call {
                     // guarded arm must not let the plain call fall to the
                     // builtin match's unreachable.
                     "zip" if self.args.len() == 2 => {
-                        // CPython 3.10+'s `zip(strict=True)` raises
-                        // ValueError on unequal lengths; rython's zip
-                        // truncates like the default. A keyword is loud —
-                        // never silently lowered as the truncating zip
-                        // (Devin review on round 101).
-                        if !self.keywords.is_empty() {
-                            let kw = self.keywords[0]
-                                .arg
-                                .as_deref()
-                                .unwrap_or("**kwargs");
-                            return Err(format!(
-                                "zip() got an unexpected keyword argument '{}'; rython's zip \
-                                 has no strict= mode (CPython's zip(strict=True) raises \
-                                 ValueError when the iterables differ in length)",
-                                kw
-                            )
-                            .into());
+                        // CPython 3.10+'s `zip(a, b, strict=True)` raises
+                        // ValueError on unequal lengths; `zip(a, b)` (and
+                        // strict=False) truncates like the default. Only
+                        // the boolean-literal strict keyword is modeled;
+                        // any other keyword is loud, never silently lowered
+                        // as the truncating zip (Devin review on round 101).
+                        let mut strict = false;
+                        for kw in &self.keywords {
+                            match kw.arg.as_deref() {
+                                Some("strict")
+                                    if matches!(
+                                        &kw.value,
+                                        ExprType::Constant(c)
+                                            if matches!(&c.0, Some(litrs::Literal::Bool(_)))
+                                    ) =>
+                                {
+                                    strict = matches!(
+                                        &kw.value,
+                                        ExprType::Constant(c)
+                                            if matches!(
+                                                &c.0,
+                                                Some(litrs::Literal::Bool(litrs::BoolLit::True))
+                                            )
+                                    )
+                                }
+                                Some("strict") => {
+                                    return Err(
+                                        "zip() strict= must be a boolean literal (True/False); \
+                                         rython cannot model a runtime strict value"
+                                            .into(),
+                                    )
+                                }
+                                other => {
+                                    let kw = other.unwrap_or("**kwargs");
+                                    return Err(format!(
+                                        "zip() got an unexpected keyword argument '{}'",
+                                        kw
+                                    )
+                                    .into());
+                                }
+                            }
                         }
                         // A STRING argument (`zip(self._buffer, range(0,
                         // len))` — charset_normalizer's md.py, which
@@ -2841,6 +2865,11 @@ impl<'a> CodeGen for Call {
                         let b = &rendered[1];
                         let a = seq(&self.args[0], a);
                         let b = seq(&self.args[1], b);
+                        if strict {
+                            // zip(a, b, strict=True) raises ValueError on
+                            // unequal lengths — the Result threads `?`.
+                            return Ok(quote!(zip_strict(#a, #b)?));
+                        }
                         return Ok(quote!(zip(#a, #b)));
                     }
     "min" | "max" => {

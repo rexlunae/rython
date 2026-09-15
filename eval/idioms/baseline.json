@@ -74,6 +74,9 @@
     },
     "views": {
       "status": "pass"
+    },
+    "zip_strict": {
+      "status": "pass"
     }
   }
 }
