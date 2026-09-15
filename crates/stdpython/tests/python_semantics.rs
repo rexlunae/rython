@@ -317,8 +317,14 @@ fn math_isqrt_cbrt_fma_hypot_nextafter_match_cpython() {
     assert_eq!(isqrt(1).unwrap(), 1);
     let e = isqrt(-1).unwrap_err();
     assert_eq!(format!("{}", e), "ValueError: isqrt() argument must be nonnegative");
-    assert_eq!(cbrt(27.0), 3.0);
+    // cbrt routes through the platform libm, which is NOT correctly rounded
+    // on every system: glibc computes cbrt(27.0) == 3.0000000000000004 while
+    // Apple's libm returns exactly 3.0. Pin the roots that are exact on both
+    // libms byte-for-byte, and bound the non-exact case within IEEE tolerance
+    // (a faithful-rounded cbrt is within 1 ulp everywhere).
     assert_eq!(cbrt(-8.0), -2.0);
+    assert_eq!(cbrt(0.0), 0.0);
+    assert!((cbrt(27.0) - 3.0).abs() < 1e-15, "cbrt(27.0) = {}", cbrt(27.0));
     assert_eq!(fma(3.0, 4.0, 5.0), 17.0);
     assert_eq!(hypot(3.0, 4.0), 5.0);
     assert_eq!(hypot(0.0, 0.0), 0.0);
