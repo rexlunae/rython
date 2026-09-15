@@ -954,7 +954,7 @@ pub fn isqrt(n: i64) -> Result<i64, PyException> {
         return Ok(n);
     }
     let mut x = n;
-    let mut y = (x + 1) / 2;
+    let mut y = x / 2 + x % 2; // ceil(n/2); avoids (n+1)/2 overflowing at i64::MAX
     while y < x {
         x = y;
         y = (x + n / x) / 2;
@@ -975,16 +975,36 @@ python_function! {
 
 python_function! {
     /// math.fma(x, y, z) - fused multiply-add: x*y + z with a single
-    /// rounding (libm); the float path uses the exact residual.
-    pub fn fma<T, U, V>(x: T, y: U, z: V) -> f64
+    /// rounding. Matches CPython's error behavior exactly: finite inputs
+    /// whose exact product+sum overflows raise OverflowError("overflow in
+    /// fma"), and an invalid 0*inf / inf*0 (NaN result from non-NaN
+    /// inputs) raises ValueError("invalid operation in fma"). An infinite
+    /// result that comes from an infinite operand, and a NaN that comes
+    /// from a NaN operand, are returned unchanged.
+    pub fn fma<T, U, V>(x: T, y: U, z: V) -> Result<f64, PyException>
     where [T: Into<f64>, U: Into<f64>, V: Into<f64>]
     [signature: (x, y, z)]
-    [concrete_types: (f64, f64, f64) -> f64]
+    [concrete_types: (f64, f64, f64) -> Result<f64, crate::PyException>]
     {
         let x = x.into();
         let y = y.into();
         let z = z.into();
-        x.mul_add(y, z)
+        let r = x.mul_add(y, z);
+        if r.is_finite() {
+            return Ok(r);
+        }
+        if r.is_nan() {
+            if !x.is_nan() && !y.is_nan() && !z.is_nan() {
+                return Err(PyException::new("ValueError", "invalid operation in fma"));
+            }
+            return Ok(r);
+        }
+        // r is infinite: raise overflow only when it arose from finite
+        // operands, matching CPython.
+        if x.is_finite() && y.is_finite() && z.is_finite() {
+            return Err(PyException::new("OverflowError", "overflow in fma"));
+        }
+        Ok(r)
     }
 }
 

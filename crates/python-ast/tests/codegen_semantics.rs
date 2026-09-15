@@ -6258,9 +6258,10 @@ fn math_comb_perm_route_and_default_perm_k() {
 
 #[test]
 fn math_scalar_extras_route_and_isqrt_threads_result() {
-    // #369: math.cbrt/fma/hypot/nextafter lower through the infallible
-    // `Into<f64>` runtime (math::cbrt(...)); math.isqrt is FALLIBLE (it
-    // returns Result — ValueError on a negative), so it threads `?`.
+    // #369: math.cbrt/hypot/nextafter lower through the infallible
+    // `Into<f64>` runtime (math::cbrt(...)); math.isqrt and math.fma are
+    // FALLIBLE (they return Result — isqrt's ValueError on a negative, fma's
+    // OverflowError/ValueError on overflow/invalid), so they thread `?`.
     let out = compile(
         concat!(
             "import math\n",
@@ -6283,6 +6284,34 @@ fn math_scalar_extras_route_and_isqrt_threads_result() {
         "fallible math.isqrt must thread `?`: {}",
         out
     );
+    assert!(
+        out.contains("math :: fma (3.0 , 4.0 , 5.0) ?"),
+        "fallible math.fma must thread `?` (OverflowError/ValueError): {}",
+        out
+    );
+}
+
+#[test]
+fn math_hypot_and_nextafter_unsupported_arities_are_loud() {
+    // #369 / review: valid CPython arities rython does not model for the
+    // scalar extras must be LOUD conversion errors, never mismatched Rust
+    // calls. hypot() and hypot(x) are supported (0.0 and abs(x)); three or
+    // more coordinates (n-dimensional norm) and nextafter's optional steps
+    // argument are refused by name.
+    let out = compile("import math\na = math.hypot()\n", "hypot0.py");
+    assert!(out.contains("0.0"), "hypot() must lower to 0.0: {}", out);
+    let out1 = compile("import math\na = math.hypot(-10.5)\n", "hypot1.py");
+    assert!(
+        out1.contains("math :: hypot (- 10.5 , 0.0)"),
+        "hypot(x) must lower to hypot(x, 0.0): {}",
+        out1
+    );
+    let e = compile_err("import math\na = math.hypot(1.5, 1.5, 0.5)\n", "hypot3.py");
+    assert!(e.contains("not supported yet") && e.contains("refuses to silently ignore"),
+        "n-dimensional hypot must be loud: {}", e);
+    let e2 = compile_err("import math\na = math.nextafter(1.0, 2.0, 3)\n", "na3.py");
+    assert!(e2.contains("not supported yet") && e2.contains("refuses to silently ignore"),
+        "steps nextafter must be loud: {}", e2);
 }
 
 #[test]

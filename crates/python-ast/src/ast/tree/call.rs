@@ -44,6 +44,9 @@ const FALLIBLE_STDLIB_FN: &[&str] = &[
     // math: domain/range errors and overflow.
     "sqrt", "pow", "log", "log2", "log10", "log1p", "asin", "acos", "acosh", "atanh",
     "factorial", "fmod", "remainder", "ldexp", "fsum", "comb", "perm", "isqrt",
+    // math.fma raises OverflowError("overflow in fma") on finite overflow
+    // and ValueError("invalid operation in fma") on 0*inf / inf*0.
+    "fma",
     // json: parse errors.
     "loads",
     // glob: filesystem access can fail.
@@ -5557,6 +5560,8 @@ impl<'a> CodeGen for Call {
                         | "sumprod"
                         | "comb"
                         | "perm"
+                        | "hypot"
+                        | "nextafter"
                 )
             });
             if let (Some((fname, module_prefix, render_name)), true) = (target, known) {
@@ -6522,6 +6527,39 @@ impl<'a> CodeGen for Call {
                         Ok(quote!(#p(#n, #k)?))
                     }
                     ("perm", _) => Err(arity("1 or 2")),
+                    ("hypot", [x, y]) => {
+                        let p = qual("hypot");
+                        Ok(quote!(#p(#x, #y)))
+                    }
+                    ("hypot", [x]) => {
+                        // math.hypot(x) == abs(x): route it through the
+                        // two-argument norm with a zero second coordinate.
+                        let p = qual("hypot");
+                        Ok(quote!(#p(#x, 0.0)))
+                    }
+                    ("hypot", []) => Ok(quote!(0.0)),
+                    // n-dimensional math.hypot(*coords) is a valid CPython
+                    // call but the runtime models only the scalar 1D/2D
+                    // norms; refuse it loudly instead of emitting a
+                    // mismatched three-argument Rust call (issue #369).
+                    ("hypot", _) => Err(
+                        "math.hypot(*coords) with three or more coordinates is not supported \
+                         yet by stdpython; rython refuses to silently ignore it"
+                            .into(),
+                    ),
+                    ("nextafter", [x, y]) => {
+                        let p = qual("nextafter");
+                        Ok(quote!(#p(#x, #y)))
+                    }
+                    // math.nextafter(x, y, steps) advances several
+                    // representable steps; the runtime models only the
+                    // single-step form. Refuse the extra steps argument
+                    // loudly (issue #369).
+                    ("nextafter", _) => Err(
+                        "math.nextafter(x, y, steps) with a steps argument is not supported \
+                         yet by stdpython; rython refuses to silently ignore it"
+                            .into(),
+                    ),
                     ("md5" | "sha1" | "sha256" | "sha512", []) => {
                         let p = qual(crate::ast::tree::std_module::hashlib_new_variant(&fname)
                             .expect("the arm above names exactly the registry algos"));

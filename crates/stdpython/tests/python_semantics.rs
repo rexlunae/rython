@@ -309,25 +309,58 @@ fn math_comb_perm_match_cpython() {
 
 #[test]
 fn math_isqrt_cbrt_fma_hypot_nextafter_match_cpython() {
-    // pinned against python3 3.14.
+    // pinned against python3 3.14 (each assertion names its Python expression).
     use stdpython::math::{cbrt, fma, hypot, isqrt, nextafter};
+    // Python: math.isqrt(16) == 4, .isqrt(15) == 3, .isqrt(0) == 0, .isqrt(1) == 1
     assert_eq!(isqrt(16).unwrap(), 4);
     assert_eq!(isqrt(15).unwrap(), 3);
     assert_eq!(isqrt(0).unwrap(), 0);
     assert_eq!(isqrt(1).unwrap(), 1);
+    // Python: math.isqrt(9223372036854775807) == 3037000499 (i64::MAX, no
+    // overflow in the Newton seeding — the (n+1)/2 ceiling wraps at MAX).
+    for n in [i64::MAX, i64::MAX - 1, 99_999_999_999_999] {
+        let r = isqrt(n).unwrap();
+        assert_eq!(r, (n as f64).sqrt().floor() as i64, "math.isqrt({n})");
+    }
+    // Python: math.isqrt(-1) raises ValueError("isqrt() argument must be nonnegative")
     let e = isqrt(-1).unwrap_err();
     assert_eq!(format!("{}", e), "ValueError: isqrt() argument must be nonnegative");
-    // cbrt routes through the platform libm, which is NOT correctly rounded
-    // on every system: glibc computes cbrt(27.0) == 3.0000000000000004 while
-    // Apple's libm returns exactly 3.0. Pin the roots that are exact on both
-    // libms byte-for-byte, and bound the non-exact case within IEEE tolerance
-    // (a faithful-rounded cbrt is within 1 ulp everywhere).
+    // cbrt routes through the Rust `libm` crate, a fixed correctly-rounded
+    // software cube root (deterministic on every ABI): it returns the exact
+    // root for perfect cubes (cbrt(-8.0) == -2.0, cbrt(0.0) == 0.0). CPython
+    // instead calls the platform libm, which is NOT correctly rounded on
+    // every system (glibc computes cbrt(27.0) == 3.0000000000000004 while
+    // Apple's libm returns 3.0). So byte-exact cross-platform pins only hold
+    // for inputs whose root is exact under every libm; cbrt(27.0) is bounded
+    // within IEEE tolerance (a faithful-rounded cbrt is within 1 ulp).
+    // Python: math.cbrt(-8.0) == -2.0, math.cbrt(0.0) == 0.0
     assert_eq!(cbrt(-8.0), -2.0);
     assert_eq!(cbrt(0.0), 0.0);
+    // Python: abs(math.cbrt(27.0) - 3.0) < 1e-15
     assert!((cbrt(27.0) - 3.0).abs() < 1e-15, "cbrt(27.0) = {}", cbrt(27.0));
-    assert_eq!(fma(3.0, 4.0, 5.0), 17.0);
+    // fma(x, y, z) = x*y + z with a single rounding; finite operands whose
+    // exact product+sum overflows raise OverflowError, and a 0*inf/inf*0
+    // (NaN from non-NaN inputs) raises ValueError — byte-identical to
+    // CPython 3.13+ (math_helper returns the fused result otherwise).
+    // Python: math.fma(3.0, 4.0, 5.0) == 17.0
+    assert_eq!(fma(3.0, 4.0, 5.0).unwrap(), 17.0);
+    // Python: math.fma(1e308, 1e308, 0.0) raises OverflowError("overflow in fma")
+    assert_eq!(fma(1e308, 1e308, 0.0).unwrap_err().to_string(),
+               "OverflowError: overflow in fma");
+    // Python: math.fma(1e308, -1e308, 0.0) raises OverflowError("overflow in fma")
+    assert_eq!(fma(1e308, -1e308, 0.0).unwrap_err().to_string(),
+               "OverflowError: overflow in fma");
+    // Python: math.fma(0.0, inf, 0.0) raises ValueError("invalid operation in fma")
+    assert_eq!(fma(0.0, f64::INFINITY, 0.0).unwrap_err().to_string(),
+               "ValueError: invalid operation in fma");
+    // Python: math.fma(inf, 1.0, 0.0) == inf (no raise; infinite operand)
+    assert_eq!(fma(f64::INFINITY, 1.0, 0.0).unwrap(), f64::INFINITY);
+    // Python: math.fma(nan, 1.0, 0.0) is nan (no raise; NaN operand)
+    assert!(fma(f64::NAN, 1.0, 0.0).unwrap().is_nan());
+    // Python: math.hypot(3.0, 4.0) == 5.0, math.hypot(0.0, 0.0) == 0.0
     assert_eq!(hypot(3.0, 4.0), 5.0);
     assert_eq!(hypot(0.0, 0.0), 0.0);
+    // Python: repr(math.nextafter(1.0, 2.0)) == '1.0000000000000002'
     assert_eq!(nextafter(1.0, 2.0), 1.0000000000000002);
 }
 

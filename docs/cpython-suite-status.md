@@ -267,16 +267,18 @@ inside (or leads to) the unittest harness:
   `math_scalar_extras` idiom. (`math.fma` is Python 3.13+; it is pinned in
   the runtime/codegen tests but EXCLUDED from the idiom transcript, whose
   3.11/3.12 oracle cannot produce it.)
-- **Divergence (platform, not rython): `math.cbrt` handoff to the platform
-  libm is NOT correctly rounded on every system.** glibc computes
-  `cbrt(27.0) == 3.0000000000000004` while Apple's libm returns exactly
-  `3.0` — both are faithful-rounded (within 1 ulp), so rython matches the
-  ABI's CPython exactly on each platform (both call the same libm). Because a
-  byte-exact pin of that value cannot hold across platforms, the
-  `math_scalar_extras` transcript and the runtime pin use inputs whose roots
-  are exact everywhere (`-8.0` → `-2.0`, `0.0` → `0.0`), and the `cbrt(27.0)`
-  case is pinned only within IEEE tolerance in the runtime test. recorded in
-  `docs/spec.md` §12.
+- **Divergence (model limit): `math.cbrt` is the Rust `libm` crate's fixed
+  software cube root, correctly rounded for perfect cubes (`cbrt(-8.0)` =
+  `-2.0`, `cbrt(27.0)` = `3.0`), deterministic on every ABI. CPython calls
+  the PLATFORM libm, which is not correctly rounded on every system: glibc
+  returns `cbrt(27.0) == 3.0000000000000004` while Apple's libm returns
+  exactly `3.0` (both within 1 ulp). rython matches CPython exactly where
+  the platform's cube root is the exact root (`-8.0`/`0.0`); where glibc is
+  off by an ulp (`27.0`) the correctly-rounded rython value differs, within
+  IEEE tolerance. The `math_scalar_extras` transcript and the runtime pin use
+  roots exact under every libm (`-8.0` → `-2.0`, `0.0` → `0.0`), and the
+  `cbrt(27.0)` case is pinned within tolerance. recorded in `docs/spec.md`
+  §12.
 - **Boxed-class CONSTRUCTOR arguments now box** (#367 class model): a class
   with an UNANNOTATED `__init__` param stores a boxed PyValue field
   (`self.value = value`), so its `new(value: PyValue)` needs the call-site
