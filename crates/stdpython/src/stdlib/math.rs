@@ -939,3 +939,97 @@ pub fn perm(n: i64, k: i64) -> Result<i64, PyException> {
     }
     Ok(result)
 }
+
+/// math.isqrt(n) — the integer square root (floor of sqrt(n)), exact via
+/// Newton's method (never through a lossy float). CPython: ValueError
+/// `isqrt() argument must be nonnegative` for a negative n.
+pub fn isqrt(n: i64) -> Result<i64, PyException> {
+    if n < 0 {
+        return Err(PyException::new(
+            "ValueError",
+            "isqrt() argument must be nonnegative",
+        ));
+    }
+    if n < 2 {
+        return Ok(n);
+    }
+    let mut x = n;
+    let mut y = x / 2 + x % 2; // ceil(n/2); avoids (n+1)/2 overflowing at i64::MAX
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    Ok(x)
+}
+
+python_function! {
+    /// math.cbrt - cube root (libm, exact for perfect cubes)
+    pub fn cbrt<T>(x: T) -> f64
+    where [T: Into<f64>]
+    [signature: (x)]
+    [concrete_types: (f64) -> f64]
+    {
+        libm::cbrt(x.into())
+    }
+}
+
+python_function! {
+    /// math.fma(x, y, z) - fused multiply-add: x*y + z with a single
+    /// rounding. Matches CPython's error behavior exactly: finite inputs
+    /// whose exact product+sum overflows raise OverflowError("overflow in
+    /// fma"), and an invalid 0*inf / inf*0 (NaN result from non-NaN
+    /// inputs) raises ValueError("invalid operation in fma"). An infinite
+    /// result that comes from an infinite operand, and a NaN that comes
+    /// from a NaN operand, are returned unchanged.
+    pub fn fma<T, U, V>(x: T, y: U, z: V) -> Result<f64, PyException>
+    where [T: Into<f64>, U: Into<f64>, V: Into<f64>]
+    [signature: (x, y, z)]
+    [concrete_types: (f64, f64, f64) -> Result<f64, crate::PyException>]
+    {
+        let x = x.into();
+        let y = y.into();
+        let z = z.into();
+        let r = x.mul_add(y, z);
+        if r.is_finite() {
+            return Ok(r);
+        }
+        if r.is_nan() {
+            if !x.is_nan() && !y.is_nan() && !z.is_nan() {
+                return Err(PyException::new("ValueError", "invalid operation in fma"));
+            }
+            return Ok(r);
+        }
+        // r is infinite: raise overflow only when it arose from finite
+        // operands, matching CPython.
+        if x.is_finite() && y.is_finite() && z.is_finite() {
+            return Err(PyException::new("OverflowError", "overflow in fma"));
+        }
+        Ok(r)
+    }
+}
+
+python_function! {
+    /// math.hypot(*coords) - Euclidean norm (two-argument form here; libm).
+    pub fn hypot<T, U>(x: T, y: U) -> f64
+    where [T: Into<f64>, U: Into<f64>]
+    [signature: (x, y)]
+    [concrete_types: (f64, f64) -> f64]
+    {
+        let x = x.into();
+        let y = y.into();
+        libm::hypot(x, y)
+    }
+}
+
+python_function! {
+    /// math.nextafter(x, y) - the next representable float from x toward y.
+    pub fn nextafter<T, U>(x: T, y: U) -> f64
+    where [T: Into<f64>, U: Into<f64>]
+    [signature: (x, y)]
+    [concrete_types: (f64, f64) -> f64]
+    {
+        let x = x.into();
+        let y = y.into();
+        libm::nextafter(x, y)
+    }
+}

@@ -6257,6 +6257,97 @@ fn math_comb_perm_route_and_default_perm_k() {
 }
 
 #[test]
+fn math_scalar_extras_route_and_isqrt_threads_result() {
+    // #369: math.cbrt/hypot/nextafter lower through the infallible
+    // `Into<f64>` runtime (math::cbrt(...)); math.isqrt and math.fma are
+    // FALLIBLE (they return Result — isqrt's ValueError on a negative, fma's
+    // OverflowError/ValueError on overflow/invalid), so they thread `?`.
+    let out = compile(
+        concat!(
+            "import math\n",
+            "a = math.cbrt(27.0)\n",
+            "b = math.fma(3.0, 4.0, 5.0)\n",
+            "c = math.hypot(3.0, 4.0)\n",
+            "d = math.nextafter(1.0, 2.0)\n",
+            "e = math.isqrt(16)\n",
+        ),
+        "math_scalar_extra.py",
+    );
+    assert!(
+        out.contains("math :: cbrt (27.0)") && out.contains("math :: hypot (3.0 , 4.0)")
+            && out.contains("math :: fma (3.0 , 4.0 , 5.0)"),
+        "cbrt/fma/hypot must lower through the runtime: {}",
+        out
+    );
+    assert!(
+        out.contains("math :: isqrt (16) ?"),
+        "fallible math.isqrt must thread `?`: {}",
+        out
+    );
+    assert!(
+        out.contains("math :: fma (3.0 , 4.0 , 5.0) ?"),
+        "fallible math.fma must thread `?` (OverflowError/ValueError): {}",
+        out
+    );
+}
+
+#[test]
+fn math_hypot_and_nextafter_unsupported_arities_are_loud() {
+    // #369 / review: valid CPython arities rython does not model for the
+    // scalar extras must be LOUD conversion errors, never mismatched Rust
+    // calls. hypot() and hypot(x) are supported (0.0 and abs(x)); three or
+    // more coordinates (n-dimensional norm) and nextafter's optional steps
+    // argument are refused by name.
+    let out = compile("import math\na = math.hypot()\n", "hypot0.py");
+    assert!(out.contains("0.0"), "hypot() must lower to 0.0: {}", out);
+    let out1 = compile("import math\na = math.hypot(-10.5)\n", "hypot1.py");
+    assert!(
+        out1.contains("math :: hypot (- 10.5 , 0.0)"),
+        "hypot(x) must lower to hypot(x, 0.0): {}",
+        out1
+    );
+    let e = compile_err("import math\na = math.hypot(1.5, 1.5, 0.5)\n", "hypot3.py");
+    assert!(e.contains("not supported yet") && e.contains("refuses to silently ignore"),
+        "n-dimensional hypot must be loud: {}", e);
+    let e2 = compile_err("import math\na = math.nextafter(1.0, 2.0, 3)\n", "na3.py");
+    assert!(e2.contains("not supported yet") && e2.contains("refuses to silently ignore"),
+        "steps nextafter must be loud: {}", e2);
+}
+
+#[test]
+fn bare_math_import_threads_exception_inside_try() {
+    // #369 / review: a BARE `from math import isqrt/fma` (direct or aliased)
+    // inside a `try:` must thread `?` so the exception reaches its `except`
+    // block instead of being swallowed. isqrt raises ValueError on a
+    // negative; fma raises OverflowError on finite overflow.
+    let out = compile(
+        concat!(
+            "from math import isqrt\n",
+            "from math import fma as fm\n",
+            "try:\n",
+            "    isqrt(-1)\n",
+            "except ValueError as e:\n",
+            "    pass\n",
+            "try:\n",
+            "    fm(1e308, 1e308, 0.0)\n",
+            "except OverflowError:\n",
+            "    pass\n",
+        ),
+        "bare_math.py",
+    );
+    assert!(
+        out.contains("isqrt (- 1) ?"),
+        "bare isqrt must thread `?` inside try: {}",
+        out
+    );
+    assert!(
+        out.contains("fm") && out.contains(") ?") && out.contains("OverflowError"),
+        "aliased bare fma must thread `?` and catch OverflowError: {}",
+        out
+    );
+}
+
+#[test]
 fn textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error() {
     // #368: `wrap(text, width, **kwargs)` (test_textwrap's check_wrap
     // forwarding its **kwargs, which may carry initial_indent/drop_whitespace)

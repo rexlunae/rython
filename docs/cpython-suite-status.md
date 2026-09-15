@@ -256,6 +256,38 @@ inside (or leads to) the unittest harness:
   runtime (`math::comb(n, k)?` / `math::perm(n, n)?` for the 1-arg form).
   Pins: `math_comb_perm_match_cpython` (runtime),
   `math_comb_perm_route_and_default_perm_k` (codegen), `comb_perm` idiom.
+- **`math.isqrt` / `math.cbrt` / `math.fma` / `math.hypot` / `math.nextafter`**
+  now exist (#369, test_math-missing scalars). `isqrt` is the EXACT integer
+  square root (Newton's method, never a lossy float; ValueError
+  `isqrt() argument must be nonnegative` for a negative n); `cbrt`/`fma`/
+  `hypot`/`nextafter` are libm-backed `Into<f64>` runtime functions. `isqrt`
+  and `fma` are FALLIBLE: `isqrt` raises that ValueError and `fma` raises
+  CPython's `OverflowError("overflow in fma")` on finite overflow and
+  `ValueError("invalid operation in fma")` on 0*inf/inf*0 — both thread `?`
+  through QUALIFIED `math.<fn>(...)` calls AND BARE `from math import ...`
+  imports (direct or aliased), so an exception reaches a surrounding `try`.
+  Unsupported valid arities fail loudly at conversion: `hypot()` → `0.0` and
+  `hypot(x)` → `hypot(x, 0.0)` are modeled, the n-dimensional
+  `hypot(a,b,c…)` and `nextafter(x, y, steps)` are refused with a message.
+  All verified byte-identical against python3 3.14. Pins:
+  `math_isqrt_cbrt_fma_hypot_nextafter_match_cpython` (runtime),
+  `math_scalar_extras_route_and_isqrt_threads_result` +
+  `bare_math_import_threads_exception_inside_try` + hypoth/nextafter arities
+  (codegen), `math_scalar_extras` + `math_bare_imports` idioms. (`math.fma`
+  is Python 3.13+; it is pinned in the runtime/codegen tests but EXCLUDED
+  from the idiom transcripts, whose 3.11/3.12 oracle cannot produce it.)
+- **Divergence (model limit): `math.cbrt` is the Rust `libm` crate's fixed
+  software cube root, correctly rounded for perfect cubes (`cbrt(-8.0)` =
+  `-2.0`, `cbrt(27.0)` = `3.0`), deterministic on every ABI. CPython calls
+  the PLATFORM libm, which is not correctly rounded on every system: glibc
+  returns `cbrt(27.0) == 3.0000000000000004` while Apple's libm returns
+  exactly `3.0` (both within 1 ulp). rython matches CPython exactly where
+  the platform's cube root is the exact root (`-8.0`/`0.0`); where glibc is
+  off by an ulp (`27.0`) the correctly-rounded rython value differs, within
+  IEEE tolerance. The `math_scalar_extras` transcript and the runtime pin use
+  roots exact under every libm (`-8.0` → `-2.0`, `0.0` → `0.0`), and the
+  `cbrt(27.0)` case is pinned within tolerance. recorded in `docs/spec.md`
+  §12.
 - **Boxed-class CONSTRUCTOR arguments now box** (#367 class model): a class
   with an UNANNOTATED `__init__` param stores a boxed PyValue field
   (`self.value = value`), so its `new(value: PyValue)` needs the call-site
