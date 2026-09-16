@@ -44,7 +44,7 @@ const ISINSTANCE_TARGET_NAMES: &[&str] = &[
 const FALLIBLE_STDLIB_FN: &[&str] = &[
     // math: domain/range errors and overflow.
     "sqrt", "pow", "log", "log2", "log10", "log1p", "asin", "acos", "acosh", "atanh",
-    "factorial", "fmod", "remainder", "ldexp", "fsum", "comb", "perm", "isqrt",
+    "factorial", "fmod", "remainder", "ldexp", "fsum", "comb", "perm", "isqrt", "gamma", "lgamma",
     // math.fma raises OverflowError("overflow in fma") on finite overflow
     // and ValueError("invalid operation in fma") on 0*inf / inf*0.
     "fma",
@@ -117,7 +117,7 @@ fn math_arg_signature(f: MathFn) -> Option<&'static [MathArg]> {
     Some(match f {
         Sqrt | Cbrt | Ulp | Exp | Exp2 | Expm1 | Log1p | Log2 | Log10 | Sin | Cos | Tan
         | Asin | Acos | Atan | Sinh | Cosh | Tanh | Asinh | Acosh | Atanh | Degrees
-        | Radians | Isfinite | Isinf | Isnan | Fabs | Frexp | Modf => &[Float],
+        | Radians | Isfinite | Isinf | Isnan | Fabs | Frexp | Modf | Gamma | Lgamma => &[Float],
         // ceil/floor/trunc of an integer are EXACT (the arg unchanged); only
         // a float / FloatLike arg round-trips through f64.
         Ceil | Floor | Trunc => &[ExactInt],

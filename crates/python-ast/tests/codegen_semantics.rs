@@ -6430,6 +6430,25 @@ fn math_log_fills_the_optional_base() {
 }
 
 #[test]
+fn math_gamma_lgamma_route_fallibly() {
+    // #369: math.gamma/lgamma are FALLIBLE (ValueError on a pole,
+    // OverflowError on gamma overflow), so they must thread `?`.
+    let g = compile("import math\na = math.gamma(5.0)\n", "gam.py");
+    assert!(
+        g.contains("math :: gamma (5.0) ?"),
+        "gamma must thread `?`: {}", g);
+    let l = compile("import math\na = math.lgamma(0.5)\n", "lg.py");
+    assert!(
+        l.contains("math :: lgamma (0.5) ?"),
+        "lgamma must thread `?`: {}", l);
+    // an int arg to gamma is coerced to f64 (Into<f64>).
+    let gi = compile("import math\nm = 5\na = math.gamma(m)\n", "gami.py");
+    assert!(
+        gi.contains("math :: gamma ((m) as f64) ?"),
+        "gamma int arg must coerce: {}", gi);
+}
+
+#[test]
 fn aliased_non_math_module_floor_is_not_hijacked() {
     // #369 / review: an Alias whose canonical target is NOT the math module
     // (e.g. a sibling `import geometry as g`) must not route g.floor/ceil/

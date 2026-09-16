@@ -398,6 +398,34 @@ fn math_log_one_and_two_arg_match_python() {
 }
 
 #[test]
+fn math_gamma_matches_python_values_and_pole() {
+    // Python: math.gamma(5.0)==24.0, gamma(0.5)≈1.7724538509055159,
+    // gamma(-2.5)≈-0.9453087204829418, gamma(1.0)==1.0; a 0 / non-positive
+    // integer is a pole (ValueError); a finite input whose gamma overflows
+    // raises OverflowError("math range error"). lgamma(0.5) is within 1 ulp
+    // of CPython (libm software).
+    use stdpython::math::{gamma, lgamma};
+    assert_eq!(gamma(5.0).unwrap(), 24.0);
+    assert_eq!(gamma(1.0).unwrap(), 1.0);
+    // Non-integer gamma goes through CPython's platform lgamma and can be
+    // 1 ulp off across libms (macOS vs glibc), so pin it within tolerance.
+    assert!((gamma(0.5).unwrap() - 1.7724538509055159).abs() < 1e-12);
+    assert!((gamma(-2.5).unwrap() - (-0.9453087204829418)).abs() < 1e-12);
+    assert_eq!(format!("{}", gamma(0.0).unwrap_err()), "ValueError: math domain error");
+    assert_eq!(format!("{}", gamma(-3.0).unwrap_err()), "ValueError: math domain error");
+    assert_eq!(
+        format!("{}", gamma(171.7).unwrap_err()),
+        "OverflowError: math range error"
+    );
+    // Python: math.lgamma(0.5) ≈ 0.5723649429247004 (within tolerance), and
+    // lgamma(-inf) == +inf (NOT a pole), while a large FINITE input raises
+    // OverflowError("math range error") (lgamma(1e308)).
+    assert!((lgamma(0.5).unwrap() - 0.5723649429247004).abs() < 1e-12);
+    assert_eq!(lgamma(f64::NEG_INFINITY).unwrap(), f64::INFINITY);
+    assert_eq!(format!("{}", lgamma(1e308).unwrap_err()), "OverflowError: math range error");
+}
+
+#[test]
 fn py_pow_matches_python() {
     // Python: 2 ** 10 == 1024 (int stays int)
     assert_eq!(py_pow(2i64, 10i64), 1024);

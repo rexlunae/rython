@@ -1082,3 +1082,63 @@ python_function! {
         libm::nextafter(a, inf) - a
     }
 }
+
+/// Whether `x` is a gamma/lgamma POLE — 0 or a non-positive integer
+/// (CPython raises ValueError "math domain error"; a non-integer negative
+/// like -2.5 is fine).
+fn gamma_pole(x: f64) -> bool {
+    x <= 0.0 && x == x.trunc()
+}
+
+python_function! {
+    /// math.lgamma(x) - the natural logarithm of the magnitude of the gamma
+    /// function. A non-positive integer / 0 is a pole (ValueError "math
+    /// domain error"); otherwise libm::lgamma. The result is the same as
+    /// CPython's within 1 ulp (the Rust libm crate is a software libm).
+    pub fn lgamma<T>(x: T) -> Result<f64, PyException>
+    where [T: Into<f64>]
+    [signature: (x)]
+    [concrete_types: (f64) -> Result<f64, crate::PyException>]
+    {
+        let x = x.into();
+        // lgamma(-inf) is +inf (CPython), NOT a pole.
+        if x == f64::NEG_INFINITY {
+            return Ok(inf);
+        }
+        if gamma_pole(x) {
+            return Err(crate::value_error("math domain error"));
+        }
+        let g = libm::lgamma(x);
+        // A FINITE input whose log-gamma overflows f64 raises OverflowError
+        // (e.g. lgamma(1e308)); +inf is a successful infinity.
+        if x.is_finite() && g.is_infinite() {
+            Err(crate::overflow_error("math range error"))
+        } else {
+            Ok(g)
+        }
+    }
+}
+
+python_function! {
+    /// math.gamma(x) - the gamma function. A non-positive integer / 0 is a
+    /// pole (ValueError "math domain error"); a finite input whose gamma
+    /// overflows to infinity raises OverflowError "math range error" (e.g.
+    /// gamma(171.6)); otherwise libm::tgamma (CPython-exact for the integer
+    /// and half-integer values test_math exercises).
+    pub fn gamma<T>(x: T) -> Result<f64, PyException>
+    where [T: Into<f64>]
+    [signature: (x)]
+    [concrete_types: (f64) -> Result<f64, crate::PyException>]
+    {
+        let x = x.into();
+        if gamma_pole(x) {
+            return Err(crate::value_error("math domain error"));
+        }
+        let g = libm::tgamma(x);
+        if x.is_finite() && g.is_infinite() {
+            Err(crate::overflow_error("math range error"))
+        } else {
+            Ok(g)
+        }
+    }
+}

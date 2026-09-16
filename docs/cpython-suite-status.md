@@ -257,7 +257,7 @@ inside (or leads to) the unittest harness:
   Pins: `math_comb_perm_match_cpython` (runtime),
   `math_comb_perm_route_and_default_perm_k` (codegen), `comb_perm` idiom.
 - **`math.isqrt` / `math.cbrt` / `math.fma` / `math.hypot` / `math.nextafter` /
-  `math.ulp`** now exist (#369, test_math-missing scalars). `isqrt` is the
+  `math.ulp`/`math.gamma`/`math.lgamma`** now exist (#369, test_math-missing scalars). `isqrt` is the
   EXACT integer square root (Newton's method, never a lossy float; ValueError
   `isqrt() argument must be nonnegative` for a negative n); `cbrt`/`fma`/
   `hypot`/`nextafter`/`ulp` are libm-backed `Into<f64>` runtime functions

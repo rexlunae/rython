@@ -57,6 +57,8 @@ pub enum MathFn {
     Fma,
     Ldexp,
     Log,
+    Gamma,
+    Lgamma,
 }
 
 impl MathFn {
@@ -109,6 +111,8 @@ impl MathFn {
             "fma" => Fma,
             "ldexp" => Ldexp,
             "log" => Log,
+            "gamma" => Gamma,
+            "lgamma" => Lgamma,
             _ => return None,
         })
     }
