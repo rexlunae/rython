@@ -39,6 +39,9 @@
     "math_exact_int_round": {
       "status": "pass"
     },
+    "math_gamma_lgamma": {
+      "status": "pass"
+    },
     "math_int_coercion": {
       "status": "pass"
     },
