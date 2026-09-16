@@ -385,6 +385,19 @@ fn math_isqrt_cbrt_fma_hypot_nextafter_match_cpython() {
 }
 
 #[test]
+fn math_log_one_and_two_arg_match_python() {
+    // Python: math.log(e) == 1.0 (base None), math.log(8, 2) == 3.0,
+    // math.log(100, 10) == 2.0; a non-positive x or invalid base raises
+    // ValueError("math domain error").
+    use stdpython::math::log;
+    assert_eq!(log(2.718281828459045, None).unwrap(), 1.0);
+    assert_eq!(log(8.0, Some(2.0)).unwrap(), 3.0);
+    assert_eq!(log(100.0, Some(10.0)).unwrap(), 2.0);
+    assert_eq!(format!("{}", log(-1.0, None).unwrap_err()), "ValueError: math domain error");
+    assert_eq!(format!("{}", log(8.0, Some(1.0)).unwrap_err()), "ValueError: math domain error");
+}
+
+#[test]
 fn py_pow_matches_python() {
     // Python: 2 ** 10 == 1024 (int stays int)
     assert_eq!(py_pow(2i64, 10i64), 1024);

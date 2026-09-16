@@ -6399,6 +6399,37 @@ fn math_ceil_floor_trunc_int_use_exact_i64_overload() {
 }
 
 #[test]
+fn math_log_fills_the_optional_base() {
+    // #369: math.log's runtime base is `Option<f64>` (default None). A
+    // one-argument call must pass `None` and a two-argument call wraps the
+    // base in `Some(...)` as an f64 — the generic fallback would otherwise
+    // emit `math::log(x)` (E0061) or a bare base (E0308).
+    let one = compile("import math\na = math.log(2.718281828459045)\n", "log1.py");
+    assert!(
+        one.contains("math :: log (2.718281828459045 , None) ?"),
+        "one-arg log must fill None: {}", one);
+    let two = compile("import math\na = math.log(8, 2)\n", "log2.py");
+    assert!(
+        two.contains("math :: log ((8) as f64 , Some ((2) as f64)) ?"),
+        "two-arg log must wrap base in Some(f64): {}", two);
+    let var = compile("import math\nx = 100.0\nb = 10.0\na = math.log(x)\nc = math.log(x, b)\n", "log3.py");
+    assert!(
+        var.contains("math :: log (x , None) ?") && var.contains("math :: log (x , Some (b)) ?"),
+        "variable-arg log: {}", var);
+    // Invalid shapes are loud: CPython raises TypeError for math.log()
+    // (too few), math.log(8, 2, 99) (too many), and any keyword.
+    for (src, frag) in [
+        ("import math\na = math.log()\n", "takes 1 or 2 positional arguments"),
+        ("import math\na = math.log(8, 2, 99)\n", "takes 1 or 2 positional arguments"),
+        ("import math\na = math.log(x=8)\n", "got keyword arguments"),
+        ("import math\na = math.log(8, base=2)\n", "got keyword arguments"),
+    ] {
+        let e = compile_err(src, "logbad.py");
+        assert!(e.contains(frag), "for `{}`: {}", frag, e);
+    }
+}
+
+#[test]
 fn aliased_non_math_module_floor_is_not_hijacked() {
     // #369 / review: an Alias whose canonical target is NOT the math module
     // (e.g. a sibling `import geometry as g`) must not route g.floor/ceil/

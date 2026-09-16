@@ -273,12 +273,19 @@ inside (or leads to) the unittest harness:
   **Int args to math `Into<f64>` scalars now coerce `(m) as f64`** — a
   COMPUTED int (`m = 2 ** 52`) previously rendered as a bare `m` and failed
   rustc (std has no `From<i64> for f64`); a small literal was already coerced
-  by inference. All verified byte-identical against python3 3.14. Pins:
-  `math_isqrt_cbrt_fma_hypot_nextafter_match_cpython` (runtime, incl. `ulp`),
-  `math_scalar_extras_route_and_isqrt_threads_result` +
-  `bare_math_import_threads_exception_inside_try` + hypoth/nextafter arities +
-  `math_int_args_coerce_to_f64` (codegen), `math_scalar_extras` +
-  `math_bare_imports` + `math_int_coercion` idioms. (`math.fma` is Python
+  by inference. **`math.ceil`/`floor`/`trunc` over an exact integer are EXACT**
+  (the arg unchanged — no >=2^53 f64 precision loss; routed to the `<fn>_i64`
+  overload). **`math.log(x[, base])`** fills its optional `Option<f64>` base
+  (`None` / `Some(base)`), so both spellings build (the generic fallback had
+  emitted `math::log(x)` — E0061 — or a bare base — E0308). All verified
+  byte-identical against python3 3.14. Pins:
+  `math_isqrt_cbrt_fma_hypot_nextafter_match_cpython` (runtime, incl. `ulp` +
+  `math_log_one_and_two_arg_match_python`), `math_scalar_extras_route_and_isqrt_threads_result`
+  + `bare_math_import_threads_exception_inside_try` + hypoth/nextafter arities
+  + `math_int_args_coerce_to_f64` + `math_ceil_floor_trunc_int_use_exact_i64_overload`
+  + `math_log_fills_the_optional_base` (codegen), `math_scalar_extras` +
+  `math_bare_imports` + `math_int_coercion` + `math_exact_int_round` +
+  `math_log` idioms. (`math.fma` is Python
   3.13+; it is pinned in the runtime/codegen tests but EXCLUDED from the
   idiom transcripts, whose 3.11/3.12 oracle cannot produce it.)
 - **`zip(a, b, strict=True)` is refused loudly** (CPython 3.10+). CPython's
