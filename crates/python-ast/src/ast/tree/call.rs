@@ -10107,6 +10107,13 @@ let mutating_self_field = boxed_self_ref_receiver
                 crate::TypeInfo::Option(_)
             )
         });
+        // math.log's optional base source expr, captured before `self.args`
+        // is consumed (so the log handler can re-render it as an f64 Some).
+        let log_base_expr = math_fn_name.as_deref().eq(&Some("log")).then(|| self.args.get(1).cloned()).flatten();
+        // math.log's positional arity, captured before `self.args` is consumed.
+        let arg_count = self.args.len();
+        // math.log's keyword presence, captured before `self.keywords` is consumed.
+        let has_keywords = !self.keywords.is_empty();
         for (i, arg) in self.args.into_iter().enumerate() {
             let rust_arg = if let Some(param) = pos_params.get(i) {
                 // A CALLABLE parameter (`dict_class: type`): the argument
@@ -10277,6 +10284,59 @@ let mutating_self_field = boxed_self_ref_receiver
         // like Python; propagate rather than hand back a bare Result.
         if name_str.ends_with(":: strptime") {
             return Ok(quote!(#call_expr?));
+        }
+        // math.log(x[, base]) — the runtime's base is `Option<f64>`
+        // (default None, `[signature: (x, base=None)]`): a one-argument call
+        // must pass None and a two-argument call wraps the base in Some(...).
+        // The generic fallback would emit `math::log(x)` (missing the second
+        // arg → E0061) or a bare base (E0308).
+        if math_fn_name
+            .as_deref()
+            .and_then(crate::MathFn::from_name)
+            == Some(crate::ast::tree::MathFn::Log)
+        {
+            // CPython's math.log accepts exactly one or two POSITIONAL
+            // arguments; any keyword (incl. **kwargs) or a wrong arity is a
+            // TypeError. Reject loudly (correct-or-loud) — never fabricate a
+            // result for an invalid call.
+            if has_keywords {
+                return Err(
+                    "math.log() got keyword arguments, which rython does not model \
+                     (CPython raises TypeError); use positional arguments"
+                        .into(),
+                );
+            }
+            if arg_count < 1 || arg_count > 2 {
+                return Err(
+                    "math.log() takes 1 or 2 positional arguments (x[, base]); \
+                     rython refuses to silently ignore an invalid call shape"
+                        .into(),
+                );
+            }
+            let x = all_args
+                .first()
+                .cloned()
+                .expect("arity >= 1 guaranteed above");
+            let base = if arg_count == 2 && let Some(b) = &log_base_expr {
+                // Render the base as an f64 so `Some(...)` holds a float
+                // (CPython coerces int base to float); a computed int
+                // becomes `(m) as f64`.
+                Some(crate::render_typed_reused(
+                    b,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                    Some(crate::TypeInfo::Float),
+                )?)
+            } else {
+                None
+            };
+            // math.log is fallible (raises ValueError on a non-positive x
+            // or an invalid base): thread `?`.
+            return Ok(match base {
+                None => quote!(#name(#x, None)?),
+                Some(b) => quote!(#name(#x, Some(#b))?),
+            });
         }
         // `subprocess :: run` and `os :: execv` are NOT here: the if-else
         // chain below handles both with dedicated arms before this branch

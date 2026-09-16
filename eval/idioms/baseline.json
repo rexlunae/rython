@@ -42,6 +42,9 @@
     "math_int_coercion": {
       "status": "pass"
     },
+    "math_log": {
+      "status": "pass"
+    },
     "math_scalar_extras": {
       "status": "pass"
     },
