@@ -97,6 +97,13 @@ impl CodeGen for For {
             collect_target_names(&self.target, &mut names);
             names
         };
+        // Whether the body mutates the (single-name) target in place —
+        // decides whether an array of FRESH tuple members binds `mut`
+        // (issue #370). Asked here, before the body is consumed.
+        let target_mutated = match &self.target {
+            ExprType::Name(n) => crate::ast::tree::closure::mutates_name(&self.body, &n.id),
+            _ => false,
+        };
         let unused_index = matches!(
             &self.target,
             ExprType::Name(n)
@@ -137,7 +144,7 @@ impl CodeGen for For {
         // When any target name leaks, the loop element binds to a temp
         // (`__rython_elt`) and the target lowering stores it into the
         // real bindings; otherwise the target pattern binds directly.
-        let (loop_target, loop_inner): (TokenStream, TokenStream) = if any_hoisted {
+        let (mut loop_target, loop_inner): (TokenStream, TokenStream) = if any_hoisted {
             let mut stmts = Vec::new();
             let mut counter = 0usize;
             lower_loop_target(
@@ -260,6 +267,84 @@ impl CodeGen for For {
                 #iter . chars () . map (| __rython_char | __rython_char . to_string ())
             );
         }
+        // A TUPLE iterable whose members share one type (issue #370 —
+        // `for xs in (list(), UserList())`, test_bisect): Python iterates
+        // the tuple; rython's tuple is a Rust tuple, which is not
+        // IntoIterator. It iterates as an ARRAY of its members instead. A
+        // literal's members render in place, an element-less `list()`/`[]`
+        // taking the element type its siblings give it; a tuple-typed
+        // value is destructured into the array. Members of differing types
+        // are left to the paths below.
+        let tuple_members: Option<Vec<crate::TypeInfo>> =
+            match crate::infer_type(Some(&ctx), &self.iter, &options, &symbols) {
+                crate::TypeInfo::Tuple(ms) => Some(ms),
+                _ => None,
+            };
+        let tuple_element = tuple_members
+            .as_deref()
+            .and_then(crate::ast::tree::type_ctx::tuple_iteration_element);
+        if let Some(element) = &tuple_element {
+            let owned_str = matches!(element, crate::TypeInfo::String);
+            if let ExprType::Tuple(t) = &self.iter {
+                let mut elts = Vec::with_capacity(t.elts.len());
+                for elt in &t.elts {
+                    let elt_type = crate::infer_type(Some(&ctx), elt, &options, &symbols);
+                    let empty_list = crate::ast::tree::type_ctx::type_mentions_pyobject(&elt_type)
+                        && (matches!(elt, ExprType::List(l) if l.is_empty())
+                            || matches!(
+                                elt,
+                                ExprType::Call(c)
+                                    if c.args.is_empty()
+                                        && c.keywords.is_empty()
+                                        && matches!(c.func.as_ref(), ExprType::Name(f) if f.id == "list")
+                            ));
+                    let tok = if empty_list {
+                        quote!(Vec::new())
+                    } else {
+                        crate::render_reused(elt, ctx.clone(), options.clone(), symbols.clone())?
+                    };
+                    // A str member may render borrowed (a literal, or a
+                    // local bound from one) even where it infers String;
+                    // the array's element is owned.
+                    if owned_str {
+                        elts.push(quote!((#tok).to_string()));
+                    } else {
+                        elts.push(tok);
+                    }
+                }
+                iter = quote!([#(#elts),*]);
+                // Mutating the target in place (`xs.append(9)`) needs a
+                // `mut` binding. Only when every member is a FRESH value
+                // nothing else can observe: Python's loop aliases each
+                // member, and rython's array holds copies — for a member
+                // that is a name, the mutation would silently miss the
+                // named object, so that case keeps its loud build error.
+                let fresh = |e: &ExprType| match e {
+                    ExprType::List(_) | ExprType::Dict(_) | ExprType::Set(_) => true,
+                    ExprType::Call(c) => match c.func.as_ref() {
+                        ExprType::Name(f) => {
+                            matches!(f.id.as_str(), "list" | "dict" | "set")
+                                || matches!(
+                                    symbols.get(&f.id),
+                                    Some(crate::SymbolTableNode::ClassDef(_))
+                                )
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if target_mutated && !any_hoisted && t.elts.iter().all(fresh) {
+                    loop_target = quote!(mut #loop_target);
+                }
+            } else {
+                let n = tuple_members.as_ref().map_or(0, Vec::len);
+                let fields = (0..n).map(syn::Index::from);
+                iter = quote!({
+                    let __rython_tuple = #iter;
+                    [#(__rython_tuple.#fields),*]
+                });
+            }
+        }
         // A TUPLE-LITERAL iterable (`for key in ("headers",
         // "_proxy_headers", "_socks_options")` — urllib3's poolmanager):
         // Python iterates the tuple; rython's tuple value is a Rust tuple,
@@ -268,7 +353,8 @@ impl CodeGen for For {
         // literals own themselves (the loop target feeds String-keyed
         // dict calls: `request_context.pop(key, None)`,
         // `key in request_context`).
-        if let ExprType::Tuple(t) = &self.iter
+        if tuple_element.is_none()
+            && let ExprType::Tuple(t) = &self.iter
             && t.elts.iter().all(|e| {
                 matches!(
                     e,

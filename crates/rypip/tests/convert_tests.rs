@@ -12597,6 +12597,68 @@ fn unittest_skip_and_expected_failure_gates_match_cpython() {
 }
 
 #[test]
+fn loops_over_tuples_of_one_member_type_match_cpython() {
+    // issue #370: a loop over a tuple — a literal, a function's returned
+    // tuple, a tuple-typed local — iterated a Rust tuple (not
+    // IntoIterator). It iterates an array now; an element-less `list()`
+    // takes its siblings' element type, and str members are owned.
+    let scratch = Scratch::new("tupleiter");
+    let krate = package_crate(
+        &scratch,
+        "tupleiter",
+        &[(
+            "cli.py",
+            concat!(
+                    "def pair() -> tuple[int, int]:\n",
+                    "    return (4, 5)\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    for xs in (list(), [3, 1, 2]):\n",
+                    "        xs.append(9)\n",
+                    "        print(len(xs), xs[-1])\n",
+                    "    for xs in ([5], [3, 1, 2]):\n",
+                    "        print(sum(xs))\n",
+                    "    for word in (\"a\", \"bc\"):\n",
+                    "        print(word * 2)\n",
+                    "    name = \"zz\"\n",
+                    "    for w in (name, \"q\"):\n",
+                    "        print(w.upper())\n",
+                    "    for v in pair():\n",
+                    "        print(v + 1)\n",
+                    "    t = (7, 8)\n",
+                    "    for v in t:\n",
+                    "        print(v)\n",
+                    "    print(t)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "tupleiter"),
+        vec![
+            "1 9",
+            "4 9",
+            "5",
+            "6",
+            "aa",
+            "bcbc",
+            "ZZ",
+            "Q",
+            "5",
+            "6",
+            "7",
+            "8",
+            "(7, 8)",
+        ]
+    );
+}
+
+#[test]
 fn non_finite_float_constants_match_cpython() {
     // issue #372: `1e400` is inf. It used to panic the converter; then it
     // rendered, but typed as a str in operator lowering (`1e400 * 0.0`

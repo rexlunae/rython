@@ -1370,9 +1370,54 @@ fn infer_type_inner(
 /// a `range` (whose elements are Python ints). A string is deliberately
 /// absent — iterating one yields single-character strings, which is a
 /// different type from the receiver and not what any caller here wants.
+/// The one element type a loop over a tuple of these member types binds,
+/// or None when the members differ (issue #370). STRICT on purpose: an
+/// UNKNOWN element (`list()`'s `Vec<PyObject>`) takes the type its siblings
+/// give it, but `unify`'s widening is refused — `for x in (1, 2.0)` binds
+/// an int and then a float, and one f64 element type would print `1.0`.
+pub(crate) fn tuple_iteration_element(members: &[TypeInfo]) -> Option<TypeInfo> {
+    fn join(a: &TypeInfo, b: &TypeInfo) -> Option<TypeInfo> {
+        let norm = |t: &TypeInfo| match t {
+            TypeInfo::StrRef => TypeInfo::String,
+            other => other.clone(),
+        };
+        let (a, b) = (norm(a), norm(b));
+        match (&a, &b) {
+            _ if a == b => Some(a),
+            (TypeInfo::PyObject, _) => Some(b),
+            (_, TypeInfo::PyObject) => Some(a),
+            (TypeInfo::Vec(x), TypeInfo::Vec(y)) => Some(TypeInfo::Vec(Box::new(join(x, y)?))),
+            (TypeInfo::HashSet(x), TypeInfo::HashSet(y)) => {
+                Some(TypeInfo::HashSet(Box::new(join(x, y)?)))
+            }
+            (TypeInfo::Option(x), TypeInfo::Option(y)) => {
+                Some(TypeInfo::Option(Box::new(join(x, y)?)))
+            }
+            (TypeInfo::Dict(k1, v1), TypeInfo::Dict(k2, v2)) => Some(TypeInfo::Dict(
+                Box::new(join(k1, k2)?),
+                Box::new(join(v1, v2)?),
+            )),
+            (TypeInfo::Tuple(x), TypeInfo::Tuple(y)) if x.len() == y.len() => Some(TypeInfo::Tuple(
+                x.iter().zip(y).map(|(a, b)| join(a, b)).collect::<Option<Vec<_>>>()?,
+            )),
+            _ => None,
+        }
+    }
+    let (first, rest) = members.split_first()?;
+    let mut acc = first.clone();
+    for m in rest {
+        acc = join(&acc, m)?;
+    }
+    // A member type nothing pinned leaves the element unknown.
+    (!type_mentions_pyobject(&acc)).then_some(acc)
+}
+
 pub(crate) fn iterable_element_type(t: &TypeInfo) -> Option<TypeInfo> {
     match t {
         TypeInfo::Vec(e) | TypeInfo::HashSet(e) => Some((**e).clone()),
+        // A tuple whose members share one type iterates as that type (the
+        // loop lowers it to an array — issue #370).
+        TypeInfo::Tuple(members) => tuple_iteration_element(members),
         // Iterating a dict yields its keys.
         TypeInfo::Dict(k, _) => Some((**k).clone()),
         // Iterating a str yields one-character strings.

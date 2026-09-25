@@ -739,7 +739,7 @@ fn count_bindings(
 /// Whether anything in `body` — this scope, a nested definition, or a
 /// lambda — mutates the object `name` is bound to: a store through it, or
 /// a mutating method on it.
-fn mutates_name(body: &[Statement], name: &str) -> bool {
+pub(crate) fn mutates_name(body: &[Statement], name: &str) -> bool {
     let mut found = false;
     walk_stmts(body, Descend::All, &mut |s| {
         for t in crate::ast::tree::visit::stmt_targets(s) {

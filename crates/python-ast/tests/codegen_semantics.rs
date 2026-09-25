@@ -6708,6 +6708,32 @@ fn the_unittest_runner_honors_skip_gates_in_sorted_order() {
 }
 
 #[test]
+fn a_loop_over_a_tuple_of_one_member_type_iterates_an_array() {
+    // issue #370: `for xs in (list(), [3, 1, 2])` (test_bisect's shape)
+    // iterated a Rust tuple, which is not IntoIterator. A tuple whose
+    // members share one type iterates as an array; the element-less
+    // `list()` takes its siblings' element type, and — every member being
+    // a fresh value nothing else can observe — the target binds `mut` for
+    // the in-place append.
+    let out = compile(
+        concat!(
+            "def f() -> None:\n",
+            "    for xs in (list(), [3, 1, 2]):\n",
+            "        xs.append(9)\n",
+        ),
+        "tuple_iter.py",
+    );
+    assert!(out.contains("for mut xs in [Vec :: new () ,"), "generated: {}", out);
+    // Members of differing types are not widened into one array type:
+    // `(1, 2.0)` binds an int and then a float.
+    let out = compile(
+        "def g() -> None:\n    for n in (1, 2.0):\n        print(n)\n",
+        "tuple_mixed.py",
+    );
+    assert!(!out.contains("[1.0"), "an int member must not become a float: {}", out);
+}
+
+#[test]
 fn chained_class_level_literal_constants_lower_per_target() {
     // issue #367: a class-level CHAINED assignment (`tol = rel = 0` —
     // statistics' NumericTestCase) must lower one associated const per
