@@ -564,7 +564,7 @@ pub fn coerce_tokens(
         }
         // Anything → PyValue (issue #121): a value stored into a boxed
         // union / Any slot wraps in PyValue::from (None via From<()>).
-        (_, TypeInfo::PyValue) => Some(quote!(PyValue::from((#tokens)))),
+        (_, TypeInfo::PyValue) => Some(quote!(PyValue::from(#tokens))),
         // Anything → StrOrBytes (issue #121): the str | bytes union's
         // heterogeneous slot converts via its From impls (&str, String,
         // &[u8], Vec<u8>).
@@ -818,12 +818,25 @@ fn infer_type_inner(
             TypeInfo::PyObject
         }
         ExprType::List(l) => {
-            let mut elt = TypeInfo::PyObject;
-            for e in l {
-                let t = infer_type_inner(ctx, e, options, symbols);
-                if !matches!(t, TypeInfo::PyObject) {
-                    elt = unify(elt, t);
+            let known: Vec<TypeInfo> = l
+                .iter()
+                .map(|e| infer_type_inner(ctx, e, options, symbols))
+                .filter(|t| !matches!(t, TypeInfo::PyObject))
+                .collect();
+            let mut distinct: Vec<&TypeInfo> = Vec::new();
+            for t in &known {
+                if !distinct.contains(&t) {
+                    distinct.push(t);
                 }
+            }
+            let mut elt = join_known_types(distinct.iter().copied());
+            // The same decision the literal's lowering makes (expression.rs):
+            // an all-boxable mix that does not join is Vec<PyValue>.
+            if distinct.len() > 1
+                && matches!(elt, TypeInfo::PyObject)
+                && distinct.iter().all(|t| is_boxable_value_type(t))
+            {
+                elt = TypeInfo::PyValue;
             }
             TypeInfo::Vec(Box::new(elt))
         }
@@ -1660,6 +1673,24 @@ pub fn unify(a: TypeInfo, b: TypeInfo) -> TypeInfo {
     }
 }
 
+/// The join of a literal's KNOWN member types, folded in order: two
+/// known types that do not join make the result the unknown marker for
+/// good. `unify` itself lets a later member absorb the marker (it is also
+/// "no type yet"), so a plain fold over `[1, 2.5, 3j, "x"]` ended on
+/// `String` and hid the heterogeneity the boxing check looks for (issue
+/// #366). Unknown members are the caller's to skip.
+pub fn join_known_types<'a>(types: impl IntoIterator<Item = &'a TypeInfo>) -> TypeInfo {
+    let mut joined = TypeInfo::PyObject;
+    for t in types {
+        let next = unify(joined.clone(), t.clone());
+        if matches!(next, TypeInfo::PyObject) && !matches!(joined, TypeInfo::PyObject) {
+            return TypeInfo::PyObject;
+        }
+        joined = next;
+    }
+    joined
+}
+
 fn numeric_join(a: &TypeInfo, b: &TypeInfo) -> TypeInfo {
     if matches!(a, TypeInfo::Float) || matches!(b, TypeInfo::Float) {
         TypeInfo::Float
@@ -2222,6 +2253,8 @@ pub fn is_boxable_value_type(t: &TypeInfo) -> bool {
             | TypeInfo::Dict(_, _)
             | TypeInfo::StrOrBytes
             | TypeInfo::PyValue
+            // A complex member (`[1, 2.5, 3j]` — issue #366).
+            | TypeInfo::Complex
     )
 }
 

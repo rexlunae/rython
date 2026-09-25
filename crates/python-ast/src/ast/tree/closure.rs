@@ -676,7 +676,11 @@ pub(crate) fn wrap_function_as_callable(
     // One `def` is one function object however many times it is named
     // (`register(hello)` ... `unregister(hello)`): the wrapper carries the
     // definition's module-qualified name as its identity.
-    let identity = format!("{}.{}", options.this_module_path.join("."), n.id);
+    let identity = if options.this_module_path.is_empty() {
+        n.id.clone()
+    } else {
+        format!("{}.{}", options.this_module_path.join("."), n.id)
+    };
     Some(Ok(quote! {
         stdpython::PyCallable::function(
             #py_name,

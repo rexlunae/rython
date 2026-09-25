@@ -2732,6 +2732,9 @@ pub enum PyValue {
     Bytes(Vec<u8>),
     Tuple(Arc<Vec<PyValue>>),
     Dict(Arc<PyDict<String, PyValue>>),
+    /// A Python `complex` (issue #366): a heterogeneous container or an
+    /// `assertEqual` over complex operands carries it boxed.
+    Complex(Complex),
     None_,
 }
 
@@ -2765,6 +2768,7 @@ impl IntoIterator for PyValue {
             PyValue::Int(_) => panic!("TypeError: 'int' object is not iterable"),
             PyValue::Float(_) => panic!("TypeError: 'float' object is not iterable"),
             PyValue::Bool(_) => panic!("TypeError: 'bool' object is not iterable"),
+            PyValue::Complex(_) => panic!("TypeError: 'complex' object is not iterable"),
             PyValue::None_ => panic!("TypeError: 'NoneType' object is not iterable"),
         };
         items.into_iter()
@@ -2863,6 +2867,7 @@ impl Truthy for PyValue {
             PyValue::Bytes(b) => !b.is_empty(),
             PyValue::Tuple(t) => !t.is_empty(),
             PyValue::Dict(d) => !d.is_empty(),
+            PyValue::Complex(z) => z.real != 0.0 || z.imag != 0.0,
             PyValue::None_ => false,
         }
     }
@@ -3099,6 +3104,7 @@ impl PyValue {
             PyValue::Bytes(_) => "bytes",
             PyValue::Tuple(_) => "tuple",
             PyValue::Dict(_) => "dict",
+            PyValue::Complex(_) => "complex",
             PyValue::None_ => "NoneType",
         }
     }
@@ -3226,6 +3232,7 @@ pub fn py_value_type_name(v: &PyValue) -> &'static str {
         PyValue::Bytes(_) => "bytes",
         PyValue::Tuple(_) => "tuple",
         PyValue::Dict(_) => "dict",
+        PyValue::Complex(_) => "complex",
         PyValue::None_ => "NoneType",
     }
 }
@@ -3237,6 +3244,7 @@ pub fn py_value_str(v: &PyValue) -> String {
         PyValue::Bool(b) => if *b { "True" } else { "False" }.to_string(),
         PyValue::Str(s) => s.clone(),
         PyValue::Bytes(b) => py_bytes_repr(b),
+        PyValue::Complex(z) => z.py_display(),
         PyValue::Tuple(items) => {
             let inner: Vec<String> = items.iter().map(py_value_repr).collect();
             if inner.len() == 1 {
@@ -3314,6 +3322,13 @@ impl core::hash::Hash for PyValue {
                     core::hash::Hash::hash(k, state);
                     core::hash::Hash::hash(v, state);
                 }
+            }
+            PyValue::Complex(z) => {
+                core::hash::Hash::hash(&8u8, state);
+                // Signed zeros compare equal, so they hash alike (as Float).
+                let bits = |f: f64| if f == 0.0 { 0f64.to_bits() } else { f.to_bits() };
+                core::hash::Hash::hash(&bits(z.real), state);
+                core::hash::Hash::hash(&bits(z.imag), state);
             }
             PyValue::None_ => core::hash::Hash::hash(&6u8, state),
         }
@@ -6557,6 +6572,19 @@ pub(crate) fn py_value_eq(a: &PyValue, b: &PyValue) -> bool {
         (PyValue::Int(x), PyValue::Bool(y)) => *x == (*y as i64),
         (PyValue::Bool(x), PyValue::Float(y)) => ((*x as i64) as f64) == *y,
         (PyValue::Float(x), PyValue::Bool(y)) => *x == ((*y as i64) as f64),
+        // A complex equals a real number when its imaginary part is zero
+        // and its real part equals the number (`-1+0j == -1`, issue #366).
+        (PyValue::Complex(z), other) | (other, PyValue::Complex(z))
+            if !matches!(other, PyValue::Complex(_)) =>
+        {
+            let real = match other {
+                PyValue::Int(i) => *i as f64,
+                PyValue::Float(f) => *f,
+                PyValue::Bool(b) => (*b as i64) as f64,
+                _ => return false,
+            };
+            z.imag == 0.0 && z.real == real
+        }
         _ => a == b,
     }
 }
@@ -7177,6 +7205,12 @@ pub fn complex_repr(re: f64, im: f64) -> String {
         "+"
     };
     format!("({}{}{}j)", complex_component_repr(re), sign, complex_component_repr(im.abs()))
+}
+
+impl From<Complex> for PyValue {
+    fn from(z: Complex) -> Self {
+        PyValue::Complex(z)
+    }
 }
 
 impl PyBool for Complex {

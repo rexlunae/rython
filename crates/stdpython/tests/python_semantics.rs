@@ -4830,3 +4830,25 @@ fn unittest_assert_order_comparisons_match_cpython() {
             .matches("AssertionError")
     );
 }
+
+#[test]
+fn a_boxed_complex_behaves_like_cpythons_complex() {
+    // issue #366: `[1, 2.5, 3j, "x"]` carries its complex member boxed.
+    let z = PyValue::from(Complex::new(0.0, 3.0));
+    // str([1, 2.5, 3j, 'x'])  == "[1, 2.5, 3j, 'x']"
+    assert_eq!(py_display(&z), "3j");
+    // type(3j).__name__ == 'complex'
+    assert_eq!(py_value_type_name(&z), "complex");
+    // bool(0j) is False, bool(3j) is True
+    assert!(z.is_truthy());
+    assert!(!PyValue::from(Complex::new(0.0, 0.0)).is_truthy());
+    // 1j * 1j == -1 (a complex with zero imaginary part equals the real);
+    // 1 + 1j != 1; 2j != 3j
+    let minus_one = PyValue::from(Complex::new(-1.0, 0.0));
+    assert!(stdpython::stdlib::unittest::assert_eq(&minus_one, &PyValue::from(-1i64), String::new()).is_ok());
+    assert!(stdpython::stdlib::unittest::assert_eq(&PyValue::from(Complex::new(2.5, 0.0)), &PyValue::from(2.5f64), String::new()).is_ok());
+    assert!(stdpython::stdlib::unittest::assert_not_eq(&PyValue::from(Complex::new(1.0, 1.0)), &PyValue::from(1i64), String::new()).is_ok());
+    let err = stdpython::stdlib::unittest::assert_eq(&PyValue::from(Complex::new(0.0, 1.0)), &PyValue::from(1i64), String::new()).unwrap_err();
+    // AssertionError: 1j != 1
+    assert_eq!(err.message, "1j != 1");
+}

@@ -17134,3 +17134,53 @@ fn re_sub_duplicate_count_raises_type_error_at_run_time() {
         vec!["bbaaa", "baaaa", "TypeError: sub() got multiple values for argument 'count'"]
     );
 }
+
+#[test]
+fn complex_values_box_and_compare_like_cpython() {
+    // Issue #366: a complex member of a mixed list or dict boxes, and
+    // assertEqual/assertNotEqual compare complex against int/float the
+    // way CPython's `==` does.
+    let scratch = Scratch::new("complexbox");
+    let krate = package_crate(
+        &scratch,
+        "complexbox",
+        &[(
+            "cli.py",
+            concat!(
+                "import unittest\n",
+                "\n",
+                "\n",
+                "class T(unittest.TestCase):\n",
+                "    def test_eq(self):\n",
+                "        self.assertEqual(1j * 1j, -1 + 0j)\n",
+                "        self.assertEqual(1j * 1j, -1)\n",
+                "        self.assertEqual(2.5 + 0j, 2.5)\n",
+                "        self.assertNotEqual(2j, 3j)\n",
+                "        self.assertNotEqual(1 + 1j, 1)\n",
+                "        print(\"eq ok\")\n",
+                "\n",
+                "    def test_mixed(self):\n",
+                "        vals = [1, 2.5, 3j, \"x\"]\n",
+                "        print([type(v).__name__ for v in vals])\n",
+                "        print(vals, len(vals))\n",
+                "        d = {\"a\": 1, \"b\": 2j, \"c\": \"s\"}\n",
+                "        print(d)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    unittest.main()\n",
+            ),
+        )],
+    );
+    // Verified against python3 (stdout).
+    assert_eq!(
+        run_package(&krate, "complexbox"),
+        vec![
+            "eq ok",
+            "['int', 'float', 'complex', 'str']",
+            "[1, 2.5, 3j, 'x'] 4",
+            "{'a': 1, 'b': 2j, 'c': 's'}",
+        ]
+    );
+}
+

@@ -751,6 +751,11 @@ pub fn pyvalue_to_json(value: &crate::PyValue) -> JSONValue {
         PyValue::Float(f) => JSONValue::Float(*f),
         PyValue::Str(s) => JSONValue::String(s.clone()),
         PyValue::Bytes(b) => JSONValue::String(String::from_utf8_lossy(b).into_owned()),
+        // CPython's encoder refuses a complex; there is no Result channel
+        // here, so its TypeError is a loud panic (§12.2).
+        PyValue::Complex(_) => {
+            panic!("TypeError: Object of type complex is not JSON serializable")
+        }
         PyValue::Tuple(t) => {
             JSONValue::Array(t.iter().map(pyvalue_to_json).collect())
         }

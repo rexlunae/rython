@@ -55,7 +55,6 @@ impl CodeGen for Dict {
         // becomes PyDict<i64, String> with the string literal owned.
         // Issue #121: a store into a `dict[str, Any]` name forces the
         // value type to the boxed PyValue, so mixed values wrap.
-        let mut k_expected = crate::TypeInfo::PyObject;
         let mut v_expected = crate::TypeInfo::PyObject;
         let mut k_distinct: Vec<crate::TypeInfo> = Vec::new();
         let mut v_distinct: Vec<crate::TypeInfo> = Vec::new();
@@ -65,9 +64,8 @@ impl CodeGen for Dict {
                 let kt = crate::infer_type(Some(&ctx), k, &options, &symbols);
                 if !matches!(kt, crate::TypeInfo::PyObject) {
                     if !k_distinct.contains(&kt) {
-                        k_distinct.push(kt.clone());
+                        k_distinct.push(kt);
                     }
-                    k_expected = crate::unify(k_expected, kt);
                 }
             }
             let vt = crate::infer_type(Some(&ctx), value, &options, &symbols);
@@ -78,6 +76,9 @@ impl CodeGen for Dict {
                 v_expected = crate::unify(v_expected, vt);
             }
         }
+        // Keys join order-independently of repeats, and a conflict between
+        // two known key types sticks (join_known_types — issue #366).
+        let mut k_expected = crate::ast::tree::type_ctx::join_known_types(&k_distinct);
         // A forced key/value type overrides the mixed-type check: the
         // assignment target dictates the element type.
         if forced_kv.is_none()

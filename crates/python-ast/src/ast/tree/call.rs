@@ -364,6 +364,7 @@ fn box_assert_argument(
                     | crate::TypeInfo::StrRef
                     | crate::TypeInfo::String
                     | crate::TypeInfo::Bytes
+                    | crate::TypeInfo::Complex
                     | crate::TypeInfo::PyValue
             ) =>
         {
@@ -375,6 +376,7 @@ fn box_assert_argument(
         | crate::TypeInfo::StrRef
         | crate::TypeInfo::String
         | crate::TypeInfo::Bytes
+        | crate::TypeInfo::Complex
         | crate::TypeInfo::PyValue => Ok(Some(quote!(PyValue::from(#r)))),
         // An UNKNOWN-typed but already-concrete Rust expression (issue #377):
         // a loop variable whose element type the inference maps don't record,

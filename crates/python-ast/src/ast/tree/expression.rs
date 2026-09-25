@@ -358,7 +358,6 @@ impl ExprType {
                         elt_types.push(t);
                     }
                 }
-                let mut expected = crate::TypeInfo::PyObject;
                 let mut distinct: Vec<crate::TypeInfo> = Vec::new();
                 for t in &elt_types {
                     if !distinct.contains(t) {
@@ -372,9 +371,9 @@ impl ExprType {
                 // element list ends on a 2-tuple and `unify(PyObject,
                 // Tuple2)` snaps expected back to Tuple2, hiding the
                 // heterogeneity from the boxable-union check below).
-                for t in &distinct {
-                    expected = crate::unify(expected, t.clone());
-                }
+                // Two known types that do not join stay a conflict
+                // (`[1, 2.5, 3j, "x"]` — issue #366; join_known_types).
+                let mut expected = crate::ast::tree::type_ctx::join_known_types(&distinct);
                 if distinct.len() > 1 && matches!(expected, crate::TypeInfo::PyObject) {
                     // A list of DIFFERENT class instances (`[d_sp, d_ta,
                     // ...]` — charset_normalizer's debug plugin list) has

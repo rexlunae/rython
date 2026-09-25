@@ -4676,8 +4676,8 @@ fn boxed_class_constructor_boxes_scalar_arguments() {
         "boxed_ctor.py",
     );
     assert!(
-        out.contains("C :: new (PyValue :: from ((42))) ?")
-            && out.contains("C :: new (PyValue :: from ((\"hi\"))) ?"),
+        out.contains("C :: new (PyValue :: from (42)) ?")
+            && out.contains("C :: new (PyValue :: from (\"hi\")) ?"),
         "boxed-class construction must box scalar args: {}",
         out
     );
@@ -4712,13 +4712,13 @@ fn float_coercible_class_lowers_via_float_and_into() {
         out
     );
     assert!(
-        out.contains("math :: ceil ({ FloatLike :: new (PyValue :: from ((42.5))) ? }) . into ()")
+        out.contains("math :: ceil ({ FloatLike :: new (PyValue :: from (42.5)) ? }) . into ()")
             || out.contains(". into ()"),
         "a FloatLike arg to a math call must lower via Into<f64>: {}",
         out
     );
     assert!(
-        out.contains("FloatLike :: new (PyValue :: from ((1.0))) ? }) . into ()"),
+        out.contains("FloatLike :: new (PyValue :: from (1.0)) ? }) . into ()"),
         "a heterogeneous [float, FloatLike] list element must coerce via Into: {}",
         out
     );
@@ -17256,7 +17256,7 @@ fn an_option_callee_result_into_a_boxed_union_param_coerces() {
         out
     );
     assert!(
-        out.contains("Some (__rython_v) => PyValue :: from ((__rython_v))")
+        out.contains("Some (__rython_v) => PyValue :: from (__rython_v)")
             || out.contains("Some(__rython_v)=>PyValue::from((__rython_v))"),
         "the Some arm must box the inner: {}",
         out
@@ -17317,7 +17317,7 @@ fn a_property_read_local_on_a_factory_local_coerces_into_a_boxed_union_param() {
         out
     );
     assert!(
-        out.contains("match (read_timeout) { Some (__rython_v) => PyValue :: from ((__rython_v)) , None => stdpython :: PyValue :: None_ , }")
+        out.contains("match (read_timeout) { Some (__rython_v) => PyValue :: from (__rython_v) , None => stdpython :: PyValue :: None_ , }")
             || out.contains("match(read_timeout){Some(__rython_v)=>PyValue::from((__rython_v)),None=>stdpython::PyValue::None_,}"),
         "the Option<f64> local must coerce into the boxed param: {}",
         out
@@ -19003,8 +19003,8 @@ fn mixed_arity_tuple_list_boxes_heterogeneous_elements() {
     );
     let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        flat.contains("PyValue::from(((65,\"M\",\"a\")))")
-            && flat.contains("PyValue::from(((76,\"V\")))"),
+        flat.contains("PyValue::from((65,\"M\",\"a\"))")
+            && flat.contains("PyValue::from((76,\"V\"))"),
         "mixed-arity tuple list elements must box as PyValue: {}",
         out
     );
@@ -19034,7 +19034,7 @@ fn list_of_union_tuples_return_annotation_boxes_elements() {
         out
     );
     assert!(
-        flat.contains("PyValue::from(((0,\"3\")))"),
+        flat.contains("PyValue::from((0,\"3\"))"),
         "the returning list must box each element: {}",
         out
     );
@@ -19147,7 +19147,7 @@ fn boxed_return_list_annotation_does_not_retag_local_lists() {
     );
     let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        flat.contains("PyValue::from(((0,\"3\")))"),
+        flat.contains("PyValue::from((0,\"3\"))"),
         "the RETURNED list must box each element: {}",
         out
     );
@@ -19184,7 +19184,7 @@ fn boxed_return_list_annotation_spreads_starred_elements() {
         out
     );
     assert!(
-        flat.contains("__rython_list.push(PyValue::from(((65,\"M\",\"a\")))"),
+        flat.contains("__rython_list.push(PyValue::from((65,\"M\",\"a\"))"),
         "the fixed elements after the spread must still box, in order: {}",
         out
     );
@@ -24873,7 +24873,7 @@ fn a_function_name_in_a_callable_position_wraps_the_item() {
         "wrap.py",
     );
     assert!(
-        out.contains("stdpython :: PyCallable :: new (\"step\" , | (__rython_a0 ,) : (i64 ,) | step (__rython_a0) ,)"),
+        out.contains("stdpython :: PyCallable :: function (\"step\" , \"step\" , | (__rython_a0 ,) : (i64 ,) | step (__rython_a0) ,)"),
         "{}",
         out
     );
@@ -25109,3 +25109,18 @@ fn a_call_through_an_unmodelable_callable_annotation_is_loud() {
     assert!(out.contains("no fixed arity"), "{}", out);
     assert!(!out.contains("PyValue :: None_"), "{}", out);
 }
+
+#[test]
+fn a_literal_mixing_three_kinds_boxes_whatever_the_order() {
+    // Issue #366: the element-type fold let a later member absorb the
+    // conflict between two earlier ones (`[1, 2.5, 3j, "x"]` folded to
+    // Vec<String>; `[1, b"x", "s"]` likewise), so the literal was not
+    // boxed and rustc refused it. A conflict now sticks.
+    let out = compile("def f() -> None:\n    vals = [1, 2.5, 3j, \"x\"]\n    print(vals)\n", "mix3.py");
+    assert!(out.contains("PyValue :: from (Complex :: new"), "generated: {}", out);
+    let out = compile("def f() -> None:\n    vals = [1, b\"x\", \"s\"]\n    print(vals)\n", "mix3b.py");
+    assert!(out.contains("PyValue :: from"), "generated: {}", out);
+    let out = compile("def f() -> None:\n    d = {1: \"a\", b\"k\": \"b\", \"s\": \"c\"}\n    print(d)\n", "mix3d.py");
+    assert!(out.contains("PyValue :: from"), "generated: {}", out);
+}
+

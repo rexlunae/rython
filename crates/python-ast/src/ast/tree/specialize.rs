@@ -575,7 +575,7 @@ fn py_id_typeinfo(id: &str, symbols: &SymbolTableScopes) -> Option<crate::TypeIn
 
 /// Whether a Python return-type id can live inside the boxed PyValue.
 pub fn py_id_boxable(id: &str) -> bool {
-    matches!(id, "int" | "float" | "bool" | "str" | "bytes")
+    matches!(id, "int" | "float" | "complex" | "bool" | "str" | "bytes")
 }
 
 /// The TypeInfo a morph assignment gives one axis.
