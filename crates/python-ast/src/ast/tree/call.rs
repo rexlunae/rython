@@ -6460,10 +6460,25 @@ impl<'a> CodeGen for Call {
                                 .to_string()
                                 .into());
                         }
-                        if rendered.len() > 3 && count_kw.is_some() {
-                            return Err("sub() got multiple values for argument 'count'"
-                                .to_string()
-                                .into());
+                        // CPython raises this TypeError at RUN time, after
+                        // evaluating every argument — a test's
+                        // `assertRaises(TypeError)` depends on it (issue
+                        // #369) — so it lowers to a raise, not a refusal.
+                        // The explicit `Err::<String, _>(..)?` types the
+                        // expression without diverging statically (no
+                        // unreachable-code warning after it).
+                        if rendered.len() > 3
+                            && let Some(c) = &count_kw
+                        {
+                            let c = c.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                            return Ok(quote!({
+                                #(let _ = &(#rendered);)*
+                                let _ = &(#c);
+                                Err::<String, PyException>(PyException::new(
+                                    "TypeError",
+                                    "sub() got multiple values for argument 'count'",
+                                ))?
+                            }));
                         }
                         let count = match (rendered.get(3), count_kw) {
                             (Some(c), None) => quote!(#c),

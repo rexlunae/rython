@@ -17099,3 +17099,38 @@ fn module_containers_mutated_by_functions_match_cpython() {
         vec!["42 [6, 8] 1 2 ['n']", "b a none []"]
     );
 }
+
+#[test]
+fn re_sub_duplicate_count_raises_type_error_at_run_time() {
+    // Issue #369: CPython raises the duplicate-`count` TypeError when the
+    // call RUNS, so an `except TypeError` around it catches it.
+    let scratch = Scratch::new("resubcount");
+    let krate = package_crate(
+        &scratch,
+        "resubcount",
+        &[(
+            "cli.py",
+            concat!(
+                "import re\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    print(re.sub(\"a\", \"b\", \"aaaaa\", count=2))\n",
+                "    print(re.sub(\"a\", \"b\", \"aaaaa\", 1))\n",
+                "    try:\n",
+                "        re.sub(\"a\", \"b\", \"aaaaa\", 1, count=1)\n",
+                "    except TypeError as e:\n",
+                "        print(\"TypeError:\", e)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "resubcount"),
+        vec!["bbaaa", "baaaa", "TypeError: sub() got multiple values for argument 'count'"]
+    );
+}
