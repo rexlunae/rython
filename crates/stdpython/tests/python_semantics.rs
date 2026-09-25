@@ -4615,6 +4615,84 @@ fn str_format_with_runtime_kwargs_matches_cpython() {
 }
 
 #[test]
+fn str_format_runtime_matches_cpython() {
+    // issue #368: the runtime `str.format` for templates the conversion
+    // cannot see. Arguments arrive rendered through str(). Verified
+    // against python3 3.11.
+    let args = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let kw = |xs: &[(&str, &str)]| {
+        xs.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<Vec<_>>()
+    };
+    // "{}={}".format("k", 7) == 'k=7'; "{1}:{0}".format("k", 7) == '7:k'
+    assert_eq!(str_format_runtime("{}={}", &args(&["k", "7"]), &[]).unwrap(), "k=7");
+    assert_eq!(str_format_runtime("{1}:{0}", &args(&["k", "7"]), &[]).unwrap(), "7:k");
+    // "{0}{0}".format("x") == 'xx'; "{{}}{}".format(3) == '{}3'
+    assert_eq!(str_format_runtime("{0}{0}", &args(&["x"]), &[]).unwrap(), "xx");
+    assert_eq!(str_format_runtime("{{}}{}", &args(&["3"]), &[]).unwrap(), "{}3");
+    // "{!s}".format(4) == '4'; "{who} has {n}".format(who="ann", n=3)
+    assert_eq!(str_format_runtime("{!s}", &args(&["4"]), &[]).unwrap(), "4");
+    assert_eq!(
+        str_format_runtime("{who} has {n}", &[], &kw(&[("who", "ann"), ("n", "3")])).unwrap(),
+        "ann has 3"
+    );
+    let err = |t: &str, a: &[&str], k: &[(&str, &str)]| {
+        let e = str_format_runtime(t, &args(a), &kw(k)).err().unwrap();
+        (e.exception_type.clone(), e.message.clone())
+    };
+    // '{} {}'.format(1) -> IndexError
+    assert_eq!(
+        err("{} {}", &["1"], &[]),
+        ("IndexError".into(), "Replacement index 1 out of range for positional args tuple".into())
+    );
+    // "{a}".format() -> KeyError: 'a'
+    assert_eq!(err("{a}", &[], &[]), ("KeyError".into(), "'a'".into()));
+    // "{}{0}".format(1, 2) / "{0}{}".format(1, 2) -> ValueError
+    assert_eq!(
+        err("{}{0}", &["1", "2"], &[]).1,
+        "cannot switch from automatic field numbering to manual field specification"
+    );
+    assert_eq!(
+        err("{0}{}", &["1", "2"], &[]).1,
+        "cannot switch from manual field specification to automatic field numbering"
+    );
+    // "}" / "a{" / "{x" -> ValueError, three different messages
+    assert_eq!(err("}", &[], &[]).1, "Single '}' encountered in format string");
+    assert_eq!(err("a{", &[], &[]).1, "Single '{' encountered in format string");
+    assert_eq!(err("{x", &[], &[("x", "1")]).1, "expected '}' before end of string");
+    // "{a}".format(**{"a": 1}, a=2) -> TypeError
+    assert_eq!(
+        err("{a}", &[], &[("a", "1"), ("a", "2")]),
+        (
+            "TypeError".into(),
+            "str.format() got multiple values for keyword argument 'a'".into()
+        )
+    );
+    // A spec, a !r conversion, or {a.b}/{a[0]} is refused, not approximated.
+    for t in ["{:>3}", "{!r}", "{0.x}", "{0[0]}"] {
+        assert_eq!(err(t, &["1"], &[]).0, "ValueError", "{}", t);
+    }
+}
+
+#[test]
+fn a_forwarded_kwargs_bag_is_empty_or_refused() {
+    // issue #368: `wrap(text, width, **kwargs)` models no keyword options,
+    // so the forwarded bag is checked where it is used. An empty bag is a
+    // no-op (the call is exactly CPython's); an option raises rather than
+    // being ignored.
+    let empty = PyDict::<String, PyValue>::from([]);
+    assert!(refuse_forwarded_kwargs("wrap", &empty).is_ok());
+    let bag = PyDict::<String, PyValue>::from([(
+        "initial_indent".to_string(),
+        PyValue::from("> "),
+    )]);
+    let err = refuse_forwarded_kwargs("wrap", &bag).err().unwrap();
+    assert_eq!(err.exception_type, "NotImplementedError");
+    assert!(err.message.contains("'initial_indent'"), "{}", err.message);
+}
+
+#[test]
 fn csv_reader_quote_none_with_escapechar_matches_cpython() {
     use stdpython::stdlib::csv::reader;
     // Verified against CPython 3.14.1: QUOTE_NONE + escapechar makes the

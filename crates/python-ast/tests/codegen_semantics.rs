@@ -5363,7 +5363,7 @@ fn str_format_with_runtime_kwargs_routes_to_the_runtime_formatter() {
         "fmt_kw.py",
     );
     assert!(
-        out.contains("str_format_kwargs"),
+        out.contains("str_format_runtime") && out.contains("str_format_bag"),
         "must route to the runtime formatter: {}",
         out
     );
@@ -5412,23 +5412,56 @@ fn str_format_errors_are_loud_or_lower_to_variants() {
         out
     );
 
-    // Non-literal templates can't be checked at conversion time: the
-    // dynamic-format divergence — the call is dropped and -W reports it.
-    let (out, warnings) = compile_with_warnings(
+    // A template the conversion cannot see formats at RUN time (issue
+    // #368). It used to be replaced by `None` behind a -W warning, which
+    // printed `None` where CPython prints the formatted string.
+    let out = compile(
         "def f(t: str, x: int) -> str:\n    return t.format(x)\n",
         "fmtdyn.py",
     );
     assert!(
-        out.contains("stdpython :: PyValue :: None_"),
-        "the dynamic format must drop to a no-op: {}",
+        out.contains("str_format_runtime") && !out.contains("PyValue :: None_"),
+        "a dynamic template must format at run time, never drop to None: {}",
         out
     );
+}
+
+#[test]
+fn unbound_str_format_takes_its_template_from_the_first_argument() {
+    // `str.format("{}!", x)` is `"{}!".format(x)` (issue #368): the
+    // literal template still lowers to `format!` at conversion time. It
+    // used to look for the template in `str` itself, find none, and
+    // replace the call with `None`.
+    let out = compile(
+        "def f(x: int) -> str:\n    return str.format(\"{}!\", x)\n",
+        "fmtunbound.py",
+    );
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("non-literal template") && w.contains("dropped")),
-        "the dynamic-format divergence must be reported through -W: {:?}",
-        warnings
+        out.contains("format !") && !out.contains("PyValue :: None_"),
+        "the unbound form must format its literal template: {}",
+        out
+    );
+}
+
+#[test]
+fn a_runtime_keyword_bag_keeps_the_calls_other_arguments() {
+    // `"{who}/{extra}".format(extra=True, **bag)` with a bag built at run
+    // time (issue #368): the call formats at run time with BOTH the bag
+    // and `extra`. The bag path used to return early with the bag alone,
+    // so `{extra}` raised KeyError where CPython prints it.
+    let out = compile(
+        concat!(
+            "def f() -> str:\n",
+            "    bag = {}\n",
+            "    bag[\"who\"] = \"bob\"\n",
+            "    return \"{who}/{extra}\".format(extra=True, **bag)\n",
+        ),
+        "fmtbag.py",
+    );
+    assert!(
+        out.contains("str_format_bag") && out.contains("\"extra\""),
+        "the explicit keyword must reach the runtime formatter with the bag: {}",
+        out
     );
 }
 
@@ -6503,13 +6536,15 @@ fn bare_math_import_threads_exception_inside_try() {
 }
 
 #[test]
-fn textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error() {
+fn textwrap_kwargs_spread_is_checked_at_run_time_not_a_hard_error() {
     // #368: `wrap(text, width, **kwargs)` (test_textwrap's check_wrap
     // forwarding its **kwargs, which may carry initial_indent/drop_whitespace)
-    // must be a LOUD drop — never a hard "unexpected keyword argument" — since
-    // rython's textwrap.wrap(text, width) models only the width. The spread
-    // keys are dynamic at this lowering (the dynamic-kwargs divergence).
-    let (out, warnings) = compile_with_warnings(
+    // converts — never a hard "unexpected keyword argument" — and since
+    // rython's textwrap.wrap(text, width) models only the width, the bag is
+    // checked at RUN time: empty, the call is exactly CPython's; carrying an
+    // option, it raises NotImplementedError rather than wrapping without it
+    // (which is what the old -W drop did).
+    let out = compile(
         concat!(
             "from textwrap import wrap\n",
             "class T:\n",
@@ -6524,9 +6559,9 @@ fn textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error() {
         out
     );
     assert!(
-        warnings.iter().any(|w| w.contains("kwargs") && w.contains("dropped")),
-        "the **kwargs spread must be a loud drop: {:?}",
-        warnings
+        out.contains("refuse_forwarded_kwargs (\"wrap\""),
+        "the forwarded **kwargs bag must be checked at run time: {}",
+        out
     );
 }
 

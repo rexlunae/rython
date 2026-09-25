@@ -5742,6 +5742,10 @@ impl<'a> CodeGen for Call {
                 )
             });
             if let (Some((fname, module_prefix, render_name)), true) = (target, known) {
+                // A `**kwargs` bag forwarded into one of these calls is checked at
+                // run time before the call (issue #368) — see the guard below.
+                let mut forwarded_bags: Vec<TokenStream> = Vec::new();
+                let lowered = (|| -> Result<TokenStream, Box<dyn std::error::Error>> {
                 // wrap/fill accept width=, the re functions accept
                 // flags= (and sub also count=); everything else takes no
                 // keywords.
@@ -5814,13 +5818,24 @@ impl<'a> CodeGen for Call {
                         // CSVBase.defaults IS the excel default dialect):
                         // the spread's keys are dynamic at this lowering —
                         // dropped (the dialect-options divergence).
-                        None if matches!(fname.as_str(), "reader" | "writer") => {
-                            options.definition_warnings.borrow_mut().push(
-                                "csv.reader/writer `**`-spread dialect options are \
-                                 dropped; the excel default dialect is used \
-                                 (documented divergence)"
-                                    .to_string(),
-                            );
+                        None if matches!(
+                            fname.as_str(),
+                            "reader" | "writer" | "wrap" | "fill" | "indent" | "shorten"
+                                | "dedent"
+                        ) => {
+                            // The spread's keys are only known at run time,
+                            // and none of these lowerings models the call's
+                            // keyword options (issue #368): an empty bag
+                            // changes nothing; a non-empty one raises there
+                            // rather than being ignored.
+                            let bag = kw.value.clone().to_rust(
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?;
+                            forwarded_bags.push(quote!(
+                                stdpython::refuse_forwarded_kwargs(#fname, &(#bag))?;
+                            ));
                             continue;
                         }
                         // textwrap wrap/fill/indent/shorten/dedent: a `**kwargs`
@@ -5830,19 +5845,7 @@ impl<'a> CodeGen for Call {
                         // dynamic at this lowering, and rython's wrap(text,
                         // width) models only the width — the forwarded options
                         // are dropped (the dynamic-kwargs divergence), loudly.
-                        None if matches!(
-                            fname.as_str(),
-                            "wrap" | "fill" | "indent" | "shorten" | "dedent"
-                        ) => {
-                            options.definition_warnings.borrow_mut().push(format!(
-                                "{}() `**kwargs`-spread options are dropped (rython's \
-                                 {} lowers only its positional form; the dynamic \
-                                 keyword options are the dynamic-kwargs divergence)",
-                                fname,
-                                fname
-                            ));
-                            continue;
-                        }
+
                         _ => {
                             return Err(format!(
                                 "{}() got an unexpected keyword argument '{}'",
@@ -6784,6 +6787,11 @@ impl<'a> CodeGen for Call {
                     ) => Err(arity("2")),
                     _ => Err(arity("the documented number of")),
                 };
+                })()?;
+                if forwarded_bags.is_empty() {
+                    return Ok(lowered);
+                }
+                return Ok(quote!({ #(#forwarded_bags)* #lowered }));
             }
         }
 
@@ -8158,23 +8166,39 @@ let mutating_self_field = boxed_self_ref_receiver
             // spec Rust cannot reproduce exactly is a loud conversion
             // error, never approximated output.
             if attr.attr == "format" {
+                // The UNBOUND form `str.format(template, *args, **kw)` is
+                // the bound call `template.format(*args, **kw)` (issue
+                // #368): the template is the first argument, not `str`.
+                let unbound = matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "str")
+                    && symbols.get("str").is_none()
+                    && matches!(self.args.first(), Some(a) if !matches!(a, ExprType::Starred(_)));
+                let (template_expr, format_args) = if unbound {
+                    (&self.args[0], &self.args[1..])
+                } else {
+                    (attr.value.as_ref(), &self.args[..])
+                };
                 let Some(template) =
-                    str_format_template(attr.value.as_ref(), Some(&ctx), &symbols, &options)
+                    str_format_template(template_expr, Some(&ctx), &symbols, &options)
                 else {
-                    // The dynamic-format divergence: a template the
-                    // conversion cannot see (a parameter, a field stored
-                    // from one) — the call is dropped as the boxed None,
-                    // with the warning.
-                    options.definition_warnings.borrow_mut().push(
-                        "str.format on a non-literal template is dropped (the \
-                         dynamic-format divergence)"
-                            .to_string(),
+                    // A template the conversion cannot see (a parameter, a
+                    // field stored from one): formatted at run time.
+                    let template = template_expr.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?;
+                    return lower_str_format_runtime(
+                        template,
+                        format_args,
+                        &self.keywords,
+                        &ctx,
+                        &options,
+                        &symbols,
                     );
-                    return Ok(quote!(stdpython::PyValue::None_));
                 };
                 return lower_str_format(
                     &template,
-                    &self.args,
+                    format_args,
                     &self.keywords,
                     &ctx,
                     &options,
@@ -10767,6 +10791,68 @@ pub(crate) fn str_format_template(
 /// ones bind to `_` so no warning fires. Errors mirror Python's:
 /// mixing auto and manual numbering, out-of-range indices, and missing
 /// keywords are conversion-time failures.
+/// `template.format(*args, **kwargs)` formatted at RUN time (issue #368),
+/// for a template the conversion cannot see or a keyword bag it cannot
+/// resolve. Every argument renders through Python's `str()` — which is
+/// what `format(value, "")` is for a field without a spec — in Python's
+/// evaluation order (template, then positional arguments, then keywords);
+/// `stdpython::str_format_runtime` substitutes them and raises a
+/// `ValueError` for any field it cannot render exactly.
+fn lower_str_format_runtime(
+    template: TokenStream,
+    args: &[ExprType],
+    keywords: &[Keyword],
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    let as_str = |value: &ExprType| -> Result<TokenStream, Box<dyn std::error::Error>> {
+        ExprType::Call(Call {
+            func: Box::new(ExprType::Name(crate::ast::tree::name::Name {
+                id: "str".to_string(),
+            })),
+            args: vec![value.clone()],
+            keywords: Vec::new(),
+        })
+        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+    };
+    let mut positional = Vec::new();
+    for arg in args {
+        if matches!(arg, ExprType::Starred(_)) {
+            return Err("str.format with a `*` spread into a template rython cannot see at \
+                        conversion time is not supported yet (bind the template to a string \
+                        literal, or pass the fields explicitly); rython refuses to silently \
+                        ignore it"
+                .into());
+        }
+        positional.push(as_str(arg)?);
+    }
+    let mut keyword_steps = Vec::new();
+    for kw in keywords {
+        match &kw.arg {
+            Some(name) => {
+                let value = as_str(&kw.value)?;
+                keyword_steps.push(quote!(__rython_kw.push((#name.to_string(), #value));));
+            }
+            None => {
+                let bag = kw
+                    .value
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                keyword_steps.push(quote!(__rython_kw.extend(stdpython::str_format_bag(&(#bag)));));
+            }
+        }
+    }
+    Ok(quote!({
+        let __rython_template = #template;
+        let __rython_args: Vec<String> = vec![#(#positional),*];
+        #[allow(unused_mut)]
+        let mut __rython_kw: Vec<(String, String)> = Vec::new();
+        #(#keyword_steps)*
+        stdpython::str_format_runtime(&__rython_template, &__rython_args, &__rython_kw)?
+    }))
+}
+
 fn lower_str_format(
     template: &str,
     args: &[ExprType],
@@ -10782,13 +10868,22 @@ fn lower_str_format(
         Err(e) => {
             // A template with fields this lowering cannot express
             // (`{data[installer][name]}` — pip's user agent): attribute/
-            // index access inside fields is unmodeled — the format call is
-            // dropped (documented divergence).
+            // index access inside fields is unmodeled. It is not dropped
+            // (issue #368): the runtime path formats every field it can
+            // and raises a ValueError naming the one it cannot, at the
+            // point Python would have used it.
             options.definition_warnings.borrow_mut().push(format!(
-                "str.format({:?}) is dropped: {}",
+                "str.format({:?}) is formatted at run time and raises ValueError there: {}",
                 template, e
             ));
-            return Ok(quote!(stdpython::PyValue::None_));
+            return lower_str_format_runtime(
+                quote!(#template),
+                args,
+                keywords,
+                ctx,
+                options,
+                symbols,
+            );
         }
     };
 
@@ -10879,13 +10974,19 @@ fn lower_str_format(
             if entries.is_empty() {
                 // A `**runtime_bag` spread with DYNAMIC keys (test_calendar's
                 // `format_` — a runtime dict from default_format.copy() plus a
-                // dynamic key): not statically resolvable. Route to the
-                // runtime field-name formatter (issue #368), which substitutes
-                // `{key}` from the bag at runtime and refuses loudly on a
-                // format-spec/conversion it cannot render. The static-core
-                // `format!` path stays for resolvable templates.
-                let bag = kw.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                return Ok(quote!(stdpython::str_format_kwargs(#template, &(#bag))?));
+                // dynamic key): not statically resolvable, so the whole call
+                // formats at run time (issue #368) — with its positional
+                // arguments and other keywords, which an early return on the
+                // bag alone used to discard.
+                let original: Vec<ExprType> = args.iter().map(|a| (*a).clone()).collect();
+                return lower_str_format_runtime(
+                    quote!(#template),
+                    &original,
+                    keywords,
+                    ctx,
+                    options,
+                    symbols,
+                );
             }
             for (ename, evalue) in entries {
                 resolved_keywords.push(crate::Keyword {

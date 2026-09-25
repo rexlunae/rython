@@ -12416,6 +12416,87 @@ fn run_package(krate: &rypip::convert::ConvertedCrate, pkg_name: &str) -> Vec<St
 }
 
 #[test]
+fn str_format_on_templates_rython_cannot_see_matches_cpython() {
+    // issue #368: a template held in a parameter, the unbound
+    // `str.format(t, ...)` form, and a keyword bag built at run time all
+    // format at RUN time — including CPython's IndexError / KeyError /
+    // ValueError messages. Each of these was previously replaced by
+    // `None` (or, for a runtime bag, formatted without the call's other
+    // arguments), so the program printed `None` where CPython printed text.
+    let scratch = Scratch::new("fmtrt");
+    let krate = package_crate(
+        &scratch,
+        "fmtrt",
+        &[(
+            "cli.py",
+            concat!(
+                    "def render(tmpl: str, name: str, n: int) -> str:\n",
+                    "    return tmpl.format(name, n)\n",
+                    "\n",
+                    "\n",
+                    "def render_kw(tmpl: str, name: str) -> str:\n",
+                    "    return tmpl.format(who=name, count=3)\n",
+                    "\n",
+                    "\n",
+                    "def try_fmt(tmpl: str, v: int) -> str:\n",
+                    "    try:\n",
+                    "        return tmpl.format(v)\n",
+                    "    except IndexError as e:\n",
+                    "        return \"IndexError: \" + str(e)\n",
+                    "    except KeyError as e:\n",
+                    "        return \"KeyError: \" + str(e)\n",
+                    "    except ValueError as e:\n",
+                    "        return \"ValueError: \" + str(e)\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    d = {\"a\": \"x\", \"b\": \"y\"}\n",
+                    "    print(\"{a}-{b}\".format(**d))\n",
+                    "    print(str.format(\"{a}!\", **d))\n",
+                    "    print(str.format(\"{}+{}\", 1, 2.5))\n",
+                    "    print(render(\"{}={}\", \"k\", 7))\n",
+                    "    print(render(\"{1}:{0}\", \"k\", 7))\n",
+                    "    print(render_kw(\"{who} has {count}\", \"ann\"))\n",
+                    "    bag = {}\n",
+                    "    bag[\"who\"] = \"bob\"\n",
+                    "    print(\"{who}/{extra}\".format(extra=True, **bag))\n",
+                    "    print(render(\"{{}} {} {}\", \"lit\", 1))\n",
+                    "    print(try_fmt(\"{} {}\", 1))\n",
+                    "    print(try_fmt(\"{x}\", 1))\n",
+                    "    print(try_fmt(\"{}{0}\", 1))\n",
+                    "    print(try_fmt(\"}\", 1))\n",
+                    "    print(try_fmt(\"{\", 1))\n",
+                    "    print(try_fmt(\"{0\", 1))\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "fmtrt"),
+        vec![
+            "x-y",
+            "x!",
+            "1+2.5",
+            "k=7",
+            "7:k",
+            "ann has 3",
+            "bob/True",
+            "{} lit 1",
+            "IndexError: Replacement index 1 out of range for positional args tuple",
+            "KeyError: 'x'",
+            "ValueError: cannot switch from automatic field numbering to manual field specification",
+            "ValueError: Single '}' encountered in format string",
+            "ValueError: Single '{' encountered in format string",
+            "ValueError: expected '}' before end of string",
+        ]
+    );
+}
+
+#[test]
 fn a_local_shadowing_a_module_static_is_spelled_apart_at_runtime() {
     // `LIMIT = compute() + 1` is a module value functions read (a promoted
     // static); `scaled` binds a LOCAL of the same name (a store, then a

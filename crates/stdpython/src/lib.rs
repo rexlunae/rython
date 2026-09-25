@@ -8469,75 +8469,188 @@ pub fn format_string<T: AsRef<str>>(template: T, args: &[&dyn Display]) -> Strin
     result
 }
 
-/// Runtime `str.format(**kwargs)` for a KWARGS-DICT receiver (issue #368):
-/// substitutes `{key}` placeholders from a `PyDict<String, String>` of
-/// keyword values, with CPython's `{{`/`}}` escaping and a `KeyError` for a
-/// missing key. This is the DYNAMIC seam for the (rare) `"template".
-/// format(**runtime_dict)` calls that cannot be resolved at conversion
-/// time; the statically-resolvable templates still lower to `format!`.
+/// Runtime `str.format` (issue #368), for a call whose template or
+/// keyword bag the conversion cannot see: a template held in a parameter
+/// or a field, a `**runtime_dict` spread, the unbound `str.format(t, ...)`
+/// form over a non-literal `t`. A template the conversion CAN see still
+/// lowers to `format!` at conversion time (`lower_str_format`); this is
+/// the seam for the rest, which was previously replaced by `None`.
 ///
-/// The scalar `{key}` FIELD-NAME form is the supported surface (which is
-/// how the CPython test corpus uses it). A format-SPEC or CONVERSION
-/// (`{key:>5}`, `{key!r}`) is a loud `ValueError`, NOT a silent wrong
-/// substitution — the corpus's runtime-kwargs templates never use them,
-/// and a best-effort approximation is exactly what the prime directive
-/// forbids.
-pub fn str_format_kwargs<T: AsRef<str>>(
+/// `args` and `kwargs` arrive already rendered through Python's `str()`,
+/// which is exactly what `format(value, "")` produces for a field with no
+/// spec — so `{}`, `{0}`, `{name}`, `{!s}`, and `{{`/`}}` all match
+/// CPython. A field this path cannot render faithfully — a format spec
+/// (`{:>5}`), a `!r`/`!a` conversion, attribute or index access
+/// (`{a.b}`, `{a[0]}`) — raises a `ValueError` naming the field at the
+/// point of divergence, never an approximation.
+///
+/// Errors follow CPython's messages and its left-to-right order: the
+/// first bad field raises, after the fields before it were rendered.
+pub fn str_format_runtime<T: AsRef<str>>(
     template: T,
-    kwargs: &PyDict<String, String>,
+    args: &[String],
+    kwargs: &[(String, String)],
 ) -> Result<String, PyException> {
+    // CPython rejects a keyword given twice before it looks at the
+    // template (`"{a}".format(**{"a": 1}, a=2)`).
+    for (i, (k, _)) in kwargs.iter().enumerate() {
+        if kwargs[..i].iter().any(|(prev, _)| prev == k) {
+            return Err(PyException::new(
+                "TypeError",
+                format!("str.format() got multiple values for keyword argument '{}'", k),
+            ));
+        }
+    }
     let chars: Vec<char> = template.as_ref().chars().collect();
+    let n = chars.len();
     let mut out = String::new();
     let mut i = 0usize;
-    let n = chars.len();
+    let mut auto_next = 0usize;
+    // Numbered fields are either all automatic (`{}`) or all manual
+    // (`{0}`); named fields do not take part.
+    let mut automatic: Option<bool> = None;
     while i < n {
         let c = chars[i];
-        if c == '{' {
-            if (i + 1 < n) && chars[i + 1] == '{' {
-                out.push('{');
-                i += 2;
-                continue;
-            }
-            // A replacement field: find the closing '}'.
-            let mut j = i + 1;
-            let mut key = String::new();
-            while j < n && chars[j] != '}' {
-                let fc = chars[j];
-                if fc == ':' || fc == '!' {
-                    // format-spec or conversion — unsupported, be loud.
-                    return Err(PyException::new(
-                        "ValueError",
-                        "str.format(**kwargs) format-spec / conversion is not supported \
-                         by the runtime kwargs path (issue #368)"
-                    ));
-                }
-                key.push(fc);
-                j += 1;
-            }
-            if j >= n {
-                return Err(PyException::new("ValueError", "expected '}' before end of string"));
-            }
-            match kwargs.get(&key) {
-                Some(v) => out.push_str(v),
-                None => {
-                    return Err(PyException::new("KeyError", format!("'{}'", key)))
-                }
-            }
-            i = j + 1;
-            continue;
-        }
         if c == '}' {
-            if (i + 1 < n) && chars[i + 1] == '}' {
+            if i + 1 < n && chars[i + 1] == '}' {
                 out.push('}');
                 i += 2;
                 continue;
             }
-            return Err(PyException::new("ValueError", "single '}' in format string"));
+            return Err(PyException::new(
+                "ValueError",
+                "Single '}' encountered in format string",
+            ));
         }
-        out.push(c);
-        i += 1;
+        if c != '{' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if i + 1 < n && chars[i + 1] == '{' {
+            out.push('{');
+            i += 2;
+            continue;
+        }
+        if i + 1 >= n {
+            return Err(PyException::new(
+                "ValueError",
+                "Single '{' encountered in format string",
+            ));
+        }
+        // The field runs to its closing '}'.
+        let Some(close) = (i + 1..n).find(|&j| chars[j] == '}') else {
+            return Err(PyException::new(
+                "ValueError",
+                "expected '}' before end of string",
+            ));
+        };
+        let field: String = chars[i + 1..close].iter().collect();
+        let (name, conversion) = match field.split_once('!') {
+            Some((name, conv)) => (name, Some(conv)),
+            None => (field.as_str(), None),
+        };
+        if name.contains(':') || conversion.is_some_and(|c| c != "s") {
+            return Err(PyException::new(
+                "ValueError",
+                format!(
+                    "str.format field '{{{}}}' uses a format spec or conversion, which rython \
+                     renders only for a template it can see at conversion time",
+                    field
+                ),
+            ));
+        }
+        if name.contains('.') || name.contains('[') {
+            return Err(PyException::new(
+                "ValueError",
+                format!(
+                    "str.format field '{{{}}}' uses attribute or index access, which rython \
+                     does not support",
+                    field
+                ),
+            ));
+        }
+        let value = if name.is_empty() || name.bytes().all(|b| b.is_ascii_digit()) {
+            let index = if name.is_empty() {
+                if automatic == Some(false) {
+                    return Err(PyException::new(
+                        "ValueError",
+                        "cannot switch from manual field specification to automatic field \
+                         numbering",
+                    ));
+                }
+                automatic = Some(true);
+                auto_next += 1;
+                auto_next - 1
+            } else {
+                if automatic == Some(true) {
+                    return Err(PyException::new(
+                        "ValueError",
+                        "cannot switch from automatic field numbering to manual field \
+                         specification",
+                    ));
+                }
+                automatic = Some(false);
+                name.parse::<usize>().unwrap_or(usize::MAX)
+            };
+            match args.get(index) {
+                Some(v) => v,
+                None => {
+                    return Err(PyException::new(
+                        "IndexError",
+                        format!(
+                            "Replacement index {} out of range for positional args tuple",
+                            index
+                        ),
+                    ));
+                }
+            }
+        } else {
+            match kwargs.iter().find(|(k, _)| k == name) {
+                Some((_, v)) => v,
+                None => return Err(PyException::new("KeyError", format!("'{}'", name))),
+            }
+        };
+        out.push_str(value);
+        i = close + 1;
     }
     Ok(out)
+}
+
+/// A `**kwargs` bag forwarded into a stdlib call whose rython lowering
+/// models none of that call's keyword options (issue #368) —
+/// `textwrap.wrap(text, width, **kwargs)`, `csv.writer(f, **fmtparams)`.
+/// The keys are only known at run time, so the check is there: an EMPTY
+/// bag changes nothing and the call proceeds exactly as CPython's does; a
+/// bag carrying any option raises `NotImplementedError` naming it, where
+/// silently ignoring it would produce different output.
+pub fn refuse_forwarded_kwargs<V>(call: &str, bag: &PyDict<String, V>) -> Result<(), PyException> {
+    match bag.keys().next() {
+        None => Ok(()),
+        Some(key) => Err(PyException::new(
+            "NotImplementedError",
+            format!(
+                "{}() got keyword option '{}' through a **kwargs spread; rython models none \
+                 of {}()'s keyword options and refuses to silently ignore it",
+                call, key, call
+            ),
+        )),
+    }
+}
+
+/// A `**bag` spread's entries as `str.format` keywords, each value
+/// rendered through Python's `str()` (see [`str_format_runtime`]).
+pub fn str_format_bag<V: Clone + PyToString>(bag: &PyDict<String, V>) -> Vec<(String, String)> {
+    bag.iter().map(|(k, v)| (k.clone(), v.clone().py_str())).collect()
+}
+
+/// `template.format(**kwargs)` over a runtime keyword bag (issue #368):
+/// [`str_format_runtime`] with no positional arguments.
+pub fn str_format_kwargs<T: AsRef<str>, V: Clone + PyToString>(
+    template: T,
+    kwargs: &PyDict<String, V>,
+) -> Result<String, PyException> {
+    str_format_runtime(template, &[], &str_format_bag(kwargs))
 }
 
 /// Helper for range() function with optional parameters - more flexible than the basic range

@@ -415,13 +415,32 @@ Python `repr` first, then pad. Integer radix and sign formatting go
 through a helper reproducing Python's sign+magnitude form
 (`format(-255, 'x')` is `-ff`, not two's complement).
 
-`str.format` works on **literal templates only**; every argument is
+`str.format` on a template the conversion can see (a literal, a name
+or field bound to one, a class constant — including the unbound
+`str.format(template, ...)` form) lowers to `format!`; every argument is
 evaluated exactly once in Python's order, whether used or not. Errors
 mirror CPython's (mixing automatic and manual numbering, missing
 keywords, `Single '{' encountered in format string`).
 
-Loud errors: non-literal templates, `format(**kwargs)`, format specs
-Rust cannot reproduce (`,` grouping, `=` alignment, space sign, `e`/`g`
+A template the conversion cannot see (a parameter, a field stored from
+one) or a `**bag` whose keys are only known at run time formats at
+**run time** (`stdpython::str_format_runtime`, issue #368): every
+argument renders through `str()` — which is what `format(value, "")`
+is for a field with no spec — and `{}`, `{0}`, `{name}`, `{!s}` and
+`{{`/`}}` match CPython, with its `IndexError`/`KeyError`/`ValueError`/
+duplicate-keyword `TypeError` messages. A field that path cannot
+render exactly — a format spec, `!r`/`!a`, `{a.b}`/`{a[0]}` — raises
+`ValueError` naming the field. (Before #368 such calls were replaced by
+`None`.)
+
+A `**kwargs` bag forwarded into `textwrap.wrap/fill/indent/shorten/
+dedent` or `csv.reader/writer`, whose lowerings model none of those
+keyword options, is checked at run time: an empty bag is a no-op; one
+carrying an option raises `NotImplementedError` naming it rather than
+being ignored.
+
+Loud conversion errors, for a template the conversion can see: format
+specs Rust cannot reproduce (`,` grouping, `=` alignment, space sign, `e`/`g`
 presentations, nested spec interpolation `f"{x:{w}}"`, `!r` combined
 with a numeric presentation type), and attribute/index access inside a
 replacement field (`{a.b}`, `{a[0]}`).
