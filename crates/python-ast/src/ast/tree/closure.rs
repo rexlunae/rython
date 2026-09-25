@@ -673,9 +673,14 @@ pub(crate) fn wrap_function_as_callable(
     };
     let item = crate::safe_ident(&n.id);
     let py_name = n.id.clone();
+    // One `def` is one function object however many times it is named
+    // (`register(hello)` ... `unregister(hello)`): the wrapper carries the
+    // definition's module-qualified name as its identity.
+    let identity = format!("{}.{}", options.this_module_path.join("."), n.id);
     Some(Ok(quote! {
-        stdpython::PyCallable::new(
+        stdpython::PyCallable::function(
             #py_name,
+            #identity,
             |#pattern: #arg_type| #item(#(#idents),*),
         )
     }))

@@ -265,7 +265,20 @@ Four things become one:
   the name is loud where it is called);
 - a module function NAME in such a position (`run(step)`,
   `_INITIALIZERS.append(callback)`), wrapped in a `PyCallable` that
-  forwards to the item.
+  forwards to the item. Every reference to one `def` is the ONE function
+  object CPython has: the wrapper carries the definition's
+  module-qualified name as its identity, so `register(hello)` then
+  `unregister(hello)` finds and removes it, while two lambdas stay two
+  objects.
+
+A module-level container that functions mutate in place — a registry of
+callbacks (`_INITIALIZERS = []`, appended to inside
+`register_initializer(callback: Callable[[str], None])`) — is shared
+mutable state behind a lock (issue #337), and its element type is pinned
+by those uses: a module function's body, typed with its own annotated
+parameters, and the `__main__` block count as evidence exactly as
+module-level statements do. An UNANNOTATED parameter appended into it
+gives no element type and stays loud.
 
 A call through the value is `f.call((x,))?`: it returns the same
 `Result<R, PyException>` every generated function returns, so an
@@ -2479,7 +2492,7 @@ accepted as permanent spec:
 | Argument-render-then-mutate shapes (`print(xs, xs.pop(), xs)`) render the first argument before the mutation | Recorded in issue #79 |
 | A read of a module member the generated module has no item for (`util.ssl_.PROTOCOL_TLS` — an external ssl constant) lowers to the boxed `None` with a warning (dynamic-module-member divergence) | Model limit; module members are static path items |
 | A call through a sibling-module member that is not a module-level function/class (`probe.acquire_and_get`, a bound-method alias) is dropped with the callable-as-value warning | Model limit; a BOUND METHOD is not a value (a plain callable is — §3.6) |
-| Callables as VALUES (issue #122): a `Callable[[A], R]` annotation, a nested `def`, a `lambda` in a callable position and a module function name in one are `stdpython::PyCallable<(A,), R>` — a call through the value is `f.call((x,))?`, whose `Result` makes an exception raised inside a callable catchable by its caller. Capture is LATE-BINDING through a shared `stdpython::PyCell`, so a rebinding, a mutation, or a loop's next turn reaches the closure exactly as in Python, and reading a cell before its first assignment is CPython's UnboundLocalError; a capture that cannot change after the definition (bound once, unconditionally, outside every loop, mutated by nobody) is cloned in instead, which is indistinguishable (§3.6). A lambda local is typed by the uses that name a type; uses that disagree, and the shapes with no Rust type or no closure semantics (an unannotated parameter, a missing return annotation, `*args`, a keyword-only parameter, a default, a decorator, a generator, `nonlocal`, a lambda that would mutate a capture) are refused at the definition with the reason and are loud at the use site — a refused definition whose HEADER runs code (a decorator, a non-literal default) is refused at CONVERSION instead, since Python evaluates those where the `def` stands. `Callable[..., R]` keeps the boxed value and is loud at a call through it. CPython's function repr prints the plain name, not the nested qualname (`<function add at 0x…>`, not `make_adder.<locals>.add`), and a `PyCallable` is not `Send` | Correct-or-loud (issue #122) |
+| Callables as VALUES (issue #122): a `Callable[[A], R]` annotation, a nested `def`, a `lambda` in a callable position and a module function name in one are `stdpython::PyCallable<(A,), R>` — a call through the value is `f.call((x,))?`, whose `Result` makes an exception raised inside a callable catchable by its caller. Capture is LATE-BINDING through a shared `stdpython::PyCell`, so a rebinding, a mutation, or a loop's next turn reaches the closure exactly as in Python, and reading a cell before its first assignment is CPython's UnboundLocalError; a capture that cannot change after the definition (bound once, unconditionally, outside every loop, mutated by nobody) is cloned in instead, which is indistinguishable (§3.6). A lambda local is typed by the uses that name a type; uses that disagree, and the shapes with no Rust type or no closure semantics (an unannotated parameter, a missing return annotation, `*args`, a keyword-only parameter, a default of a MUTABLE type (an immutable one is evaluated where the `def` stands and bound at each direct call that omits it — issue #370), a decorator, a generator, `nonlocal`, a lambda that would mutate a capture) are refused at the definition with the reason and are loud at the use site — a refused definition whose HEADER runs code (a decorator, a non-literal default) is refused at CONVERSION instead, since Python evaluates those where the `def` stands. `Callable[..., R]` keeps the boxed value and is loud at a call through it. CPython's function repr prints the plain name, not the nested qualname (`<function add at 0x…>`, not `make_adder.<locals>.add`), and every reference to one module `def` is one function object (equal, same repr) while each lambda evaluation is a new one | Correct-or-loud (issue #122) |
 | Release-mode integer overflow may wrap (debug panics) | Bounded by §12.2's contract |
 | A non-daemon thread never joined is joined when its LAST handle drops (at latest, end of `main`) — CPython joins at interpreter exit, so a fire-and-forget thread can block a scope exit earlier than CPython would | Model limit; the common create/start/join shape is identical |
 | A thread's unhandled exception prints CPython's header and final exception line but no traceback frames | Model limit (no frames) — same family as §8's messages |

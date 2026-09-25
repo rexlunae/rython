@@ -6,6 +6,9 @@
     "boxed_constructor": {
       "status": "pass"
     },
+    "callback_registry": {
+      "status": "pass"
+    },
     "clauses": {
       "status": "pass"
     },
