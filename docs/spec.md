@@ -120,7 +120,7 @@ declaration — loud, but at the wrong layer (§12.1).
 |---|---|---|
 | `int` | `i64` | No arbitrary precision; overflow is not detected as a Python-level error (§12.2) |
 | `float` | `f64` | |
-| `complex` | `stdpython::Complex` | An `f64` real/imaginary pair with CPython's repr, arithmetic, `abs`, `conjugate`, and `==` against `int`/`float` (a zero imaginary part and an equal real part). A mixed container boxes it as `PyValue::Complex` (issue #366); ordering (`<` …), which CPython rejects with a TypeError, fails the build (loud, at the wrong layer — §12.1) |
+| `complex` | `stdpython::Complex` | An `f64` real/imaginary pair with CPython's repr, arithmetic, `abs`, `conjugate`, and `==` against `int`/`float` (a zero imaginary part and an equal real part). A mixed container boxes it as `PyValue::Complex` (issue #366); an order comparison (`1j < 2j`) raises CPython's TypeError, with its message, when it runs |
 | `bool` | `bool` | |
 | `str` | `String` (fields, returns, elements); `impl Into<String>` as a parameter | String *literals* are `&'static str` internally and are coerced to `String` where an owned string is expected |
 | `bytes` | `Vec<u8>` | Literals lower to Rust byte strings |

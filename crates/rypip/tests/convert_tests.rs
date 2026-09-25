@@ -17184,3 +17184,44 @@ fn complex_values_box_and_compare_like_cpython() {
     );
 }
 
+#[test]
+fn ordering_a_complex_raises_type_error_like_cpython() {
+    // Issue #366: complex numbers are unordered; CPython raises the
+    // TypeError when the comparison runs, so a handler catches it.
+    let scratch = Scratch::new("complexorder");
+    let krate = package_crate(
+        &scratch,
+        "complexorder",
+        &[(
+            "cli.py",
+            concat!(
+                "def f() -> None:\n",
+                "    a = 1j\n",
+                "    b = 2j\n",
+                "    try:\n",
+                "        print(a < b)\n",
+                "    except TypeError as e:\n",
+                "        print(\"TypeError:\", e)\n",
+                "    try:\n",
+                "        print(a >= 3)\n",
+                "    except TypeError as e:\n",
+                "        print(\"TypeError:\", e)\n",
+                "    print(a == 1j, a != b)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    f()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "complexorder"),
+        vec![
+            "TypeError: '<' not supported between instances of 'complex' and 'complex'",
+            "TypeError: '>=' not supported between instances of 'complex' and 'int'",
+            "True True",
+        ]
+    );
+}
+
