@@ -206,7 +206,7 @@ impl<'a> CodeGen for Attribute {
             // type in scope at all.
             ExprType::Name(receiver) => match symbols.get(&receiver.id) {
                 Some(crate::SymbolTableNode::ClassDef(class)) => class
-                    .literal_constant_on_mro(&self.attr, &symbols)
+                    .literal_constant_on_mro(&self.attr, &symbols, &options)
                     .map(|(definer, _)| definer.name),
                 _ => None,
             },
@@ -223,7 +223,7 @@ impl<'a> CodeGen for Attribute {
                 .enclosing_class_name()
                 .and_then(|c| match symbols.get(c) {
                     Some(crate::SymbolTableNode::ClassDef(class)) => {
-                        class.literal_constant_on_mro(&self.attr, &symbols)
+                        class.literal_constant_on_mro(&self.attr, &symbols, &options)
                     }
                     _ => None,
                 })

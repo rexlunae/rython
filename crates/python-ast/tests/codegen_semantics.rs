@@ -25224,3 +25224,39 @@ fn bisect_lowers_to_the_runtime_and_refuses_key() {
     assert!(err.contains("key=") && err.contains("not supported"), "error: {}", err);
 }
 
+
+/// Sweep regressions of the #367/#370 rounds (urllib3): a class attribute
+/// that a SUBCLASS also assigns per instance (`HTTPConnection.is_verified
+/// = False`, set by `HTTPSConnection`) is an instance attribute with a
+/// class default — never a trait const beside the field accessor (E0428,
+/// E0324, E0046); and a loop over a module STATIC tuple iterates the
+/// static as it is emitted rather than destructuring it (`SSL_KEYWORDS`
+/// is a boxed PyValue static — E0609 on `.0`).
+#[test]
+fn a_class_default_a_subclass_assigns_is_no_trait_const() {
+    let out = compile(
+        concat!(
+            "SEQ = (\"a\", \"b\")\n",
+            "\n",
+            "class Base:\n",
+            "    verified = False\n",
+            "\n",
+            "    def get(self) -> bool:\n",
+            "        return self.verified\n",
+            "\n",
+            "class Sub(Base):\n",
+            "    def connect(self) -> None:\n",
+            "        self.verified = True\n",
+            "\n",
+            "def keys() -> None:\n",
+            "    for k in SEQ:\n",
+            "        print(k)\n",
+        ),
+        "classdefault.py",
+    );
+    // Only the struct's own `pub const` (its pre-existing class-attribute
+    // lowering) — the trait does not declare one too.
+    assert_eq!(out.matches("const verified").count(), 1, "generated: {}", out);
+    assert!(out.contains("pub const verified : bool = false"), "generated: {}", out);
+    assert!(!out.contains("__rython_tuple . 0"), "generated: {}", out);
+}

@@ -1235,7 +1235,7 @@ fn infer_type_inner(
                     symbols.get(&recv.id)
                 };
                 if let Some(SymbolTableNode::ClassDef(class)) = class
-                    && let Some((_, value)) = class.literal_constant_on_mro(&attr.attr, symbols)
+                    && let Some((_, value)) = class.literal_constant_on_mro(&attr.attr, symbols, options)
                 {
                     return match infer_type_inner(ctx, &value, options, symbols) {
                         TypeInfo::String => TypeInfo::StrRef,

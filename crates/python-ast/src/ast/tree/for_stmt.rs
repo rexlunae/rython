@@ -280,9 +280,17 @@ impl CodeGen for For {
                 crate::TypeInfo::Tuple(ms) => Some(ms),
                 _ => None,
             };
+        // Destructuring needs the value to BE a Rust tuple. A module
+        // STATIC that infers as a tuple from its literal may be emitted
+        // boxed (urllib3's `SSL_KEYWORDS` is a PyValue static, which
+        // iterates as-is), so a static keeps the paths below.
+        let rust_tuple = !matches!(&self.iter, ExprType::Name(n)
+            if options.promoted_statics.contains(&n.id)
+                || options.mutable_statics.contains_key(&n.id));
         let tuple_element = tuple_members
             .as_deref()
-            .and_then(crate::ast::tree::type_ctx::tuple_iteration_element);
+            .and_then(crate::ast::tree::type_ctx::tuple_iteration_element)
+            .filter(|_| rust_tuple);
         if let Some(element) = &tuple_element {
             let owned_str = matches!(element, crate::TypeInfo::String);
             if let ExprType::Tuple(t) = &self.iter {

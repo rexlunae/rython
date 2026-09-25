@@ -1684,11 +1684,12 @@ impl ClassDef {
         &self,
         attr: &str,
         symbols: &SymbolTableScopes,
+        options: &PythonOptions,
     ) -> Option<(ClassDef, ExprType)> {
-        let chain = self.base_chain(symbols);
-        if chain.iter().any(|c| c.owns_field(attr)) {
+        if self.family_owns_field(attr, symbols, options) {
             return None;
         }
+        let chain = self.base_chain(symbols);
         chain.into_iter().find_map(|c| {
             let value = c
                 .literal_constants()
@@ -1696,6 +1697,39 @@ impl ClassDef {
                 .find(|(name, _)| name == attr)
                 .map(|(_, v)| v)?;
             Some((c, value))
+        })
+    }
+
+    /// Whether any class of this class's family stores `self.<attr>`: its
+    /// ancestors, or — through the hierarchy registry — any class in its
+    /// root's subtree. A class attribute that an instance anywhere in the
+    /// family also assigns (urllib3's `HTTPConnection.is_verified = False`,
+    /// set per instance by `HTTPSConnection`) is an instance attribute
+    /// with a class-level default, which the family's trait carries as a
+    /// field accessor — never also as an associated const (E0428/E0324).
+    pub(crate) fn family_owns_field(
+        &self,
+        attr: &str,
+        symbols: &SymbolTableScopes,
+        options: &PythonOptions,
+    ) -> bool {
+        let chain = self.base_chain(symbols);
+        if chain.iter().any(|c| c.owns_field(attr)) {
+            return true;
+        }
+        let root = chain.last().map(|c| c.name.clone()).unwrap_or_else(|| self.name.clone());
+        let Some(variants) = options.hierarchy_roots.get(&root) else {
+            return false;
+        };
+        variants.iter().any(|v| {
+            let class = match &v.module_path {
+                Some(path) => crate::module_class_def(options, path, &v.name).map(|(c, _)| c),
+                None => match symbols.get(&v.name) {
+                    Some(SymbolTableNode::ClassDef(c)) => Some(c.clone()),
+                    _ => None,
+                },
+            };
+            class.is_some_and(|c| c.owns_field(attr))
         })
     }
 
@@ -4910,6 +4944,9 @@ impl ClassDef {
         // that redefines NAME overrides it in its impl of this trait.
         let mut own_const_decls = TokenStream::new();
         for (name, value) in self.literal_constants() {
+            if self.family_owns_field(&name, &symbols, &options) {
+                continue;
+            }
             let ty = crate::ast::tree::module::const_static_type(&value)
                 .expect("a literal constant has a const type");
             let ident = crate::safe_ident(&name);
@@ -5133,6 +5170,9 @@ impl ClassDef {
             // instance's class finds (issue #367).
             let mut const_overrides = TokenStream::new();
             for (name, _) in ancestor.literal_constants() {
+                if ancestor.family_owns_field(&name, &symbols, &options) {
+                    continue;
+                }
                 for (c, c_syms, c_opts, _) in chain.iter() {
                     if c.name == ancestor.name {
                         break;
