@@ -655,7 +655,49 @@ impl CodeGen for StatementType {
                     }
                 })
             }
+            // A store into a `threading.local()` object's attribute (issue
+            // #356) creates or rebinds it for this thread, boxed.
+            StatementType::Assign(ref a)
+                if let [ExprType::Attribute(t)] = a.targets.as_slice()
+                    && let Some(recv) = crate::ast::tree::attribute::threading_local_receiver(
+                        &t.value, &ctx, &options, &symbols,
+                    )? =>
+            {
+                let name = t.attr.as_str();
+                let value = crate::render_typed(
+                    &a.value,
+                    ctx,
+                    options,
+                    symbols,
+                    Some(crate::TypeInfo::PyValue),
+                )?;
+                Ok(quote!((#recv).py_setattr(#name, #value)))
+            }
             StatementType::Assign(a) => a.to_rust(ctx, options, symbols),
+            // `tl.n += 1`: this thread's value, combined, stored back.
+            StatementType::AugAssign(ref a)
+                if let ExprType::Attribute(t) = &a.target
+                    && let Some(recv) = crate::ast::tree::attribute::threading_local_receiver(
+                        &t.value, &ctx, &options, &symbols,
+                    )? =>
+            {
+                let name = t.attr.as_str();
+                let mut read = t.clone();
+                read.ctx = "Load".to_string();
+                let combined = ExprType::BinOp(crate::ast::tree::bin_ops::BinOp {
+                    op: a.op.clone(),
+                    left: Box::new(ExprType::Attribute(read)),
+                    right: Box::new(a.value.clone()),
+                });
+                let value = crate::render_typed(
+                    &combined,
+                    ctx,
+                    options,
+                    symbols,
+                    Some(crate::TypeInfo::PyValue),
+                )?;
+                Ok(quote!((#recv).py_setattr(#name, #value)))
+            }
             StatementType::AugAssign(a) => a.to_rust(ctx, options, symbols),
             StatementType::Break => {
                 // A break whose loop lies outside an enclosing try-block
@@ -1262,6 +1304,17 @@ impl CodeGen for StatementType {
             StatementType::Delete(targets) => {
                 let mut stmts = Vec::new();
                 for target in targets {
+                    // `del tl.name` on a `threading.local()` object (issue
+                    // #356): this thread's binding, or AttributeError.
+                    if let ExprType::Attribute(t) = &target
+                        && let Some(recv) = crate::ast::tree::attribute::threading_local_receiver(
+                            &t.value, &ctx, &options, &symbols,
+                        )?
+                    {
+                        let name = t.attr.as_str();
+                        stmts.push(quote!((#recv).py_delattr(#name)?;));
+                        continue;
+                    }
                     match target {
                         ExprType::Subscript(sub) => {
                             let receiver = crate::subscript_receiver_place(

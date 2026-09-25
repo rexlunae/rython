@@ -4568,6 +4568,51 @@ impl<'a> CodeGen for Call {
                     // (nothing is known about the value's members); and
                     // setattr(obj, name, v) is a no-op. All through the -W
                     // channel, never silent.
+                    // On a `threading.local()` object (issue #356) the
+                    // lookup IS modeled: its attributes live in a run-time
+                    // bag, so getattr/hasattr/setattr go to it.
+                    "getattr" | "hasattr" | "setattr"
+                        if self.keywords.is_empty()
+                            && let Some(obj) = self.args.first()
+                            && let Some(recv) = crate::ast::tree::attribute::threading_local_receiver(
+                                obj, &ctx, &options, &symbols,
+                            )? =>
+                    {
+                        let name = rendered.get(1).ok_or_else(|| {
+                            format!("{bname}() needs an attribute name")
+                        })?;
+                        return Ok(match (bname, rendered.len()) {
+                            ("hasattr", 2) => quote!((#recv).py_hasattr(&(#name))),
+                            ("getattr", 2) => quote!((#recv).py_getattr(&(#name))?),
+                            ("getattr", 3) => {
+                                let d = crate::render_typed(
+                                    &self.args[2],
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                    Some(crate::TypeInfo::PyValue),
+                                )?;
+                                quote!((#recv).py_getattr(&(#name)).unwrap_or_else(|_| #d))
+                            }
+                            ("setattr", 3) => {
+                                let v = crate::render_typed(
+                                    &self.args[2],
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                    Some(crate::TypeInfo::PyValue),
+                                )?;
+                                quote!((#recv).py_setattr(&(#name), #v))
+                            }
+                            _ => {
+                                return Err(format!(
+                                    "{bname}() got {} arguments; rython models                                      hasattr(obj, name), getattr(obj, name[, default])                                      and setattr(obj, name, value)",
+                                    rendered.len()
+                                )
+                                .into());
+                            }
+                        });
+                    }
                     "getattr" => {
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));

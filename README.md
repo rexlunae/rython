@@ -138,7 +138,8 @@ error output), and a growing stdlib: `math`, `random`, `os`, `sys`,
 `heapq`, `copy`, `textwrap`, `hashlib`, `csv` (reader and writer),
 `collections`, `pathlib`, `glob`, `subprocess`, `tempfile`,
 `threading` (Thread with static targets, Lock/RLock/Event/Semaphore
-with a real `with lock:` acquire/release lowering), `socket` (TCP/UDP
+with a real `with lock:` acquire/release lowering, `local()` as a
+per-thread bag of run-time attributes), `socket` (TCP/UDP
 over std::net with the CPython OSError hierarchy), `urllib.request`
 (`urlopen` for http/https, behind stdpython's opt-in `http-ureq`
 feature that `rypip` enables automatically), and more.

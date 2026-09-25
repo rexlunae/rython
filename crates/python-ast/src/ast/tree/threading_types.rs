@@ -19,6 +19,9 @@ pub enum ThreadingType {
     RLock,
     Event,
     Semaphore,
+    /// `threading.local()`: a per-thread bag of run-time attributes
+    /// (issue #356); attribute access on it is dynamic (`py_getattr`).
+    Local,
 }
 
 impl ThreadingType {
@@ -32,6 +35,7 @@ impl ThreadingType {
             "RLock" => Some(ThreadingType::RLock),
             "Event" => Some(ThreadingType::Event),
             "Semaphore" => Some(ThreadingType::Semaphore),
+            "local" => Some(ThreadingType::Local),
             _ => None,
         }
     }
@@ -55,6 +59,7 @@ impl ThreadingType {
             ThreadingType::RLock => "RLock",
             ThreadingType::Event => "Event",
             ThreadingType::Semaphore => "Semaphore",
+            ThreadingType::Local => "local",
         }
     }
 
@@ -66,6 +71,7 @@ impl ThreadingType {
             ThreadingType::RLock => quote!(threading::RLock),
             ThreadingType::Event => quote!(threading::Event),
             ThreadingType::Semaphore => quote!(threading::Semaphore),
+            ThreadingType::Local => quote!(threading::Local),
         }
     }
 }

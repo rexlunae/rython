@@ -2036,6 +2036,9 @@ impl ClassDef {
                     _ => return None,
                 },
                 Access::Property(attr) => attr,
+                Access::Store(attr) => {
+                    return crate::ast::tree::scope::interior_store(attr, &ctx, symbols, options);
+                }
             };
             let (class, class_symbols) =
                 crate::receiver_class(&attr.value, &ctx, symbols, options)?;
@@ -5345,6 +5348,11 @@ fn infer_field_type(
         // A constructed instance of a known class types the field as that
         // class's struct.
         ExprType::Call(call) => match call.func.as_ref() {
+            // `self._local = threading.local()` (requests' HTTPDigestAuth):
+            // the per-thread attribute object (issue #356).
+            func if crate::ast::tree::type_ctx::threading_local_ctor(func, symbols) => {
+                Some(crate::TypeInfo::Threading(crate::ThreadingType::Local))
+            }
             ExprType::Name(n) if n.id == "bool" => Some(crate::TypeInfo::Bool),
             // A `cast(T, ...)` typing no-op (`self.frames = cast(List[str],
             // spinner["frames"])[:]` — rich's Spinner): the cast's FIRST

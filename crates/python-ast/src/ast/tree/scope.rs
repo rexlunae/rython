@@ -208,6 +208,26 @@ pub fn analyze_scope(body: &[Statement], initialized: &[String]) -> ScopeBinding
 pub(crate) enum Access<'a> {
     Call(&'a crate::Call),
     Property(&'a crate::ast::tree::attribute::Attribute),
+    /// A store `x.attr = v` (plain or augmented): `Some(false)` when the
+    /// store is interior and leaves `x`'s base binding untouched — a
+    /// `threading.local()` attribute (issue #356) lives in a shared
+    /// per-thread bag, not in the struct.
+    Store(&'a crate::ast::tree::attribute::Attribute),
+}
+
+/// The answer for an [`Access::Store`] every resolver shares: a store
+/// into a `threading.local()` object's attribute is interior.
+pub(crate) fn interior_store(
+    attr: &crate::ast::tree::attribute::Attribute,
+    ctx: &crate::CodeGenContext,
+    symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> Option<bool> {
+    matches!(
+        crate::infer_type(Some(ctx), &attr.value, options, symbols),
+        crate::TypeInfo::Threading(crate::ThreadingType::Local)
+    )
+    .then_some(false)
 }
 
 /// analyze_scope with an access resolver: when the resolver classifies a
@@ -291,7 +311,9 @@ fn record_target(target: &ExprType, a: &mut Analysis<'_>, multi: bool) {
             walk_subscript_kind(&sub.kind, a);
         }
         ExprType::Attribute(attr) => {
-            if let Some(name) = chain_base_name(&attr.value) {
+            if (a.resolve)(Access::Store(attr)) != Some(false)
+                && let Some(name) = chain_base_name(&attr.value)
+            {
                 a.record_mutation(name);
             }
         }
@@ -476,6 +498,7 @@ pub(crate) fn class_call_resolver<'a>(
                 _ => return None,
             },
             Access::Property(attr) => attr,
+            Access::Store(attr) => return interior_store(attr, ctx, symbols, options),
         };
         let (class, class_symbols) = crate::receiver_class(&attr.value, ctx, symbols, options)?;
         if class.method_on_mro(&attr.attr, &class_symbols).is_none() {

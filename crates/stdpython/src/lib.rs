@@ -3171,6 +3171,143 @@ macro_rules! pyvalue_add_rhs {
 }
 pyvalue_add_rhs!(i64, f64, bool, String, &str);
 
+/// A boxed number's value on CPython's numeric tower (bool ⊂ int ⊂ float
+/// ⊂ complex), for the boxed `-` and `*` below.
+enum BoxedNum {
+    Int(i64),
+    Float(f64),
+    Complex(Complex),
+}
+
+fn boxed_num(v: &PyValue) -> Option<BoxedNum> {
+    match v {
+        PyValue::Int(i) => Some(BoxedNum::Int(*i)),
+        PyValue::Bool(b) => Some(BoxedNum::Int(*b as i64)),
+        PyValue::Float(f) => Some(BoxedNum::Float(*f)),
+        PyValue::Complex(z) => Some(BoxedNum::Complex(z.clone())),
+        _ => None,
+    }
+}
+
+/// Apply a numeric operator on the promoted pair, or None when either
+/// side is not a number.
+fn boxed_arith(
+    a: &PyValue,
+    b: &PyValue,
+    int: fn(i64, i64) -> i64,
+    float: fn(f64, f64) -> f64,
+    complex: fn(&Complex, &Complex) -> Complex,
+) -> Option<PyValue> {
+    let as_complex = |n: &BoxedNum| match n {
+        BoxedNum::Int(i) => Complex::new(*i as f64, 0.0),
+        BoxedNum::Float(f) => Complex::new(*f, 0.0),
+        BoxedNum::Complex(z) => z.clone(),
+    };
+    let as_float = |n: &BoxedNum| match n {
+        BoxedNum::Int(i) => *i as f64,
+        BoxedNum::Float(f) => *f,
+        BoxedNum::Complex(_) => unreachable!("complex pairs are handled first"),
+    };
+    let (x, y) = (boxed_num(a)?, boxed_num(b)?);
+    Some(match (&x, &y) {
+        (BoxedNum::Int(i), BoxedNum::Int(j)) => PyValue::Int(int(*i, *j)),
+        (BoxedNum::Complex(_), _) | (_, BoxedNum::Complex(_)) => {
+            PyValue::Complex(complex(&as_complex(&x), &as_complex(&y)))
+        }
+        _ => PyValue::Float(float(as_float(&x), as_float(&y))),
+    })
+}
+
+fn boxed_operand_error(op: &str, a: &PyValue, b: &PyValue) -> ! {
+    panic!(
+        "{}",
+        PyException::new(
+            "TypeError",
+            format!(
+                "unsupported operand type(s) for {}: '{}' and '{}'",
+                op,
+                a.py_type_name(),
+                b.py_type_name()
+            )
+        )
+    )
+}
+
+/// `-` on BOXED values (a `threading.local()` attribute — issue #356):
+/// CPython's numeric promotion; any other pair is its TypeError (a loud
+/// panic, §12.2, as for `+`).
+impl PySub<PyValue> for PyValue {
+    type Output = PyValue;
+    fn py_sub(&self, rhs: &PyValue) -> PyValue {
+        boxed_arith(self, rhs, |a, b| a - b, |a, b| a - b, |a, b| a.py_sub(b))
+            .unwrap_or_else(|| boxed_operand_error("-", self, rhs))
+    }
+}
+
+/// `*` on BOXED values: CPython's numeric promotion, and a sequence
+/// (str, bytes, tuple) repeated by an int (a non-positive count is
+/// empty); a sequence times a non-int is CPython's "can't multiply
+/// sequence" TypeError.
+impl PyMul<PyValue> for PyValue {
+    type Output = PyValue;
+    fn py_mul(&self, rhs: &PyValue) -> PyValue {
+        use PyValue as V;
+        if let Some(v) = boxed_arith(self, rhs, |a, b| a * b, |a, b| a * b, |a, b| a.py_mul(b)) {
+            return v;
+        }
+        let (seq, count) = match (self, rhs) {
+            (V::Str(_) | V::Bytes(_) | V::Tuple(_), n) => (self, n),
+            (n, V::Str(_) | V::Bytes(_) | V::Tuple(_)) => (rhs, n),
+            _ => boxed_operand_error("*", self, rhs),
+        };
+        let times = match count {
+            V::Int(i) => (*i).max(0) as usize,
+            V::Bool(b) => *b as usize,
+            other if boxed_num(other).is_some() => panic!(
+                "{}",
+                PyException::new(
+                    "TypeError",
+                    format!(
+                        "can't multiply sequence by non-int of type '{}'",
+                        other.py_type_name()
+                    )
+                )
+            ),
+            _ => boxed_operand_error("*", self, rhs),
+        };
+        match seq {
+            V::Str(s) => V::Str(s.repeat(times)),
+            V::Bytes(b) => V::Bytes(b.repeat(times)),
+            V::Tuple(t) => {
+                let mut out = Vec::with_capacity(t.len() * times);
+                for _ in 0..times {
+                    out.extend(t.iter().cloned());
+                }
+                V::Tuple(Arc::new(out))
+            }
+            _ => unreachable!("matched a sequence above"),
+        }
+    }
+}
+
+macro_rules! pyvalue_sub_mul_rhs {
+    ($($t:ty),* $(,)?) => {
+        $(impl PySub<$t> for PyValue {
+            type Output = PyValue;
+            fn py_sub(&self, rhs: &$t) -> PyValue {
+                PySub::<PyValue>::py_sub(self, &PyValue::from(rhs.clone()))
+            }
+        }
+        impl PyMul<$t> for PyValue {
+            type Output = PyValue;
+            fn py_mul(&self, rhs: &$t) -> PyValue {
+                PyMul::<PyValue>::py_mul(self, &PyValue::from(rhs.clone()))
+            }
+        })*
+    };
+}
+pyvalue_sub_mul_rhs!(i64, f64, bool);
+
 /// Read a mutable module global (issue #115: a module-level name written by
 /// functions through `global` lowers to a `static Mutex<T>`). The guard is
 /// dropped inside this function, so two reads in one statement never hold
@@ -4507,6 +4644,24 @@ impl<T> PyListOps<T> for Vec<T> {
 /// formatters print the two's-complement bit pattern. `align` is one of
 /// '<', '>', '^', or '\0' for the default (right, with sign-aware zero
 /// padding when `zero` is set).
+/// A boxed value under an integer presentation type (`f"{v:08x}"`): its
+/// int (a bool is an int), or CPython's `ValueError: Unknown format code
+/// 'x' for object of type 'str'`.
+pub fn py_value_format_int(v: &PyValue, code: char) -> Result<i64, PyException> {
+    match v {
+        PyValue::Int(i) => Ok(*i),
+        PyValue::Bool(b) => Ok(*b as i64),
+        other => Err(PyException::new(
+            "ValueError",
+            format!(
+                "Unknown format code '{}' for object of type '{}'",
+                code,
+                py_value_type_name(other)
+            ),
+        )),
+    }
+}
+
 pub fn py_int_radix_format(
     v: i64,
     fill: char,
@@ -6564,6 +6719,34 @@ impl PyContains<str> for PyValue {
 /// Python's `==` on boxed members: numeric kinds compare by value across
 /// int/float/bool (CPython: `1 == 1.0`, `True == 1`); everything else is
 /// structural.
+/// `==` between a concrete scalar and a boxed value (`nonce ==
+/// tl.last_nonce`, where the attribute of a `threading.local()` is boxed —
+/// issue #356): CPython's `==`, the numeric tower included, both ways.
+macro_rules! scalar_eq_pyvalue {
+    ($($t:ty => $conv:expr),* $(,)?) => {$(
+        impl PartialEq<PyValue> for $t {
+            fn eq(&self, other: &PyValue) -> bool {
+                let conv: fn(&$t) -> PyValue = $conv;
+                py_value_eq(&conv(self), other)
+            }
+        }
+        impl PartialEq<$t> for PyValue {
+            fn eq(&self, other: &$t) -> bool {
+                let conv: fn(&$t) -> PyValue = $conv;
+                py_value_eq(self, &conv(other))
+            }
+        }
+    )*};
+}
+scalar_eq_pyvalue! {
+    String => |s| PyValue::Str(s.clone()),
+    str => |s| PyValue::Str(s.to_string()),
+    &str => |s| PyValue::Str(s.to_string()),
+    i64 => |i| PyValue::Int(*i),
+    f64 => |f| PyValue::Float(*f),
+    bool => |b| PyValue::Bool(*b),
+}
+
 pub(crate) fn py_value_eq(a: &PyValue, b: &PyValue) -> bool {
     match (a, b) {
         (PyValue::Int(x), PyValue::Float(y)) => (*x as f64) == *y,

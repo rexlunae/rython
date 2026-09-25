@@ -4852,3 +4852,35 @@ fn a_boxed_complex_behaves_like_cpythons_complex() {
     // AssertionError: 1j != 1
     assert_eq!(err.message, "1j != 1");
 }
+
+#[test]
+fn boxed_values_subtract_multiply_and_compare_like_cpython() {
+    // issue #356: a `threading.local()` attribute is boxed, so its uses
+    // go through PyValue's operators.
+    // 3.5 - 1 == 2.5 ; 2 * 2.5 == 5.0 ; 1j * 2 == 2j
+    assert_eq!(PyValue::Float(3.5).py_sub(&1i64), PyValue::Float(2.5));
+    assert_eq!(PyValue::Int(2).py_mul(&2.5f64), PyValue::Float(5.0));
+    assert_eq!(py_display(&PyValue::from(Complex::new(0.0, 1.0)).py_mul(&2i64)), "2j");
+    // 'ab' * 2 == 'abab' ; b'x' * 3 == b'xxx' ; (1, 2) * 2 == (1, 2, 1, 2)
+    assert_eq!(PyValue::from("ab").py_mul(&2i64), PyValue::from("abab"));
+    assert_eq!(py_display(&PyValue::Bytes(b"x".to_vec()).py_mul(&3i64)), "b'xxx'");
+    assert_eq!(
+        py_display(&PyValue::from(vec![PyValue::Int(1), PyValue::Int(2)]).py_mul(&2i64)),
+        "(1, 2, 1, 2)"
+    );
+    // 'x' == 'x' against a boxed str; 3 == 3.0 across the tower
+    assert!(String::from("x") == PyValue::from("x"));
+    assert!(PyValue::Float(3.0) == 3i64);
+    // f'{7:04x}' == '0007' ; f'{True:x}' == '1' ; f'{"s":x}' is a ValueError
+    assert_eq!(py_value_format_int(&PyValue::Int(7), 'x').unwrap(), 7);
+    assert_eq!(py_value_format_int(&PyValue::Bool(true), 'x').unwrap(), 1);
+    let err = py_value_format_int(&PyValue::from("s"), 'x').unwrap_err();
+    assert_eq!(err.message, "Unknown format code 'x' for object of type 'str'");
+}
+
+#[test]
+#[should_panic(expected = "can't multiply sequence by non-int of type 'float'")]
+fn a_boxed_sequence_times_a_float_is_cpythons_type_error() {
+    // 'a' * 2.0 -> TypeError: can't multiply sequence by non-int of type 'float'
+    let _ = PyValue::from("a").py_mul(&2.0f64);
+}

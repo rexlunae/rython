@@ -480,3 +480,152 @@ impl Drop for SemaphoreReleaseGuard {
         let _ = self.sem.release();
     }
 }
+
+// ---------------------------------------------------------------------------
+// threading.local (issue #356)
+// ---------------------------------------------------------------------------
+
+/// Each `threading.local()` object's identity. A counter, not an address:
+/// an address is reused once the object is freed, and a new object must
+/// never see a dead one's per-thread attributes.
+static NEXT_LOCAL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+std::thread_local! {
+    /// This thread's attribute bags, one per live `threading.local()`
+    /// object, keyed by the object's identity.
+    static LOCAL_ATTRS: core::cell::RefCell<
+        std::collections::HashMap<u64, crate::PyDict<String, crate::PyValue>>,
+    > = core::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+struct LocalId(u64);
+
+impl Drop for LocalId {
+    /// The last handle is gone: this thread's bag goes with it. (Another
+    /// thread's bag for the object is freed when that thread exits.)
+    fn drop(&mut self) {
+        let _ = LOCAL_ATTRS.try_with(|m| m.borrow_mut().remove(&self.0));
+    }
+}
+
+/// `threading.local()`: an object whose attributes are created at run time
+/// (`tl.count = 0`) and are PER THREAD — every thread starts with none and
+/// sees only its own. Values are boxed (`PyValue`), since the attribute set
+/// and each attribute's type are decided by the program as it runs. A
+/// handle clone is the same object (Python reference semantics).
+#[derive(Clone)]
+pub struct Local {
+    id: Arc<LocalId>,
+}
+
+/// `threading.local()` — constructor function.
+pub fn local() -> Local {
+    Local {
+        id: Arc::new(LocalId(NEXT_LOCAL_ID.fetch_add(1, Ordering::Relaxed))),
+    }
+}
+
+/// The type under its Python name, so `from threading import local`
+/// brings in both the constructor function and the type: a construction
+/// through the imported name renders `local::new()`.
+#[allow(non_camel_case_types)]
+pub type local = Local;
+
+impl Default for Local {
+    fn default() -> Self {
+        local()
+    }
+}
+
+impl Local {
+    /// `local()` — a new object with no attributes in any thread.
+    pub fn new() -> Local {
+        local()
+    }
+
+    fn missing(name: &str) -> PyException {
+        PyException::new(
+            "AttributeError",
+            format!("'_thread._local' object has no attribute '{name}'"),
+        )
+    }
+
+    /// `tl.name` — this thread's value, or CPython's AttributeError.
+    pub fn py_getattr(&self, name: &str) -> Result<crate::PyValue, PyException> {
+        LOCAL_ATTRS.with(|m| {
+            m.borrow()
+                .get(&self.id.0)
+                .and_then(|bag| bag.get(name).cloned())
+                .ok_or_else(|| Self::missing(name))
+        })
+    }
+
+    /// `tl.name = value` — for this thread only.
+    pub fn py_setattr<V: Into<crate::PyValue>>(&self, name: &str, value: V) {
+        let value = value.into();
+        LOCAL_ATTRS.with(|m| {
+            m.borrow_mut()
+                .entry(self.id.0)
+                .or_default()
+                .insert(name.to_string(), value);
+        });
+    }
+
+    /// `hasattr(tl, "name")` — in this thread.
+    pub fn py_hasattr(&self, name: &str) -> bool {
+        LOCAL_ATTRS.with(|m| m.borrow().get(&self.id.0).is_some_and(|bag| bag.contains_key(name)))
+    }
+
+    /// `del tl.name` — this thread's binding, or CPython's AttributeError.
+    pub fn py_delattr(&self, name: &str) -> Result<(), PyException> {
+        LOCAL_ATTRS.with(|m| {
+            m.borrow_mut()
+                .get_mut(&self.id.0)
+                .and_then(|bag| bag.shift_remove(name))
+                .map(|_| ())
+                .ok_or_else(|| Self::missing(name))
+        })
+    }
+}
+
+impl core::fmt::Debug for Local {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "<_thread._local object at 0x{:012x}>", Arc::as_ptr(&self.id) as usize)
+    }
+}
+
+impl crate::PyDisplay for Local {
+    fn py_display(&self) -> String {
+        format!("{:?}", self)
+    }
+}
+
+#[cfg(test)]
+mod local_tests {
+    use super::*;
+
+    #[test]
+    fn attributes_are_per_thread_and_per_object() {
+        let tl = local();
+        assert!(!tl.py_hasattr("n"));
+        tl.py_setattr("n", 1i64);
+        assert_eq!(tl.py_getattr("n").unwrap(), crate::PyValue::Int(1));
+        // A clone is the same object.
+        assert!(tl.clone().py_hasattr("n"));
+        // Another object has its own attributes.
+        assert!(!local().py_hasattr("n"));
+        // Another thread starts empty and does not disturb this one.
+        let other = tl.clone();
+        std::thread::spawn(move || {
+            assert!(!other.py_hasattr("n"));
+            other.py_setattr("n", 2i64);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(tl.py_getattr("n").unwrap(), crate::PyValue::Int(1));
+        tl.py_delattr("n").unwrap();
+        let err = tl.py_getattr("n").unwrap_err();
+        assert_eq!(err.message, "'_thread._local' object has no attribute 'n'");
+        assert!(tl.py_delattr("n").is_err());
+    }
+}

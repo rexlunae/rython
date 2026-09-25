@@ -261,13 +261,25 @@ impl FormattedValue {
                 zero,
                 width,
                 radix,
-            } => Ok((
-                "{}".to_string(),
-                quote!(py_int_radix_format(
-                    #value, #fill, #align, #plus, #alternate, #zero, #width,
-                    #radix,
-                )),
-            )),
+            } => {
+                // A BOXED operand (a `threading.local()` attribute — issue
+                // #356) is an int at run time or CPython's ValueError.
+                let value = if matches!(
+                    crate::infer_type(Some(ctx), &self.value, options, symbols),
+                    crate::TypeInfo::PyValue
+                ) {
+                    quote!(stdpython::py_value_format_int(&(#value), #radix)?)
+                } else {
+                    value
+                };
+                Ok((
+                    "{}".to_string(),
+                    quote!(py_int_radix_format(
+                        #value, #fill, #align, #plus, #alternate, #zero, #width,
+                        #radix,
+                    )),
+                ))
+            }
             // The `,` thousands separator (`f"{size:,}"` — rich's
             // filesize): the runtime formatter groups the integer's
             // digits.

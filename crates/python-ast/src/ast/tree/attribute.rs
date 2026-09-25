@@ -85,6 +85,12 @@ impl<'a> CodeGen for Attribute {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        // A READ of a `threading.local()` object's attribute (issue #356):
+        // this thread's value, boxed, or CPython's AttributeError.
+        if let Some(recv) = threading_local_receiver(&self.value, &ctx, &options, &symbols)? {
+            let name = self.attr.as_str();
+            return Ok(quote!((#recv).py_getattr(#name)?));
+        }
         // `type(self).__name__` — the class name string for repr/error
         // messages (urllib3's ConnectionPool/Retry/Timeout reprs). The
         // `type(self)` call alone lowers to the name string (call.rs's
@@ -1663,3 +1669,22 @@ pub(crate) fn dropped_boxed_receiver_call(
     // call (protocol methods survive; module members do not drop).
     crate::ast::tree::call::boxed_receiver_method_dropped(a, ctx, symbols, options)
 }
+
+/// The rendered receiver when `value` is a `threading.local()` object
+/// (issue #356), whose attributes are created and read at run time:
+/// reads, stores, `hasattr`, and `del` all go through it dynamically.
+pub(crate) fn threading_local_receiver(
+    value: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+    if !matches!(
+        crate::infer_type(Some(ctx), value, options, symbols),
+        crate::TypeInfo::Threading(crate::ThreadingType::Local)
+    ) {
+        return Ok(None);
+    }
+    Ok(Some(value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?))
+}
+

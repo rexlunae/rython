@@ -137,7 +137,7 @@ declaration — loud, but at the wrong layer (§12.1).
 | any other all-boxable union (`str \| int`, `bool \| str \| None`, …) | `stdpython::PyValue` | The boxed heterogeneous value (issue #121): members keep concrete types, `isinstance` narrows at runtime; `str()`/`repr()`/`print()` render Python-faithfully. Operators on a boxed value are not modeled — they fail the build loudly rather than guessing. A union containing None is NOT an Option slot — the box absorbs None, so `None`-defaulted parameters of such a type (`cert_reqs: int \| str \| None`, `retries: Retry \| bool \| int \| None` — urllib3) store plain values through `PyValue::from`, never a `Some(...)` wrap (rounds 40/42). A class-instance member has no boxed repr — storing one stays loudly unboxable (`PyValue: From<Retry>` fails) |
 | `np.ndarray`, `np.float64`, `np.int32`, … | `numpy::NdArray`, `f64`, `i32`, … | Provided by the runtime's `numpy` module |
 | `socket.socket` | `socket::Socket` | The runtime socket handle — `wait.py`'s `sock: socket.socket` parameters compile as real `Socket` values, not boxed PyValues |
-| `threading.Thread/Lock/RLock/Event/Semaphore` | `threading::*` | The runtime threading handles (`ready: threading.Event` — a real shared handle) |
+| `threading.Thread/Lock/RLock/Event/Semaphore/local` | `threading::*` | The runtime threading handles (`ready: threading.Event` — a real shared handle) |
 | `Callable[[A, B], R]` | `stdpython::PyCallable<(A, B), R>` | A CALLABLE held as a VALUE (issue #122): the argument list renders as the argument TUPLE, so one runtime type serves every arity (`Callable[[], None]` is `PyCallable<(), ()>`). The members resolve through the same annotation authority as any other, so a callable over a module type alias is typed, not boxed. `Callable[..., R]` has no fixed arity, hence no Rust signature: it stays the boxed `PyValue`, and a call through it is loud |
 | `type[X]` / `Type[X]` | `Option<()>` | A CLASS value: rython cannot hold classes as values (the classes-as-data divergence — callables ARE values, §3.6); the tolerated opaque marker |
 | `typing.Tuple/Dict/List/Set/FrozenSet/Optional/Literal/…` | like the bare containers | The typing-module spellings map identically to the bare `tuple[...]`/`dict[...]`/… (one resolver, one answer) |
@@ -2158,6 +2158,20 @@ An unhandled exception in a thread prints CPython's
 "Exception in thread NAME:" header and the exception line (no
 traceback frames). `start()`/`join()` misuse panics with CPython's
 RuntimeError text (§12.2 family).
+
+`threading.local()` (issue #356 — requests' `HTTPDigestAuth`) is
+`threading::Local`: an object whose attributes are created at run time
+and are PER THREAD, each thread starting with none. Its attributes are
+boxed values (`PyValue`), since both the attribute set and each
+attribute's type are the program's run-time decision: `tl.x` reads this
+thread's value or raises CPython's `AttributeError: '_thread._local'
+object has no attribute 'x'`; `tl.x = v`, `tl.x += v`, `del tl.x`,
+`hasattr`/`getattr`/`setattr` go to the same bag. A store into it is
+interior — the object is a shared handle — so it does not make the
+enclosing method take `&mut self`. A boxed attribute supports what a
+boxed value does (`+`/`-`/`*` on CPython's numeric tower and sequence
+repetition, `==` against scalars, integer format specs); other uses are
+loud in rustc.
 
 **`socket`** (std tier): `socket.socket(AF_INET|AF_INET6,
 SOCK_STREAM|SOCK_DGRAM)`, `bind`, `listen`, `accept`, `connect`,

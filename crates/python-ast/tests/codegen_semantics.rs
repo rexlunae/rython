@@ -25124,3 +25124,35 @@ fn a_literal_mixing_three_kinds_boxes_whatever_the_order() {
     assert!(out.contains("PyValue :: from"), "generated: {}", out);
 }
 
+#[test]
+fn a_threading_local_is_a_per_thread_attribute_bag() {
+    // Issue #356 (requests' HTTPDigestAuth): the field is the runtime's
+    // threading::Local, its attributes are dynamic, and a store through
+    // it is interior — the method keeps `&self`.
+    let out = compile(
+        concat!(
+            "import threading\n",
+            "\n",
+            "class Auth:\n",
+            "    def __init__(self) -> None:\n",
+            "        self._tl = threading.local()\n",
+            "\n",
+            "    def init(self) -> None:\n",
+            "        if not hasattr(self._tl, \"init\"):\n",
+            "            self._tl.init = True\n",
+            "            self._tl.chal = {}\n",
+            "        self._tl.n = 0\n",
+            "        self._tl.n += 1\n",
+            "        del self._tl.chal\n",
+        ),
+        "tlocal.py",
+    );
+    assert!(out.contains("pub _tl : threading :: Local"), "generated: {}", out);
+    assert!(out.contains("pub fn init (& self ,)"), "generated: {}", out);
+    assert!(out.contains("py_hasattr (& (\"init\"))"), "generated: {}", out);
+    assert!(out.contains("py_setattr (\"init\" , PyValue :: from (true))"), "generated: {}", out);
+    assert!(out.contains("PyDict :: < String , stdpython :: PyValue > :: default ()"), "generated: {}", out);
+    assert!(out.contains("py_getattr (\"n\") ?"), "generated: {}", out);
+    assert!(out.contains("py_delattr (\"chal\") ?"), "generated: {}", out);
+}
+

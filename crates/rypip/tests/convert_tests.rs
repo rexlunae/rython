@@ -17225,3 +17225,80 @@ fn ordering_a_complex_raises_type_error_like_cpython() {
     );
 }
 
+#[test]
+fn threading_local_is_per_thread_like_cpython() {
+    // Issue #356: requests' HTTPDigestAuth shape — attributes created on
+    // first use behind hasattr, a counter bumped with +=, a hex f-string,
+    // del, AttributeError — and a second thread that starts with none of
+    // the first thread's attributes.
+    let scratch = Scratch::new("threadlocal");
+    let krate = package_crate(
+        &scratch,
+        "threadlocal",
+        &[(
+            "cli.py",
+            concat!(
+                "import threading\n",
+                "\n",
+                "\n",
+                "class Auth:\n",
+                "    def __init__(self) -> None:\n",
+                "        self._tl = threading.local()\n",
+                "\n",
+                "    def init_state(self) -> None:\n",
+                "        if not hasattr(self._tl, \"init\"):\n",
+                "            self._tl.init = True\n",
+                "            self._tl.last_nonce = \"\"\n",
+                "            self._tl.nonce_count = 0\n",
+                "            self._tl.chal = {}\n",
+                "            self._tl.pos = None\n",
+                "\n",
+                "    def bump(self, nonce: str) -> str:\n",
+                "        self.init_state()\n",
+                "        if nonce == self._tl.last_nonce:\n",
+                "            self._tl.nonce_count += 1\n",
+                "        else:\n",
+                "            self._tl.nonce_count = 1\n",
+                "        self._tl.last_nonce = nonce\n",
+                "        return f\"{self._tl.nonce_count:08x}\"\n",
+                "\n",
+                "\n",
+                "def worker(a: Auth) -> None:\n",
+                "    print(\"thread:\", a.bump(\"n1\"), a.bump(\"n1\"))\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    a = Auth()\n",
+                "    print(a.bump(\"n1\"), a.bump(\"n1\"), a.bump(\"n2\"))\n",
+                "    t = threading.Thread(target=worker, args=(a,))\n",
+                "    t.start()\n",
+                "    t.join()\n",
+                "    print(a.bump(\"n2\"))\n",
+                "    print(hasattr(a._tl, \"chal\"), a._tl.pos is None, a._tl.init)\n",
+                "    del a._tl.pos\n",
+                "    print(hasattr(a._tl, \"pos\"))\n",
+                "    try:\n",
+                "        print(a._tl.missing)\n",
+                "    except AttributeError as e:\n",
+                "        print(\"AttributeError:\", e)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "threadlocal"),
+        vec![
+            "00000001 00000002 00000001",
+            "thread: 00000001 00000002",
+            "00000002",
+            "True True True",
+            "False",
+            "AttributeError: '_thread._local' object has no attribute 'missing'",
+        ]
+    );
+}
+

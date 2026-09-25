@@ -1013,6 +1013,12 @@ fn infer_type_inner(
             }
         }
         ExprType::Call(call) => match call.func.as_ref() {
+            // `threading.local()` (or an imported `local()`) constructs the
+            // per-thread attribute object (issue #356), whose attribute
+            // access lowers dynamically.
+            func if threading_local_ctor(func, symbols) => {
+                TypeInfo::Threading(crate::ThreadingType::Local)
+            }
             // The ITERATOR builtins carry their argument's element type
             // through (issue #222), so they are typed before the
             // name-only table below, which cannot see arguments.
@@ -1210,6 +1216,14 @@ fn infer_type_inner(
         // context, no class) falls through to the PyObject arm below —
         // exactly the pre-ctx behavior (round 99).
         ExprType::Attribute(attr) => {
+            // Any attribute of a `threading.local()` object is a run-time
+            // attribute: a boxed value (issue #356).
+            if matches!(
+                infer_type_inner(ctx, &attr.value, options, symbols),
+                TypeInfo::Threading(crate::ThreadingType::Local)
+            ) {
+                return TypeInfo::PyValue;
+            }
             // A class-level literal constant read through `self` or the
             // class (issue #367 — attribute.rs renders `Self::NAME` /
             // `Definer::NAME`): the constant's own type, a string one being
@@ -1673,6 +1687,32 @@ pub fn unify(a: TypeInfo, b: TypeInfo) -> TypeInfo {
     }
 }
 
+/// Whether `func` names `threading.local` — `threading.local` through an
+/// unshadowed module name, or a name `from threading import local [as x]`
+/// bound (issue #356).
+pub(crate) fn threading_local_ctor(func: &ExprType, symbols: &SymbolTableScopes) -> bool {
+    match func {
+        ExprType::Attribute(attr) => {
+            matches!(attr.value.as_ref(), ExprType::Name(m)
+                if crate::StdModule::from_name(&m.id) == Some(crate::StdModule::Threading)
+                    && !crate::module_name_shadowed(crate::StdModule::Threading.name(), symbols))
+                && crate::ThreadingType::from_name(&attr.attr) == Some(crate::ThreadingType::Local)
+        }
+        ExprType::Name(n) => match symbols.get(&n.id) {
+            Some(SymbolTableNode::ImportFrom(i)) => {
+                crate::StdModule::from_name(&i.module) == Some(crate::StdModule::Threading)
+                    && i.names.iter().any(|a| {
+                        a.asname.as_deref().unwrap_or(&a.name) == n.id
+                            && crate::ThreadingType::from_name(&a.name)
+                                == Some(crate::ThreadingType::Local)
+                    })
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// The join of a literal's KNOWN member types, folded in order: two
 /// known types that do not join make the result the unknown marker for
 /// good. `unify` itself lets a later member absorb the marker (it is also
@@ -1760,6 +1800,19 @@ pub fn render_typed(
         )
     {
         return wrapped;
+    }
+    // An EMPTY dict literal into a boxed slot (`tl.chal = {}` — issue
+    // #356): nothing in it names an element type, so the boxed form is
+    // spelled out (a bare `PyDict::from([])` leaves K/V to
+    // inference, which the boxing conversion cannot supply — E0283).
+    if matches!(expected, Some(TypeInfo::PyValue)) {
+        if let ExprType::Dict(d) = expr
+            && d.keys.is_empty()
+        {
+            return Ok(quote!(stdpython::PyValue::from(
+                stdpython::PyDict::<String, stdpython::PyValue>::default()
+            )));
+        }
     }
     // A class name used as a VALUE (`[ChecksumError]`, `merge_setting(
     // ..., dict_class=OrderedDict)` — requests' sessions): classes as
