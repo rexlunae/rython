@@ -12712,6 +12712,123 @@ fn nested_defaults_are_evaluated_where_the_def_stands() {
 }
 
 #[test]
+fn class_constants_resolve_through_the_mro_like_cpython() {
+    // issue #367: class-level constants read through `self`, the class, and
+    // a subclass — an intermediate override, a leaf override, str/float/
+    // bool/int values, an inherited method seeing the instance's class.
+    let scratch = Scratch::new("classconsts");
+    let krate = package_crate(
+        &scratch,
+        "classconsts",
+        &[(
+            "cli.py",
+            concat!(
+                    "class Base:\n",
+                    "    kind = \"base\"\n",
+                    "    scale = 1.5\n",
+                    "    strict = False\n",
+                    "    limit = 10\n",
+                    "\n",
+                    "    def describe(self) -> str:\n",
+                    "        return self.kind\n",
+                    "\n",
+                    "    def total(self, n: int) -> float:\n",
+                    "        return n * self.scale + self.limit\n",
+                    "\n",
+                    "    def mode(self) -> bool:\n",
+                    "        return self.strict\n",
+                    "\n",
+                    "\n",
+                    "class Mid(Base):\n",
+                    "    kind = \"mid\"\n",
+                    "    limit = 20\n",
+                    "\n",
+                    "\n",
+                    "class Leaf(Mid):\n",
+                    "    strict = True\n",
+                    "\n",
+                    "\n",
+                    "class Solo:\n",
+                    "    greeting = \"hi\"\n",
+                    "\n",
+                    "    def say(self, who: str) -> str:\n",
+                    "        return self.greeting + \" \" + who\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    for obj in [Base(), Mid(), Leaf()]:\n",
+                    "        print(obj.describe(), obj.total(2), obj.mode())\n",
+                    "    print(Leaf.kind, Leaf.limit, Leaf.scale, Mid.strict, Base.kind)\n",
+                    "    print(Solo().say(\"ann\"), Solo.greeting)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "classconsts"),
+        vec![
+            "base 13.0 False",
+            "mid 23.0 False",
+            "mid 23.0 True",
+            "mid 20 1.5 False base",
+            "hi ann hi",
+        ]
+    );
+}
+
+#[test]
+fn nested_classes_match_cpython() {
+    // issue #367: nested classes (with their own constants and constructor)
+    // reached as `Outer.X` and `self.X`, hoisted to module level.
+    let scratch = Scratch::new("nestedclasses");
+    let krate = package_crate(
+        &scratch,
+        "nestedclasses",
+        &[(
+            "cli.py",
+            concat!(
+                    "class Outer:\n",
+                    "    class Inner:\n",
+                    "        size = 3\n",
+                    "\n",
+                    "        def val(self) -> int:\n",
+                    "            return 7 + self.size\n",
+                    "\n",
+                    "    class Pair:\n",
+                    "        def __init__(self, a: int, b: int) -> None:\n",
+                    "            self.a = a\n",
+                    "            self.b = b\n",
+                    "\n",
+                    "        def total(self) -> int:\n",
+                    "            return self.a + self.b\n",
+                    "\n",
+                    "    def get(self) -> int:\n",
+                    "        return Outer.Inner().val() + self.Inner().val()\n",
+                    "\n",
+                    "    def pair_total(self) -> int:\n",
+                    "        return Outer.Pair(2, 3).total()\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    o = Outer()\n",
+                    "    print(o.get(), o.pair_total(), Outer.Inner.size, Outer.Inner().val())\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "nestedclasses"),
+        vec![
+            "20 5 3 10",
+        ]
+    );
+}
+
+#[test]
 fn non_finite_float_constants_match_cpython() {
     // issue #372: `1e400` is inf. It used to panic the converter; then it
     // rendered, but typed as a str in operator lowering (`1e400 * 0.0`

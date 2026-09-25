@@ -193,31 +193,39 @@ impl<'a> CodeGen for Attribute {
         // is bound to the enclosing ClassDef — the constant lives on the
         // class (urllib3's Retry.from_int).
         let class_const_read: Option<String> = match self.value.as_ref() {
-            ExprType::Name(receiver) => symbols
-                .get(&receiver.id)
-                .is_some_and(|s| match s {
-                    crate::SymbolTableNode::ClassDef(class) => class.body.iter().any(|bs| {
-                        matches!(
-                            &bs.statement,
-                            crate::StatementType::Assign(a)
-                                if a.targets.len() == 1
-                                    && matches!(&a.targets[0], ExprType::Name(n) if n.id == self.attr)
-                                    && crate::ast::tree::module::const_static_type(&a.value)
-                                        .is_some()
-                        )
-                    }),
-                    _ => false,
-                })
-                .then(|| {
-                    // The class's OWN name (for `cls`, the receiver
-                    // identifier is not a Rust type in scope).
-                    match symbols.get(&receiver.id) {
-                        Some(crate::SymbolTableNode::ClassDef(c)) => c.name.clone(),
-                        _ => receiver.id.clone(),
-                    }
-                }),
+            // Python looks a class attribute up the MRO (issue #367): the
+            // definer may be a base (`Sub.rel` where only NumericTestCase
+            // assigns `tol = rel = 0`), and the path is the DEFINING
+            // class's — for `cls`, the receiver identifier is not a Rust
+            // type in scope at all.
+            ExprType::Name(receiver) => match symbols.get(&receiver.id) {
+                Some(crate::SymbolTableNode::ClassDef(class)) => class
+                    .literal_constant_on_mro(&self.attr, &symbols)
+                    .map(|(definer, _)| definer.name),
+                _ => None,
+            },
             _ => None,
         };
+        // `self.NAME` where NAME is a class-level literal constant, not an
+        // instance attribute (issue #367): `Self::NAME`. Inside a method
+        // an instance of a SUBCLASS runs, that is the subclass's value —
+        // Python's lookup through the instance's class — because each
+        // class's trait declares its constants as associated consts and a
+        // subclass overrides them in its impl (class_def.rs).
+        let self_class_const = crate::ast::tree::visit::is_self(self.value.as_ref())
+            && ctx
+                .enclosing_class_name()
+                .and_then(|c| match symbols.get(c) {
+                    Some(crate::SymbolTableNode::ClassDef(class)) => {
+                        class.literal_constant_on_mro(&self.attr, &symbols)
+                    }
+                    _ => None,
+                })
+                .is_some();
+        if self_class_const {
+            let attr = crate::safe_ident(&self.attr);
+            return Ok(quote!(Self::#attr));
+        }
         // A class-level COMPUTED constant read
         // (`self._encode_url_methods`, `cls.X`, `RequestMethods.X` —
         // urllib3's RequestMethods): the LazyLock static lives at MODULE

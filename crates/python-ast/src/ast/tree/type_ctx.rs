@@ -1197,6 +1197,25 @@ fn infer_type_inner(
         // context, no class) falls through to the PyObject arm below —
         // exactly the pre-ctx behavior (round 99).
         ExprType::Attribute(attr) => {
+            // A class-level literal constant read through `self` or the
+            // class (issue #367 — attribute.rs renders `Self::NAME` /
+            // `Definer::NAME`): the constant's own type, a string one being
+            // the `&'static str` the const holds.
+            if let ExprType::Name(recv) = attr.value.as_ref() {
+                let class = if recv.id == "self" {
+                    ctx.and_then(|c| c.enclosing_class_name()).and_then(|c| symbols.get(c))
+                } else {
+                    symbols.get(&recv.id)
+                };
+                if let Some(SymbolTableNode::ClassDef(class)) = class
+                    && let Some((_, value)) = class.literal_constant_on_mro(&attr.attr, symbols)
+                {
+                    return match infer_type_inner(ctx, &value, options, symbols) {
+                        TypeInfo::String => TypeInfo::StrRef,
+                        other => other,
+                    };
+                }
+            }
             // `self` needs the class context; a class-typed NAME (a local
             // or parameter the analysis typed) resolves in any context.
             if let ExprType::Name(recv) = attr.value.as_ref()

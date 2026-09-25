@@ -6759,6 +6759,53 @@ fn a_nested_default_of_a_mutable_type_stays_refused() {
 }
 
 #[test]
+fn class_constants_resolve_through_the_mro() {
+    // issue #367: `self.tol` read a struct field that does not exist (the
+    // constant is an associated const) and `Base.rel` from a CHAINED
+    // assignment lowered to None. `self.NAME` is `Self::NAME`, with each
+    // class's trait declaring its constants as associated consts a
+    // subclass overrides; `Cls.NAME` names the class on the MRO that
+    // defines it.
+    let out = compile(
+        concat!(
+            "class Base:\n",
+            "    tol = rel = 0\n",
+            "    def show(self) -> int:\n",
+            "        return self.tol + self.rel\n",
+            "class Sub(Base):\n",
+            "    tol = 5\n",
+            "def f() -> int:\n",
+            "    return Sub.rel + Sub.tol\n",
+        ),
+        "class_consts.py",
+    );
+    assert!(out.contains("Self :: tol"), "self.tol reads the class constant: {}", out);
+    assert!(out.contains("const tol : i64 = 5 ;"), "Sub overrides tol in its impl: {}", out);
+    assert!(out.contains("Base :: rel"), "Sub.rel resolves to its definer: {}", out);
+    assert!(!out.contains("PyValue :: None_"), "no read drops to None: {}", out);
+}
+
+#[test]
+fn a_nested_class_is_hoisted_to_module_level() {
+    // issue #367: a class nested in a class body was refused. Class scopes
+    // do not nest, so it is a module class reached through the outer one:
+    // hoisted, with `Outer.Inner` and `self.Inner` rewritten to it.
+    let out = compile(
+        concat!(
+            "class Outer:\n",
+            "    class Inner:\n",
+            "        def val(self) -> int:\n",
+            "            return 7\n",
+            "    def get(self) -> int:\n",
+            "        return Outer.Inner().val() + self.Inner().val()\n",
+        ),
+        "nested_class.py",
+    );
+    assert!(out.contains("pub struct Inner"), "Inner is a module struct: {}", out);
+    assert!(out.contains("Inner :: new"), "references construct the hoisted class: {}", out);
+}
+
+#[test]
 fn chained_class_level_literal_constants_lower_per_target() {
     // issue #367: a class-level CHAINED assignment (`tol = rel = 0` —
     // statistics' NumericTestCase) must lower one associated const per

@@ -247,6 +247,7 @@ impl CodeGen for Module {
         // the conversion error.
         let body = crate::ast::tree::singledispatch::desugar_module(self.raw.body.clone())
             .unwrap_or(self.raw.body);
+        let body = crate::ast::tree::class_def::hoist_nested_classes(body);
         for s in body {
             symbols = s.clone().find_symbols(symbols);
         }
@@ -3791,6 +3792,9 @@ pub(crate) fn normalize_module_body(
     // any body analysis — the shape the monomorphizing specialization
     // pass already lowers (ast::tree::singledispatch).
     let body = crate::ast::tree::singledispatch::desugar_module(body)?;
+    // Issue #367: nested classes are module classes reached through the
+    // outer one — hoisted before any analysis sees the class bodies.
+    let body = crate::ast::tree::class_def::hoist_nested_classes(body);
     let (body, newly_live, folded_imports) = fold_static_import_trys(&body, options);
     // Issue #137: module-level VERSION-GATED blocks (`if
     // sys.version_info >= (3, 11):` — certifi's core.py) and static-name

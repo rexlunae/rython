@@ -1118,7 +1118,7 @@ impl CodeGen for StatementType {
                         ret_options.forced_list_elt =
                             std::rc::Rc::new(Some(elt.clone()));
                         e.clone()
-                            .to_rust(ctx.clone(), ret_options, symbols)?
+                            .to_rust(ctx.clone(), ret_options, symbols.clone())?
                     } else {
                         tokens
                     };
@@ -1133,6 +1133,16 @@ impl CodeGen for StatementType {
                     // exactly.
                     if options.clone_str_attribute_returns {
                         match &e.value {
+                            // A class-level str CONSTANT (`return self.kind`
+                            // — issue #367) is a `&'static str`: own it.
+                            ExprType::Attribute(_)
+                                if matches!(
+                                    crate::infer_type(Some(&ctx), &e.value, &options, &symbols),
+                                    crate::TypeInfo::StrRef
+                                ) =>
+                            {
+                                quote!((#tokens).to_string())
+                            }
                             ExprType::Attribute(_) => quote!((#tokens).clone()),
                             ExprType::Constant(c)
                                 if matches!(&c.0, Some(litrs::Literal::String(_))) =>
