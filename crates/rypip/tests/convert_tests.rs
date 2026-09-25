@@ -12415,6 +12415,187 @@ fn run_package(krate: &rypip::convert::ConvertedCrate, pkg_name: &str) -> Vec<St
         .collect()
 }
 
+/// Build the package crate and run its binary; the stdout lines and the
+/// exit status (for programs whose status is part of what they print —
+/// a unittest run exits 1 on a failure).
+fn run_package_status(
+    krate: &rypip::convert::ConvertedCrate,
+    pkg_name: &str,
+) -> (Vec<String>, i32) {
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join(format!("target/debug/{pkg_name}")))
+        .output()
+        .expect("running generated binary");
+    (
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
+#[test]
+fn unittest_skip_and_expected_failure_gates_match_cpython() {
+    // issue #371: skip/skipIf/skipUnless (on a method or a class) keep a
+    // test from running at all — it is not constructed, set up, or run —
+    // and expectedFailure inverts its outcome, an unexpected success
+    // failing the run. These gates used to be consumed as no-ops, so a
+    // skipped test ran (and could fail the run). Tests also run in the
+    // sorted order CPython's TestLoader uses, which decides the order of
+    // everything they print.
+    // Verified against python3 (stdout and exit status).
+    assert_eq!(
+        run_package_status(
+            &package_crate(
+                &Scratch::new("gate_fail"),
+                "gate_fail",
+                &[(
+                    "cli.py",
+                    concat!(
+                        "import unittest\n",
+                        "\n",
+                        "HAVE = True\n",
+                        "MISSING = False\n",
+                        "\n",
+                        "\n",
+                        "class T(unittest.TestCase):\n",
+                        "    @unittest.skipUnless(HAVE, \"needs it\")\n",
+                        "    def test_runs_and_fails(self) -> None:\n",
+                        "        print(\"ran runs_and_fails\")\n",
+                        "        self.assertEqual(1, 2)\n",
+                        "\n",
+                        "    @unittest.skipUnless(MISSING, \"missing\")\n",
+                        "    def test_skipped(self) -> None:\n",
+                        "        print(\"ran skipped\")\n",
+                        "        self.assertEqual(1, 2)\n",
+                        "\n",
+                        "    @unittest.skipIf(HAVE, \"have it\")\n",
+                        "    def test_skipif(self) -> None:\n",
+                        "        print(\"ran skipif\")\n",
+                        "\n",
+                        "    def test_plain(self) -> None:\n",
+                        "        print(\"ran plain\")\n",
+                        "\n",
+                        "\n",
+                        "if __name__ == \"__main__\":\n",
+                        "    unittest.main()\n",
+                    ),
+                )],
+            ),
+            "gate_fail",
+        ),
+        (
+            [
+                "ran plain",
+                "ran runs_and_fails",
+            ]
+            .map(String::from)
+            .to_vec(),
+            1,
+        )
+    );
+    // Verified against python3 (stdout and exit status).
+    assert_eq!(
+        run_package_status(
+            &package_crate(
+                &Scratch::new("gate_class"),
+                "gate_class",
+                &[(
+                    "cli.py",
+                    concat!(
+                        "import unittest\n",
+                        "\n",
+                        "FAST = False\n",
+                        "\n",
+                        "\n",
+                        "@unittest.skipUnless(FAST, \"slow machine\")\n",
+                        "class ZSlow(unittest.TestCase):\n",
+                        "    def test_never(self) -> None:\n",
+                        "        print(\"ZSlow ran\")\n",
+                        "\n",
+                        "\n",
+                        "class Alpha(unittest.TestCase):\n",
+                        "    def setUp(self) -> None:\n",
+                        "        print(\"setUp\")\n",
+                        "\n",
+                        "    @unittest.skip(\"not today\")\n",
+                        "    def test_c_skipped(self) -> None:\n",
+                        "        print(\"c ran\")\n",
+                        "\n",
+                        "    @unittest.expectedFailure\n",
+                        "    def test_b_expected(self) -> None:\n",
+                        "        print(\"b ran\")\n",
+                        "        self.assertEqual(1, 2)\n",
+                        "\n",
+                        "    def test_a_first(self) -> None:\n",
+                        "        print(\"a ran\")\n",
+                        "\n",
+                        "\n",
+                        "class Beta(unittest.TestCase):\n",
+                        "    @unittest.skipIf(FAST, \"fast\")\n",
+                        "    def test_runs(self) -> None:\n",
+                        "        print(\"beta ran\")\n",
+                        "\n",
+                        "\n",
+                        "if __name__ == \"__main__\":\n",
+                        "    unittest.main()\n",
+                    ),
+                )],
+            ),
+            "gate_class",
+        ),
+        (
+            [
+                "setUp",
+                "a ran",
+                "setUp",
+                "b ran",
+                "beta ran",
+            ]
+            .map(String::from)
+            .to_vec(),
+            0,
+        )
+    );
+    // Verified against python3 (stdout and exit status).
+    assert_eq!(
+        run_package_status(
+            &package_crate(
+                &Scratch::new("gate_unexpected"),
+                "gate_unexpected",
+                &[(
+                    "cli.py",
+                    concat!(
+                        "import unittest\n",
+                        "\n",
+                        "\n",
+                        "class T(unittest.TestCase):\n",
+                        "    @unittest.expectedFailure\n",
+                        "    def test_passes_unexpectedly(self) -> None:\n",
+                        "        print(\"ran\")\n",
+                        "        self.assertEqual(1, 1)\n",
+                        "\n",
+                        "\n",
+                        "if __name__ == \"__main__\":\n",
+                        "    unittest.main()\n",
+                    ),
+                )],
+            ),
+            "gate_unexpected",
+        ),
+        (
+            [
+                "ran",
+            ]
+            .map(String::from)
+            .to_vec(),
+            1,
+        )
+    );
+}
+
 #[test]
 fn non_finite_float_constants_match_cpython() {
     // issue #372: `1e400` is inf. It used to panic the converter; then it

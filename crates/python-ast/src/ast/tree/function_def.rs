@@ -1430,12 +1430,17 @@ fn parse_method_decorator(
         // no-op for the converted function body — the definition lowers as
         // a plain method/function — but it is LOUD (a -W definition
         // warning), never silently ignored.
-        Some(crate::Decorator::TestGate(_)) => {
-            options.definition_warnings.borrow_mut().push(format!(
-                "test-runner gate decorator consumed as a no-op (the converted body \
-                 runs unconditionally; the skip/mark/patch condition is a test-RUNNER \
-                 directive that rython does not model)"
-            ));
+        // skip/skipIf/skipUnless/expectedFailure/cpython_only are honored
+        // by the generated unittest runner (issue #371), which reads them
+        // off the definition; the method body itself lowers plainly.
+        Some(crate::Decorator::TestGate(gate)) => {
+            if !gate.runner_honors() {
+                options.definition_warnings.borrow_mut().push(format!(
+                    "test-runner gate decorator consumed as a no-op (the converted body \
+                     runs unconditionally; the mark/patch/support condition is a \
+                     test-RUNNER directive that rython does not model)"
+                ));
+            }
             Ok(MethodDecorator::None)
         }
         Some(d) => d.as_method_decorator().ok_or_else(|| {

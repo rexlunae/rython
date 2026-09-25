@@ -6653,19 +6653,21 @@ fn complex_literals_render_as_complex_values() {
 }
 
 #[test]
-fn test_runner_gate_decorators_convert_with_a_warning() {
+fn test_runner_gate_decorators_convert_and_unmodeled_ones_warn() {
     // issue #371: `@skipUnless(...)`, `@unittest.skipIf(...)`,
-    // `@cpython_only`, `@test.support.requires_*` are test-RUNNER gates —
-    // consumed as no-ops so the definition converts, but LOUDLY (a -W
-    // definition warning), never silently ignored and never re-shaping.
+    // `@cpython_only`, `@test.support.requires_*` are test-RUNNER gates.
+    // The definition converts either way. skip/skipIf/skipUnless/
+    // expectedFailure/cpython_only are carried out by the generated runner,
+    // so they need no warning; a gate rython does not model (a support
+    // directive, mock.patch) is consumed LOUDLY with a -W warning.
     let (_, w1) = compile_with_warnings(
         "class T:\n    @skipUnless(hasattr(t, 'x'), 'msg')\n    def m(self):\n        return 1\n",
         "gate_skip.py",
     );
     assert!(
-        w1.iter().any(|x| x.contains("test-runner gate decorator consumed as a no-op")),
-        "a skipUnless gate must warn ({} warnings)",
-        w1.len()
+        !w1.iter().any(|x| x.contains("test-runner gate decorator")),
+        "a skipUnless gate is honored by the runner, not dropped: {:?}",
+        w1
     );
 
     let (_, w2) = compile_with_warnings(
@@ -6677,6 +6679,32 @@ fn test_runner_gate_decorators_convert_with_a_warning() {
         "a test.support gate must warn ({} warnings)",
         w2.len()
     );
+}
+
+#[test]
+fn the_unittest_runner_honors_skip_gates_in_sorted_order() {
+    // issue #371: a gated test is guarded in the runner (never constructed
+    // or set up when skipped), and tests run in the sorted order CPython's
+    // TestLoader uses, not definition order.
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "HAVE = False\n",
+            "class T(unittest.TestCase):\n",
+            "    @unittest.skipUnless(HAVE, 'needs it')\n",
+            "    def test_b(self) -> None:\n",
+            "        pass\n",
+            "    def test_a(self) -> None:\n",
+            "        pass\n",
+            "if __name__ == '__main__':\n",
+            "    unittest.main()\n",
+        ),
+        "gate_runner.py",
+    );
+    assert!(out.contains("__rython_ntest_skipped += 1"), "the skip must be guarded: {}", out);
+    let a = out.find(". test_a ()").expect("test_a is run");
+    let b = out.find(". test_b ()").expect("test_b is run");
+    assert!(a < b, "tests run in sorted order: {}", out);
 }
 
 #[test]

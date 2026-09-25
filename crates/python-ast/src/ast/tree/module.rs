@@ -6216,19 +6216,21 @@ fn matched_unittest_main(stmt: &crate::Statement) -> bool {
     )
 }
 
-/// The `test_*` method names directly defined on a class.
+/// The `test_*` method names directly defined on a class, in the sorted
+/// order CPython's TestLoader runs them.
 fn test_method_names(class_def: &crate::ClassDef) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for s in &class_def.body {
         match &s.statement {
             crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
-                if f.name.starts_with("test") {
+                if f.name.starts_with("test") && !out.contains(&f.name) {
                     out.push(format!("{}", f.name));
                 }
             }
             _ => {}
         }
     }
+    out.sort();
     out
 }
 
@@ -6236,18 +6238,56 @@ fn test_method_names(class_def: &crate::ClassDef) -> Vec<String> {
 /// module has no direct `unittest.TestCase`-derived classes (nothing to run —
 /// leave `unittest.main()` to the runtime, which then raises its loud
 /// NotImplementedError).
+/// A test-runner gate the emitted runner carries out (issue #371).
+enum RunGate {
+    Skip,
+    SkipIf(crate::ExprType),
+    SkipUnless(crate::ExprType),
+    ExpectedFailure,
+    /// `@cpython_only`: rython is not CPython, so — as on any other
+    /// implementation — the test does not run.
+    CpythonOnly,
+}
+
+/// The runner gates among `decorators` (a class's, then a method's), in
+/// order. A gate whose condition argument is missing is not honored here
+/// (its decorator was already reported as a plain gate).
+fn run_gates(decorators: &[crate::ExprType]) -> Vec<RunGate> {
+    use crate::ast::tree::decorator::{TestGate, test_gate_from_expr};
+    let mut out = Vec::new();
+    for d in decorators {
+        let condition = match d {
+            crate::ExprType::Call(c) => c.args.first().cloned(),
+            _ => None,
+        };
+        match (test_gate_from_expr(d), condition) {
+            (Some(TestGate::Skip), _) => out.push(RunGate::Skip),
+            (Some(TestGate::SkipIf), Some(cond)) => out.push(RunGate::SkipIf(cond)),
+            (Some(TestGate::SkipUnless), Some(cond)) => out.push(RunGate::SkipUnless(cond)),
+            (Some(TestGate::ExpectedFailure), _) => out.push(RunGate::ExpectedFailure),
+            (Some(TestGate::CpythonOnly), _) => out.push(RunGate::CpythonOnly),
+            _ => {}
+        }
+    }
+    out
+}
+
 fn emit_test_runner(
     module_stmts: &[crate::Statement],
-    _ctx: crate::CodeGenContext,
-    _options: crate::PythonOptions,
-    _symbols: crate::SymbolTableScopes,
+    ctx: crate::CodeGenContext,
+    options: crate::PythonOptions,
+    symbols: crate::SymbolTableScopes,
 ) -> Option<TokenStream> {
     let mut classes: Vec<crate::ClassDef> = Vec::new();
     collect_class_defs(module_stmts, &mut classes);
-    let test_classes: Vec<&crate::ClassDef> = classes
+    // CPython's TestLoader visits the module's classes in `dir()` order and
+    // each class's test methods in sorted order (getTestCaseNames sorts
+    // with three_way_cmp) — not definition order.
+    let mut test_classes: Vec<&crate::ClassDef> = classes
         .iter()
         .filter(|c| c.bases.iter().any(is_testcase_base))
         .collect();
+    test_classes.sort_by(|a, b| a.name.cmp(&b.name));
     if test_classes.is_empty() {
         return None;
     }
@@ -6270,22 +6310,101 @@ fn emit_test_runner(
         };
         for m in test_method_names(c) {
             let mident = quote::format_ident!("{}", m);
-            stmts.extend(quote! {
+            // The class's gates, then the method's (issue #371). A skipped
+            // test is never constructed, set up, or run — CPython decides
+            // the skip before setUp. Each condition is evaluated when the
+            // runner reaches the test; CPython evaluates it when the
+            // decorator runs at import, which differs only for a condition
+            // the module rebinds after defining the class.
+            let method_decorators = c
+                .body
+                .iter()
+                .find_map(|s| match &s.statement {
+                    crate::StatementType::FunctionDef(f)
+                    | crate::StatementType::AsyncFunctionDef(f)
+                        if f.name == m =>
+                    {
+                        Some(f.decorator_list.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let mut gates = run_gates(&c.decorator_list);
+            gates.extend(run_gates(&method_decorators));
+            let truth = |cond: &crate::ExprType| -> Option<TokenStream> {
+                crate::ExprType::Call(crate::Call {
+                    func: Box::new(crate::ExprType::Name(crate::ast::tree::name::Name {
+                        id: "bool".to_string(),
+                    })),
+                    args: vec![cond.clone()],
+                    keywords: Vec::new(),
+                })
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                .ok()
+            };
+            let mut skip_terms: Vec<TokenStream> = Vec::new();
+            let mut expected_failure = false;
+            for g in &gates {
+                match g {
+                    RunGate::Skip | RunGate::CpythonOnly => skip_terms.push(quote!(true)),
+                    RunGate::SkipIf(cond) => {
+                        let t = truth(cond)?;
+                        skip_terms.push(quote!((#t)));
+                    }
+                    RunGate::SkipUnless(cond) => {
+                        let t = truth(cond)?;
+                        skip_terms.push(quote!(!(#t)));
+                    }
+                    RunGate::ExpectedFailure => expected_failure = true,
+                }
+            }
+            let outcome = if expected_failure {
+                // `@expectedFailure`: a failure is the expected outcome; a
+                // pass is an "unexpected success", which fails the run
+                // (CPython's wasSuccessful() is False for it since 3.4).
+                quote! {
+                    match __rython_tc.#mident() {
+                        Ok(_) => {
+                            eprintln!("UNEXPECTED SUCCESS: {}", #m);
+                            __rython_ntest_failures += 1;
+                        }
+                        Err(_) => {}
+                    };
+                }
+            } else {
+                quote! {
+                    match __rython_tc.#mident() {
+                        Ok(__rython_v) => __rython_v,
+                        Err(__rython_e) => {
+                            eprintln!("FAIL: {}", __rython_e);
+                            __rython_ntest_failures += 1;
+                        }
+                    };
+                }
+            };
+            let run = quote! {
                 let mut __rython_tc = #cname::new()?;
                 #setup
-                match __rython_tc.#mident() {
-                    Ok(__rython_v) => __rython_v,
-                    Err(__rython_e) => {
-                        eprintln!("FAIL: {}", __rython_e);
-                        __rython_ntest_failures += 1;
-                    }
-                };
+                #outcome
                 #teardown
-            });
+            };
+            if skip_terms.is_empty() {
+                stmts.extend(run);
+            } else {
+                stmts.extend(quote! {
+                    if #(#skip_terms)||* {
+                        __rython_ntest_skipped += 1;
+                    } else {
+                        #run
+                    }
+                });
+            }
         }
     }
     Some(quote! {
         let mut __rython_ntest_failures: usize = 0usize;
+        #[allow(unused_mut, unused_variables)]
+        let mut __rython_ntest_skipped: usize = 0usize;
         #stmts
         if __rython_ntest_failures != 0usize {
             return Err(PyException::new(
