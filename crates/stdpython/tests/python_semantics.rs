@@ -4884,3 +4884,14 @@ fn a_boxed_sequence_times_a_float_is_cpythons_type_error() {
     // 'a' * 2.0 -> TypeError: can't multiply sequence by non-int of type 'float'
     let _ = PyValue::from("a").py_mul(&2.0f64);
 }
+
+#[test]
+fn a_list_of_numbers_boxes_and_unboxes() {
+    // issue #334: `self.assertEqual(intranges_from_list([111]), (x,))` —
+    // an unknown-typed list[int] result boxes like the str list does.
+    assert_eq!(py_display(&PyValue::from(vec![1i64, 2])), "(1, 2)");
+    assert_eq!(py_display(&PyValue::from(vec![0.5f64])), "(0.5,)");
+    // A boxed int sequence into a list[int] slot; True counts as 1.
+    let v: Vec<i64> = PyValue::from(vec![PyValue::Int(3), PyValue::Bool(true)]).into();
+    assert_eq!(v, vec![3, 1]);
+}

@@ -17302,3 +17302,51 @@ fn threading_local_is_per_thread_like_cpython() {
     );
 }
 
+#[test]
+fn bisect_matches_cpython() {
+    // bisect_left/right/bisect with positional and keyword bounds, a str
+    // list, insort/insort_left, and CPython's ValueError for lo < 0.
+    let scratch = Scratch::new("bisectmod");
+    let krate = package_crate(
+        &scratch,
+        "bisectmod",
+        &[(
+            "cli.py",
+            concat!(
+                "import bisect\n",
+                "from bisect import bisect_left, insort\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    a = [1, 2, 2, 4, 8]\n",
+                "    print(bisect.bisect_left(a, 2), bisect.bisect_right(a, 2), bisect.bisect(a, 5))\n",
+                "    print(bisect_left(a, 2, 2), bisect.bisect_left(a, 2, lo=0, hi=1))\n",
+                "    words = [\"apple\", \"fig\", \"pear\"]\n",
+                "    print(bisect.bisect(words, \"grape\"))\n",
+                "    insort(a, 3)\n",
+                "    bisect.insort_left(a, 2)\n",
+                "    print(a)\n",
+                "    try:\n",
+                "        bisect.bisect_left(a, 2, -1)\n",
+                "    except ValueError as e:\n",
+                "        print(\"ValueError:\", e)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "bisectmod"),
+        vec![
+            "1 3 4",
+            "2 1",
+            "2",
+            "[1, 2, 2, 2, 3, 4, 8]",
+            "ValueError: lo must be non-negative",
+        ]
+    );
+}
+

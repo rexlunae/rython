@@ -25199,3 +25199,28 @@ fn a_small_module_lowers_on_a_default_sized_thread() {
         .join()
         .unwrap();
 }
+
+#[test]
+fn bisect_lowers_to_the_runtime_and_refuses_key() {
+    // Issue #334 (idna's intranges) / #370 (test_bisect): the bisect
+    // functions route to stdpython::bisect with CPython's lo/hi bounds;
+    // insort borrows its list mutably; key= is refused, not ignored.
+    let out = compile(
+        concat!(
+            "import bisect\n",
+            "\n",
+            "def f(a: list[int], x: int) -> int:\n",
+            "    bisect.insort(a, x)\n",
+            "    return bisect.bisect_left(a, x, 1, hi=3)\n",
+        ),
+        "bis.py",
+    );
+    assert!(out.contains("bisect :: insort (& mut (a) , x , 0 , None) ?"), "generated: {}", out);
+    assert!(out.contains("bisect :: bisect_left (& (a) , & (x) , 1 , Some (3)) ?"), "generated: {}", out);
+    let err = compile_err(
+        "import bisect\n\ndef f(a: list[int]) -> int:\n    return bisect.bisect(a, 1, key=abs)\n",
+        "biskey.py",
+    );
+    assert!(err.contains("key=") && err.contains("not supported"), "error: {}", err);
+}
+

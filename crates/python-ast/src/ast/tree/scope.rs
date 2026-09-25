@@ -665,19 +665,28 @@ fn walk_loop(
     walk_stmts(orelse, a, outer_multi);
 }
 
-/// The heapq functions that mutate their first argument in place (the
-/// heapq surface treats a plain list as a heap, so `heappush(h, x)`
-/// mutates `h` like a method call would). ONE registry: call.rs's
-/// `&mut`-rendering consults it too, so the borrow emission and this
-/// needs-`mut` analysis cannot drift.
-pub(crate) const HEAPQ_FIRST_ARG_MUTATORS: &[&str] =
-    &["heappush", "heappop", "heapify", "heappushpop", "heapreplace"];
+/// The heapq and bisect functions that mutate their first argument in
+/// place (the heapq surface treats a plain list as a heap, so
+/// `heappush(h, x)` mutates `h` like a method call would; `insort(a, x)`
+/// inserts into `a`). ONE registry: call.rs's `&mut`-rendering consults
+/// it too, so the borrow emission and this needs-`mut` analysis cannot
+/// drift.
+pub(crate) const FIRST_ARG_MUTATORS: &[&str] = &[
+    "heappush",
+    "heappop",
+    "heapify",
+    "heappushpop",
+    "heapreplace",
+    "insort",
+    "insort_left",
+    "insort_right",
+];
 
 /// Free functions that mutate their first argument in place: the heapq
-/// mutators plus csv.writer(f), which holds &mut f for the writer's
+/// and bisect mutators plus csv.writer(f), which holds &mut f for the writer's
 /// lifetime.
 fn mutates_first_arg(name: &str) -> bool {
-    HEAPQ_FIRST_ARG_MUTATORS.contains(&name) || name == "writer"
+    FIRST_ARG_MUTATORS.contains(&name) || name == "writer"
 }
 
 fn walk_call(call: &crate::Call, a: &mut Analysis<'_>) {

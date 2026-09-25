@@ -67,6 +67,7 @@ pub(crate) fn stdpython_module_class(module: &str, name: &str) -> bool {
         | StdModule::Warnings
         | StdModule::Textwrap
         | StdModule::Heapq
+        | StdModule::Bisect
         | StdModule::Copy
         | StdModule::Glob
         | StdModule::Sysconfig
@@ -260,6 +261,7 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
         | StdModule::Tempfile
         | StdModule::Textwrap
         | StdModule::Heapq
+        | StdModule::Bisect
         | StdModule::Copy
         | StdModule::String
         | StdModule::Glob

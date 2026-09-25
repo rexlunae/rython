@@ -378,6 +378,34 @@ fn box_assert_argument(
         | crate::TypeInfo::Bytes
         | crate::TypeInfo::Complex
         | crate::TypeInfo::PyValue => Ok(Some(quote!(PyValue::from(#r)))),
+        // A fixed-arity TUPLE of boxable scalars (`(_encode_range(1, 2),)`
+        // — idna's test_intranges, issue #334): the boxed tuple of its
+        // boxed members.
+        crate::TypeInfo::Tuple(members)
+            if members.iter().all(|m| {
+                matches!(
+                    m,
+                    crate::TypeInfo::Int
+                        | crate::TypeInfo::Float
+                        | crate::TypeInfo::Bool
+                        | crate::TypeInfo::StrRef
+                        | crate::TypeInfo::String
+                        | crate::TypeInfo::Bytes
+                        | crate::TypeInfo::Complex
+                        | crate::TypeInfo::PyValue
+                        // An unknown member is a concrete Rust value that
+                        // boxes via From, or a build error — as above.
+                        | crate::TypeInfo::PyObject
+                )
+            }) =>
+        {
+            let fields = (0..members.len()).map(syn::Index::from);
+            Ok(Some(quote!({
+                #[allow(unused_variables)]
+                let __rython_t = #r;
+                PyValue::from(Vec::<PyValue>::from([#(PyValue::from(__rython_t.#fields)),*]))
+            })))
+        }
         // An UNKNOWN-typed but already-concrete Rust expression (issue #377):
         // a loop variable whose element type the inference maps don't record,
         // a function-call result, or a subscript. These render to a real Rust
@@ -5894,6 +5922,12 @@ impl<'a> CodeGen for Call {
                         | "heapreplace"
                         | "nlargest"
                         | "nsmallest"
+                        | "bisect"
+                        | "bisect_left"
+                        | "bisect_right"
+                        | "insort"
+                        | "insort_left"
+                        | "insort_right"
                         | "copy"
                         | "deepcopy"
                         | "dedent"
@@ -5951,8 +5985,24 @@ impl<'a> CodeGen for Call {
                 let mut quoting_kw: Option<crate::ExprType> = None;
                 let mut escapechar_kw: Option<crate::ExprType> = None;
                 let mut delimiter_kw: Option<crate::ExprType> = None;
+                let is_bisect_fn = matches!(
+                    fname.as_str(),
+                    "bisect" | "bisect_left" | "bisect_right" | "insort" | "insort_left" | "insort_right"
+                );
+                let mut lo_kw: Option<crate::ExprType> = None;
+                let mut hi_kw: Option<crate::ExprType> = None;
                 for kw in &self.keywords {
                     let slot = match kw.arg.as_deref() {
+                        Some("lo") if is_bisect_fn => &mut lo_kw,
+                        Some("hi") if is_bisect_fn => &mut hi_kw,
+                        Some("key") if is_bisect_fn => {
+                            return Err(format!(
+                                "{fname}(key=...) is not supported yet: bisect's key function \
+                                 (Python 3.10) is not modeled; rython refuses to silently \
+                                 ignore it — search a list of the keys instead"
+                            )
+                            .into());
+                        }
                         Some("width") if matches!(fname.as_str(), "wrap" | "fill") => &mut width_kw,
                         Some("flags") if is_re_fn => &mut flags_kw,
                         Some("count") if fname == "sub" => &mut count_kw,
@@ -6179,7 +6229,7 @@ impl<'a> CodeGen for Call {
                 // rendered[0] becomes the full mutable-borrow expression:
                 // py_index_mut already yields &mut for subscripts, names
                 // take a fresh &mut.
-                let heap_mutator = crate::ast::tree::scope::HEAPQ_FIRST_ARG_MUTATORS
+                let heap_mutator = crate::ast::tree::scope::FIRST_ARG_MUTATORS
                     .contains(&fname.as_str());
                 if heap_mutator {
                     if let Some(first) = self.args.first() {
@@ -6229,6 +6279,57 @@ impl<'a> CodeGen for Call {
                     ("heappush", [h, x]) => {
                         let p = qual("heappush");
                         Ok(quote!(#p(#h, #x)))
+                    }
+                    // bisect(a, x, lo=0, hi=len(a)): positional or keyword
+                    // bounds, each given once (CPython's TypeError text
+                    // otherwise, at conversion — the call's shape is static).
+                    (
+                        "bisect" | "bisect_left" | "bisect_right" | "insort" | "insort_left"
+                        | "insort_right",
+                        [a, x, rest @ ..],
+                    ) if rest.len() <= 2 => {
+                        let bound = |pos: Option<&TokenStream>,
+                                     kw: &Option<crate::ExprType>,
+                                     name: &str|
+                         -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+                            match (pos, kw) {
+                                (Some(_), Some(_)) => Err(format!(
+                                    "{fname}() got multiple values for argument '{name}'"
+                                )
+                                .into()),
+                                (Some(p), None) => Ok(Some(quote!(#p))),
+                                (None, Some(k)) => Ok(Some(k.clone().to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )?)),
+                                (None, None) => Ok(None),
+                            }
+                        };
+                        let lo = bound(rest.first(), &lo_kw, "lo")?
+                            .unwrap_or_else(|| quote!(0));
+                        let hi = match bound(rest.get(1), &hi_kw, "hi")? {
+                            Some(h) => quote!(Some(#h)),
+                            None => quote!(None),
+                        };
+                        // The probe takes the sequence's element type (a
+                        // str literal into a list of str owns itself).
+                        let x = match crate::infer_type(Some(&ctx), &self.args[0], &options, &symbols) {
+                            crate::TypeInfo::Vec(elem) => crate::render_typed(
+                                &self.args[1],
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(*elem),
+                            )?,
+                            _ => x.clone(),
+                        };
+                        let p = qual(&fname);
+                        if fname.starts_with("insort") {
+                            Ok(quote!(#p(#a, #x, #lo, #hi)?))
+                        } else {
+                            Ok(quote!(#p(&(#a), &(#x), #lo, #hi)?))
+                        }
                     }
                     ("heappop", [h]) => {
                         let p = qual("heappop");

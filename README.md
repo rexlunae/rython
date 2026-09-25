@@ -104,7 +104,7 @@ cargo test -p python-ast
 `stdpython` is tiered for `no_std` use: the default `std` tier has the full
 surface; the `alloc` tier (`--no-default-features --features alloc`) keeps
 everything that doesn't need an OS (strings, collections, json, itertools,
-functools, heapq, textwrap, hashlib, csv, the in-memory
+functools, heapq, bisect, textwrap, hashlib, csv, the in-memory
 `io.StringIO`/`io.BytesIO` file buffers, …) and works on embedded targets.
 
 ## Compatibility
@@ -135,7 +135,7 @@ conversion-time `argparse` (typed namespace, byte-identical help and
 error output), and a growing stdlib: `math`, `random`, `os`, `sys`,
 `json`, `re` (incl. flags, named groups, findall tuples),
 `datetime`/`time` (incl. `strptime`), `itertools`, `functools.reduce`,
-`heapq`, `copy`, `textwrap`, `hashlib`, `csv` (reader and writer),
+`heapq`, `bisect`, `copy`, `textwrap`, `hashlib`, `csv` (reader and writer),
 `collections`, `pathlib`, `glob`, `subprocess`, `tempfile`,
 `threading` (Thread with static targets, Lock/RLock/Event/Semaphore
 with a real `with lock:` acquire/release lowering, `local()` as a

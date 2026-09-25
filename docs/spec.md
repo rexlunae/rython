@@ -2040,7 +2040,8 @@ to CPython's MT19937), `os`/`os.path`, `sys`, `json`, `re`
 groups; backreferences/lookarounds are a loud `re.error`),
 `datetime`/`time` (incl. `strptime`, keyword `replace()`), `itertools`
 (lazy iterators), `functools` (`reduce`, `partial`, `lru_cache`),
-`heapq`, `copy`, `textwrap`, `hashlib`, `csv` (default excel dialect; the
+`heapq`, `bisect` (`bisect_left`/`bisect_right`/`insort*` with `lo`/`hi`;
+`key=` is refused), `copy`, `textwrap`, `hashlib`, `csv` (default excel dialect; the
 reader/writer thread a literal `delimiter=` and a named dialect from a
 std-gated `register_dialect`/`get_dialect` registry — dialect OBJECTS,
 `DictReader`/`DictWriter`/`Sniffer`/`field_size_limit` stay unsupported),
@@ -2052,7 +2053,7 @@ pluggable execution backends). `urllib.request` (§10.5) rides the
 feature-gate convention below.
 
 Available on the `alloc` (no-OS) tier: `string`, `json`, `collections`,
-`itertools`, `functools`, `heapq`, `copy`, `textwrap`, `hashlib`,
+`itertools`, `functools`, `heapq`, `bisect`, `copy`, `textwrap`, `hashlib`,
 `csv`, and `io`'s in-memory buffers (`StringIO`/`BytesIO` — the no_std
 profile's file I/O; `open()` and disk files stay std-only). Everything
 OS-touching is std-only and is a loud conversion error under

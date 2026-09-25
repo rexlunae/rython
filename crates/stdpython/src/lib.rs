@@ -3040,6 +3040,47 @@ impl From<Vec<String>> for PyValue {
     }
 }
 
+// A list of ints/floats/bools boxes as a Tuple of its members, like the
+// str list above (the documented list-as-tuple representation): an
+// unknown-typed call result that is `list[int]` (issue #334 — idna's
+// `intranges_from_list`) reaches an assertEqual this way.
+impl From<Vec<i64>> for PyValue {
+    fn from(value: Vec<i64>) -> Self {
+        PyValue::Tuple(Arc::new(value.into_iter().map(PyValue::Int).collect()))
+    }
+}
+
+impl From<Vec<f64>> for PyValue {
+    fn from(value: Vec<f64>) -> Self {
+        PyValue::Tuple(Arc::new(value.into_iter().map(PyValue::Float).collect()))
+    }
+}
+
+impl From<Vec<bool>> for PyValue {
+    fn from(value: Vec<bool>) -> Self {
+        PyValue::Tuple(Arc::new(value.into_iter().map(PyValue::Bool).collect()))
+    }
+}
+
+/// A boxed sequence of ints into a `list[int]` slot (a boxed parameter
+/// passed on to a typed one): its members, a bool counting as an int;
+/// anything else is the loud member panic every boxed conversion uses.
+impl From<PyValue> for Vec<i64> {
+    fn from(value: PyValue) -> Vec<i64> {
+        let PyValue::Tuple(items) = &value else {
+            value_member_panic("list[int]")
+        };
+        items
+            .iter()
+            .map(|v| match v {
+                PyValue::Int(i) => *i,
+                PyValue::Bool(b) => *b as i64,
+                _ => value_member_panic("list[int]"),
+            })
+            .collect()
+    }
+}
+
 // A list of ALREADY-BOXED members (`PyValue::from(exceptions)` where the
 // local is Vec<PyValue>) boxes as a Tuple of the members.
 impl From<Vec<PyValue>> for PyValue {
@@ -7647,6 +7688,7 @@ pub use stdlib::functools;
 // The lru_cache backing store must be nameable in generated statics.
 pub use stdlib::functools::PyLruCache;
 pub use stdlib::heapq;
+pub use stdlib::bisect;
 pub use stdlib::copy;
 pub use stdlib::textwrap;
 pub use stdlib::hashlib;
