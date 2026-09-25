@@ -16,7 +16,7 @@ use crate::{
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FunctionDef {
     pub name: String,
-    pub args: ParameterList,
+    pub args: Box<ParameterList>,
     pub body: Vec<Statement>,
     pub decorator_list: Vec<ExprType>,
     /// The function's return annotation (`-> int`), if present.
@@ -41,7 +41,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for FunctionDef {
 
         Ok(FunctionDef {
             name,
-            args,
+            args: Box::new(args),
             body,
             decorator_list,
             returns,

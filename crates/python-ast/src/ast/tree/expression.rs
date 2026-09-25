@@ -231,6 +231,7 @@ impl<'a> CodeGen for ExprType {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
+        crate::stack_guard::check()?;
         self.to_rust_inner(ctx, options, symbols)
     }
 }
@@ -242,298 +243,341 @@ impl ExprType {
         options: PythonOptions,
         symbols: SymbolTableScopes,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
-        match self {
-            ExprType::Attribute(attribute) => attribute.to_rust(ctx, options, symbols),
-            ExprType::Await(func) => func.to_rust(ctx, options, symbols),
-            ExprType::BinOp(binop) => binop.to_rust(ctx, options, symbols),
-            ExprType::BoolOp(boolop) => boolop.to_rust(ctx, options, symbols),
-            ExprType::Call(call) => call.to_rust(ctx, options, symbols),
-            ExprType::Compare(c) => c.to_rust(ctx, options, symbols),
-            ExprType::Constant(c) => c.to_rust(ctx, options, symbols),
-            ExprType::Lambda(l) => l.to_rust(ctx, options, symbols),
-            ExprType::IfExp(i) => i.to_rust(ctx, options, symbols),
-            ExprType::Dict(d) => d.to_rust(ctx, options, symbols),
-            ExprType::Set(s) => s.to_rust(ctx, options, symbols),
-            ExprType::ListComp(lc) => lc.to_rust(ctx, options, symbols),
-            ExprType::DictComp(dc) => dc.to_rust(ctx, options, symbols),
-            ExprType::SetComp(sc) => sc.to_rust(ctx, options, symbols),
-            ExprType::GeneratorExp(ge) => ge.to_rust(ctx, options, symbols),
-            ExprType::Tuple(t) => t.to_rust(ctx, options, symbols),
-            ExprType::Subscript(s) => s.to_rust(ctx, options, symbols),
-            ExprType::Starred(s) => s.to_rust(ctx, options, symbols),
-            ExprType::Yield(y) => y.to_rust(ctx, options, symbols),
-            ExprType::YieldFrom(yf) => yf.to_rust(ctx, options, symbols),
-            ExprType::JoinedStr(js) => js.to_rust(ctx, options, symbols),
-            ExprType::FormattedValue(fv) => fv.to_rust(ctx, options, symbols),
-            ExprType::NamedExpr(ne) => ne.to_rust(ctx, options, symbols),
-            ExprType::List(l) => {
-                // Type-aware list lowering: infer the element type across
-                // the literal, then coerce each element to it —
-                // `[1, 2.0]` → `Vec<f64>` with `1 as f64`, `["a", s]` →
-                // `Vec<String>` with `"a".to_string()`. Incompatible kinds
-                // ([1, "a"]) are a loud conversion-time error rather than
-                // a cryptic rustc mismatch inside generated code.
-                // A FORCED element type (a `-> List[Union[...]]` return
-                // whose element boxes — idna's `_seg_N` tables, round 57)
-                // overrides the inference: every fixed element boxes,
-                // and a Starred element SPREADS its collection exactly
-                // like the normal path (Devin review on #263: the first
-                // version emitted the spread as one list element).
-                if let Some(forced) = &*options.forced_list_elt {
-                    let expected = Some(forced.clone());
-                    let mut elements = Vec::new();
-                    let mut spreads: Vec<TokenStream> = Vec::new();
-                    for li in &l {
-                        if let ExprType::Starred(starred) = li {
-                            let inner = crate::render_reused(
-                                &starred.value,
-                                ctx.clone(),
-                                options.clone(),
-                                symbols.clone(),
-                            )?;
-                            spreads.push(quote!(#inner));
-                            continue;
-                        }
-                        // A NAME element read again later takes the
-                        // reuse-clone (`dials = [d]` then `d.level = 6` —
-                        // a shared reference; the corpus's ledger).
-                        elements.push(crate::render_typed_reused(
-                            li,
-                            ctx.clone(),
-                            options.clone(),
-                            symbols.clone(),
-                            expected.clone(),
-                        )?);
-                    }
-                    if spreads.is_empty() {
-                        return Ok(quote!(vec![#(#elements),*]));
-                    }
-                    // Source-order interleave of fixed and spread
-                    // segments (`[*a, x, *b]` extends a, pushes x, then
-                    // extends b — the same shape the non-forced starred
-                    // path emits below).
-                    let mut segments: Vec<TokenStream> = Vec::new();
-                    let mut si = 0usize;
-                    let mut ei = 0usize;
-                    for li in &l {
-                        if let ExprType::Starred(_) = li {
-                            let s = spreads[si].clone();
-                            // A SPREAD of borrowed strings into a
-                            // Vec<String> list (`return ["a", *more]`
-                            // where more is Vec<&str>): own each spread
-                            // element (Devin review on #286).
-                            let s = if matches!(forced, crate::TypeInfo::String) {
-                                quote!(#s.into_iter().map(|__e| __e.to_string()))
-                            } else {
-                                s
-                            };
-                            segments.push(quote!(__rython_list.extend(#s);));
-                            si += 1;
-                        } else {
-                            let e = elements[ei].clone();
-                            segments.push(quote!(__rython_list.push(#e);));
-                            ei += 1;
-                        }
-                    }
-                    return Ok(quote!({
-                        let mut __rython_list = Vec::new();
-                        #(#segments)*
-                        __rython_list
-                    }));
-                }
-                let mut has_starred = false;
-                let mut elt_types: Vec<crate::TypeInfo> = Vec::new();
-                for li in &l {
-                    if matches!(li, ExprType::Starred(_)) {
-                        // Starred elements spread their collection's ELEMENT
-                        // type, not the collection's type: counting them here
-                        // makes `[*xs, 1]` look like a (list, int) mix and
-                        // reject it before the (accurate) starred-unpacking
-                        // error can surface (Devin review on #103).
-                        has_starred = true;
-                        continue;
-                    }
-                    let t = crate::infer_type(Some(&ctx), &li, &options, &symbols);
-                    if !matches!(t, crate::TypeInfo::PyObject) {
-                        elt_types.push(t);
-                    }
-                }
-                let mut distinct: Vec<crate::TypeInfo> = Vec::new();
-                for t in &elt_types {
-                    if !distinct.contains(t) {
-                        distinct.push(t.clone());
-                    }
-                }
-                // Unify the DISTINCT types (a repeat of an early element at
-                // the END of the literal must not re-absorb the result:
-                // `[(0, "3"), (65, "M", "a"), (76, "V")]` — idna's
-                // _seg tables mix 2- and 3-tuples — folding the raw
-                // element list ends on a 2-tuple and `unify(PyObject,
-                // Tuple2)` snaps expected back to Tuple2, hiding the
-                // heterogeneity from the boxable-union check below).
-                // Two known types that do not join stay a conflict
-                // (`[1, 2.5, 3j, "x"]` — issue #366; join_known_types).
-                let mut expected = crate::ast::tree::type_ctx::join_known_types(&distinct);
-                if distinct.len() > 1 && matches!(expected, crate::TypeInfo::PyObject) {
-                    // A list of DIFFERENT class instances (`[d_sp, d_ta,
-                    // ...]` — charset_normalizer's debug plugin list) has
-                    // no single Rust element type. That is a documented
-                    // divergence (heterogeneous class lists cannot build in
-                    // rython; rustc reports the Vec element mismatch), but
-                    // the conversion itself proceeds — primitive mixes
-                    // ([1, "a"]) stay a loud error.
-                    if !distinct.iter().all(|t| matches!(t, crate::TypeInfo::Class(_))) {
-                        // A HETEROGENEOUS list involving a TUPLE
-                        // (`['s3_use_arn_region', ('s3',
-                        // 'use_arn_region')]` — botocore's
-                        // configprovider): a structured config list — box
-                        // the elements as PyValue (documented divergence).
-                        // A list mixing an OPTIONAL element (`["--username",
-                        // username]` where username is `str | None` — pip's
-                        // subversion) boxes the same way. Primitive mixes
-                        // without tuples/optionals ([1, 'a']) stay a loud
-                        // error.
-                        // Issue #130: ANY mix whose element types are all
-                        // boxable (`[1, "a"]`, `[None, "x", 2, b"y"]`, ...)
-                        // boxes to Vec<PyValue> - not just the >=3-kind and
-                        // tuple/optional shapes this branch used to cover.
-                        if distinct.iter().all(crate::is_boxable_value_type) {
-                            expected = crate::TypeInfo::PyValue;
-                        } else if crate::ast::tree::type_ctx::is_float_coercible_mix(
-                            &distinct,
-                            &symbols,
-                            &options,
-                        ) {
-                            // A `[float, FloatLike, ...]` mix: the FloatLike
-                            // elements implement `Into<f64>` (their `__float__`
-                            // backs a `From<Class> for f64`), so the literal
-                            // unifies to `Vec<f64>` and each class element
-                            // coerces via the coercion layer (issue #367 —
-                            // test_math's `math.fsum([1e100, FloatLike(1.0),
-                            // ...])` wall). NOT a silent divergence: the class
-                            // genuinely is float-coercible.
-                            expected = crate::TypeInfo::Float;
-                        } else {
-                            let kinds = distinct
-                                .iter()
-                                .map(|d| d.display())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            return Err(format!(
-                                "list literal mixes incompatible element types ({kinds}); \
-                                 elements must share a common type (or annotate the \
-                                 variable, e.g. `xs: list[float] = [...]`)"
-                            )
-                            .into());
-                        }
-                    }
-                }
-                let expected_elt = if matches!(expected, crate::TypeInfo::PyObject) {
-                    None
-                } else {
-                    // String-literal elements are owned String, not
-                    // &'static str — the same rule as dict VALUES (round
-                    // 87): `ks = ["Retry-After"]; return ks` in a
-                    // `-> list[str]` function must build Vec<String>, or
-                    // the literal's Vec<&str> can never match the
-                    // annotation-honest Vec<String> return.
-                    Some(match expected {
-                        crate::TypeInfo::StrRef => crate::TypeInfo::String,
-                        other => other,
-                    })
-                };
-
-                let mut elements = Vec::new();
-                let mut starred_vals: Vec<TokenStream> = Vec::new();
-                for li in &l {
-                    if let ExprType::Starred(starred) = li {
-                        // `[*xs]` — the spread's collection extends the
-                        // list (`[key, *val]` — urllib3). The spread reads
-                        // the collection WITHOUT consuming it (Python's
-                        // `[*xs, a]` leaves `xs` usable), so the reuse-clone
-                        // rule applies like any other name read.
-                        let inner = crate::render_reused(
-                            &starred.value,
-                            ctx.clone(),
-                            options.clone(),
-                            symbols.clone(),
-                        )?;
-                        starred_vals.push(inner);
-                        continue;
-                    }
-                    let code = crate::render_typed_reused(
-                        &li,
-                        ctx.clone(),
-                        options.clone(),
-                        symbols.clone(),
-                        expected_elt.clone(),
-                    )?;
-                    elements.push(code);
-                }
-                
-                // If we have starred expressions, handle them specially
-                if has_starred {
-                    // Emit elements in SOURCE ORDER: a spread before or
-                    // between fixed elements must interleave (`[*xs, a]` is
-                    // `xs` then `a`, not `a` then `xs` — the old lowering
-                    // pushed all fixed elements first and extended with the
-                    // spreads after, silently reordering).
-                    enum Seg {
-                        Fixed(proc_macro2::TokenStream),
-                        Spread(proc_macro2::TokenStream),
-                    }
-                    // `elements` holds the fixed renders in source order;
-                    // merge them back with the spreads by walking the
-                    // literal once.
-                    let mut segments: Vec<Seg> = Vec::new();
-                    let mut si = 0usize;
-                    let mut ei = 0usize;
-                    for li in &l {
-                        if let ExprType::Starred(_) = li {
-                            segments.push(Seg::Spread(starred_vals[si].clone()));
-                            si += 1;
-                        } else {
-                            segments.push(Seg::Fixed(elements[ei].clone()));
-                            ei += 1;
-                        }
-                    }
-                    let elt_ty = expected_elt
-                        .as_ref()
-                        .map(|t| t.to_rust_type())
-                        .unwrap_or_else(|| quote!(_));
-                    let stmts = segments.iter().map(|seg| match seg {
-                        Seg::Fixed(t) => quote!(__rython_list.push(#t);),
-                        Seg::Spread(t) => quote!(__rython_list.extend(#t);),
-                    });
-                    Ok(quote! {
-                        {
-                            let mut __rython_list: Vec<#elt_ty> = Vec::new();
-                            #(#stmts)*
-                            __rython_list
-                        }
-                    })
-                } else {
-                    // Elements keep their own types: [1, 2, 3] must become a
-                    // Vec<i64>, not a Vec<String>.
-                    Ok(quote! {
-                        vec![#(#elements),*]
-                    })
-                }
-            }
-            ExprType::Name(name) => name.to_rust(ctx, options, symbols),
+        let node: Box<dyn LowerNode> = match self {
+            ExprType::Attribute(attribute) => Box::new(attribute),
+            ExprType::Await(func) => Box::new(func),
+            ExprType::BinOp(binop) => Box::new(binop),
+            ExprType::BoolOp(boolop) => Box::new(boolop),
+            ExprType::Call(call) => Box::new(call),
+            ExprType::Compare(c) => Box::new(c),
+            ExprType::Constant(c) => Box::new(c),
+            ExprType::Lambda(l) => Box::new(l),
+            ExprType::IfExp(i) => Box::new(i),
+            ExprType::Dict(d) => Box::new(d),
+            ExprType::Set(s) => Box::new(s),
+            ExprType::ListComp(lc) => Box::new(lc),
+            ExprType::DictComp(dc) => Box::new(dc),
+            ExprType::SetComp(sc) => Box::new(sc),
+            ExprType::GeneratorExp(ge) => Box::new(ge),
+            ExprType::Tuple(t) => Box::new(t),
+            ExprType::Subscript(s) => Box::new(s),
+            ExprType::Starred(s) => Box::new(s),
+            ExprType::Yield(y) => Box::new(y),
+            ExprType::YieldFrom(yf) => Box::new(yf),
+            ExprType::JoinedStr(js) => Box::new(js),
+            ExprType::FormattedValue(fv) => Box::new(fv),
+            ExprType::NamedExpr(ne) => Box::new(ne),
+            ExprType::List(l) => return lower_list_literal(l, ctx, options, symbols),
+            ExprType::Name(name) => Box::new(name),
             // Python's None is Rust's Option::None: `x = None` initializes
             // an Option, `f(None)` passes one, `d.get(k)` results compare
             // against it.
-            ExprType::NoneType(_) => Ok(quote!(None)),
-            ExprType::UnaryOp(operand) => operand.to_rust(ctx, options, symbols),
+            ExprType::NoneType(_) => return Ok(quote!(None)),
+            ExprType::UnaryOp(operand) => Box::new(operand),
 
             _ => {
                 let error = err_from(ExprTypeNotYetImplemented(self));
-                Err(error.into())
+                return Err(error.into());
             }
-        }
+        };
+        // ONE call site for every node kind (issue #354): in a debug build
+        // each call site owns its own stack slots for the by-value
+        // arguments (`PythonOptions` alone is ~770 bytes), so thirty arms
+        // each calling `to_rust` made this frame ~25 KB — paid again at
+        // every level of expression nesting.
+        node.lower(ctx, options, symbols)
     }
 }
+
+/// A node lowered through one dynamic call (see `to_rust_inner`).
+trait LowerNode {
+    fn lower(
+        self: Box<Self>,
+        ctx: CodeGenContext,
+        options: PythonOptions,
+        symbols: SymbolTableScopes,
+    ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>>;
+}
+
+impl<T> LowerNode for T
+where
+    T: CodeGen<Context = CodeGenContext, Options = PythonOptions, SymbolTable = SymbolTableScopes>,
+{
+    fn lower(
+        self: Box<Self>,
+        ctx: CodeGenContext,
+        options: PythonOptions,
+        symbols: SymbolTableScopes,
+    ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
+        (*self).to_rust(ctx, options, symbols)
+    }
+}
+
+/// A list literal's lowering, out of line: every arm of the
+/// `ExprType` dispatcher shares one stack frame, so this arm's locals
+/// made each level of expression nesting cost ~58 KB of stack in debug
+/// builds (issue #354). `#[inline(never)]` keeps them in a frame of their
+/// own that exists only while a list literal is being lowered.
+#[inline(never)]
+fn lower_list_literal(
+    l: Vec<ExprType>,
+    ctx: CodeGenContext,
+    options: PythonOptions,
+    symbols: SymbolTableScopes,
+) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
+        // Type-aware list lowering: infer the element type across
+        // the literal, then coerce each element to it —
+        // `[1, 2.0]` → `Vec<f64>` with `1 as f64`, `["a", s]` →
+        // `Vec<String>` with `"a".to_string()`. Incompatible kinds
+        // ([1, "a"]) are a loud conversion-time error rather than
+        // a cryptic rustc mismatch inside generated code.
+        // A FORCED element type (a `-> List[Union[...]]` return
+        // whose element boxes — idna's `_seg_N` tables, round 57)
+        // overrides the inference: every fixed element boxes,
+        // and a Starred element SPREADS its collection exactly
+        // like the normal path (Devin review on #263: the first
+        // version emitted the spread as one list element).
+        if let Some(forced) = &*options.forced_list_elt {
+            let expected = Some(forced.clone());
+            let mut elements = Vec::new();
+            let mut spreads: Vec<TokenStream> = Vec::new();
+            for li in &l {
+                if let ExprType::Starred(starred) = li {
+                    let inner = crate::render_reused(
+                        &starred.value,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?;
+                    spreads.push(quote!(#inner));
+                    continue;
+                }
+                // A NAME element read again later takes the
+                // reuse-clone (`dials = [d]` then `d.level = 6` —
+                // a shared reference; the corpus's ledger).
+                elements.push(crate::render_typed_reused(
+                    li,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                    expected.clone(),
+                )?);
+            }
+            if spreads.is_empty() {
+                return Ok(quote!(vec![#(#elements),*]));
+            }
+            // Source-order interleave of fixed and spread
+            // segments (`[*a, x, *b]` extends a, pushes x, then
+            // extends b — the same shape the non-forced starred
+            // path emits below).
+            let mut segments: Vec<TokenStream> = Vec::new();
+            let mut si = 0usize;
+            let mut ei = 0usize;
+            for li in &l {
+                if let ExprType::Starred(_) = li {
+                    let s = spreads[si].clone();
+                    // A SPREAD of borrowed strings into a
+                    // Vec<String> list (`return ["a", *more]`
+                    // where more is Vec<&str>): own each spread
+                    // element (Devin review on #286).
+                    let s = if matches!(forced, crate::TypeInfo::String) {
+                        quote!(#s.into_iter().map(|__e| __e.to_string()))
+                    } else {
+                        s
+                    };
+                    segments.push(quote!(__rython_list.extend(#s);));
+                    si += 1;
+                } else {
+                    let e = elements[ei].clone();
+                    segments.push(quote!(__rython_list.push(#e);));
+                    ei += 1;
+                }
+            }
+            return Ok(quote!({
+                let mut __rython_list = Vec::new();
+                #(#segments)*
+                __rython_list
+            }));
+        }
+        let mut has_starred = false;
+        let mut elt_types: Vec<crate::TypeInfo> = Vec::new();
+        for li in &l {
+            if matches!(li, ExprType::Starred(_)) {
+                // Starred elements spread their collection's ELEMENT
+                // type, not the collection's type: counting them here
+                // makes `[*xs, 1]` look like a (list, int) mix and
+                // reject it before the (accurate) starred-unpacking
+                // error can surface (Devin review on #103).
+                has_starred = true;
+                continue;
+            }
+            let t = crate::infer_type(Some(&ctx), &li, &options, &symbols);
+            if !matches!(t, crate::TypeInfo::PyObject) {
+                elt_types.push(t);
+            }
+        }
+        let mut distinct: Vec<crate::TypeInfo> = Vec::new();
+        for t in &elt_types {
+            if !distinct.contains(t) {
+                distinct.push(t.clone());
+            }
+        }
+        // Unify the DISTINCT types (a repeat of an early element at
+        // the END of the literal must not re-absorb the result:
+        // `[(0, "3"), (65, "M", "a"), (76, "V")]` — idna's
+        // _seg tables mix 2- and 3-tuples — folding the raw
+        // element list ends on a 2-tuple and `unify(PyObject,
+        // Tuple2)` snaps expected back to Tuple2, hiding the
+        // heterogeneity from the boxable-union check below).
+        // Two known types that do not join stay a conflict
+        // (`[1, 2.5, 3j, "x"]` — issue #366; join_known_types).
+        let mut expected = crate::ast::tree::type_ctx::join_known_types(&distinct);
+        if distinct.len() > 1 && matches!(expected, crate::TypeInfo::PyObject) {
+            // A list of DIFFERENT class instances (`[d_sp, d_ta,
+            // ...]` — charset_normalizer's debug plugin list) has
+            // no single Rust element type. That is a documented
+            // divergence (heterogeneous class lists cannot build in
+            // rython; rustc reports the Vec element mismatch), but
+            // the conversion itself proceeds — primitive mixes
+            // ([1, "a"]) stay a loud error.
+            if !distinct.iter().all(|t| matches!(t, crate::TypeInfo::Class(_))) {
+                // A HETEROGENEOUS list involving a TUPLE
+                // (`['s3_use_arn_region', ('s3',
+                // 'use_arn_region')]` — botocore's
+                // configprovider): a structured config list — box
+                // the elements as PyValue (documented divergence).
+                // A list mixing an OPTIONAL element (`["--username",
+                // username]` where username is `str | None` — pip's
+                // subversion) boxes the same way. Primitive mixes
+                // without tuples/optionals ([1, 'a']) stay a loud
+                // error.
+                // Issue #130: ANY mix whose element types are all
+                // boxable (`[1, "a"]`, `[None, "x", 2, b"y"]`, ...)
+                // boxes to Vec<PyValue> - not just the >=3-kind and
+                // tuple/optional shapes this branch used to cover.
+                if distinct.iter().all(crate::is_boxable_value_type) {
+                    expected = crate::TypeInfo::PyValue;
+                } else if crate::ast::tree::type_ctx::is_float_coercible_mix(
+                    &distinct,
+                    &symbols,
+                    &options,
+                ) {
+                    // A `[float, FloatLike, ...]` mix: the FloatLike
+                    // elements implement `Into<f64>` (their `__float__`
+                    // backs a `From<Class> for f64`), so the literal
+                    // unifies to `Vec<f64>` and each class element
+                    // coerces via the coercion layer (issue #367 —
+                    // test_math's `math.fsum([1e100, FloatLike(1.0),
+                    // ...])` wall). NOT a silent divergence: the class
+                    // genuinely is float-coercible.
+                    expected = crate::TypeInfo::Float;
+                } else {
+                    let kinds = distinct
+                        .iter()
+                        .map(|d| d.display())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(format!(
+                        "list literal mixes incompatible element types ({kinds}); \
+                         elements must share a common type (or annotate the \
+                         variable, e.g. `xs: list[float] = [...]`)"
+                    )
+                    .into());
+                }
+            }
+        }
+        let expected_elt = if matches!(expected, crate::TypeInfo::PyObject) {
+            None
+        } else {
+            // String-literal elements are owned String, not
+            // &'static str — the same rule as dict VALUES (round
+            // 87): `ks = ["Retry-After"]; return ks` in a
+            // `-> list[str]` function must build Vec<String>, or
+            // the literal's Vec<&str> can never match the
+            // annotation-honest Vec<String> return.
+            Some(match expected {
+                crate::TypeInfo::StrRef => crate::TypeInfo::String,
+                other => other,
+            })
+        };
+
+        let mut elements = Vec::new();
+        let mut starred_vals: Vec<TokenStream> = Vec::new();
+        for li in &l {
+            if let ExprType::Starred(starred) = li {
+                // `[*xs]` — the spread's collection extends the
+                // list (`[key, *val]` — urllib3). The spread reads
+                // the collection WITHOUT consuming it (Python's
+                // `[*xs, a]` leaves `xs` usable), so the reuse-clone
+                // rule applies like any other name read.
+                let inner = crate::render_reused(
+                    &starred.value,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?;
+                starred_vals.push(inner);
+                continue;
+            }
+            let code = crate::render_typed_reused(
+                &li,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+                expected_elt.clone(),
+            )?;
+            elements.push(code);
+        }
+        
+        // If we have starred expressions, handle them specially
+        if has_starred {
+            // Emit elements in SOURCE ORDER: a spread before or
+            // between fixed elements must interleave (`[*xs, a]` is
+            // `xs` then `a`, not `a` then `xs` — the old lowering
+            // pushed all fixed elements first and extended with the
+            // spreads after, silently reordering).
+            enum Seg {
+                Fixed(proc_macro2::TokenStream),
+                Spread(proc_macro2::TokenStream),
+            }
+            // `elements` holds the fixed renders in source order;
+            // merge them back with the spreads by walking the
+            // literal once.
+            let mut segments: Vec<Seg> = Vec::new();
+            let mut si = 0usize;
+            let mut ei = 0usize;
+            for li in &l {
+                if let ExprType::Starred(_) = li {
+                    segments.push(Seg::Spread(starred_vals[si].clone()));
+                    si += 1;
+                } else {
+                    segments.push(Seg::Fixed(elements[ei].clone()));
+                    ei += 1;
+                }
+            }
+            let elt_ty = expected_elt
+                .as_ref()
+                .map(|t| t.to_rust_type())
+                .unwrap_or_else(|| quote!(_));
+            let stmts = segments.iter().map(|seg| match seg {
+                Seg::Fixed(t) => quote!(__rython_list.push(#t);),
+                Seg::Spread(t) => quote!(__rython_list.extend(#t);),
+            });
+            Ok(quote! {
+                {
+                    let mut __rython_list: Vec<#elt_ty> = Vec::new();
+                    #(#stmts)*
+                    __rython_list
+                }
+            })
+        } else {
+            // Elements keep their own types: [1, 2, 3] must become a
+            // Vec<i64>, not a Vec<String>.
+            Ok(quote! {
+                vec![#(#elements),*]
+            })
+        }
+    }
 
 /// An Expr only contains a single value key, which leads to the actual expression,
 /// which is one of several types.

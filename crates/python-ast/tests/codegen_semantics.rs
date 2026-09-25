@@ -25156,3 +25156,46 @@ fn a_threading_local_is_a_per_thread_attribute_bag() {
     assert!(out.contains("py_delattr (\"chal\") ?"), "generated: {}", out);
 }
 
+
+/// Issue #354: a nesting deeper than the lowering's stack budget fails the
+/// conversion with an error naming the problem — not a SIGABRT — and a
+/// shallow program under the same budget converts.
+#[test]
+fn nesting_past_the_stack_budget_is_a_conversion_error() {
+    let run = |terms: usize| -> Result<String, String> {
+        let src = format!("def f() -> int:\n    return {}\n", vec!["1"; terms].join(" + "));
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                python_ast::with_stack_budget(1024 * 1024, || {
+                    let module = parse(&src, "deep.py").map_err(|e| e.to_string())?;
+                    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+                    module
+                        .to_rust(CodeGenContext::Module("deep".into()), PythonOptions::default(), symbols)
+                        .map(|t| t.to_string())
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    };
+    let err = run(1500).unwrap_err();
+    assert!(err.contains("nests too deeply"), "error: {}", err);
+    assert!(run(3).is_ok());
+}
+
+/// Issue #354: the twenty-line program that needed more than 2 MiB of
+/// stack to lower converts on a thread with Rust's default 2 MiB (the
+/// ExprType dispatcher no longer spends ~25 KB of frame per nesting
+/// level, and the AST payloads are a quarter of their old size).
+#[test]
+fn a_small_module_lowers_on_a_default_sized_thread() {
+    let src = "def main() -> int:\n    nums = [5, 1, 9, 3]\n    words = [\"pear\", \"fig\", \"apple\"]\n    print(f\"minkey={min(words, key=lambda w: len(w))}\")\n    print(f\"sortedkey={repr(sorted(words, key=lambda w: len(w)))}\")\n    for i, v in enumerate(reversed(nums), start=1):\n        print(f\"rev{i}={v}\")\n    print(f\"powm={pow(3, -1, 7)} fsum={repr(0.1 + 0.2)}\")\n    return 0\n";
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || compile(src, "small.py"))
+        .unwrap()
+        .join()
+        .unwrap();
+}

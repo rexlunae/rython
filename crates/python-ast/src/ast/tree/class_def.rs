@@ -1247,7 +1247,7 @@ impl ClassDef {
         }
         let init = FunctionDef {
             name: "__init__".to_string(),
-            args: crate::Arguments {
+            args: Box::new(crate::Arguments {
                 posonlyargs: Vec::new(),
                 // `self` first, like every method; strip_self removes it
                 // where callers build the `new(...)` signature.
@@ -1268,7 +1268,7 @@ impl ClassDef {
                 kw_defaults: Vec::new(),
                 kwarg: None,
                 defaults,
-            },
+            }),
             body: stores,
             decorator_list: Vec::new(),
             returns: None,

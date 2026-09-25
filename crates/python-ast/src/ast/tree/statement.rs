@@ -69,6 +69,7 @@ impl CodeGen for Statement {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        crate::stack_guard::check()?;
         let (lineno, col_offset) = (self.lineno, self.col_offset);
         let (end_lineno, end_col_offset) = (self.end_lineno, self.end_col_offset);
         // The statement's binding marks (Devin review on #338, rounds 8 to
