@@ -6619,6 +6619,28 @@ fn non_finite_float_literals_lower_to_f64_expressions() {
 }
 
 #[test]
+fn a_non_finite_float_is_a_float_everywhere_it_is_typed() {
+    // issue #372: the non-finite constant rides through a String-carrying
+    // sentinel. The renderer honored it, but the operator typing read it
+    // as a str, so `1e400 * 0.0` lowered to `multiply_string` (string
+    // repetition). And `1e400j` is complex(0, inf), whose imaginary part
+    // has no literal form either.
+    let out = compile("def f() -> float:\n    return 1e400 * 0.0\n", "inf_mul.py");
+    assert!(!out.contains("multiply_string"), "inf * 0.0 is float arithmetic: {}", out);
+    let out = compile("def f() -> complex:\n    return 1e400j\n", "inf_complex.py");
+    assert!(
+        out.contains("Complex :: new (0.0 , f64 :: INFINITY)"),
+        "the infinite imaginary part is the f64 constant: {}",
+        out
+    );
+    assert!(
+        out.contains("Result < Complex"),
+        "a `-> complex` annotation is the runtime Complex: {}",
+        out
+    );
+}
+
+#[test]
 fn complex_literals_render_as_complex_values() {
     // `2j`, `3.5j` must lower to `Complex::new(re, im)` with f64 tokens
     // (issue #366) — a plain (possibly quoted-string) fallback would be a

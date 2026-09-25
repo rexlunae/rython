@@ -729,9 +729,9 @@ fn infer_type_inner(
             // String literal, but is a COMPLEX number — type it so codegen
             // never coercses `1j`/`2j * (1+2j)` to i64/f64.
             if let Some(lit) = &c.0
-                && crate::ast::tree::constant::is_complex_literal(&*lit)
+                && let Some(t) = crate::ast::tree::constant::sentinel_typeinfo(lit)
             {
-                return TypeInfo::Complex;
+                return t;
             }
             match &c.0 {
                 Some(litrs::Literal::Integer(_)) => TypeInfo::Int,
@@ -1498,6 +1498,7 @@ fn py_type(py: &str) -> TypeInfo {
     match py {
         "int" => TypeInfo::Int,
         "float" => TypeInfo::Float,
+        "complex" => TypeInfo::Complex,
         "bool" => TypeInfo::Bool,
         "str" => TypeInfo::String,
         "bytes" => TypeInfo::Bytes,
@@ -2085,6 +2086,7 @@ pub fn is_builtin_type_annotation(ann: &ExprType) -> bool {
             n.id.as_str(),
             "int"
                 | "float"
+                | "complex"
                 | "bool"
                 | "str"
                 | "bytes"
@@ -2261,6 +2263,10 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
         ExprType::Name(n) => match n.id.as_str() {
             "int" => Some(TypeInfo::Int),
             "float" => Some(TypeInfo::Float),
+            // `-> complex`: the runtime Complex a `1j` literal already
+            // types as (issues #366/#372). Unmapped, the annotation named a
+            // Rust type `complex` that does not exist.
+            "complex" => Some(TypeInfo::Complex),
             "bool" => Some(TypeInfo::Bool),
             "str" => Some(TypeInfo::String),
             // `offsets: range` — the builtin range class as a type
@@ -3649,8 +3655,10 @@ pub(crate) fn syntactic_type(expr: &ExprType) -> TypeInfo {
         ExprType::Constant(c) => {
             // A complex sentinel (`\0RYTHON_COMPLEX:...`) is String-carrying
             // but is a COMPLEX number, never a str.
-            if let Some(lit) = &c.0 && crate::ast::tree::constant::is_complex_literal(lit) {
-                return TypeInfo::Complex;
+            if let Some(lit) = &c.0
+                && let Some(t) = crate::ast::tree::constant::sentinel_typeinfo(lit)
+            {
+                return t;
             }
             match &c.0 {
                 Some(litrs::Literal::Integer(_)) => TypeInfo::Int,

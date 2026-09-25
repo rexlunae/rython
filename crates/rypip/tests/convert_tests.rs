@@ -12416,6 +12416,56 @@ fn run_package(krate: &rypip::convert::ConvertedCrate, pkg_name: &str) -> Vec<St
 }
 
 #[test]
+fn non_finite_float_constants_match_cpython() {
+    // issue #372: `1e400` is inf. It used to panic the converter; then it
+    // rendered, but typed as a str in operator lowering (`1e400 * 0.0`
+    // became string repetition), and `1e400j` rendered an `inf` ident.
+    let scratch = Scratch::new("nonfinite");
+    let krate = package_crate(
+        &scratch,
+        "nonfinite",
+        &[(
+            "cli.py",
+            concat!(
+                    "import math\n",
+                    "\n",
+                    "\n",
+                    "def f():\n",
+                    "    x = 1e400\n",
+                    "    return x\n",
+                    "\n",
+                    "\n",
+                    "def g() -> float:\n",
+                    "    return -1e400 / 2.0\n",
+                    "\n",
+                    "\n",
+                    "def h() -> bool:\n",
+                    "    return math.isinf(1e400) and 1e400 > 10.0 ** 300\n",
+                    "\n",
+                    "\n",
+                    "def c() -> complex:\n",
+                    "    return 1e400j\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    print(f(), g(), h())\n",
+                    "    print(1e400 * 0.0 != 1e400 * 0.0)\n",
+                    "    print(c())\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "nonfinite"),
+        vec![
+            "inf -inf True",
+            "True",
+            "infj",
+        ]
+    );
+}
+
+#[test]
 fn str_format_on_templates_rython_cannot_see_matches_cpython() {
     // issue #368: a template held in a parameter, the unbound
     // `str.format(t, ...)` form, and a keyword bag built at run time all
