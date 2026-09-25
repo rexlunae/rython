@@ -2004,6 +2004,13 @@ impl FunctionDef {
                 .filter(|i| !rw.skip.contains(i))
                 .count()
         });
+        // A nested `def`'s defaults are evaluated where it stands, into
+        // hidden locals (issue #370). The inserted statements would shift
+        // the argparse rewrite's positions, so the two do not combine: a
+        // nested def with a computed default there stays refused.
+        if argparse_rewrite.is_none() {
+            crate::ast::tree::closure::hoist_nested_def_defaults(&mut effective_body);
+        }
 
         // functools cache decorators rewrite the whole definition below;
         // @classmethod/@staticmethod change the method shape; any OTHER
@@ -3067,6 +3074,10 @@ impl FunctionDef {
         let mut closure_types: Vec<(String, crate::TypeInfo)> = Vec::new();
         let mut refused_closures: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut closure_params: std::collections::HashMap<
+            String,
+            Vec<(String, Option<ExprType>)>,
+        > = std::collections::HashMap::new();
         let scope_names =
             crate::ast::tree::closure::scope_binding_names(&self.args, &effective_body);
         for nested in nested_defs(&effective_body) {
@@ -3113,6 +3124,30 @@ impl FunctionDef {
                         value_callables.insert(nested.name.clone());
                         refused_closures.insert(nested.name.clone(), reason);
                     } else {
+                        // A closure with defaults: its parameters in order,
+                        // each with its default (a constant, or the hidden
+                        // local it was evaluated into), for direct calls to
+                        // fill from (issue #370).
+                        if !nested.args.defaults.is_empty() {
+                            let params: Vec<String> = nested
+                                .args
+                                .posonlyargs
+                                .iter()
+                                .chain(nested.args.args.iter())
+                                .map(|p| p.arg.clone())
+                                .collect();
+                            let first = params.len() - nested.args.defaults.len();
+                            let entries = params
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, name)| {
+                                    let default = (i >= first)
+                                        .then(|| (*nested.args.defaults[i - first]).clone());
+                                    (name, default)
+                                })
+                                .collect();
+                            closure_params.insert(nested.name.clone(), entries);
+                        }
                         nested_closures.insert(nested.name.clone(), info);
                     }
                 }
@@ -3229,6 +3264,7 @@ impl FunctionDef {
         }
         options.refused_closures = std::rc::Rc::new(refused_closures);
         options.nested_closures = std::rc::Rc::new(nested_closures);
+        options.closure_params = std::rc::Rc::new(closure_params);
         // A `type`-annotated callable parameter is the same: calls drop
         // (called_params) and value reads box.
         for p in self

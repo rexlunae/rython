@@ -565,6 +565,13 @@ pub struct PythonOptions {
     /// its reads and calls are loud.
     pub nested_closures:
         std::rc::Rc<std::collections::HashMap<String, crate::ast::tree::closure::ClosureInfo>>,
+    /// The current scope's nested closures that have DEFAULTS (issue
+    /// #370): each parameter in order with its default — a constant, or
+    /// the hidden local it was evaluated into where the `def` stands — so
+    /// a direct call by name can bind keywords and fill what it omits.
+    pub closure_params: std::rc::Rc<
+        std::collections::HashMap<String, Vec<(String, Option<crate::ExprType>)>>,
+    >,
     /// Set while the function generator renders a nested definition AS a
     /// closure: the captures to clone in before `move`, and the cells
     /// among them. `None` for every ordinary item.
@@ -794,6 +801,7 @@ impl Default for PythonOptions {
             scope_global_writables: std::rc::Rc::new(std::collections::HashSet::new()),
             value_callables: std::rc::Rc::new(std::collections::HashSet::new()),
             nested_closures: std::rc::Rc::new(std::collections::HashMap::new()),
+            closure_params: std::rc::Rc::new(std::collections::HashMap::new()),
             closure_captures: None,
             closure_capture_types: std::rc::Rc::new(std::collections::HashMap::new()),
             cell_locals: std::rc::Rc::new(std::collections::HashSet::new()),

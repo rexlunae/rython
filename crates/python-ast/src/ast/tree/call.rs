@@ -2350,6 +2350,100 @@ impl<'a> CodeGen for Call {
         if let Some((param_types, _)) =
             callee_value_signature(self.func.as_ref(), &ctx, &options, &symbols)
         {
+            // A DIRECT call to a nested closure that has defaults (issue
+            // #370): bind the arguments by Python's rules — positional
+            // first, then keywords by name, then each omitted parameter's
+            // default (evaluated where the `def` stood). Statically known,
+            // so a binding Python would reject is a conversion error.
+            if let ExprType::Name(n) = self.func.as_ref()
+                && let Some(params) = options.closure_params.get(&n.id).cloned()
+            {
+                let fname = &n.id;
+                if self.args.iter().any(|a| matches!(a, ExprType::Starred(_)))
+                    || self.keywords.iter().any(|k| k.arg.is_none())
+                {
+                    return Err(format!(
+                        "a `*`/`**` spread into the nested function `{}`, which has \
+                         defaults, is not supported yet; pass the arguments explicitly",
+                        fname
+                    )
+                    .into());
+                }
+                if self.args.len() > params.len() {
+                    return Err(format!(
+                        "{}() takes {} positional argument(s) but {} were given",
+                        fname,
+                        params.len(),
+                        self.args.len()
+                    )
+                    .into());
+                }
+                let mut bound: Vec<Option<ExprType>> = vec![None; params.len()];
+                for (slot, arg) in bound.iter_mut().zip(self.args.iter()) {
+                    *slot = Some(arg.clone());
+                }
+                for kw in &self.keywords {
+                    let name = kw.arg.as_deref().unwrap_or_default();
+                    let Some(i) = params.iter().position(|(p, _)| p == name) else {
+                        return Err(format!(
+                            "{}() got an unexpected keyword argument '{}'",
+                            fname, name
+                        )
+                        .into());
+                    };
+                    if bound[i].is_some() {
+                        return Err(format!(
+                            "{}() got multiple values for argument '{}'",
+                            fname, name
+                        )
+                        .into());
+                    }
+                    bound[i] = Some(kw.value.clone());
+                }
+                let mut args = Vec::with_capacity(params.len());
+                for (i, ((pname, default), expected)) in
+                    params.iter().zip(param_types.iter()).enumerate()
+                {
+                    let tokens = match (&bound[i], default) {
+                        (Some(arg), _) => crate::render_typed_reused(
+                            arg,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(expected.clone()),
+                        )?,
+                        // The hidden local is read at every call that omits
+                        // the argument: a copy each time.
+                        (None, Some(d @ ExprType::Name(_))) => {
+                            let d = d.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                            quote!((#d).clone())
+                        }
+                        (None, Some(d)) => crate::render_typed_reused(
+                            d,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(expected.clone()),
+                        )?,
+                        (None, None) => {
+                            return Err(format!(
+                                "{}() missing 1 required positional argument: '{}'",
+                                fname, pname
+                            )
+                            .into());
+                        }
+                    };
+                    args.push(tokens);
+                }
+                let arg_tuple = if args.len() == 1 {
+                    let only = &args[0];
+                    quote!((#only,))
+                } else {
+                    quote!((#(#args),*))
+                };
+                let callee = self.func.clone().to_rust(ctx, options, symbols)?;
+                return Ok(quote!((#callee).call(#arg_tuple)?));
+            }
             if !self.keywords.is_empty() {
                 return Err(format!(
                     "keyword arguments require the callee's signature, and `{}` is a \

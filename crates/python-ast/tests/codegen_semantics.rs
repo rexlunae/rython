@@ -6734,6 +6734,31 @@ fn a_loop_over_a_tuple_of_one_member_type_iterates_an_array() {
 }
 
 #[test]
+fn a_nested_default_of_a_mutable_type_stays_refused() {
+    // issue #370: only IMMUTABLE defaults are carried. Python evaluates a
+    // default once and every call shares that object, so a list the body
+    // appends to accumulates across calls; a per-call copy would not.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "def outer() -> list[int]:\n",
+            "    def grow(xs: list[int] = make()) -> list[int]:\n",
+            "        xs.append(1)\n",
+            "        return xs\n",
+            "    return grow()\n",
+            "def make() -> list[int]:\n",
+            "    return []\n",
+        ),
+        "mutable_default.py",
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("whose type is not immutable")),
+        "a mutable default must be refused: {:?}",
+        warnings
+    );
+    assert!(out.contains("compile_error !"), "the use stays loud: {}", out);
+}
+
+#[test]
 fn chained_class_level_literal_constants_lower_per_target() {
     // issue #367: a class-level CHAINED assignment (`tol = rel = 0` —
     // statistics' NumericTestCase) must lower one associated const per
@@ -19709,13 +19734,11 @@ fn chained_is_none_and_none_assigning_else_do_not_narrow() {
         out_vs
     );
     // Devin review on #285 (2nd pass): a walrus in a def DEFAULT rebinds
-    // the guarded name. Since issue #122 that program does not convert at
-    // all — Python evaluates a def's default WHERE THE `def` STANDS, and
-    // the nested definition the closure model refuses would have dropped
-    // the walrus with it (silently un-rebinding `x`, which is what made
-    // this case a narrowing question in the first place). The loud
-    // refusal at the definition subsumes the narrowing rule here.
-    let module = parse(
+    // the guarded name, WHERE THE `def` STANDS. Issue #370 evaluates a
+    // nested def's default there into a hidden local, so the walrus runs
+    // in the else branch (for a refused, unannotated `g` as for any other)
+    // and `x` is not narrowed past it.
+    let out = compile(
         "def d(x: str | None) -> str:\n\
          \x20   if x is None:\n\
          \x20       return \"a\"\n\
@@ -19724,20 +19747,11 @@ fn chained_is_none_and_none_assigning_else_do_not_narrow() {
          \x20           return y\n\
          \x20   return \"b\"\n",
         "none_defdefault.py",
-    )
-    .unwrap();
-    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
-    let err = module
-        .to_rust(
-            CodeGenContext::Module("none_defdefault".to_string()),
-            PythonOptions::default(),
-            symbols,
-        )
-        .expect_err("a walrus in a nested def default runs at the def");
+    );
     assert!(
-        err.to_string().contains("default whose expression Python"),
-        "{}",
-        err
+        out.contains("__rython_default_g_y = { x = None ;"),
+        "the walrus must run where the def stands: {}",
+        out
     );
 }
 
@@ -24946,60 +24960,64 @@ fn a_lambda_that_would_mutate_a_capture_is_refused() {
 }
 
 #[test]
-fn a_refused_definition_whose_header_runs_code_is_a_conversion_error() {
+fn a_nested_definitions_header_code_runs_where_the_def_stands() {
     // Issue #122 (Devin review on #345, round 1): Python evaluates a
     // decorator and a non-literal default WHERE THE `def` STANDS. A
-    // refused definition that simply emitted nothing would drop that
-    // side effect silently, even with the name never used — so it is a
-    // conversion error, not a warning.
-    for (src, needle) in [
-        (
-            "def bump() -> int:\n\
-             \x20   return 1\n\
-             \n\
-             def deco(f: int) -> int:\n\
-             \x20   return f\n\
-             \n\
-             def outer() -> int:\n\
-             \x20   @deco\n\
-             \x20   def inner(x) -> int:\n\
-             \x20       return x\n\
-             \x20   return 1\n",
-            "has a decorator",
-        ),
-        (
-            "def bump() -> int:\n\
-             \x20   return 1\n\
-             \n\
-             def outer() -> int:\n\
-             \x20   def inner(x: int = bump()):\n\
-             \x20       return x\n\
-             \x20   return 1\n",
-            "default whose expression Python",
-        ),
-    ] {
-        let module = parse(src, "header.py").unwrap();
-        let symbols = module.clone().find_symbols(SymbolTableScopes::new());
-        let err = module
-            .to_rust(
-                CodeGenContext::Module("header".to_string()),
-                PythonOptions::default(),
-                symbols,
-            )
-            .expect_err("a definition-time side effect must be refused");
-        assert!(err.to_string().contains(needle), "{}", err);
-    }
-    // A LITERAL default runs no code: it stays the ordinary refusal,
-    // loud where the name is used.
+    // decorator on a nested definition the closure model refuses is a
+    // conversion error — dropping the definition would drop it.
+    let module = parse(
+        "def bump() -> int:\n\
+         \x20   return 1\n\
+         \n\
+         def deco(f: int) -> int:\n\
+         \x20   return f\n\
+         \n\
+         def outer() -> int:\n\
+         \x20   @deco\n\
+         \x20   def inner(x) -> int:\n\
+         \x20       return x\n\
+         \x20   return 1\n",
+        "header.py",
+    )
+    .unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let err = module
+        .to_rust(
+            CodeGenContext::Module("header".to_string()),
+            PythonOptions::default(),
+            symbols,
+        )
+        .expect_err("a definition-time decorator must be refused");
+    assert!(err.to_string().contains("has a decorator"), "{}", err);
+    // A default is evaluated THERE into a hidden local (issue #370), so
+    // even a definition the closure model refuses (no return annotation)
+    // keeps the default's side effect: `bump()` runs where the `def` is.
+    let out = compile(
+        "def bump() -> int:\n\
+         \x20   return 1\n\
+         \n\
+         def outer() -> int:\n\
+         \x20   def inner(x: int = bump()):\n\
+         \x20       return x\n\
+         \x20   return 1\n",
+        "header_default.py",
+    );
+    assert!(
+        out.contains("__rython_default_inner_x = bump () ?"),
+        "the default must be evaluated where the def stands: {}",
+        out
+    );
+    // A carried closure with a literal default: a direct call fills or
+    // overrides it by Python's binding rules.
     let out = compile(
         "def outer() -> int:\n\
          \x20   def inner(x: int = 1) -> int:\n\
          \x20       return x\n\
-         \x20   return inner(2)\n",
+         \x20   return inner() + inner(2)\n",
         "literal_default.py",
     );
     assert!(
-        out.contains("compile_error ! (\"rython: `inner` cannot be called here"),
+        out.contains("(inner) . call ((1 ,)) ?") && out.contains("(inner) . call ((2 ,)) ?"),
         "{}",
         out
     );

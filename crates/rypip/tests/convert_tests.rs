@@ -12659,6 +12659,59 @@ fn loops_over_tuples_of_one_member_type_match_cpython() {
 }
 
 #[test]
+fn nested_defaults_are_evaluated_where_the_def_stands() {
+    // issue #370 (test_hashlib's loop-local `def c(...)` with a default
+    // computed from the loop variable): a nested def's default is
+    // evaluated where the `def` stands — once per execution, so each loop
+    // iteration's `c` keeps that iteration's value — and a direct call
+    // fills what it omits, positionally or by keyword. Such a def used to
+    // be refused, every use of it a compile_error.
+    let scratch = Scratch::new("nesteddefaults");
+    let krate = package_crate(
+        &scratch,
+        "nesteddefaults",
+        &[(
+            "cli.py",
+            concat!(
+                    "def main() -> None:\n",
+                    "    out = []\n",
+                    "    later = []\n",
+                    "    for n in range(3):\n",
+                    "        def c(k: int = n * 10, j: int = 1) -> int:\n",
+                    "            return k + j\n",
+                    "        out.append(c())\n",
+                    "        out.append(c(100))\n",
+                    "        out.append(c(j=5))\n",
+                    "        later.append(n)\n",
+                    "    print(out)\n",
+                    "\n",
+                    "\n",
+                    "def labels() -> list[str]:\n",
+                    "    prefix = \"item\"\n",
+                    "\n",
+                    "    def tag(i: int, sep: str = \"-\" + \"x\") -> str:\n",
+                    "        return prefix + sep + str(i)\n",
+                    "\n",
+                    "    return [tag(1), tag(2, \"/\")]\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                    "    print(labels())\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "nesteddefaults"),
+        vec![
+            "[1, 101, 5, 11, 101, 15, 21, 101, 25]",
+            "['item-x1', 'item/2']",
+        ]
+    );
+}
+
+#[test]
 fn non_finite_float_constants_match_cpython() {
     // issue #372: `1e400` is inf. It used to panic the converter; then it
     // rendered, but typed as a str in operator lowering (`1e400 * 0.0`

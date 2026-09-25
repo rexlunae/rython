@@ -95,15 +95,33 @@ pub(crate) fn closure_refusal(def: &FunctionDef) -> Option<String> {
             ));
         }
     }
-    if !def.args.defaults.is_empty()
-        || def.args.kw_defaults.iter().any(|d| d.is_some())
-    {
-        return Some(format!(
-            "nested function `{}` has a defaulted parameter; Rust has no \
-             default arguments and a callable value has no signature to \
-             fill them in from",
-            def.name
-        ));
+    // A positional default is carried (issue #370): `hoist_nested_def_
+    // defaults` evaluates it where the `def` stands into a hidden local,
+    // and a direct call by name fills a missing argument from it. A call
+    // through the VALUE (the callable stored and called elsewhere) has no
+    // signature to fill from, so there the full arity is required, loudly.
+    // Keyword-only parameters, and so their defaults, are refused above.
+    //
+    // Only an IMMUTABLE default is carried: Python evaluates a default once
+    // and every call shares that one object, so a mutable default the body
+    // mutates accumulates across calls — a per-call copy would not.
+    let params: Vec<&crate::ast::tree::arguments::Parameter> =
+        def.args.posonlyargs.iter().chain(def.args.args.iter()).collect();
+    let first = params.len().saturating_sub(def.args.defaults.len());
+    for p in &params[first..] {
+        let immutable = p
+            .evaluated_annotation()
+            .and_then(|a| crate::ast::tree::type_ctx::annotation_type_info(&a))
+            .is_some_and(|t| immutable_default_type(&t));
+        if !immutable {
+            return Some(format!(
+                "nested function `{}` has a default for `{}` whose type is not \
+                 immutable; Python evaluates a default once and every call shares \
+                 that object, which a copied default cannot reproduce. Pass the \
+                 argument explicitly",
+                def.name, p.arg
+            ));
+        }
     }
     if def.returns.is_none() {
         return Some(format!(
@@ -816,6 +834,104 @@ pub(crate) fn scope_cell_locals(
         .into_iter()
         .filter(|name| !capture_cannot_change(name, args, body))
         .collect()
+}
+
+/// Whether a default of this type can be copied per call without any
+/// observable difference from Python's one shared default object.
+fn immutable_default_type(t: &crate::TypeInfo) -> bool {
+    use crate::TypeInfo as T;
+    match t {
+        T::Int | T::Float | T::Bool | T::String | T::StrRef | T::Bytes | T::Complex => true,
+        T::Option(inner) => immutable_default_type(inner),
+        T::Tuple(ms) => ms.iter().all(immutable_default_type),
+        _ => false,
+    }
+}
+
+/// The hidden local a nested `def`'s positional default is evaluated into
+/// (issue #370).
+pub(crate) fn nested_default_local(def_name: &str, param: &str) -> String {
+    format!("{}default_{}_{}", crate::ast::tree::visit::RESERVED_PREFIX, def_name, param)
+}
+
+/// Evaluate each nested `def`'s positional defaults WHERE THE `def`
+/// STANDS (issue #370): `def c(k: int = n * 10)` becomes
+/// `__rython_default_c_k: int = n * 10` immediately before the `def`,
+/// whose default is then that name. Python evaluates a default once per
+/// execution of the `def` — each loop iteration re-evaluates it — and the
+/// function keeps the value from that moment (early binding), which is
+/// exactly an assignment there; as an ordinary local it is hoisted and
+/// typed by the scope analysis like any other. A constant default needs
+/// no local. Nested scopes are left to their own function's pass.
+pub(crate) fn hoist_nested_def_defaults(body: &mut Vec<Statement>) {
+    let mut i = 0;
+    while i < body.len() {
+        if !crate::ast::tree::visit::opens_scope(&body[i]) {
+            for inner in crate::ast::tree::visit::stmt_bodies_mut(&mut body[i]) {
+                hoist_nested_def_defaults(inner);
+            }
+            i += 1;
+            continue;
+        }
+        let (lineno, col_offset) = (body[i].lineno, body[i].col_offset);
+        let mut inserts: Vec<Statement> = Vec::new();
+        if let StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) =
+            &mut body[i].statement
+        {
+            let params: Vec<crate::ast::tree::arguments::Parameter> = f
+                .args
+                .posonlyargs
+                .iter()
+                .chain(f.args.args.iter())
+                .cloned()
+                .collect();
+            let first = params.len().saturating_sub(f.args.defaults.len());
+            for (j, default) in f.args.defaults.iter_mut().enumerate() {
+                // A constant needs no local. A container LITERAL is Python's
+                // shared mutable default — one object every call sees — which
+                // a per-call copy cannot reproduce; left in place, the
+                // definition stays a loud refusal (header_runs_code).
+                if matches!(
+                    **default,
+                    ExprType::Constant(_)
+                        | ExprType::NoneType(_)
+                        | ExprType::List(_)
+                        | ExprType::Dict(_)
+                        | ExprType::Set(_)
+                        | ExprType::ListComp(_)
+                        | ExprType::DictComp(_)
+                        | ExprType::SetComp(_)
+                ) {
+                    continue;
+                }
+                let Some(param) = params.get(first + j) else {
+                    continue;
+                };
+                let local = nested_default_local(&f.name, &param.arg);
+                let value = std::mem::replace(
+                    &mut **default,
+                    ExprType::Name(crate::ast::tree::name::Name { id: local.clone() }),
+                );
+                inserts.push(Statement {
+                    lineno,
+                    col_offset,
+                    end_lineno: lineno,
+                    end_col_offset: col_offset,
+                    statement: StatementType::Assign(crate::Assign {
+                        targets: vec![ExprType::Name(crate::ast::tree::name::Name { id: local })],
+                        value,
+                        type_comment: None,
+                        annotation: param.annotation.as_deref().cloned(),
+                    }),
+                });
+            }
+        }
+        let n = inserts.len();
+        for (k, s) in inserts.into_iter().enumerate() {
+            body.insert(i + k, s);
+        }
+        i += n + 1;
+    }
 }
 
 /// Whether a nested definition's HEADER runs code at the `def` — a
