@@ -17038,3 +17038,64 @@ fn a_closure_reads_its_captures_at_call_time() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn module_containers_mutated_by_functions_match_cpython() {
+    // Issue #122: module-level registries mutated in place from function
+    // bodies (a dict of callables, a list pinned by `x * 2`, a list that a
+    // parameter of the same name shadows elsewhere, a `return X.pop()`
+    // under an `if`) — each mutation lands on the one module object.
+    let scratch = Scratch::new("modmutate");
+    let krate = package_crate(
+        &scratch,
+        "modmutate",
+        &[(
+            "cli.py",
+            concat!(
+                "from typing import Callable\n",
+                "\n",
+                "HANDLERS = {}\n",
+                "LOG = []\n",
+                "NAMES = []\n",
+                "STACK = [\"a\", \"b\"]\n",
+                "\n",
+                "\n",
+                "def on(name: str, fn: Callable[[int], int]) -> None:\n",
+                "    HANDLERS[name] = fn\n",
+                "\n",
+                "\n",
+                "def record(x: int) -> None:\n",
+                "    LOG.append(x * 2)\n",
+                "\n",
+                "\n",
+                "def keep(NAMES: list[str], extra: str) -> int:\n",
+                "    NAMES.append(extra)\n",
+                "    return len(NAMES)\n",
+                "\n",
+                "\n",
+                "def pop_or(default: str) -> str:\n",
+                "    if len(STACK) > 0:\n",
+                "        return STACK.pop()\n",
+                "    return default\n",
+                "\n",
+                "\n",
+                "def double(v: int) -> int:\n",
+                "    return v * 2\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    on(\"d\", double)\n",
+                "    record(3)\n",
+                "    record(4)\n",
+                "    NAMES.append(\"n\")\n",
+                "    print(HANDLERS[\"d\"](21), LOG, len(HANDLERS), keep([\"w\"], \"z\"), NAMES)\n",
+                "    print(pop_or(\"none\"), pop_or(\"none\"), pop_or(\"none\"), STACK)\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "modmutate"),
+        vec!["42 [6, 8] 1 2 ['n']", "b a none []"]
+    );
+}

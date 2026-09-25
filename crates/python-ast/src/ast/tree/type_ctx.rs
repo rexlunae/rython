@@ -3780,13 +3780,13 @@ pub fn pin_empty_containers(
     // Every body, a NESTED definition's included: a nested function
     // captures enclosing names (Python closure semantics), so
     // `md_ratios.append(x)` inside a nested def pins the outer
-    // `md_ratios = []` (charset_normalizer's from_bytes). The nested
-    // function's OWN locals must not pollute the enclosing analysis, but
-    // a use of an enclosing empty container is exactly the pin we want.
-    visit::walk_stmts(body, Descend::All, &mut |stmt| {
-        collect_use_suggestions(stmt, info, symbols, options, &mut suggested);
-        Flow::Continue
-    });
+    // `md_ratios = []` (charset_normalizer's from_bytes); likewise a
+    // module function pins a module-level registry (issue #122:
+    // `_INITIALIZERS.append(callback)` in botocore's register_initializer).
+    // The nested function's OWN locals must not pollute the enclosing
+    // analysis, but a use of an enclosing empty container is exactly the
+    // pin we want.
+    collect_scope_suggestions(body, info, symbols, options, &mut suggested);
     for (name, t) in suggested {
         if info.empty_pinned.contains_key(&name) {
             // Unify with any existing (annotated) type: an annotated
@@ -3800,6 +3800,62 @@ pub fn pin_empty_containers(
             info.empty_pinned.insert(name, final_t);
         }
     }
+}
+
+/// The use suggestions of one scope's statements, then of each nested
+/// definition's body typed with ITS OWN annotated parameters (issue #122):
+/// in `def register(callback: Callable[[str], None]):
+/// _INITIALIZERS.append(callback)` the element's type is the parameter's,
+/// which the enclosing scope's map knows nothing of. A name a parameter
+/// SHADOWS refers to the parameter in that body, so the body's
+/// suggestions for it are dropped rather than pinned onto the outer name.
+fn collect_scope_suggestions(
+    body: &[Statement],
+    info: &FunctionTypeInfo,
+    symbols: Option<&SymbolTableScopes>,
+    options: Option<&PythonOptions>,
+    out: &mut HashMap<String, TypeInfo>,
+) {
+    visit::walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        collect_use_suggestions(stmt, info, symbols, options, out);
+        if let StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) =
+            &stmt.statement
+        {
+            let a = &f.args;
+            let params: Vec<&crate::ast::tree::arguments::Parameter> = a
+                .posonlyargs
+                .iter()
+                .chain(a.args.iter())
+                .chain(a.kwonlyargs.iter())
+                .chain(a.vararg.iter())
+                .chain(a.kwarg.iter())
+                .collect();
+            let mut inner = info.clone();
+            for p in &params {
+                match p.evaluated_annotation().and_then(|ann| annotation_type_info(&ann)) {
+                    Some(t) => {
+                        inner.name_types.insert(p.arg.clone(), t);
+                    }
+                    None => {
+                        inner.name_types.remove(&p.arg);
+                    }
+                }
+            }
+            let mut nested = HashMap::new();
+            collect_scope_suggestions(&f.body, &inner, symbols, options, &mut nested);
+            for (name, t) in nested {
+                if params.iter().any(|p| p.arg == name) {
+                    continue;
+                }
+                let joined = match out.remove(&name) {
+                    Some(prev) => unify(prev, t),
+                    None => t,
+                };
+                out.insert(name, joined);
+            }
+        }
+        Flow::Continue
+    });
 }
 
 /// The use suggestions of ONE statement (its bodies are the caller's
@@ -4976,6 +5032,28 @@ fn resolve_type_inner(
                 };
             }
             syntactic_type(expr)
+        }
+        // Arithmetic over resolved operands (issue #122: `LOG.append(x *
+        // 2)` with `x: int` pins `list[int]`, not a boxed list). Only the
+        // shapes whose Python result type is fixed by the operand types;
+        // anything else stays syntactic.
+        ExprType::BinOp(b) => {
+            use crate::ast::tree::bin_ops::BinOps as Op;
+            let l = resolve_type_inner(&b.left, info, symbols, options);
+            let r = resolve_type_inner(&b.right, info, symbols, options);
+            match (&b.op, &l, &r) {
+                (Op::Add | Op::Sub | Op::Mult | Op::FloorDiv | Op::Mod, TypeInfo::Int, TypeInfo::Int) => {
+                    TypeInfo::Int
+                }
+                (Op::Div, TypeInfo::Int | TypeInfo::Float, TypeInfo::Int | TypeInfo::Float)
+                | (
+                    Op::Add | Op::Sub | Op::Mult,
+                    TypeInfo::Float,
+                    TypeInfo::Int | TypeInfo::Float,
+                )
+                | (Op::Add | Op::Sub | Op::Mult, TypeInfo::Int, TypeInfo::Float) => TypeInfo::Float,
+                _ => syntactic_type(expr),
+            }
         }
         _ => syntactic_type(expr),
     }

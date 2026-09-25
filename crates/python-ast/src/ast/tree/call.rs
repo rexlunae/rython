@@ -2316,6 +2316,54 @@ impl<'a> CodeGen for Call {
         {
             return self.args[1].clone().to_rust(ctx, options, symbols);
         }
+        // A mutating METHOD call on a module-level container (`X.append(v)`,
+        // `return X.pop()` — issues #337, #122) runs under the static's lock
+        // right where it stands, as an expression: its value flows out of
+        // the lock, and the statement around it (a `return`, an `if` test)
+        // stays outside the closure. Stores through a static (`X[k] = v`)
+        // are wrapped at the statement instead (statement.rs).
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && let ExprType::Name(recv) = attr.value.as_ref()
+            && crate::ast::tree::scope::mutates_receiver(&attr.attr)
+            && options.mutable_statics.contains_key(&recv.id)
+            && !options.static_mutation_alias.contains_key(&recv.id)
+        {
+            let root = recv.id.clone();
+            // The Mutex is not reentrant: an argument that reads the same
+            // global would deadlock — refuse rather than hang.
+            let mut reads = false;
+            for e in self.args.iter().chain(self.keywords.iter().map(|k| &k.value)) {
+                crate::ast::tree::visit::walk_expr(e, &mut |sub| {
+                    if let ExprType::Name(n) = sub
+                        && n.id == root
+                    {
+                        reads = true;
+                    }
+                });
+            }
+            if reads {
+                return Err(format!(
+                    "`{root}.{}(...)` mutates `{root}` in place while its own arguments also \
+                     READ `{root}`: the module object is held under a lock for the mutation, \
+                     so the read would deadlock. Bind the read to a local first \
+                     (`n = len({root})`), then mutate.",
+                    attr.attr
+                )
+                .into());
+            }
+            let (inner, alias_ident, static_ref) =
+                crate::ast::tree::module::static_mutation_scope(&options, &root);
+            let call = self.to_rust(ctx, inner, symbols)?;
+            // The temp is named after the Python global, so an UPPER_CASE
+            // name would draw non_snake_case; the identifier is rython's.
+            return Ok(quote! {
+                stdpython::py_global_mutate(
+                    #static_ref,
+                    #[allow(non_snake_case)]
+                    |#alias_ident| -> Result<_, stdpython::PyException> { Ok(#call) },
+                )?
+            });
+        }
         // An EXPLICIT `obj.__eq__(other)` on a shared class whose `__eq__`
         // can decline (`return NotImplemented`): the decline is the
         // `Option<bool>`'s None inside the `==` adapter (PyRefEq), and the

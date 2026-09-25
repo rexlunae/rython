@@ -9230,6 +9230,24 @@ fn module_level_empty_list_pinned_by_later_use() {
 }
 
 #[test]
+fn a_mutating_call_on_a_module_static_locks_as_an_expression() {
+    // Issue #122: `return STACK.pop()` under an `if` locks the static for
+    // the CALL only — the `return` stays outside the lock's closure (a
+    // statement-level wrapper captured it and returned from the closure).
+    let out = compile(
+        "STACK = [\"a\"]\n\ndef pop_or(d: str) -> str:\n    if len(STACK) > 0:\n        return STACK.pop()\n    return d\n",
+        "mret.py",
+    );
+    assert!(out.contains("return Ok (stdpython :: py_global_mutate"), "generated: {}", out);
+    // An argument that reads the same static would deadlock: loud.
+    let err = compile_err(
+        "LOG = [1]\n\ndef f() -> None:\n    LOG.append(len(LOG))\n",
+        "mdead.py",
+    );
+    assert!(err.contains("would deadlock"), "error: {}", err);
+}
+
+#[test]
 fn module_level_empty_dict_pinned_by_later_store() {
     let out = compile("d = {}\nd[\"k\"] = 1\n", "memptyd.py");
     assert!(out.contains("Mutex < PyDict < String , i64 > >"), "generated: {}", out);

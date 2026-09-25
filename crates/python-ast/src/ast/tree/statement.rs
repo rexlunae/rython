@@ -107,37 +107,23 @@ impl CodeGen for Statement {
                 )
                 .into());
             }
-            let ident = crate::safe_ident(&root);
-            // Rust forbids a binding that shadows a static (E0530), so the
-            // locked object takes a reserved-prefix temporary and the
-            // name resolves to it for this statement only.
-            let alias = format!("{}static_{}", crate::ast::tree::visit::RESERVED_PREFIX, root);
-            let alias_ident = crate::safe_ident(&alias);
-            let mut inner = options.clone();
-            let mut aliases = (*inner.static_mutation_alias).clone();
-            aliases.insert(root.clone(), alias.clone());
-            inner.static_mutation_alias = std::rc::Rc::new(aliases);
-            let mut statics = (*inner.mutable_statics).clone();
-            statics.remove(&root);
-            inner.mutable_statics = std::rc::Rc::new(statics);
-            let mut writables = (*inner.scope_global_writables).clone();
-            writables.remove(&root);
-            inner.scope_global_writables = std::rc::Rc::new(writables);
-            let mut promoted = (*inner.promoted_statics).clone();
-            promoted.remove(&root);
-            inner.promoted_statics = std::rc::Rc::new(promoted);
-            let kind = options.mutable_statics.get(&root).expect("root is a mutable static");
-            let static_ref = kind.static_ref(&ident);
+            let (inner, alias_ident, static_ref) =
+                crate::ast::tree::module::static_mutation_scope(&options, &root);
             let body = self.to_rust(ctx, inner, symbols)?;
-            // The temp is named after the Python global, so an
-            // UPPER_CASE module name (the common shape for a registry)
+            // The store may raise (`?` in its rendering): the closure
+            // returns the Result and the caller threads it. The temp is
+            // named after the Python global, so an UPPER_CASE module name
             // would draw rustc's non_snake_case lint at every mutation
-            // site. The warning is about an identifier rython synthesized,
-            // not about the user's Python, so it is silenced here rather
-            // than left for the reader to sift out of the real ones.
+            // site; the identifier is rython's, so it is silenced here.
             return Ok(quote! {
                 #[allow(non_snake_case)]
-                stdpython::py_global_mutate(#static_ref, |#alias_ident| { #body });
+                stdpython::py_global_mutate(
+                    #static_ref,
+                    |#alias_ident| -> Result<(), stdpython::PyException> {
+                        #body;
+                        Ok(())
+                    },
+                )?;
             });
         }
         // A statement that MUTATES a closure cell (issue #122): borrow the
