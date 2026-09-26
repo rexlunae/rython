@@ -3521,7 +3521,7 @@ fn omitted_defaults_fill_at_the_call_site() {
     );
     let out = compile(src, "kwdef.py");
     assert!(
-        out.contains("greet (\"world\" , false) }) ?"),
+        out.contains("Ok (greet (\"world\" , false) ?)"),
         "generated: {}",
         out
     );
@@ -3608,8 +3608,8 @@ fn optional_parameters_wrap_arguments_at_call_sites() {
     // All-positional calls emit directly (no reordering): the `?` still
     // applies to the whole call, now wrapped in the lowering block and
     // parenthesized so it is valid in any position (F9).
-    assert!(out.contains("({ label (Some (7)) }) ?"), "generated: {}", out);
-    assert!(out.contains("({ label (None) }) ?"), "generated: {}", out);
+    assert!(out.contains("a = label (Some (7)) ?"), "generated: {}", out);
+    assert!(out.contains("b = label (None) ?"), "generated: {}", out);
 }
 
 #[test]
@@ -4001,9 +4001,7 @@ fn local_from_dict_returning_self_method_owns_string_keys() {
         out
     );
     assert!(
-        out.contains("ctx = { (self) . _merge (None) ? }")
-            || out.contains("ctx = { (self)._merge(None)? }")
-            || out.contains("ctx = (self . _merge (None)) ?"),
+        out.contains("ctx = (self) . _merge (None) ?"),
         "the local must be assigned from the self-method call: {}",
         out
     );
@@ -4720,7 +4718,7 @@ fn float_coercible_class_lowers_via_float_and_into() {
         out
     );
     assert!(
-        out.contains("FloatLike :: new (PyValue :: from (1.0)) ? }) . into ()"),
+        out.contains("(FloatLike :: new (PyValue :: from (1.0)) ?) . into ()"),
         "a heterogeneous [float, FloatLike] list element must coerce via Into: {}",
         out
     );
@@ -11062,8 +11060,9 @@ fn global_computed_initializer_lowers_to_a_lazylock_static() {
 #[test]
 fn class_instance_global_wraps_fallible_construction_in_a_panicking_match() {
     // Issue #229: `REC = Klass(7)` promoted to `LazyLock<Klass>`. The
-    // construction renders as a brace block (`{ Klass::new(7)? }` — the
-    // argument-mapping prelude form), and the promoted-static path's
+    // construction rendered as a brace block (`{ Klass::new(7)? }` — the
+    // argument-mapping prelude form; an empty prelude now emits the bare
+    // call), and the promoted-static path's
     // trailing-`?` strip only looked at the OUTER stream's last token, so
     // the `?` survived inside a closure that returns `Klass` (E0277). The
     // strip now descends into a sole brace block, and the closure
@@ -11091,7 +11090,7 @@ fn class_instance_global_wraps_fallible_construction_in_a_panicking_match() {
         out
     );
     assert!(
-        out.contains("match { Klass :: new (7) }"),
+        out.contains("match Klass :: new (7) {"),
         "the fallible construction must unwrap inside a match: {}",
         out
     );
@@ -11112,6 +11111,61 @@ fn class_instance_global_wraps_fallible_construction_in_a_panicking_match() {
     assert!(
         out.contains("vec ! [(\"kept\") . to_string ()]"),
         "the list field's store must own its string elements: {}",
+        out
+    );
+}
+
+#[test]
+fn empty_argument_prelude_emits_the_bare_call_without_braces() {
+    // A call whose arguments need no source-order temps has an empty
+    // argument-mapping prelude; wrapping the lone call in a block
+    // (`s = { Span::new(vec![4, 9, 12])? };`) trips rustc's
+    // `unused_braces` lint in the generated crate. The empty prelude now
+    // emits the bare call; a keyword-reordering call still gets its
+    // temp-binding block.
+    let out = compile(
+        concat!(
+            "from typing import List\n",
+            "\n",
+            "class Span:\n",
+            "    def __init__(self, parts: List[int]) -> None:\n",
+            "        self.parts = parts\n",
+            "\n",
+            "    def scale(self, k: int, off: int) -> int:\n",
+            "        return self.parts[0] * k + off\n",
+            "\n",
+            "def pair(a: int, b: int) -> int:\n",
+            "    return a - b\n",
+            "\n",
+            "def main() -> None:\n",
+            "    s = Span([4, 9, 12])\n",
+            "    print(s.parts)\n",
+            "    print(s.scale(2, 1))\n",
+            "    print(pair(b=1, a=5))\n",
+        ),
+        "br.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("=Span::new(vec![4,9,12])?;"),
+        "an empty prelude must emit the bare construction: {}",
+        out
+    );
+    assert!(
+        !flat.contains("{Span::new("),
+        "no brace block may wrap a prelude-free construction: {}",
+        out
+    );
+    assert!(
+        !flat.contains("{(s).scale(") && !flat.contains("{s.scale("),
+        "no brace block may wrap a prelude-free method call: {}",
+        out
+    );
+    // Keywords out of parameter order still bind temps in source order
+    // (CPython evaluates `b=1` before `a=5`), so that call keeps its block.
+    assert!(
+        flat.contains("let__rython_arg_"),
+        "a reordering call keeps its source-order prelude: {}",
         out
     );
 }
@@ -13253,7 +13307,7 @@ fn global_class_instance_lowers_to_a_typed_static() {
         out
     );
     assert!(
-        out.contains("py_global_write (& RECORDER , Some ({ HistoryRecorder :: new () ? }))"),
+        out.contains("py_global_write (& RECORDER , Some (HistoryRecorder :: new () ?))"),
         "the class store must wrap in Some: {}",
         out
     );
@@ -16977,7 +17031,7 @@ fn annotated_local_widened_by_a_later_option_store() {
         "widened.py",
     );
     assert!(
-        out.contains("Some ({ (self) . host () ? })") || out.contains("Some({(self).host()?})"),
+        out.contains("Some ((self) . host () ?)"),
         "the plain String store must wrap into the widened local: {}",
         out
     );
@@ -18589,8 +18643,7 @@ fn class_instances_display_through_str_or_default_repr() {
         out
     );
     assert!(
-        out.contains("print (& ({ Pool :: new")
-            || out.contains("print(&({ Pool::new"),
+        out.contains("print (& (Pool :: new"),
         "a class instance in print compiles through the PyDisplay bound: {}",
         out
     );
@@ -18660,7 +18713,7 @@ fn exception_message_args_wrap_class_instances_in_py_display() {
     // The construction runs code, so it is evaluated once into a
     // temporary the message (py_display) and the recorded repr read.
     assert!(
-        out.contains("let __rython_exc_m0 = { Pool :: new (\"x\") ? } ;"),
+        out.contains("let __rython_exc_m0 = Pool :: new (\"x\") ? ;"),
         "the argument is evaluated once: {}",
         out
     );
@@ -20318,8 +20371,8 @@ fn a_list_of_a_root_holds_the_sum_type_and_its_elements_convert() {
         // Round 114: the conversion NAMES the target sum type
         // (`AnyShape::from(...)`) — an `.into()` in a `vec![...]` literal
         // left the element type unnamed (E0282).
-        flat.contains("AnyShape::from({Rect::new(2.0)?})")
-            && flat.contains("AnyShape::from({Square::new(1.0)?})"),
+        flat.contains("AnyShape::from(Rect::new(2.0)?)")
+            && flat.contains("AnyShape::from(Square::new(1.0)?)"),
         "every element converts into the root's sum type: {}",
         out
     );
@@ -21422,7 +21475,7 @@ fn a_variant_holding_its_family_inline_is_boxed_and_the_field_store_converts() {
         out
     );
     assert!(
-        flat.contains("self.inner=({Inner::new(0)?}).into();"),
+        flat.contains("self.inner=(Inner::new(0)?).into();"),
         "the store into the root-typed field converts: {}",
         out
     );
@@ -21487,7 +21540,7 @@ fn a_shared_family_sum_type_holds_references_and_borrows_in_its_delegators() {
         out
     );
     assert!(
-        flat.contains("::from({stdpython::PyRef::new(Perishable::new()?)}"),
+        flat.contains("::from(stdpython::PyRef::new(Perishable::new()?))"),
         "a subtree construction converts into the sum type: {}",
         out
     );

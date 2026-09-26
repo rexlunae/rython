@@ -8,10 +8,60 @@ mod common;
 
 use common::Scratch;
 use rypip::package::discover;
-use rypip::packaging::{read_project_metadata, resolve_package_dirs};
+use rypip::packaging::{read_project_metadata_with, resolve_package_dirs, SetupPyExec};
 use rypip::resolve::{
     matches_specifier, parse_requirement, parse_version, version_cmp, version_satisfies,
 };
+
+/// Holds the lock every environment-writing test in this binary takes, and
+/// restores each variable it touched on drop. `convert` and
+/// `resolve_dependency_tree` read `RYPIP_OFFLINE` / `RYPIP_CACHE_DIR`
+/// from the process environment, and cargo runs tests on parallel threads:
+/// an unserialized, unrestored write is observed by whichever test happens
+/// to run next. Prefer passing settings explicitly (`resolve_dependency_in`,
+/// `read_project_metadata_with`); take this guard only where the API under
+/// test reads the env itself.
+struct EnvGuard {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    fn lock() -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // A failed test poisons the lock; the environment is restored by
+        // its guard's drop regardless, so the next test may proceed.
+        let lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        EnvGuard { saved: Vec::new(), _lock: lock }
+    }
+
+    fn set(&mut self, key: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+        self.save(key);
+        // SAFETY: every env write in this binary happens under LOCK, and
+        // the variables written are read only by tests holding it.
+        unsafe { std::env::set_var(key, value) };
+    }
+
+    fn save(&mut self, key: &'static str) {
+        if !self.saved.iter().any(|(k, _)| *k == key) {
+            self.saved.push((key, std::env::var_os(key)));
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.drain(..).rev() {
+            // SAFETY: as in `set` — LOCK is still held here.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PEP 440 version comparison and specifiers
@@ -223,13 +273,12 @@ fn setup_cfg_metadata_and_install_requires() {
 
 #[test]
 fn setup_py_shim_extracts_metadata() {
-    // The shim is OPT-IN (RYPIP_ALLOW_SETUP_PY_EXEC=1): executing a
-    // downloaded sdist's setup.py runs third-party code on this host, so
-    // the default path must never fire. This test exercises the opt-in.
-    // SAFETY: single-threaded test body; no other thread reads the env.
-    unsafe {
-        std::env::set_var("RYPIP_ALLOW_SETUP_PY_EXEC", "1");
-    }
+    // The shim is OPT-IN (`SetupPyExec::Allow`, which the CLI takes from
+    // RYPIP_ALLOW_SETUP_PY_EXEC=1): executing a downloaded sdist's
+    // setup.py runs third-party code on this host, so the default path
+    // must never fire. This test passes the opt-in explicitly — setting
+    // the env var here leaked it into every test running alongside, and
+    // that leak is what masked the broken static reader below.
     if std::process::Command::new("python3")
         .arg("--version")
         .output()
@@ -239,17 +288,20 @@ fn setup_py_shim_extracts_metadata() {
         return;
     }
     let scratch = Scratch::new("setuppy");
+    // `setup(**kwargs)` has no literal keywords, so the static reader
+    // yields nothing and only the shim can recover the metadata.
     fs::write(
         scratch.path().join("setup.py"),
         concat!(
             "from setuptools import setup, find_packages\n",
             "\n",
-            "setup(\n",
+            "kwargs = dict(\n",
             "    name='shim_pkg',\n",
             "    version='2.0.0',\n",
             "    packages=find_packages(),\n",
             "    install_requires=['depx>=1.0', 'depy'],\n",
             ")\n",
+            "setup(**kwargs)\n",
         ),
     )
     .unwrap();
@@ -258,7 +310,12 @@ fn setup_py_shim_extracts_metadata() {
     fs::write(pkg_dir.join("__init__.py"), "").unwrap();
     fs::write(pkg_dir.join("mod.py"), "def f() -> int:\n    return 1\n").unwrap();
 
-    let meta = read_project_metadata(scratch.path()).unwrap();
+    // Without the opt-in nothing is executed and nothing is guessed.
+    let skipped = read_project_metadata_with(scratch.path(), SetupPyExec::Skip).unwrap();
+    assert_eq!(skipped.name, None);
+    assert_eq!(skipped.version, None);
+
+    let meta = read_project_metadata_with(scratch.path(), SetupPyExec::Allow).unwrap();
     assert_eq!(meta.name.as_deref(), Some("shim_pkg"));
     assert_eq!(meta.version.as_deref(), Some("2.0.0"));
     assert_eq!(
@@ -269,11 +326,7 @@ fn setup_py_shim_extracts_metadata() {
     assert!(meta.packages.contains(&rypip::packaging::RYTHON_FIND_SENTINEL.to_string()));
 
     let dirs = resolve_package_dirs(scratch.path(), &meta).unwrap();
-    assert_eq!(dirs.len(), 1, "{:?}", dirs);
-    let pkg = discover(scratch.path()).expect("discover");
-    let paths: Vec<String> = pkg.modules.iter().map(|m| m.path.join(".")).collect();
-    assert!(paths.contains(&"shim_pkg".to_string()), "{:?}", paths);
-    assert!(paths.contains(&"shim_pkg.mod".to_string()), "{:?}", paths);
+    assert_eq!(dirs, vec![PathBuf::from("shim_pkg")]);
 }
 
 #[test]
@@ -298,10 +351,74 @@ fn setup_py_static_fallback_without_python3() {
     fs::create_dir_all(&pkg_dir).unwrap();
     fs::write(pkg_dir.join("__init__.py"), "").unwrap();
 
+    // Explicitly without the execution opt-in: this is the static reader
+    // alone. (Before the reader was fixed it never parsed any call, and
+    // this test passed only when the shim test's leaked opt-in let
+    // python3 answer instead — a race it lost about 1 run in 75 locally.)
+    let meta = read_project_metadata_with(scratch.path(), SetupPyExec::Skip).unwrap();
+    assert_eq!(meta.version.as_deref(), Some("3.1.4"));
     let pkg = discover(scratch.path()).expect("discover");
     assert_eq!(pkg.name, "static_pkg");
     assert_eq!(pkg.version, "3.1.4");
     assert_eq!(pkg.dependencies, vec!["onlydep".to_string()]);
+}
+
+#[test]
+fn setup_py_static_reader_takes_literals_and_refuses_computed_values() {
+    // Comments, bare find_packages(), and computed keywords the reader
+    // does not consume (long_description) are all fine.
+    let scratch = Scratch::new("setuppy-static-find");
+    fs::write(
+        scratch.path().join("setup.py"),
+        concat!(
+            "from setuptools import setup, find_packages\n",
+            "setup(\n",
+            "    # the distribution's name, as pip shows it\n",
+            "    name='found_pkg',\n",
+            "    version=\"0.9.1\",\n",
+            "    long_description=open('README.md').read(),\n",
+            "    packages=find_packages(),\n",
+            "    install_requires=['a>=1,<2', \"b\"],\n",
+            ")\n",
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(scratch.path().join("found_pkg/sub")).unwrap();
+    fs::write(scratch.path().join("found_pkg/__init__.py"), "").unwrap();
+    fs::write(scratch.path().join("found_pkg/sub/__init__.py"), "").unwrap();
+    let pkg = discover(scratch.path()).expect("discover");
+    assert_eq!(pkg.name, "found_pkg");
+    assert_eq!(pkg.version, "0.9.1");
+    // The comma inside a PEP 508 specifier set belongs to its element.
+    assert_eq!(pkg.dependencies, vec!["a>=1,<2".to_string(), "b".to_string()]);
+    let paths: Vec<String> = pkg.modules.iter().map(|m| m.path.join(".")).collect();
+    assert!(paths.contains(&"found_pkg".to_string()), "{:?}", paths);
+    assert!(paths.contains(&"found_pkg.sub".to_string()), "{:?}", paths);
+
+    // A computed value of a consumed keyword is never taken verbatim (the
+    // version is not the string "__version__"), nor is an argument-taking
+    // find_packages() widened to a bare one: without the execution
+    // opt-in the metadata stays unknown.
+    for (tag, setup_py) in [
+        (
+            "setuppy-static-computed",
+            "__version__ = '1.2.3'\nfrom setuptools import setup\nsetup(name='c', version=__version__)\n",
+        ),
+        (
+            "setuppy-static-concat",
+            "from setuptools import setup\nsetup(name='c', version='1.' '2')\n",
+        ),
+        (
+            "setuppy-static-find-args",
+            "from setuptools import setup, find_packages\nsetup(name='c', packages=find_packages(where='src'))\n",
+        ),
+    ] {
+        let scratch = Scratch::new(tag);
+        fs::write(scratch.path().join("setup.py"), setup_py).unwrap();
+        let meta = read_project_metadata_with(scratch.path(), SetupPyExec::Skip).unwrap();
+        assert_eq!((meta.name.as_deref(), meta.version.as_deref()), (None, None), "{setup_py}");
+        assert!(meta.packages.is_empty(), "{setup_py}: {:?}", meta.packages);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -311,9 +428,10 @@ fn setup_py_static_fallback_without_python3() {
 #[test]
 fn resolve_requirement_from_cache_requires_network_or_cache() {
     // Offline resolution of an uncached dependency is a loud error.
-    unsafe { std::env::set_var("RYPIP_OFFLINE", "1") };
+    let scratch = Scratch::new("offline-uncached");
     let req = parse_requirement("this-package-definitely-does-not-exist-rython-test").unwrap();
-    let err = rypip::resolve::resolve_dependency(&req, true).expect_err("offline + uncached");
+    let err = rypip::resolve::resolve_dependency_in(&scratch.path().join("empty-cache"), &req, true)
+        .expect_err("offline + uncached");
     assert!(err.to_string().contains("offline"), "{:?}", err);
 }
 
@@ -907,19 +1025,15 @@ fn resolve_dependency_end_to_end_from_pypi() {
     }
     let scratch = Scratch::new("resolve-e2e");
     let cache = scratch.path().join("cache");
-    unsafe {
-        std::env::set_var("RYPIP_CACHE_DIR", &cache);
-        std::env::remove_var("RYPIP_OFFLINE");
-    }
 
     // pylev: a tiny pure-Python package with a single module.
     let req = parse_requirement("pylev>=1.3").unwrap();
-    let dep = rypip::resolve::resolve_dependency(&req, false).expect("resolve pylev");
+    let dep = rypip::resolve::resolve_dependency_in(&cache, &req, false).expect("resolve pylev");
     assert_eq!(dep.import_name, "pylev");
     assert!(dep.path.join("__init__.py").is_file() || dep.path.is_file(), "{:?}", dep.path);
 
     // A second resolution hits the cache (no fetch).
-    let dep2 = rypip::resolve::resolve_dependency(&req, false).expect("resolve pylev cached");
+    let dep2 = rypip::resolve::resolve_dependency_in(&cache, &req, false).expect("resolve pylev cached");
     assert_eq!(dep2.path, dep.path);
 
     // And the cached distribution satisfies the specifier.
@@ -997,10 +1111,9 @@ fn pyproject_dependencies_merge_with_vendored_python_modules_offline() {
     )
     .unwrap();
 
-    unsafe {
-        std::env::set_var("RYPIP_OFFLINE", "1");
-        std::env::set_var("RYPIP_CACHE_DIR", scratch.path().join("empty-cache"));
-    }
+    let mut env = EnvGuard::lock();
+    env.set("RYPIP_OFFLINE", "1");
+    env.set("RYPIP_CACHE_DIR", scratch.path().join("empty-cache"));
     let pkg = discover(scratch.path()).expect("discover");
     assert_eq!(pkg.dependencies, vec!["pylev>=1.3".to_string()]);
     let out = scratch.path().join("crate");
@@ -1036,7 +1149,8 @@ fn no_deps_skips_resolution_entirely() {
     )
     .unwrap();
 
-    unsafe { std::env::set_var("RYPIP_OFFLINE", "1") };
+    let mut env = EnvGuard::lock();
+    env.set("RYPIP_OFFLINE", "1");
     let pkg = discover(scratch.path()).expect("discover");
     let out = scratch.path().join("crate");
     rypip::convert(
@@ -1063,10 +1177,9 @@ fn resolve_dependency_tree_pulls_transitives() {
     }
     let scratch = Scratch::new("resolve-tree");
     let cache = scratch.path().join("cache");
-    unsafe {
-        std::env::set_var("RYPIP_CACHE_DIR", &cache);
-        std::env::remove_var("RYPIP_OFFLINE");
-    }
+    // resolve_dependency_tree takes its cache from RYPIP_CACHE_DIR.
+    let mut env = EnvGuard::lock();
+    env.set("RYPIP_CACHE_DIR", &cache);
 
     let req = parse_requirement("requests>=2.0").unwrap();
     let tree = rypip::resolve::resolve_dependency_tree(&req, false).expect("resolve tree");

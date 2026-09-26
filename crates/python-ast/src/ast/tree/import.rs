@@ -2854,14 +2854,28 @@ impl CodeGen for ImportFrom {
                     quote! { #visibility use #root #(::#base_parts)* #(::#module_path)*::#name as #asname; }
                 }
             };
+            // In the BIN copy of the entry module the code IS the crate
+            // root, which declares the root-level modules itself: `from .
+            // import data` resolving to `crate::data` would re-import the
+            // module into the scope that defines it (E0255). An alias
+            // (`as d`) names a new binding and still needs its use.
+            let bin_root_module = options.bin_crate_root
+                && self.level > 0
+                && self.resolved_module_path(&options).is_empty()
+                && alias.asname.as_ref().is_none_or(|a| a == &alias.name)
+                && options
+                    .module_defs
+                    .keys()
+                    .any(|k| k.first() == Some(&alias.name));
             // A SELF-referential import (`from . import packages, utils`
             // inside requests/__init__.py — the resolved module path IS
             // the current module): the names are the package's OWN
             // submodules, already declared by `pub mod`; the emitted
             // `pub use crate::requests::packages;` would re-import the
             // sibling into itself (E0255 — defined multiple times).
-            let self_resolved = self.level > 0
-                && options.this_module_path == self.resolved_module_path(&options);
+            let self_resolved = bin_root_module
+                || (self.level > 0
+                    && options.this_module_path == self.resolved_module_path(&options));
             if !self_resolved {
                 tokens.extend(import);
             }
