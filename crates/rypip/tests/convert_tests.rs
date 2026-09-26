@@ -884,6 +884,63 @@ fn class_instance_global_singleton_matches_python_at_runtime() {
 }
 
 #[test]
+fn entry_module_crate_builds_warning_clean() {
+    // An entry module is compiled twice: as the bin root (src/main.rs) and
+    // as a lib submodule (src/<name>.rs). Two artifacts of the generator
+    // surfaced as rustc warnings that say nothing about the source Python:
+    // an empty argument-mapping prelude wrapped the construction in a
+    // block (`s = { Span::new(vec![4, 9, 12])? };` — unused_braces), and
+    // the lib copy's never-called `fn main` tripped dead_code. Neither
+    // may appear in a build of the generated crate's own sources.
+    let scratch = Scratch::new("entryclean");
+    let file = scratch.path().join("br.py");
+    fs::write(
+        &file,
+        concat!(
+            "from typing import List\n",
+            "\n",
+            "class Span:\n",
+            "    def __init__(self, parts: List[int]) -> None:\n",
+            "        self.parts = parts\n",
+            "\n",
+            "def main() -> None:\n",
+            "    s = Span([4, 9, 12])\n",
+            "    print(s.parts)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let build = Command::new("cargo")
+        .arg("build")
+        .env_remove("RUSTFLAGS")
+        .current_dir(&krate.root)
+        .output()
+        .expect("running cargo build");
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(build.status.success(), "generated crate failed to compile: {}", stderr);
+    // Diagnostics located in the generated crate's own sources (a path
+    // dependency's would point outside src/).
+    assert!(
+        !stderr.contains("--> src/"),
+        "the generated crate must build warning-clean: {}",
+        stderr
+    );
+
+    let output = Command::new(krate.root.join("target/debug/br"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "[4, 9, 12]\n");
+    assert!(output.status.success(), "binary exited nonzero");
+}
+
+#[test]
 fn functools_partial_keyword_bindings_match_python_at_runtime() {
     // Keyword bindings emitting in the callee's declared order
     // (botocore's `partial(delay_exponential, base=base,
