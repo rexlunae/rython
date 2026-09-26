@@ -178,6 +178,11 @@ impl CodeGen for Statement {
                 None => tokens,
             })
             .map(|tokens| match bind {
+                // The marker is a separate statement: a rendering without
+                // its own terminator (an aug-assign `total = (total)
+                // .py_add(&(v))` in a module-level loop) must end before
+                // it, or the two run together into a parse error.
+                Some(bind) if needs_terminator(&tokens) => quote!(#tokens; #bind),
                 Some(bind) => quote!(#tokens #bind),
                 None => tokens,
             })
@@ -1590,5 +1595,18 @@ def foo():
             SymbolTableScopes::new(),
         );
         tracing::info!("module: {:?}", code);
+    }
+}
+
+/// Whether a statement's rendering needs a `;` before another statement
+/// can follow it: not when it is empty (lowered to nothing) or already
+/// ends in `;` or a `{ ... }` block (an `if`, a loop, a block statement).
+fn needs_terminator(tokens: &proc_macro2::TokenStream) -> bool {
+    use proc_macro2::{Delimiter, TokenTree};
+    match tokens.clone().into_iter().last() {
+        None => false,
+        Some(TokenTree::Punct(p)) => p.as_char() != ';',
+        Some(TokenTree::Group(g)) => g.delimiter() != Delimiter::Brace,
+        Some(_) => true,
     }
 }

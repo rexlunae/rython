@@ -941,6 +941,49 @@ fn entry_module_crate_builds_warning_clean() {
 }
 
 #[test]
+fn module_level_loop_aug_assigns_match_python_at_runtime() {
+    // A statement nested in module-level control flow is followed by its
+    // `__rython_bind__` marker. An aug-assign renders without its own
+    // terminator (`total = (total).py_add(&(v))`), so the marker ran into
+    // it (`... py_add(&(v)) __rython_bind__(..)`) and the generated crate
+    // failed to parse. The statement now ends before its marker.
+    let scratch = Scratch::new("augloop");
+    let file = scratch.path().join("augentry.py");
+    fs::write(
+        &file,
+        concat!(
+            "total = 0\n",
+            "for v in [1, 2, 3]:\n",
+            "    total += v\n",
+            "    total *= 2\n",
+            "count = 0\n",
+            "while count < 3:\n",
+            "    count += 1\n",
+            "    if count == 2:\n",
+            "        count += 10\n",
+            "print(total, count)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(\"done\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/augentry"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "22 12\ndone\n");
+}
+
+#[test]
 fn functools_partial_keyword_bindings_match_python_at_runtime() {
     // Keyword bindings emitting in the callee's declared order
     // (botocore's `partial(delay_exponential, base=base,
