@@ -5691,6 +5691,33 @@ fn lower_case_statics_allow_non_upper_case_globals() {
 }
 
 #[test]
+fn nested_module_statement_ends_before_its_bind_marker() {
+    // A statement in module-level control flow is followed by its
+    // `__rython_bind__` marker; an aug-assign's rendering carries no `;`,
+    // so the marker must not run into it (a parse error in the crate).
+    let out = compile(
+        concat!(
+            "total = 0\n",
+            "for v in [1, 2, 3]:\n",
+            "    total += v\n",
+            "print(total)\n",
+        ),
+        "augloop.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("total=(total).py_add(&(v));__rython_bind__("),
+        "the aug-assign must end before its bind marker: {}",
+        out
+    );
+    assert!(
+        !flat.contains(")__rython_bind__("),
+        "no statement may run into a bind marker: {}",
+        out
+    );
+}
+
+#[test]
 fn every_entry_point_allows_dead_code_for_the_lib_copy() {
     // rypip compiles an entry module twice: as the bin root, where `main`
     // is the process entry point, and as a lib submodule (`pub mod br;`),
