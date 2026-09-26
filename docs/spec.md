@@ -2499,6 +2499,7 @@ accepted as permanent spec:
 
 | Divergence | Status |
 |---|---|
+| `unicodedata` answers from the Unicode 16.0.0 database — CPython 3.14's `unidata_version` — for every CPython: an older CPython carries an older database (3.12: 15.0.0, 3.13: 15.1.0), so a code point assigned or re-classified since answers differently there (`category`, `bidirectional`, `combining`, `name`, `normalize`). Code points assigned before 15.0 agree | Model limit (issue #334); a per-CPython database would need one table set per version |
 | True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |
 | Exception message shapes: `int()`'s message carries "with base 10" and `float()`'s quotes the string as Python's repr (#339, round 10); `open` and stream errors are CPython's `[Errno N] text: 'path'` form (#339); the `KeyError` key quoting is single-quoted like CPython (round 99) | Correct (was a defect class in issue #82's family) |
 | An uncaught exception on the direct-`main` entry path prints Rust's `Debug` form instead of `Type: message` (exit code 1 either way) | Defect (cosmetic) |

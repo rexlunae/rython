@@ -7781,6 +7781,8 @@ pub use stdlib::asyncio;
 pub use stdlib::time;
 #[cfg(feature = "re-regex")]
 pub use stdlib::re;
+#[cfg(feature = "unicodedata-ucd")]
+pub use stdlib::unicodedata;
 // io is in-memory buffers (StringIO/BytesIO) — pure alloc, every tier;
 // the disk-backed PyFile constructors and open() stay std-only.
 pub use stdlib::io;

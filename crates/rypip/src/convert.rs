@@ -3149,14 +3149,17 @@ enum SurfaceFeature {
     SslRustls,
     /// `urllib.request` — the ureq-backed HTTP client.
     HttpUreq,
+    /// `unicodedata` — the Unicode Character Database crates.
+    UnicodedataUcd,
 }
 
 impl SurfaceFeature {
     /// Every surface, in the order features are emitted.
-    const ALL: [SurfaceFeature; 3] = [
+    const ALL: [SurfaceFeature; 4] = [
         SurfaceFeature::ReRegex,
         SurfaceFeature::SslRustls,
         SurfaceFeature::HttpUreq,
+        SurfaceFeature::UnicodedataUcd,
     ];
 
     /// The stdpython Cargo feature this surface turns on.
@@ -3165,6 +3168,7 @@ impl SurfaceFeature {
             SurfaceFeature::ReRegex => "re-regex",
             SurfaceFeature::SslRustls => "ssl-rustls",
             SurfaceFeature::HttpUreq => "http-ureq",
+            SurfaceFeature::UnicodedataUcd => "unicodedata-ucd",
         }
     }
 
@@ -3174,6 +3178,7 @@ impl SurfaceFeature {
             SurfaceFeature::ReRegex => "re",
             SurfaceFeature::SslRustls => "ssl",
             SurfaceFeature::HttpUreq => "urllib",
+            SurfaceFeature::UnicodedataUcd => "unicodedata",
         }
     }
 }

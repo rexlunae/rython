@@ -17658,7 +17658,7 @@ fn a_compiled_pattern_splits_as_a_regex() {
                 "import re\n",
                 "from typing import Any, List\n",
                 "\n",
-                "_dots = re.compile(\"[.\u3002]\")\n",
+                "_dots = re.compile(\"[.\\u3002]\")\n",
                 "\n",
                 "\n",
                 "def labels(s: Any) -> List[str]:\n",
@@ -17666,7 +17666,7 @@ fn a_compiled_pattern_splits_as_a_regex() {
                 "\n",
                 "\n",
                 "def main() -> None:\n",
-                "    print(_dots.split(\"a.b\u3002c\"), _dots.split(\"a.b.c\", 1), _dots.split(\"\"))\n",
+                "    print(_dots.split(\"a.b\\u3002c\"), _dots.split(\"a.b.c\", 1), _dots.split(\"\"))\n",
                 "    print(labels(\"x.y\"))\n",
                 "    try:\n",
                 "        labels(b\"x.y\")\n",
@@ -17736,4 +17736,112 @@ fn bisect_over_a_table_of_boxed_rows_matches_cpython() {
     );
     // Verified against python3.
     assert_eq!(run_package(&krate, "boxbis"), vec!["aaz! 3 2"]);
+}
+
+#[test]
+fn a_call_through_a_module_binds_keywords_and_defaults_by_name() {
+    // Issue #401: `lib.scale(2, offset=1, factor=100)` after `from . import
+    // lib` bound the keywords positionally in call order (102, silently)
+    // and never filled defaults; it now maps through the callee's
+    // signature exactly as the by-name call does.
+    let scratch = Scratch::new("modkw");
+    let krate = package_crate(
+        &scratch,
+        "dflt",
+        &[
+            (
+                "lib.py",
+                concat!(
+                    "def scale(x: int, factor: int = 10, offset: int = 0) -> int:\n",
+                    "    return x * factor + offset\n",
+                ),
+            ),
+            (
+                "core.py",
+                concat!(
+                    "from . import lib\n",
+                    "\n",
+                    "\n",
+                    "def run() -> None:\n",
+                    "    print(lib.scale(2, offset=1, factor=100))\n",
+                    "    print(lib.scale(2), lib.scale(2, 3), lib.scale(2, offset=1))\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .core import run\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    run()\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "dflt"), vec!["201", "20 6 21"]);
+}
+
+#[test]
+fn unicodedata_answers_like_cpython() {
+    // Issue #334 (idna's bidi/contextual rules and NFC checks): the
+    // unicodedata module — category, bidirectional, combining, name,
+    // lookup, normalize, is_normalized — with CPython's ValueErrors.
+    let scratch = Scratch::new("unicodedata");
+    let krate = package_crate(
+        &scratch,
+        "unicodedata_probe",
+        &[(
+            "cli.py",
+            concat!(
+                "import unicodedata\n",
+                "from unicodedata import normalize\n",
+                "\n",
+                "\n",
+                "def describe(ch: str) -> str:\n",
+                "    return unicodedata.category(ch) + \"/\" + unicodedata.bidirectional(ch) + \"/\" + str(unicodedata.combining(ch))\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    for ch in [\"a\", \"\\u0301\", \"\\u05d0\", \"1\", \"\\u0660\"]:\n",
+                "        print(describe(ch), unicodedata.name(ch))\n",
+                "    word = \"e\\u0301\"\n",
+                "    nfc = normalize(\"NFC\", word)\n",
+                "    print(len(word), len(nfc), nfc == \"\\u00e9\", unicodedata.is_normalized(\"NFC\", word))\n",
+                "    print(unicodedata.lookup(\"LATIN SMALL LETTER A\"), unicodedata.category(\"\\u4e00\")[0] == \"L\")\n",
+                "    try:\n",
+                "        unicodedata.name(\"\\x00\")\n",
+                "    except ValueError as e:\n",
+                "        print(\"ValueError\", e)\n",
+                "    try:\n",
+                "        unicodedata.normalize(\"XX\", \"a\")\n",
+                "    except ValueError as e:\n",
+                "        print(\"ValueError\", e)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "unicodedata_probe"),
+        vec![
+            "Ll/L/0 LATIN SMALL LETTER A",
+            "Mn/NSM/230 COMBINING ACUTE ACCENT",
+            "Lo/R/0 HEBREW LETTER ALEF",
+            "Nd/EN/0 DIGIT ONE",
+            "Nd/AN/0 ARABIC-INDIC DIGIT ZERO",
+            "2 1 True False",
+            "a True",
+            "ValueError no such name",
+            "ValueError invalid normalization form"
+        ]
+    );
 }

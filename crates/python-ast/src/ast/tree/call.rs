@@ -35,6 +35,16 @@ const ISINSTANCE_TARGET_NAMES: &[&str] = &[
     "Sequence",
 ];
 
+/// Whether the runtime function `fname` of the stdpython module `root`
+/// returns `Result` (a call threads `?`): the shared name list below, or a
+/// module whose surface is an enum that knows (unicodedata).
+fn stdlib_fn_fallible(root: &str, fname: &str) -> bool {
+    FALLIBLE_STDLIB_FN.contains(&fname)
+        || (crate::StdModule::from_name(root) == Some(crate::StdModule::Unicodedata)
+            && crate::ast::tree::std_module::UnicodedataItem::from_name(fname)
+                .is_some_and(|item| item.is_fallible_fn()))
+}
+
 /// Runtime-module functions that return `Result<T, PyException>` because
 /// they can raise like their Python counterparts. A call through a module
 /// path (`math.sqrt(x)`, `json.loads(s)`) into one of these threads `?`
@@ -2658,7 +2668,7 @@ impl<'a> CodeGen for Call {
                                 // bare import inside a `try:` swallows the
                                 // exception instead of reaching its `except`.
                                 let fname = import_canonical_fn_name(import, &name.id);
-                                FALLIBLE_STDLIB_FN.iter().any(|f| *f == fname)
+                                stdlib_fn_fallible(root, &fname)
                             }
                         }
                         // `from pylev import wf as w` — an aliased import of
@@ -2668,6 +2678,14 @@ impl<'a> CodeGen for Call {
                         // FALLIBLE, matching the qualified call.
                         Some(SymbolTableNode::Alias(canonical)) => {
                             FALLIBLE_STDLIB_FN.iter().any(|f| *f == canonical)
+                                || matches!(
+                                    symbols.get(canonical),
+                                    Some(SymbolTableNode::ImportFrom(import))
+                                        if stdlib_fn_fallible(
+                                            import.module.split('.').next().unwrap_or(""),
+                                            canonical,
+                                        )
+                                )
                                 || matches!(
                                     symbols.get(canonical),
                                     Some(SymbolTableNode::ImportFrom(import))
@@ -2720,7 +2738,7 @@ impl<'a> CodeGen for Call {
                         }
                     }
                     Some(root) if crate::is_stdpython_module(&root) => {
-                        FALLIBLE_STDLIB_FN.contains(&attr.attr.as_str())
+                        stdlib_fn_fallible(&root, &attr.attr)
                     }
                     _ => false,
                 }
@@ -10087,6 +10105,23 @@ let mutating_self_field = boxed_self_ref_receiver
                 }
                 _ => None,
                 }
+            },
+            // A crate module's function called THROUGH the module (`lib.f(x,
+            // k=v)` after `from . import lib` — idna's tests calling
+            // `idna.check_bidi(s)`): the same signature mapping as the
+            // by-name call, so keywords bind by name and defaults fill
+            // (issue #401 — the keywords used to bind positionally in call
+            // order, silently).
+            ExprType::Attribute(a) => match a.value.as_ref() {
+                ExprType::Name(m)
+                    if !options.name_types.contains_key(&m.id)
+                        && !options.local_types.contains_key(&m.id) =>
+                {
+                    crate::ast::tree::module::crate_module_bound_to(&m.id, &symbols, &options)
+                        .and_then(|path| crate::module_function_def(&options, &path, &a.attr))
+                        .map(|(f, _)| f)
+                }
+                _ => None,
             },
             _ => None,
         };

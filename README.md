@@ -136,6 +136,8 @@ error output), and a growing stdlib: `math`, `random`, `os`, `sys`,
 `json`, `re` (incl. flags, named groups, findall tuples),
 `datetime`/`time` (incl. `strptime`), `itertools`, `functools.reduce`,
 `heapq`, `bisect`, `copy`, `textwrap`, `hashlib`, `csv` (reader and writer),
+`unicodedata` (Unicode 16.0.0: category, bidirectional, combining, name,
+lookup, normalize),
 `collections`, `pathlib`, `glob`, `subprocess`, `tempfile`,
 `threading` (Thread with static targets, Lock/RLock/Event/Semaphore
 with a real `with lock:` acquire/release lowering, `local()` as a
