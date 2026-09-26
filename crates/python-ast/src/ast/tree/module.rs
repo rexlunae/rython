@@ -1984,6 +1984,13 @@ impl CodeGen for Module {
                                 )
                             }
                         };
+                    let (ty, wrapped) = crate::ast::tree::shared::thread_bound_static(
+                        options.name_types.get(&n),
+                        ty,
+                        wrapped,
+                        &symbols,
+                        &options,
+                    );
                     let case_allow = crate::ast::tree::module::static_case_allow(&ident);
                     stream.extend(quote! {
                         #case_allow pub static #ident: std::sync::LazyLock<#ty> =

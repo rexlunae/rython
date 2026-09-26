@@ -1840,6 +1840,22 @@ fn is_stringy(t: &TypeInfo) -> bool {
     matches!(t, TypeInfo::StrRef | TypeInfo::String)
 }
 
+/// Whether a type still carries an UNKNOWN part (PyObject anywhere in
+/// it): `list` without an element type is Vec(PyObject).
+fn mentions_unknown(t: &TypeInfo) -> bool {
+    match t {
+        TypeInfo::PyObject => true,
+        TypeInfo::Vec(x)
+        | TypeInfo::PyTuple(x)
+        | TypeInfo::HashSet(x)
+        | TypeInfo::Option(x)
+        | TypeInfo::Borrowed(x) => mentions_unknown(x),
+        TypeInfo::Dict(k, v) => mentions_unknown(k) || mentions_unknown(v),
+        TypeInfo::Tuple(xs) => xs.iter().any(mentions_unknown),
+        _ => false,
+    }
+}
+
 /// Join two element types for a container, unifying compatible kinds.
 /// Recurses into containers: `Vec<i64>` unifies with `Vec<f64>` to
 /// `Vec<f64>`, and an untyped `Vec<_>` unifies with `Vec<f64>` to
@@ -2503,16 +2519,17 @@ pub fn render_typed_reused(
             || tokens.to_string() == format!("stdpython :: PyValue :: from ({})", raw));
     // A MODULE-attribute read (`socket.AF_INET` — a constant) never
     // clones: the root is a module, not a class instance, so the read
-    // cannot move anything a later read needs (round 99).
+    // cannot move anything a later read needs (round 99). Only an IMPORT
+    // binding is a module root — a LOCAL (`o.inner` where `o = Outer()`)
+    // is an instance whose field a later read still needs.
     let module_root = match expr {
         ExprType::Attribute(a) => crate::ast::tree::call::root_name(&a.value)
             .is_some_and(|root| {
-                crate::module_name_shadowed(&root, &symbols)
-                    || matches!(
-                        symbols.get(&root),
-                        Some(crate::SymbolTableNode::ImportFrom(_))
-                            | Some(crate::SymbolTableNode::Import(_))
-                    )
+                matches!(
+                    symbols.get(&root),
+                    Some(crate::SymbolTableNode::ImportFrom(_))
+                        | Some(crate::SymbolTableNode::Import(_))
+                )
             }),
         _ => false,
     };
@@ -4251,7 +4268,19 @@ pub fn pin_empty_containers(
             // Unify with any existing (annotated) type: an annotated
             // `result: list[str] = []` must not be clobbered by a use
             // suggestion whose element type is still unknown.
+            // A FULLY-concrete annotation is the declared type and wins
+            // outright (`buffer: list[bytes] = []` then
+            // `buffer.append(chunk)` where chunk infers boxed — the
+            // unify would widen the list to Vec<PyValue> and break every
+            // bytes use of it); only an annotation with an unknown
+            // element (`xs: list = []`) takes the use's pin.
             let final_t = match info.name_types.get(&name) {
+                Some(existing)
+                    if info.annotated_names.contains(&name)
+                        && !mentions_unknown(existing) =>
+                {
+                    continue;
+                }
                 Some(existing) => unify(existing.clone(), t),
                 None => t,
             };

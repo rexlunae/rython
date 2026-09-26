@@ -2872,7 +2872,10 @@ impl FunctionDef {
                 use_counts: options.use_counts.as_ref().clone(),
                 name_types: options.name_types.as_ref().clone(),
                 empty_pinned: options.empty_pinned.as_ref().clone(),
-                annotated_names: std::collections::HashSet::new(),
+                // The annotations keep their authority in the re-pin: a
+                // concrete `buffer: list[bytes] = []` is not widened by
+                // a use whose element infers boxed.
+                annotated_names: options.annotated_names.as_ref().clone(),
                 optional_names: std::collections::HashSet::new(),
             };
             crate::pin_empty_containers(&effective_body, &mut info, Some(&symbols), Some(&options));
@@ -3347,6 +3350,26 @@ impl FunctionDef {
             !rebound.contains(name)
                 && crate::ast::tree::shared::binding_is_shared_value(name, &options)
         };
+        // A CLASS-typed binding (a local, or a parameter) likewise: the
+        // scope analysis above ran before the locals were typed, so it saw
+        // `a.items.append(1)` (a shared `a`) or `car.engine.rpm += 1` (a
+        // shared Engine inside a plain Car) as a mutation of the binding.
+        // Re-asked now that the types are known, the analysis answers with
+        // the borrow's `&self` — only a re-store or a mutation of the
+        // binding's own struct still needs `mut`. The late answer only
+        // ever REMOVES a class-typed binding's `mut`.
+        let late_scope = crate::analyze_scope_with(
+            &effective_body,
+            &param_names,
+            &crate::class_call_resolver(&ctx, &symbols, &options),
+        );
+        let class_binding = |name: &str| {
+            matches!(options.name_types.get(name), Some(crate::TypeInfo::Class(_)))
+        };
+        let local_needs_mut = |name: &String| {
+            scope.needs_mut.contains(name)
+                && (!class_binding(name) || late_scope.needs_mut.contains(name))
+        };
         for name in &param_names {
             let ident = crate::safe_ident(name);
             if str_params.contains(name.as_str()) {
@@ -3367,7 +3390,10 @@ impl FunctionDef {
                         quote!(let #ident: stdpython::PyValue = #ident.into();),
                     );
                 }
-            } else if scope.needs_mut.contains(name) && !shared_param_mutated_in_place(name) {
+            } else if scope.needs_mut.contains(name)
+                && !shared_param_mutated_in_place(name)
+                && (!class_binding(name) || late_scope.needs_mut.contains(name))
+            {
                 streams_prologue.extend(quote!(let mut #ident = #ident;));
             }
             // A PARAMETER a nested definition captures through a cell
@@ -3402,7 +3428,7 @@ impl FunctionDef {
                     .extend(quote!(let #ident = stdpython::PyCell::empty(#name);));
                 continue;
             }
-            if scope.needs_mut.contains(name) {
+            if local_needs_mut(name) {
                 if scope.closure_captured_uninit.contains(name) {
                     // The name is captured by a generated closure (try body,
                     // or finally-guarded handler/else body) while possibly
@@ -5153,6 +5179,14 @@ pub(crate) fn expr_yields_option_ctx(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> bool {
+    // A BoolOp whose fold lowers BOXED (`conn or self._new_conn()` — an
+    // Option operand beside a PyValue one) yields the PyValue, not an
+    // Option: the fold decides, not the presence of an Option operand.
+    if let ExprType::BoolOp(bo) = expr
+        && crate::ast::tree::bool_ops::fold_yields_boxed(&bo.values, ctx, options, symbols)
+    {
+        return false;
+    }
     if expr_yields_option(expr, options, symbols) {
         return true;
     }

@@ -213,6 +213,26 @@ pub(crate) enum Access<'a> {
     /// `threading.local()` attribute (issue #356) lives in a shared
     /// per-thread bag, not in the struct.
     Store(&'a crate::ast::tree::attribute::Attribute),
+    /// A DUNDER-dispatched read of `recv` — `recv[k]` (`__getitem__`) or
+    /// `k in recv` (`__contains__`): on a user class it calls the class's
+    /// own method, so it mutates `recv` exactly when that method does (a
+    /// `__getitem__` that counts its hits).
+    Dunder(&'a ExprType, &'static str),
+}
+
+/// The answer for an [`Access::Dunder`] every resolver shares: the
+/// receiver's class's own dunder, when the class defines one.
+pub(crate) fn dunder_access(
+    recv: &ExprType,
+    method: &str,
+    ctx: &crate::CodeGenContext,
+    symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
+    mutates: impl FnOnce(&crate::ClassDef, &crate::SymbolTableScopes) -> bool,
+) -> Option<bool> {
+    let (class, class_symbols) = crate::receiver_class(recv, ctx, symbols, options)?;
+    class.method_on_mro(method, &class_symbols)?;
+    Some(mutates(&class, &class_symbols))
 }
 
 /// The answer for an [`Access::Store`] every resolver shares: a store
@@ -498,12 +518,39 @@ pub(crate) fn class_call_resolver<'a>(
     // The BINDING's own type decides: a name typed with a shared class. A
     // polymorphic root's value is the sum type, whose narrowing view
     // (`s.__rython_as_Circle_mut()`) takes `&mut self` — it keeps `mut`.
+    // A CHAIN rooted at such a binding (`a.center.bump()`, `a.items[0] =
+    // v`) goes through the root's borrow too: every step past it is
+    // reached through the borrow guard, never through the binding.
+    // So does a chain that passes THROUGH a shared value on the way
+    // (`car.engine.rpm += 1` where `engine` holds a shared Engine): the
+    // store borrows the Engine, and `car` itself is untouched. Chains
+    // rooted at `self` keep the receiver analysis they had.
+    fn through_shared(
+        e: &ExprType,
+        ctx: &crate::CodeGenContext,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> bool {
+        match e {
+            ExprType::Name(n) => {
+                n.id != "self" && crate::ast::tree::shared::binding_is_shared_value(&n.id, options)
+            }
+            ExprType::Attribute(a) => {
+                if chain_base_name(e) == Some("self") {
+                    return false;
+                }
+                matches!(
+                    crate::infer_type(Some(ctx), e, options, symbols),
+                    crate::TypeInfo::Class(c)
+                        if crate::ast::tree::shared::is_shared(&c)
+                            && !crate::ast::tree::hierarchy::is_polymorphic_root(&c)
+                ) || through_shared(&a.value, ctx, symbols, options)
+            }
+            _ => false,
+        }
+    }
     let shared_receiver = move |attr: &crate::ast::tree::attribute::Attribute| {
-        let ExprType::Name(n) = attr.value.as_ref() else {
-            return false;
-        };
-        n.id != "self"
-            && crate::ast::tree::shared::binding_is_shared_value(&n.id, options)
+        through_shared(&attr.value, ctx, symbols, options)
     };
     move |access| {
         let attr = match access {
@@ -517,6 +564,14 @@ pub(crate) fn class_call_resolver<'a>(
                     return Some(false);
                 }
                 return interior_store(attr, ctx, symbols, options);
+            }
+            Access::Dunder(recv, method) => {
+                if through_shared(recv, ctx, symbols, options) {
+                    return Some(false);
+                }
+                return dunder_access(recv, method, ctx, symbols, options, |c, cs| {
+                    c.method_needs_mut_self(method, cs, options)
+                });
             }
         };
         if shared_receiver(attr) {
@@ -800,6 +855,14 @@ fn walk_expr(expr: &ExprType, a: &mut Analysis<'_>) {
         ExprType::UnaryOp(op) => walk_expr(&op.operand, a),
         ExprType::Compare(cmp) => {
             walk_expr(&cmp.left, a);
+            for (op, c) in cmp.ops.iter().zip(&cmp.comparators) {
+                if matches!(op, crate::Compares::In | crate::Compares::NotIn)
+                    && (a.resolve)(Access::Dunder(c, "__contains__")) == Some(true)
+                    && let Some(name) = chain_base_name(c)
+                {
+                    a.record_mutation(name);
+                }
+            }
             for c in &cmp.comparators {
                 walk_expr(c, a);
             }
@@ -857,6 +920,11 @@ fn walk_expr(expr: &ExprType, a: &mut Analysis<'_>) {
             walk_expr(&attr.value, a)
         }
         ExprType::Subscript(sub) => {
+            if (a.resolve)(Access::Dunder(&sub.value, "__getitem__")) == Some(true)
+                && let Some(name) = chain_base_name(&sub.value)
+            {
+                a.record_mutation(name);
+            }
             walk_expr(&sub.value, a);
             walk_subscript_kind(&sub.kind, a);
         }

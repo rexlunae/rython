@@ -45,6 +45,74 @@ pub(crate) fn binding_is_shared_value(name: &str, options: &PythonOptions) -> bo
     ) && !options.narrowed_names.contains_key(name)
 }
 
+/// Whether a value of type `t` holds a shared class's `PyRef` anywhere
+/// in it: a shared class, a shared root's sum type, a container or Option
+/// of one, or a class whose fields hold one (a `Registry` whose list
+/// holds shared `Item`s). Such a value's reference counts are
+/// single-threaded, so it cannot live in a `static` as it is — it is
+/// wrapped in `stdpython::ThreadBound` there.
+pub(crate) fn type_holds_shared(
+    t: &TypeInfo,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    fn holds(
+        t: &TypeInfo,
+        symbols: &SymbolTableScopes,
+        options: &PythonOptions,
+        seen: &mut HashSet<String>,
+    ) -> bool {
+        match t {
+            TypeInfo::Class(c) => {
+                if is_shared(c) {
+                    return true;
+                }
+                if !seen.insert(c.clone()) {
+                    return false;
+                }
+                let Some(class) = crate::resolve_class_referenced(c, symbols, options) else {
+                    return false;
+                };
+                class.base_chain_with_options(symbols, options).iter().any(|k| {
+                    k.infer_fields(symbols, options).ok().is_some_and(|fields| {
+                        fields.iter().any(|(_, ft)| holds(ft, symbols, options, seen))
+                    })
+                })
+            }
+            TypeInfo::Vec(x)
+            | TypeInfo::PyTuple(x)
+            | TypeInfo::HashSet(x)
+            | TypeInfo::Option(x)
+            | TypeInfo::Borrowed(x) => holds(x, symbols, options, seen),
+            TypeInfo::Dict(k, v) => {
+                holds(k, symbols, options, seen) || holds(v, symbols, options, seen)
+            }
+            TypeInfo::Tuple(xs) => xs.iter().any(|x| holds(x, symbols, options, seen)),
+            _ => false,
+        }
+    }
+    holds(t, symbols, options, &mut HashSet::new())
+}
+
+/// A static's type and initializer, wrapped in `stdpython::ThreadBound`
+/// when the value holds a shared instance (see [`type_holds_shared`]).
+pub(crate) fn thread_bound_static(
+    t: Option<&TypeInfo>,
+    ty: proc_macro2::TokenStream,
+    init: proc_macro2::TokenStream,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+    if t.is_some_and(|t| type_holds_shared(t, symbols, options)) {
+        (
+            quote::quote!(stdpython::ThreadBound<#ty>),
+            quote::quote!(stdpython::ThreadBound::new(#init)),
+        )
+    } else {
+        (ty, init)
+    }
+}
+
 /// Install the registry for the module being converted.
 pub fn install_shared(shared: &HashSet<String>) {
     SHARED.with(|s| *s.borrow_mut() = std::rc::Rc::new(shared.clone()));
@@ -74,7 +142,18 @@ pub fn compute_shared(
     // holder could miss (issue #356's scope rule, for the sharing
     // decision).
     let mut thread_local_fields: HashMap<String, HashSet<String>> = HashMap::new();
+    // Each class's FIELD classes (a `self.box = Box()` field holds a Box):
+    // an object held by a holder holds its fields' objects too.
+    let mut field_classes: HashMap<String, HashSet<String>> = HashMap::new();
     let mut register = |body: &[Statement], defs: Vec<ClassDef>, symbols: &SymbolTableScopes, opts: &PythonOptions| {
+        for c in &defs {
+            if let Ok(fields) = c.infer_fields(symbols, opts) {
+                let out = field_classes.entry(c.name.clone()).or_default();
+                for (_, t) in &fields {
+                    class_names_in(t, out);
+                }
+            }
+        }
         for c in &defs {
             let fields = thread_local_fields.entry(c.name.clone()).or_default();
             for m in all_methods(c) {
@@ -156,6 +235,22 @@ pub fn compute_shared(
             })
             .unwrap_or_else(|| vec![name.to_string()])
     };
+    // REACHABILITY: a holder holds its object's whole graph — the objects
+    // in its fields, and theirs. A parameter bound to a `Request` reaches
+    // `r.box.inner`, so a store there (`r.box.inner.x = 5`) mutates the
+    // caller's Inner: a class reachable from any holder is held (and is
+    // shared when it is mutated), while the value classes on the path
+    // stay values — their clones still carry the one shared object.
+    let mut frontier: Vec<String> = stored.iter().cloned().collect();
+    while let Some(name) = frontier.pop() {
+        for member in family_of(&name) {
+            for f in field_classes.get(&member).into_iter().flatten() {
+                if stored.insert(f.clone()) {
+                    frontier.push(f.clone());
+                }
+            }
+        }
+    }
     let mut memo: HashMap<String, bool> = HashMap::new();
     let names: Vec<String> = classes.keys().cloned().collect();
     let mut shared: HashSet<String> = names
@@ -551,6 +646,27 @@ fn collect_external_store_fields(
         for body in stmt_bodies(s) {
             collect_external_store_fields(body, &env, symbols, options, out);
         }
+    }
+}
+
+/// The class names a field type holds (`Box`, `Option[Box]`,
+/// `list[Box]`, ...).
+fn class_names_in(t: &TypeInfo, out: &mut HashSet<String>) {
+    match t {
+        TypeInfo::Class(c) => {
+            out.insert(c.clone());
+        }
+        TypeInfo::Vec(x)
+        | TypeInfo::PyTuple(x)
+        | TypeInfo::HashSet(x)
+        | TypeInfo::Option(x)
+        | TypeInfo::Borrowed(x) => class_names_in(x, out),
+        TypeInfo::Dict(k, v) => {
+            class_names_in(k, out);
+            class_names_in(v, out);
+        }
+        TypeInfo::Tuple(xs) => xs.iter().for_each(|x| class_names_in(x, out)),
+        _ => {}
     }
 }
 

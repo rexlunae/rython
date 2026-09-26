@@ -605,6 +605,11 @@ impl CodeGen for Compare {
                         crate::ast::tree::call::dunder_method_call(
                             &method,
                             &comparator,
+                            (
+                                &class,
+                                &class_symbols,
+                                crate::ast::tree::visit::is_self(comparator_ast),
+                            ),
                             std::slice::from_ref(left_ast),
                             true,
                             &ctx,
@@ -710,6 +715,11 @@ impl CodeGen for Compare {
                         let inner = crate::ast::tree::call::dunder_method_call(
                             &method,
                             &comparator,
+                            (
+                                &class,
+                                &class_symbols,
+                                crate::ast::tree::visit::is_self(comparator_ast),
+                            ),
                             std::slice::from_ref(left_ast),
                             true,
                             &ctx,

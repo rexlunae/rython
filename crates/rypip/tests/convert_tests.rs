@@ -18944,6 +18944,248 @@ fn unannotated_method_parameters_take_their_call_sites_class() {
 }
 
 #[test]
+fn a_shared_objects_dunders_and_field_chains_act_on_the_one_object() {
+    // Issue #414: a SHARED class (a `PyRef`) reached from outside its own
+    // methods — `h["k"] = v` / `h["k"]` / `"k" in h` through a parameter,
+    // a `get` whose `self[key]` runs the counting `__getitem__` (so `get`
+    // takes `&mut self`), and a store three fields deep through a
+    // parameter-held Request (`r.box.inner.x = 5`, the Inner reachable
+    // from the held Request is the caller's) — acts on the one object.
+    let scratch = Scratch::new("shareddunders");
+    let file = scratch.path().join("shared_dunders.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Headers:\n",
+            "    def __init__(self):\n",
+            "        self._store: dict[str, str] = {}\n",
+            "        self.hits = 0\n",
+            "\n",
+            "    def __getitem__(self, key: str) -> str:\n",
+            "        self.hits += 1\n",
+            "        return self._store[key.lower()]\n",
+            "\n",
+            "    def __setitem__(self, key: str, value: str) -> None:\n",
+            "        self._store[key.lower()] = value\n",
+            "\n",
+            "    def __contains__(self, key: str) -> bool:\n",
+            "        return key.lower() in self._store\n",
+            "\n",
+            "    def get(self, key: str, default: str) -> str:\n",
+            "        try:\n",
+            "            return self[key]\n",
+            "        except KeyError:\n",
+            "            return default\n",
+            "\n",
+            "\n",
+            "class Inner:\n",
+            "    def __init__(self):\n",
+            "        self.x = 1\n",
+            "\n",
+            "\n",
+            "class Box:\n",
+            "    def __init__(self):\n",
+            "        self.inner = Inner()\n",
+            "\n",
+            "\n",
+            "class Request:\n",
+            "    def __init__(self):\n",
+            "        self.headers = Headers()\n",
+            "        self.box = Box()\n",
+            "\n",
+            "\n",
+            "def fill(h: Headers) -> None:\n",
+            "    h[\"Content-Type\"] = \"text/plain\"\n",
+            "    h[\"X-Count\"] = \"3\"\n",
+            "\n",
+            "\n",
+            "def describe(h: Headers) -> str:\n",
+            "    ct = h[\"content-type\"]\n",
+            "    has = \"x-count\" in h\n",
+            "    miss = h.get(\"Accept\", \"none\")\n",
+            "    return ct + \" \" + str(has) + \" \" + miss\n",
+            "\n",
+            "\n",
+            "def poke(r: Request) -> None:\n",
+            "    r.box.inner.x = 5\n",
+            "    r.box.inner.x += 1\n",
+            "\n",
+            "\n",
+            "def peek(r: Request) -> int:\n",
+            "    return r.box.inner.x * 10\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    req = Request()\n",
+            "    fill(req.headers)\n",
+            "    print(describe(req.headers))\n",
+            "    print(req.headers.hits)\n",
+            "    poke(req)\n",
+            "    print(req.box.inner.x, peek(req))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/shared_dunders"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "text/plain True none",
+            "2",
+            "6 60",
+        ],
+    );
+}
+
+#[test]
+fn a_module_global_holding_a_shared_object_is_the_one_object() {
+    // A module global whose value holds a shared object (`DEFAULT =
+    // Counter()`, mutated through a parameter; `HOLDER` holds it in a
+    // field) lives in a thread-bound static — a `PyRef` is an `Rc`, which a
+    // plain static cannot hold — and every read reaches the one object.
+    let scratch = Scratch::new("sharedglobal");
+    let file = scratch.path().join("shared_global.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self, k: int) -> int:\n",
+            "        self.n += k\n",
+            "        return self.n\n",
+            "\n",
+            "\n",
+            "class Holder:\n",
+            "    def __init__(self, c: Counter):\n",
+            "        self.c = c\n",
+            "\n",
+            "\n",
+            "def touch(c: Counter) -> None:\n",
+            "    c.bump(10)\n",
+            "\n",
+            "\n",
+            "DEFAULT = Counter()\n",
+            "HOLDER = Holder(DEFAULT)\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    touch(DEFAULT)\n",
+            "    DEFAULT.bump(1)\n",
+            "    print(DEFAULT.n, HOLDER.c.n)\n",
+            "    touch(HOLDER.c)\n",
+            "    print(DEFAULT.n, HOLDER.c.n)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/shared_global"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "11 11",
+            "21 21",
+        ],
+    );
+}
+
+#[test]
+fn a_list_of_boxed_values_field_keeps_its_own_methods() {
+    // Issue #421: `self.q: list[Any]` is a Vec<PyValue> — a typed
+    // container, not a boxed receiver — so `append`/`pop` on it are real.
+    // They were dropped to the boxed None (the dynamic-method divergence
+    // meant for a field that IS the boxed value), losing the element
+    // silently. `conn or self._new_conn()` with an Option operand beside
+    // a boxed one returns the boxed fold's value, never an Option match.
+    let scratch = Scratch::new("boxedlistfield");
+    let file = scratch.path().join("boxed_list_field.py");
+    fs::write(
+        &file,
+        concat!(
+            "import typing\n",
+            "\n",
+            "\n",
+            "class Pool:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.q: list[typing.Any] = []\n",
+            "        self.r: list[int] = []\n",
+            "\n",
+            "    def _new_conn(self) -> typing.Any:\n",
+            "        return 1\n",
+            "\n",
+            "    def _get_conn(self) -> typing.Any:\n",
+            "        conn = None\n",
+            "        if self.q:\n",
+            "            conn = self.q.pop()\n",
+            "        return conn or self._new_conn()\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    p = Pool()\n",
+            "    print(p._get_conn())\n",
+            "    p.q.append(7)\n",
+            "    p.r.append(8)\n",
+            "    print(len(p.q), len(p.r))\n",
+            "    print(p._get_conn(), len(p.q))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/boxed_list_field"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "1",
+            "1 1",
+            "7 0",
+        ],
+    );
+}
+
+#[test]
 fn a_mutation_through_a_class_parameter_reaches_the_callers_object() {
     // Issue #414: Python passes objects by reference. A mutation through
     // a class-typed parameter — a field store, an augmented store, a

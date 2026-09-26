@@ -1487,6 +1487,11 @@ impl<'a> CodeGen for Assign {
                         return crate::ast::tree::call::dunder_method_call(
                             &method,
                             &receiver,
+                            (
+                                &class,
+                                &class_symbols,
+                                crate::ast::tree::visit::is_self(sub.value.as_ref()),
+                            ),
                             &[(**index).clone(), v_expr],
                             true,
                             &ctx,

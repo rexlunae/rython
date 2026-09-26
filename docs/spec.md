@@ -558,9 +558,23 @@ through subscript/attribute stores marks the chain's base variable.
   `borrow_mut()` (`item.qty -= qty`, `acct.deposit(5)`, `first.balance =
   1` all reach the stored object); a hierarchy family (a root and its
   subtree) shares one representation, the root's sum type holding the
-  references. Every other class stays a plain struct (cloning an
-  immutable object, or one no container or parameter holds, is
-  unobservable). The
+  references. A holder holds its object's whole graph: a class
+  REACHABLE from a held one through its fields (`r.box.inner` under a
+  parameter-held `Request`) is held too, so a store deep in the graph
+  (`r.box.inner.x = 5`) reaches the caller's object — the mutated class
+  is shared, while the unmutated classes on the path stay values whose
+  clones carry the one shared object. A dunder a shared object is used
+  through from outside (`h[k]`, `h[k] = v`, `k in h`) runs on the one
+  object, and `self[k]` in a method takes the mutability of the class's
+  own `__getitem__`. A module global (or class attribute) whose value
+  holds a shared object is a `stdpython::ThreadBound` static — an `Rc`
+  cannot live in a plain static — bound to the thread that initialized
+  it: every read on that thread is the one object, and a read from any
+  other thread panics at the read (§12.2). A global of that kind that is
+  REBOUND or mutated in place (a `Mutex` static) is not supported yet and
+  fails in rustc (issue #422). Every other class stays a plain struct
+  (cloning an immutable object, or one no container or parameter holds,
+  is unobservable). The
   `shared.rs` analysis is the one authority; a shared class's method
   that lets `self` escape (stores or returns `self`) is loud in rustc
   (the struct is not the reference). On shared references `is` is
@@ -2495,6 +2509,10 @@ catchable `PyException`:
   overflow-adjacent arithmetic as out of contract until the opt-in
   bigint tier exists.
 - Sorting a `NaN`; `hash(nan)`.
+- Reading a module global (or class attribute) that holds a shared
+  object from a thread other than the one that initialized it
+  (`stdpython::ThreadBound` — CPython lets every thread reach the one
+  object; rython's shared objects are single-threaded, §5).
 - Arithmetic on `None` (including aug-assign `-=`/`|=` on an `Option`
   target whose value is `None`, and a `-` whose RHS is `None` — the
   Option-unwrap panics carry CPython's TypeError text).

@@ -2150,6 +2150,23 @@ impl ClassDef {
                 Access::Store(attr) => {
                     return crate::ast::tree::scope::interior_store(attr, &ctx, symbols, options);
                 }
+                Access::Dunder(recv, dunder) => {
+                    return crate::ast::tree::scope::dunder_access(
+                        recv,
+                        dunder,
+                        &ctx,
+                        symbols,
+                        options,
+                        |class, class_symbols| {
+                            class.method_mut_inner(
+                                dunder,
+                                class_symbols,
+                                &mut **visited.borrow_mut(),
+                                options,
+                            )
+                        },
+                    );
+                }
             };
             let (class, class_symbols) =
                 crate::receiver_class(&attr.value, &ctx, symbols, options)?;
@@ -3885,9 +3902,16 @@ StatementType::Assign(a)
                             quote!(stdpython::PyValue::from(#value_tokens)),
                         )
                     };
+                    let (static_ty, init) = crate::ast::tree::shared::thread_bound_static(
+                        Some(&ti),
+                        ty.clone(),
+                        init,
+                        &symbols,
+                        &options,
+                    );
                     let case_allow = crate::ast::tree::module::static_case_allow(&ident);
                     class_lazylock_constants.extend(quote! {
-                        #case_allow pub static #ident: std::sync::LazyLock<#ty> =
+                        #case_allow pub static #ident: std::sync::LazyLock<#static_ty> =
                             std::sync::LazyLock::new(|| #init);
                     });
                     // The associated ACCESSOR keeps `Class::NAME`-shaped
