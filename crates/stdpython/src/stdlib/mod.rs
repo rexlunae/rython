@@ -84,6 +84,9 @@ pub mod functools;
 /// Python heapq module - heap queue algorithm on plain lists
 pub mod heapq;
 
+/// Python bisect module - binary search on sorted sequences
+pub mod bisect;
+
 /// Python copy module - shallow and deep copies
 pub mod copy;
 

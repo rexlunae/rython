@@ -1247,7 +1247,7 @@ impl ClassDef {
         }
         let init = FunctionDef {
             name: "__init__".to_string(),
-            args: crate::Arguments {
+            args: Box::new(crate::Arguments {
                 posonlyargs: Vec::new(),
                 // `self` first, like every method; strip_self removes it
                 // where callers build the `new(...)` signature.
@@ -1268,7 +1268,7 @@ impl ClassDef {
                 kw_defaults: Vec::new(),
                 kwarg: None,
                 defaults,
-            },
+            }),
             body: stores,
             decorator_list: Vec::new(),
             returns: None,
@@ -1655,6 +1655,84 @@ impl ClassDef {
             .find_map(|c| c.methods().find(|m| m.name == name).cloned())
     }
 
+    /// This class's OWN class-level literal constants — every target of a
+    /// class-body assignment whose value is a literal const (`tol = rel =
+    /// 0` gives both) — the same condition `to_rust` emits `pub const` for.
+    pub(crate) fn literal_constants(&self) -> Vec<(String, ExprType)> {
+        let mut out = Vec::new();
+        for stmt in &self.body {
+            if let StatementType::Assign(a) = &stmt.statement
+                && crate::ast::tree::module::const_static_type(&a.value).is_some()
+                && a.targets.iter().all(|t| matches!(t, ExprType::Name(_)))
+            {
+                for t in &a.targets {
+                    if let ExprType::Name(n) = t {
+                        out.push((n.id.clone(), a.value.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Python's class-attribute lookup for a literal constant (issue #367):
+    /// the nearest class on the MRO — this class first — whose body
+    /// defines `attr`, with the value it gives it. None when no class on
+    /// the chain defines it, or when an instance of the chain stores
+    /// `self.<attr>` (then it is an instance attribute, which shadows).
+    pub(crate) fn literal_constant_on_mro(
+        &self,
+        attr: &str,
+        symbols: &SymbolTableScopes,
+        options: &PythonOptions,
+    ) -> Option<(ClassDef, ExprType)> {
+        if self.family_owns_field(attr, symbols, options) {
+            return None;
+        }
+        let chain = self.base_chain(symbols);
+        chain.into_iter().find_map(|c| {
+            let value = c
+                .literal_constants()
+                .into_iter()
+                .find(|(name, _)| name == attr)
+                .map(|(_, v)| v)?;
+            Some((c, value))
+        })
+    }
+
+    /// Whether any class of this class's family stores `self.<attr>`: its
+    /// ancestors, or — through the hierarchy registry — any class in its
+    /// root's subtree. A class attribute that an instance anywhere in the
+    /// family also assigns (urllib3's `HTTPConnection.is_verified = False`,
+    /// set per instance by `HTTPSConnection`) is an instance attribute
+    /// with a class-level default, which the family's trait carries as a
+    /// field accessor — never also as an associated const (E0428/E0324).
+    pub(crate) fn family_owns_field(
+        &self,
+        attr: &str,
+        symbols: &SymbolTableScopes,
+        options: &PythonOptions,
+    ) -> bool {
+        let chain = self.base_chain(symbols);
+        if chain.iter().any(|c| c.owns_field(attr)) {
+            return true;
+        }
+        let root = chain.last().map(|c| c.name.clone()).unwrap_or_else(|| self.name.clone());
+        let Some(variants) = options.hierarchy_roots.get(&root) else {
+            return false;
+        };
+        variants.iter().any(|v| {
+            let class = match &v.module_path {
+                Some(path) => crate::module_class_def(options, path, &v.name).map(|(c, _)| c),
+                None => match symbols.get(&v.name) {
+                    Some(SymbolTableNode::ClassDef(c)) => Some(c.clone()),
+                    _ => None,
+                },
+            };
+            class.is_some_and(|c| c.owns_field(attr))
+        })
+    }
+
     /// Whether `attr` is a field assigned somewhere in this class's own
     /// `__init__`.
     pub(crate) fn owns_field(&self, attr: &str) -> bool {
@@ -1992,6 +2070,9 @@ impl ClassDef {
                     _ => return None,
                 },
                 Access::Property(attr) => attr,
+                Access::Store(attr) => {
+                    return crate::ast::tree::scope::interior_store(attr, &ctx, symbols, options);
+                }
             };
             let (class, class_symbols) =
                 crate::receiver_class(&attr.value, &ctx, symbols, options)?;
@@ -3299,13 +3380,15 @@ impl CodeGen for ClassDef {
                 // A test-runner gate on the class (`@support.cpython_only`,
                 // `@skipUnless(...)`, ...): a no-op for the lowered class,
                 // but LOUD — a -W warning, never silently ignored.
-                Some(crate::Decorator::TestGate(_)) => {
-                    options.definition_warnings.borrow_mut().push(format!(
-                        "test-runner gate decorator on a class consumed as a no-op \
-                         (the converted class body runs unconditionally; the \
-                         skip/mark/patch condition is a test-RUNNER directive that \
-                         rython does not model)"
-                    ));
+                Some(crate::Decorator::TestGate(gate)) => {
+                    if !gate.runner_honors() {
+                        options.definition_warnings.borrow_mut().push(format!(
+                            "test-runner gate decorator on a class consumed as a no-op \
+                             (the converted class body runs unconditionally; the \
+                             mark/patch/support condition is a test-RUNNER directive \
+                             that rython does not model)"
+                        ));
+                    }
                 }
                 Some(other) => {
                     return Err(format!(
@@ -4855,8 +4938,28 @@ impl ClassDef {
         } else {
             quote!()
         };
+        // This class's class-level literal constants as ASSOCIATED CONSTS
+        // with their values as defaults (issue #367): `Self::NAME` in a
+        // default body resolves through the implementor, and a subclass
+        // that redefines NAME overrides it in its impl of this trait.
+        let mut own_const_decls = TokenStream::new();
+        for (name, value) in self.literal_constants() {
+            if self.family_owns_field(&name, &symbols, &options) {
+                continue;
+            }
+            let ty = crate::ast::tree::module::const_static_type(&value)
+                .expect("a literal constant has a const type");
+            let ident = crate::safe_ident(&name);
+            let v = value.to_rust(
+                CodeGenContext::Class(self.name.clone()),
+                options.clone(),
+                symbols.clone(),
+            )?;
+            own_const_decls.extend(quote!(const #ident: #ty = #v;));
+        }
         let own_trait = quote! {
             pub trait #trait_name #supertrait #display_bound {
+                #own_const_decls
                 #own_accessor_decls
                 #own_method_defaults
                 #super_trampolines
@@ -5060,8 +5163,39 @@ impl ClassDef {
                 }
                 None => quote!(#ancestor_trait),
             };
+            // The ancestor's class-level literal constants this class
+            // (or an intermediate ancestor) redefines: the nearest
+            // definer's value overrides the trait's default, so `Self::NAME`
+            // in an inherited method reads what Python's lookup through the
+            // instance's class finds (issue #367).
+            let mut const_overrides = TokenStream::new();
+            for (name, _) in ancestor.literal_constants() {
+                if ancestor.family_owns_field(&name, &symbols, &options) {
+                    continue;
+                }
+                for (c, c_syms, c_opts, _) in chain.iter() {
+                    if c.name == ancestor.name {
+                        break;
+                    }
+                    if let Some((_, value)) =
+                        c.literal_constants().into_iter().find(|(n, _)| *n == name)
+                    {
+                        let ty = crate::ast::tree::module::const_static_type(&value)
+                            .expect("a literal constant has a const type");
+                        let ident = crate::safe_ident(&name);
+                        let v = value.to_rust(
+                            CodeGenContext::Class(c.name.clone()),
+                            c_opts.clone(),
+                            c_syms.clone(),
+                        )?;
+                        const_overrides.extend(quote!(const #ident: #ty = #v;));
+                        break;
+                    }
+                }
+            }
             ancestor_impls.extend(quote! {
                 impl #trait_path for #class_name {
+                    #const_overrides
                     #accessor_impls
                     #override_stream
                 }
@@ -5254,6 +5388,11 @@ fn infer_field_type(
         // A constructed instance of a known class types the field as that
         // class's struct.
         ExprType::Call(call) => match call.func.as_ref() {
+            // `self._local = threading.local()` (requests' HTTPDigestAuth):
+            // the per-thread attribute object (issue #356).
+            func if crate::ast::tree::type_ctx::threading_local_ctor(func, symbols) => {
+                Some(crate::TypeInfo::Threading(crate::ThreadingType::Local))
+            }
             ExprType::Name(n) if n.id == "bool" => Some(crate::TypeInfo::Bool),
             // A `cast(T, ...)` typing no-op (`self.frames = cast(List[str],
             // spinner["frames"])[:]` — rich's Spinner): the cast's FIRST
@@ -7230,4 +7369,117 @@ impl ClassDef {
             #trait_impls
         })
     }
+}
+
+/// Hoist each module-level class's NESTED classes to module level (issue
+/// #367: `class TestPartialMethod(TestCase): class A(object): ...` —
+/// test_functools). Python's nested class is a class attribute of the
+/// outer class, reached as `Outer.Inner` (or `self.Inner` in its
+/// methods), and class scopes do not nest: the inner body sees nothing of
+/// the outer's, so the same class at module level behaves identically.
+/// References are rewritten to the hoisted name.
+///
+/// Conservative on purpose: a nested class is hoisted only when its name
+/// is bound NOWHERE else in the module — no module binding and no local,
+/// parameter or nested definition in any scope — so the rewrite cannot
+/// capture another binding. Otherwise it stays where it is and the class
+/// body's loud refusal stands.
+pub(crate) fn hoist_nested_classes(mut body: Vec<Statement>) -> Vec<Statement> {
+    use visit::{Bindings, stmt_all_exprs_mut, stmt_bound_names, walk_expr_mut, walk_stmts_mut};
+    // Every name bound anywhere in the module, in any scope, with a
+    // count: a nested class's own definition is one binding of its name.
+    let mut bound: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    visit::walk_stmts(&body, Descend::All, &mut |s| {
+        for n in stmt_bound_names(s, Bindings::Every) {
+            *bound.entry(n).or_default() += 1;
+        }
+        if let StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) = &s.statement {
+            let a = &f.args;
+            for p in a
+                .posonlyargs
+                .iter()
+                .chain(a.args.iter())
+                .chain(a.kwonlyargs.iter())
+                .chain(a.vararg.iter())
+                .chain(a.kwarg.iter())
+            {
+                *bound.entry(p.arg.clone()).or_default() += 1;
+            }
+        }
+        Flow::Continue
+    });
+    // (outer, inner) pairs, and the hoisted definitions after their outer.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut hoisted: Vec<(usize, Statement)> = Vec::new();
+    for (i, s) in body.iter_mut().enumerate() {
+        let StatementType::ClassDef(outer) = &mut s.statement else {
+            continue;
+        };
+        let mut kept = Vec::with_capacity(outer.body.len());
+        for st in std::mem::take(&mut outer.body) {
+            match &st.statement {
+                StatementType::ClassDef(inner) if bound.get(&inner.name) == Some(&1) => {
+                    pairs.push((outer.name.clone(), inner.name.clone()));
+                    hoisted.push((i, st));
+                }
+                _ => kept.push(st),
+            }
+        }
+        if kept.is_empty() {
+            kept.push(Statement {
+                lineno: s.lineno,
+                col_offset: s.col_offset,
+                end_lineno: s.end_lineno,
+                end_col_offset: s.end_col_offset,
+                statement: StatementType::Pass,
+            });
+        }
+        let StatementType::ClassDef(outer) = &mut s.statement else {
+            unreachable!()
+        };
+        outer.body = kept;
+    }
+    if pairs.is_empty() {
+        return body;
+    }
+    // `Outer.Inner` anywhere, and `self.Inner` / `cls.Inner` inside
+    // Outer's own methods, become the hoisted `Inner`.
+    let rewrite = |e: &mut ExprType, receivers: &[&str], inners: &[&str]| {
+        walk_expr_mut(e, &mut |sub| {
+            if let ExprType::Attribute(a) = sub
+                && let ExprType::Name(r) = a.value.as_ref()
+                && receivers.contains(&r.id.as_str())
+                && inners.contains(&a.attr.as_str())
+            {
+                *sub = ExprType::Name(crate::ast::tree::name::Name { id: a.attr.clone() });
+            }
+        });
+    };
+    let rewrite_all = |stmts: &mut [Statement], receivers: &[&str], inners: &[&str]| {
+        walk_stmts_mut(stmts, &mut |s| {
+            for e in stmt_all_exprs_mut(s) {
+                rewrite(e, receivers, inners);
+            }
+            Flow::Continue
+        });
+    };
+    for (outer, inner) in &pairs {
+        rewrite_all(&mut body, &[outer.as_str()], &[inner.as_str()]);
+    }
+    for s in body.iter_mut() {
+        if let StatementType::ClassDef(outer) = &mut s.statement {
+            let inners: Vec<&str> = pairs
+                .iter()
+                .filter(|(o, _)| *o == outer.name)
+                .map(|(_, i)| i.as_str())
+                .collect();
+            if !inners.is_empty() {
+                rewrite_all(&mut outer.body, &["self", "cls"], &inners);
+            }
+        }
+    }
+    for (i, def) in hoisted.into_iter().rev() {
+        body.insert(i + 1, def);
+    }
+    body
 }

@@ -244,6 +244,16 @@ fn body_binds_locally(body: &[Statement], name: &str) -> bool {
     binds && !declared_outer
 }
 
+/// Whether a nested def declares `global name` in its own scope: every
+/// `name` in it is then the module's, never the enclosing local being
+/// renamed.
+fn declares_global(body: &[Statement], name: &str) -> bool {
+    use super::visit::{Descend, any_stmt};
+    any_stmt(body, Descend::SkipDefs, |s| {
+        matches!(&s.statement, StatementType::Global(names) if names.iter().any(|n| n == name))
+    })
+}
+
 fn rename_statement(
     stmt: &Statement,
     from: &str,
@@ -493,6 +503,7 @@ fn rename_statement(
             if parameter_list_binds(&f.args, from)
                 || f.name == from
                 || (mode == Mode::Local && body_binds_locally(&f.body, from))
+                || (mode == Mode::Local && declares_global(&f.body, from))
             {
                 StatementType::FunctionDef(f.clone())
             } else {
@@ -505,6 +516,7 @@ fn rename_statement(
             if parameter_list_binds(&f.args, from)
                 || f.name == from
                 || (mode == Mode::Local && body_binds_locally(&f.body, from))
+                || (mode == Mode::Local && declares_global(&f.body, from))
             {
                 StatementType::AsyncFunctionDef(f.clone())
             } else {

@@ -142,6 +142,44 @@ impl CodeGen for Compare {
         if self.ops.len() > 1 {
             return self.to_rust_chained(ctx, options, symbols);
         }
+        // An ORDER comparison with a complex operand (`1j < 2j`): complex
+        // numbers are unordered, and CPython raises TypeError when the
+        // comparison RUNS (test_operator's `assertRaises(TypeError,
+        // operator.lt, 1j, 2j)` — issue #366). Both operands are evaluated
+        // first; the typed `Err::<bool, _>(..)?` neither needs an
+        // inference anchor nor diverges statically.
+        if let [op @ (Compares::Lt | Compares::LtE | Compares::Gt | Compares::GtE)] =
+            self.ops.as_slice()
+            && let [right] = self.comparators.as_slice()
+        {
+            let lt = crate::infer_type(Some(&ctx), &self.left, &options, &symbols);
+            let rt = crate::infer_type(Some(&ctx), right, &options, &symbols);
+            let name = |t: &crate::TypeInfo| match t {
+                crate::TypeInfo::Complex => Some("complex"),
+                crate::TypeInfo::Int => Some("int"),
+                crate::TypeInfo::Float => Some("float"),
+                crate::TypeInfo::Bool => Some("bool"),
+                _ => None,
+            };
+            if (matches!(lt, crate::TypeInfo::Complex) || matches!(rt, crate::TypeInfo::Complex))
+                && let (Some(ln), Some(rn)) = (name(&lt), name(&rt))
+            {
+                let sym = match op {
+                    Compares::Lt => "<",
+                    Compares::LtE => "<=",
+                    Compares::Gt => ">",
+                    _ => ">=",
+                };
+                let msg = format!("'{sym}' not supported between instances of '{ln}' and '{rn}'");
+                let l = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                let r = right.clone().to_rust(ctx, options, symbols)?;
+                return Ok(quote!({
+                    let _ = &(#l);
+                    let _ = &(#r);
+                    Err::<bool, PyException>(PyException::new("TypeError", #msg))?
+                }));
+            }
+        }
         let mut outer_ts = TokenStream::new();
         // Python chains comparisons pairwise: `a < b < c` means
         // `a < b && b < c`, so each comparator becomes the left operand of

@@ -38,6 +38,12 @@ pub struct PyCallable<A, R> {
     /// used by `repr()`/`str()` and by the message of a call that raises.
     name: Arc<str>,
     f: Arc<CallableFn<A, R>>,
+    /// A module-level `def` referenced as a value: every reference is the
+    /// ONE function object CPython has, so two wrappers built at two
+    /// reference sites are the same callable (`_INITIALIZERS.remove(hello)`
+    /// finds the `hello` appended earlier). The key is the definition's
+    /// module-qualified name. A closure or lambda has none: each evaluation is a new object.
+    identity: Option<&'static str>,
 }
 
 /// The wrapped Rust closure. On the `std` tier it is `Send + Sync`, so a
@@ -59,7 +65,26 @@ impl<A, R> PyCallable<A, R> {
     where
         F: Fn(A) -> Result<R, PyException> + Send + Sync + 'static,
     {
-        Self { name: Arc::from(name), f: Arc::new(f) }
+        Self { name: Arc::from(name), f: Arc::new(f), identity: None }
+    }
+
+    /// A module-level function as a value (see the `identity` field):
+    /// `identity` is the item's path, the same at every reference site.
+    #[cfg(feature = "std")]
+    pub fn function<F>(name: &str, identity: &'static str, f: F) -> Self
+    where
+        F: Fn(A) -> Result<R, PyException> + Send + Sync + 'static,
+    {
+        Self { name: Arc::from(name), f: Arc::new(f), identity: Some(identity) }
+    }
+
+    /// A module-level function as a value (no_std tier).
+    #[cfg(not(feature = "std"))]
+    pub fn function<F>(name: &str, identity: &'static str, f: F) -> Self
+    where
+        F: Fn(A) -> Result<R, PyException> + 'static,
+    {
+        Self { name: Arc::from(name), f: Arc::new(f), identity: Some(identity) }
     }
 
     /// Wrap a Rust closure as a Python callable value (no_std tier — see
@@ -69,7 +94,7 @@ impl<A, R> PyCallable<A, R> {
     where
         F: Fn(A) -> Result<R, PyException> + 'static,
     {
-        Self { name: Arc::from(name), f: Arc::new(f) }
+        Self { name: Arc::from(name), f: Arc::new(f), identity: None }
     }
 
     /// Call the value: `f(x, y)` in Python is `f.call((x, y))` here.
@@ -85,7 +110,10 @@ impl<A, R> PyCallable<A, R> {
     /// The identity CPython prints in a function's repr. Two clones of
     /// one callable share it; two separately created closures do not.
     fn addr(&self) -> usize {
-        Arc::as_ptr(&self.f) as *const () as usize
+        match self.identity {
+            Some(id) => id.as_ptr() as usize,
+            None => Arc::as_ptr(&self.f) as *const () as usize,
+        }
     }
 }
 
@@ -94,7 +122,7 @@ impl<A, R> PyCallable<A, R> {
 /// captures.
 impl<A, R> Clone for PyCallable<A, R> {
     fn clone(&self) -> Self {
-        Self { name: Arc::clone(&self.name), f: Arc::clone(&self.f) }
+        Self { name: Arc::clone(&self.name), f: Arc::clone(&self.f), identity: self.identity }
     }
 }
 
@@ -124,7 +152,10 @@ impl<A, R> PyDisplay for PyCallable<A, R> {
 /// closures built from the same `lambda` are distinct objects.
 impl<A, R> PartialEq for PyCallable<A, R> {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.f, &other.f)
+        match (self.identity, other.identity) {
+            (Some(a), Some(b)) => a == b,
+            _ => Arc::ptr_eq(&self.f, &other.f),
+        }
     }
 }
 
@@ -162,6 +193,28 @@ mod tests {
             PyCallable::new("boom", |()| Err(PyException::new("ValueError", "no")));
         let e = boom.call(()).unwrap_err();
         assert_eq!(e.to_string(), "ValueError: no");
+    }
+
+    #[test]
+    fn two_references_to_one_def_are_one_function() {
+        // `register(hello)` then `unregister(hello)`: each reference builds
+        // a wrapper, but CPython has one function object (`hello == hello`).
+        fn hello(x: i64) -> Result<i64, PyException> {
+            Ok(x)
+        }
+        let a: PyCallable<(i64,), i64> =
+            PyCallable::function("hello", "m.hello", |(x,)| hello(x));
+        let b: PyCallable<(i64,), i64> =
+            PyCallable::function("hello", "m.hello", |(x,)| hello(x));
+        let other: PyCallable<(i64,), i64> =
+            PyCallable::function("bye", "m.bye", |(x,)| hello(x));
+        assert!(a == b);
+        assert!(a != other);
+        assert_eq!(a.to_string(), b.to_string());
+        // Two lambdas stay two objects.
+        let l1: PyCallable<(i64,), i64> = PyCallable::new("<lambda>", |(x,)| Ok(x));
+        let l2: PyCallable<(i64,), i64> = PyCallable::new("<lambda>", |(x,)| Ok(x));
+        assert!(l1 != l2);
     }
 
     #[test]

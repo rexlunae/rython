@@ -2732,6 +2732,9 @@ pub enum PyValue {
     Bytes(Vec<u8>),
     Tuple(Arc<Vec<PyValue>>),
     Dict(Arc<PyDict<String, PyValue>>),
+    /// A Python `complex` (issue #366): a heterogeneous container or an
+    /// `assertEqual` over complex operands carries it boxed.
+    Complex(Complex),
     None_,
 }
 
@@ -2765,6 +2768,7 @@ impl IntoIterator for PyValue {
             PyValue::Int(_) => panic!("TypeError: 'int' object is not iterable"),
             PyValue::Float(_) => panic!("TypeError: 'float' object is not iterable"),
             PyValue::Bool(_) => panic!("TypeError: 'bool' object is not iterable"),
+            PyValue::Complex(_) => panic!("TypeError: 'complex' object is not iterable"),
             PyValue::None_ => panic!("TypeError: 'NoneType' object is not iterable"),
         };
         items.into_iter()
@@ -2863,6 +2867,7 @@ impl Truthy for PyValue {
             PyValue::Bytes(b) => !b.is_empty(),
             PyValue::Tuple(t) => !t.is_empty(),
             PyValue::Dict(d) => !d.is_empty(),
+            PyValue::Complex(z) => z.real != 0.0 || z.imag != 0.0,
             PyValue::None_ => false,
         }
     }
@@ -3035,6 +3040,47 @@ impl From<Vec<String>> for PyValue {
     }
 }
 
+// A list of ints/floats/bools boxes as a Tuple of its members, like the
+// str list above (the documented list-as-tuple representation): an
+// unknown-typed call result that is `list[int]` (issue #334 — idna's
+// `intranges_from_list`) reaches an assertEqual this way.
+impl From<Vec<i64>> for PyValue {
+    fn from(value: Vec<i64>) -> Self {
+        PyValue::Tuple(Arc::new(value.into_iter().map(PyValue::Int).collect()))
+    }
+}
+
+impl From<Vec<f64>> for PyValue {
+    fn from(value: Vec<f64>) -> Self {
+        PyValue::Tuple(Arc::new(value.into_iter().map(PyValue::Float).collect()))
+    }
+}
+
+impl From<Vec<bool>> for PyValue {
+    fn from(value: Vec<bool>) -> Self {
+        PyValue::Tuple(Arc::new(value.into_iter().map(PyValue::Bool).collect()))
+    }
+}
+
+/// A boxed sequence of ints into a `list[int]` slot (a boxed parameter
+/// passed on to a typed one): its members, a bool counting as an int;
+/// anything else is the loud member panic every boxed conversion uses.
+impl From<PyValue> for Vec<i64> {
+    fn from(value: PyValue) -> Vec<i64> {
+        let PyValue::Tuple(items) = &value else {
+            value_member_panic("list[int]")
+        };
+        items
+            .iter()
+            .map(|v| match v {
+                PyValue::Int(i) => *i,
+                PyValue::Bool(b) => *b as i64,
+                _ => value_member_panic("list[int]"),
+            })
+            .collect()
+    }
+}
+
 // A list of ALREADY-BOXED members (`PyValue::from(exceptions)` where the
 // local is Vec<PyValue>) boxes as a Tuple of the members.
 impl From<Vec<PyValue>> for PyValue {
@@ -3099,6 +3145,7 @@ impl PyValue {
             PyValue::Bytes(_) => "bytes",
             PyValue::Tuple(_) => "tuple",
             PyValue::Dict(_) => "dict",
+            PyValue::Complex(_) => "complex",
             PyValue::None_ => "NoneType",
         }
     }
@@ -3165,6 +3212,143 @@ macro_rules! pyvalue_add_rhs {
 }
 pyvalue_add_rhs!(i64, f64, bool, String, &str);
 
+/// A boxed number's value on CPython's numeric tower (bool ⊂ int ⊂ float
+/// ⊂ complex), for the boxed `-` and `*` below.
+enum BoxedNum {
+    Int(i64),
+    Float(f64),
+    Complex(Complex),
+}
+
+fn boxed_num(v: &PyValue) -> Option<BoxedNum> {
+    match v {
+        PyValue::Int(i) => Some(BoxedNum::Int(*i)),
+        PyValue::Bool(b) => Some(BoxedNum::Int(*b as i64)),
+        PyValue::Float(f) => Some(BoxedNum::Float(*f)),
+        PyValue::Complex(z) => Some(BoxedNum::Complex(z.clone())),
+        _ => None,
+    }
+}
+
+/// Apply a numeric operator on the promoted pair, or None when either
+/// side is not a number.
+fn boxed_arith(
+    a: &PyValue,
+    b: &PyValue,
+    int: fn(i64, i64) -> i64,
+    float: fn(f64, f64) -> f64,
+    complex: fn(&Complex, &Complex) -> Complex,
+) -> Option<PyValue> {
+    let as_complex = |n: &BoxedNum| match n {
+        BoxedNum::Int(i) => Complex::new(*i as f64, 0.0),
+        BoxedNum::Float(f) => Complex::new(*f, 0.0),
+        BoxedNum::Complex(z) => z.clone(),
+    };
+    let as_float = |n: &BoxedNum| match n {
+        BoxedNum::Int(i) => *i as f64,
+        BoxedNum::Float(f) => *f,
+        BoxedNum::Complex(_) => unreachable!("complex pairs are handled first"),
+    };
+    let (x, y) = (boxed_num(a)?, boxed_num(b)?);
+    Some(match (&x, &y) {
+        (BoxedNum::Int(i), BoxedNum::Int(j)) => PyValue::Int(int(*i, *j)),
+        (BoxedNum::Complex(_), _) | (_, BoxedNum::Complex(_)) => {
+            PyValue::Complex(complex(&as_complex(&x), &as_complex(&y)))
+        }
+        _ => PyValue::Float(float(as_float(&x), as_float(&y))),
+    })
+}
+
+fn boxed_operand_error(op: &str, a: &PyValue, b: &PyValue) -> ! {
+    panic!(
+        "{}",
+        PyException::new(
+            "TypeError",
+            format!(
+                "unsupported operand type(s) for {}: '{}' and '{}'",
+                op,
+                a.py_type_name(),
+                b.py_type_name()
+            )
+        )
+    )
+}
+
+/// `-` on BOXED values (a `threading.local()` attribute — issue #356):
+/// CPython's numeric promotion; any other pair is its TypeError (a loud
+/// panic, §12.2, as for `+`).
+impl PySub<PyValue> for PyValue {
+    type Output = PyValue;
+    fn py_sub(&self, rhs: &PyValue) -> PyValue {
+        boxed_arith(self, rhs, |a, b| a - b, |a, b| a - b, |a, b| a.py_sub(b))
+            .unwrap_or_else(|| boxed_operand_error("-", self, rhs))
+    }
+}
+
+/// `*` on BOXED values: CPython's numeric promotion, and a sequence
+/// (str, bytes, tuple) repeated by an int (a non-positive count is
+/// empty); a sequence times a non-int is CPython's "can't multiply
+/// sequence" TypeError.
+impl PyMul<PyValue> for PyValue {
+    type Output = PyValue;
+    fn py_mul(&self, rhs: &PyValue) -> PyValue {
+        use PyValue as V;
+        if let Some(v) = boxed_arith(self, rhs, |a, b| a * b, |a, b| a * b, |a, b| a.py_mul(b)) {
+            return v;
+        }
+        let (seq, count) = match (self, rhs) {
+            (V::Str(_) | V::Bytes(_) | V::Tuple(_), n) => (self, n),
+            (n, V::Str(_) | V::Bytes(_) | V::Tuple(_)) => (rhs, n),
+            _ => boxed_operand_error("*", self, rhs),
+        };
+        let times = match count {
+            V::Int(i) => (*i).max(0) as usize,
+            V::Bool(b) => *b as usize,
+            other if boxed_num(other).is_some() => panic!(
+                "{}",
+                PyException::new(
+                    "TypeError",
+                    format!(
+                        "can't multiply sequence by non-int of type '{}'",
+                        other.py_type_name()
+                    )
+                )
+            ),
+            _ => boxed_operand_error("*", self, rhs),
+        };
+        match seq {
+            V::Str(s) => V::Str(s.repeat(times)),
+            V::Bytes(b) => V::Bytes(b.repeat(times)),
+            V::Tuple(t) => {
+                let mut out = Vec::with_capacity(t.len() * times);
+                for _ in 0..times {
+                    out.extend(t.iter().cloned());
+                }
+                V::Tuple(Arc::new(out))
+            }
+            _ => unreachable!("matched a sequence above"),
+        }
+    }
+}
+
+macro_rules! pyvalue_sub_mul_rhs {
+    ($($t:ty),* $(,)?) => {
+        $(impl PySub<$t> for PyValue {
+            type Output = PyValue;
+            fn py_sub(&self, rhs: &$t) -> PyValue {
+                PySub::<PyValue>::py_sub(self, &PyValue::from(rhs.clone()))
+            }
+        }
+        impl PyMul<$t> for PyValue {
+            type Output = PyValue;
+            fn py_mul(&self, rhs: &$t) -> PyValue {
+                PyMul::<PyValue>::py_mul(self, &PyValue::from(rhs.clone()))
+            }
+        })*
+    };
+}
+pyvalue_sub_mul_rhs!(i64, f64, bool);
+
 /// Read a mutable module global (issue #115: a module-level name written by
 /// functions through `global` lowers to a `static Mutex<T>`). The guard is
 /// dropped inside this function, so two reads in one statement never hold
@@ -3226,6 +3410,7 @@ pub fn py_value_type_name(v: &PyValue) -> &'static str {
         PyValue::Bytes(_) => "bytes",
         PyValue::Tuple(_) => "tuple",
         PyValue::Dict(_) => "dict",
+        PyValue::Complex(_) => "complex",
         PyValue::None_ => "NoneType",
     }
 }
@@ -3237,6 +3422,7 @@ pub fn py_value_str(v: &PyValue) -> String {
         PyValue::Bool(b) => if *b { "True" } else { "False" }.to_string(),
         PyValue::Str(s) => s.clone(),
         PyValue::Bytes(b) => py_bytes_repr(b),
+        PyValue::Complex(z) => z.py_display(),
         PyValue::Tuple(items) => {
             let inner: Vec<String> = items.iter().map(py_value_repr).collect();
             if inner.len() == 1 {
@@ -3314,6 +3500,13 @@ impl core::hash::Hash for PyValue {
                     core::hash::Hash::hash(k, state);
                     core::hash::Hash::hash(v, state);
                 }
+            }
+            PyValue::Complex(z) => {
+                core::hash::Hash::hash(&8u8, state);
+                // Signed zeros compare equal, so they hash alike (as Float).
+                let bits = |f: f64| if f == 0.0 { 0f64.to_bits() } else { f.to_bits() };
+                core::hash::Hash::hash(&bits(z.real), state);
+                core::hash::Hash::hash(&bits(z.imag), state);
             }
             PyValue::None_ => core::hash::Hash::hash(&6u8, state),
         }
@@ -4492,6 +4685,24 @@ impl<T> PyListOps<T> for Vec<T> {
 /// formatters print the two's-complement bit pattern. `align` is one of
 /// '<', '>', '^', or '\0' for the default (right, with sign-aware zero
 /// padding when `zero` is set).
+/// A boxed value under an integer presentation type (`f"{v:08x}"`): its
+/// int (a bool is an int), or CPython's `ValueError: Unknown format code
+/// 'x' for object of type 'str'`.
+pub fn py_value_format_int(v: &PyValue, code: char) -> Result<i64, PyException> {
+    match v {
+        PyValue::Int(i) => Ok(*i),
+        PyValue::Bool(b) => Ok(*b as i64),
+        other => Err(PyException::new(
+            "ValueError",
+            format!(
+                "Unknown format code '{}' for object of type '{}'",
+                code,
+                py_value_type_name(other)
+            ),
+        )),
+    }
+}
+
 pub fn py_int_radix_format(
     v: i64,
     fill: char,
@@ -6549,6 +6760,34 @@ impl PyContains<str> for PyValue {
 /// Python's `==` on boxed members: numeric kinds compare by value across
 /// int/float/bool (CPython: `1 == 1.0`, `True == 1`); everything else is
 /// structural.
+/// `==` between a concrete scalar and a boxed value (`nonce ==
+/// tl.last_nonce`, where the attribute of a `threading.local()` is boxed —
+/// issue #356): CPython's `==`, the numeric tower included, both ways.
+macro_rules! scalar_eq_pyvalue {
+    ($($t:ty => $conv:expr),* $(,)?) => {$(
+        impl PartialEq<PyValue> for $t {
+            fn eq(&self, other: &PyValue) -> bool {
+                let conv: fn(&$t) -> PyValue = $conv;
+                py_value_eq(&conv(self), other)
+            }
+        }
+        impl PartialEq<$t> for PyValue {
+            fn eq(&self, other: &$t) -> bool {
+                let conv: fn(&$t) -> PyValue = $conv;
+                py_value_eq(self, &conv(other))
+            }
+        }
+    )*};
+}
+scalar_eq_pyvalue! {
+    String => |s| PyValue::Str(s.clone()),
+    str => |s| PyValue::Str(s.to_string()),
+    &str => |s| PyValue::Str(s.to_string()),
+    i64 => |i| PyValue::Int(*i),
+    f64 => |f| PyValue::Float(*f),
+    bool => |b| PyValue::Bool(*b),
+}
+
 pub(crate) fn py_value_eq(a: &PyValue, b: &PyValue) -> bool {
     match (a, b) {
         (PyValue::Int(x), PyValue::Float(y)) => (*x as f64) == *y,
@@ -6557,6 +6796,19 @@ pub(crate) fn py_value_eq(a: &PyValue, b: &PyValue) -> bool {
         (PyValue::Int(x), PyValue::Bool(y)) => *x == (*y as i64),
         (PyValue::Bool(x), PyValue::Float(y)) => ((*x as i64) as f64) == *y,
         (PyValue::Float(x), PyValue::Bool(y)) => *x == ((*y as i64) as f64),
+        // A complex equals a real number when its imaginary part is zero
+        // and its real part equals the number (`-1+0j == -1`, issue #366).
+        (PyValue::Complex(z), other) | (other, PyValue::Complex(z))
+            if !matches!(other, PyValue::Complex(_)) =>
+        {
+            let real = match other {
+                PyValue::Int(i) => *i as f64,
+                PyValue::Float(f) => *f,
+                PyValue::Bool(b) => (*b as i64) as f64,
+                _ => return false,
+            };
+            z.imag == 0.0 && z.real == real
+        }
         _ => a == b,
     }
 }
@@ -7179,6 +7431,12 @@ pub fn complex_repr(re: f64, im: f64) -> String {
     format!("({}{}{}j)", complex_component_repr(re), sign, complex_component_repr(im.abs()))
 }
 
+impl From<Complex> for PyValue {
+    fn from(z: Complex) -> Self {
+        PyValue::Complex(z)
+    }
+}
+
 impl PyBool for Complex {
     fn py_bool(self) -> bool {
         // bool(z) is False only for 0+0j (signed zero makes no difference).
@@ -7430,6 +7688,7 @@ pub use stdlib::functools;
 // The lru_cache backing store must be nameable in generated statics.
 pub use stdlib::functools::PyLruCache;
 pub use stdlib::heapq;
+pub use stdlib::bisect;
 pub use stdlib::copy;
 pub use stdlib::textwrap;
 pub use stdlib::hashlib;
@@ -8469,75 +8728,188 @@ pub fn format_string<T: AsRef<str>>(template: T, args: &[&dyn Display]) -> Strin
     result
 }
 
-/// Runtime `str.format(**kwargs)` for a KWARGS-DICT receiver (issue #368):
-/// substitutes `{key}` placeholders from a `PyDict<String, String>` of
-/// keyword values, with CPython's `{{`/`}}` escaping and a `KeyError` for a
-/// missing key. This is the DYNAMIC seam for the (rare) `"template".
-/// format(**runtime_dict)` calls that cannot be resolved at conversion
-/// time; the statically-resolvable templates still lower to `format!`.
+/// Runtime `str.format` (issue #368), for a call whose template or
+/// keyword bag the conversion cannot see: a template held in a parameter
+/// or a field, a `**runtime_dict` spread, the unbound `str.format(t, ...)`
+/// form over a non-literal `t`. A template the conversion CAN see still
+/// lowers to `format!` at conversion time (`lower_str_format`); this is
+/// the seam for the rest, which was previously replaced by `None`.
 ///
-/// The scalar `{key}` FIELD-NAME form is the supported surface (which is
-/// how the CPython test corpus uses it). A format-SPEC or CONVERSION
-/// (`{key:>5}`, `{key!r}`) is a loud `ValueError`, NOT a silent wrong
-/// substitution — the corpus's runtime-kwargs templates never use them,
-/// and a best-effort approximation is exactly what the prime directive
-/// forbids.
-pub fn str_format_kwargs<T: AsRef<str>>(
+/// `args` and `kwargs` arrive already rendered through Python's `str()`,
+/// which is exactly what `format(value, "")` produces for a field with no
+/// spec — so `{}`, `{0}`, `{name}`, `{!s}`, and `{{`/`}}` all match
+/// CPython. A field this path cannot render faithfully — a format spec
+/// (`{:>5}`), a `!r`/`!a` conversion, attribute or index access
+/// (`{a.b}`, `{a[0]}`) — raises a `ValueError` naming the field at the
+/// point of divergence, never an approximation.
+///
+/// Errors follow CPython's messages and its left-to-right order: the
+/// first bad field raises, after the fields before it were rendered.
+pub fn str_format_runtime<T: AsRef<str>>(
     template: T,
-    kwargs: &PyDict<String, String>,
+    args: &[String],
+    kwargs: &[(String, String)],
 ) -> Result<String, PyException> {
+    // CPython rejects a keyword given twice before it looks at the
+    // template (`"{a}".format(**{"a": 1}, a=2)`).
+    for (i, (k, _)) in kwargs.iter().enumerate() {
+        if kwargs[..i].iter().any(|(prev, _)| prev == k) {
+            return Err(PyException::new(
+                "TypeError",
+                format!("str.format() got multiple values for keyword argument '{}'", k),
+            ));
+        }
+    }
     let chars: Vec<char> = template.as_ref().chars().collect();
+    let n = chars.len();
     let mut out = String::new();
     let mut i = 0usize;
-    let n = chars.len();
+    let mut auto_next = 0usize;
+    // Numbered fields are either all automatic (`{}`) or all manual
+    // (`{0}`); named fields do not take part.
+    let mut automatic: Option<bool> = None;
     while i < n {
         let c = chars[i];
-        if c == '{' {
-            if (i + 1 < n) && chars[i + 1] == '{' {
-                out.push('{');
-                i += 2;
-                continue;
-            }
-            // A replacement field: find the closing '}'.
-            let mut j = i + 1;
-            let mut key = String::new();
-            while j < n && chars[j] != '}' {
-                let fc = chars[j];
-                if fc == ':' || fc == '!' {
-                    // format-spec or conversion — unsupported, be loud.
-                    return Err(PyException::new(
-                        "ValueError",
-                        "str.format(**kwargs) format-spec / conversion is not supported \
-                         by the runtime kwargs path (issue #368)"
-                    ));
-                }
-                key.push(fc);
-                j += 1;
-            }
-            if j >= n {
-                return Err(PyException::new("ValueError", "expected '}' before end of string"));
-            }
-            match kwargs.get(&key) {
-                Some(v) => out.push_str(v),
-                None => {
-                    return Err(PyException::new("KeyError", format!("'{}'", key)))
-                }
-            }
-            i = j + 1;
-            continue;
-        }
         if c == '}' {
-            if (i + 1 < n) && chars[i + 1] == '}' {
+            if i + 1 < n && chars[i + 1] == '}' {
                 out.push('}');
                 i += 2;
                 continue;
             }
-            return Err(PyException::new("ValueError", "single '}' in format string"));
+            return Err(PyException::new(
+                "ValueError",
+                "Single '}' encountered in format string",
+            ));
         }
-        out.push(c);
-        i += 1;
+        if c != '{' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if i + 1 < n && chars[i + 1] == '{' {
+            out.push('{');
+            i += 2;
+            continue;
+        }
+        if i + 1 >= n {
+            return Err(PyException::new(
+                "ValueError",
+                "Single '{' encountered in format string",
+            ));
+        }
+        // The field runs to its closing '}'.
+        let Some(close) = (i + 1..n).find(|&j| chars[j] == '}') else {
+            return Err(PyException::new(
+                "ValueError",
+                "expected '}' before end of string",
+            ));
+        };
+        let field: String = chars[i + 1..close].iter().collect();
+        let (name, conversion) = match field.split_once('!') {
+            Some((name, conv)) => (name, Some(conv)),
+            None => (field.as_str(), None),
+        };
+        if name.contains(':') || conversion.is_some_and(|c| c != "s") {
+            return Err(PyException::new(
+                "ValueError",
+                format!(
+                    "str.format field '{{{}}}' uses a format spec or conversion, which rython \
+                     renders only for a template it can see at conversion time",
+                    field
+                ),
+            ));
+        }
+        if name.contains('.') || name.contains('[') {
+            return Err(PyException::new(
+                "ValueError",
+                format!(
+                    "str.format field '{{{}}}' uses attribute or index access, which rython \
+                     does not support",
+                    field
+                ),
+            ));
+        }
+        let value = if name.is_empty() || name.bytes().all(|b| b.is_ascii_digit()) {
+            let index = if name.is_empty() {
+                if automatic == Some(false) {
+                    return Err(PyException::new(
+                        "ValueError",
+                        "cannot switch from manual field specification to automatic field \
+                         numbering",
+                    ));
+                }
+                automatic = Some(true);
+                auto_next += 1;
+                auto_next - 1
+            } else {
+                if automatic == Some(true) {
+                    return Err(PyException::new(
+                        "ValueError",
+                        "cannot switch from automatic field numbering to manual field \
+                         specification",
+                    ));
+                }
+                automatic = Some(false);
+                name.parse::<usize>().unwrap_or(usize::MAX)
+            };
+            match args.get(index) {
+                Some(v) => v,
+                None => {
+                    return Err(PyException::new(
+                        "IndexError",
+                        format!(
+                            "Replacement index {} out of range for positional args tuple",
+                            index
+                        ),
+                    ));
+                }
+            }
+        } else {
+            match kwargs.iter().find(|(k, _)| k == name) {
+                Some((_, v)) => v,
+                None => return Err(PyException::new("KeyError", format!("'{}'", name))),
+            }
+        };
+        out.push_str(value);
+        i = close + 1;
     }
     Ok(out)
+}
+
+/// A `**kwargs` bag forwarded into a stdlib call whose rython lowering
+/// models none of that call's keyword options (issue #368) —
+/// `textwrap.wrap(text, width, **kwargs)`, `csv.writer(f, **fmtparams)`.
+/// The keys are only known at run time, so the check is there: an EMPTY
+/// bag changes nothing and the call proceeds exactly as CPython's does; a
+/// bag carrying any option raises `NotImplementedError` naming it, where
+/// silently ignoring it would produce different output.
+pub fn refuse_forwarded_kwargs<V>(call: &str, bag: &PyDict<String, V>) -> Result<(), PyException> {
+    match bag.keys().next() {
+        None => Ok(()),
+        Some(key) => Err(PyException::new(
+            "NotImplementedError",
+            format!(
+                "{}() got keyword option '{}' through a **kwargs spread; rython models none \
+                 of {}()'s keyword options and refuses to silently ignore it",
+                call, key, call
+            ),
+        )),
+    }
+}
+
+/// A `**bag` spread's entries as `str.format` keywords, each value
+/// rendered through Python's `str()` (see [`str_format_runtime`]).
+pub fn str_format_bag<V: Clone + PyToString>(bag: &PyDict<String, V>) -> Vec<(String, String)> {
+    bag.iter().map(|(k, v)| (k.clone(), v.clone().py_str())).collect()
+}
+
+/// `template.format(**kwargs)` over a runtime keyword bag (issue #368):
+/// [`str_format_runtime`] with no positional arguments.
+pub fn str_format_kwargs<T: AsRef<str>, V: Clone + PyToString>(
+    template: T,
+    kwargs: &PyDict<String, V>,
+) -> Result<String, PyException> {
+    str_format_runtime(template, &[], &str_format_bag(kwargs))
 }
 
 /// Helper for range() function with optional parameters - more flexible than the basic range

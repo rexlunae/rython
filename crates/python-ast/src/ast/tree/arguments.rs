@@ -232,7 +232,8 @@ pub fn is_pyvalue_boxable_member(ann: &ExprType) -> bool {
         ExprType::Name(n) => {
             matches!(
                 n.id.as_str(),
-                "int" | "float" | "str" | "bool" | "bytes" | "bytearray" | "Any" | "memoryview"
+                "int" | "float" | "complex" | "str" | "bool" | "bytes" | "bytearray" | "Any"
+                    | "memoryview"
                     // PathLike (os.PathLike) unions like `str | bytes |
                     // PathLike`: only the str/bytes members are real values in
                     // rython; the member is tolerated so file paths flow

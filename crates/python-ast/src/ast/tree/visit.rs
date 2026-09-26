@@ -192,6 +192,63 @@ pub fn stmt_targets(s: &Statement) -> Vec<&ExprType> {
     }
 }
 
+/// `stmt_exprs` and `stmt_targets` together, MUTABLY: the same
+/// enumeration (a new statement form is added to all three, side by
+/// side), for the passes that rewrite expressions in place.
+pub fn stmt_all_exprs_mut(s: &mut Statement) -> Vec<&mut ExprType> {
+    match &mut s.statement {
+        StatementType::Assign(a) => std::iter::once(&mut a.value)
+            .chain(a.targets.iter_mut())
+            .collect(),
+        StatementType::AugAssign(a) => vec![&mut a.value, &mut a.target],
+        StatementType::Expr(e) => vec![&mut e.value],
+        StatementType::Return(Some(e)) => vec![&mut e.value],
+        StatementType::If(i) => vec![&mut i.test],
+        StatementType::While(w) => vec![&mut w.test],
+        StatementType::For(f) => vec![&mut f.iter, &mut f.target],
+        StatementType::AsyncFor(f) => vec![&mut f.iter, &mut f.target],
+        StatementType::With(w) => w
+            .items
+            .iter_mut()
+            .flat_map(|i| std::iter::once(&mut i.context_expr).chain(i.optional_vars.as_mut()))
+            .collect(),
+        StatementType::AsyncWith(w) => w
+            .items
+            .iter_mut()
+            .flat_map(|i| std::iter::once(&mut i.context_expr).chain(i.optional_vars.as_mut()))
+            .collect(),
+        StatementType::Assert { test, msg } => std::iter::once(test.as_mut())
+            .chain(msg.iter_mut().map(|m| m.as_mut()))
+            .collect(),
+        StatementType::Raise(r) => r.exc.iter_mut().chain(r.cause.iter_mut()).collect(),
+        StatementType::Delete(targets) => targets.iter_mut().collect(),
+        StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => {
+            let args = &mut f.args;
+            let params = args
+                .posonlyargs
+                .iter_mut()
+                .chain(args.args.iter_mut())
+                .chain(args.kwonlyargs.iter_mut())
+                .chain(args.vararg.iter_mut())
+                .chain(args.kwarg.iter_mut());
+            f.decorator_list
+                .iter_mut()
+                .chain(args.defaults.iter_mut().map(|d| d.as_mut()))
+                .chain(args.kw_defaults.iter_mut().flatten().map(|d| d.as_mut()))
+                .chain(params.filter_map(|p| p.annotation.as_deref_mut()))
+                .chain(f.returns.as_deref_mut())
+                .collect()
+        }
+        StatementType::ClassDef(c) => c
+            .decorator_list
+            .iter_mut()
+            .chain(c.bases.iter_mut())
+            .chain(c.keywords.iter_mut().map(|k| &mut k.value))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The names a binding target binds: a name, every element of a tuple or
 /// list pattern, a starred element's name.
 pub fn target_names(target: &ExprType) -> Vec<&str> {

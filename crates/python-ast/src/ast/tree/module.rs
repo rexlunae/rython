@@ -247,6 +247,7 @@ impl CodeGen for Module {
         // the conversion error.
         let body = crate::ast::tree::singledispatch::desugar_module(self.raw.body.clone())
             .unwrap_or(self.raw.body);
+        let body = crate::ast::tree::class_def::hoist_nested_classes(body);
         for s in body {
             symbols = s.clone().find_symbols(symbols);
         }
@@ -750,8 +751,7 @@ impl CodeGen for Module {
                 if Self::is_type_checking_test(&if_stmt.test) {
                     continue;
                 }
-                let test_str = format!("{:?}", if_stmt.test);
-                if test_str.contains("__name__") && test_str.contains("__main__") {
+                if is_main_guard(&if_stmt.test) {
                     let is_simple_main_call = Self::is_simple_main_call_block(&if_stmt.body)
                         && !user_main_returns_value
                         && options.numpy_backend.is_none();
@@ -842,8 +842,7 @@ impl CodeGen for Module {
                 if Self::is_type_checking_test(&if_stmt.test) {
                     continue;
                 }
-                let test_str = format!("{:?}", if_stmt.test);
-                if test_str.contains("__name__") && test_str.contains("__main__") {
+                if is_main_guard(&if_stmt.test) {
                     continue;
                 }
             }
@@ -1024,7 +1023,27 @@ impl CodeGen for Module {
         // though the pinning use is right there (issue #81-family, Devin
         // review on #103). The __main__ block gets its own pass.
         {
-            let info = crate::analyze_function_types(&module_init_raw, Some(&options), Some(&symbols));
+            let mut info =
+                crate::analyze_function_types(&module_init_raw, Some(&options), Some(&symbols));
+            // A module FUNCTION's use of a module-level empty container
+            // pins it too (issue #122: botocore's `_INITIALIZERS = []`,
+            // appended to only inside `register_initializer(callback:
+            // Callable[[str], None])`). The definitions are not module-init
+            // statements, so the pass above never saw them.
+            // The `__main__` block's uses count as well: it is module code.
+            let defs: Vec<crate::Statement> = self
+                .raw
+                .body
+                .iter()
+                .filter(|s| match &s.statement {
+                    crate::StatementType::FunctionDef(_)
+                    | crate::StatementType::AsyncFunctionDef(_) => true,
+                    crate::StatementType::If(i) => is_main_guard(&i.test),
+                    _ => false,
+                })
+                .cloned()
+                .collect();
+            crate::pin_empty_containers(&defs, &mut info, Some(&symbols), Some(&options));
             options.use_counts = std::rc::Rc::new(info.use_counts);
             options.name_types = std::rc::Rc::new(info.name_types);
             options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
@@ -1318,8 +1337,7 @@ impl CodeGen for Module {
 
             // Check for if __name__ == "__main__" blocks at the AST level before generating code
             if let crate::StatementType::If(if_stmt) = &s.statement {
-                let test_str = format!("{:?}", if_stmt.test);
-                if test_str.contains("__name__") && test_str.contains("__main__") {
+                if is_main_guard(&if_stmt.test) {
                     // Check if this is a simple main() call pattern
                     // (disabled when --numpy-backend forces startup code: the
                     // wrapper main below must run __module_init__ first).
@@ -1355,7 +1373,14 @@ impl CodeGen for Module {
                             o.hoisted_names = std::rc::Rc::new(main_hoisted.clone());
                             o.leaked_loop_targets = std::rc::Rc::new(main_leaked.clone());
                             o.use_counts = std::rc::Rc::new(main_info.use_counts.clone());
-                            o.name_types = std::rc::Rc::new(main_info.name_types.clone());
+                            // The block's own bindings first; a module name
+                            // it only USES (a registry static — issue #122's
+                            // `HANDLERS["d"](21)`) keeps the module's type.
+                            let mut types = main_info.name_types.clone();
+                            for (k, v) in options.name_types.iter() {
+                                types.entry(k.clone()).or_insert_with(|| v.clone());
+                            }
+                            o.name_types = std::rc::Rc::new(types);
                             o.empty_pinned = std::rc::Rc::new(main_info.empty_pinned.clone());
                             o.in_module_init_body = true;
                             o
@@ -3154,8 +3179,7 @@ pub(crate) fn module_promoted_static_names(
             if Module::is_type_checking_test(&if_stmt.test) {
                 continue;
             }
-            let test_str = format!("{:?}", if_stmt.test);
-            if test_str.contains("__name__") && test_str.contains("__main__") {
+            if is_main_guard(&if_stmt.test) {
                 continue;
             }
         }
@@ -3791,6 +3815,9 @@ pub(crate) fn normalize_module_body(
     // any body analysis — the shape the monomorphizing specialization
     // pass already lowers (ast::tree::singledispatch).
     let body = crate::ast::tree::singledispatch::desugar_module(body)?;
+    // Issue #367: nested classes are module classes reached through the
+    // outer one — hoisted before any analysis sees the class bodies.
+    let body = crate::ast::tree::class_def::hoist_nested_classes(body);
     let (body, newly_live, folded_imports) = fold_static_import_trys(&body, options);
     // Issue #137: module-level VERSION-GATED blocks (`if
     // sys.version_info >= (3, 11):` — certifi's core.py) and static-name
@@ -4136,11 +4163,13 @@ pub(crate) fn module_global_mutable_names(
         let [crate::ExprType::Name(n)] = a.targets.as_slice() else {
             continue;
         };
+        // A function that binds the same name WITHOUT `global` owns a
+        // local (spelled apart under the reserved prefix, issue #333); it
+        // never rebinds the module object, so it does not disqualify it.
         if !mutated.contains(&n.id)
             || out.contains_key(&n.id)
             || module_assign_counts.get(&n.id) != Some(&1)
             || global_written.contains(&n.id)
-            || bound_without_global.contains(&n.id)
             || matches!(
                 symbols.get(&n.id),
                 Some(crate::SymbolTableNode::ImportFrom(_))
@@ -4284,6 +4313,22 @@ pub(crate) fn static_mutation_root(
     s: &crate::Statement,
     statics: &std::collections::HashMap<String, crate::MutableGlobalKind>,
 ) -> Option<String> {
+    // Only a STORE through the static (`X[k] = v`, `del X[k]`, `X.a += 1`)
+    // wraps its whole statement: an assignment has no `return` or nested
+    // body for the lock's closure to capture. A mutating METHOD call
+    // (`X.append(v)`, `return X.pop()`) is wrapped where it stands, as an
+    // expression (call.rs), so its value flows out and whatever statement
+    // holds it stays outside the lock.
+    if let crate::StatementType::Delete(targets) = &s.statement {
+        for t in targets {
+            if !matches!(t, crate::ExprType::Name(_))
+                && let Some(root) = store_root(t)
+                && statics.contains_key(root)
+            {
+                return Some(root.to_string());
+            }
+        }
+    }
     for t in crate::ast::tree::visit::stmt_targets(s) {
         if matches!(t, crate::ExprType::Name(_)) {
             continue;
@@ -4294,23 +4339,37 @@ pub(crate) fn static_mutation_root(
             return Some(root.to_string());
         }
     }
-    let mut found: Option<String> = None;
-    for e in crate::ast::tree::visit::stmt_all_exprs(s) {
-        crate::ast::tree::visit::walk_expr(e, &mut |sub| {
-            if found.is_some() {
-                return;
-            }
-            if let crate::ExprType::Call(c) = sub
-                && let crate::ExprType::Attribute(attr) = c.func.as_ref()
-                && crate::ast::tree::scope::mutates_receiver(&attr.attr)
-                && let crate::ExprType::Name(recv) = attr.value.as_ref()
-                && statics.contains_key(&recv.id)
-            {
-                found = Some(recv.id.clone());
-            }
-        });
-    }
-    found
+    None
+}
+
+/// The rendering scope for a mutation of the module static `root` under
+/// its lock (issues #337, #122): the options with `root` resolving to the
+/// locked borrow's alias (Rust forbids a binding that shadows a static,
+/// E0530, so the borrow takes a reserved-prefix name), the alias, and the
+/// static's reference to lock.
+pub(crate) fn static_mutation_scope(
+    options: &PythonOptions,
+    root: &str,
+) -> (PythonOptions, proc_macro2::Ident, TokenStream) {
+    let ident = crate::safe_ident(root);
+    let alias = format!("{}static_{}", crate::ast::tree::visit::RESERVED_PREFIX, root);
+    let alias_ident = crate::safe_ident(&alias);
+    let mut inner = options.clone();
+    let mut aliases = (*inner.static_mutation_alias).clone();
+    aliases.insert(root.to_string(), alias);
+    inner.static_mutation_alias = std::rc::Rc::new(aliases);
+    let mut statics = (*inner.mutable_statics).clone();
+    statics.remove(root);
+    inner.mutable_statics = std::rc::Rc::new(statics);
+    let mut writables = (*inner.scope_global_writables).clone();
+    writables.remove(root);
+    inner.scope_global_writables = std::rc::Rc::new(writables);
+    let mut promoted = (*inner.promoted_statics).clone();
+    promoted.remove(root);
+    inner.promoted_statics = std::rc::Rc::new(promoted);
+    let kind = options.mutable_statics.get(root).expect("root is a mutable static");
+    let static_ref = kind.static_ref(&ident);
+    (inner, alias_ident, static_ref)
 }
 
 /// Whether a statement that mutates `name` in place also READS it in the
@@ -6216,19 +6275,21 @@ fn matched_unittest_main(stmt: &crate::Statement) -> bool {
     )
 }
 
-/// The `test_*` method names directly defined on a class.
+/// The `test_*` method names directly defined on a class, in the sorted
+/// order CPython's TestLoader runs them.
 fn test_method_names(class_def: &crate::ClassDef) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for s in &class_def.body {
         match &s.statement {
             crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
-                if f.name.starts_with("test") {
+                if f.name.starts_with("test") && !out.contains(&f.name) {
                     out.push(format!("{}", f.name));
                 }
             }
             _ => {}
         }
     }
+    out.sort();
     out
 }
 
@@ -6236,18 +6297,56 @@ fn test_method_names(class_def: &crate::ClassDef) -> Vec<String> {
 /// module has no direct `unittest.TestCase`-derived classes (nothing to run —
 /// leave `unittest.main()` to the runtime, which then raises its loud
 /// NotImplementedError).
+/// A test-runner gate the emitted runner carries out (issue #371).
+enum RunGate {
+    Skip,
+    SkipIf(crate::ExprType),
+    SkipUnless(crate::ExprType),
+    ExpectedFailure,
+    /// `@cpython_only`: rython is not CPython, so — as on any other
+    /// implementation — the test does not run.
+    CpythonOnly,
+}
+
+/// The runner gates among `decorators` (a class's, then a method's), in
+/// order. A gate whose condition argument is missing is not honored here
+/// (its decorator was already reported as a plain gate).
+fn run_gates(decorators: &[crate::ExprType]) -> Vec<RunGate> {
+    use crate::ast::tree::decorator::{TestGate, test_gate_from_expr};
+    let mut out = Vec::new();
+    for d in decorators {
+        let condition = match d {
+            crate::ExprType::Call(c) => c.args.first().cloned(),
+            _ => None,
+        };
+        match (test_gate_from_expr(d), condition) {
+            (Some(TestGate::Skip), _) => out.push(RunGate::Skip),
+            (Some(TestGate::SkipIf), Some(cond)) => out.push(RunGate::SkipIf(cond)),
+            (Some(TestGate::SkipUnless), Some(cond)) => out.push(RunGate::SkipUnless(cond)),
+            (Some(TestGate::ExpectedFailure), _) => out.push(RunGate::ExpectedFailure),
+            (Some(TestGate::CpythonOnly), _) => out.push(RunGate::CpythonOnly),
+            _ => {}
+        }
+    }
+    out
+}
+
 fn emit_test_runner(
     module_stmts: &[crate::Statement],
-    _ctx: crate::CodeGenContext,
-    _options: crate::PythonOptions,
-    _symbols: crate::SymbolTableScopes,
+    ctx: crate::CodeGenContext,
+    options: crate::PythonOptions,
+    symbols: crate::SymbolTableScopes,
 ) -> Option<TokenStream> {
     let mut classes: Vec<crate::ClassDef> = Vec::new();
     collect_class_defs(module_stmts, &mut classes);
-    let test_classes: Vec<&crate::ClassDef> = classes
+    // CPython's TestLoader visits the module's classes in `dir()` order and
+    // each class's test methods in sorted order (getTestCaseNames sorts
+    // with three_way_cmp) — not definition order.
+    let mut test_classes: Vec<&crate::ClassDef> = classes
         .iter()
         .filter(|c| c.bases.iter().any(is_testcase_base))
         .collect();
+    test_classes.sort_by(|a, b| a.name.cmp(&b.name));
     if test_classes.is_empty() {
         return None;
     }
@@ -6270,22 +6369,101 @@ fn emit_test_runner(
         };
         for m in test_method_names(c) {
             let mident = quote::format_ident!("{}", m);
-            stmts.extend(quote! {
+            // The class's gates, then the method's (issue #371). A skipped
+            // test is never constructed, set up, or run — CPython decides
+            // the skip before setUp. Each condition is evaluated when the
+            // runner reaches the test; CPython evaluates it when the
+            // decorator runs at import, which differs only for a condition
+            // the module rebinds after defining the class.
+            let method_decorators = c
+                .body
+                .iter()
+                .find_map(|s| match &s.statement {
+                    crate::StatementType::FunctionDef(f)
+                    | crate::StatementType::AsyncFunctionDef(f)
+                        if f.name == m =>
+                    {
+                        Some(f.decorator_list.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let mut gates = run_gates(&c.decorator_list);
+            gates.extend(run_gates(&method_decorators));
+            let truth = |cond: &crate::ExprType| -> Option<TokenStream> {
+                crate::ExprType::Call(crate::Call {
+                    func: Box::new(crate::ExprType::Name(crate::ast::tree::name::Name {
+                        id: "bool".to_string(),
+                    })),
+                    args: vec![cond.clone()],
+                    keywords: Vec::new(),
+                })
+                .to_rust(ctx.clone(), options.clone(), symbols.clone())
+                .ok()
+            };
+            let mut skip_terms: Vec<TokenStream> = Vec::new();
+            let mut expected_failure = false;
+            for g in &gates {
+                match g {
+                    RunGate::Skip | RunGate::CpythonOnly => skip_terms.push(quote!(true)),
+                    RunGate::SkipIf(cond) => {
+                        let t = truth(cond)?;
+                        skip_terms.push(quote!((#t)));
+                    }
+                    RunGate::SkipUnless(cond) => {
+                        let t = truth(cond)?;
+                        skip_terms.push(quote!(!(#t)));
+                    }
+                    RunGate::ExpectedFailure => expected_failure = true,
+                }
+            }
+            let outcome = if expected_failure {
+                // `@expectedFailure`: a failure is the expected outcome; a
+                // pass is an "unexpected success", which fails the run
+                // (CPython's wasSuccessful() is False for it since 3.4).
+                quote! {
+                    match __rython_tc.#mident() {
+                        Ok(_) => {
+                            eprintln!("UNEXPECTED SUCCESS: {}", #m);
+                            __rython_ntest_failures += 1;
+                        }
+                        Err(_) => {}
+                    };
+                }
+            } else {
+                quote! {
+                    match __rython_tc.#mident() {
+                        Ok(__rython_v) => __rython_v,
+                        Err(__rython_e) => {
+                            eprintln!("FAIL: {}", __rython_e);
+                            __rython_ntest_failures += 1;
+                        }
+                    };
+                }
+            };
+            let run = quote! {
                 let mut __rython_tc = #cname::new()?;
                 #setup
-                match __rython_tc.#mident() {
-                    Ok(__rython_v) => __rython_v,
-                    Err(__rython_e) => {
-                        eprintln!("FAIL: {}", __rython_e);
-                        __rython_ntest_failures += 1;
-                    }
-                };
+                #outcome
                 #teardown
-            });
+            };
+            if skip_terms.is_empty() {
+                stmts.extend(run);
+            } else {
+                stmts.extend(quote! {
+                    if #(#skip_terms)||* {
+                        __rython_ntest_skipped += 1;
+                    } else {
+                        #run
+                    }
+                });
+            }
         }
     }
     Some(quote! {
         let mut __rython_ntest_failures: usize = 0usize;
+        #[allow(unused_mut, unused_variables)]
+        let mut __rython_ntest_skipped: usize = 0usize;
         #stmts
         if __rython_ntest_failures != 0usize {
             return Err(PyException::new(
@@ -6901,4 +7079,12 @@ pub(crate) fn module_reexports_stdpython_module(
         if found.is_some() { Flow::Stop } else { Flow::Continue }
     });
     found
+}
+
+/// Whether an `if` test is the `__name__ == "__main__"` guard (in any of
+/// its spellings: either operand order, `!=` under an `else`, ...). The
+/// one classifier every main-block pass asks.
+pub(crate) fn is_main_guard(test: &crate::ExprType) -> bool {
+    let text = format!("{:?}", test);
+    text.contains("__name__") && text.contains("__main__")
 }

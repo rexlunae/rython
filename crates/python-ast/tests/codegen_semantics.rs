@@ -4676,8 +4676,8 @@ fn boxed_class_constructor_boxes_scalar_arguments() {
         "boxed_ctor.py",
     );
     assert!(
-        out.contains("C :: new (PyValue :: from ((42))) ?")
-            && out.contains("C :: new (PyValue :: from ((\"hi\"))) ?"),
+        out.contains("C :: new (PyValue :: from (42)) ?")
+            && out.contains("C :: new (PyValue :: from (\"hi\")) ?"),
         "boxed-class construction must box scalar args: {}",
         out
     );
@@ -4712,13 +4712,13 @@ fn float_coercible_class_lowers_via_float_and_into() {
         out
     );
     assert!(
-        out.contains("math :: ceil ({ FloatLike :: new (PyValue :: from ((42.5))) ? }) . into ()")
+        out.contains("math :: ceil ({ FloatLike :: new (PyValue :: from (42.5)) ? }) . into ()")
             || out.contains(". into ()"),
         "a FloatLike arg to a math call must lower via Into<f64>: {}",
         out
     );
     assert!(
-        out.contains("FloatLike :: new (PyValue :: from ((1.0))) ? }) . into ()"),
+        out.contains("FloatLike :: new (PyValue :: from (1.0)) ? }) . into ()"),
         "a heterogeneous [float, FloatLike] list element must coerce via Into: {}",
         out
     );
@@ -5363,7 +5363,7 @@ fn str_format_with_runtime_kwargs_routes_to_the_runtime_formatter() {
         "fmt_kw.py",
     );
     assert!(
-        out.contains("str_format_kwargs"),
+        out.contains("str_format_runtime") && out.contains("str_format_bag"),
         "must route to the runtime formatter: {}",
         out
     );
@@ -5412,23 +5412,56 @@ fn str_format_errors_are_loud_or_lower_to_variants() {
         out
     );
 
-    // Non-literal templates can't be checked at conversion time: the
-    // dynamic-format divergence — the call is dropped and -W reports it.
-    let (out, warnings) = compile_with_warnings(
+    // A template the conversion cannot see formats at RUN time (issue
+    // #368). It used to be replaced by `None` behind a -W warning, which
+    // printed `None` where CPython prints the formatted string.
+    let out = compile(
         "def f(t: str, x: int) -> str:\n    return t.format(x)\n",
         "fmtdyn.py",
     );
     assert!(
-        out.contains("stdpython :: PyValue :: None_"),
-        "the dynamic format must drop to a no-op: {}",
+        out.contains("str_format_runtime") && !out.contains("PyValue :: None_"),
+        "a dynamic template must format at run time, never drop to None: {}",
         out
     );
+}
+
+#[test]
+fn unbound_str_format_takes_its_template_from_the_first_argument() {
+    // `str.format("{}!", x)` is `"{}!".format(x)` (issue #368): the
+    // literal template still lowers to `format!` at conversion time. It
+    // used to look for the template in `str` itself, find none, and
+    // replace the call with `None`.
+    let out = compile(
+        "def f(x: int) -> str:\n    return str.format(\"{}!\", x)\n",
+        "fmtunbound.py",
+    );
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("non-literal template") && w.contains("dropped")),
-        "the dynamic-format divergence must be reported through -W: {:?}",
-        warnings
+        out.contains("format !") && !out.contains("PyValue :: None_"),
+        "the unbound form must format its literal template: {}",
+        out
+    );
+}
+
+#[test]
+fn a_runtime_keyword_bag_keeps_the_calls_other_arguments() {
+    // `"{who}/{extra}".format(extra=True, **bag)` with a bag built at run
+    // time (issue #368): the call formats at run time with BOTH the bag
+    // and `extra`. The bag path used to return early with the bag alone,
+    // so `{extra}` raised KeyError where CPython prints it.
+    let out = compile(
+        concat!(
+            "def f() -> str:\n",
+            "    bag = {}\n",
+            "    bag[\"who\"] = \"bob\"\n",
+            "    return \"{who}/{extra}\".format(extra=True, **bag)\n",
+        ),
+        "fmtbag.py",
+    );
+    assert!(
+        out.contains("str_format_bag") && out.contains("\"extra\""),
+        "the explicit keyword must reach the runtime formatter with the bag: {}",
+        out
     );
 }
 
@@ -6503,13 +6536,15 @@ fn bare_math_import_threads_exception_inside_try() {
 }
 
 #[test]
-fn textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error() {
+fn textwrap_kwargs_spread_is_checked_at_run_time_not_a_hard_error() {
     // #368: `wrap(text, width, **kwargs)` (test_textwrap's check_wrap
     // forwarding its **kwargs, which may carry initial_indent/drop_whitespace)
-    // must be a LOUD drop — never a hard "unexpected keyword argument" — since
-    // rython's textwrap.wrap(text, width) models only the width. The spread
-    // keys are dynamic at this lowering (the dynamic-kwargs divergence).
-    let (out, warnings) = compile_with_warnings(
+    // converts — never a hard "unexpected keyword argument" — and since
+    // rython's textwrap.wrap(text, width) models only the width, the bag is
+    // checked at RUN time: empty, the call is exactly CPython's; carrying an
+    // option, it raises NotImplementedError rather than wrapping without it
+    // (which is what the old -W drop did).
+    let out = compile(
         concat!(
             "from textwrap import wrap\n",
             "class T:\n",
@@ -6524,9 +6559,9 @@ fn textwrap_kwargs_spread_is_a_loud_drop_not_a_hard_error() {
         out
     );
     assert!(
-        warnings.iter().any(|w| w.contains("kwargs") && w.contains("dropped")),
-        "the **kwargs spread must be a loud drop: {:?}",
-        warnings
+        out.contains("refuse_forwarded_kwargs (\"wrap\""),
+        "the forwarded **kwargs bag must be checked at run time: {}",
+        out
     );
 }
 
@@ -6584,6 +6619,28 @@ fn non_finite_float_literals_lower_to_f64_expressions() {
 }
 
 #[test]
+fn a_non_finite_float_is_a_float_everywhere_it_is_typed() {
+    // issue #372: the non-finite constant rides through a String-carrying
+    // sentinel. The renderer honored it, but the operator typing read it
+    // as a str, so `1e400 * 0.0` lowered to `multiply_string` (string
+    // repetition). And `1e400j` is complex(0, inf), whose imaginary part
+    // has no literal form either.
+    let out = compile("def f() -> float:\n    return 1e400 * 0.0\n", "inf_mul.py");
+    assert!(!out.contains("multiply_string"), "inf * 0.0 is float arithmetic: {}", out);
+    let out = compile("def f() -> complex:\n    return 1e400j\n", "inf_complex.py");
+    assert!(
+        out.contains("Complex :: new (0.0 , f64 :: INFINITY)"),
+        "the infinite imaginary part is the f64 constant: {}",
+        out
+    );
+    assert!(
+        out.contains("Result < Complex"),
+        "a `-> complex` annotation is the runtime Complex: {}",
+        out
+    );
+}
+
+#[test]
 fn complex_literals_render_as_complex_values() {
     // `2j`, `3.5j` must lower to `Complex::new(re, im)` with f64 tokens
     // (issue #366) — a plain (possibly quoted-string) fallback would be a
@@ -6596,19 +6653,21 @@ fn complex_literals_render_as_complex_values() {
 }
 
 #[test]
-fn test_runner_gate_decorators_convert_with_a_warning() {
+fn test_runner_gate_decorators_convert_and_unmodeled_ones_warn() {
     // issue #371: `@skipUnless(...)`, `@unittest.skipIf(...)`,
-    // `@cpython_only`, `@test.support.requires_*` are test-RUNNER gates —
-    // consumed as no-ops so the definition converts, but LOUDLY (a -W
-    // definition warning), never silently ignored and never re-shaping.
+    // `@cpython_only`, `@test.support.requires_*` are test-RUNNER gates.
+    // The definition converts either way. skip/skipIf/skipUnless/
+    // expectedFailure/cpython_only are carried out by the generated runner,
+    // so they need no warning; a gate rython does not model (a support
+    // directive, mock.patch) is consumed LOUDLY with a -W warning.
     let (_, w1) = compile_with_warnings(
         "class T:\n    @skipUnless(hasattr(t, 'x'), 'msg')\n    def m(self):\n        return 1\n",
         "gate_skip.py",
     );
     assert!(
-        w1.iter().any(|x| x.contains("test-runner gate decorator consumed as a no-op")),
-        "a skipUnless gate must warn ({} warnings)",
-        w1.len()
+        !w1.iter().any(|x| x.contains("test-runner gate decorator")),
+        "a skipUnless gate is honored by the runner, not dropped: {:?}",
+        w1
     );
 
     let (_, w2) = compile_with_warnings(
@@ -6620,6 +6679,130 @@ fn test_runner_gate_decorators_convert_with_a_warning() {
         "a test.support gate must warn ({} warnings)",
         w2.len()
     );
+}
+
+#[test]
+fn the_unittest_runner_honors_skip_gates_in_sorted_order() {
+    // issue #371: a gated test is guarded in the runner (never constructed
+    // or set up when skipped), and tests run in the sorted order CPython's
+    // TestLoader uses, not definition order.
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "HAVE = False\n",
+            "class T(unittest.TestCase):\n",
+            "    @unittest.skipUnless(HAVE, 'needs it')\n",
+            "    def test_b(self) -> None:\n",
+            "        pass\n",
+            "    def test_a(self) -> None:\n",
+            "        pass\n",
+            "if __name__ == '__main__':\n",
+            "    unittest.main()\n",
+        ),
+        "gate_runner.py",
+    );
+    assert!(out.contains("__rython_ntest_skipped += 1"), "the skip must be guarded: {}", out);
+    let a = out.find(". test_a ()").expect("test_a is run");
+    let b = out.find(". test_b ()").expect("test_b is run");
+    assert!(a < b, "tests run in sorted order: {}", out);
+}
+
+#[test]
+fn a_loop_over_a_tuple_of_one_member_type_iterates_an_array() {
+    // issue #370: `for xs in (list(), [3, 1, 2])` (test_bisect's shape)
+    // iterated a Rust tuple, which is not IntoIterator. A tuple whose
+    // members share one type iterates as an array; the element-less
+    // `list()` takes its siblings' element type, and — every member being
+    // a fresh value nothing else can observe — the target binds `mut` for
+    // the in-place append.
+    let out = compile(
+        concat!(
+            "def f() -> None:\n",
+            "    for xs in (list(), [3, 1, 2]):\n",
+            "        xs.append(9)\n",
+        ),
+        "tuple_iter.py",
+    );
+    assert!(out.contains("for mut xs in [Vec :: new () ,"), "generated: {}", out);
+    // Members of differing types are not widened into one array type:
+    // `(1, 2.0)` binds an int and then a float.
+    let out = compile(
+        "def g() -> None:\n    for n in (1, 2.0):\n        print(n)\n",
+        "tuple_mixed.py",
+    );
+    assert!(!out.contains("[1.0"), "an int member must not become a float: {}", out);
+}
+
+#[test]
+fn a_nested_default_of_a_mutable_type_stays_refused() {
+    // issue #370: only IMMUTABLE defaults are carried. Python evaluates a
+    // default once and every call shares that object, so a list the body
+    // appends to accumulates across calls; a per-call copy would not.
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "def outer() -> list[int]:\n",
+            "    def grow(xs: list[int] = make()) -> list[int]:\n",
+            "        xs.append(1)\n",
+            "        return xs\n",
+            "    return grow()\n",
+            "def make() -> list[int]:\n",
+            "    return []\n",
+        ),
+        "mutable_default.py",
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("whose type is not immutable")),
+        "a mutable default must be refused: {:?}",
+        warnings
+    );
+    assert!(out.contains("compile_error !"), "the use stays loud: {}", out);
+}
+
+#[test]
+fn class_constants_resolve_through_the_mro() {
+    // issue #367: `self.tol` read a struct field that does not exist (the
+    // constant is an associated const) and `Base.rel` from a CHAINED
+    // assignment lowered to None. `self.NAME` is `Self::NAME`, with each
+    // class's trait declaring its constants as associated consts a
+    // subclass overrides; `Cls.NAME` names the class on the MRO that
+    // defines it.
+    let out = compile(
+        concat!(
+            "class Base:\n",
+            "    tol = rel = 0\n",
+            "    def show(self) -> int:\n",
+            "        return self.tol + self.rel\n",
+            "class Sub(Base):\n",
+            "    tol = 5\n",
+            "def f() -> int:\n",
+            "    return Sub.rel + Sub.tol\n",
+        ),
+        "class_consts.py",
+    );
+    assert!(out.contains("Self :: tol"), "self.tol reads the class constant: {}", out);
+    assert!(out.contains("const tol : i64 = 5 ;"), "Sub overrides tol in its impl: {}", out);
+    assert!(out.contains("Base :: rel"), "Sub.rel resolves to its definer: {}", out);
+    assert!(!out.contains("PyValue :: None_"), "no read drops to None: {}", out);
+}
+
+#[test]
+fn a_nested_class_is_hoisted_to_module_level() {
+    // issue #367: a class nested in a class body was refused. Class scopes
+    // do not nest, so it is a module class reached through the outer one:
+    // hoisted, with `Outer.Inner` and `self.Inner` rewritten to it.
+    let out = compile(
+        concat!(
+            "class Outer:\n",
+            "    class Inner:\n",
+            "        def val(self) -> int:\n",
+            "            return 7\n",
+            "    def get(self) -> int:\n",
+            "        return Outer.Inner().val() + self.Inner().val()\n",
+        ),
+        "nested_class.py",
+    );
+    assert!(out.contains("pub struct Inner"), "Inner is a module struct: {}", out);
+    assert!(out.contains("Inner :: new"), "references construct the hoisted class: {}", out);
 }
 
 #[test]
@@ -9044,6 +9227,24 @@ fn module_level_empty_list_pinned_by_later_use() {
     let out = compile("xs = []\nxs.append(1)\n", "mempty.py");
     assert!(out.contains("Mutex < Vec < i64 > >"), "generated: {}", out);
     assert!(out.contains("py_global_mutate"), "generated: {}", out);
+}
+
+#[test]
+fn a_mutating_call_on_a_module_static_locks_as_an_expression() {
+    // Issue #122: `return STACK.pop()` under an `if` locks the static for
+    // the CALL only — the `return` stays outside the lock's closure (a
+    // statement-level wrapper captured it and returned from the closure).
+    let out = compile(
+        "STACK = [\"a\"]\n\ndef pop_or(d: str) -> str:\n    if len(STACK) > 0:\n        return STACK.pop()\n    return d\n",
+        "mret.py",
+    );
+    assert!(out.contains("return Ok (stdpython :: py_global_mutate"), "generated: {}", out);
+    // An argument that reads the same static would deadlock: loud.
+    let err = compile_err(
+        "LOG = [1]\n\ndef f() -> None:\n    LOG.append(len(LOG))\n",
+        "mdead.py",
+    );
+    assert!(err.contains("would deadlock"), "error: {}", err);
 }
 
 #[test]
@@ -17055,7 +17256,7 @@ fn an_option_callee_result_into_a_boxed_union_param_coerces() {
         out
     );
     assert!(
-        out.contains("Some (__rython_v) => PyValue :: from ((__rython_v))")
+        out.contains("Some (__rython_v) => PyValue :: from (__rython_v)")
             || out.contains("Some(__rython_v)=>PyValue::from((__rython_v))"),
         "the Some arm must box the inner: {}",
         out
@@ -17116,7 +17317,7 @@ fn a_property_read_local_on_a_factory_local_coerces_into_a_boxed_union_param() {
         out
     );
     assert!(
-        out.contains("match (read_timeout) { Some (__rython_v) => PyValue :: from ((__rython_v)) , None => stdpython :: PyValue :: None_ , }")
+        out.contains("match (read_timeout) { Some (__rython_v) => PyValue :: from (__rython_v) , None => stdpython :: PyValue :: None_ , }")
             || out.contains("match(read_timeout){Some(__rython_v)=>PyValue::from((__rython_v)),None=>stdpython::PyValue::None_,}"),
         "the Option<f64> local must coerce into the boxed param: {}",
         out
@@ -18802,8 +19003,8 @@ fn mixed_arity_tuple_list_boxes_heterogeneous_elements() {
     );
     let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        flat.contains("PyValue::from(((65,\"M\",\"a\")))")
-            && flat.contains("PyValue::from(((76,\"V\")))"),
+        flat.contains("PyValue::from((65,\"M\",\"a\"))")
+            && flat.contains("PyValue::from((76,\"V\"))"),
         "mixed-arity tuple list elements must box as PyValue: {}",
         out
     );
@@ -18833,7 +19034,7 @@ fn list_of_union_tuples_return_annotation_boxes_elements() {
         out
     );
     assert!(
-        flat.contains("PyValue::from(((0,\"3\")))"),
+        flat.contains("PyValue::from((0,\"3\"))"),
         "the returning list must box each element: {}",
         out
     );
@@ -18946,7 +19147,7 @@ fn boxed_return_list_annotation_does_not_retag_local_lists() {
     );
     let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        flat.contains("PyValue::from(((0,\"3\")))"),
+        flat.contains("PyValue::from((0,\"3\"))"),
         "the RETURNED list must box each element: {}",
         out
     );
@@ -18983,7 +19184,7 @@ fn boxed_return_list_annotation_spreads_starred_elements() {
         out
     );
     assert!(
-        flat.contains("__rython_list.push(PyValue::from(((65,\"M\",\"a\")))"),
+        flat.contains("__rython_list.push(PyValue::from((65,\"M\",\"a\"))"),
         "the fixed elements after the spread must still box, in order: {}",
         out
     );
@@ -19598,13 +19799,11 @@ fn chained_is_none_and_none_assigning_else_do_not_narrow() {
         out_vs
     );
     // Devin review on #285 (2nd pass): a walrus in a def DEFAULT rebinds
-    // the guarded name. Since issue #122 that program does not convert at
-    // all — Python evaluates a def's default WHERE THE `def` STANDS, and
-    // the nested definition the closure model refuses would have dropped
-    // the walrus with it (silently un-rebinding `x`, which is what made
-    // this case a narrowing question in the first place). The loud
-    // refusal at the definition subsumes the narrowing rule here.
-    let module = parse(
+    // the guarded name, WHERE THE `def` STANDS. Issue #370 evaluates a
+    // nested def's default there into a hidden local, so the walrus runs
+    // in the else branch (for a refused, unannotated `g` as for any other)
+    // and `x` is not narrowed past it.
+    let out = compile(
         "def d(x: str | None) -> str:\n\
          \x20   if x is None:\n\
          \x20       return \"a\"\n\
@@ -19613,20 +19812,11 @@ fn chained_is_none_and_none_assigning_else_do_not_narrow() {
          \x20           return y\n\
          \x20   return \"b\"\n",
         "none_defdefault.py",
-    )
-    .unwrap();
-    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
-    let err = module
-        .to_rust(
-            CodeGenContext::Module("none_defdefault".to_string()),
-            PythonOptions::default(),
-            symbols,
-        )
-        .expect_err("a walrus in a nested def default runs at the def");
+    );
     assert!(
-        err.to_string().contains("default whose expression Python"),
-        "{}",
-        err
+        out.contains("__rython_default_g_y = { x = None ;"),
+        "the walrus must run where the def stands: {}",
+        out
     );
 }
 
@@ -24683,7 +24873,7 @@ fn a_function_name_in_a_callable_position_wraps_the_item() {
         "wrap.py",
     );
     assert!(
-        out.contains("stdpython :: PyCallable :: new (\"step\" , | (__rython_a0 ,) : (i64 ,) | step (__rython_a0) ,)"),
+        out.contains("stdpython :: PyCallable :: function (\"step\" , \"step\" , | (__rython_a0 ,) : (i64 ,) | step (__rython_a0) ,)"),
         "{}",
         out
     );
@@ -24835,60 +25025,64 @@ fn a_lambda_that_would_mutate_a_capture_is_refused() {
 }
 
 #[test]
-fn a_refused_definition_whose_header_runs_code_is_a_conversion_error() {
+fn a_nested_definitions_header_code_runs_where_the_def_stands() {
     // Issue #122 (Devin review on #345, round 1): Python evaluates a
     // decorator and a non-literal default WHERE THE `def` STANDS. A
-    // refused definition that simply emitted nothing would drop that
-    // side effect silently, even with the name never used — so it is a
-    // conversion error, not a warning.
-    for (src, needle) in [
-        (
-            "def bump() -> int:\n\
-             \x20   return 1\n\
-             \n\
-             def deco(f: int) -> int:\n\
-             \x20   return f\n\
-             \n\
-             def outer() -> int:\n\
-             \x20   @deco\n\
-             \x20   def inner(x) -> int:\n\
-             \x20       return x\n\
-             \x20   return 1\n",
-            "has a decorator",
-        ),
-        (
-            "def bump() -> int:\n\
-             \x20   return 1\n\
-             \n\
-             def outer() -> int:\n\
-             \x20   def inner(x: int = bump()):\n\
-             \x20       return x\n\
-             \x20   return 1\n",
-            "default whose expression Python",
-        ),
-    ] {
-        let module = parse(src, "header.py").unwrap();
-        let symbols = module.clone().find_symbols(SymbolTableScopes::new());
-        let err = module
-            .to_rust(
-                CodeGenContext::Module("header".to_string()),
-                PythonOptions::default(),
-                symbols,
-            )
-            .expect_err("a definition-time side effect must be refused");
-        assert!(err.to_string().contains(needle), "{}", err);
-    }
-    // A LITERAL default runs no code: it stays the ordinary refusal,
-    // loud where the name is used.
+    // decorator on a nested definition the closure model refuses is a
+    // conversion error — dropping the definition would drop it.
+    let module = parse(
+        "def bump() -> int:\n\
+         \x20   return 1\n\
+         \n\
+         def deco(f: int) -> int:\n\
+         \x20   return f\n\
+         \n\
+         def outer() -> int:\n\
+         \x20   @deco\n\
+         \x20   def inner(x) -> int:\n\
+         \x20       return x\n\
+         \x20   return 1\n",
+        "header.py",
+    )
+    .unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let err = module
+        .to_rust(
+            CodeGenContext::Module("header".to_string()),
+            PythonOptions::default(),
+            symbols,
+        )
+        .expect_err("a definition-time decorator must be refused");
+    assert!(err.to_string().contains("has a decorator"), "{}", err);
+    // A default is evaluated THERE into a hidden local (issue #370), so
+    // even a definition the closure model refuses (no return annotation)
+    // keeps the default's side effect: `bump()` runs where the `def` is.
+    let out = compile(
+        "def bump() -> int:\n\
+         \x20   return 1\n\
+         \n\
+         def outer() -> int:\n\
+         \x20   def inner(x: int = bump()):\n\
+         \x20       return x\n\
+         \x20   return 1\n",
+        "header_default.py",
+    );
+    assert!(
+        out.contains("__rython_default_inner_x = bump () ?"),
+        "the default must be evaluated where the def stands: {}",
+        out
+    );
+    // A carried closure with a literal default: a direct call fills or
+    // overrides it by Python's binding rules.
     let out = compile(
         "def outer() -> int:\n\
          \x20   def inner(x: int = 1) -> int:\n\
          \x20       return x\n\
-         \x20   return inner(2)\n",
+         \x20   return inner() + inner(2)\n",
         "literal_default.py",
     );
     assert!(
-        out.contains("compile_error ! (\"rython: `inner` cannot be called here"),
+        out.contains("(inner) . call ((1 ,)) ?") && out.contains("(inner) . call ((2 ,)) ?"),
         "{}",
         out
     );
@@ -24914,4 +25108,155 @@ fn a_call_through_an_unmodelable_callable_annotation_is_loud() {
     );
     assert!(out.contains("no fixed arity"), "{}", out);
     assert!(!out.contains("PyValue :: None_"), "{}", out);
+}
+
+#[test]
+fn a_literal_mixing_three_kinds_boxes_whatever_the_order() {
+    // Issue #366: the element-type fold let a later member absorb the
+    // conflict between two earlier ones (`[1, 2.5, 3j, "x"]` folded to
+    // Vec<String>; `[1, b"x", "s"]` likewise), so the literal was not
+    // boxed and rustc refused it. A conflict now sticks.
+    let out = compile("def f() -> None:\n    vals = [1, 2.5, 3j, \"x\"]\n    print(vals)\n", "mix3.py");
+    assert!(out.contains("PyValue :: from (Complex :: new"), "generated: {}", out);
+    let out = compile("def f() -> None:\n    vals = [1, b\"x\", \"s\"]\n    print(vals)\n", "mix3b.py");
+    assert!(out.contains("PyValue :: from"), "generated: {}", out);
+    let out = compile("def f() -> None:\n    d = {1: \"a\", b\"k\": \"b\", \"s\": \"c\"}\n    print(d)\n", "mix3d.py");
+    assert!(out.contains("PyValue :: from"), "generated: {}", out);
+}
+
+#[test]
+fn a_threading_local_is_a_per_thread_attribute_bag() {
+    // Issue #356 (requests' HTTPDigestAuth): the field is the runtime's
+    // threading::Local, its attributes are dynamic, and a store through
+    // it is interior — the method keeps `&self`.
+    let out = compile(
+        concat!(
+            "import threading\n",
+            "\n",
+            "class Auth:\n",
+            "    def __init__(self) -> None:\n",
+            "        self._tl = threading.local()\n",
+            "\n",
+            "    def init(self) -> None:\n",
+            "        if not hasattr(self._tl, \"init\"):\n",
+            "            self._tl.init = True\n",
+            "            self._tl.chal = {}\n",
+            "        self._tl.n = 0\n",
+            "        self._tl.n += 1\n",
+            "        del self._tl.chal\n",
+        ),
+        "tlocal.py",
+    );
+    assert!(out.contains("pub _tl : threading :: Local"), "generated: {}", out);
+    assert!(out.contains("pub fn init (& self ,)"), "generated: {}", out);
+    assert!(out.contains("py_hasattr (& (\"init\"))"), "generated: {}", out);
+    assert!(out.contains("py_setattr (\"init\" , PyValue :: from (true))"), "generated: {}", out);
+    assert!(out.contains("PyDict :: < String , stdpython :: PyValue > :: default ()"), "generated: {}", out);
+    assert!(out.contains("py_getattr (\"n\") ?"), "generated: {}", out);
+    assert!(out.contains("py_delattr (\"chal\") ?"), "generated: {}", out);
+}
+
+
+/// Issue #354: a nesting deeper than the lowering's stack budget fails the
+/// conversion with an error naming the problem — not a SIGABRT — and a
+/// shallow program under the same budget converts.
+#[test]
+fn nesting_past_the_stack_budget_is_a_conversion_error() {
+    let run = |terms: usize| -> Result<String, String> {
+        let src = format!("def f() -> int:\n    return {}\n", vec!["1"; terms].join(" + "));
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                python_ast::with_stack_budget(1024 * 1024, || {
+                    let module = parse(&src, "deep.py").map_err(|e| e.to_string())?;
+                    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+                    module
+                        .to_rust(CodeGenContext::Module("deep".into()), PythonOptions::default(), symbols)
+                        .map(|t| t.to_string())
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    };
+    let err = run(1500).unwrap_err();
+    assert!(err.contains("nests too deeply"), "error: {}", err);
+    assert!(run(3).is_ok());
+}
+
+/// Issue #354: the twenty-line program that needed more than 2 MiB of
+/// stack to lower converts on a thread with Rust's default 2 MiB (the
+/// ExprType dispatcher no longer spends ~25 KB of frame per nesting
+/// level, and the AST payloads are a quarter of their old size).
+#[test]
+fn a_small_module_lowers_on_a_default_sized_thread() {
+    let src = "def main() -> int:\n    nums = [5, 1, 9, 3]\n    words = [\"pear\", \"fig\", \"apple\"]\n    print(f\"minkey={min(words, key=lambda w: len(w))}\")\n    print(f\"sortedkey={repr(sorted(words, key=lambda w: len(w)))}\")\n    for i, v in enumerate(reversed(nums), start=1):\n        print(f\"rev{i}={v}\")\n    print(f\"powm={pow(3, -1, 7)} fsum={repr(0.1 + 0.2)}\")\n    return 0\n";
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || compile(src, "small.py"))
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn bisect_lowers_to_the_runtime_and_refuses_key() {
+    // Issue #334 (idna's intranges) / #370 (test_bisect): the bisect
+    // functions route to stdpython::bisect with CPython's lo/hi bounds;
+    // insort borrows its list mutably; key= is refused, not ignored.
+    let out = compile(
+        concat!(
+            "import bisect\n",
+            "\n",
+            "def f(a: list[int], x: int) -> int:\n",
+            "    bisect.insort(a, x)\n",
+            "    return bisect.bisect_left(a, x, 1, hi=3)\n",
+        ),
+        "bis.py",
+    );
+    assert!(out.contains("bisect :: insort (& mut (a) , x , 0 , None) ?"), "generated: {}", out);
+    assert!(out.contains("bisect :: bisect_left (& (a) , & (x) , 1 , Some (3)) ?"), "generated: {}", out);
+    let err = compile_err(
+        "import bisect\n\ndef f(a: list[int]) -> int:\n    return bisect.bisect(a, 1, key=abs)\n",
+        "biskey.py",
+    );
+    assert!(err.contains("key=") && err.contains("not supported"), "error: {}", err);
+}
+
+
+/// Sweep regressions of the #367/#370 rounds (urllib3): a class attribute
+/// that a SUBCLASS also assigns per instance (`HTTPConnection.is_verified
+/// = False`, set by `HTTPSConnection`) is an instance attribute with a
+/// class default — never a trait const beside the field accessor (E0428,
+/// E0324, E0046); and a loop over a module STATIC tuple iterates the
+/// static as it is emitted rather than destructuring it (`SSL_KEYWORDS`
+/// is a boxed PyValue static — E0609 on `.0`).
+#[test]
+fn a_class_default_a_subclass_assigns_is_no_trait_const() {
+    let out = compile(
+        concat!(
+            "SEQ = (\"a\", \"b\")\n",
+            "\n",
+            "class Base:\n",
+            "    verified = False\n",
+            "\n",
+            "    def get(self) -> bool:\n",
+            "        return self.verified\n",
+            "\n",
+            "class Sub(Base):\n",
+            "    def connect(self) -> None:\n",
+            "        self.verified = True\n",
+            "\n",
+            "def keys() -> None:\n",
+            "    for k in SEQ:\n",
+            "        print(k)\n",
+        ),
+        "classdefault.py",
+    );
+    // Only the struct's own `pub const` (its pre-existing class-attribute
+    // lowering) — the trait does not declare one too.
+    assert_eq!(out.matches("const verified").count(), 1, "generated: {}", out);
+    assert!(out.contains("pub const verified : bool = false"), "generated: {}", out);
+    assert!(!out.contains("__rython_tuple . 0"), "generated: {}", out);
 }

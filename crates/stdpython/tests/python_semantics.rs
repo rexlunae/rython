@@ -4615,6 +4615,84 @@ fn str_format_with_runtime_kwargs_matches_cpython() {
 }
 
 #[test]
+fn str_format_runtime_matches_cpython() {
+    // issue #368: the runtime `str.format` for templates the conversion
+    // cannot see. Arguments arrive rendered through str(). Verified
+    // against python3 3.11.
+    let args = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let kw = |xs: &[(&str, &str)]| {
+        xs.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<Vec<_>>()
+    };
+    // "{}={}".format("k", 7) == 'k=7'; "{1}:{0}".format("k", 7) == '7:k'
+    assert_eq!(str_format_runtime("{}={}", &args(&["k", "7"]), &[]).unwrap(), "k=7");
+    assert_eq!(str_format_runtime("{1}:{0}", &args(&["k", "7"]), &[]).unwrap(), "7:k");
+    // "{0}{0}".format("x") == 'xx'; "{{}}{}".format(3) == '{}3'
+    assert_eq!(str_format_runtime("{0}{0}", &args(&["x"]), &[]).unwrap(), "xx");
+    assert_eq!(str_format_runtime("{{}}{}", &args(&["3"]), &[]).unwrap(), "{}3");
+    // "{!s}".format(4) == '4'; "{who} has {n}".format(who="ann", n=3)
+    assert_eq!(str_format_runtime("{!s}", &args(&["4"]), &[]).unwrap(), "4");
+    assert_eq!(
+        str_format_runtime("{who} has {n}", &[], &kw(&[("who", "ann"), ("n", "3")])).unwrap(),
+        "ann has 3"
+    );
+    let err = |t: &str, a: &[&str], k: &[(&str, &str)]| {
+        let e = str_format_runtime(t, &args(a), &kw(k)).err().unwrap();
+        (e.exception_type.clone(), e.message.clone())
+    };
+    // '{} {}'.format(1) -> IndexError
+    assert_eq!(
+        err("{} {}", &["1"], &[]),
+        ("IndexError".into(), "Replacement index 1 out of range for positional args tuple".into())
+    );
+    // "{a}".format() -> KeyError: 'a'
+    assert_eq!(err("{a}", &[], &[]), ("KeyError".into(), "'a'".into()));
+    // "{}{0}".format(1, 2) / "{0}{}".format(1, 2) -> ValueError
+    assert_eq!(
+        err("{}{0}", &["1", "2"], &[]).1,
+        "cannot switch from automatic field numbering to manual field specification"
+    );
+    assert_eq!(
+        err("{0}{}", &["1", "2"], &[]).1,
+        "cannot switch from manual field specification to automatic field numbering"
+    );
+    // "}" / "a{" / "{x" -> ValueError, three different messages
+    assert_eq!(err("}", &[], &[]).1, "Single '}' encountered in format string");
+    assert_eq!(err("a{", &[], &[]).1, "Single '{' encountered in format string");
+    assert_eq!(err("{x", &[], &[("x", "1")]).1, "expected '}' before end of string");
+    // "{a}".format(**{"a": 1}, a=2) -> TypeError
+    assert_eq!(
+        err("{a}", &[], &[("a", "1"), ("a", "2")]),
+        (
+            "TypeError".into(),
+            "str.format() got multiple values for keyword argument 'a'".into()
+        )
+    );
+    // A spec, a !r conversion, or {a.b}/{a[0]} is refused, not approximated.
+    for t in ["{:>3}", "{!r}", "{0.x}", "{0[0]}"] {
+        assert_eq!(err(t, &["1"], &[]).0, "ValueError", "{}", t);
+    }
+}
+
+#[test]
+fn a_forwarded_kwargs_bag_is_empty_or_refused() {
+    // issue #368: `wrap(text, width, **kwargs)` models no keyword options,
+    // so the forwarded bag is checked where it is used. An empty bag is a
+    // no-op (the call is exactly CPython's); an option raises rather than
+    // being ignored.
+    let empty = PyDict::<String, PyValue>::from([]);
+    assert!(refuse_forwarded_kwargs("wrap", &empty).is_ok());
+    let bag = PyDict::<String, PyValue>::from([(
+        "initial_indent".to_string(),
+        PyValue::from("> "),
+    )]);
+    let err = refuse_forwarded_kwargs("wrap", &bag).err().unwrap();
+    assert_eq!(err.exception_type, "NotImplementedError");
+    assert!(err.message.contains("'initial_indent'"), "{}", err.message);
+}
+
+#[test]
 fn csv_reader_quote_none_with_escapechar_matches_cpython() {
     use stdpython::stdlib::csv::reader;
     // Verified against CPython 3.14.1: QUOTE_NONE + escapechar makes the
@@ -4751,4 +4829,69 @@ fn unittest_assert_order_comparisons_match_cpython() {
             .unwrap()
             .matches("AssertionError")
     );
+}
+
+#[test]
+fn a_boxed_complex_behaves_like_cpythons_complex() {
+    // issue #366: `[1, 2.5, 3j, "x"]` carries its complex member boxed.
+    let z = PyValue::from(Complex::new(0.0, 3.0));
+    // str([1, 2.5, 3j, 'x'])  == "[1, 2.5, 3j, 'x']"
+    assert_eq!(py_display(&z), "3j");
+    // type(3j).__name__ == 'complex'
+    assert_eq!(py_value_type_name(&z), "complex");
+    // bool(0j) is False, bool(3j) is True
+    assert!(z.is_truthy());
+    assert!(!PyValue::from(Complex::new(0.0, 0.0)).is_truthy());
+    // 1j * 1j == -1 (a complex with zero imaginary part equals the real);
+    // 1 + 1j != 1; 2j != 3j
+    let minus_one = PyValue::from(Complex::new(-1.0, 0.0));
+    assert!(stdpython::stdlib::unittest::assert_eq(&minus_one, &PyValue::from(-1i64), String::new()).is_ok());
+    assert!(stdpython::stdlib::unittest::assert_eq(&PyValue::from(Complex::new(2.5, 0.0)), &PyValue::from(2.5f64), String::new()).is_ok());
+    assert!(stdpython::stdlib::unittest::assert_not_eq(&PyValue::from(Complex::new(1.0, 1.0)), &PyValue::from(1i64), String::new()).is_ok());
+    let err = stdpython::stdlib::unittest::assert_eq(&PyValue::from(Complex::new(0.0, 1.0)), &PyValue::from(1i64), String::new()).unwrap_err();
+    // AssertionError: 1j != 1
+    assert_eq!(err.message, "1j != 1");
+}
+
+#[test]
+fn boxed_values_subtract_multiply_and_compare_like_cpython() {
+    // issue #356: a `threading.local()` attribute is boxed, so its uses
+    // go through PyValue's operators.
+    // 3.5 - 1 == 2.5 ; 2 * 2.5 == 5.0 ; 1j * 2 == 2j
+    assert_eq!(PyValue::Float(3.5).py_sub(&1i64), PyValue::Float(2.5));
+    assert_eq!(PyValue::Int(2).py_mul(&2.5f64), PyValue::Float(5.0));
+    assert_eq!(py_display(&PyValue::from(Complex::new(0.0, 1.0)).py_mul(&2i64)), "2j");
+    // 'ab' * 2 == 'abab' ; b'x' * 3 == b'xxx' ; (1, 2) * 2 == (1, 2, 1, 2)
+    assert_eq!(PyValue::from("ab").py_mul(&2i64), PyValue::from("abab"));
+    assert_eq!(py_display(&PyValue::Bytes(b"x".to_vec()).py_mul(&3i64)), "b'xxx'");
+    assert_eq!(
+        py_display(&PyValue::from(vec![PyValue::Int(1), PyValue::Int(2)]).py_mul(&2i64)),
+        "(1, 2, 1, 2)"
+    );
+    // 'x' == 'x' against a boxed str; 3 == 3.0 across the tower
+    assert!(String::from("x") == PyValue::from("x"));
+    assert!(PyValue::Float(3.0) == 3i64);
+    // f'{7:04x}' == '0007' ; f'{True:x}' == '1' ; f'{"s":x}' is a ValueError
+    assert_eq!(py_value_format_int(&PyValue::Int(7), 'x').unwrap(), 7);
+    assert_eq!(py_value_format_int(&PyValue::Bool(true), 'x').unwrap(), 1);
+    let err = py_value_format_int(&PyValue::from("s"), 'x').unwrap_err();
+    assert_eq!(err.message, "Unknown format code 'x' for object of type 'str'");
+}
+
+#[test]
+#[should_panic(expected = "can't multiply sequence by non-int of type 'float'")]
+fn a_boxed_sequence_times_a_float_is_cpythons_type_error() {
+    // 'a' * 2.0 -> TypeError: can't multiply sequence by non-int of type 'float'
+    let _ = PyValue::from("a").py_mul(&2.0f64);
+}
+
+#[test]
+fn a_list_of_numbers_boxes_and_unboxes() {
+    // issue #334: `self.assertEqual(intranges_from_list([111]), (x,))` —
+    // an unknown-typed list[int] result boxes like the str list does.
+    assert_eq!(py_display(&PyValue::from(vec![1i64, 2])), "(1, 2)");
+    assert_eq!(py_display(&PyValue::from(vec![0.5f64])), "(0.5,)");
+    // A boxed int sequence into a list[int] slot; True counts as 1.
+    let v: Vec<i64> = PyValue::from(vec![PyValue::Int(3), PyValue::Bool(true)]).into();
+    assert_eq!(v, vec![3, 1]);
 }

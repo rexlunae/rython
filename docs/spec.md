@@ -120,6 +120,7 @@ declaration — loud, but at the wrong layer (§12.1).
 |---|---|---|
 | `int` | `i64` | No arbitrary precision; overflow is not detected as a Python-level error (§12.2) |
 | `float` | `f64` | |
+| `complex` | `stdpython::Complex` | An `f64` real/imaginary pair with CPython's repr, arithmetic, `abs`, `conjugate`, and `==` against `int`/`float` (a zero imaginary part and an equal real part). A mixed container boxes it as `PyValue::Complex` (issue #366); an order comparison (`1j < 2j`) raises CPython's TypeError, with its message, when it runs |
 | `bool` | `bool` | |
 | `str` | `String` (fields, returns, elements); `impl Into<String>` as a parameter | String *literals* are `&'static str` internally and are coerced to `String` where an owned string is expected |
 | `bytes` | `Vec<u8>` | Literals lower to Rust byte strings |
@@ -136,7 +137,7 @@ declaration — loud, but at the wrong layer (§12.1).
 | any other all-boxable union (`str \| int`, `bool \| str \| None`, …) | `stdpython::PyValue` | The boxed heterogeneous value (issue #121): members keep concrete types, `isinstance` narrows at runtime; `str()`/`repr()`/`print()` render Python-faithfully. Operators on a boxed value are not modeled — they fail the build loudly rather than guessing. A union containing None is NOT an Option slot — the box absorbs None, so `None`-defaulted parameters of such a type (`cert_reqs: int \| str \| None`, `retries: Retry \| bool \| int \| None` — urllib3) store plain values through `PyValue::from`, never a `Some(...)` wrap (rounds 40/42). A class-instance member has no boxed repr — storing one stays loudly unboxable (`PyValue: From<Retry>` fails) |
 | `np.ndarray`, `np.float64`, `np.int32`, … | `numpy::NdArray`, `f64`, `i32`, … | Provided by the runtime's `numpy` module |
 | `socket.socket` | `socket::Socket` | The runtime socket handle — `wait.py`'s `sock: socket.socket` parameters compile as real `Socket` values, not boxed PyValues |
-| `threading.Thread/Lock/RLock/Event/Semaphore` | `threading::*` | The runtime threading handles (`ready: threading.Event` — a real shared handle) |
+| `threading.Thread/Lock/RLock/Event/Semaphore/local` | `threading::*` | The runtime threading handles (`ready: threading.Event` — a real shared handle) |
 | `Callable[[A, B], R]` | `stdpython::PyCallable<(A, B), R>` | A CALLABLE held as a VALUE (issue #122): the argument list renders as the argument TUPLE, so one runtime type serves every arity (`Callable[[], None]` is `PyCallable<(), ()>`). The members resolve through the same annotation authority as any other, so a callable over a module type alias is typed, not boxed. `Callable[..., R]` has no fixed arity, hence no Rust signature: it stays the boxed `PyValue`, and a call through it is loud |
 | `type[X]` / `Type[X]` | `Option<()>` | A CLASS value: rython cannot hold classes as values (the classes-as-data divergence — callables ARE values, §3.6); the tolerated opaque marker |
 | `typing.Tuple/Dict/List/Set/FrozenSet/Optional/Literal/…` | like the bare containers | The typing-module spellings map identically to the bare `tuple[...]`/`dict[...]`/… (one resolver, one answer) |
@@ -265,7 +266,20 @@ Four things become one:
   the name is loud where it is called);
 - a module function NAME in such a position (`run(step)`,
   `_INITIALIZERS.append(callback)`), wrapped in a `PyCallable` that
-  forwards to the item.
+  forwards to the item. Every reference to one `def` is the ONE function
+  object CPython has: the wrapper carries the definition's
+  module-qualified name as its identity, so `register(hello)` then
+  `unregister(hello)` finds and removes it, while two lambdas stay two
+  objects.
+
+A module-level container that functions mutate in place — a registry of
+callbacks (`_INITIALIZERS = []`, appended to inside
+`register_initializer(callback: Callable[[str], None])`) — is shared
+mutable state behind a lock (issue #337), and its element type is pinned
+by those uses: a module function's body, typed with its own annotated
+parameters, and the `__main__` block count as evidence exactly as
+module-level statements do. An UNANNOTATED parameter appended into it
+gives no element type and stays loud.
 
 A call through the value is `f.call((x,))?`: it returns the same
 `Result<R, PyException>` every generated function returns, so an
@@ -415,13 +429,32 @@ Python `repr` first, then pad. Integer radix and sign formatting go
 through a helper reproducing Python's sign+magnitude form
 (`format(-255, 'x')` is `-ff`, not two's complement).
 
-`str.format` works on **literal templates only**; every argument is
+`str.format` on a template the conversion can see (a literal, a name
+or field bound to one, a class constant — including the unbound
+`str.format(template, ...)` form) lowers to `format!`; every argument is
 evaluated exactly once in Python's order, whether used or not. Errors
 mirror CPython's (mixing automatic and manual numbering, missing
 keywords, `Single '{' encountered in format string`).
 
-Loud errors: non-literal templates, `format(**kwargs)`, format specs
-Rust cannot reproduce (`,` grouping, `=` alignment, space sign, `e`/`g`
+A template the conversion cannot see (a parameter, a field stored from
+one) or a `**bag` whose keys are only known at run time formats at
+**run time** (`stdpython::str_format_runtime`, issue #368): every
+argument renders through `str()` — which is what `format(value, "")`
+is for a field with no spec — and `{}`, `{0}`, `{name}`, `{!s}` and
+`{{`/`}}` match CPython, with its `IndexError`/`KeyError`/`ValueError`/
+duplicate-keyword `TypeError` messages. A field that path cannot
+render exactly — a format spec, `!r`/`!a`, `{a.b}`/`{a[0]}` — raises
+`ValueError` naming the field. (Before #368 such calls were replaced by
+`None`.)
+
+A `**kwargs` bag forwarded into `textwrap.wrap/fill/indent/shorten/
+dedent` or `csv.reader/writer`, whose lowerings model none of those
+keyword options, is checked at run time: an empty bag is a no-op; one
+carrying an option raises `NotImplementedError` naming it rather than
+being ignored.
+
+Loud conversion errors, for a template the conversion can see: format
+specs Rust cannot reproduce (`,` grouping, `=` alignment, space sign, `e`/`g`
 presentations, nested spec interpolation `f"{x:{w}}"`, `!r` combined
 with a numeric presentation type), and attribute/index access inside a
 replacement field (`{a.b}`, `{a[0]}`).
@@ -2007,7 +2040,8 @@ to CPython's MT19937), `os`/`os.path`, `sys`, `json`, `re`
 groups; backreferences/lookarounds are a loud `re.error`),
 `datetime`/`time` (incl. `strptime`, keyword `replace()`), `itertools`
 (lazy iterators), `functools` (`reduce`, `partial`, `lru_cache`),
-`heapq`, `copy`, `textwrap`, `hashlib`, `csv` (default excel dialect; the
+`heapq`, `bisect` (`bisect_left`/`bisect_right`/`insort*` with `lo`/`hi`;
+`key=` is refused), `copy`, `textwrap`, `hashlib`, `csv` (default excel dialect; the
 reader/writer thread a literal `delimiter=` and a named dialect from a
 std-gated `register_dialect`/`get_dialect` registry — dialect OBJECTS,
 `DictReader`/`DictWriter`/`Sniffer`/`field_size_limit` stay unsupported),
@@ -2019,7 +2053,7 @@ pluggable execution backends). `urllib.request` (§10.5) rides the
 feature-gate convention below.
 
 Available on the `alloc` (no-OS) tier: `string`, `json`, `collections`,
-`itertools`, `functools`, `heapq`, `copy`, `textwrap`, `hashlib`,
+`itertools`, `functools`, `heapq`, `bisect`, `copy`, `textwrap`, `hashlib`,
 `csv`, and `io`'s in-memory buffers (`StringIO`/`BytesIO` — the no_std
 profile's file I/O; `open()` and disk files stay std-only). Everything
 OS-touching is std-only and is a loud conversion error under
@@ -2125,6 +2159,20 @@ An unhandled exception in a thread prints CPython's
 "Exception in thread NAME:" header and the exception line (no
 traceback frames). `start()`/`join()` misuse panics with CPython's
 RuntimeError text (§12.2 family).
+
+`threading.local()` (issue #356 — requests' `HTTPDigestAuth`) is
+`threading::Local`: an object whose attributes are created at run time
+and are PER THREAD, each thread starting with none. Its attributes are
+boxed values (`PyValue`), since both the attribute set and each
+attribute's type are the program's run-time decision: `tl.x` reads this
+thread's value or raises CPython's `AttributeError: '_thread._local'
+object has no attribute 'x'`; `tl.x = v`, `tl.x += v`, `del tl.x`,
+`hasattr`/`getattr`/`setattr` go to the same bag. A store into it is
+interior — the object is a shared handle — so it does not make the
+enclosing method take `&mut self`. A boxed attribute supports what a
+boxed value does (`+`/`-`/`*` on CPython's numeric tower and sequence
+repetition, `==` against scalars, integer format specs); other uses are
+loud in rustc.
 
 **`socket`** (std tier): `socket.socket(AF_INET|AF_INET6,
 SOCK_STREAM|SOCK_DGRAM)`, `bind`, `listen`, `accept`, `connect`,
@@ -2460,7 +2508,7 @@ accepted as permanent spec:
 | Argument-render-then-mutate shapes (`print(xs, xs.pop(), xs)`) render the first argument before the mutation | Recorded in issue #79 |
 | A read of a module member the generated module has no item for (`util.ssl_.PROTOCOL_TLS` — an external ssl constant) lowers to the boxed `None` with a warning (dynamic-module-member divergence) | Model limit; module members are static path items |
 | A call through a sibling-module member that is not a module-level function/class (`probe.acquire_and_get`, a bound-method alias) is dropped with the callable-as-value warning | Model limit; a BOUND METHOD is not a value (a plain callable is — §3.6) |
-| Callables as VALUES (issue #122): a `Callable[[A], R]` annotation, a nested `def`, a `lambda` in a callable position and a module function name in one are `stdpython::PyCallable<(A,), R>` — a call through the value is `f.call((x,))?`, whose `Result` makes an exception raised inside a callable catchable by its caller. Capture is LATE-BINDING through a shared `stdpython::PyCell`, so a rebinding, a mutation, or a loop's next turn reaches the closure exactly as in Python, and reading a cell before its first assignment is CPython's UnboundLocalError; a capture that cannot change after the definition (bound once, unconditionally, outside every loop, mutated by nobody) is cloned in instead, which is indistinguishable (§3.6). A lambda local is typed by the uses that name a type; uses that disagree, and the shapes with no Rust type or no closure semantics (an unannotated parameter, a missing return annotation, `*args`, a keyword-only parameter, a default, a decorator, a generator, `nonlocal`, a lambda that would mutate a capture) are refused at the definition with the reason and are loud at the use site — a refused definition whose HEADER runs code (a decorator, a non-literal default) is refused at CONVERSION instead, since Python evaluates those where the `def` stands. `Callable[..., R]` keeps the boxed value and is loud at a call through it. CPython's function repr prints the plain name, not the nested qualname (`<function add at 0x…>`, not `make_adder.<locals>.add`), and a `PyCallable` is not `Send` | Correct-or-loud (issue #122) |
+| Callables as VALUES (issue #122): a `Callable[[A], R]` annotation, a nested `def`, a `lambda` in a callable position and a module function name in one are `stdpython::PyCallable<(A,), R>` — a call through the value is `f.call((x,))?`, whose `Result` makes an exception raised inside a callable catchable by its caller. Capture is LATE-BINDING through a shared `stdpython::PyCell`, so a rebinding, a mutation, or a loop's next turn reaches the closure exactly as in Python, and reading a cell before its first assignment is CPython's UnboundLocalError; a capture that cannot change after the definition (bound once, unconditionally, outside every loop, mutated by nobody) is cloned in instead, which is indistinguishable (§3.6). A lambda local is typed by the uses that name a type; uses that disagree, and the shapes with no Rust type or no closure semantics (an unannotated parameter, a missing return annotation, `*args`, a keyword-only parameter, a default of a MUTABLE type (an immutable one is evaluated where the `def` stands and bound at each direct call that omits it — issue #370), a decorator, a generator, `nonlocal`, a lambda that would mutate a capture) are refused at the definition with the reason and are loud at the use site — a refused definition whose HEADER runs code (a decorator, a non-literal default) is refused at CONVERSION instead, since Python evaluates those where the `def` stands. `Callable[..., R]` keeps the boxed value and is loud at a call through it. CPython's function repr prints the plain name, not the nested qualname (`<function add at 0x…>`, not `make_adder.<locals>.add`), and every reference to one module `def` is one function object (equal, same repr) while each lambda evaluation is a new one | Correct-or-loud (issue #122) |
 | Release-mode integer overflow may wrap (debug panics) | Bounded by §12.2's contract |
 | A non-daemon thread never joined is joined when its LAST handle drops (at latest, end of `main`) — CPython joins at interpreter exit, so a fire-and-forget thread can block a scope exit earlier than CPython would | Model limit; the common create/start/join shape is identical |
 | A thread's unhandled exception prints CPython's header and final exception line but no traceback frames | Model limit (no frames) — same family as §8's messages |

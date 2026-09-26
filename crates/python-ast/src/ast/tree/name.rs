@@ -388,9 +388,12 @@ impl CodeGen for Name {
             // that statement is that temporary — never another
             // `py_global_read`, which would clone a second copy and read
             // it instead of the object being mutated.
+            // The temporary is the lock's `&mut T`; a read is the object
+            // behind it (`&mut (*t)` reborrows where `&mut t` would need a
+            // mutable binding).
             if let Some(alias) = options.static_mutation_alias.get(&self.id) {
                 let ident = crate::safe_ident(alias);
-                return Ok(quote!(#ident));
+                return Ok(quote!((*#ident)));
             }
             // A closure CELL (issue #122): a local a nested closure
             // mutates is held in a `stdpython::PyCell` so both sides see

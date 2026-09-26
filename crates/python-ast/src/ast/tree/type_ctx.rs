@@ -564,7 +564,7 @@ pub fn coerce_tokens(
         }
         // Anything → PyValue (issue #121): a value stored into a boxed
         // union / Any slot wraps in PyValue::from (None via From<()>).
-        (_, TypeInfo::PyValue) => Some(quote!(PyValue::from((#tokens)))),
+        (_, TypeInfo::PyValue) => Some(quote!(PyValue::from(#tokens))),
         // Anything → StrOrBytes (issue #121): the str | bytes union's
         // heterogeneous slot converts via its From impls (&str, String,
         // &[u8], Vec<u8>).
@@ -729,9 +729,9 @@ fn infer_type_inner(
             // String literal, but is a COMPLEX number — type it so codegen
             // never coercses `1j`/`2j * (1+2j)` to i64/f64.
             if let Some(lit) = &c.0
-                && crate::ast::tree::constant::is_complex_literal(&*lit)
+                && let Some(t) = crate::ast::tree::constant::sentinel_typeinfo(lit)
             {
-                return TypeInfo::Complex;
+                return t;
             }
             match &c.0 {
                 Some(litrs::Literal::Integer(_)) => TypeInfo::Int,
@@ -818,12 +818,25 @@ fn infer_type_inner(
             TypeInfo::PyObject
         }
         ExprType::List(l) => {
-            let mut elt = TypeInfo::PyObject;
-            for e in l {
-                let t = infer_type_inner(ctx, e, options, symbols);
-                if !matches!(t, TypeInfo::PyObject) {
-                    elt = unify(elt, t);
+            let known: Vec<TypeInfo> = l
+                .iter()
+                .map(|e| infer_type_inner(ctx, e, options, symbols))
+                .filter(|t| !matches!(t, TypeInfo::PyObject))
+                .collect();
+            let mut distinct: Vec<&TypeInfo> = Vec::new();
+            for t in &known {
+                if !distinct.contains(&t) {
+                    distinct.push(t);
                 }
+            }
+            let mut elt = join_known_types(distinct.iter().copied());
+            // The same decision the literal's lowering makes (expression.rs):
+            // an all-boxable mix that does not join is Vec<PyValue>.
+            if distinct.len() > 1
+                && matches!(elt, TypeInfo::PyObject)
+                && distinct.iter().all(|t| is_boxable_value_type(t))
+            {
+                elt = TypeInfo::PyValue;
             }
             TypeInfo::Vec(Box::new(elt))
         }
@@ -1000,6 +1013,12 @@ fn infer_type_inner(
             }
         }
         ExprType::Call(call) => match call.func.as_ref() {
+            // `threading.local()` (or an imported `local()`) constructs the
+            // per-thread attribute object (issue #356), whose attribute
+            // access lowers dynamically.
+            func if threading_local_ctor(func, symbols) => {
+                TypeInfo::Threading(crate::ThreadingType::Local)
+            }
             // The ITERATOR builtins carry their argument's element type
             // through (issue #222), so they are typed before the
             // name-only table below, which cannot see arguments.
@@ -1197,6 +1216,33 @@ fn infer_type_inner(
         // context, no class) falls through to the PyObject arm below —
         // exactly the pre-ctx behavior (round 99).
         ExprType::Attribute(attr) => {
+            // Any attribute of a `threading.local()` object is a run-time
+            // attribute: a boxed value (issue #356).
+            if matches!(
+                infer_type_inner(ctx, &attr.value, options, symbols),
+                TypeInfo::Threading(crate::ThreadingType::Local)
+            ) {
+                return TypeInfo::PyValue;
+            }
+            // A class-level literal constant read through `self` or the
+            // class (issue #367 — attribute.rs renders `Self::NAME` /
+            // `Definer::NAME`): the constant's own type, a string one being
+            // the `&'static str` the const holds.
+            if let ExprType::Name(recv) = attr.value.as_ref() {
+                let class = if recv.id == "self" {
+                    ctx.and_then(|c| c.enclosing_class_name()).and_then(|c| symbols.get(c))
+                } else {
+                    symbols.get(&recv.id)
+                };
+                if let Some(SymbolTableNode::ClassDef(class)) = class
+                    && let Some((_, value)) = class.literal_constant_on_mro(&attr.attr, symbols, options)
+                {
+                    return match infer_type_inner(ctx, &value, options, symbols) {
+                        TypeInfo::String => TypeInfo::StrRef,
+                        other => other,
+                    };
+                }
+            }
             // `self` needs the class context; a class-typed NAME (a local
             // or parameter the analysis typed) resolves in any context.
             if let ExprType::Name(recv) = attr.value.as_ref()
@@ -1370,9 +1416,54 @@ fn infer_type_inner(
 /// a `range` (whose elements are Python ints). A string is deliberately
 /// absent — iterating one yields single-character strings, which is a
 /// different type from the receiver and not what any caller here wants.
+/// The one element type a loop over a tuple of these member types binds,
+/// or None when the members differ (issue #370). STRICT on purpose: an
+/// UNKNOWN element (`list()`'s `Vec<PyObject>`) takes the type its siblings
+/// give it, but `unify`'s widening is refused — `for x in (1, 2.0)` binds
+/// an int and then a float, and one f64 element type would print `1.0`.
+pub(crate) fn tuple_iteration_element(members: &[TypeInfo]) -> Option<TypeInfo> {
+    fn join(a: &TypeInfo, b: &TypeInfo) -> Option<TypeInfo> {
+        let norm = |t: &TypeInfo| match t {
+            TypeInfo::StrRef => TypeInfo::String,
+            other => other.clone(),
+        };
+        let (a, b) = (norm(a), norm(b));
+        match (&a, &b) {
+            _ if a == b => Some(a),
+            (TypeInfo::PyObject, _) => Some(b),
+            (_, TypeInfo::PyObject) => Some(a),
+            (TypeInfo::Vec(x), TypeInfo::Vec(y)) => Some(TypeInfo::Vec(Box::new(join(x, y)?))),
+            (TypeInfo::HashSet(x), TypeInfo::HashSet(y)) => {
+                Some(TypeInfo::HashSet(Box::new(join(x, y)?)))
+            }
+            (TypeInfo::Option(x), TypeInfo::Option(y)) => {
+                Some(TypeInfo::Option(Box::new(join(x, y)?)))
+            }
+            (TypeInfo::Dict(k1, v1), TypeInfo::Dict(k2, v2)) => Some(TypeInfo::Dict(
+                Box::new(join(k1, k2)?),
+                Box::new(join(v1, v2)?),
+            )),
+            (TypeInfo::Tuple(x), TypeInfo::Tuple(y)) if x.len() == y.len() => Some(TypeInfo::Tuple(
+                x.iter().zip(y).map(|(a, b)| join(a, b)).collect::<Option<Vec<_>>>()?,
+            )),
+            _ => None,
+        }
+    }
+    let (first, rest) = members.split_first()?;
+    let mut acc = first.clone();
+    for m in rest {
+        acc = join(&acc, m)?;
+    }
+    // A member type nothing pinned leaves the element unknown.
+    (!type_mentions_pyobject(&acc)).then_some(acc)
+}
+
 pub(crate) fn iterable_element_type(t: &TypeInfo) -> Option<TypeInfo> {
     match t {
         TypeInfo::Vec(e) | TypeInfo::HashSet(e) => Some((**e).clone()),
+        // A tuple whose members share one type iterates as that type (the
+        // loop lowers it to an array — issue #370).
+        TypeInfo::Tuple(members) => tuple_iteration_element(members),
         // Iterating a dict yields its keys.
         TypeInfo::Dict(k, _) => Some((**k).clone()),
         // Iterating a str yields one-character strings.
@@ -1498,6 +1589,7 @@ fn py_type(py: &str) -> TypeInfo {
     match py {
         "int" => TypeInfo::Int,
         "float" => TypeInfo::Float,
+        "complex" => TypeInfo::Complex,
         "bool" => TypeInfo::Bool,
         "str" => TypeInfo::String,
         "bytes" => TypeInfo::Bytes,
@@ -1595,6 +1687,50 @@ pub fn unify(a: TypeInfo, b: TypeInfo) -> TypeInfo {
     }
 }
 
+/// Whether `func` names `threading.local` — `threading.local` through an
+/// unshadowed module name, or a name `from threading import local [as x]`
+/// bound (issue #356).
+pub(crate) fn threading_local_ctor(func: &ExprType, symbols: &SymbolTableScopes) -> bool {
+    match func {
+        ExprType::Attribute(attr) => {
+            matches!(attr.value.as_ref(), ExprType::Name(m)
+                if crate::StdModule::from_name(&m.id) == Some(crate::StdModule::Threading)
+                    && !crate::module_name_shadowed(crate::StdModule::Threading.name(), symbols))
+                && crate::ThreadingType::from_name(&attr.attr) == Some(crate::ThreadingType::Local)
+        }
+        ExprType::Name(n) => match symbols.get(&n.id) {
+            Some(SymbolTableNode::ImportFrom(i)) => {
+                crate::StdModule::from_name(&i.module) == Some(crate::StdModule::Threading)
+                    && i.names.iter().any(|a| {
+                        a.asname.as_deref().unwrap_or(&a.name) == n.id
+                            && crate::ThreadingType::from_name(&a.name)
+                                == Some(crate::ThreadingType::Local)
+                    })
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The join of a literal's KNOWN member types, folded in order: two
+/// known types that do not join make the result the unknown marker for
+/// good. `unify` itself lets a later member absorb the marker (it is also
+/// "no type yet"), so a plain fold over `[1, 2.5, 3j, "x"]` ended on
+/// `String` and hid the heterogeneity the boxing check looks for (issue
+/// #366). Unknown members are the caller's to skip.
+pub fn join_known_types<'a>(types: impl IntoIterator<Item = &'a TypeInfo>) -> TypeInfo {
+    let mut joined = TypeInfo::PyObject;
+    for t in types {
+        let next = unify(joined.clone(), t.clone());
+        if matches!(next, TypeInfo::PyObject) && !matches!(joined, TypeInfo::PyObject) {
+            return TypeInfo::PyObject;
+        }
+        joined = next;
+    }
+    joined
+}
+
 fn numeric_join(a: &TypeInfo, b: &TypeInfo) -> TypeInfo {
     if matches!(a, TypeInfo::Float) || matches!(b, TypeInfo::Float) {
         TypeInfo::Float
@@ -1664,6 +1800,19 @@ pub fn render_typed(
         )
     {
         return wrapped;
+    }
+    // An EMPTY dict literal into a boxed slot (`tl.chal = {}` — issue
+    // #356): nothing in it names an element type, so the boxed form is
+    // spelled out (a bare `PyDict::from([])` leaves K/V to
+    // inference, which the boxing conversion cannot supply — E0283).
+    if matches!(expected, Some(TypeInfo::PyValue)) {
+        if let ExprType::Dict(d) = expr
+            && d.keys.is_empty()
+        {
+            return Ok(quote!(stdpython::PyValue::from(
+                stdpython::PyDict::<String, stdpython::PyValue>::default()
+            )));
+        }
     }
     // A class name used as a VALUE (`[ChecksumError]`, `merge_setting(
     // ..., dict_class=OrderedDict)` — requests' sessions): classes as
@@ -2085,6 +2234,7 @@ pub fn is_builtin_type_annotation(ann: &ExprType) -> bool {
             n.id.as_str(),
             "int"
                 | "float"
+                | "complex"
                 | "bool"
                 | "str"
                 | "bytes"
@@ -2156,6 +2306,8 @@ pub fn is_boxable_value_type(t: &TypeInfo) -> bool {
             | TypeInfo::Dict(_, _)
             | TypeInfo::StrOrBytes
             | TypeInfo::PyValue
+            // A complex member (`[1, 2.5, 3j]` — issue #366).
+            | TypeInfo::Complex
     )
 }
 
@@ -2261,6 +2413,10 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
         ExprType::Name(n) => match n.id.as_str() {
             "int" => Some(TypeInfo::Int),
             "float" => Some(TypeInfo::Float),
+            // `-> complex`: the runtime Complex a `1j` literal already
+            // types as (issues #366/#372). Unmapped, the annotation named a
+            // Rust type `complex` that does not exist.
+            "complex" => Some(TypeInfo::Complex),
             "bool" => Some(TypeInfo::Bool),
             "str" => Some(TypeInfo::String),
             // `offsets: range` — the builtin range class as a type
@@ -3649,8 +3805,10 @@ pub(crate) fn syntactic_type(expr: &ExprType) -> TypeInfo {
         ExprType::Constant(c) => {
             // A complex sentinel (`\0RYTHON_COMPLEX:...`) is String-carrying
             // but is a COMPLEX number, never a str.
-            if let Some(lit) = &c.0 && crate::ast::tree::constant::is_complex_literal(lit) {
-                return TypeInfo::Complex;
+            if let Some(lit) = &c.0
+                && let Some(t) = crate::ast::tree::constant::sentinel_typeinfo(lit)
+            {
+                return t;
             }
             match &c.0 {
                 Some(litrs::Literal::Integer(_)) => TypeInfo::Int,
@@ -3708,13 +3866,13 @@ pub fn pin_empty_containers(
     // Every body, a NESTED definition's included: a nested function
     // captures enclosing names (Python closure semantics), so
     // `md_ratios.append(x)` inside a nested def pins the outer
-    // `md_ratios = []` (charset_normalizer's from_bytes). The nested
-    // function's OWN locals must not pollute the enclosing analysis, but
-    // a use of an enclosing empty container is exactly the pin we want.
-    visit::walk_stmts(body, Descend::All, &mut |stmt| {
-        collect_use_suggestions(stmt, info, symbols, options, &mut suggested);
-        Flow::Continue
-    });
+    // `md_ratios = []` (charset_normalizer's from_bytes); likewise a
+    // module function pins a module-level registry (issue #122:
+    // `_INITIALIZERS.append(callback)` in botocore's register_initializer).
+    // The nested function's OWN locals must not pollute the enclosing
+    // analysis, but a use of an enclosing empty container is exactly the
+    // pin we want.
+    collect_scope_suggestions(body, info, symbols, options, &mut suggested);
     for (name, t) in suggested {
         if info.empty_pinned.contains_key(&name) {
             // Unify with any existing (annotated) type: an annotated
@@ -3728,6 +3886,62 @@ pub fn pin_empty_containers(
             info.empty_pinned.insert(name, final_t);
         }
     }
+}
+
+/// The use suggestions of one scope's statements, then of each nested
+/// definition's body typed with ITS OWN annotated parameters (issue #122):
+/// in `def register(callback: Callable[[str], None]):
+/// _INITIALIZERS.append(callback)` the element's type is the parameter's,
+/// which the enclosing scope's map knows nothing of. A name a parameter
+/// SHADOWS refers to the parameter in that body, so the body's
+/// suggestions for it are dropped rather than pinned onto the outer name.
+fn collect_scope_suggestions(
+    body: &[Statement],
+    info: &FunctionTypeInfo,
+    symbols: Option<&SymbolTableScopes>,
+    options: Option<&PythonOptions>,
+    out: &mut HashMap<String, TypeInfo>,
+) {
+    visit::walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        collect_use_suggestions(stmt, info, symbols, options, out);
+        if let StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) =
+            &stmt.statement
+        {
+            let a = &f.args;
+            let params: Vec<&crate::ast::tree::arguments::Parameter> = a
+                .posonlyargs
+                .iter()
+                .chain(a.args.iter())
+                .chain(a.kwonlyargs.iter())
+                .chain(a.vararg.iter())
+                .chain(a.kwarg.iter())
+                .collect();
+            let mut inner = info.clone();
+            for p in &params {
+                match p.evaluated_annotation().and_then(|ann| annotation_type_info(&ann)) {
+                    Some(t) => {
+                        inner.name_types.insert(p.arg.clone(), t);
+                    }
+                    None => {
+                        inner.name_types.remove(&p.arg);
+                    }
+                }
+            }
+            let mut nested = HashMap::new();
+            collect_scope_suggestions(&f.body, &inner, symbols, options, &mut nested);
+            for (name, t) in nested {
+                if params.iter().any(|p| p.arg == name) {
+                    continue;
+                }
+                let joined = match out.remove(&name) {
+                    Some(prev) => unify(prev, t),
+                    None => t,
+                };
+                out.insert(name, joined);
+            }
+        }
+        Flow::Continue
+    });
 }
 
 /// The use suggestions of ONE statement (its bodies are the caller's
@@ -4904,6 +5118,28 @@ fn resolve_type_inner(
                 };
             }
             syntactic_type(expr)
+        }
+        // Arithmetic over resolved operands (issue #122: `LOG.append(x *
+        // 2)` with `x: int` pins `list[int]`, not a boxed list). Only the
+        // shapes whose Python result type is fixed by the operand types;
+        // anything else stays syntactic.
+        ExprType::BinOp(b) => {
+            use crate::ast::tree::bin_ops::BinOps as Op;
+            let l = resolve_type_inner(&b.left, info, symbols, options);
+            let r = resolve_type_inner(&b.right, info, symbols, options);
+            match (&b.op, &l, &r) {
+                (Op::Add | Op::Sub | Op::Mult | Op::FloorDiv | Op::Mod, TypeInfo::Int, TypeInfo::Int) => {
+                    TypeInfo::Int
+                }
+                (Op::Div, TypeInfo::Int | TypeInfo::Float, TypeInfo::Int | TypeInfo::Float)
+                | (
+                    Op::Add | Op::Sub | Op::Mult,
+                    TypeInfo::Float,
+                    TypeInfo::Int | TypeInfo::Float,
+                )
+                | (Op::Add | Op::Sub | Op::Mult, TypeInfo::Int, TypeInfo::Float) => TypeInfo::Float,
+                _ => syntactic_type(expr),
+            }
         }
         _ => syntactic_type(expr),
     }

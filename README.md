@@ -104,7 +104,7 @@ cargo test -p python-ast
 `stdpython` is tiered for `no_std` use: the default `std` tier has the full
 surface; the `alloc` tier (`--no-default-features --features alloc`) keeps
 everything that doesn't need an OS (strings, collections, json, itertools,
-functools, heapq, textwrap, hashlib, csv, the in-memory
+functools, heapq, bisect, textwrap, hashlib, csv, the in-memory
 `io.StringIO`/`io.BytesIO` file buffers, …) and works on embedded targets.
 
 ## Compatibility
@@ -135,10 +135,11 @@ conversion-time `argparse` (typed namespace, byte-identical help and
 error output), and a growing stdlib: `math`, `random`, `os`, `sys`,
 `json`, `re` (incl. flags, named groups, findall tuples),
 `datetime`/`time` (incl. `strptime`), `itertools`, `functools.reduce`,
-`heapq`, `copy`, `textwrap`, `hashlib`, `csv` (reader and writer),
+`heapq`, `bisect`, `copy`, `textwrap`, `hashlib`, `csv` (reader and writer),
 `collections`, `pathlib`, `glob`, `subprocess`, `tempfile`,
 `threading` (Thread with static targets, Lock/RLock/Event/Semaphore
-with a real `with lock:` acquire/release lowering), `socket` (TCP/UDP
+with a real `with lock:` acquire/release lowering, `local()` as a
+per-thread bag of run-time attributes), `socket` (TCP/UDP
 over std::net with the CPython OSError hierarchy), `urllib.request`
 (`urlopen` for http/https, behind stdpython's opt-in `http-ureq`
 feature that `rypip` enables automatically), and more.
@@ -200,13 +201,15 @@ line, never a silent behaviour change:
   ...` names (TypeVar/Protocol/TypeAlias/cast) and `if TYPE_CHECKING:`
   blocks are compile-time-only and lower to nothing; module-level
   `name = str` type aliases emit a `pub type`.
-- **Callables in containers** — a list/dict whose elements are function
-  objects (`botocore._INITIALIZERS`, populated by
-  `register_initializer(callback)` and invoked via
-  `for initializer in _INITIALIZERS: initializer(session)`) has no
-  representable element type and no call-through-container lowering.
-  Same family as "classes as values": function objects are not
-  first-class values. Blocks botocore (#3 PyPI) at its first statement.
+- **Callables in containers** — a list/dict of function objects is a
+  `Vec`/`PyDict` of `stdpython::PyCallable` (botocore's
+  `_INITIALIZERS = []`, filled by `register_initializer(callback:
+  Callable[[Session], None])`, drained by `unregister_initializer` and
+  called through by `for initializer in _INITIALIZERS:
+  initializer(session)`; issue #122). The element type comes from an
+  annotation — the container's or the appended parameter's; an
+  UNANNOTATED `callback` gives none, and the call through it is dropped
+  with a `-W` warning (the callable-as-value divergence).
 - **Dynamic imports and the import machinery** — `importlib`,
   `importlib.machinery.PathFinder`, and `sys.meta_path` hooks are not
   modeled: rython compiles imports statically. Blocks pip's

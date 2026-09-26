@@ -12415,6 +12415,550 @@ fn run_package(krate: &rypip::convert::ConvertedCrate, pkg_name: &str) -> Vec<St
         .collect()
 }
 
+/// Build the package crate and run its binary; the stdout lines and the
+/// exit status (for programs whose status is part of what they print —
+/// a unittest run exits 1 on a failure).
+fn run_package_status(
+    krate: &rypip::convert::ConvertedCrate,
+    pkg_name: &str,
+) -> (Vec<String>, i32) {
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join(format!("target/debug/{pkg_name}")))
+        .output()
+        .expect("running generated binary");
+    (
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
+#[test]
+fn unittest_skip_and_expected_failure_gates_match_cpython() {
+    // issue #371: skip/skipIf/skipUnless (on a method or a class) keep a
+    // test from running at all — it is not constructed, set up, or run —
+    // and expectedFailure inverts its outcome, an unexpected success
+    // failing the run. These gates used to be consumed as no-ops, so a
+    // skipped test ran (and could fail the run). Tests also run in the
+    // sorted order CPython's TestLoader uses, which decides the order of
+    // everything they print.
+    // Verified against python3 (stdout and exit status).
+    assert_eq!(
+        run_package_status(
+            &package_crate(
+                &Scratch::new("gate_fail"),
+                "gate_fail",
+                &[(
+                    "cli.py",
+                    concat!(
+                        "import unittest\n",
+                        "\n",
+                        "HAVE = True\n",
+                        "MISSING = False\n",
+                        "\n",
+                        "\n",
+                        "class T(unittest.TestCase):\n",
+                        "    @unittest.skipUnless(HAVE, \"needs it\")\n",
+                        "    def test_runs_and_fails(self) -> None:\n",
+                        "        print(\"ran runs_and_fails\")\n",
+                        "        self.assertEqual(1, 2)\n",
+                        "\n",
+                        "    @unittest.skipUnless(MISSING, \"missing\")\n",
+                        "    def test_skipped(self) -> None:\n",
+                        "        print(\"ran skipped\")\n",
+                        "        self.assertEqual(1, 2)\n",
+                        "\n",
+                        "    @unittest.skipIf(HAVE, \"have it\")\n",
+                        "    def test_skipif(self) -> None:\n",
+                        "        print(\"ran skipif\")\n",
+                        "\n",
+                        "    def test_plain(self) -> None:\n",
+                        "        print(\"ran plain\")\n",
+                        "\n",
+                        "\n",
+                        "if __name__ == \"__main__\":\n",
+                        "    unittest.main()\n",
+                    ),
+                )],
+            ),
+            "gate_fail",
+        ),
+        (
+            [
+                "ran plain",
+                "ran runs_and_fails",
+            ]
+            .map(String::from)
+            .to_vec(),
+            1,
+        )
+    );
+    // Verified against python3 (stdout and exit status).
+    assert_eq!(
+        run_package_status(
+            &package_crate(
+                &Scratch::new("gate_class"),
+                "gate_class",
+                &[(
+                    "cli.py",
+                    concat!(
+                        "import unittest\n",
+                        "\n",
+                        "FAST = False\n",
+                        "\n",
+                        "\n",
+                        "@unittest.skipUnless(FAST, \"slow machine\")\n",
+                        "class ZSlow(unittest.TestCase):\n",
+                        "    def test_never(self) -> None:\n",
+                        "        print(\"ZSlow ran\")\n",
+                        "\n",
+                        "\n",
+                        "class Alpha(unittest.TestCase):\n",
+                        "    def setUp(self) -> None:\n",
+                        "        print(\"setUp\")\n",
+                        "\n",
+                        "    @unittest.skip(\"not today\")\n",
+                        "    def test_c_skipped(self) -> None:\n",
+                        "        print(\"c ran\")\n",
+                        "\n",
+                        "    @unittest.expectedFailure\n",
+                        "    def test_b_expected(self) -> None:\n",
+                        "        print(\"b ran\")\n",
+                        "        self.assertEqual(1, 2)\n",
+                        "\n",
+                        "    def test_a_first(self) -> None:\n",
+                        "        print(\"a ran\")\n",
+                        "\n",
+                        "\n",
+                        "class Beta(unittest.TestCase):\n",
+                        "    @unittest.skipIf(FAST, \"fast\")\n",
+                        "    def test_runs(self) -> None:\n",
+                        "        print(\"beta ran\")\n",
+                        "\n",
+                        "\n",
+                        "if __name__ == \"__main__\":\n",
+                        "    unittest.main()\n",
+                    ),
+                )],
+            ),
+            "gate_class",
+        ),
+        (
+            [
+                "setUp",
+                "a ran",
+                "setUp",
+                "b ran",
+                "beta ran",
+            ]
+            .map(String::from)
+            .to_vec(),
+            0,
+        )
+    );
+    // Verified against python3 (stdout and exit status).
+    assert_eq!(
+        run_package_status(
+            &package_crate(
+                &Scratch::new("gate_unexpected"),
+                "gate_unexpected",
+                &[(
+                    "cli.py",
+                    concat!(
+                        "import unittest\n",
+                        "\n",
+                        "\n",
+                        "class T(unittest.TestCase):\n",
+                        "    @unittest.expectedFailure\n",
+                        "    def test_passes_unexpectedly(self) -> None:\n",
+                        "        print(\"ran\")\n",
+                        "        self.assertEqual(1, 1)\n",
+                        "\n",
+                        "\n",
+                        "if __name__ == \"__main__\":\n",
+                        "    unittest.main()\n",
+                    ),
+                )],
+            ),
+            "gate_unexpected",
+        ),
+        (
+            [
+                "ran",
+            ]
+            .map(String::from)
+            .to_vec(),
+            1,
+        )
+    );
+}
+
+#[test]
+fn loops_over_tuples_of_one_member_type_match_cpython() {
+    // issue #370: a loop over a tuple — a literal, a function's returned
+    // tuple, a tuple-typed local — iterated a Rust tuple (not
+    // IntoIterator). It iterates an array now; an element-less `list()`
+    // takes its siblings' element type, and str members are owned.
+    let scratch = Scratch::new("tupleiter");
+    let krate = package_crate(
+        &scratch,
+        "tupleiter",
+        &[(
+            "cli.py",
+            concat!(
+                    "def pair() -> tuple[int, int]:\n",
+                    "    return (4, 5)\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    for xs in (list(), [3, 1, 2]):\n",
+                    "        xs.append(9)\n",
+                    "        print(len(xs), xs[-1])\n",
+                    "    for xs in ([5], [3, 1, 2]):\n",
+                    "        print(sum(xs))\n",
+                    "    for word in (\"a\", \"bc\"):\n",
+                    "        print(word * 2)\n",
+                    "    name = \"zz\"\n",
+                    "    for w in (name, \"q\"):\n",
+                    "        print(w.upper())\n",
+                    "    for v in pair():\n",
+                    "        print(v + 1)\n",
+                    "    t = (7, 8)\n",
+                    "    for v in t:\n",
+                    "        print(v)\n",
+                    "    print(t)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "tupleiter"),
+        vec![
+            "1 9",
+            "4 9",
+            "5",
+            "6",
+            "aa",
+            "bcbc",
+            "ZZ",
+            "Q",
+            "5",
+            "6",
+            "7",
+            "8",
+            "(7, 8)",
+        ]
+    );
+}
+
+#[test]
+fn nested_defaults_are_evaluated_where_the_def_stands() {
+    // issue #370 (test_hashlib's loop-local `def c(...)` with a default
+    // computed from the loop variable): a nested def's default is
+    // evaluated where the `def` stands — once per execution, so each loop
+    // iteration's `c` keeps that iteration's value — and a direct call
+    // fills what it omits, positionally or by keyword. Such a def used to
+    // be refused, every use of it a compile_error.
+    let scratch = Scratch::new("nesteddefaults");
+    let krate = package_crate(
+        &scratch,
+        "nesteddefaults",
+        &[(
+            "cli.py",
+            concat!(
+                    "def main() -> None:\n",
+                    "    out = []\n",
+                    "    later = []\n",
+                    "    for n in range(3):\n",
+                    "        def c(k: int = n * 10, j: int = 1) -> int:\n",
+                    "            return k + j\n",
+                    "        out.append(c())\n",
+                    "        out.append(c(100))\n",
+                    "        out.append(c(j=5))\n",
+                    "        later.append(n)\n",
+                    "    print(out)\n",
+                    "\n",
+                    "\n",
+                    "def labels() -> list[str]:\n",
+                    "    prefix = \"item\"\n",
+                    "\n",
+                    "    def tag(i: int, sep: str = \"-\" + \"x\") -> str:\n",
+                    "        return prefix + sep + str(i)\n",
+                    "\n",
+                    "    return [tag(1), tag(2, \"/\")]\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                    "    print(labels())\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "nesteddefaults"),
+        vec![
+            "[1, 101, 5, 11, 101, 15, 21, 101, 25]",
+            "['item-x1', 'item/2']",
+        ]
+    );
+}
+
+#[test]
+fn class_constants_resolve_through_the_mro_like_cpython() {
+    // issue #367: class-level constants read through `self`, the class, and
+    // a subclass — an intermediate override, a leaf override, str/float/
+    // bool/int values, an inherited method seeing the instance's class.
+    let scratch = Scratch::new("classconsts");
+    let krate = package_crate(
+        &scratch,
+        "classconsts",
+        &[(
+            "cli.py",
+            concat!(
+                    "class Base:\n",
+                    "    kind = \"base\"\n",
+                    "    scale = 1.5\n",
+                    "    strict = False\n",
+                    "    limit = 10\n",
+                    "\n",
+                    "    def describe(self) -> str:\n",
+                    "        return self.kind\n",
+                    "\n",
+                    "    def total(self, n: int) -> float:\n",
+                    "        return n * self.scale + self.limit\n",
+                    "\n",
+                    "    def mode(self) -> bool:\n",
+                    "        return self.strict\n",
+                    "\n",
+                    "\n",
+                    "class Mid(Base):\n",
+                    "    kind = \"mid\"\n",
+                    "    limit = 20\n",
+                    "\n",
+                    "\n",
+                    "class Leaf(Mid):\n",
+                    "    strict = True\n",
+                    "\n",
+                    "\n",
+                    "class Solo:\n",
+                    "    greeting = \"hi\"\n",
+                    "\n",
+                    "    def say(self, who: str) -> str:\n",
+                    "        return self.greeting + \" \" + who\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    for obj in [Base(), Mid(), Leaf()]:\n",
+                    "        print(obj.describe(), obj.total(2), obj.mode())\n",
+                    "    print(Leaf.kind, Leaf.limit, Leaf.scale, Mid.strict, Base.kind)\n",
+                    "    print(Solo().say(\"ann\"), Solo.greeting)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "classconsts"),
+        vec![
+            "base 13.0 False",
+            "mid 23.0 False",
+            "mid 23.0 True",
+            "mid 20 1.5 False base",
+            "hi ann hi",
+        ]
+    );
+}
+
+#[test]
+fn nested_classes_match_cpython() {
+    // issue #367: nested classes (with their own constants and constructor)
+    // reached as `Outer.X` and `self.X`, hoisted to module level.
+    let scratch = Scratch::new("nestedclasses");
+    let krate = package_crate(
+        &scratch,
+        "nestedclasses",
+        &[(
+            "cli.py",
+            concat!(
+                    "class Outer:\n",
+                    "    class Inner:\n",
+                    "        size = 3\n",
+                    "\n",
+                    "        def val(self) -> int:\n",
+                    "            return 7 + self.size\n",
+                    "\n",
+                    "    class Pair:\n",
+                    "        def __init__(self, a: int, b: int) -> None:\n",
+                    "            self.a = a\n",
+                    "            self.b = b\n",
+                    "\n",
+                    "        def total(self) -> int:\n",
+                    "            return self.a + self.b\n",
+                    "\n",
+                    "    def get(self) -> int:\n",
+                    "        return Outer.Inner().val() + self.Inner().val()\n",
+                    "\n",
+                    "    def pair_total(self) -> int:\n",
+                    "        return Outer.Pair(2, 3).total()\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    o = Outer()\n",
+                    "    print(o.get(), o.pair_total(), Outer.Inner.size, Outer.Inner().val())\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "nestedclasses"),
+        vec![
+            "20 5 3 10",
+        ]
+    );
+}
+
+#[test]
+fn non_finite_float_constants_match_cpython() {
+    // issue #372: `1e400` is inf. It used to panic the converter; then it
+    // rendered, but typed as a str in operator lowering (`1e400 * 0.0`
+    // became string repetition), and `1e400j` rendered an `inf` ident.
+    let scratch = Scratch::new("nonfinite");
+    let krate = package_crate(
+        &scratch,
+        "nonfinite",
+        &[(
+            "cli.py",
+            concat!(
+                    "import math\n",
+                    "\n",
+                    "\n",
+                    "def f():\n",
+                    "    x = 1e400\n",
+                    "    return x\n",
+                    "\n",
+                    "\n",
+                    "def g() -> float:\n",
+                    "    return -1e400 / 2.0\n",
+                    "\n",
+                    "\n",
+                    "def h() -> bool:\n",
+                    "    return math.isinf(1e400) and 1e400 > 10.0 ** 300\n",
+                    "\n",
+                    "\n",
+                    "def c() -> complex:\n",
+                    "    return 1e400j\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    print(f(), g(), h())\n",
+                    "    print(1e400 * 0.0 != 1e400 * 0.0)\n",
+                    "    print(c())\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "nonfinite"),
+        vec![
+            "inf -inf True",
+            "True",
+            "infj",
+        ]
+    );
+}
+
+#[test]
+fn str_format_on_templates_rython_cannot_see_matches_cpython() {
+    // issue #368: a template held in a parameter, the unbound
+    // `str.format(t, ...)` form, and a keyword bag built at run time all
+    // format at RUN time — including CPython's IndexError / KeyError /
+    // ValueError messages. Each of these was previously replaced by
+    // `None` (or, for a runtime bag, formatted without the call's other
+    // arguments), so the program printed `None` where CPython printed text.
+    let scratch = Scratch::new("fmtrt");
+    let krate = package_crate(
+        &scratch,
+        "fmtrt",
+        &[(
+            "cli.py",
+            concat!(
+                    "def render(tmpl: str, name: str, n: int) -> str:\n",
+                    "    return tmpl.format(name, n)\n",
+                    "\n",
+                    "\n",
+                    "def render_kw(tmpl: str, name: str) -> str:\n",
+                    "    return tmpl.format(who=name, count=3)\n",
+                    "\n",
+                    "\n",
+                    "def try_fmt(tmpl: str, v: int) -> str:\n",
+                    "    try:\n",
+                    "        return tmpl.format(v)\n",
+                    "    except IndexError as e:\n",
+                    "        return \"IndexError: \" + str(e)\n",
+                    "    except KeyError as e:\n",
+                    "        return \"KeyError: \" + str(e)\n",
+                    "    except ValueError as e:\n",
+                    "        return \"ValueError: \" + str(e)\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    d = {\"a\": \"x\", \"b\": \"y\"}\n",
+                    "    print(\"{a}-{b}\".format(**d))\n",
+                    "    print(str.format(\"{a}!\", **d))\n",
+                    "    print(str.format(\"{}+{}\", 1, 2.5))\n",
+                    "    print(render(\"{}={}\", \"k\", 7))\n",
+                    "    print(render(\"{1}:{0}\", \"k\", 7))\n",
+                    "    print(render_kw(\"{who} has {count}\", \"ann\"))\n",
+                    "    bag = {}\n",
+                    "    bag[\"who\"] = \"bob\"\n",
+                    "    print(\"{who}/{extra}\".format(extra=True, **bag))\n",
+                    "    print(render(\"{{}} {} {}\", \"lit\", 1))\n",
+                    "    print(try_fmt(\"{} {}\", 1))\n",
+                    "    print(try_fmt(\"{x}\", 1))\n",
+                    "    print(try_fmt(\"{}{0}\", 1))\n",
+                    "    print(try_fmt(\"}\", 1))\n",
+                    "    print(try_fmt(\"{\", 1))\n",
+                    "    print(try_fmt(\"{0\", 1))\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "fmtrt"),
+        vec![
+            "x-y",
+            "x!",
+            "1+2.5",
+            "k=7",
+            "7:k",
+            "ann has 3",
+            "bob/True",
+            "{} lit 1",
+            "IndexError: Replacement index 1 out of range for positional args tuple",
+            "KeyError: 'x'",
+            "ValueError: cannot switch from automatic field numbering to manual field specification",
+            "ValueError: Single '}' encountered in format string",
+            "ValueError: Single '{' encountered in format string",
+            "ValueError: expected '}' before end of string",
+        ]
+    );
+}
+
 #[test]
 fn a_local_shadowing_a_module_static_is_spelled_apart_at_runtime() {
     // `LIMIT = compute() + 1` is a module value functions read (a promoted
@@ -16494,3 +17038,315 @@ fn a_closure_reads_its_captures_at_call_time() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn module_containers_mutated_by_functions_match_cpython() {
+    // Issue #122: module-level registries mutated in place from function
+    // bodies (a dict of callables, a list pinned by `x * 2`, a list that a
+    // parameter of the same name shadows elsewhere, a `return X.pop()`
+    // under an `if`) — each mutation lands on the one module object.
+    let scratch = Scratch::new("modmutate");
+    let krate = package_crate(
+        &scratch,
+        "modmutate",
+        &[(
+            "cli.py",
+            concat!(
+                "from typing import Callable\n",
+                "\n",
+                "HANDLERS = {}\n",
+                "LOG = []\n",
+                "NAMES = []\n",
+                "STACK = [\"a\", \"b\"]\n",
+                "\n",
+                "\n",
+                "def on(name: str, fn: Callable[[int], int]) -> None:\n",
+                "    HANDLERS[name] = fn\n",
+                "\n",
+                "\n",
+                "def record(x: int) -> None:\n",
+                "    LOG.append(x * 2)\n",
+                "\n",
+                "\n",
+                "def keep(NAMES: list[str], extra: str) -> int:\n",
+                "    NAMES.append(extra)\n",
+                "    return len(NAMES)\n",
+                "\n",
+                "\n",
+                "def pop_or(default: str) -> str:\n",
+                "    if len(STACK) > 0:\n",
+                "        return STACK.pop()\n",
+                "    return default\n",
+                "\n",
+                "\n",
+                "def double(v: int) -> int:\n",
+                "    return v * 2\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    on(\"d\", double)\n",
+                "    record(3)\n",
+                "    record(4)\n",
+                "    NAMES.append(\"n\")\n",
+                "    print(HANDLERS[\"d\"](21), LOG, len(HANDLERS), keep([\"w\"], \"z\"), NAMES)\n",
+                "    print(pop_or(\"none\"), pop_or(\"none\"), pop_or(\"none\"), STACK)\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "modmutate"),
+        vec!["42 [6, 8] 1 2 ['n']", "b a none []"]
+    );
+}
+
+#[test]
+fn re_sub_duplicate_count_raises_type_error_at_run_time() {
+    // Issue #369: CPython raises the duplicate-`count` TypeError when the
+    // call RUNS, so an `except TypeError` around it catches it.
+    let scratch = Scratch::new("resubcount");
+    let krate = package_crate(
+        &scratch,
+        "resubcount",
+        &[(
+            "cli.py",
+            concat!(
+                "import re\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    print(re.sub(\"a\", \"b\", \"aaaaa\", count=2))\n",
+                "    print(re.sub(\"a\", \"b\", \"aaaaa\", 1))\n",
+                "    try:\n",
+                "        re.sub(\"a\", \"b\", \"aaaaa\", 1, count=1)\n",
+                "    except TypeError as e:\n",
+                "        print(\"TypeError:\", e)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "resubcount"),
+        vec!["bbaaa", "baaaa", "TypeError: sub() got multiple values for argument 'count'"]
+    );
+}
+
+#[test]
+fn complex_values_box_and_compare_like_cpython() {
+    // Issue #366: a complex member of a mixed list or dict boxes, and
+    // assertEqual/assertNotEqual compare complex against int/float the
+    // way CPython's `==` does.
+    let scratch = Scratch::new("complexbox");
+    let krate = package_crate(
+        &scratch,
+        "complexbox",
+        &[(
+            "cli.py",
+            concat!(
+                "import unittest\n",
+                "\n",
+                "\n",
+                "class T(unittest.TestCase):\n",
+                "    def test_eq(self):\n",
+                "        self.assertEqual(1j * 1j, -1 + 0j)\n",
+                "        self.assertEqual(1j * 1j, -1)\n",
+                "        self.assertEqual(2.5 + 0j, 2.5)\n",
+                "        self.assertNotEqual(2j, 3j)\n",
+                "        self.assertNotEqual(1 + 1j, 1)\n",
+                "        print(\"eq ok\")\n",
+                "\n",
+                "    def test_mixed(self):\n",
+                "        vals = [1, 2.5, 3j, \"x\"]\n",
+                "        print([type(v).__name__ for v in vals])\n",
+                "        print(vals, len(vals))\n",
+                "        d = {\"a\": 1, \"b\": 2j, \"c\": \"s\"}\n",
+                "        print(d)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    unittest.main()\n",
+            ),
+        )],
+    );
+    // Verified against python3 (stdout).
+    assert_eq!(
+        run_package(&krate, "complexbox"),
+        vec![
+            "eq ok",
+            "['int', 'float', 'complex', 'str']",
+            "[1, 2.5, 3j, 'x'] 4",
+            "{'a': 1, 'b': 2j, 'c': 's'}",
+        ]
+    );
+}
+
+#[test]
+fn ordering_a_complex_raises_type_error_like_cpython() {
+    // Issue #366: complex numbers are unordered; CPython raises the
+    // TypeError when the comparison runs, so a handler catches it.
+    let scratch = Scratch::new("complexorder");
+    let krate = package_crate(
+        &scratch,
+        "complexorder",
+        &[(
+            "cli.py",
+            concat!(
+                "def f() -> None:\n",
+                "    a = 1j\n",
+                "    b = 2j\n",
+                "    try:\n",
+                "        print(a < b)\n",
+                "    except TypeError as e:\n",
+                "        print(\"TypeError:\", e)\n",
+                "    try:\n",
+                "        print(a >= 3)\n",
+                "    except TypeError as e:\n",
+                "        print(\"TypeError:\", e)\n",
+                "    print(a == 1j, a != b)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    f()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "complexorder"),
+        vec![
+            "TypeError: '<' not supported between instances of 'complex' and 'complex'",
+            "TypeError: '>=' not supported between instances of 'complex' and 'int'",
+            "True True",
+        ]
+    );
+}
+
+#[test]
+fn threading_local_is_per_thread_like_cpython() {
+    // Issue #356: requests' HTTPDigestAuth shape — attributes created on
+    // first use behind hasattr, a counter bumped with +=, a hex f-string,
+    // del, AttributeError — and a second thread that starts with none of
+    // the first thread's attributes.
+    let scratch = Scratch::new("threadlocal");
+    let krate = package_crate(
+        &scratch,
+        "threadlocal",
+        &[(
+            "cli.py",
+            concat!(
+                "import threading\n",
+                "\n",
+                "\n",
+                "class Auth:\n",
+                "    def __init__(self) -> None:\n",
+                "        self._tl = threading.local()\n",
+                "\n",
+                "    def init_state(self) -> None:\n",
+                "        if not hasattr(self._tl, \"init\"):\n",
+                "            self._tl.init = True\n",
+                "            self._tl.last_nonce = \"\"\n",
+                "            self._tl.nonce_count = 0\n",
+                "            self._tl.chal = {}\n",
+                "            self._tl.pos = None\n",
+                "\n",
+                "    def bump(self, nonce: str) -> str:\n",
+                "        self.init_state()\n",
+                "        if nonce == self._tl.last_nonce:\n",
+                "            self._tl.nonce_count += 1\n",
+                "        else:\n",
+                "            self._tl.nonce_count = 1\n",
+                "        self._tl.last_nonce = nonce\n",
+                "        return f\"{self._tl.nonce_count:08x}\"\n",
+                "\n",
+                "\n",
+                "def worker(a: Auth) -> None:\n",
+                "    print(\"thread:\", a.bump(\"n1\"), a.bump(\"n1\"))\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    a = Auth()\n",
+                "    print(a.bump(\"n1\"), a.bump(\"n1\"), a.bump(\"n2\"))\n",
+                "    t = threading.Thread(target=worker, args=(a,))\n",
+                "    t.start()\n",
+                "    t.join()\n",
+                "    print(a.bump(\"n2\"))\n",
+                "    print(hasattr(a._tl, \"chal\"), a._tl.pos is None, a._tl.init)\n",
+                "    del a._tl.pos\n",
+                "    print(hasattr(a._tl, \"pos\"))\n",
+                "    try:\n",
+                "        print(a._tl.missing)\n",
+                "    except AttributeError as e:\n",
+                "        print(\"AttributeError:\", e)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "threadlocal"),
+        vec![
+            "00000001 00000002 00000001",
+            "thread: 00000001 00000002",
+            "00000002",
+            "True True True",
+            "False",
+            "AttributeError: '_thread._local' object has no attribute 'missing'",
+        ]
+    );
+}
+
+#[test]
+fn bisect_matches_cpython() {
+    // bisect_left/right/bisect with positional and keyword bounds, a str
+    // list, insort/insort_left, and CPython's ValueError for lo < 0.
+    let scratch = Scratch::new("bisectmod");
+    let krate = package_crate(
+        &scratch,
+        "bisectmod",
+        &[(
+            "cli.py",
+            concat!(
+                "import bisect\n",
+                "from bisect import bisect_left, insort\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    a = [1, 2, 2, 4, 8]\n",
+                "    print(bisect.bisect_left(a, 2), bisect.bisect_right(a, 2), bisect.bisect(a, 5))\n",
+                "    print(bisect_left(a, 2, 2), bisect.bisect_left(a, 2, lo=0, hi=1))\n",
+                "    words = [\"apple\", \"fig\", \"pear\"]\n",
+                "    print(bisect.bisect(words, \"grape\"))\n",
+                "    insort(a, 3)\n",
+                "    bisect.insort_left(a, 2)\n",
+                "    print(a)\n",
+                "    try:\n",
+                "        bisect.bisect_left(a, 2, -1)\n",
+                "    except ValueError as e:\n",
+                "        print(\"ValueError:\", e)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "bisectmod"),
+        vec![
+            "1 3 4",
+            "2 1",
+            "2",
+            "[1, 2, 2, 2, 3, 4, 8]",
+            "ValueError: lo must be non-negative",
+        ]
+    );
+}
+

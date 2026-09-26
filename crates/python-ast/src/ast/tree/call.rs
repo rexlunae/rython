@@ -364,6 +364,7 @@ fn box_assert_argument(
                     | crate::TypeInfo::StrRef
                     | crate::TypeInfo::String
                     | crate::TypeInfo::Bytes
+                    | crate::TypeInfo::Complex
                     | crate::TypeInfo::PyValue
             ) =>
         {
@@ -375,7 +376,36 @@ fn box_assert_argument(
         | crate::TypeInfo::StrRef
         | crate::TypeInfo::String
         | crate::TypeInfo::Bytes
+        | crate::TypeInfo::Complex
         | crate::TypeInfo::PyValue => Ok(Some(quote!(PyValue::from(#r)))),
+        // A fixed-arity TUPLE of boxable scalars (`(_encode_range(1, 2),)`
+        // — idna's test_intranges, issue #334): the boxed tuple of its
+        // boxed members.
+        crate::TypeInfo::Tuple(members)
+            if members.iter().all(|m| {
+                matches!(
+                    m,
+                    crate::TypeInfo::Int
+                        | crate::TypeInfo::Float
+                        | crate::TypeInfo::Bool
+                        | crate::TypeInfo::StrRef
+                        | crate::TypeInfo::String
+                        | crate::TypeInfo::Bytes
+                        | crate::TypeInfo::Complex
+                        | crate::TypeInfo::PyValue
+                        // An unknown member is a concrete Rust value that
+                        // boxes via From, or a build error — as above.
+                        | crate::TypeInfo::PyObject
+                )
+            }) =>
+        {
+            let fields = (0..members.len()).map(syn::Index::from);
+            Ok(Some(quote!({
+                #[allow(unused_variables)]
+                let __rython_t = #r;
+                PyValue::from(Vec::<PyValue>::from([#(PyValue::from(__rython_t.#fields)),*]))
+            })))
+        }
         // An UNKNOWN-typed but already-concrete Rust expression (issue #377):
         // a loop variable whose element type the inference maps don't record,
         // a function-call result, or a subscript. These render to a real Rust
@@ -2316,6 +2346,54 @@ impl<'a> CodeGen for Call {
         {
             return self.args[1].clone().to_rust(ctx, options, symbols);
         }
+        // A mutating METHOD call on a module-level container (`X.append(v)`,
+        // `return X.pop()` — issues #337, #122) runs under the static's lock
+        // right where it stands, as an expression: its value flows out of
+        // the lock, and the statement around it (a `return`, an `if` test)
+        // stays outside the closure. Stores through a static (`X[k] = v`)
+        // are wrapped at the statement instead (statement.rs).
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && let ExprType::Name(recv) = attr.value.as_ref()
+            && crate::ast::tree::scope::mutates_receiver(&attr.attr)
+            && options.mutable_statics.contains_key(&recv.id)
+            && !options.static_mutation_alias.contains_key(&recv.id)
+        {
+            let root = recv.id.clone();
+            // The Mutex is not reentrant: an argument that reads the same
+            // global would deadlock — refuse rather than hang.
+            let mut reads = false;
+            for e in self.args.iter().chain(self.keywords.iter().map(|k| &k.value)) {
+                crate::ast::tree::visit::walk_expr(e, &mut |sub| {
+                    if let ExprType::Name(n) = sub
+                        && n.id == root
+                    {
+                        reads = true;
+                    }
+                });
+            }
+            if reads {
+                return Err(format!(
+                    "`{root}.{}(...)` mutates `{root}` in place while its own arguments also \
+                     READ `{root}`: the module object is held under a lock for the mutation, \
+                     so the read would deadlock. Bind the read to a local first \
+                     (`n = len({root})`), then mutate.",
+                    attr.attr
+                )
+                .into());
+            }
+            let (inner, alias_ident, static_ref) =
+                crate::ast::tree::module::static_mutation_scope(&options, &root);
+            let call = self.to_rust(ctx, inner, symbols)?;
+            // The temp is named after the Python global, so an UPPER_CASE
+            // name would draw non_snake_case; the identifier is rython's.
+            return Ok(quote! {
+                stdpython::py_global_mutate(
+                    #static_ref,
+                    #[allow(non_snake_case)]
+                    |#alias_ident| -> Result<_, stdpython::PyException> { Ok(#call) },
+                )?
+            });
+        }
         // An EXPLICIT `obj.__eq__(other)` on a shared class whose `__eq__`
         // can decline (`return NotImplemented`): the decline is the
         // `Option<bool>`'s None inside the `==` adapter (PyRefEq), and the
@@ -2350,6 +2428,100 @@ impl<'a> CodeGen for Call {
         if let Some((param_types, _)) =
             callee_value_signature(self.func.as_ref(), &ctx, &options, &symbols)
         {
+            // A DIRECT call to a nested closure that has defaults (issue
+            // #370): bind the arguments by Python's rules — positional
+            // first, then keywords by name, then each omitted parameter's
+            // default (evaluated where the `def` stood). Statically known,
+            // so a binding Python would reject is a conversion error.
+            if let ExprType::Name(n) = self.func.as_ref()
+                && let Some(params) = options.closure_params.get(&n.id).cloned()
+            {
+                let fname = &n.id;
+                if self.args.iter().any(|a| matches!(a, ExprType::Starred(_)))
+                    || self.keywords.iter().any(|k| k.arg.is_none())
+                {
+                    return Err(format!(
+                        "a `*`/`**` spread into the nested function `{}`, which has \
+                         defaults, is not supported yet; pass the arguments explicitly",
+                        fname
+                    )
+                    .into());
+                }
+                if self.args.len() > params.len() {
+                    return Err(format!(
+                        "{}() takes {} positional argument(s) but {} were given",
+                        fname,
+                        params.len(),
+                        self.args.len()
+                    )
+                    .into());
+                }
+                let mut bound: Vec<Option<ExprType>> = vec![None; params.len()];
+                for (slot, arg) in bound.iter_mut().zip(self.args.iter()) {
+                    *slot = Some(arg.clone());
+                }
+                for kw in &self.keywords {
+                    let name = kw.arg.as_deref().unwrap_or_default();
+                    let Some(i) = params.iter().position(|(p, _)| p == name) else {
+                        return Err(format!(
+                            "{}() got an unexpected keyword argument '{}'",
+                            fname, name
+                        )
+                        .into());
+                    };
+                    if bound[i].is_some() {
+                        return Err(format!(
+                            "{}() got multiple values for argument '{}'",
+                            fname, name
+                        )
+                        .into());
+                    }
+                    bound[i] = Some(kw.value.clone());
+                }
+                let mut args = Vec::with_capacity(params.len());
+                for (i, ((pname, default), expected)) in
+                    params.iter().zip(param_types.iter()).enumerate()
+                {
+                    let tokens = match (&bound[i], default) {
+                        (Some(arg), _) => crate::render_typed_reused(
+                            arg,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(expected.clone()),
+                        )?,
+                        // The hidden local is read at every call that omits
+                        // the argument: a copy each time.
+                        (None, Some(d @ ExprType::Name(_))) => {
+                            let d = d.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                            quote!((#d).clone())
+                        }
+                        (None, Some(d)) => crate::render_typed_reused(
+                            d,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(expected.clone()),
+                        )?,
+                        (None, None) => {
+                            return Err(format!(
+                                "{}() missing 1 required positional argument: '{}'",
+                                fname, pname
+                            )
+                            .into());
+                        }
+                    };
+                    args.push(tokens);
+                }
+                let arg_tuple = if args.len() == 1 {
+                    let only = &args[0];
+                    quote!((#only,))
+                } else {
+                    quote!((#(#args),*))
+                };
+                let callee = self.func.clone().to_rust(ctx, options, symbols)?;
+                return Ok(quote!((#callee).call(#arg_tuple)?));
+            }
             if !self.keywords.is_empty() {
                 return Err(format!(
                     "keyword arguments require the callee's signature, and `{}` is a \
@@ -4424,6 +4596,51 @@ impl<'a> CodeGen for Call {
                     // (nothing is known about the value's members); and
                     // setattr(obj, name, v) is a no-op. All through the -W
                     // channel, never silent.
+                    // On a `threading.local()` object (issue #356) the
+                    // lookup IS modeled: its attributes live in a run-time
+                    // bag, so getattr/hasattr/setattr go to it.
+                    "getattr" | "hasattr" | "setattr"
+                        if self.keywords.is_empty()
+                            && let Some(obj) = self.args.first()
+                            && let Some(recv) = crate::ast::tree::attribute::threading_local_receiver(
+                                obj, &ctx, &options, &symbols,
+                            )? =>
+                    {
+                        let name = rendered.get(1).ok_or_else(|| {
+                            format!("{bname}() needs an attribute name")
+                        })?;
+                        return Ok(match (bname, rendered.len()) {
+                            ("hasattr", 2) => quote!((#recv).py_hasattr(&(#name))),
+                            ("getattr", 2) => quote!((#recv).py_getattr(&(#name))?),
+                            ("getattr", 3) => {
+                                let d = crate::render_typed(
+                                    &self.args[2],
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                    Some(crate::TypeInfo::PyValue),
+                                )?;
+                                quote!((#recv).py_getattr(&(#name)).unwrap_or_else(|_| #d))
+                            }
+                            ("setattr", 3) => {
+                                let v = crate::render_typed(
+                                    &self.args[2],
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                    Some(crate::TypeInfo::PyValue),
+                                )?;
+                                quote!((#recv).py_setattr(&(#name), #v))
+                            }
+                            _ => {
+                                return Err(format!(
+                                    "{bname}() got {} arguments; rython models                                      hasattr(obj, name), getattr(obj, name[, default])                                      and setattr(obj, name, value)",
+                                    rendered.len()
+                                )
+                                .into());
+                            }
+                        });
+                    }
                     "getattr" => {
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
@@ -5705,6 +5922,12 @@ impl<'a> CodeGen for Call {
                         | "heapreplace"
                         | "nlargest"
                         | "nsmallest"
+                        | "bisect"
+                        | "bisect_left"
+                        | "bisect_right"
+                        | "insort"
+                        | "insort_left"
+                        | "insort_right"
                         | "copy"
                         | "deepcopy"
                         | "dedent"
@@ -5742,6 +5965,10 @@ impl<'a> CodeGen for Call {
                 )
             });
             if let (Some((fname, module_prefix, render_name)), true) = (target, known) {
+                // A `**kwargs` bag forwarded into one of these calls is checked at
+                // run time before the call (issue #368) — see the guard below.
+                let mut forwarded_bags: Vec<TokenStream> = Vec::new();
+                let lowered = (|| -> Result<TokenStream, Box<dyn std::error::Error>> {
                 // wrap/fill accept width=, the re functions accept
                 // flags= (and sub also count=); everything else takes no
                 // keywords.
@@ -5758,8 +5985,24 @@ impl<'a> CodeGen for Call {
                 let mut quoting_kw: Option<crate::ExprType> = None;
                 let mut escapechar_kw: Option<crate::ExprType> = None;
                 let mut delimiter_kw: Option<crate::ExprType> = None;
+                let is_bisect_fn = matches!(
+                    fname.as_str(),
+                    "bisect" | "bisect_left" | "bisect_right" | "insort" | "insort_left" | "insort_right"
+                );
+                let mut lo_kw: Option<crate::ExprType> = None;
+                let mut hi_kw: Option<crate::ExprType> = None;
                 for kw in &self.keywords {
                     let slot = match kw.arg.as_deref() {
+                        Some("lo") if is_bisect_fn => &mut lo_kw,
+                        Some("hi") if is_bisect_fn => &mut hi_kw,
+                        Some("key") if is_bisect_fn => {
+                            return Err(format!(
+                                "{fname}(key=...) is not supported yet: bisect's key function \
+                                 (Python 3.10) is not modeled; rython refuses to silently \
+                                 ignore it — search a list of the keys instead"
+                            )
+                            .into());
+                        }
                         Some("width") if matches!(fname.as_str(), "wrap" | "fill") => &mut width_kw,
                         Some("flags") if is_re_fn => &mut flags_kw,
                         Some("count") if fname == "sub" => &mut count_kw,
@@ -5814,13 +6057,24 @@ impl<'a> CodeGen for Call {
                         // CSVBase.defaults IS the excel default dialect):
                         // the spread's keys are dynamic at this lowering —
                         // dropped (the dialect-options divergence).
-                        None if matches!(fname.as_str(), "reader" | "writer") => {
-                            options.definition_warnings.borrow_mut().push(
-                                "csv.reader/writer `**`-spread dialect options are \
-                                 dropped; the excel default dialect is used \
-                                 (documented divergence)"
-                                    .to_string(),
-                            );
+                        None if matches!(
+                            fname.as_str(),
+                            "reader" | "writer" | "wrap" | "fill" | "indent" | "shorten"
+                                | "dedent"
+                        ) => {
+                            // The spread's keys are only known at run time,
+                            // and none of these lowerings models the call's
+                            // keyword options (issue #368): an empty bag
+                            // changes nothing; a non-empty one raises there
+                            // rather than being ignored.
+                            let bag = kw.value.clone().to_rust(
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?;
+                            forwarded_bags.push(quote!(
+                                stdpython::refuse_forwarded_kwargs(#fname, &(#bag))?;
+                            ));
                             continue;
                         }
                         // textwrap wrap/fill/indent/shorten/dedent: a `**kwargs`
@@ -5830,19 +6084,7 @@ impl<'a> CodeGen for Call {
                         // dynamic at this lowering, and rython's wrap(text,
                         // width) models only the width — the forwarded options
                         // are dropped (the dynamic-kwargs divergence), loudly.
-                        None if matches!(
-                            fname.as_str(),
-                            "wrap" | "fill" | "indent" | "shorten" | "dedent"
-                        ) => {
-                            options.definition_warnings.borrow_mut().push(format!(
-                                "{}() `**kwargs`-spread options are dropped (rython's \
-                                 {} lowers only its positional form; the dynamic \
-                                 keyword options are the dynamic-kwargs divergence)",
-                                fname,
-                                fname
-                            ));
-                            continue;
-                        }
+
                         _ => {
                             return Err(format!(
                                 "{}() got an unexpected keyword argument '{}'",
@@ -5987,7 +6229,7 @@ impl<'a> CodeGen for Call {
                 // rendered[0] becomes the full mutable-borrow expression:
                 // py_index_mut already yields &mut for subscripts, names
                 // take a fresh &mut.
-                let heap_mutator = crate::ast::tree::scope::HEAPQ_FIRST_ARG_MUTATORS
+                let heap_mutator = crate::ast::tree::scope::FIRST_ARG_MUTATORS
                     .contains(&fname.as_str());
                 if heap_mutator {
                     if let Some(first) = self.args.first() {
@@ -6037,6 +6279,57 @@ impl<'a> CodeGen for Call {
                     ("heappush", [h, x]) => {
                         let p = qual("heappush");
                         Ok(quote!(#p(#h, #x)))
+                    }
+                    // bisect(a, x, lo=0, hi=len(a)): positional or keyword
+                    // bounds, each given once (CPython's TypeError text
+                    // otherwise, at conversion — the call's shape is static).
+                    (
+                        "bisect" | "bisect_left" | "bisect_right" | "insort" | "insort_left"
+                        | "insort_right",
+                        [a, x, rest @ ..],
+                    ) if rest.len() <= 2 => {
+                        let bound = |pos: Option<&TokenStream>,
+                                     kw: &Option<crate::ExprType>,
+                                     name: &str|
+                         -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+                            match (pos, kw) {
+                                (Some(_), Some(_)) => Err(format!(
+                                    "{fname}() got multiple values for argument '{name}'"
+                                )
+                                .into()),
+                                (Some(p), None) => Ok(Some(quote!(#p))),
+                                (None, Some(k)) => Ok(Some(k.clone().to_rust(
+                                    ctx.clone(),
+                                    options.clone(),
+                                    symbols.clone(),
+                                )?)),
+                                (None, None) => Ok(None),
+                            }
+                        };
+                        let lo = bound(rest.first(), &lo_kw, "lo")?
+                            .unwrap_or_else(|| quote!(0));
+                        let hi = match bound(rest.get(1), &hi_kw, "hi")? {
+                            Some(h) => quote!(Some(#h)),
+                            None => quote!(None),
+                        };
+                        // The probe takes the sequence's element type (a
+                        // str literal into a list of str owns itself).
+                        let x = match crate::infer_type(Some(&ctx), &self.args[0], &options, &symbols) {
+                            crate::TypeInfo::Vec(elem) => crate::render_typed(
+                                &self.args[1],
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(*elem),
+                            )?,
+                            _ => x.clone(),
+                        };
+                        let p = qual(&fname);
+                        if fname.starts_with("insort") {
+                            Ok(quote!(#p(#a, #x, #lo, #hi)?))
+                        } else {
+                            Ok(quote!(#p(&(#a), &(#x), #lo, #hi)?))
+                        }
                     }
                     ("heappop", [h]) => {
                         let p = qual("heappop");
@@ -6315,10 +6608,25 @@ impl<'a> CodeGen for Call {
                                 .to_string()
                                 .into());
                         }
-                        if rendered.len() > 3 && count_kw.is_some() {
-                            return Err("sub() got multiple values for argument 'count'"
-                                .to_string()
-                                .into());
+                        // CPython raises this TypeError at RUN time, after
+                        // evaluating every argument — a test's
+                        // `assertRaises(TypeError)` depends on it (issue
+                        // #369) — so it lowers to a raise, not a refusal.
+                        // The explicit `Err::<String, _>(..)?` types the
+                        // expression without diverging statically (no
+                        // unreachable-code warning after it).
+                        if rendered.len() > 3
+                            && let Some(c) = &count_kw
+                        {
+                            let c = c.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                            return Ok(quote!({
+                                #(let _ = &(#rendered);)*
+                                let _ = &(#c);
+                                Err::<String, PyException>(PyException::new(
+                                    "TypeError",
+                                    "sub() got multiple values for argument 'count'",
+                                ))?
+                            }));
                         }
                         let count = match (rendered.get(3), count_kw) {
                             (Some(c), None) => quote!(#c),
@@ -6784,6 +7092,11 @@ impl<'a> CodeGen for Call {
                     ) => Err(arity("2")),
                     _ => Err(arity("the documented number of")),
                 };
+                })()?;
+                if forwarded_bags.is_empty() {
+                    return Ok(lowered);
+                }
+                return Ok(quote!({ #(#forwarded_bags)* #lowered }));
             }
         }
 
@@ -8158,23 +8471,39 @@ let mutating_self_field = boxed_self_ref_receiver
             // spec Rust cannot reproduce exactly is a loud conversion
             // error, never approximated output.
             if attr.attr == "format" {
+                // The UNBOUND form `str.format(template, *args, **kw)` is
+                // the bound call `template.format(*args, **kw)` (issue
+                // #368): the template is the first argument, not `str`.
+                let unbound = matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "str")
+                    && symbols.get("str").is_none()
+                    && matches!(self.args.first(), Some(a) if !matches!(a, ExprType::Starred(_)));
+                let (template_expr, format_args) = if unbound {
+                    (&self.args[0], &self.args[1..])
+                } else {
+                    (attr.value.as_ref(), &self.args[..])
+                };
                 let Some(template) =
-                    str_format_template(attr.value.as_ref(), Some(&ctx), &symbols, &options)
+                    str_format_template(template_expr, Some(&ctx), &symbols, &options)
                 else {
-                    // The dynamic-format divergence: a template the
-                    // conversion cannot see (a parameter, a field stored
-                    // from one) — the call is dropped as the boxed None,
-                    // with the warning.
-                    options.definition_warnings.borrow_mut().push(
-                        "str.format on a non-literal template is dropped (the \
-                         dynamic-format divergence)"
-                            .to_string(),
+                    // A template the conversion cannot see (a parameter, a
+                    // field stored from one): formatted at run time.
+                    let template = template_expr.clone().to_rust(
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?;
+                    return lower_str_format_runtime(
+                        template,
+                        format_args,
+                        &self.keywords,
+                        &ctx,
+                        &options,
+                        &symbols,
                     );
-                    return Ok(quote!(stdpython::PyValue::None_));
                 };
                 return lower_str_format(
                     &template,
-                    &self.args,
+                    format_args,
                     &self.keywords,
                     &ctx,
                     &options,
@@ -10767,6 +11096,68 @@ pub(crate) fn str_format_template(
 /// ones bind to `_` so no warning fires. Errors mirror Python's:
 /// mixing auto and manual numbering, out-of-range indices, and missing
 /// keywords are conversion-time failures.
+/// `template.format(*args, **kwargs)` formatted at RUN time (issue #368),
+/// for a template the conversion cannot see or a keyword bag it cannot
+/// resolve. Every argument renders through Python's `str()` — which is
+/// what `format(value, "")` is for a field without a spec — in Python's
+/// evaluation order (template, then positional arguments, then keywords);
+/// `stdpython::str_format_runtime` substitutes them and raises a
+/// `ValueError` for any field it cannot render exactly.
+fn lower_str_format_runtime(
+    template: TokenStream,
+    args: &[ExprType],
+    keywords: &[Keyword],
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    let as_str = |value: &ExprType| -> Result<TokenStream, Box<dyn std::error::Error>> {
+        ExprType::Call(Call {
+            func: Box::new(ExprType::Name(crate::ast::tree::name::Name {
+                id: "str".to_string(),
+            })),
+            args: vec![value.clone()],
+            keywords: Vec::new(),
+        })
+        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+    };
+    let mut positional = Vec::new();
+    for arg in args {
+        if matches!(arg, ExprType::Starred(_)) {
+            return Err("str.format with a `*` spread into a template rython cannot see at \
+                        conversion time is not supported yet (bind the template to a string \
+                        literal, or pass the fields explicitly); rython refuses to silently \
+                        ignore it"
+                .into());
+        }
+        positional.push(as_str(arg)?);
+    }
+    let mut keyword_steps = Vec::new();
+    for kw in keywords {
+        match &kw.arg {
+            Some(name) => {
+                let value = as_str(&kw.value)?;
+                keyword_steps.push(quote!(__rython_kw.push((#name.to_string(), #value));));
+            }
+            None => {
+                let bag = kw
+                    .value
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                keyword_steps.push(quote!(__rython_kw.extend(stdpython::str_format_bag(&(#bag)));));
+            }
+        }
+    }
+    Ok(quote!({
+        let __rython_template = #template;
+        let __rython_args: Vec<String> = vec![#(#positional),*];
+        #[allow(unused_mut)]
+        let mut __rython_kw: Vec<(String, String)> = Vec::new();
+        #(#keyword_steps)*
+        stdpython::str_format_runtime(&__rython_template, &__rython_args, &__rython_kw)?
+    }))
+}
+
 fn lower_str_format(
     template: &str,
     args: &[ExprType],
@@ -10782,13 +11173,22 @@ fn lower_str_format(
         Err(e) => {
             // A template with fields this lowering cannot express
             // (`{data[installer][name]}` — pip's user agent): attribute/
-            // index access inside fields is unmodeled — the format call is
-            // dropped (documented divergence).
+            // index access inside fields is unmodeled. It is not dropped
+            // (issue #368): the runtime path formats every field it can
+            // and raises a ValueError naming the one it cannot, at the
+            // point Python would have used it.
             options.definition_warnings.borrow_mut().push(format!(
-                "str.format({:?}) is dropped: {}",
+                "str.format({:?}) is formatted at run time and raises ValueError there: {}",
                 template, e
             ));
-            return Ok(quote!(stdpython::PyValue::None_));
+            return lower_str_format_runtime(
+                quote!(#template),
+                args,
+                keywords,
+                ctx,
+                options,
+                symbols,
+            );
         }
     };
 
@@ -10879,13 +11279,19 @@ fn lower_str_format(
             if entries.is_empty() {
                 // A `**runtime_bag` spread with DYNAMIC keys (test_calendar's
                 // `format_` — a runtime dict from default_format.copy() plus a
-                // dynamic key): not statically resolvable. Route to the
-                // runtime field-name formatter (issue #368), which substitutes
-                // `{key}` from the bag at runtime and refuses loudly on a
-                // format-spec/conversion it cannot render. The static-core
-                // `format!` path stays for resolvable templates.
-                let bag = kw.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                return Ok(quote!(stdpython::str_format_kwargs(#template, &(#bag))?));
+                // dynamic key): not statically resolvable, so the whole call
+                // formats at run time (issue #368) — with its positional
+                // arguments and other keywords, which an early return on the
+                // bag alone used to discard.
+                let original: Vec<ExprType> = args.iter().map(|a| (*a).clone()).collect();
+                return lower_str_format_runtime(
+                    quote!(#template),
+                    &original,
+                    keywords,
+                    ctx,
+                    options,
+                    symbols,
+                );
             }
             for (ename, evalue) in entries {
                 resolved_keywords.push(crate::Keyword {

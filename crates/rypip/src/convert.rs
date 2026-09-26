@@ -1859,7 +1859,14 @@ pub fn convert(
         std::thread::Builder::new()
             .name("rython-convert".to_string())
             .stack_size(CONVERT_STACK)
-            .spawn_scoped(scope, || convert_on_this_thread(package, out_dir, opts))
+            // Half the stack is the lowering's budget (issue #354): past it
+            // the conversion fails naming the construct; the other half is
+            // headroom for the analyses that recurse between two checks.
+            .spawn_scoped(scope, || {
+                python_ast::with_stack_budget(CONVERT_STACK / 2, || {
+                    convert_on_this_thread(package, out_dir, opts)
+                })
+            })
             .context("spawning the conversion thread")?
             .join()
             // A panic in the conversion is re-raised in the caller, so a

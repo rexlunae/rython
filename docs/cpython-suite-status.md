@@ -92,7 +92,24 @@ lowers to running its body directly (a subTest body may legitimately
 return/break/continue, so no closure). Each is pinned for codegen shape and
 CPython-verified message/outcome.
 
-77: **Still open:** `assertIs`/`assertRaisesRegex`, transitive `TestCase`
+77: **Gates and order landed (#371):** the runner carries out the test-runner
+gate decorators instead of consuming them as no-ops — which ran a skipped
+test (and let it fail the run). `@skip`, `@skipIf(cond, …)`,
+`@skipUnless(cond, …)` (bare or `unittest.`-qualified, on a method or on
+the class) keep the test from being constructed, set up, or run;
+`@expectedFailure` inverts the outcome, an unexpected success failing the
+run as CPython's `wasSuccessful()` does; `@cpython_only` skips, since rython
+is not CPython. A condition is evaluated when the runner reaches the test
+(CPython evaluates it when the decorator runs at import; the two differ
+only for a condition the module rebinds after the class). Gates rython does
+not model (`test.support` directives, `mock.patch`) still convert with a
+`-W` warning. Tests also run in CPython's TestLoader order — classes by
+name, methods sorted — not definition order, which decides the order of
+everything a suite prints. Pinned by
+`unittest_skip_and_expected_failure_gates_match_cpython` (stdout and exit
+status against python3).
+
+**Still open:** `assertIs`/`assertRaisesRegex`, transitive `TestCase`
 78: subclasses, `#377` (asserts on unknown-typed args — loop vars, builtins,
 79: subscripts — still loud-drop rather than box), and the stdlib-stub emission
 80: below.

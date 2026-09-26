@@ -1389,8 +1389,10 @@ fn return_type_of(
         }
         ExprType::Constant(c) => {
             // A complex sentinel (`\0RYTHON_COMPLEX:...`) is a Complex value.
-            if let Some(lit) = &c.0 && crate::ast::tree::constant::is_complex_literal(lit) {
-                return Ok(quote!(Complex));
+            if let Some(lit) = &c.0
+                && let Some(t) = crate::ast::tree::constant::sentinel_typeinfo(lit)
+            {
+                return Ok(t.to_rust_type());
             }
             match &c.0 {
                 Some(litrs::Literal::Integer(_)) => Ok(quote!(i64)),
@@ -2079,8 +2081,10 @@ fn operand_type(
         }
         ExprType::Constant(c) => {
             // A complex sentinel (`\0RYTHON_COMPLEX:...`) is a Complex value.
-            if let Some(lit) = &c.0 && crate::ast::tree::constant::is_complex_literal(lit) {
-                return Ok(quote!(Complex));
+            if let Some(lit) = &c.0
+                && let Some(t) = crate::ast::tree::constant::sentinel_typeinfo(lit)
+            {
+                return Ok(t.to_rust_type());
             }
             match &c.0 {
                 Some(litrs::Literal::Integer(_)) => quote!(i64),

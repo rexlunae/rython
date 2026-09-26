@@ -28,6 +28,7 @@ pub(crate) enum StdModule {
     Itertools,
     Functools,
     Heapq,
+    Bisect,
     Copy,
     Textwrap,
     Hashlib,
@@ -79,6 +80,7 @@ impl StdModule {
             "itertools" => StdModule::Itertools,
             "functools" => StdModule::Functools,
             "heapq" => StdModule::Heapq,
+            "bisect" => StdModule::Bisect,
             "copy" => StdModule::Copy,
             "textwrap" => StdModule::Textwrap,
             "hashlib" => StdModule::Hashlib,
@@ -120,6 +122,7 @@ impl StdModule {
             StdModule::Itertools => "itertools",
             StdModule::Functools => "functools",
             StdModule::Heapq => "heapq",
+            StdModule::Bisect => "bisect",
             StdModule::Copy => "copy",
             StdModule::Textwrap => "textwrap",
             StdModule::Hashlib => "hashlib",
@@ -182,6 +185,7 @@ impl StdModule {
             | StdModule::Itertools
             | StdModule::Functools
             | StdModule::Heapq
+            | StdModule::Bisect
             | StdModule::Copy
             | StdModule::Textwrap
             | StdModule::Hashlib
@@ -238,6 +242,7 @@ impl StdModule {
             self,
             StdModule::Functools
                 | StdModule::Heapq
+                | StdModule::Bisect
                 | StdModule::Copy
                 | StdModule::Textwrap
                 | StdModule::Re
@@ -339,7 +344,7 @@ mod tests {
     /// Every module, for the exhaustive round-trip walk. Lives in the
     /// test module (its only consumer): CI builds with -D warnings, so a
     /// test-only item in the non-test build would be a dead-code error.
-    const ALL: [StdModule; 32] = [
+    const ALL: [StdModule; 33] = [
         StdModule::Os,
         StdModule::Sys,
         StdModule::Re,
@@ -354,6 +359,7 @@ mod tests {
         StdModule::Itertools,
         StdModule::Functools,
         StdModule::Heapq,
+        StdModule::Bisect,
         StdModule::Copy,
         StdModule::Textwrap,
         StdModule::Hashlib,

@@ -45,3 +45,7 @@ pub use rust_module::*;
 /// (the generator behind stdpython's checked-in exception tree).
 pub mod exception_tree;
 pub use exception_tree::*;
+
+/// A loud limit on lowering depth (issue #354).
+pub mod stack_guard;
+pub use stack_guard::with_stack_budget;

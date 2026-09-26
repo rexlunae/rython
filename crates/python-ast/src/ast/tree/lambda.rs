@@ -10,7 +10,7 @@ use crate::{extraction_failure,
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Lambda {
-    pub args: ParameterList,
+    pub args: Box<ParameterList>,
     pub body: Box<ExprType>,
     pub lineno: Option<usize>,
     pub col_offset: Option<usize>,
@@ -24,11 +24,11 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Lambda {
         let args = ob.extract_attr_with_context("args", "lambda arguments")?;
         let body = ob.extract_attr_with_context("body", "lambda body")?;
         
-        let args = args.extract().map_err(|e| extraction_failure("getting lambda arguments", &ob, e))?;
+        let args: ParameterList = args.extract().map_err(|e| extraction_failure("getting lambda arguments", &ob, e))?;
         let body = body.extract().map_err(|e| extraction_failure("getting lambda body", &ob, e))?;
         
         Ok(Lambda {
-            args,
+            args: Box::new(args),
             body: Box::new(body),
             lineno: ob.lineno(),
             col_offset: ob.col_offset(),

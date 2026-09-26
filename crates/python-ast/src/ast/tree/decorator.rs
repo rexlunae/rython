@@ -132,10 +132,14 @@ impl Decorator {
 /// `unittest` / `test.support` / `support` / `hashlib_helper` are EXTERNAL
 /// modules in rython's model (not `StdModule` variants), so any decorator
 /// bound to one is a gate regardless of the attribute name.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TestGate {
-    /// `@skip`, `@skipIf(...)`, `@skipUnless(...)` (and `@unittest.*`).
+    /// `@skip(reason)`: never run.
     Skip,
+    /// `@skipIf(condition, reason)`: not run when the condition is true.
+    SkipIf,
+    /// `@skipUnless(condition, reason)`: not run unless it is true.
+    SkipUnless,
     /// `@expectedFailure`, `@expectedFailureIf(...)`.
     ExpectedFailure,
     /// `@cpython_only`.
@@ -148,11 +152,29 @@ pub enum TestGate {
 }
 
 impl TestGate {
+    /// Whether the generated unittest runner carries out this gate (issue
+    /// #371). The rest are consumed with a -W warning.
+    pub(crate) fn runner_honors(&self) -> bool {
+        matches!(
+            self,
+            TestGate::Skip
+                | TestGate::SkipIf
+                | TestGate::SkipUnless
+                | TestGate::ExpectedFailure
+                | TestGate::CpythonOnly
+        )
+    }
+
     /// The ONE string boundary for a bare (no-receiver) decorator name.
     pub(crate) fn from_name(name: &str) -> Option<TestGate> {
         match name {
-            "skip" | "skipIf" | "skipUnless" => Some(TestGate::Skip),
-            "expectedFailure" | "expectedFailureIf" => Some(TestGate::ExpectedFailure),
+            "skip" => Some(TestGate::Skip),
+            "skipIf" => Some(TestGate::SkipIf),
+            "skipUnless" => Some(TestGate::SkipUnless),
+            "expectedFailure" => Some(TestGate::ExpectedFailure),
+            // Not a unittest API: a test file's own helper, whose condition
+            // semantics rython does not know — a plain gate.
+            "expectedFailureIf" => Some(TestGate::Support),
             "cpython_only" => Some(TestGate::CpythonOnly),
             "patch" => Some(TestGate::MockPatch),
             // Common bare test-support directives imported as `from
@@ -196,7 +218,19 @@ fn is_test_support_receiver(e: &ExprType) -> bool {
 /// is `TestGate::Support` regardless of the attribute.
 pub(crate) fn test_gate_from_expr(e: &ExprType) -> Option<TestGate> {
     if is_test_support_receiver(e) {
-        return Some(TestGate::Support);
+        // `@unittest.skipIf(...)` names a runner directive the runner
+        // honors (issue #371): classify it by its attribute through the
+        // same boundary as the bare spelling. Any other receiver-bound
+        // directive is a plain gate.
+        let attr = match e {
+            ExprType::Call(c) => match c.func.as_ref() {
+                ExprType::Attribute(a) => Some(a.attr.as_str()),
+                _ => None,
+            },
+            ExprType::Attribute(a) => Some(a.attr.as_str()),
+            _ => None,
+        };
+        return Some(attr.and_then(TestGate::from_name).unwrap_or(TestGate::Support));
     }
     // A bare name: `@skipUnless`, `@cpython_only`, `@requires_*`, ...
     // `name_of` surfaces the bare name only when the receiver is NOT a

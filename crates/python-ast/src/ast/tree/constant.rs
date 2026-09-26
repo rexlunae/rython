@@ -143,11 +143,60 @@ pub fn try_bool(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
 /// Display drops the ".0" of an integral float, which would re-parse as an
 /// INTEGER literal and change the type.
 pub fn f64_token(v: f64) -> String {
+    // A non-finite value has no literal form ("inf"/"NaN" would lex as
+    // identifiers): spell it as the f64 constant (issue #372 — `1e400j` is
+    // `complex(0, inf)`).
+    if v.is_nan() {
+        return "f64::NAN".to_string();
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { "f64::INFINITY" } else { "f64::NEG_INFINITY" }.to_string();
+    }
     let mut s = format!("{}", v);
-    if v.is_finite() && !s.contains('.') && !s.contains('e') && !s.contains('E') {
+    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
         s.push_str(".0");
     }
     s
+}
+
+/// What a NUL-prefixed SENTINEL constant really is. Values Python has but
+/// `litrs::Literal` cannot hold (a complex number, a non-finite float,
+/// Ellipsis) ride through a `Literal::String` carrying a NUL-prefixed
+/// marker — a NUL cannot open a real Python string literal, so the two
+/// never collide. Anything that reads a `Literal::String` constant as a
+/// `str` must ask this first; that is the one place the markers are
+/// interpreted (issue #372: the non-finite marker was honored by the
+/// renderer but typed as a str, so `1e400 * 0.0` lowered to string
+/// repetition).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SentinelKind {
+    Complex,
+    NonFinite,
+    Ellipsis,
+}
+
+/// The sentinel `l` carries, or None for a genuine literal.
+pub fn sentinel_kind(l: &Literal<String>) -> Option<SentinelKind> {
+    if is_complex_literal(l) {
+        Some(SentinelKind::Complex)
+    } else if is_nonfinite_literal(l) {
+        Some(SentinelKind::NonFinite)
+    } else if is_ellipsis_literal(l) {
+        Some(SentinelKind::Ellipsis)
+    } else {
+        None
+    }
+}
+
+/// The type of a sentinel constant that is a VALUE (a complex number, a
+/// non-finite float); None for a genuine literal and for Ellipsis, which
+/// is not a value rython lowers.
+pub fn sentinel_typeinfo(l: &Literal<String>) -> Option<crate::TypeInfo> {
+    match sentinel_kind(l)? {
+        SentinelKind::Complex => Some(crate::TypeInfo::Complex),
+        SentinelKind::NonFinite => Some(crate::TypeInfo::Float),
+        SentinelKind::Ellipsis => None,
+    }
 }
 
 /// The NUL-prefixed sentinel marker used to carry a Python `complex` value

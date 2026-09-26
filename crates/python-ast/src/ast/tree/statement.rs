@@ -69,6 +69,7 @@ impl CodeGen for Statement {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        crate::stack_guard::check()?;
         let (lineno, col_offset) = (self.lineno, self.col_offset);
         let (end_lineno, end_col_offset) = (self.end_lineno, self.end_col_offset);
         // The statement's binding marks (Devin review on #338, rounds 8 to
@@ -107,37 +108,23 @@ impl CodeGen for Statement {
                 )
                 .into());
             }
-            let ident = crate::safe_ident(&root);
-            // Rust forbids a binding that shadows a static (E0530), so the
-            // locked object takes a reserved-prefix temporary and the
-            // name resolves to it for this statement only.
-            let alias = format!("{}static_{}", crate::ast::tree::visit::RESERVED_PREFIX, root);
-            let alias_ident = crate::safe_ident(&alias);
-            let mut inner = options.clone();
-            let mut aliases = (*inner.static_mutation_alias).clone();
-            aliases.insert(root.clone(), alias.clone());
-            inner.static_mutation_alias = std::rc::Rc::new(aliases);
-            let mut statics = (*inner.mutable_statics).clone();
-            statics.remove(&root);
-            inner.mutable_statics = std::rc::Rc::new(statics);
-            let mut writables = (*inner.scope_global_writables).clone();
-            writables.remove(&root);
-            inner.scope_global_writables = std::rc::Rc::new(writables);
-            let mut promoted = (*inner.promoted_statics).clone();
-            promoted.remove(&root);
-            inner.promoted_statics = std::rc::Rc::new(promoted);
-            let kind = options.mutable_statics.get(&root).expect("root is a mutable static");
-            let static_ref = kind.static_ref(&ident);
+            let (inner, alias_ident, static_ref) =
+                crate::ast::tree::module::static_mutation_scope(&options, &root);
             let body = self.to_rust(ctx, inner, symbols)?;
-            // The temp is named after the Python global, so an
-            // UPPER_CASE module name (the common shape for a registry)
+            // The store may raise (`?` in its rendering): the closure
+            // returns the Result and the caller threads it. The temp is
+            // named after the Python global, so an UPPER_CASE module name
             // would draw rustc's non_snake_case lint at every mutation
-            // site. The warning is about an identifier rython synthesized,
-            // not about the user's Python, so it is silenced here rather
-            // than left for the reader to sift out of the real ones.
+            // site; the identifier is rython's, so it is silenced here.
             return Ok(quote! {
                 #[allow(non_snake_case)]
-                stdpython::py_global_mutate(#static_ref, |#alias_ident| { #body });
+                stdpython::py_global_mutate(
+                    #static_ref,
+                    |#alias_ident| -> Result<(), stdpython::PyException> {
+                        #body;
+                        Ok(())
+                    },
+                )?;
             });
         }
         // A statement that MUTATES a closure cell (issue #122): borrow the
@@ -669,7 +656,49 @@ impl CodeGen for StatementType {
                     }
                 })
             }
+            // A store into a `threading.local()` object's attribute (issue
+            // #356) creates or rebinds it for this thread, boxed.
+            StatementType::Assign(ref a)
+                if let [ExprType::Attribute(t)] = a.targets.as_slice()
+                    && let Some(recv) = crate::ast::tree::attribute::threading_local_receiver(
+                        &t.value, &ctx, &options, &symbols,
+                    )? =>
+            {
+                let name = t.attr.as_str();
+                let value = crate::render_typed(
+                    &a.value,
+                    ctx,
+                    options,
+                    symbols,
+                    Some(crate::TypeInfo::PyValue),
+                )?;
+                Ok(quote!((#recv).py_setattr(#name, #value)))
+            }
             StatementType::Assign(a) => a.to_rust(ctx, options, symbols),
+            // `tl.n += 1`: this thread's value, combined, stored back.
+            StatementType::AugAssign(ref a)
+                if let ExprType::Attribute(t) = &a.target
+                    && let Some(recv) = crate::ast::tree::attribute::threading_local_receiver(
+                        &t.value, &ctx, &options, &symbols,
+                    )? =>
+            {
+                let name = t.attr.as_str();
+                let mut read = t.clone();
+                read.ctx = "Load".to_string();
+                let combined = ExprType::BinOp(crate::ast::tree::bin_ops::BinOp {
+                    op: a.op.clone(),
+                    left: Box::new(ExprType::Attribute(read)),
+                    right: Box::new(a.value.clone()),
+                });
+                let value = crate::render_typed(
+                    &combined,
+                    ctx,
+                    options,
+                    symbols,
+                    Some(crate::TypeInfo::PyValue),
+                )?;
+                Ok(quote!((#recv).py_setattr(#name, #value)))
+            }
             StatementType::AugAssign(a) => a.to_rust(ctx, options, symbols),
             StatementType::Break => {
                 // A break whose loop lies outside an enclosing try-block
@@ -1118,7 +1147,7 @@ impl CodeGen for StatementType {
                         ret_options.forced_list_elt =
                             std::rc::Rc::new(Some(elt.clone()));
                         e.clone()
-                            .to_rust(ctx.clone(), ret_options, symbols)?
+                            .to_rust(ctx.clone(), ret_options, symbols.clone())?
                     } else {
                         tokens
                     };
@@ -1133,6 +1162,16 @@ impl CodeGen for StatementType {
                     // exactly.
                     if options.clone_str_attribute_returns {
                         match &e.value {
+                            // A class-level str CONSTANT (`return self.kind`
+                            // — issue #367) is a `&'static str`: own it.
+                            ExprType::Attribute(_)
+                                if matches!(
+                                    crate::infer_type(Some(&ctx), &e.value, &options, &symbols),
+                                    crate::TypeInfo::StrRef
+                                ) =>
+                            {
+                                quote!((#tokens).to_string())
+                            }
                             ExprType::Attribute(_) => quote!((#tokens).clone()),
                             ExprType::Constant(c)
                                 if matches!(&c.0, Some(litrs::Literal::String(_))) =>
@@ -1266,6 +1305,17 @@ impl CodeGen for StatementType {
             StatementType::Delete(targets) => {
                 let mut stmts = Vec::new();
                 for target in targets {
+                    // `del tl.name` on a `threading.local()` object (issue
+                    // #356): this thread's binding, or AttributeError.
+                    if let ExprType::Attribute(t) = &target
+                        && let Some(recv) = crate::ast::tree::attribute::threading_local_receiver(
+                            &t.value, &ctx, &options, &symbols,
+                        )?
+                    {
+                        let name = t.attr.as_str();
+                        stmts.push(quote!((#recv).py_delattr(#name)?;));
+                        continue;
+                    }
                     match target {
                         ExprType::Subscript(sub) => {
                             let receiver = crate::subscript_receiver_place(

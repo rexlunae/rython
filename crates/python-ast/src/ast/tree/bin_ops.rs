@@ -210,7 +210,7 @@ impl CodeGen for BinOp {
             let is_str_lit = |e: &crate::ExprType| {
                 if let ExprType::Constant(c) = e {
                     if let Some(lit) = &c.0 {
-                        !crate::ast::tree::constant::is_complex_literal(lit)
+                        crate::ast::tree::constant::sentinel_kind(lit).is_none()
                             && matches!(lit, litrs::Literal::String(_))
                     } else {
                         false
