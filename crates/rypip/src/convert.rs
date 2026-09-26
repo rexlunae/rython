@@ -2324,6 +2324,26 @@ fn convert_on_this_thread(
             // lib's shim.
             decls.push_str(&root_shim());
         }
+        // The entry's `from . import sibling` is `pub use crate::sibling;`
+        // — right in the lib's entry module, but in the bin the entry IS
+        // the crate root, where the `pub mod sibling;` above already binds
+        // the name (E0255 on idna's `from . import compat`). The
+        // declaration serves both, so the re-export goes.
+        let mut code = code.clone();
+        for line in decls.lines() {
+            if let Some(kid) = line
+                .trim()
+                .strip_prefix("pub mod ")
+                .and_then(|r| r.strip_suffix(';'))
+            {
+                for spelling in [
+                    format!("pub use crate :: {kid} ;"),
+                    format!("use crate :: {kid} ;"),
+                ] {
+                    code = code.replace(&spelling, "");
+                }
+            }
+        }
         let main_contents = format!("{}{}\n{}", generated_lint_attrs(opts.warnings), code, decls);
         write_file(src_dir.join("main.rs"), format_rust(&main_contents))?;
         has_binary = true;

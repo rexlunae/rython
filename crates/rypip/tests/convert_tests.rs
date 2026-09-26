@@ -18037,3 +18037,34 @@ fn functions_held_boxed_are_called_like_cpython() {
         ]
     );
 }
+
+#[test]
+fn an_entry_module_imports_a_sibling_module() {
+    // The ENTRY module's `from . import data` is a `pub use crate::data;`
+    // — in the bin the entry is the crate root, which already declares
+    // `pub mod data;` (E0255 on idna's `from . import compat`).
+    let scratch = Scratch::new("entrysib");
+    let krate = package_crate(
+        &scratch,
+        "entrysib",
+        &[
+            ("data.py", "TABLE = {65: 84}\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from . import data\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(data.TABLE.get(65), data.TABLE.get(66))\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "entrysib"), vec!["84 None"]);
+}
