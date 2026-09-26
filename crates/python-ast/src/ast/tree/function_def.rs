@@ -3345,10 +3345,7 @@ impl FunctionDef {
         let rebound = crate::ast::tree::method_params::rebound_names(&effective_body);
         let shared_param_mutated_in_place = |name: &str| {
             !rebound.contains(name)
-                && matches!(
-                    options.name_types.get(name),
-                    Some(crate::TypeInfo::Class(c)) if crate::ast::tree::shared::is_shared(c)
-                )
+                && crate::ast::tree::shared::binding_is_shared_value(name, &options)
         };
         for name in &param_names {
             let ident = crate::safe_ident(name);

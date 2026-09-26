@@ -32,6 +32,19 @@ pub fn is_shared(name: &str) -> bool {
     SHARED.with(|s| s.borrow().contains(name))
 }
 
+/// Whether the name `name` holds a shared class's `PyRef` itself — typed
+/// with a shared class that is not a polymorphic root (a root's value is
+/// its sum type, whose mutable narrowing view needs a `mut` binding).
+/// Mutation through such a binding goes through its borrow, so the binding
+/// needs `mut` only when it is rebound.
+pub(crate) fn binding_is_shared_value(name: &str, options: &PythonOptions) -> bool {
+    matches!(
+        options.name_types.get(name),
+        Some(TypeInfo::Class(c))
+            if is_shared(c) && !crate::ast::tree::hierarchy::is_polymorphic_root(c)
+    ) && !options.narrowed_names.contains_key(name)
+}
+
 /// Install the registry for the module being converted.
 pub fn install_shared(shared: &HashSet<String>) {
     SHARED.with(|s| *s.borrow_mut() = std::rc::Rc::new(shared.clone()));

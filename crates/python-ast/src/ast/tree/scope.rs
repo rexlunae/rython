@@ -495,10 +495,15 @@ pub(crate) fn class_call_resolver<'a>(
     // borrow — `x.borrow_mut().f = v`, `x.borrow_mut().m()` — which takes
     // `&self`: the binding itself never needs `mut`. `self` is the struct
     // inside the borrow, as before.
+    // The BINDING's own type decides: a name typed with a shared class. A
+    // polymorphic root's value is the sum type, whose narrowing view
+    // (`s.__rython_as_Circle_mut()`) takes `&mut self` — it keeps `mut`.
     let shared_receiver = move |attr: &crate::ast::tree::attribute::Attribute| {
-        !crate::ast::tree::visit::is_self(attr.value.as_ref())
-            && crate::receiver_class(&attr.value, ctx, symbols, options)
-                .is_some_and(|(c, _)| crate::ast::tree::shared::is_shared(&c.name))
+        let ExprType::Name(n) = attr.value.as_ref() else {
+            return false;
+        };
+        n.id != "self"
+            && crate::ast::tree::shared::binding_is_shared_value(&n.id, options)
     };
     move |access| {
         let attr = match access {
