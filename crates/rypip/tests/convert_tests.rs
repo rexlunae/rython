@@ -984,6 +984,59 @@ fn module_level_loop_aug_assigns_match_python_at_runtime() {
 }
 
 #[test]
+fn module_values_read_by_the_main_block_match_python_at_runtime() {
+    // A module value that is not a literal constant (`data = len(...)`,
+    // `total` accumulated in a loop) lowered to a local of the
+    // __module_init__ closure; read only by the `__main__` block, it was
+    // out of scope in the entry wrapper (E0425). The main block now counts
+    // as a reader, like a function, so the value is a static. A string
+    // global stored more than once (`names += s`) is an owned String,
+    // not the `&'static str` its first literal infers.
+    let scratch = Scratch::new("mainscope");
+    let file = scratch.path().join("mainscope.py");
+    fs::write(
+        &file,
+        concat!(
+            "total = 0\n",
+            "for v in [1, 2, 3]:\n",
+            "    total += v\n",
+            "data = len(\"abc\") + 1\n",
+            "names = \"\"\n",
+            "for s in [\"a\", \"b\"]:\n",
+            "    names += s\n",
+            "greeting = \"hi\"\n",
+            "if len(names) > 1:\n",
+            "    greeting = \"hello \" + names\n",
+            "\n",
+            "def show() -> None:\n",
+            "    print(names, greeting)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(total, data)\n",
+            "    show()\n",
+            "    print(names.upper(), len(greeting))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/mainscope"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "6 4\nab hello ab\nAB 8\n"
+    );
+}
+
+#[test]
 fn functools_partial_keyword_bindings_match_python_at_runtime() {
     // Keyword bindings emitting in the callee's declared order
     // (botocore's `partial(delay_exponential, base=base,

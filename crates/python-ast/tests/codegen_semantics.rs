@@ -5718,6 +5718,42 @@ fn nested_module_statement_ends_before_its_bind_marker() {
 }
 
 #[test]
+fn main_block_reads_promote_module_values_to_statics() {
+    // The `__main__` block is a reader like a function: a non-constant
+    // module value it reads must be a static the entry wrapper can see,
+    // not a local of the __module_init__ closure (E0425). A string global
+    // stored twice is the owned-String mutable static.
+    let out = compile(
+        concat!(
+            "data = len(\"abc\") + 1\n",
+            "names = \"\"\n",
+            "for s in [\"a\", \"b\"]:\n",
+            "    names += s\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(data, names)\n",
+        ),
+        "mainscope.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("pubstaticdata:"),
+        "a value read by the main block must be a static: {}",
+        out
+    );
+    assert!(
+        flat.contains("pubstaticnames:std::sync::LazyLock<std::sync::Mutex<String>>"),
+        "a twice-stored string global must be an owned String static: {}",
+        out
+    );
+    assert!(
+        !flat.contains("letdata;") && !flat.contains("letmutnames;"),
+        "no init-body local may shadow the promoted values: {}",
+        out
+    );
+}
+
+#[test]
 fn every_entry_point_allows_dead_code_for_the_lib_copy() {
     // rypip compiles an entry module twice: as the bin root, where `main`
     // is the process entry point, and as a lib submodule (`pub mod br;`),
