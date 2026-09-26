@@ -1118,6 +1118,19 @@ fn infer_type_inner(
                 iterator_builtin_type(&n.id, call, ctx, options, symbols)
                     .expect("just checked")
             }
+            // `round(x)` is an int; `round(x, n)` keeps the number's type
+            // (a float stays a float, an int an int) — CPython's rule. A
+            // `round` the module binds itself is its own function.
+            ExprType::Name(n) if n.id == "round" && symbols.get("round").is_none() => {
+                match call.args.as_slice() {
+                    [_] => TypeInfo::Int,
+                    [x, _] => match infer_type(ctx, x, options, symbols) {
+                        t @ (TypeInfo::Float | TypeInfo::Int) => t,
+                        _ => TypeInfo::PyObject,
+                    },
+                    _ => TypeInfo::PyObject,
+                }
+            }
             ExprType::Name(n) => match builtin_call_type(&n.id) {
                 Some(t) => t,
                 None => match symbols.get(&n.id) {
@@ -1262,6 +1275,21 @@ fn infer_type_inner(
                             },
                             _ => TypeInfo::PyObject,
                         }
+                    }
+                    // A method of the ENCLOSING class (`self.subtotal(o)`):
+                    // its declared return, or the type its definition is
+                    // emitted with — the same answer the analysis seeds a
+                    // local assigned from the call with.
+                    _ if crate::ast::tree::visit::is_self(attr.value.as_ref())
+                        && ctx.and_then(|c| c.enclosing_class_name()).is_some() =>
+                    {
+                        self_method_return_typeinfo(
+                            call,
+                            ctx.and_then(|c| c.enclosing_class_name()),
+                            Some(symbols),
+                            Some(options),
+                        )
+                        .unwrap_or(TypeInfo::PyObject)
                     }
                     _ if matches!(attr.value.as_ref(), ExprType::Name(_))
                         || matches!(attr.value.as_ref(), ExprType::Call(c)
@@ -5342,8 +5370,45 @@ fn self_method_return_typeinfo(
     let (class, class_symbols) =
         crate::ast::tree::call::receiver_class_tail(class_name, symbols.clone(), options)?;
     let method = class.method_on_mro(&attr.attr, &class_symbols)?;
-    let ann = method.returns.as_deref()?;
-    resolve_alias_typeinfo(ann, &class_symbols, options)
+    if let Some(ann) = method.returns.as_deref() {
+        return resolve_alias_typeinfo(ann, &class_symbols, options);
+    }
+    // An UNANNOTATED method: the return type its definition is emitted
+    // with, when that is a plain primitive (`def subtotal(self, o): total
+    // = 0.0 ... return total` is emitted `-> f64`), so a caller's
+    // `round(self.subtotal(o), 2)` is typed. Guarded against recursion
+    // through the method's own returns.
+    let tokens = self_method_resolved_return(class_name, &method, &class_symbols, options)?;
+    match tokens.to_string().as_str() {
+        "f64" => Some(TypeInfo::Float),
+        "i64" => Some(TypeInfo::Int),
+        "bool" => Some(TypeInfo::Bool),
+        "String" => Some(TypeInfo::String),
+        _ => None,
+    }
+}
+
+/// The return type `method` of `class` is emitted with (its whole
+/// return-type chain), guarded against recursion through methods that call
+/// each other: a cycle answers None. Keyed by the class and method NAME,
+/// since the definition is a fresh clone at every lookup.
+pub(crate) fn self_method_resolved_return(
+    class_name: &str,
+    method: &crate::FunctionDef,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<proc_macro2::TokenStream> {
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        ("self-method-return", class_name, &method.name).hash(&mut h);
+        h.finish() as usize
+    };
+    resolving_return(
+        key,
+        || None,
+        || method.resolved_return_type_in(symbols, options, Some(class_name)),
+    )
 }
 
 /// The symbol table of a module in options.module_defs ("" root).

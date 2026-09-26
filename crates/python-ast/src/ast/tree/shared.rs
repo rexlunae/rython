@@ -1,13 +1,14 @@
 //! The SHARED classes of the crate (issue #137, the aliasing
-//! representation): a class whose instances are stored in a container
+//! representation): a class whose instances are stored in a container or
+//! held by a parameter (issue #414 — a parameter binds the caller's object)
 //! anywhere in the crate AND mutated after construction anywhere in the
 //! crate holds its state behind `stdpython::PyRef<T>` (`Rc<RefCell<T>>`),
 //! so a local fetched from the container, the container slot, and every
 //! other holder are ONE object — CPython's reference semantics for the
 //! shape that would otherwise diverge silently (`item = self.find(name)`;
 //! `item.qty -= qty`; `acct.deposit(5)`). Every other class stays a plain
-//! struct: cloning an immutable object, or one that no container holds,
-//! is unobservable.
+//! struct: cloning an immutable object, or one that no container or
+//! parameter holds, is unobservable.
 //!
 //! The set is computed once per module conversion over every module of
 //! the crate (the same crate-wide walk the hierarchy index takes) and
@@ -60,6 +61,10 @@ pub fn compute_shared(
             classes.entry(c.name.clone()).or_insert(c);
         }
         collect_container_elements(body, symbols, opts, &mut stored);
+        // A PARAMETER is a second holder of the caller's object, exactly
+        // as a container slot is (issue #414): `def bump(order: Order):
+        // order.total += 1` mutates the caller's `o`.
+        collect_parameter_holders(body, symbols, opts, &mut stored);
         collect_external_store_fields(body, &Env::default(), symbols, opts, &mut external_stores);
     };
     register(this_body, this_classes.to_vec(), this_symbols, options);
@@ -82,6 +87,12 @@ pub fn compute_shared(
         let module: &crate::Module = module;
         let module_symbols = module.clone().find_symbols(SymbolTableScopes::new());
         register(&module.raw.body, defs, &module_symbols, &module_opts);
+    }
+    // A parameter typed from its call sites (method_params.rs) holds the
+    // caller's object as an annotated one does; the other modules' ASTs
+    // here are un-annotated, so the answers join directly.
+    if let Some(inferred) = crate::ast::tree::method_params::computed(options) {
+        stored.extend(inferred.values().cloned());
     }
     // Mutability is INHERITED: a stored subclass whose only mutator is
     // its base's is mutated through it (Devin review on #321). And both
@@ -281,6 +292,42 @@ fn collect_container_elements(
             }
         }
     }
+}
+
+/// The classes a function or method PARAMETER holds (its annotation is
+/// the class, bare or `| None`), anywhere in `stmts`: the parameter binds
+/// the caller's object, so a mutation through it — a field store, an
+/// augmented store, a mutating method — is the caller's (issue #414).
+/// The receiver needs no exclusion: `self` carries no annotation.
+fn collect_parameter_holders(
+    stmts: &[Statement],
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+    out: &mut HashSet<String>,
+) {
+    crate::ast::tree::visit::walk_stmts(stmts, crate::ast::tree::visit::Descend::All, &mut |s| {
+        if let StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) = &s.statement {
+            for p in f.args.posonlyargs.iter().chain(f.args.args.iter()).chain(f.args.kwonlyargs.iter()) {
+                let Some(ann) = p.annotation.as_deref() else {
+                    continue;
+                };
+                let held = match crate::resolve_alias_typeinfo(ann, symbols, options)
+                    .or_else(|| crate::annotation_type_info(ann))
+                {
+                    Some(TypeInfo::Class(c)) => Some(c),
+                    Some(TypeInfo::Option(inner)) => match *inner {
+                        TypeInfo::Class(c) => Some(c),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(c) = held {
+                    out.insert(crate::ast::tree::hierarchy::canonical_class_name(&c, symbols));
+                }
+            }
+        }
+        crate::ast::tree::visit::Flow::Continue
+    });
 }
 
 /// A store through a NON-`self` receiver (`acct.balance = 1`,

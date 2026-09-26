@@ -18864,3 +18864,175 @@ fn type_self_name_in_an_inherited_method_names_the_instance_class() {
         ],
     );
 }
+
+#[test]
+fn unannotated_method_parameters_take_their_call_sites_class() {
+    // Issue #335: `add_headers(self, request)` and `describe(self,
+    // request)` have no annotation, and every caller passes a `Request` —
+    // `send`'s annotated parameter, `main`'s constructed local. The
+    // parameters take the class from their call sites, so the methods read
+    // and store its fields, and the stores reach the caller's object
+    // (Request is mutated through a parameter, so it is shared — #414).
+    let scratch = Scratch::new("callsiteparams");
+    let file = scratch.path().join("callsite_params.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Request:\n",
+            "    def __init__(self, url: str) -> None:\n",
+            "        self.url = url\n",
+            "        self.headers: dict[str, str] = {}\n",
+            "        self.retries = 0\n",
+            "\n",
+            "\n",
+            "class Adapter:\n",
+            "    def __init__(self, prefix: str) -> None:\n",
+            "        self.prefix = prefix\n",
+            "\n",
+            "    def add_headers(self, request):\n",
+            "        request.headers[\"X-Prefix\"] = self.prefix\n",
+            "        request.retries += 1\n",
+            "\n",
+            "    def describe(self, request) -> str:\n",
+            "        return request.url + \" \" + str(len(request.headers)) + \" \" + str(request.retries)\n",
+            "\n",
+            "    def send(self, request: Request) -> str:\n",
+            "        self.add_headers(request)\n",
+            "        return self.describe(request)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    a = Adapter(\"p\")\n",
+            "    r = Request(\"http://x\")\n",
+            "    print(a.send(r))\n",
+            "    a.add_headers(r)\n",
+            "    print(a.describe(r), r.retries)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/callsite_params"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "http://x 1 1",
+            "http://x 1 2 2",
+        ],
+    );
+}
+
+#[test]
+fn a_mutation_through_a_class_parameter_reaches_the_callers_object() {
+    // Issue #414: Python passes objects by reference. A mutation through
+    // a class-typed parameter — a field store, an augmented store, a
+    // mutating method, through an `Order | None` parameter, or an object
+    // stored into another's field by `__init__` and mutated later — is the
+    // caller's. rython cloned a plain class instance into the call, and
+    // the mutation was lost (`0.0 50.0`). A class that is mutated and held
+    // by a parameter now shares the caller's object; an unmutated one
+    // (`Point`) stays a plain value.
+    let scratch = Scratch::new("paramalias");
+    let file = scratch.path().join("annotated_mut.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Order:\n",
+            "    def __init__(self, total: float) -> None:\n",
+            "        self.total = total\n",
+            "        self.discount = 0.0\n",
+            "\n",
+            "    def add(self, amount: float) -> None:\n",
+            "        self.total += amount\n",
+            "\n",
+            "\n",
+            "class Point:\n",
+            "    def __init__(self, x: int, y: int) -> None:\n",
+            "        self.x = x\n",
+            "        self.y = y\n",
+            "\n",
+            "\n",
+            "class Pricer:\n",
+            "    def __init__(self, rate: float) -> None:\n",
+            "        self.rate = rate\n",
+            "\n",
+            "    def apply(self, order: Order) -> None:\n",
+            "        order.discount = order.total * self.rate\n",
+            "\n",
+            "\n",
+            "class Checkout:\n",
+            "    def __init__(self, pricer: Pricer) -> None:\n",
+            "        self.pricer = pricer\n",
+            "\n",
+            "    def run(self, order: Order) -> float:\n",
+            "        self.pricer.apply(order)\n",
+            "        return order.discount\n",
+            "\n",
+            "\n",
+            "def bump(order: Order) -> None:\n",
+            "    order.total += 1.0\n",
+            "    order.add(2.0)\n",
+            "\n",
+            "\n",
+            "def maybe_bump(order: Order | None) -> None:\n",
+            "    if order is not None:\n",
+            "        order.add(10.0)\n",
+            "\n",
+            "\n",
+            "def dist(p: Point) -> int:\n",
+            "    return abs(p.x) + abs(p.y)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    o = Order(50.0)\n",
+            "    Pricer(0.1).apply(o)\n",
+            "    bump(o)\n",
+            "    maybe_bump(o)\n",
+            "    maybe_bump(None)\n",
+            "    print(o.discount, o.total)\n",
+            "    p = Pricer(0.5)\n",
+            "    c = Checkout(p)\n",
+            "    p.rate = 0.25\n",
+            "    print(c.run(Order(8.0)))\n",
+            "    print(dist(Point(3, -4)))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/annotated_mut"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "5.0 63.0",
+            "2.0",
+            "7",
+        ],
+    );
+}

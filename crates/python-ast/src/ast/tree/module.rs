@@ -312,6 +312,20 @@ impl CodeGen for Module {
             symbols = s.clone().find_symbols(symbols);
         }
 
+        // Unannotated METHOD parameters typed from their call sites (issue
+        // #335, method_params.rs): computed once for the crate, written
+        // into this module's methods as annotations before anything reads
+        // them, so the signature, the body typing and every call site take
+        // the annotated path.
+        {
+            let inferred =
+                crate::ast::tree::method_params::inferred_params(&options, &self, &symbols);
+            if crate::ast::tree::method_params::annotate(&mut self.raw.body, &inferred) {
+                symbols = self.clone().find_symbols(SymbolTableScopes::new());
+                crate::register_rust_module_imports(&self.raw.body, &options, &mut symbols)?;
+            }
+        }
+
         // Capture the module's source filename before fields of `self` are
         // moved, so statement errors can point at the user's Python file.
         let module_filename = self
@@ -7131,11 +7145,20 @@ fn module_class_info(
     // consults only the module's own AST and symbols, so it cannot re-enter
     // this cache).
     let mut table = std::collections::HashMap::new();
+    // The call-site-inferred method parameters (method_params.rs), when
+    // computed: every module's classes carry them as annotations, exactly
+    // as the module's own conversion does.
+    let inferred = crate::ast::tree::method_params::computed(options);
     for (module_path, module) in options.module_defs.iter() {
-        table.insert(
-            module_path.clone(),
-            std::rc::Rc::new(module_class_info_for(module)),
-        );
+        let info = match &inferred {
+            Some(map) if !map.is_empty() => {
+                let mut annotated: crate::Module = (**module).clone();
+                crate::ast::tree::method_params::annotate(&mut annotated.raw.body, map);
+                module_class_info_for(&annotated)
+            }
+            _ => module_class_info_for(module),
+        };
+        table.insert(module_path.clone(), std::rc::Rc::new(info));
     }
     *options.cross_module_classes.borrow_mut() =
         CrossModuleClasses::Computed(std::rc::Rc::new(table));

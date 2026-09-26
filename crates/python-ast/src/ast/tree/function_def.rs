@@ -3339,6 +3339,17 @@ impl FunctionDef {
             .map(|p| p.arg.as_str())
             .collect();
         let mut streams_prologue = TokenStream::new();
+        // A SHARED-class parameter (shared.rs: a `PyRef`) is mutated
+        // through its borrow (`p.borrow_mut().x = 1`), which takes `&self`:
+        // it needs a `mut` binding only when the name itself is rebound.
+        let rebound = crate::ast::tree::method_params::rebound_names(&effective_body);
+        let shared_param_mutated_in_place = |name: &str| {
+            !rebound.contains(name)
+                && matches!(
+                    options.name_types.get(name),
+                    Some(crate::TypeInfo::Class(c)) if crate::ast::tree::shared::is_shared(c)
+                )
+        };
         for name in &param_names {
             let ident = crate::safe_ident(name);
             if str_params.contains(name.as_str()) {
@@ -3359,7 +3370,7 @@ impl FunctionDef {
                         quote!(let #ident: stdpython::PyValue = #ident.into();),
                     );
                 }
-            } else if scope.needs_mut.contains(name) {
+            } else if scope.needs_mut.contains(name) && !shared_param_mutated_in_place(name) {
                 streams_prologue.extend(quote!(let mut #ident = #ident;));
             }
             // A PARAMETER a nested definition captures through a cell
@@ -6122,7 +6133,10 @@ impl FunctionDef {
         }
         let mut scoped = options.clone();
         scoped.name_types = std::rc::Rc::new(types);
-        self.inferred_return_typeinfo(symbols, &scoped)
+        match self_class.filter(|_| instance_method) {
+            Some(class) => self.inferred_return_typeinfo_in(class, symbols, &scoped),
+            None => self.inferred_return_typeinfo(symbols, &scoped),
+        }
             .filter(renderable_return_typeinfo)
             .map(|t| t.to_rust_type())
     }
@@ -6323,9 +6337,13 @@ impl FunctionDef {
                 }
                 ti.to_rust_type()
             } else {
-                method
-                    .unified_return_type(symbols, options)
-                    .or_else(|| method.param_scoped_return_type(Some(class_name), symbols, options))?
+                // The type the callee's own definition is emitted with
+                // (its full return-type chain, locals included: `total =
+                // 0.0 ... return total` is `f64`), guarded against
+                // recursion through mutually calling methods.
+                crate::ast::tree::type_ctx::self_method_resolved_return(
+                    class_name, &method, symbols, options,
+                )?
             };
             match &unified {
                 None => unified = Some(ty),
@@ -6518,12 +6536,30 @@ impl FunctionDef {
         crate::ast::tree::type_ctx::resolving_return(
             self as *const FunctionDef as usize,
             || None,
-            || self.inferred_return_typeinfo_inner(symbols, options),
+            || self.inferred_return_typeinfo_inner(None, symbols, options),
+        )
+    }
+
+    /// [`Self::inferred_return_typeinfo`] for a METHOD of `class`: the
+    /// returns are typed in the class's context, so `self.subtotal(o)` and
+    /// `self.field` inside a returned expression resolve.
+    pub(crate) fn inferred_return_typeinfo_in(
+        &self,
+        class: &str,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Option<crate::TypeInfo> {
+        let ctx = crate::CodeGenContext::Class(class.to_string());
+        crate::ast::tree::type_ctx::resolving_return(
+            self as *const FunctionDef as usize,
+            || None,
+            || self.inferred_return_typeinfo_inner(Some(&ctx), symbols, options),
         )
     }
 
     fn inferred_return_typeinfo_inner(
         &self,
+        ctx: Option<&crate::CodeGenContext>,
         symbols: &crate::SymbolTableScopes,
         options: &crate::PythonOptions,
     ) -> Option<crate::TypeInfo> {
@@ -6553,7 +6589,7 @@ impl FunctionDef {
                 has_none = true;
                 continue;
             }
-            let t = match crate::infer_type(None, r, options, symbols) {
+            let t = match crate::infer_type(ctx, r, options, symbols) {
                 // A string-LITERAL return infers `&'static str` (StrRef);
                 // the codegen returns an owned String — normalize so the
                 // `T | None` fold types `return "s"` + `return None` as

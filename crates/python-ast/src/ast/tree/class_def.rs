@@ -4458,8 +4458,16 @@ StatementType::Assign(a)
                 }
                 None => quote!(true),
             };
+            // A class without `__bool__`/`__len__` is always truthy and
+            // never reads the object: the parameter is unused (a
+            // warning in the generated crate).
+            let param = if dunder.is_none() {
+                quote!(_r)
+            } else {
+                quote!(r)
+            };
             quote!(impl stdpython::PyRefTruth for #class_name {
-                fn ref_truth(r: &stdpython::PyRef<Self>) -> bool {
+                fn ref_truth(#param: &stdpython::PyRef<Self>) -> bool {
                     #body
                 }
             })

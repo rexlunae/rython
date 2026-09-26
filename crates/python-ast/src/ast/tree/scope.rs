@@ -491,6 +491,15 @@ pub(crate) fn class_call_resolver<'a>(
     symbols: &'a crate::SymbolTableScopes,
     options: &'a crate::PythonOptions,
 ) -> impl Fn(Access<'_>) -> Option<bool> + 'a {
+    // A SHARED class's value (shared.rs: a `PyRef`) is mutated through its
+    // borrow — `x.borrow_mut().f = v`, `x.borrow_mut().m()` — which takes
+    // `&self`: the binding itself never needs `mut`. `self` is the struct
+    // inside the borrow, as before.
+    let shared_receiver = move |attr: &crate::ast::tree::attribute::Attribute| {
+        !crate::ast::tree::visit::is_self(attr.value.as_ref())
+            && crate::receiver_class(&attr.value, ctx, symbols, options)
+                .is_some_and(|(c, _)| crate::ast::tree::shared::is_shared(&c.name))
+    };
     move |access| {
         let attr = match access {
             Access::Call(call) => match call.func.as_ref() {
@@ -498,8 +507,16 @@ pub(crate) fn class_call_resolver<'a>(
                 _ => return None,
             },
             Access::Property(attr) => attr,
-            Access::Store(attr) => return interior_store(attr, ctx, symbols, options),
+            Access::Store(attr) => {
+                if shared_receiver(attr) {
+                    return Some(false);
+                }
+                return interior_store(attr, ctx, symbols, options);
+            }
         };
+        if shared_receiver(attr) {
+            return Some(false);
+        }
         let (class, class_symbols) = crate::receiver_class(&attr.value, ctx, symbols, options)?;
         if class.method_on_mro(&attr.attr, &class_symbols).is_none() {
             return None;

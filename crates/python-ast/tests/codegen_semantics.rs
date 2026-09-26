@@ -4796,11 +4796,13 @@ fn composed_fields_type_and_resolve_through_chains() {
         "        self.p.shift(1)\n",
     );
     let out = compile(src, "compose.py");
-    assert!(out.contains("pub p : Point"), "generated: {}", out);
+    // Point is mutated (shift) and a parameter holds it (`p: Point`): the
+    // field shares the caller's object (issue #414).
+    assert!(out.contains("pub p : stdpython :: PyRef < Point >"), "generated: {}", out);
     // shift mutates Point, so nudge mutates self through the field chain.
     assert!(out.contains("fn nudge (& mut self ,"), "generated: {}", out);
     assert!(
-        out.contains(". shift (1) ?"),
+        out.contains("((self . p) . borrow_mut ()) . shift (__rython_sarg0) ?"),
         "field-chain method calls propagate exceptions: {}",
         out
     );
@@ -12403,13 +12405,15 @@ fn property_getter_setter_pair_renames_setter_and_routes_access() {
         "setter must lower as url_set: {}",
         out
     );
+    // C is mutated (the setter) and held by a parameter: shared (issue
+    // #414), so the calls go through the borrow of the caller's object.
     assert!(
-        out.contains("c.url()?") || out.contains("c . url () ?"),
+        out.contains("(c) . borrow () . url () ?"),
         "property read must route to the getter call: {}",
         out
     );
     assert!(
-        out.contains("c.url_set(v)?") || out.contains("c . url_set (v) ?"),
+        out.contains("(c) . borrow_mut () . url_set (v) ?"),
         "property store must route to the setter call: {}",
         out
     );
@@ -21122,8 +21126,8 @@ fn a_shared_classs_truth_runs_through_the_reference() {
         out
     );
     assert!(
-        flat.contains("implstdpython::PyRefTruthforPlain{fnref_truth(r:&stdpython::PyRef<Self>)->bool{true}}"),
-        "a plain shared instance is true: {}",
+        flat.contains("implstdpython::PyRefTruthforPlain{fnref_truth(_r:&stdpython::PyRef<Self>)->bool{true}}"),
+        "a plain shared instance is true (the unread parameter is `_r`, no warning): {}",
         out
     );
 }
@@ -21631,17 +21635,17 @@ fn a_mutation_through_a_narrowed_root_typed_name_takes_the_mutable_view() {
     );
     let flat: String = out.split_whitespace().collect();
     assert!(
-        flat.contains("(s).__rython_as_Circle_mut().unwrap().r="),
+        flat.contains("((s).__rython_as_Circle_mut().unwrap()).borrow_mut().r="),
         "the store goes through the mutable view: {}",
         out
     );
     assert!(
-        flat.contains("((s).__rython_as_Circle_mut().unwrap()).grow(2.0)?"),
+        flat.contains("(((s).__rython_as_Circle_mut().unwrap()).borrow_mut()).grow(__rython_sarg0)?"),
         "the mutating call goes through the mutable view: {}",
         out
     );
     assert!(
-        flat.contains("pubfn__rython_as_Circle_mut(&mutself)->Option<&mutCircle>"),
+        flat.contains("pubfn__rython_as_Circle_mut(&mutself)->Option<&mutstdpython::PyRef<Circle>>"),
         "the sum type offers the mutable view: {}",
         out
     );
@@ -25594,4 +25598,77 @@ fn type_self_name_in_a_trait_default_reads_the_implementor() {
         "tname.py",
     );
     assert!(out.contains("stdpython :: py_class_name :: < Self > ()"), "generated: {}", out);
+}
+
+/// Issue #335: an unannotated method parameter every call site passes a
+/// class instance to takes that class's type, through a chain of calls (a
+/// parameter handed on is typed by the fixpoint).
+#[test]
+fn an_unannotated_method_parameter_takes_its_call_sites_class() {
+    let out = compile(
+        concat!(
+            "class Req:\n",
+            "    def __init__(self, url: str) -> None:\n",
+            "        self.url = url\n",
+            "\n",
+            "class Adapter:\n",
+            "    def send(self, req):\n",
+            "        return self.describe(req)\n",
+            "\n",
+            "    def describe(self, req):\n",
+            "        return req.url\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(Adapter().send(Req(\"x\")))\n",
+        ),
+        "infer_chain.py",
+    );
+    assert!(out.contains("fn send (& self , req : Req)"), "generated: {}", out);
+    assert!(out.contains("fn describe (& self , req : Req)"), "generated: {}", out);
+}
+
+/// The inference only answers when EVERY resolved call agrees: two classes
+/// at two call sites, a method read as a value (its callers are out of
+/// sight), a spread into the call, or no call at all leave the parameter
+/// boxed, as before.
+#[test]
+fn a_method_parameter_without_one_agreed_class_stays_boxed() {
+    let out = compile(
+        concat!(
+            "class A:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.n = 1\n",
+            "\n",
+            "class B:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.n = 2\n",
+            "\n",
+            "class Sink:\n",
+            "    def mixed(self, x):\n",
+            "        return x\n",
+            "\n",
+            "    def as_value(self, x):\n",
+            "        return x\n",
+            "\n",
+            "    def spread(self, x):\n",
+            "        return x\n",
+            "\n",
+            "    def uncalled(self, x):\n",
+            "        return x\n",
+            "\n",
+            "def main() -> None:\n",
+            "    s = Sink()\n",
+            "    s.mixed(A())\n",
+            "    s.mixed(B())\n",
+            "    f = s.as_value\n",
+            "    s.as_value(A())\n",
+            "    args = [A()]\n",
+            "    s.spread(*args)\n",
+        ),
+        "infer_refuse.py",
+    );
+    for m in ["mixed", "as_value", "spread", "uncalled"] {
+        let sig = format!("fn {} (& self , x : stdpython :: PyValue)", m);
+        assert!(out.contains(&sig), "{} must stay boxed: {}", m, out);
+    }
 }

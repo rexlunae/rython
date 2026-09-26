@@ -94,8 +94,7 @@
       "status": "pass"
     },
     "untyped_method_args": {
-      "status": "build-failed",
-      "errors": 12
+      "status": "pass"
     },
     "valueor": {
       "status": "pass"
