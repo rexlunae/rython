@@ -757,6 +757,13 @@ pub struct PythonOptionsData {
     pub cross_module_classes:
         std::rc::Rc<std::cell::RefCell<CrossModuleClasses>>,
 
+    /// The crate's unannotated METHOD parameters typed from their call
+    /// sites (issue #335, method_params.rs): computed once per conversion,
+    /// shared by every module's options through the Rc, and applied to each
+    /// module's AST as synthesized annotations.
+    pub inferred_method_params:
+        std::rc::Rc<std::cell::RefCell<crate::ast::tree::method_params::InferredParamsState>>,
+
     /// Lazily-computed per-module sets of names promoted to `pub static`
     /// LazyLock statics (module.rs's promotion pass), keyed by module path.
     /// A name imported from a sibling module (`from .constant import _THAI`)
@@ -874,6 +881,9 @@ impl Default for PythonOptionsData {
             bin_crate_root: false,
             cross_module_mut_self: std::rc::Rc::new(std::cell::RefCell::new(
                 CrossModuleMutSelf::Uncomputed,
+            )),
+            inferred_method_params: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::ast::tree::method_params::InferredParamsState::Uncomputed,
             )),
             cross_module_classes: std::rc::Rc::new(std::cell::RefCell::new(
                 CrossModuleClasses::Uncomputed,

@@ -1,13 +1,14 @@
 //! The SHARED classes of the crate (issue #137, the aliasing
-//! representation): a class whose instances are stored in a container
+//! representation): a class whose instances are stored in a container or
+//! held by a parameter (issue #414 — a parameter binds the caller's object)
 //! anywhere in the crate AND mutated after construction anywhere in the
 //! crate holds its state behind `stdpython::PyRef<T>` (`Rc<RefCell<T>>`),
 //! so a local fetched from the container, the container slot, and every
 //! other holder are ONE object — CPython's reference semantics for the
 //! shape that would otherwise diverge silently (`item = self.find(name)`;
 //! `item.qty -= qty`; `acct.deposit(5)`). Every other class stays a plain
-//! struct: cloning an immutable object, or one that no container holds,
-//! is unobservable.
+//! struct: cloning an immutable object, or one that no container or
+//! parameter holds, is unobservable.
 //!
 //! The set is computed once per module conversion over every module of
 //! the crate (the same crate-wide walk the hierarchy index takes) and
@@ -29,6 +30,87 @@ thread_local! {
 /// Whether `name` is a shared class (see the module doc).
 pub fn is_shared(name: &str) -> bool {
     SHARED.with(|s| s.borrow().contains(name))
+}
+
+/// Whether the name `name` holds a shared class's `PyRef` itself — typed
+/// with a shared class that is not a polymorphic root (a root's value is
+/// its sum type, whose mutable narrowing view needs a `mut` binding).
+/// Mutation through such a binding goes through its borrow, so the binding
+/// needs `mut` only when it is rebound.
+pub(crate) fn binding_is_shared_value(name: &str, options: &PythonOptions) -> bool {
+    matches!(
+        options.name_types.get(name),
+        Some(TypeInfo::Class(c))
+            if is_shared(c) && !crate::ast::tree::hierarchy::is_polymorphic_root(c)
+    ) && !options.narrowed_names.contains_key(name)
+}
+
+/// Whether a value of type `t` holds a shared class's `PyRef` anywhere
+/// in it: a shared class, a shared root's sum type, a container or Option
+/// of one, or a class whose fields hold one (a `Registry` whose list
+/// holds shared `Item`s). Such a value's reference counts are
+/// single-threaded, so it cannot live in a `static` as it is — it is
+/// wrapped in `stdpython::ThreadBound` there.
+pub(crate) fn type_holds_shared(
+    t: &TypeInfo,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    fn holds(
+        t: &TypeInfo,
+        symbols: &SymbolTableScopes,
+        options: &PythonOptions,
+        seen: &mut HashSet<String>,
+    ) -> bool {
+        match t {
+            TypeInfo::Class(c) => {
+                if is_shared(c) {
+                    return true;
+                }
+                if !seen.insert(c.clone()) {
+                    return false;
+                }
+                let Some(class) = crate::resolve_class_referenced(c, symbols, options) else {
+                    return false;
+                };
+                class.base_chain_with_options(symbols, options).iter().any(|k| {
+                    k.infer_fields(symbols, options).ok().is_some_and(|fields| {
+                        fields.iter().any(|(_, ft)| holds(ft, symbols, options, seen))
+                    })
+                })
+            }
+            TypeInfo::Vec(x)
+            | TypeInfo::PyTuple(x)
+            | TypeInfo::HashSet(x)
+            | TypeInfo::Option(x)
+            | TypeInfo::Borrowed(x) => holds(x, symbols, options, seen),
+            TypeInfo::Dict(k, v) => {
+                holds(k, symbols, options, seen) || holds(v, symbols, options, seen)
+            }
+            TypeInfo::Tuple(xs) => xs.iter().any(|x| holds(x, symbols, options, seen)),
+            _ => false,
+        }
+    }
+    holds(t, symbols, options, &mut HashSet::new())
+}
+
+/// A static's type and initializer, wrapped in `stdpython::ThreadBound`
+/// when the value holds a shared instance (see [`type_holds_shared`]).
+pub(crate) fn thread_bound_static(
+    t: Option<&TypeInfo>,
+    ty: proc_macro2::TokenStream,
+    init: proc_macro2::TokenStream,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+    if t.is_some_and(|t| type_holds_shared(t, symbols, options)) {
+        (
+            quote::quote!(stdpython::ThreadBound<#ty>),
+            quote::quote!(stdpython::ThreadBound::new(#init)),
+        )
+    } else {
+        (ty, init)
+    }
 }
 
 /// Install the registry for the module being converted.
@@ -54,12 +136,53 @@ pub fn compute_shared(
     let mut defined_in: HashMap<String, usize> = HashMap::new();
     let mut stored: HashSet<String> = HashSet::new();
     let mut external_stores: HashSet<ExternalStore> = HashSet::new();
+    // Each class's fields that hold a `threading.local()` bag: a store
+    // through one (`self._tl.count = 1`) is interior — every clone of the
+    // object shares the per-thread bag — so it mutates nothing a second
+    // holder could miss (issue #356's scope rule, for the sharing
+    // decision).
+    let mut thread_local_fields: HashMap<String, HashSet<String>> = HashMap::new();
+    // Each class's FIELD classes (a `self.box = Box()` field holds a Box):
+    // an object held by a holder holds its fields' objects too.
+    let mut field_classes: HashMap<String, HashSet<String>> = HashMap::new();
     let mut register = |body: &[Statement], defs: Vec<ClassDef>, symbols: &SymbolTableScopes, opts: &PythonOptions| {
+        for c in &defs {
+            if let Ok(fields) = c.infer_fields(symbols, opts) {
+                let out = field_classes.entry(c.name.clone()).or_default();
+                for (_, t) in &fields {
+                    class_names_in(t, out);
+                }
+            }
+        }
+        for c in &defs {
+            let fields = thread_local_fields.entry(c.name.clone()).or_default();
+            for m in all_methods(c) {
+                crate::ast::tree::visit::walk_stmts(&m.body, crate::ast::tree::visit::Descend::SkipDefs, &mut |st| {
+                    if let StatementType::Assign(a) = &st.statement
+                        && let ExprType::Call(call) = &a.value
+                        && crate::ast::tree::type_ctx::threading_local_ctor(&call.func, symbols)
+                    {
+                        for t in &a.targets {
+                            if let ExprType::Attribute(attr) = t
+                                && is_self(&attr.value)
+                            {
+                                fields.insert(attr.attr.clone());
+                            }
+                        }
+                    }
+                    crate::ast::tree::visit::Flow::Continue
+                });
+            }
+        }
         for c in defs {
             *defined_in.entry(c.name.clone()).or_insert(0) += 1;
             classes.entry(c.name.clone()).or_insert(c);
         }
         collect_container_elements(body, symbols, opts, &mut stored);
+        // A PARAMETER is a second holder of the caller's object, exactly
+        // as a container slot is (issue #414): `def bump(order: Order):
+        // order.total += 1` mutates the caller's `o`.
+        collect_parameter_holders(body, symbols, opts, &mut stored);
         collect_external_store_fields(body, &Env::default(), symbols, opts, &mut external_stores);
     };
     register(this_body, this_classes.to_vec(), this_symbols, options);
@@ -82,6 +205,12 @@ pub fn compute_shared(
         let module: &crate::Module = module;
         let module_symbols = module.clone().find_symbols(SymbolTableScopes::new());
         register(&module.raw.body, defs, &module_symbols, &module_opts);
+    }
+    // A parameter typed from its call sites (method_params.rs) holds the
+    // caller's object as an annotated one does; the other modules' ASTs
+    // here are un-annotated, so the answers join directly.
+    if let Some(inferred) = crate::ast::tree::method_params::computed(options) {
+        stored.extend(inferred.values().cloned());
     }
     // Mutability is INHERITED: a stored subclass whose only mutator is
     // its base's is mutated through it (Devin review on #321). And both
@@ -106,6 +235,22 @@ pub fn compute_shared(
             })
             .unwrap_or_else(|| vec![name.to_string()])
     };
+    // REACHABILITY: a holder holds its object's whole graph — the objects
+    // in its fields, and theirs. A parameter bound to a `Request` reaches
+    // `r.box.inner`, so a store there (`r.box.inner.x = 5`) mutates the
+    // caller's Inner: a class reachable from any holder is held (and is
+    // shared when it is mutated), while the value classes on the path
+    // stay values — their clones still carry the one shared object.
+    let mut frontier: Vec<String> = stored.iter().cloned().collect();
+    while let Some(name) = frontier.pop() {
+        for member in family_of(&name) {
+            for f in field_classes.get(&member).into_iter().flatten() {
+                if stored.insert(f.clone()) {
+                    frontier.push(f.clone());
+                }
+            }
+        }
+    }
     let mut memo: HashMap<String, bool> = HashMap::new();
     let names: Vec<String> = classes.keys().cloned().collect();
     let mut shared: HashSet<String> = names
@@ -117,7 +262,7 @@ pub fn compute_shared(
                 && !crate::ast::tree::class_def::is_exception_class(c)
                 && family
                     .iter()
-                    .any(|m| class_mutates(m, &classes, &external_stores, &mut memo));
+                    .any(|m| class_mutates(m, &classes, &external_stores, &thread_local_fields, &mut memo));
             if qualifies && defined_in.get(*name).copied().unwrap_or(0) > 1 {
                 options.definition_warnings.borrow_mut().push(format!(
                     "class `{}` is defined by more than one module of the crate: its \
@@ -160,10 +305,10 @@ pub fn compute_shared(
             continue;
         }
         let stored_family = stored.contains(name) || base_family.iter().any(|m| stored.contains(m));
-        let mutates = class_mutates(name, &classes, &external_stores, &mut memo)
+        let mutates = class_mutates(name, &classes, &external_stores, &thread_local_fields, &mut memo)
             || base_family
                 .iter()
-                .any(|m| class_mutates(m, &classes, &external_stores, &mut memo));
+                .any(|m| class_mutates(m, &classes, &external_stores, &thread_local_fields, &mut memo));
         if stored_family && mutates {
             let root = base_family.first().cloned().unwrap_or_default();
             options.definition_warnings.borrow_mut().push(format!(
@@ -281,6 +426,42 @@ fn collect_container_elements(
             }
         }
     }
+}
+
+/// The classes a function or method PARAMETER holds (its annotation is
+/// the class, bare or `| None`), anywhere in `stmts`: the parameter binds
+/// the caller's object, so a mutation through it — a field store, an
+/// augmented store, a mutating method — is the caller's (issue #414).
+/// The receiver needs no exclusion: `self` carries no annotation.
+fn collect_parameter_holders(
+    stmts: &[Statement],
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+    out: &mut HashSet<String>,
+) {
+    crate::ast::tree::visit::walk_stmts(stmts, crate::ast::tree::visit::Descend::All, &mut |s| {
+        if let StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) = &s.statement {
+            for p in f.args.posonlyargs.iter().chain(f.args.args.iter()).chain(f.args.kwonlyargs.iter()) {
+                let Some(ann) = p.annotation.as_deref() else {
+                    continue;
+                };
+                let held = match crate::resolve_alias_typeinfo(ann, symbols, options)
+                    .or_else(|| crate::annotation_type_info(ann))
+                {
+                    Some(TypeInfo::Class(c)) => Some(c),
+                    Some(TypeInfo::Option(inner)) => match *inner {
+                        TypeInfo::Class(c) => Some(c),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(c) = held {
+                    out.insert(crate::ast::tree::hierarchy::canonical_class_name(&c, symbols));
+                }
+            }
+        }
+        crate::ast::tree::visit::Flow::Continue
+    });
 }
 
 /// A store through a NON-`self` receiver (`acct.balance = 1`,
@@ -468,6 +649,27 @@ fn collect_external_store_fields(
     }
 }
 
+/// The class names a field type holds (`Box`, `Option[Box]`,
+/// `list[Box]`, ...).
+fn class_names_in(t: &TypeInfo, out: &mut HashSet<String>) {
+    match t {
+        TypeInfo::Class(c) => {
+            out.insert(c.clone());
+        }
+        TypeInfo::Vec(x)
+        | TypeInfo::PyTuple(x)
+        | TypeInfo::HashSet(x)
+        | TypeInfo::Option(x)
+        | TypeInfo::Borrowed(x) => class_names_in(x, out),
+        TypeInfo::Dict(k, v) => {
+            class_names_in(k, out);
+            class_names_in(v, out);
+        }
+        TypeInfo::Tuple(xs) => xs.iter().for_each(|x| class_names_in(x, out)),
+        _ => {}
+    }
+}
+
 /// Every method of the class, the asynchronous ones included (a mutation
 /// in an `async def` is a mutation), overloads excluded as `methods()`
 /// excludes them.
@@ -492,6 +694,7 @@ fn class_mutates(
     name: &str,
     classes: &BTreeMap<String, ClassDef>,
     external_stores: &HashSet<ExternalStore>,
+    thread_local_fields: &HashMap<String, HashSet<String>>,
     memo: &mut HashMap<String, bool>,
 ) -> bool {
     if let Some(&m) = memo.get(name) {
@@ -502,13 +705,14 @@ fn class_mutates(
     let Some(c) = classes.get(name) else {
         return false;
     };
-    let own = has_mutating_method(c)
+    let empty = HashSet::new();
+    let own = has_mutating_method(c, thread_local_fields.get(name).unwrap_or(&empty))
         || own_field_names(c)
             .iter()
             .any(|f| external_stores.iter().any(|st| st.hits(name, f)));
     let inherited = c.bases.iter().any(|b| match b {
-        ExprType::Name(n) => class_mutates(&n.id, classes, external_stores, memo),
-        ExprType::Attribute(a) => class_mutates(&a.attr, classes, external_stores, memo),
+        ExprType::Name(n) => class_mutates(&n.id, classes, external_stores, thread_local_fields, memo),
+        ExprType::Attribute(a) => class_mutates(&a.attr, classes, external_stores, thread_local_fields, memo),
         _ => false,
     });
     let result = own || inherited;
@@ -530,7 +734,7 @@ fn own_field_names(c: &ClassDef) -> HashSet<String> {
 /// Whether any method other than `__init__` mutates `self`: a store or
 /// augmented store into a `self` field, a container-mutating call on
 /// one, a `del`, or a call to another such method of the class.
-fn has_mutating_method(c: &ClassDef) -> bool {
+fn has_mutating_method(c: &ClassDef, thread_local_fields: &HashSet<String>) -> bool {
     let mut direct: HashSet<String> = HashSet::new();
     let mut calls: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for m in all_methods(c) {
@@ -539,7 +743,10 @@ fn has_mutating_method(c: &ClassDef) -> bool {
         }
         let mut stores = Vec::new();
         let mut self_calls = Vec::new();
-        if self_stores(&m.body, &mut stores, &mut self_calls) {
+        // A store through a `threading.local()` field is interior (above).
+        if self_stores(&m.body, &mut stores, &mut self_calls)
+            && stores.iter().any(|f| !thread_local_fields.contains(f))
+        {
             direct.insert(m.name.clone());
         }
         calls.insert(m.name.clone(), self_calls);

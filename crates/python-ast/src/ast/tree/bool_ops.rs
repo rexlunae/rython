@@ -183,34 +183,6 @@ fn fold(
         // fires when the operands land on a concrete value type.
         let u = crate::ast::tree::type_ctx::unify(a.clone(), b.clone());
         use crate::TypeInfo as T;
-        // Whether the operand can hold the Option's inner type: the
-        // concrete match (`ca and x` where both are str), a STRING
-        // literal (`ca and "fixed"` — the literal infers StrRef, not
-        // String), or an UNKNOWN type (`ca and expanduser(ca)` — the
-        // call's return infers PyObject because method/module-call
-        // returns are unresolved, but the rendered expression IS the
-        // inner type). An unknown operand falls back to the Option arm
-        // and lets rustc judge: `Some(#rest)` into the Option<T> context
-        // is loud if #rest is not T — the same loudness the && fallback
-        // would have, but correct for the unifiable case.
-        fn inner_matches(inner: &T, other: &T) -> bool {
-            inner == other
-                || matches!(other, T::PyObject)
-                || (matches!(inner, T::String) && matches!(other, T::StrRef))
-                || (matches!(inner, T::Bytes) && matches!(other, T::StrRef))
-                // CONTAINER-typed pairs that unify (`headers or {}` where
-                // headers is `Mapping[str, str] | None` and the empty-dict
-                // literal infers Dict(PyObject, PyObject) — urllib3's
-                // RequestMethods): the literal's element types are
-                // unknown, but the Option's inner anchors them. Round 62:
-                // unify() is the same compatibility relation the rest of
-                // the codebase uses; a boxed-PyValue result is excluded
-                // (a PyValue operand does not Some-wrap into Option<T>).
-                || !matches!(
-                    crate::ast::tree::type_ctx::unify(inner.clone(), other.clone()),
-                    T::PyObject | T::PyValue
-                )
-        }
         match (&a, &b) {
             // a: Option<T>, b: T — the falsy arm holds the Option, the
             // truthy arm wraps the plain value.
@@ -452,6 +424,65 @@ fn some_arm(expr: &crate::ExprType, tokens: TokenStream) -> TokenStream {
         quote!(Some((#tokens).to_string()))
     } else {
         quote!(Some(#tokens))
+    }
+}
+
+/// Whether the operand can hold the Option's inner type: the
+/// concrete match (`ca and x` where both are str), a STRING
+/// literal (`ca and "fixed"` — the literal infers StrRef, not
+/// String), or an UNKNOWN type (`ca and expanduser(ca)` — the
+/// call's return infers PyObject because method/module-call
+/// returns are unresolved, but the rendered expression IS the
+/// inner type). An unknown operand falls back to the Option arm
+/// and lets rustc judge: `Some(#rest)` into the Option<T> context
+/// is loud if #rest is not T — the same loudness the && fallback
+/// would have, but correct for the unifiable case.
+fn inner_matches(inner: &crate::TypeInfo, other: &crate::TypeInfo) -> bool {
+    use crate::TypeInfo as T;
+    inner == other
+        || matches!(other, T::PyObject)
+        || (matches!(inner, T::String) && matches!(other, T::StrRef))
+        || (matches!(inner, T::Bytes) && matches!(other, T::StrRef))
+        // CONTAINER-typed pairs that unify (`headers or {}` where
+        // headers is `Mapping[str, str] | None` and the empty-dict
+        // literal infers Dict(PyObject, PyObject) — urllib3's
+        // RequestMethods): the literal's element types are
+        // unknown, but the Option's inner anchors them. Round 62:
+        // unify() is the same compatibility relation the rest of
+        // the codebase uses; a boxed-PyValue result is excluded
+        // (a PyValue operand does not Some-wrap into Option<T>).
+        || !matches!(
+            crate::ast::tree::type_ctx::unify(inner.clone(), other.clone()),
+            T::PyObject | T::PyValue
+        )
+}
+
+/// Whether a BoolOp's fold lowers to a BOXED PyValue — the arm choice
+/// `fold_at` makes for its outermost pair (the first operand against the
+/// second): a bool beside a boxed value, or operands unifying to PyValue
+/// without an Option arm taking them. The return and store paths ask
+/// this instead of treating any Option operand as an Option-valued fold
+/// (`conn or self._new_conn()` where conn is `Option<_>` and the call
+/// returns PyValue folds boxed — the Some/None unwrap would not compile).
+pub(crate) fn fold_yields_boxed(
+    values: &[crate::ExprType],
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    use crate::TypeInfo as T;
+    let [first, second, ..] = values else {
+        return false;
+    };
+    let a = fold_operand_type(first, ctx, options, symbols);
+    let b = fold_operand_type(second, ctx, options, symbols);
+    let u = crate::ast::tree::type_ctx::unify(a.clone(), b.clone());
+    match (&a, &b) {
+        (T::Option(inner), b) if inner_matches(inner, b) => false,
+        (a, T::Option(inner)) if inner_matches(inner, a) => false,
+        (T::Bool, T::PyValue) | (T::PyValue, T::Bool) => true,
+        _ if value_unify(&u) => false,
+        _ => matches!(u, T::PyValue),
     }
 }
 

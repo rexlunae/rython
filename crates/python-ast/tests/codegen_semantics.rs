@@ -4796,11 +4796,13 @@ fn composed_fields_type_and_resolve_through_chains() {
         "        self.p.shift(1)\n",
     );
     let out = compile(src, "compose.py");
-    assert!(out.contains("pub p : Point"), "generated: {}", out);
+    // Point is mutated (shift) and a parameter holds it (`p: Point`): the
+    // field shares the caller's object (issue #414).
+    assert!(out.contains("pub p : stdpython :: PyRef < Point >"), "generated: {}", out);
     // shift mutates Point, so nudge mutates self through the field chain.
     assert!(out.contains("fn nudge (& mut self ,"), "generated: {}", out);
     assert!(
-        out.contains(". shift (1) ?"),
+        out.contains("((self . p) . borrow_mut ()) . shift (__rython_sarg0) ?"),
         "field-chain method calls propagate exceptions: {}",
         out
     );
@@ -12667,13 +12669,15 @@ fn property_getter_setter_pair_renames_setter_and_routes_access() {
         "setter must lower as url_set: {}",
         out
     );
+    // C is mutated (the setter) and held by a parameter: shared (issue
+    // #414), so the calls go through the borrow of the caller's object.
     assert!(
-        out.contains("c.url()?") || out.contains("c . url () ?"),
+        out.contains("(c) . borrow () . url () ?"),
         "property read must route to the getter call: {}",
         out
     );
     assert!(
-        out.contains("c.url_set(v)?") || out.contains("c . url_set (v) ?"),
+        out.contains("(c) . borrow_mut () . url_set (v) ?"),
         "property store must route to the setter call: {}",
         out
     );
@@ -15514,13 +15518,11 @@ fn functools_partial_keyword_call_through_the_bound_name_is_loud() {
 
 #[test]
 fn boxed_self_field_method_drop_warns_with_a_readable_spelling() {
-    // Issue #209: `self.items.append(x)` on an UNTYPED list field (the
-    // empty literal types the field as the boxed PyValue) cannot lower —
-    // the boxed value's methods are unmodeled — so the call drops through
-    // the -W channel with a READABLE spelling of the dropped call, not an
-    // AST Debug dump. (Annotating the field — `self.items: list[str] = []`
-    // — lowers append to Vec::push; that is the rewrite the message
-    // names.)
+    // Issue #421 (was #209's drop): `self.items.append(x)` on an UNTYPED
+    // list field — the empty literal types the field Vec<PyValue>, a
+    // typed container of boxed values — is a real push that boxes the
+    // element. The dynamic-method drop is for a field that IS the boxed
+    // value; applied to the container it lost the element silently.
     let (out, warnings) = compile_with_warnings(
         concat!(
             "class Bag:\n",
@@ -15533,17 +15535,36 @@ fn boxed_self_field_method_drop_warns_with_a_readable_spelling() {
         "bag.py",
     );
     assert!(
-        warnings.iter().any(|w| w
-            .contains("`self.items.append(...)` is dropped: the receiver is a boxed \
-                       PyValue (dynamic-method divergence)")),
-        "the drop must warn with a readable source spelling: {:?}",
+        !warnings.iter().any(|w| w.contains("is dropped")),
+        "the append is not dropped: {:?}",
         warnings
     );
-    // The dropped call is a no-op in the generated body.
     assert!(
-        out.contains("stdpython :: PyValue :: None_ ; Ok (())"),
-        "the dropped call lowers to the boxed None: {}",
+        out.contains("(self . items) . push (stdpython :: PyValue :: from (x))"),
+        "the append pushes the boxed element: {}",
         out
+    );
+    // A field that IS the boxed value still drops its unmodeled methods
+    // through the -W channel, with a READABLE spelling of the call.
+    let (_, boxed_warnings) = compile_with_warnings(
+        concat!(
+            "import typing\n",
+            "\n",
+            "class Holder:\n",
+            "    def __init__(self, conn: typing.Any) -> None:\n",
+            "        self.conn = conn\n",
+            "\n",
+            "    def ping(self) -> None:\n",
+            "        self.conn.send_ping()\n",
+        ),
+        "holder.py",
+    );
+    assert!(
+        boxed_warnings.iter().any(|w| w
+            .contains("`self.conn.send_ping(...)` is dropped: the receiver is a boxed \
+                       PyValue (dynamic-method divergence)")),
+        "the drop must warn with a readable source spelling: {:?}",
+        boxed_warnings
     );
     // The pinned shape lowers for real: append becomes Vec::push.
     let (pinned, pinned_warnings) = compile_with_warnings(
@@ -21386,8 +21407,8 @@ fn a_shared_classs_truth_runs_through_the_reference() {
         out
     );
     assert!(
-        flat.contains("implstdpython::PyRefTruthforPlain{fnref_truth(r:&stdpython::PyRef<Self>)->bool{true}}"),
-        "a plain shared instance is true: {}",
+        flat.contains("implstdpython::PyRefTruthforPlain{fnref_truth(_r:&stdpython::PyRef<Self>)->bool{true}}"),
+        "a plain shared instance is true (the unread parameter is `_r`, no warning): {}",
         out
     );
 }
@@ -21531,9 +21552,19 @@ fn a_field_mutated_through_a_shared_receiver_takes_the_mutable_borrow() {
         "the container field mutates through the mutable borrow: {}",
         out
     );
+    // The composed Point is REACHABLE from the stored Account and mutated
+    // (`bump`), so it is shared too: its mutating call borrows the Point
+    // itself, reached through the Account's borrow.
     assert!(
-        flat.contains("((a).borrow_mut().center).bump()"),
+        flat.contains("(((a).borrow_mut().center).borrow_mut()).bump()"),
         "the composed field's mutating call goes through the mutable borrow: {}",
+        out
+    );
+    // Every mutation of `a` goes through its borrow (`&self`): the local
+    // binding needs no `mut`.
+    assert!(
+        flat.contains("leta;") && !flat.contains("letmuta;"),
+        "the shared local is not `mut`: {}",
         out
     );
 }
@@ -21895,17 +21926,17 @@ fn a_mutation_through_a_narrowed_root_typed_name_takes_the_mutable_view() {
     );
     let flat: String = out.split_whitespace().collect();
     assert!(
-        flat.contains("(s).__rython_as_Circle_mut().unwrap().r="),
+        flat.contains("((s).__rython_as_Circle_mut().unwrap()).borrow_mut().r="),
         "the store goes through the mutable view: {}",
         out
     );
     assert!(
-        flat.contains("((s).__rython_as_Circle_mut().unwrap()).grow(2.0)?"),
+        flat.contains("(((s).__rython_as_Circle_mut().unwrap()).borrow_mut()).grow(__rython_sarg0)?"),
         "the mutating call goes through the mutable view: {}",
         out
     );
     assert!(
-        flat.contains("pubfn__rython_as_Circle_mut(&mutself)->Option<&mutCircle>"),
+        flat.contains("pubfn__rython_as_Circle_mut(&mutself)->Option<&mutstdpython::PyRef<Circle>>"),
         "the sum type offers the mutable view: {}",
         out
     );
@@ -22029,8 +22060,10 @@ fn a_mutation_through_a_chain_rooted_at_a_narrowed_name_takes_the_mutable_view()
         "the container store goes through the mutable view: {}",
         out
     );
+    // The composed Point is reachable from the parameter-held Circle and
+    // mutated, so it is shared: its call borrows the Point itself.
     assert!(
-        flat.contains("((s).__rython_as_Circle_mut().unwrap().center).bump()"),
+        flat.contains("(((s).__rython_as_Circle_mut().unwrap().center).borrow_mut()).bump()"),
         "the composed field's mutating call goes through the mutable view: {}",
         out
     );
@@ -22798,13 +22831,14 @@ fn empty_container_pins_its_element_from_the_split_chain() {
     // `out = []` whose element comes from a str-method CHAIN pins
     // Vec<String> — the split/strip/lower returns are in the typed
     // table, so the empty container adopts String and the pushes stay
-    // direct (round 99, text_stats's words()).
+    // unboxed (round 99, text_stats's words()). `w` is read twice, so
+    // the push takes the reuse-clone every call argument takes.
     let out = compile(
         "def words(text: str) -> list[str]:\n    out = []\n    for raw in text.split():\n        w = raw.strip().lower()\n        if w:\n            out.append(w)\n    return out\n",
         "boxedpush.py",
     );
     assert!(
-        out.contains("Vec :: < String > :: new") && out.contains("push (w)"),
+        out.contains("Vec :: < String > :: new") && out.contains("push ((w) . clone ())"),
         "the empty container must pin String from the chain: {}",
         out
     );
@@ -25858,4 +25892,204 @@ fn type_self_name_in_a_trait_default_reads_the_implementor() {
         "tname.py",
     );
     assert!(out.contains("stdpython :: py_class_name :: < Self > ()"), "generated: {}", out);
+}
+
+/// Issue #335: an unannotated method parameter every call site passes a
+/// class instance to takes that class's type, through a chain of calls (a
+/// parameter handed on is typed by the fixpoint).
+#[test]
+fn an_unannotated_method_parameter_takes_its_call_sites_class() {
+    let out = compile(
+        concat!(
+            "class Req:\n",
+            "    def __init__(self, url: str) -> None:\n",
+            "        self.url = url\n",
+            "\n",
+            "class Adapter:\n",
+            "    def send(self, req):\n",
+            "        return self.describe(req)\n",
+            "\n",
+            "    def describe(self, req):\n",
+            "        return req.url\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(Adapter().send(Req(\"x\")))\n",
+        ),
+        "infer_chain.py",
+    );
+    assert!(out.contains("fn send (& self , req : Req)"), "generated: {}", out);
+    assert!(out.contains("fn describe (& self , req : Req)"), "generated: {}", out);
+}
+
+/// The inference only answers when EVERY resolved call agrees: two classes
+/// at two call sites, a method read as a value (its callers are out of
+/// sight), a spread into the call, or no call at all leave the parameter
+/// boxed, as before.
+#[test]
+fn a_method_parameter_without_one_agreed_class_stays_boxed() {
+    let out = compile(
+        concat!(
+            "class A:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.n = 1\n",
+            "\n",
+            "class B:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.n = 2\n",
+            "\n",
+            "class Sink:\n",
+            "    def mixed(self, x):\n",
+            "        return x\n",
+            "\n",
+            "    def as_value(self, x):\n",
+            "        return x\n",
+            "\n",
+            "    def spread(self, x):\n",
+            "        return x\n",
+            "\n",
+            "    def uncalled(self, x):\n",
+            "        return x\n",
+            "\n",
+            "def main() -> None:\n",
+            "    s = Sink()\n",
+            "    s.mixed(A())\n",
+            "    s.mixed(B())\n",
+            "    f = s.as_value\n",
+            "    s.as_value(A())\n",
+            "    args = [A()]\n",
+            "    s.spread(*args)\n",
+        ),
+        "infer_refuse.py",
+    );
+    for m in ["mixed", "as_value", "spread", "uncalled"] {
+        let sig = format!("fn {} (& self , x : stdpython :: PyValue)", m);
+        assert!(out.contains(&sig), "{} must stay boxed: {}", m, out);
+    }
+}
+
+/// A FULLY-concrete annotation on an empty container is the declared type:
+/// `buffer: list[bytes] = []` stays Vec<Vec<u8>> even when a later
+/// `buffer.append(chunk)` sees a boxed element (urllib3's
+/// BaseHTTPResponse.__iter__ — the use pin widened it to Vec<PyValue>).
+#[test]
+fn a_concrete_container_annotation_is_not_widened_by_a_use() {
+    let out = compile(
+        concat!(
+            "import typing\n",
+            "\n",
+            "def lines(parts: typing.Any) -> list[bytes]:\n",
+            "    buffer: list[bytes] = []\n",
+            "    for chunk in parts:\n",
+            "        buffer.append(chunk)\n",
+            "    return buffer\n",
+        ),
+        "annotated_buffer.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("buffer=Vec::<Vec<u8>>::new()"),
+        "the annotated list keeps its bytes element: {}",
+        out
+    );
+}
+
+/// A module global whose value holds a SHARED object (a `PyRef` — an
+/// `Rc`, which a `static` cannot hold) lives in a thread-bound static;
+/// its reads deref through it unchanged.
+#[test]
+fn a_module_global_holding_a_shared_object_is_thread_bound() {
+    let out = compile(
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.n += 1\n",
+            "\n",
+            "def touch(c: Counter) -> None:\n",
+            "    c.bump()\n",
+            "\n",
+            "DEFAULT = Counter()\n",
+            "\n",
+            "def run() -> int:\n",
+            "    touch(DEFAULT)\n",
+            "    return DEFAULT.n\n",
+        ),
+        "thread_bound.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains(
+            "pubstaticDEFAULT:std::sync::LazyLock<stdpython::ThreadBound<stdpython::PyRef<Counter>>>"
+        ),
+        "the static is thread-bound: {}",
+        out
+    );
+    assert!(
+        flat.contains("stdpython::ThreadBound::new("),
+        "the initializer binds the value to its thread: {}",
+        out
+    );
+}
+
+/// A FIELD read of a LOCAL passed as an argument (`show(o.inner)` twice)
+/// is reuse-cloned like a name read: the local is an instance, not a
+/// module, so the first call must not move the field out of it.
+#[test]
+fn a_local_field_argument_read_again_is_cloned() {
+    let out = compile(
+        concat!(
+            "class Inner:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "class Outer:\n",
+            "    def __init__(self):\n",
+            "        self.inner = Inner()\n",
+            "\n",
+            "def show(i: Inner) -> int:\n",
+            "    return i.n\n",
+            "\n",
+            "def run() -> int:\n",
+            "    o = Outer()\n",
+            "    return show(o.inner) + show(o.inner)\n",
+        ),
+        "field_arg.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("show(Clone::clone(&(o.inner)))"),
+        "the field argument is cloned: {}",
+        out
+    );
+}
+
+/// `self[key]` runs the class's own `__getitem__`: a `get` that reads
+/// through it takes `&mut self` when that `__getitem__` mutates (counts
+/// its hits) — the scope analysis resolves the dunder like a call.
+#[test]
+fn a_subscript_of_self_takes_the_mutability_of_getitem() {
+    let out = compile(
+        concat!(
+            "class Headers:\n",
+            "    def __init__(self):\n",
+            "        self.store: dict[str, str] = {}\n",
+            "        self.hits = 0\n",
+            "\n",
+            "    def __getitem__(self, key: str) -> str:\n",
+            "        self.hits += 1\n",
+            "        return self.store[key]\n",
+            "\n",
+            "    def first(self, key: str) -> str:\n",
+            "        return self[key]\n",
+        ),
+        "dunder_mut.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("fnfirst(&mutself"),
+        "first reads through the mutating __getitem__: {}",
+        out
+    );
 }

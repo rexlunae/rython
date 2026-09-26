@@ -162,6 +162,7 @@ impl CodeGen for Subscript {
         // else keeps the py_index path, loud in rustc for classes (§12.1).
         // Slices are not routed (a slice object has no rython value).
         // Computed BEFORE `self.value` is moved by the to_rust below.
+        let recv_is_self = crate::ast::tree::visit::is_self(self.value.as_ref());
         let dunder_getitem =
             crate::receiver_class(&self.value, &ctx, &symbols, &options)
                 .and_then(|(class, class_symbols)| {
@@ -246,10 +247,11 @@ impl CodeGen for Subscript {
             // Python index rules via PyIndex: negatives from the end, a
             // catchable IndexError/KeyError instead of a Rust panic.
             SubscriptKind::Index(index) => {
-                if let Some((_class, _class_symbols, method)) = &dunder_getitem {
+                if let Some((class, class_symbols, method)) = &dunder_getitem {
                     return crate::ast::tree::call::dunder_method_call(
                         method,
                         &value,
+                        (class, class_symbols, recv_is_self),
                         std::slice::from_ref(index.as_ref()),
                         true,
                         &ctx,

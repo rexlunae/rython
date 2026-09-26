@@ -66,6 +66,9 @@
     "mixin_fields": {
       "status": "pass"
     },
+    "nested_param_mutation": {
+      "status": "pass"
+    },
     "pipeline": {
       "status": "pass"
     },
@@ -91,6 +94,9 @@
       "status": "pass"
     },
     "tree": {
+      "status": "pass"
+    },
+    "untyped_method_args": {
       "status": "pass"
     },
     "valueor": {

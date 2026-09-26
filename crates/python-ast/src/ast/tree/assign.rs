@@ -1487,6 +1487,11 @@ impl<'a> CodeGen for Assign {
                         return crate::ast::tree::call::dunder_method_call(
                             &method,
                             &receiver,
+                            (
+                                &class,
+                                &class_symbols,
+                                crate::ast::tree::visit::is_self(sub.value.as_ref()),
+                            ),
                             &[(**index).clone(), v_expr],
                             true,
                             &ctx,
@@ -1525,25 +1530,19 @@ impl<'a> CodeGen for Assign {
                                 .name_types
                                 .get(&n.id)
                                 .and_then(through_option),
-                            // A `self.<field>` receiver: infer_type's
-                            // self-field arm resolves the class-table type
+                            // Any other receiver — `self.<field>`, a field
+                            // of a class-typed parameter or local
+                            // (`request.headers["k"] = v`), a nested
+                            // subscript — is what infer_type makes of it:
+                            // its field arms resolve the class-table type
                             // (round 99 — replaces the self_field_rust_ty
                             // fallback, Directive 2).
-                            ExprType::Attribute(_)
-                                if matches!(
-                                    sub.value.as_ref(),
-                                    ExprType::Attribute(a)
-                                        if crate::ast::tree::visit::is_self(a.value.as_ref())
-                                ) =>
-                            {
-                                through_option(&crate::infer_type(
-                                    Some(&ctx),
-                                    &sub.value,
-                                    &options,
-                                    &symbols,
-                                ))
-                            }
-                            _ => None,
+                            _ => through_option(&crate::infer_type(
+                                Some(&ctx),
+                                &sub.value,
+                                &options,
+                                &symbols,
+                            )),
                         }
                     };
                     let string_keyed = receiver_dict()

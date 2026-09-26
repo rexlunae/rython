@@ -19077,3 +19077,488 @@ fn type_self_name_in_an_inherited_method_names_the_instance_class() {
         ],
     );
 }
+
+#[test]
+fn unannotated_method_parameters_take_their_call_sites_class() {
+    // Issue #335: `add_headers(self, request)` and `describe(self,
+    // request)` have no annotation, and every caller passes a `Request` —
+    // `send`'s annotated parameter, `main`'s constructed local. The
+    // parameters take the class from their call sites, so the methods read
+    // and store its fields, and the stores reach the caller's object
+    // (Request is mutated through a parameter, so it is shared — #414).
+    let scratch = Scratch::new("callsiteparams");
+    let file = scratch.path().join("callsite_params.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Request:\n",
+            "    def __init__(self, url: str) -> None:\n",
+            "        self.url = url\n",
+            "        self.headers: dict[str, str] = {}\n",
+            "        self.retries = 0\n",
+            "\n",
+            "\n",
+            "class Adapter:\n",
+            "    def __init__(self, prefix: str) -> None:\n",
+            "        self.prefix = prefix\n",
+            "\n",
+            "    def add_headers(self, request):\n",
+            "        request.headers[\"X-Prefix\"] = self.prefix\n",
+            "        request.retries += 1\n",
+            "\n",
+            "    def describe(self, request) -> str:\n",
+            "        return request.url + \" \" + str(len(request.headers)) + \" \" + str(request.retries)\n",
+            "\n",
+            "    def send(self, request: Request) -> str:\n",
+            "        self.add_headers(request)\n",
+            "        return self.describe(request)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    a = Adapter(\"p\")\n",
+            "    r = Request(\"http://x\")\n",
+            "    print(a.send(r))\n",
+            "    a.add_headers(r)\n",
+            "    print(a.describe(r), r.retries)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/callsite_params"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "http://x 1 1",
+            "http://x 1 2 2",
+        ],
+    );
+}
+
+#[test]
+fn a_shared_objects_dunders_and_field_chains_act_on_the_one_object() {
+    // Issue #414: a SHARED class (a `PyRef`) reached from outside its own
+    // methods — `h["k"] = v` / `h["k"]` / `"k" in h` through a parameter,
+    // a `get` whose `self[key]` runs the counting `__getitem__` (so `get`
+    // takes `&mut self`), and a store three fields deep through a
+    // parameter-held Request (`r.box.inner.x = 5`, the Inner reachable
+    // from the held Request is the caller's) — acts on the one object.
+    let scratch = Scratch::new("shareddunders");
+    let file = scratch.path().join("shared_dunders.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Headers:\n",
+            "    def __init__(self):\n",
+            "        self._store: dict[str, str] = {}\n",
+            "        self.hits = 0\n",
+            "\n",
+            "    def __getitem__(self, key: str) -> str:\n",
+            "        self.hits += 1\n",
+            "        return self._store[key.lower()]\n",
+            "\n",
+            "    def __setitem__(self, key: str, value: str) -> None:\n",
+            "        self._store[key.lower()] = value\n",
+            "\n",
+            "    def __contains__(self, key: str) -> bool:\n",
+            "        return key.lower() in self._store\n",
+            "\n",
+            "    def get(self, key: str, default: str) -> str:\n",
+            "        try:\n",
+            "            return self[key]\n",
+            "        except KeyError:\n",
+            "            return default\n",
+            "\n",
+            "\n",
+            "class Inner:\n",
+            "    def __init__(self):\n",
+            "        self.x = 1\n",
+            "\n",
+            "\n",
+            "class Box:\n",
+            "    def __init__(self):\n",
+            "        self.inner = Inner()\n",
+            "\n",
+            "\n",
+            "class Request:\n",
+            "    def __init__(self):\n",
+            "        self.headers = Headers()\n",
+            "        self.box = Box()\n",
+            "\n",
+            "\n",
+            "def fill(h: Headers) -> None:\n",
+            "    h[\"Content-Type\"] = \"text/plain\"\n",
+            "    h[\"X-Count\"] = \"3\"\n",
+            "\n",
+            "\n",
+            "def describe(h: Headers) -> str:\n",
+            "    ct = h[\"content-type\"]\n",
+            "    has = \"x-count\" in h\n",
+            "    miss = h.get(\"Accept\", \"none\")\n",
+            "    return ct + \" \" + str(has) + \" \" + miss\n",
+            "\n",
+            "\n",
+            "def poke(r: Request) -> None:\n",
+            "    r.box.inner.x = 5\n",
+            "    r.box.inner.x += 1\n",
+            "\n",
+            "\n",
+            "def peek(r: Request) -> int:\n",
+            "    return r.box.inner.x * 10\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    req = Request()\n",
+            "    fill(req.headers)\n",
+            "    print(describe(req.headers))\n",
+            "    print(req.headers.hits)\n",
+            "    poke(req)\n",
+            "    print(req.box.inner.x, peek(req))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/shared_dunders"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "text/plain True none",
+            "2",
+            "6 60",
+        ],
+    );
+}
+
+#[test]
+fn a_module_global_holding_a_shared_object_is_the_one_object() {
+    // A module global whose value holds a shared object (`DEFAULT =
+    // Counter()`, mutated through a parameter; `HOLDER` holds it in a
+    // field) lives in a thread-bound static — a `PyRef` is an `Rc`, which a
+    // plain static cannot hold — and every read reaches the one object.
+    let scratch = Scratch::new("sharedglobal");
+    let file = scratch.path().join("shared_global.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self, k: int) -> int:\n",
+            "        self.n += k\n",
+            "        return self.n\n",
+            "\n",
+            "\n",
+            "class Holder:\n",
+            "    def __init__(self, c: Counter):\n",
+            "        self.c = c\n",
+            "\n",
+            "\n",
+            "def touch(c: Counter) -> None:\n",
+            "    c.bump(10)\n",
+            "\n",
+            "\n",
+            "DEFAULT = Counter()\n",
+            "HOLDER = Holder(DEFAULT)\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    touch(DEFAULT)\n",
+            "    DEFAULT.bump(1)\n",
+            "    print(DEFAULT.n, HOLDER.c.n)\n",
+            "    touch(HOLDER.c)\n",
+            "    print(DEFAULT.n, HOLDER.c.n)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/shared_global"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "11 11",
+            "21 21",
+        ],
+    );
+}
+
+#[test]
+fn a_list_of_boxed_values_field_keeps_its_own_methods() {
+    // Issue #421: `self.q: list[Any]` is a Vec<PyValue> — a typed
+    // container, not a boxed receiver — so `append`/`pop` on it are real.
+    // They were dropped to the boxed None (the dynamic-method divergence
+    // meant for a field that IS the boxed value), losing the element
+    // silently. `conn or self._new_conn()` with an Option operand beside
+    // a boxed one returns the boxed fold's value, never an Option match.
+    let scratch = Scratch::new("boxedlistfield");
+    let file = scratch.path().join("boxed_list_field.py");
+    fs::write(
+        &file,
+        concat!(
+            "import typing\n",
+            "\n",
+            "\n",
+            "class Pool:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.q: list[typing.Any] = []\n",
+            "        self.r: list[int] = []\n",
+            "\n",
+            "    def _new_conn(self) -> typing.Any:\n",
+            "        return 1\n",
+            "\n",
+            "    def _get_conn(self) -> typing.Any:\n",
+            "        conn = None\n",
+            "        if self.q:\n",
+            "            conn = self.q.pop()\n",
+            "        return conn or self._new_conn()\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    p = Pool()\n",
+            "    print(p._get_conn())\n",
+            "    p.q.append(7)\n",
+            "    p.r.append(8)\n",
+            "    print(len(p.q), len(p.r))\n",
+            "    print(p._get_conn(), len(p.q))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/boxed_list_field"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "1",
+            "1 1",
+            "7 0",
+        ],
+    );
+}
+
+#[test]
+fn copy_and_len_on_shared_objects_and_containers() {
+    // `len(q)` on a SHARED object (a `PyRef`, held by a parameter and
+    // mutated) is the one object's `__len__`; `dict.copy()` / `list.copy()`
+    // are Python's shallow copies — a later mutation of the original (or
+    // the copy) does not reach the other. An argument pushed and then read
+    // again (`items.append(b)` then `len(b)`) is reuse-cloned.
+    let scratch = Scratch::new("copylen");
+    let file = scratch.path().join("copy_len.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Queue:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items: list[bytes] = []\n",
+            "        self.meta: dict[str, int] = {}\n",
+            "\n",
+            "    def __len__(self) -> int:\n",
+            "        return len(self.items)\n",
+            "\n",
+            "    def put(self, b: bytes) -> None:\n",
+            "        self.items.append(b)\n",
+            "        self.meta[str(len(self.items))] = len(b)\n",
+            "\n",
+            "    def snapshot(self) -> dict[str, int]:\n",
+            "        return self.meta.copy()\n",
+            "\n",
+            "\n",
+            "def fill(q: Queue, n: int) -> None:\n",
+            "    for i in range(n):\n",
+            "        q.put(b\"x\" * (i + 1))\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    q = Queue()\n",
+            "    fill(q, 3)\n",
+            "    snap = q.snapshot()\n",
+            "    q.put(b\"yy\")\n",
+            "    print(len(q), len(snap), len(q.meta))\n",
+            "    xs = [1, 2, 3]\n",
+            "    ys = xs.copy()\n",
+            "    ys.append(4)\n",
+            "    print(len(xs), len(ys), ys)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/copy_len"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "4 3 4",
+            "3 4 [1, 2, 3, 4]",
+        ],
+    );
+}
+
+#[test]
+fn a_mutation_through_a_class_parameter_reaches_the_callers_object() {
+    // Issue #414: Python passes objects by reference. A mutation through
+    // a class-typed parameter — a field store, an augmented store, a
+    // mutating method, through an `Order | None` parameter, or an object
+    // stored into another's field by `__init__` and mutated later — is the
+    // caller's. rython cloned a plain class instance into the call, and
+    // the mutation was lost (`0.0 50.0`). A class that is mutated and held
+    // by a parameter now shares the caller's object; an unmutated one
+    // (`Point`) stays a plain value.
+    let scratch = Scratch::new("paramalias");
+    let file = scratch.path().join("annotated_mut.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Order:\n",
+            "    def __init__(self, total: float) -> None:\n",
+            "        self.total = total\n",
+            "        self.discount = 0.0\n",
+            "\n",
+            "    def add(self, amount: float) -> None:\n",
+            "        self.total += amount\n",
+            "\n",
+            "\n",
+            "class Point:\n",
+            "    def __init__(self, x: int, y: int) -> None:\n",
+            "        self.x = x\n",
+            "        self.y = y\n",
+            "\n",
+            "\n",
+            "class Pricer:\n",
+            "    def __init__(self, rate: float) -> None:\n",
+            "        self.rate = rate\n",
+            "\n",
+            "    def apply(self, order: Order) -> None:\n",
+            "        order.discount = order.total * self.rate\n",
+            "\n",
+            "\n",
+            "class Checkout:\n",
+            "    def __init__(self, pricer: Pricer) -> None:\n",
+            "        self.pricer = pricer\n",
+            "\n",
+            "    def run(self, order: Order) -> float:\n",
+            "        self.pricer.apply(order)\n",
+            "        return order.discount\n",
+            "\n",
+            "\n",
+            "def bump(order: Order) -> None:\n",
+            "    order.total += 1.0\n",
+            "    order.add(2.0)\n",
+            "\n",
+            "\n",
+            "def maybe_bump(order: Order | None) -> None:\n",
+            "    if order is not None:\n",
+            "        order.add(10.0)\n",
+            "\n",
+            "\n",
+            "def dist(p: Point) -> int:\n",
+            "    return abs(p.x) + abs(p.y)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    o = Order(50.0)\n",
+            "    Pricer(0.1).apply(o)\n",
+            "    bump(o)\n",
+            "    maybe_bump(o)\n",
+            "    maybe_bump(None)\n",
+            "    print(o.discount, o.total)\n",
+            "    p = Pricer(0.5)\n",
+            "    c = Checkout(p)\n",
+            "    p.rate = 0.25\n",
+            "    print(c.run(Order(8.0)))\n",
+            "    print(dist(Point(3, -4)))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/annotated_mut"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "5.0 63.0",
+            "2.0",
+            "7",
+        ],
+    );
+}

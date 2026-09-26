@@ -4811,6 +4811,14 @@ impl<T: PyRefTruth> PyBool for PyRef<T> {
     }
 }
 
+/// `len(x)` on a shared instance is the one object's `__len__` (the
+/// converter implements `Len` for every class that defines it).
+impl<T: Len> Len for PyRef<T> {
+    fn len(&self) -> usize {
+        self.borrow().len()
+    }
+}
+
 impl<T> PyIsNone for PyRef<T> {
     fn py_is_none(&self) -> bool {
         false
@@ -4818,6 +4826,93 @@ impl<T> PyIsNone for PyRef<T> {
 }
 
 impl<T: PyInherits<Base>, Base> PyInherits<Base> for PyRef<T> {}
+
+/// A MODULE GLOBAL (or class attribute) whose value holds a shared
+/// instance (`PyRef` — an `Rc`, which a `static` cannot hold): the value
+/// is bound to the thread that initialized it. CPython lets every thread
+/// reach the one object; rython's single-threaded reference cells cannot,
+/// so a read from any other thread panics at that read — loud at the
+/// divergence (§12.2), never a data race. Reads deref to the value, so a
+/// global's `(*NAME).clone()` and method calls are unchanged.
+#[cfg(feature = "std")]
+pub struct ThreadBound<T> {
+    owner: std::thread::ThreadId,
+    value: core::mem::ManuallyDrop<T>,
+}
+
+#[cfg(feature = "std")]
+impl<T> ThreadBound<T> {
+    pub fn new(value: T) -> Self {
+        ThreadBound {
+            owner: std::thread::current().id(),
+            value: core::mem::ManuallyDrop::new(value),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<T> core::ops::Deref for ThreadBound<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        if std::thread::current().id() != self.owner {
+            panic!(
+                "RuntimeError: a module global holding a shared object is read from a \
+                 thread other than the one that created it; rython's shared objects are \
+                 single-threaded (issue #414)"
+            );
+        }
+        &self.value
+    }
+}
+
+#[cfg(feature = "std")]
+impl<T> Drop for ThreadBound<T> {
+    fn drop(&mut self) {
+        // Only the owning thread may touch the value's reference counts;
+        // anywhere else it is leaked (a static never drops at all).
+        if std::thread::current().id() == self.owner {
+            // SAFETY: dropped exactly once, here, and never read again.
+            unsafe { core::mem::ManuallyDrop::drop(&mut self.value) }
+        }
+    }
+}
+
+// SAFETY: every access to the value goes through `Deref` (or `Drop`),
+// both of which touch it only on the owning thread, so the non-Send
+// reference counts inside are never used from two threads.
+#[cfg(feature = "std")]
+unsafe impl<T> Send for ThreadBound<T> {}
+#[cfg(feature = "std")]
+unsafe impl<T> Sync for ThreadBound<T> {}
+
+#[cfg(all(test, feature = "std"))]
+mod thread_bound_tests {
+    use super::*;
+
+    #[test]
+    fn a_thread_bound_value_reads_on_its_own_thread() {
+        let g = ThreadBound::new(PyRef::new(3i64));
+        assert_eq!(*g.borrow(), 3);
+        *g.borrow_mut() += 1;
+        assert_eq!(*g.clone().borrow(), 4);
+    }
+
+    #[test]
+    fn a_thread_bound_value_read_from_another_thread_panics() {
+        static G: std::sync::LazyLock<ThreadBound<PyRef<i64>>> =
+            std::sync::LazyLock::new(|| ThreadBound::new(PyRef::new(1)));
+        assert_eq!(*G.borrow(), 1);
+        let err = std::thread::spawn(|| *G.borrow())
+            .join()
+            .expect_err("another thread's read must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(msg.contains("from a thread other than the one that created it"), "{}", msg);
+    }
+}
 
 #[cfg(test)]
 mod pyref_tests {
@@ -5877,6 +5972,38 @@ impl<K: Eq + Hash + Clone, V: Clone> PyDictOps<K, V> for PyDict<K, V> {
         for (k, v) in other {
             self.insert(k, v);
         }
+    }
+}
+
+/// `container.copy()` — Python's SHALLOW copy of a list, dict or set: a
+/// new container holding the same elements. An element that is a shared
+/// object stays the one object (its clone is another reference); every
+/// other element is a value, whose copy is unobservable.
+pub trait PyCopy {
+    fn copy(&self) -> Self;
+}
+
+impl<T: Clone> PyCopy for Vec<T> {
+    fn copy(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl<K: Clone, V: Clone, S: Clone> PyCopy for indexmap::IndexMap<K, V, S> {
+    fn copy(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl<K: Clone, V: Clone, S: Clone> PyCopy for HashMap<K, V, S> {
+    fn copy(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl<T: Clone, S: Clone> PyCopy for HashSet<T, S> {
+    fn copy(&self) -> Self {
+        self.clone()
     }
 }
 

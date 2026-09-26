@@ -844,6 +844,12 @@ impl<'a> CodeGen for Attribute {
                     let accessor = crate::safe_ident(&field);
                     Ok(quote!(#value_tokens.#accessor()))
                 }
+                // An inherited field of a SHARED receiver reads through
+                // the borrow, as its own fields do (the arm above).
+                Some(FieldRewrite::Chain { depth }) if shared_recv => {
+                    let chain = base_field_chain(depth);
+                    Ok(quote!((#value_tokens).borrow() #chain.#attr.clone()))
+                }
                 Some(FieldRewrite::Chain { depth }) => {
                     let chain = base_field_chain(depth);
                     Ok(quote!(#value_tokens #chain.#attr))
@@ -978,6 +984,12 @@ pub(crate) fn to_rust_place_expr(
                     } else {
                         Ok(quote!(#recv_place.#accessor()))
                     }
+                }
+                Some(FieldRewrite::Chain { depth })
+                    if shared_receiver(&attr.value, ctx, symbols, options) =>
+                {
+                    let chain = base_field_chain(depth);
+                    Ok(quote!((#recv_place).borrow_mut() #chain.#attr_ident))
                 }
                 Some(FieldRewrite::Chain { depth }) => {
                     let chain = base_field_chain(depth);
@@ -1399,10 +1411,23 @@ fn field_chain_ends_in_pyvalue(
     let Ok(fields) = class.infer_fields(&class_symbols, options) else {
         return false;
     };
+    // The FIELD ITSELF must be the boxed value (or an optional one): a
+    // CONTAINER of boxed values (`self.q: list[Any]` — a Vec<PyValue>)
+    // is a typed container whose own methods (`append`, `pop`) are real —
+    // dropping them lost the element silently.
     fields
         .iter()
         .find(|(name, _)| name == &a.attr)
-        .is_some_and(|(_, ty)| crate::ast::tree::type_ctx::type_contains_pyvalue(ty))
+        .is_some_and(|(_, ty)| {
+            matches!(
+                ty,
+                crate::TypeInfo::PyValue | crate::TypeInfo::PyValueMember(_)
+            ) || matches!(
+                ty,
+                crate::TypeInfo::Option(inner)
+                    if matches!(**inner, crate::TypeInfo::PyValue | crate::TypeInfo::PyValueMember(_))
+            )
+        })
 }
 
 /// Whether an expression is a BOXED PyValue at runtime: a name with an

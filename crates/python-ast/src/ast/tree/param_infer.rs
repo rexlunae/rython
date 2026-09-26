@@ -44,7 +44,9 @@
 //!   conversion failure at -W deny).
 //!
 //! Still loud errors (later milestones): callable parameters, tuple/
-//! attribute loop targets, and method parameters.
+//! attribute loop targets. Method parameters are not this pass's: an
+//! unannotated one takes a class from its call sites (method_params.rs)
+//! or stays the boxed slot.
 
 use std::collections::{HashMap, HashSet};
 

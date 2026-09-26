@@ -8822,19 +8822,18 @@ let mutating_self_field = boxed_self_ref_receiver
                         )?);
                         continue;
                     }
-                    // A SHARED class's reference stored into a container
-                    // (`self.audit.append(acct)`) and read again later is
-                    // another reference to the one object: clone it.
-                    let shared_name_reused = matches!(arg, ExprType::Name(n)
-                        if options.use_counts.get(&n.id).copied().unwrap_or(0) > 1
-                            && matches!(options.name_types.get(&n.id),
-                                Some(crate::TypeInfo::Class(c)) if crate::ast::tree::shared::is_shared(c)));
-                    let rendered = arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    rendered_args.push(if shared_name_reused {
-                        quote!(Clone::clone(&(#rendered)))
-                    } else {
-                        rendered
-                    });
+                    // An argument read again later (`self.cars.append(car)`
+                    // then `car.name`; `items.append(b)` then `len(b)`) is
+                    // reuse-cloned like any call argument: a SHARED class's
+                    // clone is another reference to the one object, and any
+                    // other class stored into a container is one nothing
+                    // mutates (shared.rs), so its copy is unobservable.
+                    rendered_args.push(crate::render_reused(
+                        arg,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?);
                 }
                 match (attr.attr.as_str(), rendered_args.as_slice()) {
                     // list.append(x) pushes one element; Vec::append (inherent)
@@ -9437,6 +9436,11 @@ let mutating_self_field = boxed_self_ref_receiver
                             let call = crate::dunder_method_call(
                                 &method,
                                 &receiver,
+                                (
+                                    &class,
+                                    &class_symbols,
+                                    crate::ast::tree::visit::is_self(attr.value.as_ref()),
+                                ),
                                 std::slice::from_ref(&self.args[0]),
                                 false,
                                 &ctx,
@@ -9527,12 +9531,25 @@ let mutating_self_field = boxed_self_ref_receiver
                                 symbols.clone(),
                                 Some(crate::TypeInfo::String),
                             )?;
+                            let getitem_recv = borrow_shared_receiver(
+                                quote!(__rython_recv),
+                                &class,
+                                &class_symbols,
+                                "__getitem__",
+                                crate::ast::tree::visit::is_self(attr.value.as_ref()),
+                                &options,
+                            );
                             return Ok(quote! {
                                 {
                                     let __rython_recv = (#receiver).clone();
                                     let __rython_key = #key_arg;
                                     let __rython_default = #default;
-                                    match __rython_recv.__getitem__(__rython_key) {
+                                    // Bound before the match: a shared
+                                    // receiver's `Ref` guard is a
+                                    // temporary that must drop here, not
+                                    // at the end of the block.
+                                    let __rython_found = #getitem_recv.__getitem__(__rython_key);
+                                    match __rython_found {
                                         #ok_arm,
                                         Err(__rython_e)
                                             if __rython_e.matches("KeyError") =>
@@ -12028,6 +12045,16 @@ pub(crate) fn receiver_class(
                     ..
                 }) => match call.func.as_ref() {
                     ExprType::Name(_) => named_call_class(call, symbols, options),
+                    // `type(self)(...)` in a method constructs the
+                    // enclosing class — the class its lowering constructs
+                    // (`clone = type(self)()` — urllib3's HTTPHeaderDict).
+                    ExprType::Call(inner)
+                        if matches!(inner.func.as_ref(), ExprType::Name(t) if t.id == "type")
+                            && symbols.get("type").is_none()
+                            && matches!(inner.args.as_slice(), [ExprType::Name(s)] if s.id == "self") =>
+                    {
+                        ctx.enclosing_class_name().map(|c| (c.to_string(), symbols.clone()))
+                    }
                     _ => None,
                 },
                 _ => None,
@@ -14253,6 +14280,32 @@ foo(b=9)",
     }
 }
 
+/// A method call's receiver tokens for a SHARED class's value (shared.rs:
+/// a `PyRef`): the call runs on the one object through its borrow —
+/// mutably when the method mutates. `self` is the struct itself, and a
+/// shared ROOT's sum type borrows in its delegators; both, and every
+/// unshared class, keep the receiver as it is.
+pub(crate) fn borrow_shared_receiver(
+    recv: TokenStream,
+    class: &crate::ClassDef,
+    class_symbols: &SymbolTableScopes,
+    method: &str,
+    recv_is_self: bool,
+    options: &PythonOptions,
+) -> TokenStream {
+    if !crate::ast::tree::shared::is_shared(&class.name)
+        || crate::ast::tree::hierarchy::is_polymorphic_root(&class.name)
+        || recv_is_self
+    {
+        return recv;
+    }
+    if class.method_needs_mut_self(method, class_symbols, options) {
+        quote!((#recv).borrow_mut())
+    } else {
+        quote!((#recv).borrow())
+    }
+}
+
 /// Route a SUBSCRIPT/`in`/dunder operation to a user-class's own dunder
 /// method through the FULL call-argument mapping — the same mapping a
 /// normal call receives — so arguments coerce to the method's declared
@@ -14265,12 +14318,21 @@ foo(b=9)",
 pub(crate) fn dunder_method_call(
     method: &crate::FunctionDef,
     recv: &TokenStream,
+    recv_class: (&crate::ClassDef, &SymbolTableScopes, bool),
     args: &[ExprType],
     fallible: bool,
     ctx: &CodeGenContext,
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    // A SHARED class's value is a `PyRef` (shared.rs): the dunder runs on
+    // the one object through its borrow — mutably when it mutates — as
+    // an ordinary method call does. `self` is the struct itself; a shared
+    // ROOT's sum type borrows in its delegators.
+    let (class, class_symbols, recv_is_self) = recv_class;
+    let borrowed =
+        borrow_shared_receiver(recv.clone(), class, class_symbols, &method.name, recv_is_self, options);
+    let recv = &borrowed;
     let mut sig = method.clone();
     // The receiver parameter (`self`) is bound to the receiver
     // expression, never an argument — the same strip the ordinary
