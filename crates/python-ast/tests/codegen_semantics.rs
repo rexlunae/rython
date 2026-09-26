@@ -1629,10 +1629,12 @@ fn loop_else_break_inside_if_still_tracked() {
 
 #[test]
 fn with_binds_context_manager() {
+    // A text file's `with` binding is never `mut` (every file method
+    // takes `&self`).
     let src = "with open(name) as fh:\n    read(fh)\n";
     let out = compile(src, "with.py");
-    assert!(out.contains("let mut fh"), "generated: {}", out);
-    assert!(out.contains("open"), "generated: {}", out);
+    assert!(out.contains("let fh = open"), "generated: {}", out);
+    assert!(!out.contains("let mut fh"), "generated: {}", out);
 }
 
 #[test]
