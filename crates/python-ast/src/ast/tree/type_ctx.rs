@@ -849,6 +849,25 @@ fn infer_type_inner(
                 let _entry = NameInferenceEntry::enter(n.id.clone());
                 return infer_type_inner(ctx, value, options, symbols);
             }
+            // 5. A literal table IMPORTED from another crate module (`from
+            // .idnadata import joining_types`): the defining module's
+            // static type.
+            if let Some(SymbolTableNode::ImportFrom(i)) = symbols.get(&n.id)
+                && options.module_defs.len() > 1
+            {
+                let defining = i
+                    .names
+                    .iter()
+                    .find(|a| a.asname.as_deref() == Some(n.id.as_str()))
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| n.id.clone());
+                let path = i.resolved_module_path(options);
+                if let Some(t) =
+                    crate::ast::tree::module::crate_module_static_type(options, &path, &defining)
+                {
+                    return t;
+                }
+            }
             // A CLASS NAME read as a VALUE (`[ChecksumError]`,
             // `EXCEPTION_MAP['k']` — botocore's retryhandler): classes as
             // values lower to their NAME STRINGS — the exception model is
@@ -1285,6 +1304,21 @@ fn infer_type_inner(
         // context, no class) falls through to the PyObject arm below —
         // exactly the pre-ctx behavior (round 99).
         ExprType::Attribute(attr) => {
+            // A literal table of another crate module read through the
+            // module (`idnadata.joining_types` after `from . import
+            // idnadata` — idna's core.py): the defining module's static
+            // type. A local or parameter shadowing the module name is not
+            // the module.
+            if let ExprType::Name(m) = attr.value.as_ref()
+                && !options.name_types.contains_key(&m.id)
+                && !options.local_types.contains_key(&m.id)
+                && let Some(path) =
+                    crate::ast::tree::module::crate_module_bound_to(&m.id, symbols, options)
+                && let Some(t) =
+                    crate::ast::tree::module::crate_module_static_type(options, &path, &attr.attr)
+            {
+                return t;
+            }
             // Any attribute of a `threading.local()` object is a run-time
             // attribute: a boxed value (issue #356).
             if matches!(
@@ -1980,6 +2014,35 @@ pub fn render_typed(
         let ty = elem.to_rust_type();
         return Ok(quote!(stdpython::PyTuple::<#ty>(vec![#(#elts),*])));
     }
+    // A tuple LITERAL into a fixed-shape tuple slot of its own arity
+    // (`return "", 0` from a `-> tuple[str, int]` function — idna's
+    // codec): each member renders against its slot, so a str literal
+    // owns itself where the slot holds a String.
+    if let (ExprType::Tuple(t), Some(TypeInfo::Tuple(slots))) = (expr, &expected)
+        && t.elts.len() == slots.len()
+        && !slots.is_empty()
+    {
+        let elts = t
+            .elts
+            .iter()
+            .zip(slots)
+            .map(|(e, slot)| {
+                render_typed_reused(
+                    e,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                    Some(slot.clone()),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(if elts.len() == 1 {
+            let only = &elts[0];
+            quote!((#only,))
+        } else {
+            quote!((#(#elts),*))
+        });
+    }
     // A class name used as a VALUE (`[ChecksumError]`, `merge_setting(
     // ..., dict_class=OrderedDict)` — requests' sessions): classes as
     // values lower to their NAME STRINGS — the exception model is
@@ -2336,6 +2399,13 @@ pub fn render_typed_reused(
     // wrapped Option would move x into it first (Devin review on #342,
     // round 4).
     let some_wrapped = adapted && tokens.to_string() == format!("Some ({})", raw);
+    // A BOXING wrap (`PyValue::from(data)` — a str into a boxed
+    // parameter, then `len(data)` in the same statement: idna's codec
+    // `return encode(data), len(data)`): the clone belongs to the READ
+    // too, or the box consumes the name before the later read.
+    let box_wrapped = adapted
+        && (tokens.to_string() == format!("PyValue :: from ({})", raw)
+            || tokens.to_string() == format!("stdpython :: PyValue :: from ({})", raw));
     // A MODULE-attribute read (`socket.AF_INET` — a constant) never
     // clones: the root is a module, not a class instance, so the read
     // cannot move anything a later read needs (round 99).
@@ -2371,6 +2441,9 @@ pub fn render_typed_reused(
                         return Ok(quote!(Some(Clone::clone(&(#raw)))));
                     }
                     return Ok(quote!(Some((#raw).clone())));
+                }
+                if box_wrapped {
+                    return Ok(quote!(stdpython::PyValue::from((#raw).clone())));
                 }
                 if matches!(t, TypeInfo::Class(_)) {
                     return Ok(quote!(Clone::clone(&(#tokens))));

@@ -160,7 +160,12 @@ fn encode_with_errors<S: AsRef<str>>(
 
 /// bytes.decode(name) with a RUNTIME codec name (a parameter, not a
 /// literal): dispatch on the name string, like CPython's codec registry.
-pub fn decode_by_name<N: AsRef<str>>(b: &[u8], name: N) -> Result<String, PyException> {
+pub fn decode_by_name<B: DecodeSource + ?Sized, N: AsRef<str>>(
+    b: &B,
+    name: N,
+) -> Result<String, PyException> {
+    let b = b.decode_source()?;
+    let b: &[u8] = &b;
     match name.as_ref() {
         "utf-8" | "utf8" => decode_utf8(b),
         "ascii" => decode_ascii(b),
@@ -438,4 +443,54 @@ pub fn encode_latin1<S: AsRef<str>>(s: S) -> Result<Vec<u8>, PyException> {
         out.push(cp as u8);
     }
     Ok(out)
+}
+
+/// What `str(x, encoding)` decodes: bytes, or a boxed value holding bytes
+/// (idna's `s = str(s, "ascii")` on a `str | bytes` union narrowed away
+/// from str). A str member is CPython's `TypeError: decoding str is not
+/// supported`; any other member its "need a bytes-like object" TypeError.
+pub trait DecodeSource {
+    fn decode_source(&self) -> Result<alloc::borrow::Cow<'_, [u8]>, PyException>;
+}
+
+impl DecodeSource for [u8] {
+    fn decode_source(&self) -> Result<alloc::borrow::Cow<'_, [u8]>, PyException> {
+        Ok(alloc::borrow::Cow::Borrowed(self))
+    }
+}
+
+impl DecodeSource for Vec<u8> {
+    fn decode_source(&self) -> Result<alloc::borrow::Cow<'_, [u8]>, PyException> {
+        Ok(alloc::borrow::Cow::Borrowed(self.as_slice()))
+    }
+}
+
+impl<const N: usize> DecodeSource for [u8; N] {
+    fn decode_source(&self) -> Result<alloc::borrow::Cow<'_, [u8]>, PyException> {
+        Ok(alloc::borrow::Cow::Borrowed(self.as_slice()))
+    }
+}
+
+impl<T: DecodeSource + ?Sized> DecodeSource for &T {
+    fn decode_source(&self) -> Result<alloc::borrow::Cow<'_, [u8]>, PyException> {
+        (**self).decode_source()
+    }
+}
+
+impl DecodeSource for crate::PyValue {
+    fn decode_source(&self) -> Result<alloc::borrow::Cow<'_, [u8]>, PyException> {
+        match self {
+            crate::PyValue::Bytes(b) => Ok(alloc::borrow::Cow::Borrowed(b.as_slice())),
+            crate::PyValue::Str(_) => {
+                Err(PyException::new("TypeError", "decoding str is not supported"))
+            }
+            other => Err(PyException::new(
+                "TypeError",
+                alloc::format!(
+                    "decoding to str: need a bytes-like object, {} found",
+                    other.py_type_name()
+                ),
+            )),
+        }
+    }
 }

@@ -564,6 +564,66 @@ pub fn split<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
     // Compile FIRST: Python validates the pattern before consulting
     // maxsplit, so a bad pattern raises even when no split would occur.
     let re = compile(pattern.as_ref(), flags)?;
+    split_on(&re, text, maxsplit)
+}
+
+/// The text a compiled pattern's `split` takes (`_unicode_dots_re.split(s)`
+/// — idna, where `s` may be a boxed `str | bytes`): a str, or a boxed
+/// value holding one; anything else is CPython's TypeError.
+pub trait ReText {
+    fn re_text(&self) -> Result<String, PyException>;
+}
+
+impl ReText for str {
+    fn re_text(&self) -> Result<String, PyException> {
+        Ok(self.to_string())
+    }
+}
+
+impl ReText for String {
+    fn re_text(&self) -> Result<String, PyException> {
+        Ok(self.clone())
+    }
+}
+
+impl<T: ReText + ?Sized> ReText for &T {
+    fn re_text(&self) -> Result<String, PyException> {
+        (**self).re_text()
+    }
+}
+
+impl ReText for crate::PyValue {
+    fn re_text(&self) -> Result<String, PyException> {
+        match self {
+            crate::PyValue::Str(s) => Ok(s.clone()),
+            crate::PyValue::Bytes(_) => Err(PyException::new(
+                "TypeError",
+                "cannot use a string pattern on a bytes-like object",
+            )),
+            other => Err(PyException::new(
+                "TypeError",
+                alloc::format!(
+                    "expected string or bytes-like object, got '{}'",
+                    other.py_type_name()
+                ),
+            )),
+        }
+    }
+}
+
+impl Regex {
+    /// `pattern.split(string, maxsplit=0)` on a COMPILED pattern: the
+    /// same splitting as [`split`], without re-compiling.
+    pub fn py_re_split<S: ReText + ?Sized>(
+        &self,
+        string: &S,
+        maxsplit: i64,
+    ) -> Result<Vec<String>, PyException> {
+        split_on(&self.re, &string.re_text()?, maxsplit)
+    }
+}
+
+fn split_on(re: &regex::Regex, text: &str, maxsplit: i64) -> Result<Vec<String>, PyException> {
     if maxsplit < 0 {
         return Ok(alloc::vec![text.to_string()]);
     }

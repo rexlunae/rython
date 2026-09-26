@@ -25336,3 +25336,34 @@ fn a_narrowed_boxed_tuple_reads_as_a_py_tuple() {
     );
     assert!(out.contains("stdpython :: PyTuple ((x) . as_tuple () . unwrap () . clone ())"), "{}", out);
 }
+
+#[test]
+fn a_tuple_literal_returned_into_a_fixed_tuple_renders_each_member_against_its_slot() {
+    // idna's codec: `return "", 0` from a `-> Tuple[str, int]` function —
+    // the str literal owns itself where the slot holds a String.
+    let out = compile(
+        "from typing import Tuple\n\n\
+         def dec(data: str) -> Tuple[str, int]:\n\
+         \x20   if not data:\n\
+         \x20       return \"\", 0\n\
+         \x20   return data, len(data)\n",
+        "rt.py",
+    );
+    assert!(out.contains("return Ok (((\"\") . to_string () , 0))"), "{}", out);
+}
+
+#[test]
+fn a_reused_name_boxed_into_a_parameter_clones_the_read() {
+    // idna's codec: `return encode(data), len(data)` where encode's
+    // parameter is a boxed union — the box must not consume `data` before
+    // the later read; the clone belongs to the read inside the box.
+    let out = compile(
+        "from typing import Tuple, Union\n\n\
+         def size(s: Union[str, bytes, int]) -> int:\n\
+         \x20   return 1\n\n\
+         def both(data: str) -> Tuple[int, int]:\n\
+         \x20   return size(data), len(data)\n",
+        "boxmove.py",
+    );
+    assert!(out.contains("size (stdpython :: PyValue :: from ((data) . clone ()))"), "{}", out);
+}

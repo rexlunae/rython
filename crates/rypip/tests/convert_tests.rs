@@ -17530,3 +17530,210 @@ fn variable_length_tuples_print_as_tuples() {
         vec!["(3, 4) 2 3 4 (4,) [3, 4]", "(2, 9) True 6", "('b', 'c') ('a',) (6, 7, 8) (5,)", "('x', 'y') ()", "(1, 'x')", "()", "2 0", "(1, 'a') 2"]
     );
 }
+
+#[test]
+fn optional_probes_and_string_enumeration_match_cpython() {
+    // Issue #334 (idna's valid_contextj): `jt in [..]` / `jt not in [..]`
+    // where jt is a `dict.get` result — None is never a member — and
+    // `enumerate(s)` / `enumerate(s, 1)` over a str.
+    let scratch = Scratch::new("optprobe");
+    let krate = package_crate(
+        &scratch,
+        "optprobe",
+        &[(
+            "cli.py",
+            concat!(
+                "from typing import Dict\n",
+                "\n",
+                "\n",
+                "TABLE: Dict[int, int] = {65: 84, 66: 76}\n",
+                "\n",
+                "\n",
+                "def kind(c: str) -> str:\n",
+                "    jt = TABLE.get(ord(c))\n",
+                "    if jt == ord(\"T\"):\n",
+                "        return \"T\"\n",
+                "    if jt in [ord(\"L\"), ord(\"D\")]:\n",
+                "        return \"L\"\n",
+                "    if jt not in [ord(\"L\")]:\n",
+                "        return \"none\"\n",
+                "    return \"never\"\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    for i, ch in enumerate(\"ABC\"):\n",
+                "        print(i, ch, kind(ch))\n",
+                "    for i, ch in enumerate(\"xy\", 1):\n",
+                "        print(i, ch)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "optprobe"),
+        vec!["0 A T", "1 B L", "2 C none", "1 x", "2 y"]
+    );
+}
+
+#[test]
+fn a_literal_table_read_from_another_module_is_typed() {
+    // Issue #334 (idna's core.py reading `idnadata.joining_types`): a
+    // module-level literal table read from ANOTHER module — through the
+    // module or imported by name — has the defining module's type, so a
+    // `.get(...)` result is the Option it is and compares as CPython
+    // does, and a read through the module deref-clones the static.
+    let scratch = Scratch::new("xmodtable");
+    let krate = package_crate(
+        &scratch,
+        "xmod",
+        &[
+            (
+                "data.py",
+                concat!(
+                    "TABLE = {65: 84, 66: 76, 68: 68}\n",
+                    "WORDS = [\"alpha\", \"beta\"]\n",
+                ),
+            ),
+            (
+                "core.py",
+                concat!(
+                    "from . import data\n",
+                    "from .data import WORDS\n",
+                    "\n",
+                    "\n",
+                    "def kind(c: str) -> str:\n",
+                    "    jt = data.TABLE.get(ord(c))\n",
+                    "    if jt == ord(\"T\"):\n",
+                    "        return \"T\"\n",
+                    "    if jt in [ord(\"L\"), ord(\"D\")]:\n",
+                    "        return \"L/D\"\n",
+                    "    return \"none\"\n",
+                    "\n",
+                    "\n",
+                    "def run() -> None:\n",
+                    "    for ch in \"ABCD\":\n",
+                    "        print(ch, kind(ch))\n",
+                    "    print(WORDS, len(data.WORDS), data.TABLE)\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .core import run\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    run()\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "xmod"),
+        vec!["A T", "B L/D", "C none", "D L/D", "['alpha', 'beta'] 2 {65: 84, 66: 76, 68: 68}"]
+    );
+}
+
+#[test]
+fn a_compiled_pattern_splits_as_a_regex() {
+    // Issue #334 (idna's `_unicode_dots_re.split(s)`): a compiled
+    // pattern's split is the regex split — maxsplit included — and a
+    // bytes text is CPython's TypeError.
+    let scratch = Scratch::new("resplit");
+    let krate = package_crate(
+        &scratch,
+        "resplit",
+        &[(
+            "cli.py",
+            concat!(
+                "import re\n",
+                "from typing import Any, List\n",
+                "\n",
+                "_dots = re.compile(\"[.\u3002]\")\n",
+                "\n",
+                "\n",
+                "def labels(s: Any) -> List[str]:\n",
+                "    return _dots.split(s)\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    print(_dots.split(\"a.b\u3002c\"), _dots.split(\"a.b.c\", 1), _dots.split(\"\"))\n",
+                "    print(labels(\"x.y\"))\n",
+                "    try:\n",
+                "        labels(b\"x.y\")\n",
+                "    except TypeError as e:\n",
+                "        print(\"TypeError\", e)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "resplit"),
+        vec!["['a', 'b', 'c'] ['a', 'b.c'] ['']", "['x', 'y']", "TypeError cannot use a string pattern on a bytes-like object"]
+    );
+}
+
+#[test]
+fn bisect_over_a_table_of_boxed_rows_matches_cpython() {
+    // Issue #334 (idna's uts46_remap): `bisect_left(table, (cp, "Z"))`
+    // over a tuple of mixed-arity rows compares boxed tuples with CPython's
+    // `<`, and the row's members read back as the str they are.
+    let scratch = Scratch::new("boxbis");
+    let krate = package_crate(
+        &scratch,
+        "boxbis",
+        &[(
+            "cli.py",
+            concat!(
+                "import bisect\n",
+                "from typing import List, Optional, Tuple, Union\n",
+                "\n",
+                "\n",
+                "def _seg() -> List[Union[Tuple[int, str], Tuple[int, str, str]]]:\n",
+                "    return [(0, \"3\"), (65, \"M\", \"a\"), (91, \"V\"), (300, \"X\")]\n",
+                "\n",
+                "\n",
+                "table = tuple(_seg())\n",
+                "\n",
+                "\n",
+                "def remap(text: str) -> str:\n",
+                "    out = \"\"\n",
+                "    for ch in text:\n",
+                "        cp = ord(ch)\n",
+                "        row = table[bisect.bisect_left(table, (cp, \"Z\")) - 1]\n",
+                "        status = row[1]\n",
+                "        replacement: Optional[str] = None\n",
+                "        if len(row) == 3:\n",
+                "            replacement = row[2]\n",
+                "        if status == \"M\" and replacement is not None:\n",
+                "            out += replacement\n",
+                "        else:\n",
+                "            out += ch\n",
+                "    return out\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    print(remap(\"ABz!\"), bisect.bisect_right(table, (91, \"V\")), bisect.bisect_left(table, (91,)))\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "boxbis"), vec!["aaz! 3 2"]);
+}

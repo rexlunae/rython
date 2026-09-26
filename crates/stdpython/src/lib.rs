@@ -1388,8 +1388,12 @@ pub fn any<T: Truthy, I: IntoIterator<Item = T>>(iterable: I) -> bool {
 /// Python enumerate() function - returns iterator with index and value
 /// pairs. The index is an i64 because Python's is an int, and generated
 /// arithmetic on it must not need casts.
-pub fn enumerate<T>(iterable: Vec<T>) -> Vec<(i64, T)> {
+///
+/// Any materializable iterable — a list, a tuple, a str (one-character
+/// strings), a range.
+pub fn enumerate<I: PyListFrom>(iterable: I) -> Vec<(i64, I::Item)> {
     iterable
+        .py_list()
         .into_iter()
         .enumerate()
         .map(|(i, x)| (i as i64, x))
@@ -1397,8 +1401,9 @@ pub fn enumerate<T>(iterable: Vec<T>) -> Vec<(i64, T)> {
 }
 
 /// Python enumerate(iterable, start=n).
-pub fn enumerate_start<T>(iterable: Vec<T>, start: i64) -> Vec<(i64, T)> {
+pub fn enumerate_start<I: PyListFrom>(iterable: I, start: i64) -> Vec<(i64, I::Item)> {
     iterable
+        .py_list()
         .into_iter()
         .enumerate()
         .map(|(i, x)| (start + i as i64, x))
@@ -2116,22 +2121,39 @@ impl<T: PyRepr> PyRepr for Vec<T> {
 // Python tuples: ('a', 1). Rust tuples back m.span() and the
 // findall2/findall3 result shapes; str(tuple) is repr(tuple), elements
 // included, so PyDisplay defers to PyRepr.
-impl<A: PyRepr, B: PyRepr> PyRepr for (A, B) {
-    fn py_repr(&self) -> String {
-        format!("({}, {})", self.0.py_repr(), self.1.py_repr())
-    }
-}
+// Every arity up to eight; a 1-tuple keeps CPython's trailing comma,
+// `(7,)`.
+macro_rules! tuple_repr {
+    ($($name:ident . $idx:tt),+) => {
+        impl<$($name: PyRepr),+> PyRepr for ($($name,)+) {
+            fn py_repr(&self) -> String {
+                let items: [String; tuple_repr!(@count $($name)+)] =
+                    [$(self.$idx.py_repr()),+];
+                if items.len() == 1 {
+                    format!("({},)", items[0])
+                } else {
+                    format!("({})", items.join(", "))
+                }
+            }
+        }
 
-impl<A: PyRepr, B: PyRepr, C: PyRepr> PyRepr for (A, B, C) {
-    fn py_repr(&self) -> String {
-        format!(
-            "({}, {}, {})",
-            self.0.py_repr(),
-            self.1.py_repr(),
-            self.2.py_repr()
-        )
-    }
+        impl<$($name: PyRepr),+> PyDisplay for ($($name,)+) {
+            fn py_display(&self) -> String {
+                self.py_repr()
+            }
+        }
+    };
+    (@count $($name:ident)+) => { <[()]>::len(&[$(tuple_repr!(@unit $name)),+]) };
+    (@unit $name:ident) => { () };
 }
+tuple_repr!(A.0);
+tuple_repr!(A.0, B.1);
+tuple_repr!(A.0, B.1, C.2);
+tuple_repr!(A.0, B.1, C.2, D.3);
+tuple_repr!(A.0, B.1, C.2, D.3, E.4);
+tuple_repr!(A.0, B.1, C.2, D.3, E.4, F.5);
+tuple_repr!(A.0, B.1, C.2, D.3, E.4, F.5, G.6);
+tuple_repr!(A.0, B.1, C.2, D.3, E.4, F.5, G.6, H.7);
 
 /// Python dict repr: `{'a': 1, 'b': 2}` — keys AND values both render
 /// with repr, and insertion order is preserved (IndexMap matches
@@ -2152,18 +2174,6 @@ impl<K: PyRepr, V: PyRepr> PyRepr for PyDict<K, V> {
 }
 
 impl<K: PyRepr, V: PyRepr> PyDisplay for PyDict<K, V> {
-    fn py_display(&self) -> String {
-        self.py_repr()
-    }
-}
-
-impl<A: PyRepr, B: PyRepr> PyDisplay for (A, B) {
-    fn py_display(&self) -> String {
-        self.py_repr()
-    }
-}
-
-impl<A: PyRepr, B: PyRepr, C: PyRepr> PyDisplay for (A, B, C) {
     fn py_display(&self) -> String {
         self.py_repr()
     }
@@ -2808,6 +2818,16 @@ impl IntoIterator for PyValue {
     }
 }
 
+/// `list(v)` / `enumerate(v)` of a boxed value: its members as Python
+/// iterates them (a str's characters, a bytes' ints, a tuple's members,
+/// a dict's keys) — the non-iterables raise CPython's TypeError.
+impl PyListFrom for PyValue {
+    type Item = PyValue;
+    fn py_list(self) -> Vec<PyValue> {
+        self.into_iter().collect()
+    }
+}
+
 impl PyValue {
     pub fn is_int(&self) -> bool {
         matches!(self, PyValue::Int(_))
@@ -3172,6 +3192,46 @@ impl From<()> for PyValue {
 }
 
 impl PyValue {
+    /// CPython's `<` between two boxed values: numbers on the numeric tower
+    /// (bool ⊂ int ⊂ float; a NaN compares False both ways), a str or a
+    /// bytes lexicographically (a str by code point — UTF-8's byte order),
+    /// a tuple lexicographically by its first unequal member, then by
+    /// length. Any other pair is CPython's TypeError (issue #334: idna's
+    /// `bisect_left(uts46data, (code_point, "Z"))` over boxed rows).
+    pub fn py_lt_boxed(&self, other: &PyValue) -> Result<bool, PyException> {
+        use PyValue as V;
+        let num = |v: &PyValue| match v {
+            V::Int(i) => Some(*i as f64),
+            V::Bool(b) => Some(*b as i64 as f64),
+            V::Float(f) => Some(*f),
+            _ => None,
+        };
+        match (self, other) {
+            (V::Int(a), V::Int(b)) => Ok(a < b),
+            (V::Str(a), V::Str(b)) => Ok(a < b),
+            (V::Bytes(a), V::Bytes(b)) => Ok(a < b),
+            (V::Tuple(a), V::Tuple(b)) => {
+                for (x, y) in a.iter().zip(b.iter()) {
+                    if x != y {
+                        return x.py_lt_boxed(y);
+                    }
+                }
+                Ok(a.len() < b.len())
+            }
+            (a, b) => match (num(a), num(b)) {
+                (Some(x), Some(y)) => Ok(x < y),
+                _ => Err(PyException::new(
+                    "TypeError",
+                    format!(
+                        "'<' not supported between instances of '{}' and '{}'",
+                        a.py_type_name(),
+                        b.py_type_name()
+                    ),
+                )),
+            },
+        }
+    }
+
     /// The Python type name of the boxed member, for CPython-shaped
     /// operator error messages.
     pub fn py_type_name(&self) -> &'static str {
@@ -3725,24 +3785,54 @@ impl IntoBytesLike for StrOrBytes {
     }
 }
 
+/// A bytes argument to a bytes method: bytes by value or by reference —
+/// never a str (`AsRef<[u8]>` would admit one, where CPython raises
+/// TypeError).
+pub trait BytesArg {
+    fn bytes_arg(&self) -> &[u8];
+}
+impl BytesArg for [u8] {
+    fn bytes_arg(&self) -> &[u8] {
+        self
+    }
+}
+impl BytesArg for Vec<u8> {
+    fn bytes_arg(&self) -> &[u8] {
+        self
+    }
+}
+impl<const N: usize> BytesArg for [u8; N] {
+    fn bytes_arg(&self) -> &[u8] {
+        self
+    }
+}
+impl<T: BytesArg + ?Sized> BytesArg for &T {
+    fn bytes_arg(&self) -> &[u8] {
+        (**self).bytes_arg()
+    }
+}
+
 /// Python bytes methods that a narrowed `str | bytes` union exercises
 /// (idna's A-label handling: lower/startswith/endswith/isascii). ASCII
 /// byte-wise semantics, matching Python's bytes methods.
 pub trait PyBytesOps {
     fn lower(&self) -> Vec<u8>;
-    fn startswith(&self, prefix: &[u8]) -> bool;
-    fn endswith(&self, suffix: &[u8]) -> bool;
+    /// The prefix by value or by reference (`b.startswith(prefix)` where
+    /// the prefix is a bytes local or a static's clone — idna's alabel).
+    /// Bytes only: a str prefix is CPython's TypeError, loud in rustc.
+    fn startswith<P: BytesArg>(&self, prefix: P) -> bool;
+    fn endswith<P: BytesArg>(&self, suffix: P) -> bool;
     fn isascii(&self) -> bool;
 }
 impl PyBytesOps for Vec<u8> {
     fn lower(&self) -> Vec<u8> {
         self.iter().map(|b| b.to_ascii_lowercase()).collect()
     }
-    fn startswith(&self, prefix: &[u8]) -> bool {
-        self.starts_with(prefix)
+    fn startswith<P: BytesArg>(&self, prefix: P) -> bool {
+        self.starts_with(prefix.bytes_arg())
     }
-    fn endswith(&self, suffix: &[u8]) -> bool {
-        self.ends_with(suffix)
+    fn endswith<P: BytesArg>(&self, suffix: P) -> bool {
+        self.ends_with(suffix.bytes_arg())
     }
     fn isascii(&self) -> bool {
         self.iter().all(|b| b.is_ascii())
@@ -4854,9 +4944,9 @@ fn single_fill_char(fill: &str) -> Result<char, PyException> {
 /// the subscript read yields PyValue, and the runtime member is a str in
 /// practice). CPython dispatches on the runtime type; a non-str member
 /// raises AttributeError, which the loud §12.2 panic mirrors with
-/// CPython's message. A separate trait: the blanket `PyStrOps for T:
-/// AsRef<str>` cannot be narrowed to PyValue without a coherence
-/// conflict, and PyValue does not satisfy AsRef<str>.
+/// CPython's message. These keep CPython's AttributeError text; the rest
+/// of the str surface reaches a boxed value through its `AsRef<str>`
+/// (the str member, a TypeError panic otherwise — issue #334).
 pub trait PyBoxedStrOps {
     /// str.lower() on the runtime member.
     fn py_boxed_lower(&self) -> String;
@@ -6229,6 +6319,34 @@ string_add!(
     &str, str,
     str, str,
 );
+
+/// `str + boxed` (idna's uts46_remap: `output += replacement` where the
+/// replacement is a member of a heterogeneous table row): the boxed str
+/// member concatenates; any other member is CPython's TypeError, raised
+/// as the loud §12.2 panic (the operator surface is infallible).
+macro_rules! string_add_boxed {
+    ($($l:ty),* $(,)?) => {
+        $(impl PyAdd<PyValue> for $l {
+            type Output = String;
+            fn py_add(&self, rhs: &PyValue) -> String {
+                match rhs {
+                    PyValue::Str(s) => format!("{}{}", self, s),
+                    other => panic!(
+                        "{}",
+                        PyException::new(
+                            "TypeError",
+                            format!(
+                                "can only concatenate str (not \"{}\") to str",
+                                other.py_type_name()
+                            )
+                        )
+                    ),
+                }
+            }
+        })*
+    };
+}
+string_add_boxed!(String, &str, str);
 
 /// `+` on a maybe-None value: Python raises TypeError at runtime when the
 /// value actually is None, and proceeds when it holds one. The panic
@@ -9300,20 +9418,44 @@ mod pyvalue_round21_tests {
 
 /// Python's `sep.join(parts)` for BYTES (`b"".join(data_parts)` —
 /// urllib3's chunked response assembly): concatenate the byte slices
-/// with the separator between them. A str element would be CPython's
-/// TypeError — the typed signature (Vec<Vec<u8>>) makes a str element a
-/// loud build error instead.
-pub fn bytes_join(sep: &[u8], parts: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(
-        parts.iter().map(Vec::len).sum::<usize>() + sep.len().saturating_mul(parts.len().saturating_sub(1)),
-    );
+/// with the separator between them. A str element is CPython's
+/// TypeError: a loud build error for a typed list (`Vec<String>` is no
+/// [`BytesJoinItem`]), the raised TypeError for a boxed member.
+pub fn bytes_join<P: BytesJoinItem>(sep: &[u8], parts: &[P]) -> Result<Vec<u8>, PyException> {
+    let mut out = Vec::new();
     for (i, part) in parts.iter().enumerate() {
         if i > 0 {
             out.extend_from_slice(sep);
         }
-        out.extend_from_slice(part);
+        out.extend_from_slice(part.join_bytes(i)?);
     }
-    out
+    Ok(out)
+}
+
+/// An element `bytes.join` accepts: bytes, or a boxed value holding
+/// bytes (idna's `b".".join(result)` over a list of boxed labels).
+pub trait BytesJoinItem {
+    fn join_bytes(&self, index: usize) -> Result<&[u8], PyException>;
+}
+impl BytesJoinItem for Vec<u8> {
+    fn join_bytes(&self, _index: usize) -> Result<&[u8], PyException> {
+        Ok(self)
+    }
+}
+impl BytesJoinItem for PyValue {
+    fn join_bytes(&self, index: usize) -> Result<&[u8], PyException> {
+        match self {
+            PyValue::Bytes(b) => Ok(b),
+            other => Err(PyException::new(
+                "TypeError",
+                format!(
+                    "sequence item {}: expected a bytes-like object, {} found",
+                    index,
+                    other.py_type_name()
+                ),
+            )),
+        }
+    }
 }
 
 /// Python's `list.extend(x)` where x is a BOXED value (a boxed tuple of
@@ -9534,5 +9676,22 @@ mod py_format_g_tests {
         assert_eq!(py_format_g(1234.5, 3), "1.23e+03");
         assert_eq!(py_format_g(f64::INFINITY, 6), "inf");
         assert_eq!(py_format_g(f64::NAN, 6), "nan");
+    }
+}
+
+/// A boxed value read as a str (issue #334: idna's `s` after `if not
+/// isinstance(s, str): s = str(s, "ascii")` — the name stays the boxed
+/// `str | bytes` union, and every str operation on it reads the str
+/// member). A non-str member is CPython's TypeError at the operation,
+/// raised as a panic here: the str surface's signatures are infallible.
+impl AsRef<str> for PyValue {
+    fn as_ref(&self) -> &str {
+        match self {
+            PyValue::Str(s) => s.as_str(),
+            other => panic!(
+                "TypeError: expected str, got '{}' (a boxed value used as a str)",
+                other.py_type_name()
+            ),
+        }
     }
 }

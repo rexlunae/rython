@@ -6358,6 +6358,29 @@ impl<'a> CodeGen for Call {
                             Some(h) => quote!(Some(#h)),
                             None => quote!(None),
                         };
+                        // A BOXED sequence (idna's `uts46data`) searches
+                        // with the boxed `<` (the runtime's BisectSeq);
+                        // the probe boxes too.
+                        let seq_ty =
+                            crate::infer_type(Some(&ctx), &self.args[0], &options, &symbols);
+                        if !fname.starts_with("insort")
+                            && (matches!(seq_ty, crate::TypeInfo::PyValue)
+                                || matches!(
+                                    &seq_ty,
+                                    crate::TypeInfo::Vec(e) | crate::TypeInfo::PyTuple(e)
+                                        if matches!(**e, crate::TypeInfo::PyValue)
+                                ))
+                        {
+                            let x = crate::render_typed(
+                                &self.args[1],
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(crate::TypeInfo::PyValue),
+                            )?;
+                            let p = qual(&fname);
+                            return Ok(quote!(#p(&(#a), &(#x), #lo, #hi)?));
+                        }
                         // The probe takes the sequence's element type (a
                         // str literal into a list of str owns itself).
                         let x = match crate::infer_type(Some(&ctx), &self.args[0], &options, &symbols) {
@@ -8418,6 +8441,55 @@ let mutating_self_field = boxed_self_ref_receiver
                 return Ok(quote!(stdpython::PyValue::None_));
             }
 
+            // A COMPILED PATTERN's split (`_unicode_dots_re.split(s)` —
+            // idna): the regex split, never the str method. The text may
+            // be a boxed `str | bytes` value (CPython's TypeError on bytes).
+            if attr.attr == "split"
+                && crate::ast::tree::call::is_compiled_regex_expr(&attr.value, &symbols, &options)
+            {
+                let mut text = self.args.first().cloned();
+                let mut maxsplit = self.args.get(1).cloned();
+                if self.args.len() > 2 {
+                    return Err(format!(
+                        "split() takes at most 2 arguments ({} given)",
+                        self.args.len()
+                    )
+                    .into());
+                }
+                for kw in &self.keywords {
+                    let slot = match kw.arg.as_deref() {
+                        Some("string") => &mut text,
+                        Some("maxsplit") => &mut maxsplit,
+                        other => {
+                            return Err(format!(
+                                "split() got an unexpected keyword argument '{}'",
+                                other.unwrap_or("**kwargs")
+                            )
+                            .into());
+                        }
+                    };
+                    if slot.is_some() {
+                        return Err(format!(
+                            "split() got multiple values for argument '{}'",
+                            kw.arg.as_deref().unwrap_or_default()
+                        )
+                        .into());
+                    }
+                    *slot = Some(kw.value.clone());
+                }
+                let Some(text) = text else {
+                    return Err("split() missing required argument 'string' (pos 1)"
+                        .to_string()
+                        .into());
+                };
+                let text = text.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                let maxsplit = match maxsplit {
+                    Some(m) => m.to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+                    None => quote!(0),
+                };
+                return Ok(quote!((#receiver).py_re_split(&(#text), #maxsplit)?));
+            }
+
             // str.split / str.rsplit take sep and maxsplit by position or
             // keyword, with sep=None (or absent) meaning whitespace mode.
             // Normalized here so every spelling maps to the right runtime
@@ -8985,7 +9057,7 @@ let mutating_self_field = boxed_self_ref_receiver
                                 let runtime = crate::safe_ident(&options.stdpython);
                                 if errors == "strict" {
                                     return Ok(quote!(
-                                        #runtime::stdlib::codec::encode_ascii(#receiver)?
+                                        #runtime::stdlib::codec::encode_ascii(&(#receiver))?
                                     ));
                                 }
                                 return Ok(quote!(
@@ -9145,7 +9217,7 @@ let mutating_self_field = boxed_self_ref_receiver
                         ) =>
                     {
                         let runtime = crate::safe_ident(&options.stdpython);
-                        return Ok(quote!(#runtime::bytes_join(&(#receiver), &(#parts))));
+                        return Ok(quote!(#runtime::bytes_join(&(#receiver), &(#parts))?));
                     }
                     // list.pop() returns the last element or raises IndexError
                     // (Vec::pop returns an Option). A GENERIC receiver (an

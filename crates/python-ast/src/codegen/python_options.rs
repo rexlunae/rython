@@ -759,6 +759,17 @@ pub struct PythonOptionsData {
     /// conversions (empty `module_defs`) never touch it.
     pub module_promoted_statics:
         std::rc::Rc<std::cell::RefCell<std::collections::HashMap<Vec<String>, std::rc::Rc<std::collections::HashSet<String>>>>>,
+
+    /// Lazily-computed types of module-level literal tables READ FROM
+    /// ANOTHER crate module (`idnadata.joining_types.get(cp)` in idna's
+    /// core.py), keyed by (defining module path, name): see
+    /// `module::crate_module_static_type`. Per-module conversions (empty
+    /// `module_defs`) never touch it.
+    pub cross_module_static_types: std::rc::Rc<
+        std::cell::RefCell<
+            std::collections::HashMap<(Vec<String>, String), Option<crate::TypeInfo>>,
+        >,
+    >,
 }
 
 impl Default for PythonOptionsData {
@@ -859,6 +870,9 @@ impl Default for PythonOptionsData {
                 CrossModuleClasses::Uncomputed,
             )),
             module_promoted_statics: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            )),
+            cross_module_static_types: std::rc::Rc::new(std::cell::RefCell::new(
                 std::collections::HashMap::new(),
             )),
         }
