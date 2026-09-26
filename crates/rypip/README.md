@@ -45,9 +45,14 @@ itself resolves them**:
   `package-dir`, `[tool.setuptools.packages.find]` with `where`).
 - **`setup.cfg`** — `[metadata]` and `[options]` (packages, py_modules,
   install_requires, `[options.packages.find]`).
-- **`setup.py`** — executed through a `python3` shim (pip-style) that
-  records the `setup(...)` call without running setuptools; a static
-  parser falls back when no interpreter is available.
+- **`setup.py`** — read statically first: the literal keywords of the
+  `setup(...)` call (`name`, `version`, `install_requires`, `packages`
+  including a bare `find_packages()`, `py_modules`, `package_dir`). A
+  computed value (`version=__version__`, `setup(**kwargs)`) is never
+  guessed; the file is then executed through a `python3` shim that records
+  the `setup(...)` call without running setuptools, **only** when
+  `RYPIP_ALLOW_SETUP_PY_EXEC=1` is set (it runs the sdist's own code).
+  Otherwise a note names the keyword that stopped the static read.
 
 `find_packages()` / `[tool.setuptools.packages.find]` discover packages
 recursively (skipping hidden and underscore-prefixed directories), and both
