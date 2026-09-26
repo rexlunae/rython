@@ -17953,3 +17953,98 @@ fn optional_callable_parameters_match_cpython() {
     // Verified against python3.
     assert_eq!(run_package(&krate, "optcallable"), vec!["HI! hi?"]);
 }
+
+#[test]
+fn entry_module_imports_sibling_module_relatively() {
+    // The entry `cli.py` doing `from . import data`: the bin's copy of the
+    // entry is the bin crate root, which declares `pub mod data;` itself,
+    // so the relative import must not also emit `pub use crate::data;`
+    // there (E0255 — defined multiple times). The lib's `crate::cli` copy
+    // keeps the use; an `as d` alias is a new name and keeps it in both.
+    let scratch = Scratch::new("siblingmod");
+    let krate = package_crate(
+        &scratch,
+        "siblingmod",
+        &[
+            ("data.py", "TABLE = {65: 84, 66: 85}\n"),
+            (
+                "cli.py",
+                concat!(
+                    "from . import data\n",
+                    "from . import data as d\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(data.TABLE.get(65))\n",
+                    "    print(d.TABLE[66], len(data.TABLE))\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "siblingmod"), vec!["84", "85 2"]);
+}
+
+#[test]
+fn duck_traits_are_generated_per_module() {
+    // Two modules each bounding a parameter on `.speak()`: each needs its
+    // own `HasSpeak` (the trait is emitted into the module that uses it).
+    // The "already generated" set leaked across modules, so the second
+    // module named a trait it never defined (E0405).
+    let scratch = Scratch::new("duckpermod");
+    let krate = package_crate(
+        &scratch,
+        "duckpermod",
+        &[
+            (
+                "zoo.py",
+                concat!(
+                    "class Dog:\n",
+                    "    def speak(self) -> str:\n",
+                    "        return \"woof\"\n",
+                    "\n",
+                    "class Cat:\n",
+                    "    def speak(self) -> str:\n",
+                    "        return \"meow\"\n",
+                    "\n",
+                    "def hear(animal):\n",
+                    "    return animal.speak()\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .zoo import hear, Dog\n",
+                    "\n",
+                    "class Bird:\n",
+                    "    def speak(self) -> str:\n",
+                    "        return \"tweet\"\n",
+                    "\n",
+                    "class Fish:\n",
+                    "    def speak(self) -> str:\n",
+                    "        return \"blub\"\n",
+                    "\n",
+                    "def praise(animal):\n",
+                    "    return \"nice \" + animal.speak()\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(hear(Dog()))\n",
+                    "    print(praise(Bird()))\n",
+                    "    print(praise(Fish()))\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "duckpermod"),
+        vec!["woof", "nice tweet", "nice blub"]
+    );
+}
