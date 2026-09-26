@@ -1592,8 +1592,15 @@ pub(crate) fn tuple_call_element(
         return None;
     }
     match infer_type(ctx, &call.args[0], options, symbols) {
+        // Boxed members keep the boxed factory: `PyValue::from(xs)` is
+        // already a tuple that prints as one (PyValue::Tuple), and a
+        // function returning it stays typed as the boxed value its callers
+        // see (botocore's `return tuple(retryable)` into an unannotated
+        // `__init__` parameter).
         TypeInfo::Vec(e) | TypeInfo::PyTuple(e)
-            if !type_mentions_pyobject(&e) && !matches!(*e, TypeInfo::StrRef) =>
+            if !type_mentions_pyobject(&e)
+                && !type_contains_pyvalue(&e)
+                && !matches!(*e, TypeInfo::StrRef) =>
         {
             Some(*e)
         }
