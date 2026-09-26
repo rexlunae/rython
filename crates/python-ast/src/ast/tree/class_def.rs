@@ -3856,16 +3856,15 @@ StatementType::Assign(a)
                     // of literals is a concrete set the boxed PyValue
                     // cannot hold); the PyValue wrap only as a fallback.
                     let ident = crate::class_const_static_ident(&self.name, &n.id);
-                    // A list LITERAL of strings (`names = ["a", "b"]`)
-                    // infers Vec<&'static str>, but the static owns its
-                    // elements: type it Vec<String> and render each
-                    // element owned, so the closure matches the type — the
-                    // module-level static's rule for the same shape
-                    // (round 78).
+                    // A list of strings (`names = ["a", "b"]`, `["x"] +
+                    // ["y"]`) infers Vec<&'static str>, but the static owns
+                    // its elements: type it Vec<String> and render each
+                    // list-literal element owned, so the closure matches
+                    // the type — the module-level static's rule for the
+                    // same shape (round 78).
                     let mut ti = crate::infer_type(Some(&ctx), &a.value, &options, &symbols);
                     let mut value_options = options.clone();
-                    if matches!(&a.value, ExprType::List(_))
-                        && let crate::TypeInfo::Vec(elt) = &ti
+                    if let crate::TypeInfo::Vec(elt) = &ti
                         && matches!(elt.as_ref(), crate::TypeInfo::StrRef | crate::TypeInfo::String)
                     {
                         ti = crate::TypeInfo::Vec(Box::new(crate::TypeInfo::String));
@@ -3945,8 +3944,10 @@ StatementType::Assign(a)
                 // = {...}`, `default_port = port_by_scheme["https"]`, a
                 // method alias `getheaders = getlist`): metadata the struct
                 // cannot express (the class lowers as a plain struct with
-                // its fields). Reads of these attributes fail at rustc —
-                // the documented class-as-value divergence.
+                // its fields). Reads of these attributes are loud: a
+                // `self.name` read fails in rustc, and a read through the
+                // class (`Class.name`, `cls.name`) is a compile_error!
+                // naming the attribute (attribute.rs; issue #417).
                 StatementType::Assign(a)
                     if a.targets.len() == 1
                         && matches!(&a.targets[0], ExprType::Name(_)) => {}
@@ -6822,6 +6823,12 @@ fn class_level_metadata_body(stmts: &[crate::Statement]) -> bool {
 /// `DEFAULT_ALLOWED_METHODS = frozenset(["HEAD", "GET", ...])`.
 pub(crate) fn class_body_computed_constant(value: &crate::ExprType) -> bool {
     match value {
+        // An operator tree over literal-built operands (`["x"] + ["y"]`,
+        // `2 * 3`, `-(1 << 4)`) is as module-state-free as its leaves; left
+        // unpromoted, a class-receiver read of it was the boxed None
+        // (issue #417).
+        ExprType::BinOp(b) => literal_built(&b.left) && literal_built(&b.right),
+        ExprType::UnaryOp(u) => literal_built(&u.operand),
         ExprType::Call(c) => {
             // `frozenset(...)` / `set(...)` / `list(...)` / `tuple(...)`
             // of literal elements (or a dict/list/set literal directly).
@@ -6853,6 +6860,12 @@ pub(crate) fn class_body_computed_constant(value: &crate::ExprType) -> bool {
         }
         _ => false,
     }
+}
+
+/// A literal, or a value built only from literals: an operand of a
+/// promotable operator tree.
+fn literal_built(e: &crate::ExprType) -> bool {
+    expr_is_literal(e) || class_body_computed_constant(e)
 }
 
 fn expr_is_literal(e: &crate::ExprType) -> bool {
