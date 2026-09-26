@@ -5602,6 +5602,97 @@ fn value_returning_main_gets_a_wrapper_entry_point() {
 }
 
 #[test]
+fn module_scope_upper_case_locals_allow_non_snake_case() {
+    // A module global used only at module level lowers to a local of the
+    // init body (`let REG;`), and a `__main__` block's names to locals of
+    // the entry wrapper. UPPER_CASE is PEP 8's spelling for a module
+    // constant, not a weakness in the source, so rustc's non_snake_case
+    // must not fire on rython's rendering of it; a lower-case name gets
+    // no attribute, and a FUNCTION's own UPPER_CASE local keeps the
+    // warning.
+    let out = compile(
+        concat!(
+            "from typing import List\n",
+            "REG: List[int] = [1, 2]\n",
+            "print(REG)\n",
+            "\n",
+            "def f() -> None:\n",
+            "    X = 5\n",
+            "    print(X)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    ITEMS = [1]\n",
+            "    ITEMS.append(2)\n",
+            "    n = len(ITEMS)\n",
+            "    print(ITEMS, n)\n",
+            "    f()\n",
+        ),
+        "modcase.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("#[allow(non_snake_case)]letREG;"),
+        "the init body's UPPER_CASE module name must allow non_snake_case: {}",
+        out
+    );
+    assert!(
+        flat.contains("#[allow(non_snake_case)]letmutITEMS;"),
+        "the __main__ block's UPPER_CASE name must allow non_snake_case: {}",
+        out
+    );
+    assert!(
+        flat.contains("letn;") && !flat.contains("#[allow(non_snake_case)]letn;"),
+        "a snake_case module name gets no attribute: {}",
+        out
+    );
+    assert!(
+        !flat.contains("#[allow(non_snake_case)]letX"),
+        "a function's own UPPER_CASE local keeps the lint: {}",
+        out
+    );
+}
+
+#[test]
+fn lower_case_statics_allow_non_upper_case_globals() {
+    // A lower_case module global or class attribute promoted to a Rust
+    // static/const (`pub static count`) tripped non_upper_case_globals:
+    // Python spells module names lower_case as readily as UPPER_CASE, so
+    // the lint reports rython's rendering, not the source. An UPPER_CASE
+    // name gets no attribute.
+    let out = compile(
+        concat!(
+            "count = 0\n",
+            "LIMIT = 3\n",
+            "\n",
+            "class Cfg:\n",
+            "    retries = 3\n",
+            "    MAX = 9\n",
+            "\n",
+            "def show() -> None:\n",
+            "    print(count + LIMIT + Cfg.retries + Cfg.MAX)\n",
+        ),
+        "lowstat.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("#[allow(non_upper_case_globals)]pubstaticcount:"),
+        "a lower_case module static must allow non_upper_case_globals: {}",
+        out
+    );
+    assert!(
+        flat.contains("#[allow(non_upper_case_globals)]pubconstretries:"),
+        "a lower_case class constant must allow non_upper_case_globals: {}",
+        out
+    );
+    assert!(
+        !flat.contains("#[allow(non_upper_case_globals)]pubstaticLIMIT")
+            && !flat.contains("#[allow(non_upper_case_globals)]pubconstMAX"),
+        "an UPPER_CASE name gets no attribute: {}",
+        out
+    );
+}
+
+#[test]
 fn every_entry_point_allows_dead_code_for_the_lib_copy() {
     // rypip compiles an entry module twice: as the bin root, where `main`
     // is the process entry point, and as a lib submodule (`pub mod br;`),
