@@ -5278,15 +5278,8 @@ pub fn call_return_typeinfo(
                 return Some(TypeInfo::Class(defining));
             }
             let (f, _) = crate::module_function_def(options, path, &defining)?;
-            let def_symbols = module_symbols(options, &path);
-            // An UNANNOTATED imported callee answers from its body, as a
-            // same-module one does (`username, password =
-            // get_auth_from_url(proxy)` — requests' utils function, whose
-            // boxed return the destructure must see).
-            return match f.returns.as_deref() {
-                Some(ann) => resolve_alias_typeinfo(ann, &def_symbols, options),
-                None => f.inferred_return_typeinfo(&def_symbols, options),
-            };
+            let ann = f.returns.as_deref()?;
+            return resolve_alias_typeinfo(ann, &module_symbols(options, &path), options);
         }
         Some(SymbolTableNode::Assign { value, .. }) => {
             // `cached_mess_ratio = lru_cache(...)(mess_ratio)`: resolve the
