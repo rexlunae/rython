@@ -19391,6 +19391,77 @@ fn a_list_of_boxed_values_field_keeps_its_own_methods() {
 }
 
 #[test]
+fn copy_and_len_on_shared_objects_and_containers() {
+    // `len(q)` on a SHARED object (a `PyRef`, held by a parameter and
+    // mutated) is the one object's `__len__`; `dict.copy()` / `list.copy()`
+    // are Python's shallow copies — a later mutation of the original (or
+    // the copy) does not reach the other. An argument pushed and then read
+    // again (`items.append(b)` then `len(b)`) is reuse-cloned.
+    let scratch = Scratch::new("copylen");
+    let file = scratch.path().join("copy_len.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Queue:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items: list[bytes] = []\n",
+            "        self.meta: dict[str, int] = {}\n",
+            "\n",
+            "    def __len__(self) -> int:\n",
+            "        return len(self.items)\n",
+            "\n",
+            "    def put(self, b: bytes) -> None:\n",
+            "        self.items.append(b)\n",
+            "        self.meta[str(len(self.items))] = len(b)\n",
+            "\n",
+            "    def snapshot(self) -> dict[str, int]:\n",
+            "        return self.meta.copy()\n",
+            "\n",
+            "\n",
+            "def fill(q: Queue, n: int) -> None:\n",
+            "    for i in range(n):\n",
+            "        q.put(b\"x\" * (i + 1))\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    q = Queue()\n",
+            "    fill(q, 3)\n",
+            "    snap = q.snapshot()\n",
+            "    q.put(b\"yy\")\n",
+            "    print(len(q), len(snap), len(q.meta))\n",
+            "    xs = [1, 2, 3]\n",
+            "    ys = xs.copy()\n",
+            "    ys.append(4)\n",
+            "    print(len(xs), len(ys), ys)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/copy_len"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "4 3 4",
+            "3 4 [1, 2, 3, 4]",
+        ],
+    );
+}
+
+#[test]
 fn a_mutation_through_a_class_parameter_reaches_the_callers_object() {
     // Issue #414: Python passes objects by reference. A mutation through
     // a class-typed parameter — a field store, an augmented store, a

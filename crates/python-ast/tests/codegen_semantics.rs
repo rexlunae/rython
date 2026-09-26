@@ -22831,13 +22831,14 @@ fn empty_container_pins_its_element_from_the_split_chain() {
     // `out = []` whose element comes from a str-method CHAIN pins
     // Vec<String> — the split/strip/lower returns are in the typed
     // table, so the empty container adopts String and the pushes stay
-    // direct (round 99, text_stats's words()).
+    // unboxed (round 99, text_stats's words()). `w` is read twice, so
+    // the push takes the reuse-clone every call argument takes.
     let out = compile(
         "def words(text: str) -> list[str]:\n    out = []\n    for raw in text.split():\n        w = raw.strip().lower()\n        if w:\n            out.append(w)\n    return out\n",
         "boxedpush.py",
     );
     assert!(
-        out.contains("Vec :: < String > :: new") && out.contains("push (w)"),
+        out.contains("Vec :: < String > :: new") && out.contains("push ((w) . clone ())"),
         "the empty container must pin String from the chain: {}",
         out
     );

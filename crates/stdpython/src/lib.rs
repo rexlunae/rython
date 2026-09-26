@@ -4811,6 +4811,14 @@ impl<T: PyRefTruth> PyBool for PyRef<T> {
     }
 }
 
+/// `len(x)` on a shared instance is the one object's `__len__` (the
+/// converter implements `Len` for every class that defines it).
+impl<T: Len> Len for PyRef<T> {
+    fn len(&self) -> usize {
+        self.borrow().len()
+    }
+}
+
 impl<T> PyIsNone for PyRef<T> {
     fn py_is_none(&self) -> bool {
         false
@@ -5964,6 +5972,38 @@ impl<K: Eq + Hash + Clone, V: Clone> PyDictOps<K, V> for PyDict<K, V> {
         for (k, v) in other {
             self.insert(k, v);
         }
+    }
+}
+
+/// `container.copy()` — Python's SHALLOW copy of a list, dict or set: a
+/// new container holding the same elements. An element that is a shared
+/// object stays the one object (its clone is another reference); every
+/// other element is a value, whose copy is unobservable.
+pub trait PyCopy {
+    fn copy(&self) -> Self;
+}
+
+impl<T: Clone> PyCopy for Vec<T> {
+    fn copy(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl<K: Clone, V: Clone, S: Clone> PyCopy for indexmap::IndexMap<K, V, S> {
+    fn copy(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl<K: Clone, V: Clone, S: Clone> PyCopy for HashMap<K, V, S> {
+    fn copy(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl<T: Clone, S: Clone> PyCopy for HashSet<T, S> {
+    fn copy(&self) -> Self {
+        self.clone()
     }
 }
 

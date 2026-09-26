@@ -8822,23 +8822,18 @@ let mutating_self_field = boxed_self_ref_receiver
                         )?);
                         continue;
                     }
-                    // A CLASS instance or a FIELD read stored into a
-                    // container and read again later (`self.cars.append(car)`
-                    // then `car.name`) is reuse-cloned like a call argument:
-                    // a SHARED class's clone is another reference to the one
-                    // object, and any other class stored into a container is
-                    // one nothing mutates (shared.rs), so its copy is
-                    // unobservable. A plain value keeps the direct move.
-                    let class_or_field = matches!(arg, ExprType::Attribute(_))
-                        || matches!(
-                            crate::infer_type(Some(&ctx), arg, &options, &symbols),
-                            crate::TypeInfo::Class(_)
-                        );
-                    rendered_args.push(if class_or_field {
-                        crate::render_reused(arg, ctx.clone(), options.clone(), symbols.clone())?
-                    } else {
-                        arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?
-                    });
+                    // An argument read again later (`self.cars.append(car)`
+                    // then `car.name`; `items.append(b)` then `len(b)`) is
+                    // reuse-cloned like any call argument: a SHARED class's
+                    // clone is another reference to the one object, and any
+                    // other class stored into a container is one nothing
+                    // mutates (shared.rs), so its copy is unobservable.
+                    rendered_args.push(crate::render_reused(
+                        arg,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                    )?);
                 }
                 match (attr.attr.as_str(), rendered_args.as_slice()) {
                     // list.append(x) pushes one element; Vec::append (inherent)
