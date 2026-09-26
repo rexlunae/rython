@@ -17848,3 +17848,69 @@ fn unicodedata_answers_like_cpython() {
         ]
     );
 }
+
+#[test]
+fn rows_unpack_and_testcase_setup_fields_match_cpython() {
+    // Issue #334 (idna's tests): `for a, b in rows` over a list of lists
+    // unpacks each row (CPython's ValueError on a length mismatch); a
+    // nested str-list field owns its strings; a TestCase's setUp stores
+    // are its fields.
+    let scratch = Scratch::new("rows");
+    let krate = package_crate(
+        &scratch,
+        "rows",
+        &[(
+            "cli.py",
+            concat!(
+                "import unittest\n",
+                "from typing import List\n",
+                "\n",
+                "\n",
+                "class Box:\n",
+                "    def __init__(self) -> None:\n",
+                "        self.items = [[\"a\", \"b\"], [\"c\", \"d\"]]\n",
+                "\n",
+                "    def show(self) -> None:\n",
+                "        for a, b in self.items:\n",
+                "            print(a, b)\n",
+                "\n",
+                "\n",
+                "class RowTests(unittest.TestCase):\n",
+                "    def setUp(self) -> None:\n",
+                "        self.rows = [[\"x\", \"y\"], [\"p\", \"q\"]]\n",
+                "        self.count = 2\n",
+                "\n",
+                "    def test_rows(self) -> None:\n",
+                "        seen = 0\n",
+                "        for left, right in self.rows:\n",
+                "            print(\"row\", left, right)\n",
+                "            seen += 1\n",
+                "        self.assertEqual(seen, self.count)\n",
+                "\n",
+                "    def test_bad_row(self) -> None:\n",
+                "        bad: List[List[int]] = [[1, 2, 3]]\n",
+                "        try:\n",
+                "            for p, q in bad:\n",
+                "                print(p, q)\n",
+                "        except ValueError as e:\n",
+                "            print(\"ValueError\", e)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    Box().show()\n",
+                "    unittest.main()\n",
+            ),
+        )],
+    );
+    // Verified against python3 (stdout; unittest's report is stderr).
+    assert_eq!(
+        run_package(&krate, "rows"),
+        vec![
+            "a b",
+            "c d",
+            "ValueError too many values to unpack (expected 2)",
+            "row x y",
+            "row p q"
+        ]
+    );
+}

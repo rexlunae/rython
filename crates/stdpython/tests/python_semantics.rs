@@ -5019,3 +5019,19 @@ fn boxed_values_order_like_cpython() {
     let probe = t(vec![i(91), s("V")]);
     assert_eq!(stdpython::stdlib::bisect::bisect_right(&table, &probe, 0, None).unwrap(), 3);
 }
+
+#[test]
+fn unpacking_a_sequence_checks_its_length() {
+    // a, b = [1, 2] -> 1, 2
+    assert_eq!(unpack_sequence::<i64, 2>(vec![1, 2]).unwrap(), [1, 2]);
+    // a, b = [1, 2, 3] -> ValueError: too many values to unpack (expected 2)
+    assert_eq!(
+        unpack_sequence::<i64, 2>(vec![1, 2, 3]).unwrap_err().message,
+        "too many values to unpack (expected 2)"
+    );
+    // a, b = [1] -> ValueError: not enough values to unpack (expected 2, got 1)
+    assert_eq!(
+        unpack_sequence::<i64, 2>(PyTuple(vec![1])).unwrap_err().message,
+        "not enough values to unpack (expected 2, got 1)"
+    );
+}

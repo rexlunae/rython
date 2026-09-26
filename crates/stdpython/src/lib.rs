@@ -1506,6 +1506,23 @@ impl<T> PyListFrom for HashSet<T> {
     }
 }
 
+/// Unpacking a sequence into `N` targets (`for a, b in rows` where each
+/// row is a list): the members as an array, or CPython's ValueError when
+/// the length is not `N`.
+pub fn unpack_sequence<T, const N: usize>(
+    seq: impl Into<Vec<T>>,
+) -> Result<[T; N], PyException> {
+    let items: Vec<T> = seq.into();
+    let got = items.len();
+    <[T; N]>::try_from(items).map_err(|_| {
+        if got > N {
+            value_error(&format!("too many values to unpack (expected {N})"))
+        } else {
+            value_error(&format!("not enough values to unpack (expected {N}, got {got})"))
+        }
+    })
+}
+
 /// Python list() builtin.
 pub fn list<L: PyListFrom>(x: L) -> Vec<L::Item> {
     x.py_list()

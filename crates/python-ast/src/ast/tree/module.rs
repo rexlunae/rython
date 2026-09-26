@@ -6307,7 +6307,7 @@ pub(crate) fn collect_class_defs(stmts: &[crate::Statement], out: &mut Vec<crate
 
 /// Whether a class's BASE (a `bases` ExprType) resolves to `unittest.TestCase`:
 /// the bare name `TestCase` or a `unittest.TestCase` attribute.
-fn is_testcase_base(base: &crate::ExprType) -> bool {
+pub(crate) fn is_testcase_base(base: &crate::ExprType) -> bool {
     match base {
         crate::ExprType::Name(n) => n.id == "TestCase",
         crate::ExprType::Attribute(a) => a.attr == "TestCase",

@@ -2124,7 +2124,18 @@ impl ClassDef {
         options: &PythonOptions,
     ) -> Result<Vec<(String, crate::TypeInfo)>, Box<dyn std::error::Error>> {
         let mut fields: Vec<(String, crate::TypeInfo)> = Vec::new();
-        let Some(init) = self.init_method() else {
+        // A unittest TestCase without `__init__` initializes in `setUp`,
+        // which the generated runner calls before every test (idna's
+        // `self.tld_strings`): its stores are the fields, which hold their
+        // defaults from construction until setUp runs — no test observes
+        // them before (issue #334).
+        let Some(init) = self.init_method().or_else(|| {
+            self.bases
+                .iter()
+                .any(crate::ast::tree::module::is_testcase_base)
+                .then(|| self.methods().find(|m| m.name == "setUp"))
+                .flatten()
+        }) else {
             return Ok(fields);
         };
         // Types known for names in the __init__ body: annotated
@@ -6618,7 +6629,19 @@ fn infer_field_type(
             if unknown {
                 Some(crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue)))
             } else {
-                elt_ty.map(|t| crate::TypeInfo::Vec(Box::new(t)))
+                // The literal owns its strings at every depth (`[["a",
+                // "b"]]` renders `vec![vec!["a".to_string(), ...]]`), so
+                // the field type does too.
+                fn owned(t: crate::TypeInfo) -> crate::TypeInfo {
+                    use crate::TypeInfo as T;
+                    match t {
+                        T::StrRef => T::String,
+                        T::Vec(e) => T::Vec(Box::new(owned(*e))),
+                        T::PyTuple(e) => T::PyTuple(Box::new(owned(*e))),
+                        other => other,
+                    }
+                }
+                elt_ty.map(|t| crate::TypeInfo::Vec(Box::new(owned(t))))
             }
         }
         other => crate::simple_expr_typeinfo(other).map(|t| {

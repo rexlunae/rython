@@ -111,6 +111,17 @@ impl CodeGen for For {
                     && !crate::name_referenced_in(&self.body, &n.id)
                     && !crate::name_referenced_in(&self.orelse, &n.id)
         );
+        // The target names the body or else clause reads (an unread one
+        // of a row-unpacking target binds `_`). Asked before the body is
+        // consumed.
+        let read_targets: std::collections::HashSet<String> = target_names
+            .iter()
+            .filter(|n| {
+                crate::name_referenced_in(&self.body, n)
+                    || crate::name_referenced_in(&self.orelse, n)
+            })
+            .map(|n| n.to_string())
+            .collect();
         // A CELL target binds through the cell, which needs the same
         // element-temp shape a leaked target uses.
         let any_hoisted = target_names
@@ -156,6 +167,39 @@ impl CodeGen for For {
                 &mut counter,
             );
             (quote!(__rython_elt), quote!({ #(#stmts)* #(#body_stmts;)* }))
+        } else if let ExprType::Tuple(t) = &self.target
+            && !t.elts.is_empty()
+            && t.elts.iter().all(|e| matches!(e, ExprType::Name(_)))
+            && matches!(
+                crate::ast::tree::type_ctx::iterable_element_type(&crate::infer_type(
+                    Some(&ctx),
+                    &self.iter,
+                    &options,
+                    &symbols,
+                )),
+                Some(crate::TypeInfo::Vec(_) | crate::TypeInfo::PyTuple(_))
+            )
+        {
+            // A tuple target over SEQUENCE elements (`for a, b in rows`
+            // where each row is a list — idna's `tld_strings`): Python
+            // unpacks each row, raising ValueError on a length mismatch;
+            // a Rust tuple pattern cannot match a Vec. The row unpacks
+            // through the runtime into an array pattern.
+            let n = t.elts.len();
+            let names = t.elts.iter().map(|e| match e {
+                ExprType::Name(name) if read_targets.contains(&name.id) => {
+                    let id = crate::safe_ident(&name.id);
+                    quote!(#id)
+                }
+                _ => quote!(_),
+            });
+            (
+                quote!(__rython_row),
+                quote!(
+                    let [#(#names),*] = stdpython::unpack_sequence::<_, #n>(__rython_row)?;
+                    #(#body_stmts;)*
+                ),
+            )
         } else {
             let target = if unused_index {
                 quote!(_)
