@@ -18422,7 +18422,15 @@ fn os_file_functions_raise_like_cpython() {
         .output()
         .expect("running generated binary");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    // Verified against python3.
+    // `os.remove(".")` raises whatever errno the OS's unlink(2) returns
+    // for a directory, and CPython reports it as-is: EISDIR on Linux,
+    // EPERM on macOS (python3 on Darwin prints the PermissionError line).
+    let remove_dir = if cfg!(target_os = "macos") {
+        "PermissionError [Errno 1] Operation not permitted: '.'"
+    } else {
+        "IsADirectoryError [Errno 21] Is a directory: '.'"
+    };
+    // Verified against python3 (Linux, and macOS for the directory line).
     assert_eq!(
         String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -18431,7 +18439,7 @@ fn os_file_functions_raise_like_cpython() {
             "False True",
             "False",
             "FileNotFoundError [Errno 2] No such file or directory: 'osr_b.txt'",
-            "IsADirectoryError [Errno 21] Is a directory: '.'",
+            remove_dir,
             "FileNotFoundError [Errno 2] No such file or directory: 'osr_missing.txt' -> 'osr_c.txt'",
             "FileNotFoundError [Errno 2] No such file or directory: 'osr_no_such_dir'",
             "True",
