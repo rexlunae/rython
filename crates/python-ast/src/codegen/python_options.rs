@@ -727,6 +727,14 @@ pub struct PythonOptionsData {
     /// before `cli` (Devin review on #338).
     pub root_init_module: Option<String>,
 
+    /// Set by the converter on the BIN copy of the entry module: that code
+    /// is the bin crate root, which already declares every root-level
+    /// module of the crate (`pub mod data;`). A relative import resolving
+    /// to such a module (`from . import data` in `pkg/cli.py`) must not
+    /// re-import it there — `pub use crate::data;` beside `pub mod data;`
+    /// is E0255 — though the lib copy (`crate::cli`) still needs the use.
+    pub bin_crate_root: bool,
+
     /// Lazily-computed merged trait-mut table over ALL modules of the crate
     /// (`module_defs`), shared across every module's conversion: the
     /// cross-module fallback in `method_needs_mut_self` scans each module
@@ -863,6 +871,7 @@ impl Default for PythonOptionsData {
             )),
             folded_guard_imports: std::rc::Rc::new(std::collections::HashMap::new()),
             root_init_module: None,
+            bin_crate_root: false,
             cross_module_mut_self: std::rc::Rc::new(std::cell::RefCell::new(
                 CrossModuleMutSelf::Uncomputed,
             )),
