@@ -701,8 +701,9 @@ impl CodeGen for Module {
             for (name, kind) in global_mutables.iter() {
                 if matches!(kind, crate::MutableGlobalKind::Boxed) && !top_level_stored.contains(name) {
                     let ident = crate::safe_ident(name);
+                    let case_allow = crate::ast::tree::module::static_case_allow(&ident);
                     stream.extend(quote! {
-                        pub static #ident: std::sync::Mutex<stdpython::PyValue> =
+                        #case_allow pub static #ident: std::sync::Mutex<stdpython::PyValue> =
                             std::sync::Mutex::new(stdpython::PyValue::None_);
                     });
                 }
@@ -1583,8 +1584,9 @@ impl CodeGen for Module {
                         ));
                         for n in &names {
                             let ident = crate::safe_ident(n);
+                            let case_allow = crate::ast::tree::module::static_case_allow(&ident);
                             stream.extend(quote! {
-                                pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
+                                #case_allow pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
                                     std::sync::LazyLock::new(|| stdpython::PyValue::None_);
                             });
                         }
@@ -1641,8 +1643,9 @@ impl CodeGen for Module {
                     let ident = crate::safe_ident(&target.id);
                     match kind {
                         Kind::Boxed => {
+                            let case_allow = crate::ast::tree::module::static_case_allow(&ident);
                             stream.extend(quote! {
-                                pub static #ident: std::sync::Mutex<stdpython::PyValue> =
+                                #case_allow pub static #ident: std::sync::Mutex<stdpython::PyValue> =
                                     std::sync::Mutex::new(stdpython::PyValue::None_);
                             });
                         }
@@ -1654,8 +1657,9 @@ impl CodeGen for Module {
                             // representation, unwrapped at value reads
                             // (name.rs) and matched by `is None` (compare.rs).
                             let cls = crate::safe_ident(class);
+                            let case_allow = crate::ast::tree::module::static_case_allow(&ident);
                             stream.extend(quote! {
-                                pub static #ident: std::sync::Mutex<Option<#cls>> =
+                                #case_allow pub static #ident: std::sync::Mutex<Option<#cls>> =
                                     std::sync::Mutex::new(None);
                             });
                         }
@@ -1667,8 +1671,9 @@ impl CodeGen for Module {
                                 options.clone(),
                                 symbols.clone(),
                             )?;
+                            let case_allow = crate::ast::tree::module::static_case_allow(&ident);
                             stream.extend(quote! {
-                                pub static #ident: std::sync::Mutex<#ty> =
+                                #case_allow pub static #ident: std::sync::Mutex<#ty> =
                                     std::sync::Mutex::new(#value);
                             });
                         }
@@ -1678,8 +1683,9 @@ impl CodeGen for Module {
                                 options.clone(),
                                 symbols.clone(),
                             )?;
+                            let case_allow = crate::ast::tree::module::static_case_allow(&ident);
                             stream.extend(quote! {
-                                pub static #ident:
+                                #case_allow pub static #ident:
                                     std::sync::LazyLock<std::sync::Mutex<String>> =
                                     std::sync::LazyLock::new(|| {
                                         std::sync::Mutex::new((#value).to_string())
@@ -1708,8 +1714,9 @@ impl CodeGen for Module {
                                     .expect("Computed{boxed:false} implies an inferred type");
                                 (ty, value_tokens)
                             };
+                            let case_allow = crate::ast::tree::module::static_case_allow(&ident);
                             stream.extend(quote! {
-                                pub static #ident:
+                                #case_allow pub static #ident:
                                     std::sync::LazyLock<std::sync::Mutex<#ty>> =
                                     std::sync::LazyLock::new(|| {
                                         std::sync::Mutex::new(#wrapped)
@@ -1767,7 +1774,8 @@ impl CodeGen for Module {
                             )?;
                             for n in &names {
                                 let ident = crate::safe_ident(n);
-                                stream.extend(quote!(pub static #ident: #ty = #value;));
+                                let case_allow = crate::ast::tree::module::static_case_allow(&ident);
+                                stream.extend(quote!(#case_allow pub static #ident: #ty = #value;));
                             }
                             continue;
                         }
@@ -1871,8 +1879,9 @@ impl CodeGen for Module {
                 let shared_ident = unpack_pairs.as_ref().map(|_| {
                     let ident = crate::safe_ident(&format!("__rython_unpack_{}", unpack_counter));
                     unpack_counter += 1;
+                    let case_allow = crate::ast::tree::module::static_case_allow(&ident);
                     stream.extend(quote! {
-                        pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
+                        #case_allow pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
                             std::sync::LazyLock::new(|| stdpython::PyValue::from(#value_tokens));
                     });
                     module_init_stmts.push(quote!(let _ = &*#ident;));
@@ -1961,8 +1970,9 @@ impl CodeGen for Module {
                                 )
                             }
                         };
+                    let case_allow = crate::ast::tree::module::static_case_allow(&ident);
                     stream.extend(quote! {
-                        pub static #ident: std::sync::LazyLock<#ty> =
+                        #case_allow pub static #ident: std::sync::LazyLock<#ty> =
                             std::sync::LazyLock::new(|| #wrapped);
                     });
                     module_init_stmts.push(quote!(let _ = &*#ident;));
@@ -2019,8 +2029,9 @@ impl CodeGen for Module {
                     )
                 };
                 if is_fn_attr(&b1.value) && is_fn_attr(&b2.value) {
+                    let case_allow = crate::ast::tree::module::static_case_allow(&ident);
                     stream.extend(quote! {
-                        pub static #ident: std::sync::LazyLock<fn() -> f64> =
+                        #case_allow pub static #ident: std::sync::LazyLock<fn() -> f64> =
                             std::sync::LazyLock::new(|| {
                                 if #test {
                                     #v1
@@ -2030,8 +2041,9 @@ impl CodeGen for Module {
                             });
                     });
                 } else {
+                    let case_allow = crate::ast::tree::module::static_case_allow(&ident);
                     stream.extend(quote! {
-                        pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
+                        #case_allow pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
                             std::sync::LazyLock::new(|| {
                                 if #test {
                                     stdpython::PyValue::None_
@@ -2292,8 +2304,9 @@ impl CodeGen for Module {
                     let body_val = crate::ast::tree::call::strip_trailing_question(&body_val);
                     // The try body runs first; on error the handler's value
                     // applies. The handler may itself fail — propagate.
+                    let case_allow = crate::ast::tree::module::static_case_allow(&ident);
                     stream.extend(quote! {
-                        pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
+                        #case_allow pub static #ident: std::sync::LazyLock<stdpython::PyValue> =
                             std::sync::LazyLock::new(|| {
                                 match (|| -> Result<_, PyException> {
                                     Ok(stdpython::PyValue::from(#body_val))
@@ -5761,6 +5774,20 @@ fn hoisted_name_set(
     (hoisted, scope.leaked_loop_targets)
 }
 
+/// The lint allowance for a static or constant named after a Python name.
+/// Python spells module globals and class attributes lower_case as often as
+/// UPPER_CASE (PEP 8 reserves UPPER_CASE for constants, and rython cannot
+/// tell intent), so rustc's non_upper_case_globals on `pub static count`
+/// reports rython's rendering, not a weakness in the source. An
+/// already-upper name gets no attribute, keeping the common case clean.
+pub(crate) fn static_case_allow(ident: &proc_macro2::Ident) -> TokenStream {
+    if ident.to_string().chars().any(|c| c.is_lowercase()) {
+        quote!(#[allow(non_upper_case_globals)])
+    } else {
+        quote!()
+    }
+}
+
 fn hoisted_declarations(
     body: &[crate::Statement],
     ctx: &crate::CodeGenContext,
@@ -5830,17 +5857,28 @@ fn hoisted_declarations(
             continue;
         }
         let ident = crate::safe_ident(name);
+        // Every caller declares MODULE-scope names (the init body, the
+        // `__main__` block), where UPPER_CASE is PEP 8's constant spelling,
+        // not a weakness in the source: the local is rython's rendering of
+        // a module global, so non_snake_case is silenced on it (as for the
+        // static-mutation temp in statement.rs). A function's own
+        // UPPER_CASE local keeps the warning.
+        let allow = if name.chars().any(|c| c.is_uppercase()) {
+            quote!(#[allow(non_snake_case)])
+        } else {
+            quote!()
+        };
         if scope.needs_mut.contains(name) {
             if scope.closure_captured_uninit.contains(name) {
                 // Captured by a generated try/handler closure while possibly
                 // uninitialized: Default-initialize so rustc accepts the
                 // capture (issue #78).
-                out.extend(quote!(let mut #ident = Default::default();));
+                out.extend(quote!(#allow let mut #ident = Default::default();));
             } else {
-                out.extend(quote!(let mut #ident;));
+                out.extend(quote!(#allow let mut #ident;));
             }
         } else {
-            out.extend(quote!(let #ident;));
+            out.extend(quote!(#allow let #ident;));
         }
     }
     out
