@@ -18656,3 +18656,154 @@ fn boxed_or_and_return_the_selected_operand() {
         ],
     );
 }
+
+#[test]
+fn a_mixin_uses_an_attribute_its_subclasses_define() {
+    // A mixin's methods read and store `self.max_redirects`, which only
+    // its subclasses assign (requests' SessionRedirectMixin, issue #335):
+    // the mixin's trait declares an accessor for it, and each subclass
+    // reaches the field wherever its own chain holds it (Session through
+    // Base). Every instance reads and writes its own attribute.
+    let scratch = Scratch::new("mixinfields");
+    let file = scratch.path().join("mixin_fields.py");
+    fs::write(
+        &file,
+        concat!(
+            "class RedirectMixin:\n",
+            "    def describe(self) -> str:\n",
+            "        return \"max \" + str(self.max_redirects)\n",
+            "\n",
+            "    def bump(self) -> None:\n",
+            "        self.max_redirects += 1\n",
+            "\n",
+            "\n",
+            "class Base(RedirectMixin):\n",
+            "    def __init__(self, limit: int) -> None:\n",
+            "        self.max_redirects = limit\n",
+            "\n",
+            "\n",
+            "class Session(Base):\n",
+            "    def __init__(self, limit: int, name: str) -> None:\n",
+            "        super().__init__(limit)\n",
+            "        self.name = name\n",
+            "\n",
+            "    def label(self) -> str:\n",
+            "        return self.name + \": \" + self.describe()\n",
+            "\n",
+            "\n",
+            "class Other(RedirectMixin):\n",
+            "    def __init__(self) -> None:\n",
+            "        self.max_redirects = 7\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    s = Session(30, \"s\")\n",
+            "    print(s.label())\n",
+            "    s.bump()\n",
+            "    s.bump()\n",
+            "    print(s.describe(), s.max_redirects)\n",
+            "    o = Other()\n",
+            "    o.bump()\n",
+            "    print(o.describe())\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/mixin_fields"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "s: max 30",
+            "max 32 32",
+            "max 8",
+        ],
+    );
+}
+
+#[test]
+fn type_self_name_in_an_inherited_method_names_the_instance_class() {
+    // Issue #411: `type(self).__name__` in a method a subclass inherits
+    // names the INSTANCE's class, as in CPython — in `__repr__`, through
+    // `super()`, and on a base-typed value holding a subclass. It used to
+    // name the defining class (`Base Base leaf/Base`).
+    let scratch = Scratch::new("inheritedtypename");
+    let file = scratch.path().join("typename.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Base:\n",
+            "    def __init__(self, n: int) -> None:\n",
+            "        self.n = n\n",
+            "\n",
+            "    def name(self) -> str:\n",
+            "        return type(self).__name__\n",
+            "\n",
+            "    def __repr__(self) -> str:\n",
+            "        return f\"{type(self).__name__}(n={self.n})\"\n",
+            "\n",
+            "\n",
+            "class Mid(Base):\n",
+            "    def tag(self) -> str:\n",
+            "        return \"mid:\" + type(self).__name__\n",
+            "\n",
+            "\n",
+            "class Leaf(Mid):\n",
+            "    def name(self) -> str:\n",
+            "        return \"leaf/\" + super().name()\n",
+            "\n",
+            "\n",
+            "def pick(flag: bool) -> Base:\n",
+            "    if flag:\n",
+            "        return Leaf(3)\n",
+            "    return Base(1)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(Base(1).name(), Mid(2).name(), Leaf(3).name())\n",
+            "    print(repr(Base(1)), repr(Mid(2)), repr(Leaf(3)))\n",
+            "    print(Mid(2).tag(), Leaf(3).tag())\n",
+            "    b = pick(True)\n",
+            "    print(b.name(), repr(b), repr(pick(False)))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/typename"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "Base Mid leaf/Leaf",
+            "Base(n=1) Mid(n=2) Leaf(n=3)",
+            "mid:Mid mid:Leaf",
+            "leaf/Leaf Leaf(n=3) Base(n=1)",
+        ],
+    );
+}

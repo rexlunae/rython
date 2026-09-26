@@ -5172,3 +5172,23 @@ fn boxed_and_list_unpacking_raise_cpythons_errors() {
     // a, b = [7, 8] -> 7, 8
     assert_eq!(PyUnpack::<2>::py_unpack(vec![7i64, 8]).unwrap(), (7, 8));
 }
+
+#[test]
+fn py_class_name_reads_the_python_class_name_off_the_type() {
+    mod m {
+        pub struct Session;
+        pub struct Self_;
+        // A Python class named `type`, as the generated crate spells it.
+        #[allow(non_camel_case_types)]
+        pub struct r#type;
+        pub struct G<T>(pub T);
+    }
+    // type(Session()).__name__ -> 'Session'
+    assert_eq!(stdpython::py_class_name::<m::Session>(), "Session");
+    // a class named Self (renamed Self_ in Rust) -> 'Self'
+    assert_eq!(stdpython::py_class_name::<m::Self_>(), "Self");
+    // a class named type (a raw identifier) -> 'type'
+    assert_eq!(stdpython::py_class_name::<m::r#type>(), "type");
+    // generics never leak into the name
+    assert_eq!(stdpython::py_class_name::<m::G<m::Session>>(), "G");
+}

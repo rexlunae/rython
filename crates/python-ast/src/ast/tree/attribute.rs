@@ -109,6 +109,12 @@ impl<'a> CodeGen for Attribute {
             if matches!(call.args.first(), Some(ExprType::Name(n)) if n.id == "self")
                 && let Some(enclosing) = ctx.enclosing_class_name()
             {
+                // In a trait default `self` is the IMPLEMENTOR — a method
+                // a subclass inherits names the instance's class, as in
+                // CPython (issue #411) — so the name comes from `Self`.
+                if ctx.in_generic_trait() {
+                    return Ok(quote!(stdpython::py_class_name::<Self>().to_string()));
+                }
                 let name = crate::safe_ident(enclosing);
                 return Ok(quote!(stringify!(#name).to_string()));
             }
@@ -1142,7 +1148,20 @@ pub(crate) fn class_field_access(
         }
     }
     let (class, class_symbols) = crate::receiver_class_for_read(value, ctx, symbols, options)?;
-    let depth = class.field_owner_depth(attr, &class_symbols, options)?;
+    let Some(depth) = class.field_owner_depth(attr, &class_symbols, options) else {
+        // A field only a SUBCLASS defines (a mixin's `self.max_redirects`):
+        // the class's trait declares an accessor for it, so `self` — the
+        // generic one of a trait default or the class's own — reads and
+        // stores through it (the class's own impl raises AttributeError).
+        return (is_self
+            && class
+                .subclass_fields(&class_symbols, options)
+                .iter()
+                .any(|(f, _)| f == attr))
+        .then(|| FieldRewrite::Accessor {
+            field: crate::ast::tree::class_def::subclass_accessor(attr),
+        });
+    };
     if depth == 0 {
         // The receiver's own field. Direct access works for any concrete
         // receiver; only the generic `self` of a trait default needs the
