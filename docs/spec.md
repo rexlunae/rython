@@ -620,14 +620,18 @@ counterparts. Loop `else` runs when the loop wasn't left by `break`,
 implemented with a broke-flag only when the body actually contains a
 direct `break`. A loop variable read after the loop is hoisted so
 Python's scope-leak of the induction variable is preserved. Tuple
-targets destructure. A tuple target over a value that is not
-statically a tuple unpacks as Python does, by iteration, the value's
-Rust type choosing how (`PyUnpack`): a boxed value iterates its members
-(a str its characters), a list or variable-length tuple is
-length-checked, a tuple is itself — with CPython's `TypeError: cannot
-unpack non-iterable int object` and its `ValueError` for a length
-mismatch. A loop over boxed rows (`for k, v in fields` with `fields`
-boxed) unpacks each row the same way.
+targets destructure. A tuple target over a BOXED value, over a
+function call whose return type inference cannot see (`username,
+password = get_auth_from_url(proxy)`), or over a list local unpacks as
+Python does, by iteration, the value's Rust type choosing how
+(`PyUnpack`): a boxed value iterates its members (a str its
+characters), a list is length-checked, a tuple is itself — with
+CPython's `TypeError: cannot unpack non-iterable int object` and its
+`ValueError` for a length mismatch. A loop over boxed rows (`for k, v
+in fields` with `fields` boxed) unpacks each row the same way. Any
+other destructure is the plain Rust tuple pattern (a method result
+such as `m.groups()`, a class instance: loud in rustc when the shapes
+disagree).
 
 ### 5.3 `with`
 
