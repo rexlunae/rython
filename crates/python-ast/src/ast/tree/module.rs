@@ -6855,7 +6855,15 @@ pub(crate) fn crate_module_bound_to(
     if options.module_defs.len() <= 1 {
         return None;
     }
-    let path: Vec<String> = match symbols.get(name)? {
+    // An `as` binding (`from . import core as idna`) is recorded as an
+    // alias of the imported name, whose import node carries the `as`.
+    let node = match symbols.get(name)? {
+        crate::SymbolTableNode::Alias(canonical) if canonical != name => {
+            symbols.get(canonical)?
+        }
+        other => other,
+    };
+    let path: Vec<String> = match node {
         crate::SymbolTableNode::Import(im) => {
             let alias = im.names.iter().find(|a| {
                 a.asname.as_deref().unwrap_or(a.name.as_str()) == name
@@ -6867,9 +6875,16 @@ pub(crate) fn crate_module_bound_to(
             alias.name.split('.').map(str::to_string).collect()
         }
         crate::SymbolTableNode::ImportFrom(ifm) => {
-            let alias = ifm.names.iter().find(|a| {
-                a.asname.as_deref().unwrap_or(a.name.as_str()) == name
-            })?;
+            // The symbol table keeps ONE node per name, so `from . import
+            // lib` followed by `from . import lib as L` records `lib`
+            // under the aliased statement: the module's own name matches
+            // its `name` there too (the path rendering binds it the same
+            // way).
+            let alias = ifm
+                .names
+                .iter()
+                .find(|a| a.asname.as_deref().unwrap_or(a.name.as_str()) == name)
+                .or_else(|| ifm.names.iter().find(|a| a.name == name))?;
             let mut full = ifm.resolved_module_path(options);
             full.push(alias.name.clone());
             full

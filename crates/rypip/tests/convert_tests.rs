@@ -17743,7 +17743,8 @@ fn a_call_through_a_module_binds_keywords_and_defaults_by_name() {
     // Issue #401: `lib.scale(2, offset=1, factor=100)` after `from . import
     // lib` bound the keywords positionally in call order (102, silently)
     // and never filled defaults; it now maps through the callee's
-    // signature exactly as the by-name call does.
+    // signature exactly as the by-name call does — through an `as` alias
+    // of the module too (`from . import lib as L`).
     let scratch = Scratch::new("modkw");
     let krate = package_crate(
         &scratch,
@@ -17760,11 +17761,13 @@ fn a_call_through_a_module_binds_keywords_and_defaults_by_name() {
                 "core.py",
                 concat!(
                     "from . import lib\n",
+                    "from . import lib as L\n",
                     "\n",
                     "\n",
                     "def run() -> None:\n",
                     "    print(lib.scale(2, offset=1, factor=100))\n",
                     "    print(lib.scale(2), lib.scale(2, 3), lib.scale(2, offset=1))\n",
+                    "    print(L.scale(x=3, offset=2), L.scale(1, factor=5, offset=7))\n",
                 ),
             ),
             (
@@ -17784,7 +17787,7 @@ fn a_call_through_a_module_binds_keywords_and_defaults_by_name() {
         ],
     );
     // Verified against python3.
-    assert_eq!(run_package(&krate, "dflt"), vec!["201", "20 6 21"]);
+    assert_eq!(run_package(&krate, "dflt"), vec!["201", "20 6 21", "32 12"]);
 }
 
 #[test]
