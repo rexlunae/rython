@@ -7343,6 +7343,17 @@ pub(crate) fn module_reexports_stdpython_module(
     found
 }
 
+/// Whether the crate module at `path` is the program's ENTRY — it holds a
+/// top-level `if __name__ == "__main__":` guard, so CPython runs it as
+/// `__main__` and its functions' qualified names read `__main__.f`.
+pub(crate) fn module_is_entry(options: &crate::PythonOptions, path: &[String]) -> bool {
+    options.module_defs.get(path).is_some_and(|m| {
+        m.raw.body.iter().any(|stmt| {
+            matches!(&stmt.statement, crate::StatementType::If(i) if is_main_guard(&i.test))
+        })
+    })
+}
+
 /// Whether an `if` test is the `__name__ == "__main__"` guard (in any of
 /// its spellings: either operand order, `!=` under an `else`, ...). The
 /// one classifier every main-block pass asks.

@@ -291,8 +291,12 @@ its positional and keyword arguments by the function's own signature
 a wrong binding (`enc() missing 1 required positional argument: 's'`,
 `got an unexpected keyword argument`, `got multiple values`), and calling
 any other boxed member is `TypeError: '<type>' object is not callable`.
-It compares by identity (`encode is idna.encode`). A `*`/`**` spread
-into such a call is loud.
+It compares by identity (`encode is idna.encode`). A `*xs` / `**d`
+spread into such a call (urllib3's `key_class(**context)`) extends the
+arguments from the boxed iterable or mapping at run time, with CPython's
+TypeErrors naming the function module-qualified (`__main__.f() argument
+after * must be an iterable, not int`, `... argument after ** must be a
+mapping ...`, `... got multiple values for keyword argument 'k'`).
 
 A call through the value is `f.call((x,))?`: it returns the same
 `Result<R, PyException>` every generated function returns, so an

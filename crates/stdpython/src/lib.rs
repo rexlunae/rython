@@ -3323,6 +3323,86 @@ impl PyValue {
         }
     }
 
+    /// The callee's name as CPython's call-site errors spell it (`f()
+    /// argument after * must be ...`): the function's module-qualified
+    /// name — `__main__.f` for a script's function.
+    fn call_site_name(&self) -> String {
+        match self {
+            PyValue::Function(f) => match f.identity() {
+                Some(id) if id.contains('.') => id.to_string(),
+                Some(id) => format!("__main__.{}", id),
+                None => format!("__main__.{}", f.name()),
+            },
+            other => other.py_type_name().to_string(),
+        }
+    }
+
+    /// `f(..., *v)` through this boxed callable: `v`'s members append to
+    /// the positional arguments, in iteration order. A non-iterable is
+    /// CPython's TypeError (`__main__.f() argument after * must be an
+    /// iterable, not int`).
+    pub fn extend_spread_args(
+        &self,
+        args: &mut Vec<PyValue>,
+        spread: PyValue,
+    ) -> Result<(), PyException> {
+        match spread {
+            PyValue::Int(_)
+            | PyValue::Float(_)
+            | PyValue::Bool(_)
+            | PyValue::Complex(_)
+            | PyValue::Function(_)
+            | PyValue::None_ => Err(PyException::new(
+                "TypeError",
+                format!(
+                    "{}() argument after * must be an iterable, not {}",
+                    self.call_site_name(),
+                    spread.py_type_name()
+                ),
+            )),
+            iterable => {
+                args.extend(iterable);
+                Ok(())
+            }
+        }
+    }
+
+    /// `f(..., **d)` through this boxed callable: `d`'s items append to
+    /// the keyword arguments. A non-mapping is CPython's TypeError
+    /// (`... argument after ** must be a mapping, not int`); a name given
+    /// twice (explicitly and in `d`) is `... got multiple values for
+    /// keyword argument 'k'`.
+    pub fn extend_spread_kwargs(
+        &self,
+        keywords: &mut Vec<(String, PyValue)>,
+        spread: PyValue,
+    ) -> Result<(), PyException> {
+        let PyValue::Dict(d) = spread else {
+            return Err(PyException::new(
+                "TypeError",
+                format!(
+                    "{}() argument after ** must be a mapping, not {}",
+                    self.call_site_name(),
+                    spread.py_type_name()
+                ),
+            ));
+        };
+        for (k, v) in d.iter() {
+            if keywords.iter().any(|(name, _)| name == k) {
+                return Err(PyException::new(
+                    "TypeError",
+                    format!(
+                        "{}() got multiple values for keyword argument '{}'",
+                        self.call_site_name(),
+                        k
+                    ),
+                ));
+            }
+            keywords.push((k.clone(), v.clone()));
+        }
+        Ok(())
+    }
+
     /// CPython's `<` between two boxed values: numbers on the numeric tower
     /// (bool ⊂ int ⊂ float; a NaN compares False both ways), a str or a
     /// bytes lexicographically (a str by code point — UTF-8's byte order),

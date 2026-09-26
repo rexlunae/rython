@@ -18039,6 +18039,85 @@ fn functions_held_boxed_are_called_like_cpython() {
 }
 
 #[test]
+fn spreads_into_a_boxed_function_bind_like_cpython() {
+    // `f(*args, **opts)` through a boxed function value (urllib3's
+    // `key_class(**context)` — refused at conversion by the first cut of
+    // boxed calls, which failed the whole package): the arguments build
+    // in call order, each spread extending them at run time, and bind by
+    // the function's signature. A non-iterable `*`, a non-mapping `**`,
+    // and a keyword given twice raise CPython's TypeError, naming the
+    // function module-qualified (`__main__.scale` in the entry module).
+    let scratch = Scratch::new("spreadcalls");
+    let file = scratch.path().join("spread_calls.py");
+    fs::write(
+        &file,
+        concat!(
+            "def scale(x: int, factor: int = 2, offset: int = 0) -> int:\n",
+            "    return x * factor + offset\n",
+            "\n",
+            "\n",
+            "def run(fn=None):\n",
+            "    if fn is None:\n",
+            "        fn = scale\n",
+            "    args = (3,)\n",
+            "    opts = {\"offset\": 1}\n",
+            "    print(fn(*args, **opts))\n",
+            "    print(fn(2, *[5], offset=7))\n",
+            "    print(fn(**{\"x\": 4, \"factor\": 10}))\n",
+            "    try:\n",
+            "        fn(*5)\n",
+            "    except TypeError as exc:\n",
+            "        print(exc)\n",
+            "    try:\n",
+            "        fn(**5)\n",
+            "    except TypeError as exc:\n",
+            "        print(exc)\n",
+            "    try:\n",
+            "        fn(1, offset=1, **{\"offset\": 2})\n",
+            "    except TypeError as exc:\n",
+            "        print(exc)\n",
+            "    try:\n",
+            "        fn(*(1, 2, 3, 4))\n",
+            "    except TypeError as exc:\n",
+            "        print(exc)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    run()\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/spread_calls"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "7",
+            "17",
+            "40",
+            "__main__.scale() argument after * must be an iterable, not int",
+            "__main__.scale() argument after ** must be a mapping, not int",
+            "__main__.scale() got multiple values for keyword argument 'offset'",
+            "scale() takes from 1 to 3 positional arguments but 4 were given",
+        ],
+    );
+}
+
+#[test]
 fn an_entry_module_imports_a_sibling_module() {
     // The ENTRY module's `from . import data` is a `pub use crate::data;`
     // — in the bin the entry is the crate root, which already declares

@@ -677,7 +677,9 @@ pub(crate) fn wrap_function_as_callable(
     // One `def` is one function object however many times it is named
     // (`register(hello)` ... `unregister(hello)`): the wrapper carries the
     // definition's module-qualified name as its identity.
-    let identity = if options.this_module_path.is_empty() {
+    let identity = if crate::ast::tree::module::module_is_entry(options, &options.this_module_path) {
+        format!("__main__.{}", n.id)
+    } else if options.this_module_path.is_empty() {
         n.id.clone()
     } else {
         format!("{}.{}", options.this_module_path.join("."), n.id)
@@ -791,7 +793,11 @@ pub(crate) fn box_function_value(
         Ok(t) => t,
         Err(e) => return Some(Err(e)),
     };
-    let identity = if def_module.is_empty() {
+    // The entry module runs as `__main__` (its functions are
+    // `__main__.f` in CPython's call-site errors).
+    let identity = if crate::ast::tree::module::module_is_entry(options, &def_module) {
+        format!("__main__.{}", py_name)
+    } else if def_module.is_empty() {
         py_name.clone()
     } else {
         format!("{}.{}", def_module.join("."), py_name)

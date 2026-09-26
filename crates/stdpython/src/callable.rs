@@ -107,6 +107,12 @@ impl<A, R> PyCallable<A, R> {
         &self.name
     }
 
+    /// A module-level `def`'s module-qualified name (its identity); None
+    /// for a closure or lambda.
+    pub fn identity(&self) -> Option<&'static str> {
+        self.identity
+    }
+
     /// The identity CPython prints in a function's repr. Two clones of
     /// one callable share it; two separately created closures do not.
     fn addr(&self) -> usize {

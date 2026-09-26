@@ -5077,3 +5077,35 @@ fn boxed_argument_binding_raises_cpythons_type_errors() {
         "'NoneType' object is not callable"
     );
 }
+
+#[test]
+fn boxed_call_spreads_raise_cpythons_type_errors() {
+    // def f(*a, **k): return len(a) + len(k)   (the entry module's f)
+    let f = PyValue::Function(stdpython::PyCallable::function(
+        "f",
+        "__main__.f",
+        |(a, k): stdpython::BoxedArgs| Ok(PyValue::Int((a.len() + k.len()) as i64)),
+    ));
+    let mut args = vec![PyValue::Int(1)];
+    // f(1, *(2, 3)) -> the members append in order
+    f.extend_spread_args(&mut args, PyValue::from((2i64, 3i64))).unwrap();
+    assert_eq!(args.len(), 3);
+    // f(*5) -> __main__.f() argument after * must be an iterable, not int
+    assert_eq!(
+        f.extend_spread_args(&mut args, PyValue::Int(5)).unwrap_err().message,
+        "__main__.f() argument after * must be an iterable, not int"
+    );
+    // f(**5) -> __main__.f() argument after ** must be a mapping, not int
+    let mut kw: Vec<(String, PyValue)> = vec![("a".to_string(), PyValue::Int(1))];
+    assert_eq!(
+        f.extend_spread_kwargs(&mut kw, PyValue::Int(5)).unwrap_err().message,
+        "__main__.f() argument after ** must be a mapping, not int"
+    );
+    // f(a=1, **{"a": 2}) -> __main__.f() got multiple values for keyword argument 'a'
+    let mut d: stdpython::PyDict<String, PyValue> = stdpython::PyDict::new();
+    d.insert("a".to_string(), PyValue::Int(2));
+    assert_eq!(
+        f.extend_spread_kwargs(&mut kw, PyValue::from(d)).unwrap_err().message,
+        "__main__.f() got multiple values for keyword argument 'a'"
+    );
+}

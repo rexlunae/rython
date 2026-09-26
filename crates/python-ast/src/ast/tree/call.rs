@@ -2346,15 +2346,6 @@ impl Call {
         options: &PythonOptions,
         symbols: &SymbolTableScopes,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        if self.args.iter().any(|a| matches!(a, ExprType::Starred(_)))
-            || self.keywords.iter().any(|k| k.arg.is_none())
-        {
-            return Err(format!(
-                "a `*`/`**` spread into a call through the boxed callable value `{callee}` \
-                 is not supported yet; pass the arguments explicitly"
-            )
-            .into());
-        }
         let boxed = |e: &ExprType| {
             crate::render_typed_reused(
                 e,
@@ -2364,21 +2355,54 @@ impl Call {
                 Some(crate::TypeInfo::PyValue),
             )
         };
-        let args = self.args.iter().map(boxed).collect::<Result<Vec<_>, _>>()?;
-        let keywords = self
-            .keywords
-            .iter()
-            .map(|k| {
-                let name = k.arg.clone().unwrap_or_default();
-                boxed(&k.value).map(|v| quote!((#name.to_string(), #v)))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let callee = crate::safe_ident(callee);
-        Ok(if keywords.is_empty() {
-            quote!((#callee).call_boxed(vec![#(#args),*])?)
-        } else {
-            quote!((#callee).call_boxed_kw(vec![#(#args),*], vec![#(#keywords),*])?)
-        })
+        let spread = self.args.iter().any(|a| matches!(a, ExprType::Starred(_)))
+            || self.keywords.iter().any(|k| k.arg.is_none());
+        if !spread {
+            let args = self.args.iter().map(boxed).collect::<Result<Vec<_>, _>>()?;
+            let keywords = self
+                .keywords
+                .iter()
+                .map(|k| {
+                    let name = k.arg.clone().unwrap_or_default();
+                    boxed(&k.value).map(|v| quote!((#name.to_string(), #v)))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(if keywords.is_empty() {
+                quote!((#callee).call_boxed(vec![#(#args),*])?)
+            } else {
+                quote!((#callee).call_boxed_kw(vec![#(#args),*], vec![#(#keywords),*])?)
+            });
+        }
+        // A `*xs` / `**d` spread (urllib3's `key_class(**context)`): the
+        // arguments build in call order, each spread extending them from
+        // its boxed iterable or mapping at run time — CPython's TypeError
+        // for a non-iterable, a non-mapping, or a keyword given twice.
+        let mut steps = Vec::new();
+        for a in &self.args {
+            if let ExprType::Starred(s) = a {
+                let v = boxed(&s.value)?;
+                steps.push(quote!((#callee).extend_spread_args(&mut __rython_args, #v)?;));
+            } else {
+                let v = boxed(a)?;
+                steps.push(quote!(__rython_args.push(#v);));
+            }
+        }
+        for k in &self.keywords {
+            let v = boxed(&k.value)?;
+            match &k.arg {
+                Some(name) => steps.push(quote!(__rython_kw.push((#name.to_string(), #v));)),
+                None => steps.push(quote!((#callee).extend_spread_kwargs(&mut __rython_kw, #v)?;)),
+            }
+        }
+        let args_mut = (!self.args.is_empty()).then(|| quote!(mut));
+        let kw_mut = (!self.keywords.is_empty()).then(|| quote!(mut));
+        Ok(quote!({
+            let #args_mut __rython_args: Vec<stdpython::PyValue> = Vec::new();
+            let #kw_mut __rython_kw: Vec<(String, stdpython::PyValue)> = Vec::new();
+            #(#steps)*
+            (#callee).call_boxed_kw(__rython_args, __rython_kw)?
+        }))
     }
 }
 
