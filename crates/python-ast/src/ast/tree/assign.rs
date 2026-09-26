@@ -1200,6 +1200,23 @@ impl<'a> CodeGen for Assign {
                             }
                         }
                         quote!(#target_code = (#(#rendered),*);)
+                    } else if !matches!(&value_expr, ExprType::Tuple(_))
+                        && !tuple_target.elts.iter().any(|t| matches!(t, ExprType::Starred(_)))
+                        && !matches!(
+                            crate::infer_type(Some(&ctx), &value_expr, &options, &symbols),
+                            crate::TypeInfo::Tuple(_)
+                        )
+                    {
+                        // A value NOT statically a tuple (`username,
+                        // password = get_auth_from_url(proxy)` — requests,
+                        // where the call returns a boxed value): Python
+                        // unpacks by iteration, and the Rust type picks how
+                        // — a tuple is itself, a boxed value iterates, a
+                        // list is length-checked (`PyUnpack`), each with
+                        // CPython's TypeError/ValueError. A statically
+                        // typed tuple keeps the plain destructure.
+                        let n = tuple_target.elts.len();
+                        quote!(#target_code = stdpython::PyUnpack::<#n>::py_unpack(#value)?;)
                     } else {
                         quote!(#target_code = #value;)
                     }

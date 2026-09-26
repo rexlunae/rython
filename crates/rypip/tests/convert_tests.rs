@@ -18342,6 +18342,227 @@ fn spreads_into_a_boxed_function_bind_like_cpython() {
 }
 
 #[test]
+fn destructuring_a_boxed_or_list_value_unpacks_like_cpython() {
+    // `first, second = get_boxed(v)` where the value is boxed (requests'
+    // `username, password = get_auth_from_url(proxy)`, issue #335): Python
+    // unpacks by iteration — a str's characters, a tuple's members —
+    // with CPython's TypeError for a non-iterable and its ValueError for a
+    // length mismatch. A list value is length-checked the same way; a
+    // statically typed tuple destructures as itself.
+    let scratch = Scratch::new("boxedunpack");
+    let file = scratch.path().join("boxed_unpack.py");
+    fs::write(
+        &file,
+        concat!(
+            "def split_pair(text: str) -> tuple[str, str]:\n",
+            "    head, _, tail = text.partition(\":\")\n",
+            "    return head, tail\n",
+            "\n",
+            "\n",
+            "def first_two(items: list[int]) -> int:\n",
+            "    try:\n",
+            "        a, b = items\n",
+            "        return a + b\n",
+            "    except ValueError as exc:\n",
+            "        print(type(exc).__name__, exc)\n",
+            "        return -1\n",
+            "\n",
+            "\n",
+            "def get_boxed(v=None):\n",
+            "    return v\n",
+            "\n",
+            "\n",
+            "def show(v=None) -> None:\n",
+            "    try:\n",
+            "        first, second = get_boxed(v)\n",
+            "        print(first, second)\n",
+            "    except (TypeError, ValueError) as exc:\n",
+            "        print(type(exc).__name__, exc)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    username, password = split_pair(\"user:secret\")\n",
+            "    print(username, password)\n",
+            "    print(first_two(list(range(2))), first_two(list(range(3))), first_two([]))\n",
+            "    show(5)\n",
+            "    show(\"abc\")\n",
+            "    show(None)\n",
+            "    show(\"ab\")\n",
+            "    show((1, \"x\"))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/boxed_unpack"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "user secret",
+            "ValueError too many values to unpack (expected 2)",
+            "ValueError not enough values to unpack (expected 2, got 0)",
+            "1 -1 -1",
+            "TypeError cannot unpack non-iterable int object",
+            "ValueError too many values to unpack (expected 2)",
+            "TypeError cannot unpack non-iterable NoneType object",
+            "a b",
+            "1 x",
+        ],
+    );
+}
+
+#[test]
+fn a_loop_over_boxed_rows_unpacks_each_row() {
+    // `for name, value in fields` where `fields` is boxed (requests'
+    // `for field, val in fields`, issue #335): each boxed row unpacks by
+    // iteration — a tuple's members, a str's characters — with CPython's
+    // ValueError for a length mismatch and TypeError for a non-iterable
+    // row. A Rust tuple pattern could not match the boxed row (E0308).
+    let scratch = Scratch::new("boxedrows");
+    let file = scratch.path().join("boxed_rows.py");
+    fs::write(
+        &file,
+        concat!(
+            "def get_boxed(v=None):\n",
+            "    return v\n",
+            "\n",
+            "\n",
+            "def tally(fields=None) -> int:\n",
+            "    count = 0\n",
+            "    for name, value in fields:\n",
+            "        print(name, value)\n",
+            "        count += 1\n",
+            "    return count\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(tally(get_boxed(((\"a\", 1), (\"b\", 2)))))\n",
+            "    print(tally(get_boxed((\"xy\", \"zw\"))))\n",
+            "    try:\n",
+            "        tally(get_boxed(((1, 2, 3),)))\n",
+            "    except ValueError as exc:\n",
+            "        print(type(exc).__name__, exc)\n",
+            "    try:\n",
+            "        tally(get_boxed((7,)))\n",
+            "    except TypeError as exc:\n",
+            "        print(type(exc).__name__, exc)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/boxed_rows"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "a 1",
+            "b 2",
+            "2",
+            "x y",
+            "z w",
+            "2",
+            "ValueError too many values to unpack (expected 2)",
+            "TypeError cannot unpack non-iterable int object",
+        ],
+    );
+}
+
+#[test]
+fn boxed_or_and_return_the_selected_operand() {
+    // `hooks or {}` where `hooks` is an unannotated `hooks=None`
+    // parameter (requests' default_hooks, issue #335): the operands unify
+    // to a boxed value, and Python returns the SELECTED operand — `or`
+    // the first when truthy, else the second; `and` the second when the
+    // first is truthy, else the first. The fold used to fall to Rust's
+    // `||`/`&&`, which cannot take a boxed operand (E0308).
+    let scratch = Scratch::new("boxedor");
+    let file = scratch.path().join("boxed_or.py");
+    fs::write(
+        &file,
+        concat!(
+            "def default_hooks(hooks=None):\n",
+            "    hooks = hooks or {}\n",
+            "    return hooks\n",
+            "\n",
+            "\n",
+            "def listed(items=None):\n",
+            "    items = items or []\n",
+            "    return len(items)\n",
+            "\n",
+            "\n",
+            "def pick(value=None, fallback: str = \"none\"):\n",
+            "    return value and fallback\n",
+            "\n",
+            "\n",
+            "def chained(a=None, b=None):\n",
+            "    return a or b or \"default\"\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(default_hooks())\n",
+            "    print(default_hooks({\"response\": 1}))\n",
+            "    xs = list(range(3))\n",
+            "    print(listed(), listed(xs))\n",
+            "    print(repr(pick()), repr(pick(0)), repr(pick(5)), repr(pick(\"x\", \"y\")))\n",
+            "    print(chained(), chained(0, 7), chained(\"a\"), chained(\"\", \"\"))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/boxed_or"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "{}",
+            "{'response': 1}",
+            "0 3",
+            "None 0 'none' 'y'",
+            "default 7 a default",
+        ],
+    );
+}
+
+#[test]
 fn an_entry_module_imports_a_sibling_module() {
     // The ENTRY module's `from . import data` is a `pub use crate::data;`
     // — in the bin the entry is the crate root, which already declares

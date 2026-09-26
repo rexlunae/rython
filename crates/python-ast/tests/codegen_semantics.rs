@@ -9064,6 +9064,25 @@ fn a_binary_open_mode_is_the_bytes_file() {
 }
 
 #[test]
+fn a_boxed_or_operand_folds_to_the_selected_boxed_value() {
+    // `hooks or {}` with an unannotated `hooks=None` parameter (requests'
+    // default_hooks, issue #335): the operands unify to PyValue, and the
+    // fold returns the selected operand boxed — never Rust's `||`, which
+    // cannot take a boxed operand.
+    let out = compile(
+        concat!(
+            "def default_hooks(hooks=None):\n",
+            "    hooks = hooks or {}\n",
+            "    return hooks\n",
+        ),
+        "hooks.py",
+    );
+    assert!(out.contains("let __rython_or : stdpython :: PyValue ="), "generated: {}", out);
+    assert!(out.contains("if (__rython_or) . is_truthy () { __rython_or } else {"), "generated: {}", out);
+    assert!(!out.contains("||"), "generated: {}", out);
+}
+
+#[test]
 fn a_text_file_iterates_its_lines_fallibly() {
     // `for line in f` over a text file reads a line per turn; a read can
     // raise (a decode error, a closed file) at that turn, so each line is

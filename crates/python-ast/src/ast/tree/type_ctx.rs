@@ -2872,6 +2872,9 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
                             infos.push(annotation_type_info(e)?);
                         }
                         Some(TypeInfo::Tuple(infos))
+                    } else if let crate::SubscriptKind::Index(elt) = &sub.kind {
+                        // `tuple[int]` — a ONE-element tuple (`(i64,)`).
+                        Some(TypeInfo::Tuple(vec![annotation_type_info(elt)?]))
                     } else {
                         None
                     }
@@ -3884,6 +3887,30 @@ fn analyze_statement_types(
                             && !matches!(slot, TypeInfo::PyObject)
                         {
                             info.name_types.insert(n.id.clone(), slot.clone());
+                        }
+                    }
+                }
+                // A tuple-target destructure of a BOXED value (`username,
+                // password = get_auth_from_url(proxy)` — requests, where the
+                // call returns a boxed value): the lowering unpacks it
+                // through `unpack_boxed`, so each untyped name is boxed.
+                if let (Some(o), Some(s)) = (options, symbols)
+                    && targets.elts.iter().all(|t| matches!(t, ExprType::Name(_)))
+                    && matches!(
+                        infer_type(
+                            self_class.map(|c| CodeGenContext::Class(c.to_string())).as_ref(),
+                            &assign.value,
+                            &analysis_view(o, info),
+                            s,
+                        ),
+                        TypeInfo::PyValue
+                    )
+                {
+                    for t in &targets.elts {
+                        if let ExprType::Name(n) = t
+                            && !info.name_types.contains_key(&n.id)
+                        {
+                            info.name_types.insert(n.id.clone(), TypeInfo::PyValue);
                         }
                     }
                 }
@@ -5251,8 +5278,15 @@ pub fn call_return_typeinfo(
                 return Some(TypeInfo::Class(defining));
             }
             let (f, _) = crate::module_function_def(options, path, &defining)?;
-            let ann = f.returns.as_deref()?;
-            return resolve_alias_typeinfo(ann, &module_symbols(options, &path), options);
+            let def_symbols = module_symbols(options, &path);
+            // An UNANNOTATED imported callee answers from its body, as a
+            // same-module one does (`username, password =
+            // get_auth_from_url(proxy)` — requests' utils function, whose
+            // boxed return the destructure must see).
+            return match f.returns.as_deref() {
+                Some(ann) => resolve_alias_typeinfo(ann, &def_symbols, options),
+                None => f.inferred_return_typeinfo(&def_symbols, options),
+            };
         }
         Some(SymbolTableNode::Assign { value, .. }) => {
             // `cached_mess_ratio = lru_cache(...)(mess_ratio)`: resolve the
@@ -5532,6 +5566,11 @@ pub(crate) fn seed_binder_types(
             if let TypeInfo::Tuple(ts) = ty {
                 for (elt, ety) in t.elts.iter().zip(ts.iter()) {
                     seed_binder_types(elt, ety, out, shadow);
+                }
+            } else if matches!(ty, TypeInfo::PyValue) {
+                // A BOXED row unpacks into boxed members (`unpack_boxed`).
+                for elt in &t.elts {
+                    seed_binder_types(elt, &TypeInfo::PyValue, out, shadow);
                 }
             }
         }

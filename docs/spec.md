@@ -419,7 +419,12 @@ the literal (`.to_string()`) so both arms are `String`. Two Bools still
 lower to `&&`/`||` (a bool's truthiness *is* the result, so `||` is
 exact), and inference types a value BoolOp as the unify of its operands
 — the same relation the fold lowers — so inference and codegen agree on
-the selected operand's type.
+the selected operand's type. A BOXED operand beside any other (`hooks or
+{}` where `hooks` is an unannotated `hooks=None` parameter) unifies to
+the boxed value: the fold returns the selected operand boxed, each
+direct operand rendered into the PyValue slot (an empty `{}` or `[]`
+boxes as a typed empty container) — never Rust's `||`, which cannot take
+a boxed operand.
 
 A subscript STORE into a boxed dict (`dict[str, Any]` →
 `PyDict<String, PyValue>`) absorbs an `Option` value the way the box
@@ -615,7 +620,14 @@ counterparts. Loop `else` runs when the loop wasn't left by `break`,
 implemented with a broke-flag only when the body actually contains a
 direct `break`. A loop variable read after the loop is hoisted so
 Python's scope-leak of the induction variable is preserved. Tuple
-targets destructure.
+targets destructure. A tuple target over a value that is not
+statically a tuple unpacks as Python does, by iteration, the value's
+Rust type choosing how (`PyUnpack`): a boxed value iterates its members
+(a str its characters), a list or variable-length tuple is
+length-checked, a tuple is itself — with CPython's `TypeError: cannot
+unpack non-iterable int object` and its `ValueError` for a length
+mismatch. A loop over boxed rows (`for k, v in fields` with `fields`
+boxed) unpacks each row the same way.
 
 ### 5.3 `with`
 
@@ -2516,6 +2528,7 @@ accepted as permanent spec:
 | Divergence | Status |
 |---|---|
 | `unicodedata` answers from the Unicode 16.0.0 database — CPython 3.14's `unidata_version` — for every CPython: an older CPython carries an older database (3.12: 15.0.0, 3.13: 15.1.0), so a code point assigned or re-classified since answers differently there (`category`, `bidirectional`, `combining`, `name`, `normalize`). Code points assigned before 15.0 agree | Model limit (issue #334); a per-CPython database would need one table set per version |
+| Unpacking's ValueError text is CPython 3.11–3.13's: `too many values to unpack (expected 2)`. CPython 3.14 appends the length for a sized sequence (`(expected 2, got 3)` for a tuple, list or dict; not for a str). `not enough values to unpack (expected 2, got 1)` and `cannot unpack non-iterable int object` agree across versions | Model limit; one message set, pinned to the 3.11 transcripts |
 | True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |
 | Exception message shapes: `int()`'s message carries "with base 10" and `float()`'s quotes the string as Python's repr (#339, round 10); `open` and stream errors are CPython's `[Errno N] text: 'path'` form (#339); the `KeyError` key quoting is single-quoted like CPython (round 99) | Correct (was a defect class in issue #82's family) |
 | An uncaught exception on the direct-`main` entry path prints Rust's `Debug` form instead of `Type: message` (exit code 1 either way) | Defect (cosmetic) |

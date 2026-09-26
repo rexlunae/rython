@@ -1595,6 +1595,82 @@ pub fn unpack_sequence<T, const N: usize>(
     })
 }
 
+/// Unpacking a BOXED value into `N` targets (`for k, v in pairs` or
+/// `user, password = get_auth(url)` where the value is boxed): its
+/// members as Python iterates them, CPython's `TypeError: cannot unpack
+/// non-iterable int object` for a non-iterable, and the ValueError of
+/// [`unpack_sequence`] for a length other than `N`.
+pub fn unpack_boxed<const N: usize>(value: PyValue) -> Result<[PyValue; N], PyException> {
+    match value {
+        PyValue::Int(_)
+        | PyValue::Float(_)
+        | PyValue::Bool(_)
+        | PyValue::Complex(_)
+        | PyValue::Function(_)
+        | PyValue::None_ => Err(type_error(&format!(
+            "cannot unpack non-iterable {} object",
+            value.py_type_name()
+        ))),
+        iterable => unpack_sequence::<PyValue, N>(iterable.into_iter().collect::<Vec<_>>()),
+    }
+}
+
+/// Python's `a, b = value` for a value whose shape the compiler cannot
+/// see (`username, password = get_auth_from_url(proxy)` — requests): the
+/// Rust type picks the unpacking. A tuple is itself; a boxed value
+/// iterates ([`unpack_boxed`]); a list or variable-length tuple is
+/// length-checked ([`unpack_sequence`]) — CPython's TypeError and
+/// ValueError in each case.
+pub trait PyUnpack<const N: usize> {
+    type Out;
+    fn py_unpack(self) -> Result<Self::Out, PyException>;
+}
+
+macro_rules! py_unpack_impls {
+    ($n:literal; $($T:ident),+) => {
+        impl<$($T),+> PyUnpack<$n> for ($($T,)+) {
+            type Out = ($($T,)+);
+            fn py_unpack(self) -> Result<Self::Out, PyException> {
+                Ok(self)
+            }
+        }
+        impl PyUnpack<$n> for PyValue {
+            type Out = ($(py_unpack_impls!(@as $T PyValue),)+);
+            #[allow(non_snake_case)]
+            fn py_unpack(self) -> Result<Self::Out, PyException> {
+                let [$($T),+] = unpack_boxed::<$n>(self)?;
+                Ok(($($T,)+))
+            }
+        }
+        impl<X> PyUnpack<$n> for Vec<X> {
+            type Out = ($(py_unpack_impls!(@as $T X),)+);
+            #[allow(non_snake_case)]
+            fn py_unpack(self) -> Result<Self::Out, PyException> {
+                let [$($T),+] = unpack_sequence::<X, $n>(self)?;
+                Ok(($($T,)+))
+            }
+        }
+        impl<X> PyUnpack<$n> for PyTuple<X> {
+            type Out = ($(py_unpack_impls!(@as $T X),)+);
+            #[allow(non_snake_case)]
+            fn py_unpack(self) -> Result<Self::Out, PyException> {
+                let [$($T),+] = unpack_sequence::<X, $n>(self.0)?;
+                Ok(($($T,)+))
+            }
+        }
+    };
+    (@as $T:ident $U:ty) => { $U };
+}
+
+py_unpack_impls!(1; A);
+py_unpack_impls!(2; A, B);
+py_unpack_impls!(3; A, B, C);
+py_unpack_impls!(4; A, B, C, D);
+py_unpack_impls!(5; A, B, C, D, E);
+py_unpack_impls!(6; A, B, C, D, E, F);
+py_unpack_impls!(7; A, B, C, D, E, F, G);
+py_unpack_impls!(8; A, B, C, D, E, F, G, H);
+
 /// Python list() builtin.
 pub fn list<L: PyListFrom>(x: L) -> Vec<L::Item> {
     x.py_list()
