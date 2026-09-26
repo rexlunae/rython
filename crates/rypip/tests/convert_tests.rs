@@ -18740,7 +18740,7 @@ fn type_self_name_in_an_inherited_method_names_the_instance_class() {
     // names the INSTANCE's class, as in CPython — in `__repr__`, through
     // `super()`, and on a base-typed value holding a subclass. It used to
     // name the defining class (`Base Base leaf/Base`).
-    let scratch = Scratch::new("typename");
+    let scratch = Scratch::new("inheritedtypename");
     let file = scratch.path().join("typename.py");
     fs::write(
         &file,
