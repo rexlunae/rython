@@ -4895,3 +4895,40 @@ fn a_list_of_numbers_boxes_and_unboxes() {
     let v: Vec<i64> = PyValue::from(vec![PyValue::Int(3), PyValue::Bool(true)]).into();
     assert_eq!(v, vec![3, 1]);
 }
+
+#[test]
+fn a_boxed_range_is_still_a_range() {
+    // issue #335: a range passed into a boxed parameter slot.
+    let r = PyValue::from(range_start_stop(3, 6));
+    // repr(range(3, 6)) == 'range(3, 6)'; range(0, 10, 2) keeps its step
+    assert_eq!(py_display(&r), "range(3, 6)");
+    assert_eq!(py_display(&PyValue::from(range(2))), "range(0, 2)");
+    assert_eq!(py_display(&PyValue::from(range_start_stop_step(0, 10, 2).unwrap())), "range(0, 10, 2)");
+    // len(range(0, 10, 3)) == 4; range(0, 10, 3)[2] == 6; 3 in range(0, 10, 3)
+    let r3 = PyValue::from(range_start_stop_step(0, 10, 3).unwrap());
+    assert_eq!(r3.len(), 4);
+    assert_eq!(r3.py_index(2i64).unwrap(), PyValue::Int(6));
+    assert!(r3.py_contains(&PyValue::Int(3)));
+    // range(3)[5] -> IndexError: range object index out of range
+    assert_eq!(
+        PyValue::from(range(3)).py_index(5i64).unwrap_err().message,
+        "range object index out of range"
+    );
+    // bool(range(0)) is False; list(range(3, 6)) == [3, 4, 5]
+    assert!(!PyValue::from(range(0)).is_truthy());
+    let v: Vec<i64> = r.clone().into();
+    assert_eq!(v, vec![3, 4, 5]);
+    // range(0, 3, 2) == range(0, 4, 2); range(0) == range(2, 2)
+    assert!(stdpython::stdlib::unittest::assert_eq(
+        &PyValue::from(range_start_stop_step(0, 3, 2).unwrap()),
+        &PyValue::from(range_start_stop_step(0, 4, 2).unwrap()),
+        String::new()
+    )
+    .is_ok());
+    assert!(stdpython::stdlib::unittest::assert_eq(
+        &PyValue::from(range(0)),
+        &PyValue::from(range_start_stop(2, 2)),
+        String::new()
+    )
+    .is_ok());
+}

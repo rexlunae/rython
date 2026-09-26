@@ -94,12 +94,12 @@ fn main() -> Result<()> {
         // Rust-module imports resolve through the rython.toml manifest in
         // the input file's directory.
         let rust_modules = load_rust_modules(input.parent().unwrap_or_else(|| Path::new(".")))?;
-        let options = PythonOptions {
+        let options = PythonOptions::from(python_ast::PythonOptionsData {
             with_std_python: !args.nostd,
             numpy_backend: args.numpy_backend.clone(),
             rust_modules: std::rc::Rc::new(rust_modules),
             ..Default::default()
-        };
+        });
 
         let module_name = format!("{}", input.to_string_lossy());
         let py = read_to_string(input.clone())?;

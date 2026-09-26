@@ -756,6 +756,9 @@ pub fn pyvalue_to_json(value: &crate::PyValue) -> JSONValue {
         PyValue::Complex(_) => {
             panic!("TypeError: Object of type complex is not JSON serializable")
         }
+        PyValue::Range(_) => {
+            panic!("TypeError: Object of type range is not JSON serializable")
+        }
         PyValue::Tuple(t) => {
             JSONValue::Array(t.iter().map(pyvalue_to_json).collect())
         }

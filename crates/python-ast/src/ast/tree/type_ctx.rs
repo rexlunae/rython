@@ -533,6 +533,14 @@ pub fn coerce_tokens(
         | (TypeInfo::PyValue, TypeInfo::Bytes) => {
             Some(quote!((#tokens).into()))
         }
+        // A boxed int sequence into a `list[int]` slot (issue #335: a
+        // boxed method parameter passed on to `def total(xs: List[int])`).
+        (TypeInfo::PyValue, TypeInfo::Vec(inner)) if matches!(**inner, TypeInfo::Int) => {
+            // Clone the source: the conversion consumes it, and a loop or a
+            // later read may still need the boxed value (the reuse-clone
+            // wraps the converted result, not the source).
+            Some(quote!(<Vec<i64>>::from((#tokens).clone())))
+        }
         // Round 83 (the generics directive): an OPTION-typed value into a
         // CONCRETE slot (`Option<Vec<u8>> → Vec<u8>` — a `bytes | None`
         // field read passed to a `bytes`-annotated parameter — urllib3's
@@ -908,6 +916,24 @@ fn infer_type_inner(
         ExprType::BinOp(op) => {
             let l = infer_type_inner(ctx, &op.left, options, symbols);
             let r = infer_type_inner(ctx, &op.right, options, symbols);
+            // A BOXED left operand under `+`/`-`/`*` (issue #335 —
+            // `method + " " + url` over an instance method's boxed
+            // parameters): the runtime's PyValue operators take a boxed
+            // or scalar right operand and answer a boxed value.
+            if matches!(l, TypeInfo::PyValue)
+                && matches!(op.op, crate::BinOps::Add | crate::BinOps::Sub | crate::BinOps::Mult)
+                && matches!(
+                    r,
+                    TypeInfo::PyValue
+                        | TypeInfo::Int
+                        | TypeInfo::Float
+                        | TypeInfo::Bool
+                        | TypeInfo::String
+                        | TypeInfo::StrRef
+                )
+            {
+                return TypeInfo::PyValue;
+            }
             match op.op {
                 crate::BinOps::Add => {
                     if is_stringy(&l) && is_stringy(&r) {
@@ -1470,6 +1496,9 @@ pub(crate) fn iterable_element_type(t: &TypeInfo) -> Option<TypeInfo> {
         TypeInfo::String | TypeInfo::StrRef => Some(TypeInfo::String),
         TypeInfo::Range => Some(TypeInfo::Int),
         TypeInfo::Borrowed(inner) => iterable_element_type(inner),
+        // A boxed value iterates boxed members (PyValue's IntoIterator —
+        // tuple elements, 1-char strs, byte ints, dict keys; issue #335).
+        TypeInfo::PyValue => Some(TypeInfo::PyValue),
         _ => None,
     }
 }
@@ -1812,6 +1841,33 @@ pub fn render_typed(
             return Ok(quote!(stdpython::PyValue::from(
                 stdpython::PyDict::<String, stdpython::PyValue>::default()
             )));
+        }
+        // An EMPTY list into a boxed slot: the boxed list's representation
+        // (the §12.3 list-as-tuple divergence every boxed list has),
+        // spelled out so the element type is not left to inference.
+        if let ExprType::List(l) = expr
+            && l.is_empty()
+        {
+            return Ok(quote!(stdpython::PyValue::from(Vec::<stdpython::PyValue>::new())));
+        }
+        // A list literal of one scalar kind (`[111]` into a boxed slot —
+        // idna's `_test_containment([111], [110, 112])`, issue #334): the
+        // element type is pinned before boxing, or rustc defaults the int
+        // literals to i32, which has no boxed form.
+        if let ExprType::List(l) = expr
+            && !l.is_empty()
+            && let TypeInfo::Vec(elem) = infer_type(Some(&ctx), expr, &options, &symbols)
+            && matches!(*elem, TypeInfo::Int | TypeInfo::Float | TypeInfo::Bool)
+        {
+            let ty = elem.to_rust_type();
+            let inner = render_typed(
+                expr,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+                Some(TypeInfo::Vec(elem.clone())),
+            )?;
+            return Ok(quote!(stdpython::PyValue::from(<Vec<#ty>>::from(#inner))));
         }
     }
     // A class name used as a VALUE (`[ChecksumError]`, `merge_setting(
@@ -2308,6 +2364,8 @@ pub fn is_boxable_value_type(t: &TypeInfo) -> bool {
             | TypeInfo::PyValue
             // A complex member (`[1, 2.5, 3j]` — issue #366).
             | TypeInfo::Complex
+            // A range (PyValue::Range — issue #335).
+            | TypeInfo::Range
     )
 }
 
