@@ -7393,7 +7393,7 @@ impl<'a> CodeGen for Call {
                         };
                         let construct =
                             shared_construction(&class.name, quote!(#cname::new(#(#args),*)?));
-                        return Ok(quote!({ #prelude #construct }));
+                        return Ok(with_prelude(prelude, construct));
                     }
                     None => {
                         // The class has NO own __init__ and its base's
@@ -7619,7 +7619,7 @@ impl<'a> CodeGen for Call {
                 )?;
                 let cname = crate::safe_ident(&receiver.id);
                 let method_name = crate::safe_ident(&attr.attr);
-                return Ok(quote!({ #prelude #cname::#method_name(#(#args),*)? }));
+                return Ok(with_prelude(prelude, quote!(#cname::#method_name(#(#args),*)?)));
             }
             // An UNBOUND-method call (`RequestMethods.__init__(self,
             // headers)` — urllib3's connectionpool, where HTTPConnectionPool
@@ -7654,7 +7654,7 @@ impl<'a> CodeGen for Call {
                 )?;
                 let cname = crate::safe_ident(&receiver.id);
                 let method_name = crate::safe_ident(&attr.attr);
-                return Ok(quote!({ #prelude #cname::#method_name(#(#args),*)? }));
+                return Ok(with_prelude(prelude, quote!(#cname::#method_name(#(#args),*)?)));
             }
         }
 
@@ -7859,7 +7859,7 @@ impl<'a> CodeGen for Call {
                         quote!(self #chain_tokens)
                     };
                     let method_name = crate::safe_ident(&attr.attr);
-                    return Ok(quote!({ #prelude (#receiver).#method_name(#(#args),*)? }));
+                    return Ok(with_prelude(prelude, quote!((#receiver).#method_name(#(#args),*)?)));
                 }
                 // Non-init `super().m(...)`: dispatch through the DEFINER's
                 // super trampoline with the plain derived `self`, so the
@@ -7876,7 +7876,7 @@ impl<'a> CodeGen for Call {
                 let definer_trait =
                     crate::safe_ident(&format!("{}Trait", definer.name));
                 let helper = crate::safe_ident(&format!("__rython_super_{}", attr.attr));
-                return Ok(quote!({ #prelude <Self as #definer_trait>::#helper(self, #(#args),*)? }));
+                return Ok(with_prelude(prelude, quote!(<Self as #definer_trait>::#helper(self, #(#args),*)?)));
             }
             // A method call on a receiver whose class is known — `self`
             // inside a method, or a name assigned a construction — resolves
@@ -8032,7 +8032,7 @@ impl<'a> CodeGen for Call {
                     if is_static || is_classmethod {
                         let cname = crate::safe_ident(&class.name);
                         let mname = crate::safe_ident(&attr.attr);
-                        return Ok(quote!({ #prelude #cname::#mname(#(#args),*)? }));
+                        return Ok(with_prelude(prelude, quote!(#cname::#mname(#(#args),*)?)));
                     }
                     // A field receiver (`self.inner`, `self.items`) renders
                     // in place flavor when the callee mutates the receiver
@@ -8155,7 +8155,7 @@ impl<'a> CodeGen for Call {
                             __rython_call
                         }));
                     }
-                    return Ok(quote!({ #prelude (#receiver).#method_name(#(#args),*)? }));
+                    return Ok(with_prelude(prelude, quote!((#receiver).#method_name(#(#args),*)?)));
                 }
             }
             // A method call on a PyValue-typed SELF-FIELD
@@ -10229,8 +10229,11 @@ let mutating_self_field = boxed_self_ref_receiver
                     &symbols,
                 )?;
                 let name = self.func.to_rust(ctx, options, symbols)?;
-                let call = quote!({ #prelude #name(#(#args),*) });
-                return Ok(if propagates_exceptions {
+                let bare = prelude.is_empty();
+                let call = with_prelude(prelude, quote!(#name(#(#args),*)));
+                return Ok(if propagates_exceptions && bare {
+                    quote!(#call?)
+                } else if propagates_exceptions {
                     // Parenthesize before `?`: a bare `{...}?` in statement
                     // position is not a valid expression statement (the
                     // block's tail value mismatches `()`), so `f(a=1)` on
@@ -12407,6 +12410,19 @@ struct MappedArguments {
     args: Vec<TokenStream>,
 }
 
+/// `{ prelude call }`, or the bare `call` when the prelude is empty: a
+/// block around a lone expression trips rustc's `unused_braces` lint
+/// (`s = { Span::new(vec![4, 9, 12])? };`). Every call shape passed here
+/// is a postfix expression, so dropping the braces never changes how it
+/// binds in the surrounding expression.
+fn with_prelude(prelude: TokenStream, call: TokenStream) -> TokenStream {
+    if prelude.is_empty() {
+        call
+    } else {
+        quote!({ #prelude #call })
+    }
+}
+
 /// Defaults are evaluated ONCE at def time by CPython; rython inlines them
 /// at each call site. A scalar constant (literal, None/True/False, or a
 /// tuple of those) is safe to inline; anything else is a loud conversion
@@ -14157,9 +14173,9 @@ pub(crate) fn dunder_method_call(
         map_call_arguments(&sig, args, &[], ctx, options, symbols)?;
     let mname = crate::safe_ident(&method.name);
     if fallible {
-        Ok(quote!({ #prelude (#recv).#mname(#(#args),*)? }))
+        Ok(with_prelude(prelude, quote!((#recv).#mname(#(#args),*)?)))
     } else {
-        Ok(quote!({ #prelude (#recv).#mname(#(#args),*) }))
+        Ok(with_prelude(prelude, quote!((#recv).#mname(#(#args),*))))
     }
 }
 
