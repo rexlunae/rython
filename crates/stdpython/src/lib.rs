@@ -1595,6 +1595,82 @@ pub fn unpack_sequence<T, const N: usize>(
     })
 }
 
+/// Unpacking a BOXED value into `N` targets (`for k, v in pairs` or
+/// `user, password = get_auth(url)` where the value is boxed): its
+/// members as Python iterates them, CPython's `TypeError: cannot unpack
+/// non-iterable int object` for a non-iterable, and the ValueError of
+/// [`unpack_sequence`] for a length other than `N`.
+pub fn unpack_boxed<const N: usize>(value: PyValue) -> Result<[PyValue; N], PyException> {
+    match value {
+        PyValue::Int(_)
+        | PyValue::Float(_)
+        | PyValue::Bool(_)
+        | PyValue::Complex(_)
+        | PyValue::Function(_)
+        | PyValue::None_ => Err(type_error(&format!(
+            "cannot unpack non-iterable {} object",
+            value.py_type_name()
+        ))),
+        iterable => unpack_sequence::<PyValue, N>(iterable.into_iter().collect::<Vec<_>>()),
+    }
+}
+
+/// Python's `a, b = value` for a value whose shape the compiler cannot
+/// see (`username, password = get_auth_from_url(proxy)` — requests): the
+/// Rust type picks the unpacking. A tuple is itself; a boxed value
+/// iterates ([`unpack_boxed`]); a list or variable-length tuple is
+/// length-checked ([`unpack_sequence`]) — CPython's TypeError and
+/// ValueError in each case.
+pub trait PyUnpack<const N: usize> {
+    type Out;
+    fn py_unpack(self) -> Result<Self::Out, PyException>;
+}
+
+macro_rules! py_unpack_impls {
+    ($n:literal; $($T:ident),+) => {
+        impl<$($T),+> PyUnpack<$n> for ($($T,)+) {
+            type Out = ($($T,)+);
+            fn py_unpack(self) -> Result<Self::Out, PyException> {
+                Ok(self)
+            }
+        }
+        impl PyUnpack<$n> for PyValue {
+            type Out = ($(py_unpack_impls!(@as $T PyValue),)+);
+            #[allow(non_snake_case)]
+            fn py_unpack(self) -> Result<Self::Out, PyException> {
+                let [$($T),+] = unpack_boxed::<$n>(self)?;
+                Ok(($($T,)+))
+            }
+        }
+        impl<X> PyUnpack<$n> for Vec<X> {
+            type Out = ($(py_unpack_impls!(@as $T X),)+);
+            #[allow(non_snake_case)]
+            fn py_unpack(self) -> Result<Self::Out, PyException> {
+                let [$($T),+] = unpack_sequence::<X, $n>(self)?;
+                Ok(($($T,)+))
+            }
+        }
+        impl<X> PyUnpack<$n> for PyTuple<X> {
+            type Out = ($(py_unpack_impls!(@as $T X),)+);
+            #[allow(non_snake_case)]
+            fn py_unpack(self) -> Result<Self::Out, PyException> {
+                let [$($T),+] = unpack_sequence::<X, $n>(self.0)?;
+                Ok(($($T,)+))
+            }
+        }
+    };
+    (@as $T:ident $U:ty) => { $U };
+}
+
+py_unpack_impls!(1; A);
+py_unpack_impls!(2; A, B);
+py_unpack_impls!(3; A, B, C);
+py_unpack_impls!(4; A, B, C, D);
+py_unpack_impls!(5; A, B, C, D, E);
+py_unpack_impls!(6; A, B, C, D, E, F);
+py_unpack_impls!(7; A, B, C, D, E, F, G);
+py_unpack_impls!(8; A, B, C, D, E, F, G, H);
+
 /// Python list() builtin.
 pub fn list<L: PyListFrom>(x: L) -> Vec<L::Item> {
     x.py_list()
@@ -7354,6 +7430,14 @@ impl PyException {
     /// does NOT catch SystemExit, KeyboardInterrupt or GeneratorExit —
     /// the old hand-copied tree missed parts of that (spec §12.3 defect
     /// class, fixed here).
+    /// Python's `type(e).__name__`: the raised class's name. A builtin
+    /// alias names its class (`raise IOError` raises an `OSError`).
+    pub fn type_name(&self) -> alloc::string::String {
+        crate::builtin_exceptions::canonical_name(&self.exception_type)
+            .unwrap_or(&self.exception_type)
+            .to_string()
+    }
+
     pub fn matches(&self, name: &str) -> bool {
         use crate::builtin_exceptions::BUILTIN_EXCEPTION_MRO;
         // Exact name equality covers user-defined classes and builtins
@@ -8250,6 +8334,14 @@ pub fn input<P: AsRef<str>>(prompt: Option<P>) -> Result<String, PyException> {
 /// RuntimeError would never match, and the error would escape the try.
 #[cfg(feature = "std")]
 fn os_error(e: &std::io::Error, path: &str) -> PyException {
+    os_error_paths(e, &[path])
+}
+
+/// [`os_error`] over the failing call's filenames, as CPython renders
+/// them: none (`os.getcwd()` — `[Errno 2] No such file or directory`),
+/// one (`: 'path'`), or a pair (`os.replace` — `: 'src' -> 'dst'`).
+#[cfg(feature = "std")]
+pub(crate) fn os_error_paths(e: &std::io::Error, paths: &[&str]) -> PyException {
     let kind = os_error_kind(e);
     // CPython's str(OSError): `[Errno 2] No such file or directory:
     // 'path'` — the errno and the OS's own text (Rust's Display appends
@@ -8262,9 +8354,16 @@ fn os_error(e: &std::io::Error, path: &str) -> PyException {
     // The path is Python's repr (`"it's.txt"` switches quotes, as
     // CPython's `filename` rendering does — Devin review on #339,
     // round 4).
-    let message = match e.raw_os_error() {
-        Some(code) => format!("[Errno {}] {}: {}", code, text, py_str_repr(path)),
-        None => format!("{}: {}", text, py_str_repr(path)),
+    let names = paths
+        .iter()
+        .map(|p| py_str_repr(p))
+        .collect::<Vec<_>>()
+        .join(" -> ");
+    let message = match (e.raw_os_error(), names.is_empty()) {
+        (Some(code), false) => format!("[Errno {}] {}: {}", code, text, names),
+        (Some(code), true) => format!("[Errno {}] {}", code, text),
+        (None, false) => format!("{}: {}", text, names),
+        (None, true) => text,
     };
     PyException::new(kind, message)
 }
@@ -8508,6 +8607,35 @@ pub struct PyFile {
     /// Python `f.name`: the path a disk file was opened from (an
     /// in-memory StringIO has no name in Python; here it is "").
     pub name: String,
+}
+
+/// The line iterator of a text file ([`PyFile::py_lines`]): each item is
+/// the next `readline()`, ending at the empty string; a failed read is
+/// yielded once and ends the iteration.
+pub struct PyFileLines {
+    file: PyFile,
+    done: bool,
+}
+
+impl Iterator for PyFileLines {
+    type Item = Result<String, PyException>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self.file.readline() {
+            Ok(line) if line.is_empty() => {
+                self.done = true;
+                None
+            }
+            Ok(line) => Some(Ok(line)),
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
 }
 
 /// The text-mode reader of a disk file — CPython's TextIOWrapper over
@@ -8827,6 +8955,14 @@ impl PyFile {
             PyFileBackend::DiskWrite(_) => Err(unsupported_operation("not readable")),
             PyFileBackend::Closed => Err(closed_file_error()),
         }
+    }
+
+    /// Python's `for line in f`: one `readline()` per turn until the
+    /// empty string. Each line is a Result — a read that fails (a UTF-8
+    /// decode error, a closed file) is the exception at THAT turn, after
+    /// the earlier lines were seen, as CPython's iteration raises it.
+    pub fn py_lines(&self) -> PyFileLines {
+        PyFileLines { file: self.clone(), done: false }
     }
 
     /// Python file.readlines() method. Lines KEEP their terminators

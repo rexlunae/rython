@@ -388,6 +388,46 @@ fn fold(
                     })
                 }
             }
+            // A BOXED operand beside any other (`hooks or {}`, `files or
+            // []` — requests' unannotated `hooks=None` parameters, issue
+            // #335): the operands unify to PyValue — the type inference
+            // already gives the BoolOp — so the fold returns the SELECTED
+            // operand boxed: `or` = truthy ? first : rest, `and` = truthy ?
+            // rest : first, the first operand bound once and the second
+            // evaluated only when selected. Each direct operand renders
+            // against the PyValue slot (an empty `{}` / `[]` literal boxes
+            // as a typed empty container); a nested fold's result is boxed
+            // whole. The `&&`/`||` fallback could never compile here — a
+            // PyValue is not a bool.
+            (_, _) if matches!(u, T::PyValue) => {
+                let boxed = |k: usize, plain: &TokenStream| {
+                    crate::render_typed_reused(
+                        &values[k],
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                        Some(T::PyValue),
+                    )
+                    .unwrap_or_else(|_| quote!(stdpython::PyValue::from(#plain)))
+                };
+                let boxed_first = boxed(i, first);
+                let boxed_rest = if i + 1 == values.len() - 1 {
+                    boxed(i + 1, &rest)
+                } else {
+                    quote!(stdpython::PyValue::from(#rest))
+                };
+                if op == BoolOps::And {
+                    quote!({
+                        let __rython_and: stdpython::PyValue = #boxed_first;
+                        if (__rython_and).is_truthy() { #boxed_rest } else { __rython_and }
+                    })
+                } else {
+                    quote!({
+                        let __rython_or: stdpython::PyValue = #boxed_first;
+                        if (__rython_or).is_truthy() { __rython_or } else { #boxed_rest }
+                    })
+                }
+            }
             _ => {
                 if op == BoolOps::And {
                     quote!((#first) && (#rest))

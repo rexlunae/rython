@@ -130,6 +130,16 @@ impl<'a> CodeGen for Attribute {
             let recv = arg
                 .clone()
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            // A CAUGHT EXCEPTION (`except E as exc: type(exc).__name__`)
+            // carries its raised class's name — exact, no boxing.
+            if crate::ast::tree::arguments::is_exception_typeinfo(&crate::infer_type(
+                Some(&ctx),
+                arg,
+                &options,
+                &symbols,
+            )) {
+                return Ok(quote!((#recv).type_name()));
+            }
             options.definition_warnings.borrow_mut().push(
                 "type(x).__name__ on a non-self receiver lowers through the boxed \
                  value's runtime type name (the class-as-value divergence)"

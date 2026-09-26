@@ -1,0 +1,7 @@
+ERROR 1 !
+INFO  3
+WARN  1
+lines read: 7 total: 5
+first warning: 'WARN disk 91%\n'
+next: '# comment\n'
+ValueError: I/O operation on closed file.

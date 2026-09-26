@@ -170,15 +170,15 @@ impl CodeGen for For {
         } else if let ExprType::Tuple(t) = &self.target
             && !t.elts.is_empty()
             && t.elts.iter().all(|e| matches!(e, ExprType::Name(_)))
-            && matches!(
+            && let Some(row_type @ (crate::TypeInfo::Vec(_)
+            | crate::TypeInfo::PyTuple(_)
+            | crate::TypeInfo::PyValue)) =
                 crate::ast::tree::type_ctx::iterable_element_type(&crate::infer_type(
                     Some(&ctx),
                     &self.iter,
                     &options,
                     &symbols,
-                )),
-                Some(crate::TypeInfo::Vec(_) | crate::TypeInfo::PyTuple(_))
-            )
+                ))
         {
             // A tuple target over SEQUENCE elements (`for a, b in rows`
             // where each row is a list — idna's `tld_strings`): Python
@@ -193,10 +193,19 @@ impl CodeGen for For {
                 }
                 _ => quote!(_),
             });
+            // A BOXED row (`for k, v in pairs` where the iterable is a
+            // boxed value — requests' `for field, val in fields`) unpacks
+            // through the boxed iteration, with CPython's TypeError for a
+            // non-iterable member.
+            let unpack = if matches!(row_type, crate::TypeInfo::PyValue) {
+                quote!(stdpython::unpack_boxed::<#n>(__rython_row)?)
+            } else {
+                quote!(stdpython::unpack_sequence::<_, #n>(__rython_row)?)
+            };
             (
                 quote!(__rython_row),
                 quote!(
-                    let [#(#names),*] = stdpython::unpack_sequence::<_, #n>(__rython_row)?;
+                    let [#(#names),*] = #unpack;
                     #(#body_stmts;)*
                 ),
             )
@@ -433,6 +442,22 @@ impl CodeGen for For {
             }
             iter = quote!([#(#elts),*]);
         }
+        // A TEXT FILE iterable (`for line in f` — idna's IdnaTestV2 vector
+        // reader): Python reads a line per turn until the empty string. A
+        // read can fail (a UTF-8 decode error, a closed file), and that
+        // failure is the exception at THAT turn, after the earlier lines'
+        // bodies ran — so each line is a Result, propagated in the body.
+        let (loop_target, loop_inner) = if crate::ast::tree::type_ctx::is_file_typeinfo(
+            &crate::infer_type(Some(&ctx), &self.iter, &options, &symbols),
+        ) {
+            iter = quote!((#iter).py_lines());
+            (
+                quote!(__rython_line),
+                quote!(let #loop_target = __rython_line?; #loop_inner),
+            )
+        } else {
+            (loop_target, loop_inner)
+        };
 
         if !has_else {
             Ok(quote! {

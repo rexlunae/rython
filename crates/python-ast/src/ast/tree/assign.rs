@@ -1200,6 +1200,30 @@ impl<'a> CodeGen for Assign {
                             }
                         }
                         quote!(#target_code = (#(#rendered),*);)
+                    } else if !tuple_target.elts.iter().any(|t| matches!(t, ExprType::Starred(_)))
+                        && match crate::infer_type(Some(&ctx), &value_expr, &options, &symbols) {
+                            crate::TypeInfo::PyValue => true,
+                            crate::TypeInfo::PyObject => matches!(&value_expr,
+                                ExprType::Call(c) if matches!(c.func.as_ref(), ExprType::Name(_))),
+                            // A LIST local (`a, b = items`): length-checked.
+                            crate::TypeInfo::Vec(_) => matches!(&value_expr, ExprType::Name(_)),
+                            _ => false,
+                        }
+                    {
+                        // A BOXED value, or a FUNCTION's result whose type
+                        // inference cannot see (`username, password =
+                        // get_auth_from_url(proxy)` — requests, where the
+                        // unannotated callee returns a boxed value): Python
+                        // unpacks by iteration, and the Rust type picks how
+                        // — a tuple is itself, a boxed value iterates, a
+                        // list is length-checked (`PyUnpack`), each with
+                        // CPython's TypeError/ValueError; a list local is
+                        // length-checked. Every other value keeps the plain
+                        // destructure (a typed tuple is itself; a method
+                        // result or a class instance stays the loud
+                        // mismatch it was).
+                        let n = tuple_target.elts.len();
+                        quote!(#target_code = stdpython::PyUnpack::<#n>::py_unpack(#value)?;)
                     } else {
                         quote!(#target_code = #value;)
                     }

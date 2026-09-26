@@ -1107,6 +1107,8 @@ fn infer_type_inner(
             func if threading_local_ctor(func, symbols) => {
                 TypeInfo::Threading(crate::ThreadingType::Local)
             }
+            // The builtin `open` in a text mode returns the text file.
+            _ if is_text_open_call(call, symbols) => file_typeinfo(),
             // The ITERATOR builtins carry their argument's element type
             // through (issue #222), so they are typed before the
             // name-only table below, which cannot see arguments.
@@ -1623,8 +1625,39 @@ pub(crate) fn iterable_element_type(t: &TypeInfo) -> Option<TypeInfo> {
         // A boxed value iterates boxed members (PyValue's IntoIterator —
         // tuple elements, 1-char strs, byte ints, dict keys; issue #335).
         TypeInfo::PyValue => Some(TypeInfo::PyValue),
+        // A text file iterates its lines (`for line in f` — the loop
+        // lowers through `PyFile::py_lines`).
+        t if is_file_typeinfo(t) => Some(TypeInfo::String),
         _ => None,
     }
+}
+
+/// The runtime's text-file type as a TypeInfo: `PyFile`, what a text-mode
+/// `open(...)` returns (and what `with open(...) as f` binds — a file's
+/// `__enter__` returns the file itself).
+pub(crate) fn file_typeinfo() -> TypeInfo {
+    TypeInfo::Custom(quote!(PyFile))
+}
+
+/// Whether a TypeInfo is the runtime's text-file type ([`file_typeinfo`]).
+pub(crate) fn is_file_typeinfo(t: &TypeInfo) -> bool {
+    matches!(t, TypeInfo::Custom(tokens) if tokens.to_string() == "PyFile")
+}
+
+/// Whether a call is the BUILTIN `open` in a text mode — no mode, or a
+/// literal one without `b` (a binary file is the runtime's BytesIO; a
+/// mode chosen at run time leaves the result untyped).
+fn is_text_open_call(call: &crate::Call, symbols: &SymbolTableScopes) -> bool {
+    matches!(call.func.as_ref(), ExprType::Name(n) if n.id == "open")
+        && symbols.get("open").is_none()
+        && match call.args.get(1) {
+            None => true,
+            Some(ExprType::Constant(c)) => matches!(
+                &c.0,
+                Some(litrs::Literal::String(s)) if !s.value().contains('b')
+            ),
+            Some(_) => false,
+        }
 }
 
 /// The declared return type of a function referenced BY NAME (`map(double,
@@ -2839,6 +2872,9 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
                             infos.push(annotation_type_info(e)?);
                         }
                         Some(TypeInfo::Tuple(infos))
+                    } else if let crate::SubscriptKind::Index(elt) = &sub.kind {
+                        // `tuple[int]` — a ONE-element tuple (`(i64,)`).
+                        Some(TypeInfo::Tuple(vec![annotation_type_info(elt)?]))
                     } else {
                         None
                     }
@@ -3854,6 +3890,30 @@ fn analyze_statement_types(
                         }
                     }
                 }
+                // A tuple-target destructure of a BOXED value (`username,
+                // password = get_auth_from_url(proxy)` — requests, where the
+                // call returns a boxed value): the lowering unpacks it
+                // through `unpack_boxed`, so each untyped name is boxed.
+                if let (Some(o), Some(s)) = (options, symbols)
+                    && targets.elts.iter().all(|t| matches!(t, ExprType::Name(_)))
+                    && matches!(
+                        infer_type(
+                            self_class.map(|c| CodeGenContext::Class(c.to_string())).as_ref(),
+                            &assign.value,
+                            &analysis_view(o, info),
+                            s,
+                        ),
+                        TypeInfo::PyValue
+                    )
+                {
+                    for t in &targets.elts {
+                        if let ExprType::Name(n) = t
+                            && !info.name_types.contains_key(&n.id)
+                        {
+                            info.name_types.insert(n.id.clone(), TypeInfo::PyValue);
+                        }
+                    }
+                }
                 // A tuple-target store of ALL-None literals (`auth, host,
                 // port = None, None, None` — urllib3's parse_url): each
                 // element name becomes an Option binding, mirroring the
@@ -3999,6 +4059,15 @@ fn analyze_statement_types(
                 count_expr_reads(&item.context_expr, info);
                 if let Some(vars) = &item.optional_vars {
                     count_target_reads(vars, info);
+                    // `with open(...) as f` binds the file itself (its
+                    // `__enter__` returns self); other managers' `as`
+                    // values are whatever their `__enter__` returns.
+                    if let ExprType::Call(call) = &item.context_expr
+                        && let Some(symbols) = symbols
+                        && is_text_open_call(call, symbols)
+                    {
+                        seed_binder_types(vars, &file_typeinfo(), &mut info.name_types, false);
+                    }
                 }
             }
             for b in body {
@@ -5131,6 +5200,24 @@ pub fn call_return_typeinfo(
             return None;
         };
         let (symbols, options) = (symbols?, options?);
+        // A MODULE-ATTRIBUTE callee (`idna.encode(s)` after `from . import
+        // core as idna`): the defining module's function and its return
+        // annotation — the same resolution the call lowering maps the
+        // arguments through (issue #401), so `.decode(...)` on the bytes
+        // result sees bytes.
+        if let ExprType::Name(m) = attr.value.as_ref()
+            && !options.name_types.contains_key(&m.id)
+            && !options.local_types.contains_key(&m.id)
+            && let Some(path) =
+                crate::ast::tree::module::crate_module_bound_to(&m.id, symbols, options)
+        {
+            let (f, _) = crate::module_function_def(options, &path, &attr.attr)?;
+            return resolve_alias_typeinfo(
+                f.returns.as_deref()?,
+                &module_symbols(options, &path),
+                options,
+            );
+        }
         // The receiver's class, through the same authority the call
         // LOWERING uses for attribute-READ receivers. The receiver need
         // not be a NAME the analysis typed: a FACTORY CALL
@@ -5472,6 +5559,11 @@ pub(crate) fn seed_binder_types(
             if let TypeInfo::Tuple(ts) = ty {
                 for (elt, ety) in t.elts.iter().zip(ts.iter()) {
                     seed_binder_types(elt, ety, out, shadow);
+                }
+            } else if matches!(ty, TypeInfo::PyValue) {
+                // A BOXED row unpacks into boxed members (`unpack_boxed`).
+                for elt in &t.elts {
+                    seed_binder_types(elt, &TypeInfo::PyValue, out, shadow);
                 }
             }
         }

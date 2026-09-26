@@ -567,6 +567,18 @@ fn py_exception_matches_handler_names() {
 }
 
 #[test]
+fn py_exception_type_name_is_the_raised_class() {
+    // type(ValueError()).__name__ -> 'ValueError'
+    assert_eq!(PyException::new("ValueError", "").type_name(), "ValueError");
+    // type(IOError()).__name__ -> 'OSError' (the alias IS the class);
+    // likewise EnvironmentError
+    assert_eq!(PyException::new("IOError", "").type_name(), "OSError");
+    assert_eq!(PyException::new("EnvironmentError", "").type_name(), "OSError");
+    // A user class (class IDNAError(UnicodeError)) keeps its own name.
+    assert_eq!(PyException::new("IDNAError", "").type_name(), "IDNAError");
+}
+
+#[test]
 fn truthiness_matches_python_bool() {
     // Python: bool("") is False, bool("x") is True
     assert!(!"".is_truthy());
@@ -3007,6 +3019,30 @@ mod file_objects {
     }
 
     #[test]
+    fn file_line_iteration_matches_python() {
+        // list(io.StringIO("x\ny\n\nz")) -> ['x\n', 'y\n', '\n', 'z'],
+        // and the file is exhausted after: f.readline() -> ''
+        let f = io::StringIO_seeded("x\ny\n\nz");
+        let lines: Vec<String> = f.py_lines().map(Result::unwrap).collect();
+        assert_eq!(lines, vec!["x\n", "y\n", "\n", "z"]);
+        assert_eq!(f.readline().unwrap(), "");
+        // for l in f: break  -> 'a\n'; then list(f) -> ['b\n'] (the
+        // loop and the later reads share one cursor)
+        let f = io::StringIO_seeded("a\nb\n");
+        assert_eq!(f.py_lines().next().unwrap().unwrap(), "a\n");
+        let rest: Vec<String> = f.py_lines().map(Result::unwrap).collect();
+        assert_eq!(rest, vec!["b\n"]);
+        // f.close(); for l in f -> ValueError: I/O operation on closed
+        // file. — raised once, ending the iteration
+        f.close().unwrap();
+        let mut closed = f.py_lines();
+        let err = closed.next().unwrap().unwrap_err();
+        assert_eq!(err.type_name(), "ValueError");
+        assert_eq!(err.message, "I/O operation on closed file.");
+        assert!(closed.next().is_none());
+    }
+
+    #[test]
     fn closed_files_raise_pythons_value_error() {
         let b = io::StringIO();
         b.close().unwrap();
@@ -5108,4 +5144,31 @@ fn boxed_call_spreads_raise_cpythons_type_errors() {
         f.extend_spread_kwargs(&mut kw, PyValue::from(d)).unwrap_err().message,
         "__main__.f() got multiple values for keyword argument 'a'"
     );
+}
+
+#[test]
+fn boxed_and_list_unpacking_raise_cpythons_errors() {
+    use stdpython::{unpack_boxed, PyUnpack};
+    // a, b = ("x", 1) boxed -> 'x', 1
+    let [a, b] = unpack_boxed::<2>(PyValue::from(("x", 1i64))).unwrap();
+    assert_eq!((a, b), (PyValue::from("x"), PyValue::Int(1)));
+    // a, b = "ab" -> 'a', 'b' (a str iterates its characters)
+    let [a, b] = unpack_boxed::<2>(PyValue::from("ab")).unwrap();
+    assert_eq!((a, b), (PyValue::from("a"), PyValue::from("b")));
+    // a, b = 5 -> TypeError: cannot unpack non-iterable int object
+    let e = unpack_boxed::<2>(PyValue::Int(5)).unwrap_err();
+    assert_eq!((e.exception_type.as_str(), e.message.as_str()), ("TypeError", "cannot unpack non-iterable int object"));
+    // a, b = None -> TypeError: cannot unpack non-iterable NoneType object
+    let e = unpack_boxed::<2>(PyValue::None_).unwrap_err();
+    assert_eq!(e.message, "cannot unpack non-iterable NoneType object");
+    // a, b = "abc" -> ValueError: too many values to unpack (expected 2)
+    let e = unpack_boxed::<2>(PyValue::from("abc")).unwrap_err();
+    assert_eq!((e.exception_type.as_str(), e.message.as_str()), ("ValueError", "too many values to unpack (expected 2)"));
+    // a, b = (1, 2) -> the tuple itself
+    assert_eq!(PyUnpack::<2>::py_unpack((1i64, "s")).unwrap(), (1, "s"));
+    // a, b = [7] -> ValueError: not enough values to unpack (expected 2, got 1)
+    let e = PyUnpack::<2>::py_unpack(vec![7i64]).unwrap_err();
+    assert_eq!(e.message, "not enough values to unpack (expected 2, got 1)");
+    // a, b = [7, 8] -> 7, 8
+    assert_eq!(PyUnpack::<2>::py_unpack(vec![7i64, 8]).unwrap(), (7, 8));
 }
