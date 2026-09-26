@@ -2087,16 +2087,29 @@ fn convert_on_this_thread(
     {
         entry_options.root_init_module = Some(ROOT_BIN_MODULE.to_string());
     }
+    // The bin's copy of the entry is the bin crate ROOT, where the sibling
+    // modules are declared (`pub mod data;`): a `from . import data` there
+    // must not also `pub use crate::data;` (E0255), while the lib's copy
+    // (`crate::cli`) needs that use. The entry is transpiled a second time
+    // for the bin with the root flag set; its warnings duplicate the
+    // lib copy's and are discarded.
+    let mut entry_bin_code: Option<String> = None;
     for module in &package.modules {
         if !reachable.contains(&module.path) {
             continue;
         }
-        let options = if entry_file.as_ref() == Some(&module.file) {
+        let is_entry = entry_file.as_ref() == Some(&module.file);
+        let options = if is_entry {
             &entry_options
         } else {
             &base_options
         };
         let code = transpile(module, &mut warnings, options)?;
+        if is_entry {
+            let mut bin_options = entry_options.clone();
+            bin_options.bin_crate_root = true;
+            entry_bin_code = Some(transpile(module, &mut Vec::new(), &bin_options)?);
+        }
         transpiled.push((module, code));
     }
     // An entry module named `main` (path ["main"]) is bin-only: its module
@@ -2274,10 +2287,13 @@ fn convert_on_this_thread(
     // Binary entry point.
     let mut has_binary = false;
     if let Some(entry_file) = &entry_file {
-        let (entry, code) = transpiled
+        let (entry, _) = transpiled
             .iter()
             .find(|(m, _)| &m.file == entry_file)
             .expect("entry module was transpiled");
+        let code = entry_bin_code
+            .as_ref()
+            .expect("entry module's bin copy was transpiled");
         // The bin target declares the sibling modules itself so the entry
         // module's `use crate::...` imports resolve within the bin crate.
         // Order: lint allowances, entry code (may start with inner doc
@@ -2323,26 +2339,6 @@ fn convert_on_this_thread(
             // the siblings' `crate::__rython_root::...` paths take the
             // lib's shim.
             decls.push_str(&root_shim());
-        }
-        // The entry's `from . import sibling` is `pub use crate::sibling;`
-        // — right in the lib's entry module, but in the bin the entry IS
-        // the crate root, where the `pub mod sibling;` above already binds
-        // the name (E0255 on idna's `from . import compat`). The
-        // declaration serves both, so the re-export goes.
-        let mut code = code.clone();
-        for line in decls.lines() {
-            if let Some(kid) = line
-                .trim()
-                .strip_prefix("pub mod ")
-                .and_then(|r| r.strip_suffix(';'))
-            {
-                for spelling in [
-                    format!("pub use crate :: {kid} ;"),
-                    format!("use crate :: {kid} ;"),
-                ] {
-                    code = code.replace(&spelling, "");
-                }
-            }
         }
         let main_contents = format!("{}{}\n{}", generated_lint_attrs(opts.warnings), code, decls);
         write_file(src_dir.join("main.rs"), format_rust(&main_contents))?;
@@ -3104,6 +3100,11 @@ fn transpile(
     // from this module (`from .constant import _THAI`), so cross-module
     // constants are promoted to importable statics.
     options.this_module_path = module.path.clone();
+    // Duck-typing traits (`HasSpeak`) are emitted once per MODULE: a fresh
+    // set per transpile, or a second module needing the same trait (the
+    // entry's bin copy among them) would find it "already generated" and
+    // name a trait it never defines (E0405).
+    options.generated_duck_traits = Default::default();
     // Register rust-module imports in the shared symbol table so call
     // lowering can resolve them (Import::to_rust only sees a clone).
     let mut symbols = symbols;
