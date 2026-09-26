@@ -93,6 +93,10 @@
     "tree": {
       "status": "pass"
     },
+    "untyped_method_args": {
+      "status": "build-failed",
+      "errors": 12
+    },
     "valueor": {
       "status": "pass"
     },
