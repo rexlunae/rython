@@ -5178,6 +5178,8 @@ fn py_class_name_reads_the_python_class_name_off_the_type() {
     mod m {
         pub struct Session;
         pub struct Self_;
+        // A Python class named `type`, as the generated crate spells it.
+        #[allow(non_camel_case_types)]
         pub struct r#type;
         pub struct G<T>(pub T);
     }
