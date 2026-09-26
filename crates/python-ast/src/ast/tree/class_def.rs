@@ -3799,7 +3799,8 @@ StatementType::Assign(a)
             .value
             .clone()
             .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-        class_constants.extend(quote!(pub const #ident: #ty = #value;));
+        let case_allow = crate::ast::tree::module::static_case_allow(&ident);
+        class_constants.extend(quote!(#case_allow pub const #ident: #ty = #value;));
     }
 }
                 // A class-level METHOD-ALIAS chain (`__ne__ = __lt__ = __eq__`
@@ -3884,8 +3885,9 @@ StatementType::Assign(a)
                             quote!(stdpython::PyValue::from(#value_tokens)),
                         )
                     };
+                    let case_allow = crate::ast::tree::module::static_case_allow(&ident);
                     class_lazylock_constants.extend(quote! {
-                        pub static #ident: std::sync::LazyLock<#ty> =
+                        #case_allow pub static #ident: std::sync::LazyLock<#ty> =
                             std::sync::LazyLock::new(|| #init);
                     });
                     // The associated ACCESSOR keeps `Class::NAME`-shaped
