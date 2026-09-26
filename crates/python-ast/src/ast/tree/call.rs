@@ -2332,6 +2332,56 @@ pub(crate) fn callee_value_signature(
     }
 }
 
+impl Call {
+    /// A call through a BOXED name (issue #334): the boxed value may hold a
+    /// function (PyValue::Function), whose own binder takes the positional
+    /// arguments and the keywords by name — CPython's TypeErrors for a
+    /// wrong binding — or any other member raises CPython's `TypeError:
+    /// '<type>' object is not callable`. A `*`/`**` spread has no static
+    /// shape to pass and is loud.
+    fn boxed_value_call(
+        &self,
+        callee: &str,
+        ctx: &CodeGenContext,
+        options: &PythonOptions,
+        symbols: &SymbolTableScopes,
+    ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        if self.args.iter().any(|a| matches!(a, ExprType::Starred(_)))
+            || self.keywords.iter().any(|k| k.arg.is_none())
+        {
+            return Err(format!(
+                "a `*`/`**` spread into a call through the boxed callable value `{callee}` \
+                 is not supported yet; pass the arguments explicitly"
+            )
+            .into());
+        }
+        let boxed = |e: &ExprType| {
+            crate::render_typed_reused(
+                e,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+                Some(crate::TypeInfo::PyValue),
+            )
+        };
+        let args = self.args.iter().map(boxed).collect::<Result<Vec<_>, _>>()?;
+        let keywords = self
+            .keywords
+            .iter()
+            .map(|k| {
+                let name = k.arg.clone().unwrap_or_default();
+                boxed(&k.value).map(|v| quote!((#name.to_string(), #v)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let callee = crate::safe_ident(callee);
+        Ok(if keywords.is_empty() {
+            quote!((#callee).call_boxed(vec![#(#args),*])?)
+        } else {
+            quote!((#callee).call_boxed_kw(vec![#(#args),*], vec![#(#keywords),*])?)
+        })
+    }
+}
+
 /// Whether a callable value's callee is an `Option` the call must unwrap:
 /// an Optional-callable name not narrowed by a guard (a narrowed read
 /// already unwraps — name.rs). Calling None is CPython's TypeError, the
@@ -10334,6 +10384,19 @@ let mutating_self_field = boxed_self_ref_receiver
             );
             return Ok(quote!(compile_error!(#msg)));
         }
+        // A call through a BOXED called parameter (issue #334: `encode(s)`
+        // where `encode=None` is reassigned `idna.encode`): the boxed value
+        // holds a function (PyValue::Function) or it does not, and
+        // `call_boxed` answers exactly as CPython does — the function's own
+        // argument binding, or `TypeError: 'NoneType' object is not
+        // callable`. Positional arguments only: a keyword has no parameter
+        // names to bind against in the boxed value.
+        if let ExprType::Name(callee_name) = self.func.as_ref()
+            && options.called_params.contains(&callee_name.id)
+            && matches!(options.name_types.get(&callee_name.id), Some(crate::TypeInfo::PyValue))
+        {
+            return self.boxed_value_call(&callee_name.id, &ctx, &options, &symbols);
+        }
         if let ExprType::Name(callee_name) = self.func.as_ref()
             && options.called_params.contains(&callee_name.id)
         {
@@ -10516,6 +10579,19 @@ let mutating_self_field = boxed_self_ref_receiver
                 drop
             }
         };
+        // A positional call through a BOXED name (issue #334): the boxed
+        // value may hold a function (PyValue::Function) — `call_boxed`
+        // calls it, or raises CPython's `TypeError: '<type>' object is not
+        // callable` for any other member, where the drop answered None.
+        if value_callee
+            && let ExprType::Name(n) = self.func.as_ref()
+            && matches!(
+                crate::infer_type(Some(&ctx), self.func.as_ref(), &options, &symbols),
+                crate::TypeInfo::PyValue
+            )
+        {
+            return self.boxed_value_call(&n.id, &ctx, &options, &symbols);
+        }
         if value_callee {
             options.definition_warnings.borrow_mut().push(format!(
                 "call through value `{}` is dropped (callables cannot be \

@@ -323,6 +323,19 @@ impl CodeGen for Compare {
                     symbols.clone(),
                     Some(left_ty),
                 )?,
+                // A module FUNCTION compared with a boxed value (`if encode
+                // == idna.encode:` — idna's tests, issue #334): the function
+                // as the boxed function value, which compares by identity.
+                (_, crate::TypeInfo::PyValue)
+                    if let Some(boxed) = crate::ast::tree::closure::box_function_value(
+                        comparator_ast,
+                        &ctx,
+                        &symbols,
+                        &options,
+                    ) =>
+                {
+                    boxed?
+                }
                 _ => comparator_ast
                     .clone()
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?,

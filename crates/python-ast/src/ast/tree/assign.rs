@@ -1019,6 +1019,17 @@ impl<'a> CodeGen for Assign {
                     {
                         if value_is_none_early {
                             quote!(#target_code = PyValue::None_;)
+                        } else if let Some(boxed) = crate::ast::tree::closure::box_function_value(
+                            &value_expr,
+                            &ctx,
+                            &symbols,
+                            &options,
+                        ) {
+                            // A module FUNCTION stored into the boxed name
+                            // (`encode = idna.encode` — issue #334): the
+                            // boxed function value.
+                            let boxed = boxed?;
+                            quote!(#target_code = #boxed;)
                         } else if crate::expr_yields_pyvalue(&value_expr, &options, &symbols) {
                             // A REUSED boxed name stores a CLONE (the
                             // Arc copy — Python reference semantics); the

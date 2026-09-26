@@ -17953,3 +17953,87 @@ fn optional_callable_parameters_match_cpython() {
     // Verified against python3.
     assert_eq!(run_package(&krate, "optcallable"), vec!["HI! hi?"]);
 }
+
+#[test]
+fn functions_held_boxed_are_called_like_cpython() {
+    // Issue #334 (idna's `test_encode(self, encode=None)` with `encode =
+    // idna.encode`): a module function stored into a boxed slot is a
+    // function value — called through the slot with positional and keyword
+    // arguments bound by its own signature (defaults filled, CPython's
+    // TypeErrors for a wrong binding), compared by identity, and calling
+    // None is CPython's TypeError.
+    let scratch = Scratch::new("boxedfn");
+    let krate = package_crate(
+        &scratch,
+        "boxedfn",
+        &[(
+            "cli.py",
+            concat!(
+                "def enc(s: str, upper: bool = False) -> str:\n",
+                "    if upper:\n",
+                "        return s.upper()\n",
+                "    return s + \"!\"\n",
+                "\n",
+                "\n",
+                "def other(s: str, upper: bool = False) -> str:\n",
+                "    return \"<\" + s + \">\"\n",
+                "\n",
+                "\n",
+                "class Runner:\n",
+                "    def run(self, f=None, tag=\"x\"):\n",
+                "        if f is None:\n",
+                "            f = enc\n",
+                "        print(f(\"ab\"), f(\"cd\", True), f(\"ef\", upper=True), tag)\n",
+                "        print(f == enc, f == other)\n",
+                "        for bad in range(4):\n",
+                "            try:\n",
+                "                if bad == 0:\n",
+                "                    f()\n",
+                "                elif bad == 1:\n",
+                "                    f(\"a\", True, 3)\n",
+                "                elif bad == 2:\n",
+                "                    f(\"a\", colour=1)\n",
+                "                else:\n",
+                "                    f(\"a\", s=\"b\")\n",
+                "            except TypeError as e:\n",
+                "                print(\"TypeError\", e)\n",
+                "\n",
+                "    def call_none(self, g=None):\n",
+                "        try:\n",
+                "            g(1)\n",
+                "        except TypeError as e:\n",
+                "            print(\"TypeError\", e)\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    r = Runner()\n",
+                "    r.run()\n",
+                "    r.run(other, \"y\")\n",
+                "    r.call_none()\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "boxedfn"),
+        vec![
+            "ab! CD EF x",
+            "True False",
+            "TypeError enc() missing 1 required positional argument: 's'",
+            "TypeError enc() takes from 1 to 2 positional arguments but 3 were given",
+            "TypeError enc() got an unexpected keyword argument 'colour'",
+            "TypeError enc() got multiple values for argument 's'",
+            "<ab> <cd> <ef> y",
+            "False True",
+            "TypeError other() missing 1 required positional argument: 's'",
+            "TypeError other() takes from 1 to 2 positional arguments but 3 were given",
+            "TypeError other() got an unexpected keyword argument 'colour'",
+            "TypeError other() got multiple values for argument 's'",
+            "TypeError 'NoneType' object is not callable"
+        ]
+    );
+}

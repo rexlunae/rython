@@ -6431,6 +6431,45 @@ fn emit_test_runner(
         };
         for m in test_method_names(c) {
             let mident = quote::format_ident!("{}", m);
+            // A test method with DEFAULTED parameters (`def test_encode(self,
+            // encode=None, skip_bytes=False)` — idna's tests, issue #334):
+            // the loader calls it with none, so each takes its default,
+            // rendered against the parameter's slot (an unannotated one is
+            // the boxed value). A parameter without a default is CPython's
+            // TypeError at the call — left to rustc's arity error, loudly.
+            let mut default_args: Vec<TokenStream> = Vec::new();
+            if let Some(def) = c.body.iter().find_map(|s| match &s.statement {
+                crate::StatementType::FunctionDef(f)
+                | crate::StatementType::AsyncFunctionDef(f)
+                    if f.name == m =>
+                {
+                    Some(f.clone())
+                }
+                _ => None,
+            }) {
+                let params: Vec<&crate::Parameter> =
+                    def.args.posonlyargs.iter().chain(def.args.args.iter()).skip(1).collect();
+                let defaults = &def.args.defaults;
+                let first_default = params.len().saturating_sub(defaults.len());
+                for (i, p) in params.iter().enumerate() {
+                    if i < first_default {
+                        continue;
+                    }
+                    let expected = match p.annotation.as_deref() {
+                        None => Some(crate::TypeInfo::PyValue),
+                        Some(ann) => crate::resolve_alias_typeinfo(ann, &symbols, &options),
+                    };
+                    let rendered = crate::render_typed(
+                        &defaults[i - first_default],
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                        expected,
+                    )
+                    .ok()?;
+                    default_args.push(rendered);
+                }
+            }
             // The class's gates, then the method's (issue #371). A skipped
             // test is never constructed, set up, or run — CPython decides
             // the skip before setUp. Each condition is evaluated when the
@@ -6484,7 +6523,7 @@ fn emit_test_runner(
                 // pass is an "unexpected success", which fails the run
                 // (CPython's wasSuccessful() is False for it since 3.4).
                 quote! {
-                    match __rython_tc.#mident() {
+                    match __rython_tc.#mident(#(#default_args),*) {
                         Ok(_) => {
                             eprintln!("UNEXPECTED SUCCESS: {}", #m);
                             __rython_ntest_failures += 1;
@@ -6494,7 +6533,7 @@ fn emit_test_runner(
                 }
             } else {
                 quote! {
-                    match __rython_tc.#mident() {
+                    match __rython_tc.#mident(#(#default_args),*) {
                         Ok(__rython_v) => __rython_v,
                         Err(__rython_e) => {
                             eprintln!("FAIL: {}", __rython_e);
