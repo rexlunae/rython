@@ -1794,6 +1794,13 @@ impl Point {
   Rust) typed from the value when inferable, plus an associated accessor
   `Class::name()` that reads clone it through — so `self.name`,
   `cls.name`, and cross-module `Class.name` reads all work (issue #137).
+  A value built from literals by operators (`["x"] + ["y"]`, `2 * 3`,
+  `[0] * 3`) promotes the same way, its list type inferred through
+  `+`/`*` (issue #417). A class-body value rython does NOT promote (one
+  that reads module state, a method alias, a subscript) is dropped, and
+  a read of it through the class (`Class.name`, `cls.name`) is a loud
+  `compile_error!` naming the attribute and the rewrite — never the
+  boxed None (issue #417); a `self.name` read of it fails in rustc.
 - **Construction**: `Point(1.0, 2.0)` lowers to `Point::new(…)?`. The
   synthesized `new` defaults the struct then runs `__init__`. A
   user-defined method named `new` is a loud error.

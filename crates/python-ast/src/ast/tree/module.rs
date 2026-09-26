@@ -1079,8 +1079,16 @@ impl CodeGen for Module {
                 && let Some(kind) = global_mutables.get_mut(&n.id)
                 && matches!(kind, crate::MutableGlobalKind::Computed { .. })
             {
-                *kind = crate::MutableGlobalKind::Computed {
-                    boxed: module_init_static_ty(&n.id, &a.value, &options, &symbols).is_none(),
+                // A string global stored more than once (`names = ""`, then
+                // `names += s`) cannot be a `&'static str` — the later
+                // stores build Strings: it is the owned-String kind, as a
+                // `global`-written string is.
+                *kind = if matches!(options.name_types.get(&n.id), Some(crate::TypeInfo::StrRef)) {
+                    crate::MutableGlobalKind::Str
+                } else {
+                    crate::MutableGlobalKind::Computed {
+                        boxed: module_init_static_ty(&n.id, &a.value, &options, &symbols).is_none(),
+                    }
                 };
             }
         }
@@ -1726,6 +1734,19 @@ impl CodeGen for Module {
                             } else {
                                 let ty = module_init_static_ty(&target.id, &a.value, &options, &symbols)
                                     .expect("Computed{boxed:false} implies an inferred type");
+                                // The initializer takes the static's type: a
+                                // name whose stores unify to String starts
+                                // from a literal (`greeting = "hi"`, later
+                                // `greeting = "hello " + names`).
+                                let value_tokens = match options.name_types.get(&target.id) {
+                                    Some(to) => crate::coerce_tokens(
+                                        value_tokens.clone(),
+                                        &crate::infer_type(Some(&ctx), &a.value, &options, &symbols),
+                                        to,
+                                    )
+                                    .unwrap_or(value_tokens),
+                                    None => value_tokens,
+                                };
                                 (ty, value_tokens)
                             };
                             let case_allow = crate::ast::tree::module::static_case_allow(&ident);
@@ -4936,6 +4957,23 @@ fn module_function_free_reads(body: &[crate::Statement]) -> std::collections::Ha
                 scope_free_reads(s, &mut free, &visit_stmt);
             }
             return Flow::Skip;
+        }
+        // The `__main__` block runs as the entry wrapper's body, a scope
+        // of its own: a module value it reads (`data = compute()` at top
+        // level, `print(data)` under the guard) must be a static the
+        // wrapper can see, exactly as for a function — an init-body local
+        // is invisible there (E0425). Names the block binds are its own.
+        // The walk continues into the block for the defs it hosts.
+        if let ST::If(i) = &s.statement
+            && is_main_guard(&i.test)
+        {
+            let mut all = std::collections::HashSet::new();
+            let mut bound = std::collections::HashSet::new();
+            walk_stmts(&i.body, Descend::All, &mut |inner| {
+                visit_stmt(inner, &mut all, &mut bound);
+                Flow::Continue
+            });
+            free.extend(all.difference(&bound).cloned());
         }
         if let ST::If(i) = &s.statement {
             let is_type_checking = matches!(

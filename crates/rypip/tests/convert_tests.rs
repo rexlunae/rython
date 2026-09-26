@@ -941,6 +941,211 @@ fn entry_module_crate_builds_warning_clean() {
 }
 
 #[test]
+fn module_level_loop_aug_assigns_match_python_at_runtime() {
+    // A statement nested in module-level control flow is followed by its
+    // `__rython_bind__` marker. An aug-assign renders without its own
+    // terminator (`total = (total).py_add(&(v))`), so the marker ran into
+    // it (`... py_add(&(v)) __rython_bind__(..)`) and the generated crate
+    // failed to parse. The statement now ends before its marker.
+    let scratch = Scratch::new("augloop");
+    let file = scratch.path().join("augentry.py");
+    fs::write(
+        &file,
+        concat!(
+            "total = 0\n",
+            "for v in [1, 2, 3]:\n",
+            "    total += v\n",
+            "    total *= 2\n",
+            "count = 0\n",
+            "while count < 3:\n",
+            "    count += 1\n",
+            "    if count == 2:\n",
+            "        count += 10\n",
+            "print(total, count)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(\"done\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/augentry"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "22 12\ndone\n");
+}
+
+#[test]
+fn module_values_read_by_the_main_block_match_python_at_runtime() {
+    // A module value that is not a literal constant (`data = len(...)`,
+    // `total` accumulated in a loop) lowered to a local of the
+    // __module_init__ closure; read only by the `__main__` block, it was
+    // out of scope in the entry wrapper (E0425). The main block now counts
+    // as a reader, like a function, so the value is a static. A string
+    // global stored more than once (`names += s`) is an owned String,
+    // not the `&'static str` its first literal infers.
+    let scratch = Scratch::new("mainscope");
+    let file = scratch.path().join("mainscope.py");
+    fs::write(
+        &file,
+        concat!(
+            "total = 0\n",
+            "for v in [1, 2, 3]:\n",
+            "    total += v\n",
+            "data = len(\"abc\") + 1\n",
+            "names = \"\"\n",
+            "for s in [\"a\", \"b\"]:\n",
+            "    names += s\n",
+            "greeting = \"hi\"\n",
+            "if len(names) > 1:\n",
+            "    greeting = \"hello \" + names\n",
+            "\n",
+            "def show() -> None:\n",
+            "    print(names, greeting)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(total, data)\n",
+            "    show()\n",
+            "    print(names.upper(), len(greeting))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/mainscope"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "6 4\nab hello ab\nAB 8\n"
+    );
+}
+
+#[test]
+fn class_level_string_list_matches_python_at_runtime() {
+    // A class-body list literal of strings (`names = ["a", "b"]`) lowers
+    // to a class-mangled LazyLock static. Its type was inferred from the
+    // literal (Vec<&'static str>) while the initializer rendered owned
+    // elements (`("a").to_string()`) — E0308. The static is now typed
+    // Vec<String> with owned elements, the module-level static's rule.
+    let scratch = Scratch::new("clsnames");
+    let file = scratch.path().join("clsnames.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Cfg:\n",
+            "    names = [\"a\", \"b\"]\n",
+            "\n",
+            "    def describe(self) -> str:\n",
+            "        return \",\".join(Cfg.names)\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(Cfg().describe())\n",
+            "    for n in Cfg.names:\n",
+            "        print(n.upper())\n",
+            "    print(len(Cfg.names))\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/clsnames"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "a,b\nA\nB\n2\n");
+}
+
+
+
+#[test]
+fn class_body_literal_operator_trees_match_python_at_runtime() {
+    // Issue #417: class-body values built from literals by operators read
+    // as the boxed None through the class (`print(Cfg.tags)` printed
+    // `None`, exit 0). They now promote to typed statics; the list
+    // inference through `+` / `*` also covers a function's own locals.
+    let scratch = Scratch::new("classops");
+    let file = scratch.path().join("classops.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Cfg:\n",
+            "    tags = [\"x\"] + [\"y\"]\n",
+            "    size = 2 * 3\n",
+            "    neg = -(1 << 4)\n",
+            "    reps = [0] * 3\n",
+            "    ints = [1, 2] + [3]\n",
+            "\n",
+            "    def via_self(self) -> None:\n",
+            "        print(self.tags, self.size)\n",
+            "\n",
+            "    @classmethod\n",
+            "    def via_cls(cls) -> None:\n",
+            "        print(cls.tags, cls.size)\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(Cfg.tags, Cfg.size, Cfg.neg, Cfg.reps, Cfg.ints)\n",
+            "    print(len(Cfg.tags) + len(Cfg.reps))\n",
+            "    Cfg().via_self()\n",
+            "    Cfg.via_cls()\n",
+            "    x = [\"a\"] + [\"b\"]\n",
+            "    x.append(\"c\")\n",
+            "    print(x, [7] * 2)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/classops"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        concat!(
+            "['x', 'y'] 6 -16 [0, 0, 0] [1, 2, 3]\n",
+            "5\n",
+            "['x', 'y'] 6\n",
+            "['x', 'y'] 6\n",
+            "['a', 'b', 'c'] [7, 7]\n",
+        )
+    );
+}
+
+#[test]
 fn functools_partial_keyword_bindings_match_python_at_runtime() {
     // Keyword bindings emitting in the callee's declared order
     // (botocore's `partial(delay_exponential, base=base,
