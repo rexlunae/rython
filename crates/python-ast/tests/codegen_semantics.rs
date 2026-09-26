@@ -5754,6 +5754,116 @@ fn main_block_reads_promote_module_values_to_statics() {
 }
 
 #[test]
+fn class_level_string_list_static_owns_its_elements() {
+    // `names = ["a", "b"]` in a class body: the LazyLock static's type
+    // and its initializer must agree — Vec<String> with owned elements
+    // (the literal alone infers Vec<&'static str>).
+    let out = compile(
+        concat!(
+            "class Cfg:\n",
+            "    names = [\"a\", \"b\"]\n",
+            "    nums = [1, 2]\n",
+            "\n",
+            "    def first(self) -> str:\n",
+            "        return Cfg.names[0]\n",
+        ),
+        "clsnames.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("Cfg_names:std::sync::LazyLock<Vec<String>>"),
+        "the string-list static must be Vec<String>: {}",
+        out
+    );
+    assert!(
+        !flat.contains("LazyLock<Vec<&'staticstr>>"),
+        "no borrowed-string element type may remain: {}",
+        out
+    );
+    assert!(
+        flat.contains("Cfg_nums:std::sync::LazyLock<Vec<i64>>"),
+        "a non-string list keeps its inferred type: {}",
+        out
+    );
+}
+
+
+#[test]
+fn class_body_literal_operator_trees_promote_to_typed_statics() {
+    // Issue #417: a class-body value built from literals by operators
+    // (`["x"] + ["y"]`, `2 * 3`, `[0] * 3`) was neither promoted nor
+    // rejected, and a read through the class lowered to the boxed None.
+    // It now promotes like the other computed constants, with the list
+    // type inferred through `+` / `*` (not the boxed list-as-tuple).
+    let out = compile(
+        concat!(
+            "class Cfg:\n",
+            "    tags = [\"x\"] + [\"y\"]\n",
+            "    size = 2 * 3\n",
+            "    reps = [0] * 3\n",
+            "\n",
+            "def show() -> None:\n",
+            "    print(Cfg.tags, Cfg.size, Cfg.reps)\n",
+        ),
+        "classops.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    for decl in [
+        "Cfg_tags:std::sync::LazyLock<Vec<String>>",
+        "Cfg_size:std::sync::LazyLock<i64>",
+        "Cfg_reps:std::sync::LazyLock<Vec<i64>>",
+    ] {
+        assert!(flat.contains(decl), "missing `{}`: {}", decl, out);
+    }
+    assert!(
+        !flat.contains("PyValue::None_"),
+        "no promoted attribute may read as the boxed None: {}",
+        out
+    );
+}
+
+#[test]
+fn class_value_read_of_an_unpromoted_class_body_attribute_is_loud() {
+    // Issue #417: `port = {"http": 80}["http"]` in a class body is not
+    // literal-built, so it is not promoted; `Cfg.port` / `cls.port` read
+    // it as the boxed None — a silent wrong value. The read is now a
+    // compile_error! naming the attribute and the rewrite. An attribute
+    // the class body never assigns (assigned at module level, the
+    // ledgered class-attribute divergence) keeps the boxed None.
+    let out = compile(
+        concat!(
+            "class Cfg:\n",
+            "    port = {\"http\": 80}[\"http\"]\n",
+            "\n",
+            "    @classmethod\n",
+            "    def via_cls(cls) -> None:\n",
+            "        print(cls.port)\n",
+            "\n",
+            "def show() -> None:\n",
+            "    print(Cfg.port)\n",
+            "    print(Cfg.elsewhere)\n",
+        ),
+        "clsread.py",
+    );
+    assert_eq!(
+        out.matches("compile_error !").count(),
+        2,
+        "both class-value reads of the unpromoted attribute must be loud: {}",
+        out
+    );
+    assert!(
+        out.contains("`Cfg.port` reads a class attribute whose class-body value rython does not model"),
+        "the error names the attribute: {}",
+        out
+    );
+    assert!(
+        out.contains("PyValue :: None_"),
+        "an attribute the class body never assigns keeps the ledgered boxed None: {}",
+        out
+    );
+}
+
+#[test]
 fn every_entry_point_allows_dead_code_for_the_lib_copy() {
     // rypip compiles an entry module twice: as the bin root, where `main`
     // is the process entry point, and as a lib submodule (`pub mod br;`),

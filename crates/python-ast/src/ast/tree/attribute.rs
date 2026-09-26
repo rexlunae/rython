@@ -351,6 +351,31 @@ impl<'a> CodeGen for Attribute {
             }
             _ => None,
         };
+        // The class-value read of an attribute the class BODY assigns but
+        // the class lowering could not promote (a value reading module
+        // state, a method alias, a subscript of a literal): unlike an
+        // attribute assigned at module level (the ledgered class-attribute
+        // divergence below), it is the class's own data, and reading it as
+        // the boxed None was a silent wrong value (issue #417). Enum
+        // members are the enum lowering's business.
+        let dropped_class_body_attr: Option<String> =
+            class_value_receiver.as_ref().and_then(|receiver| {
+                let class = crate::resolve_class_referenced(receiver, &symbols, &options)?;
+                if class.bases.iter().any(|b| {
+                    matches!(b, ExprType::Name(n) if crate::ast::tree::class_def::is_enum_base_name(&n.id))
+                }) {
+                    return None;
+                }
+                crate::ast::tree::visit::any_stmt(
+                    &class.body,
+                    crate::ast::tree::visit::Descend::SkipDefs,
+                    |st| {
+                        matches!(&st.statement, crate::StatementType::Assign(a)
+                            if a.targets.iter().any(|t| matches!(t, ExprType::Name(n) if n.id == self.attr)))
+                    },
+                )
+                .then(|| class.name.clone())
+            });
         let module_chain = is_module_path_chain(&self.value, &symbols, &options);
         // A stdlib module's EXCEPTION CLASS read as a VALUE (`BaseSSLError
         // = ssl.SSLError` — urllib3's connection.py): the class-as-value
@@ -730,6 +755,16 @@ impl<'a> CodeGen for Attribute {
             // (`cls.DEFAULT` — module-level class attribute): no static
             // item — the boxed None (module-level class-attribute
             // divergence).
+            if let Some(class_name) = &dropped_class_body_attr {
+                let message = format!(
+                    "`{}.{}` reads a class attribute whose class-body value rython \
+                     does not model (only literals and values built from literals \
+                     lower); rython refuses to silently read it as None. Bind the \
+                     value to a module-level name and read that, or assign a literal",
+                    class_name, self.attr
+                );
+                return Ok(quote!(compile_error!(#message)));
+            }
             if let Some(receiver) = &class_value_receiver {
                 warnings.borrow_mut().push(format!(
                     "`{}.{}` (a module-level class attribute) lowers to the boxed \

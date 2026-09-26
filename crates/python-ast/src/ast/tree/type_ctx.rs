@@ -1008,9 +1008,28 @@ fn infer_type_inner(
                         TypeInfo::Bytes
                     } else if is_numeric(&l) && is_numeric(&r) {
                         numeric_join(&l, &r)
+                    } else if let (TypeInfo::Vec(le), TypeInfo::Vec(re)) = (&l, &r) {
+                        // list + list is a list of the joined element
+                        // type (`["x"] + ["y"]`): the runtime concatenates
+                        // Vec<T> pairs (issue #417).
+                        match unify((**le).clone(), (**re).clone()) {
+                            TypeInfo::PyObject => TypeInfo::PyObject,
+                            elt => TypeInfo::Vec(Box::new(elt)),
+                        }
                     } else {
                         TypeInfo::PyObject
                     }
+                }
+                // list * int / int * list repeats the list: its own type.
+                crate::BinOps::Mult
+                    if matches!((&l, &r), (TypeInfo::Vec(_), TypeInfo::Int)) =>
+                {
+                    l
+                }
+                crate::BinOps::Mult
+                    if matches!((&l, &r), (TypeInfo::Int, TypeInfo::Vec(_))) =>
+                {
+                    r
                 }
                 crate::BinOps::Div => TypeInfo::Float, // Python true division
                 crate::BinOps::Sub | crate::BinOps::Mult | crate::BinOps::Pow => {
