@@ -2321,8 +2321,42 @@ pub(crate) fn callee_value_signature(
     };
     match inferred {
         crate::TypeInfo::Callable(params, ret) => Some((params, *ret)),
+        // An OPTIONAL callable (`fn: Optional[Callable[[str], str]] = None`,
+        // then `if fn is None: fn = default`): called as the callable it
+        // holds — see [`callee_value_is_optional`].
+        crate::TypeInfo::Option(inner) => match *inner {
+            crate::TypeInfo::Callable(params, ret) => Some((params, *ret)),
+            _ => None,
+        },
         _ => None,
     }
+}
+
+/// Whether a callable value's callee is an `Option` the call must unwrap:
+/// an Optional-callable name not narrowed by a guard (a narrowed read
+/// already unwraps — name.rs). Calling None is CPython's TypeError, the
+/// loud §12.2 panic here.
+fn callee_value_is_optional(
+    func: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    if let ExprType::Name(n) = func
+        && options.narrowed_names.contains_key(&n.id)
+    {
+        return false;
+    }
+    let inferred = match func {
+        ExprType::Name(n) => options
+            .name_types
+            .get(&n.id)
+            .cloned()
+            .unwrap_or_else(|| crate::infer_type(Some(ctx), func, options, symbols)),
+        _ => crate::infer_type(Some(ctx), func, options, symbols),
+    };
+    matches!(inferred, crate::TypeInfo::Option(inner)
+        if matches!(*inner, crate::TypeInfo::Callable(..)))
 }
 
 impl<'a> CodeGen for Call {
@@ -2585,7 +2619,15 @@ impl<'a> CodeGen for Call {
             } else {
                 quote!((#(#args),*))
             };
+            let optional = callee_value_is_optional(self.func.as_ref(), &ctx, &options, &symbols);
             let callee = self.func.clone().to_rust(ctx, options, symbols)?;
+            let callee = if optional {
+                quote!((#callee).clone().unwrap_or_else(|| {
+                    panic!("TypeError: 'NoneType' object is not callable")
+                }))
+            } else {
+                callee
+            };
             return Ok(quote!((#callee).call(#arg_tuple)?));
         }
         // A compat builtin ALIAS used as a callee (`builtin_str = str` —
@@ -13197,6 +13239,27 @@ fn map_call_arguments_inner(
         {
             let name = n.id.clone();
             return Ok(quote!(#name.to_string()));
+        }
+        // An OPTIONAL CALLABLE parameter (`fn: Optional[Callable[[str],
+        // str]] = None`): a lambda or a function name builds the callable
+        // value inside the Some (render_typed), as for a plain callable
+        // parameter.
+        if optional
+            && let Some(slot @ crate::TypeInfo::Option(_)) = param
+                .evaluated_annotation()
+                .as_ref()
+                .and_then(|ann| crate::resolve_alias_typeinfo(ann, symbols, options))
+            && matches!(&slot, crate::TypeInfo::Option(inner)
+                if matches!(inner.as_ref(), crate::TypeInfo::Callable(..)))
+            && !crate::is_none_expr(expr)
+        {
+            return crate::render_typed(
+                expr,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+                Some(slot),
+            );
         }
         if optional {
             // An `X | None` parameter whose X has no Rust type

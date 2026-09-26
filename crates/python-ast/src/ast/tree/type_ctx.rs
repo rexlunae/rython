@@ -1943,6 +1943,26 @@ pub fn render_typed(
             lam, params, ret, ctx, options, symbols,
         );
     }
+    // A lambda or a module function name where an OPTIONAL callable is
+    // expected (`apply(text, fn=shout)`, `fn = shout` into an
+    // `Optional[Callable[[str], str]]` slot): the present callable value,
+    // built as for the plain callable slot.
+    if let Some(TypeInfo::Option(inner)) = &expected
+        && let TypeInfo::Callable(params, ret) = inner.as_ref()
+    {
+        if let ExprType::Lambda(lam) = expr {
+            let c = crate::ast::tree::closure::render_lambda_callable(
+                lam, params, ret, ctx, options, symbols,
+            )?;
+            return Ok(quote!(Some(#c)));
+        }
+        if let Some(wrapped) = crate::ast::tree::closure::wrap_function_as_callable(
+            expr, params, &symbols, &options,
+        ) {
+            let c = wrapped?;
+            return Ok(quote!(Some(#c)));
+        }
+    }
     // A module FUNCTION NAME where a callable value is expected
     // (`guarded(checked, 4)`): the name denotes a definition, so it is
     // wrapped in the runtime callable type, which forwards to the item.

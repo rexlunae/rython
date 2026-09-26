@@ -1794,7 +1794,26 @@ impl<'a> CodeGen for Assign {
                 // pinned element type above (Vec::<T>::new()); reuse it so
                 // the Some wrap lands on the typed container, not on a bare
                 // vec![] that rustc cannot infer.
-                let value = if is_empty_container_literal(&value_expr) {
+                let optional_callable = match options.name_types.get(&name.id) {
+                    Some(slot @ crate::TypeInfo::Option(inner))
+                        if matches!(inner.as_ref(), crate::TypeInfo::Callable(..)) =>
+                    {
+                        Some(slot.clone())
+                    }
+                    _ => None,
+                };
+                let value = if let Some(slot) = optional_callable {
+                    // An OPTIONAL CALLABLE local (`if fn is None: fn =
+                    // shout`): the function name or lambda builds the
+                    // callable value inside the Some.
+                    crate::render_typed(
+                        &value_expr,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                        Some(slot),
+                    )?
+                } else if is_empty_container_literal(&value_expr) {
                     if boxed_slot {
                         quote!(Some(Box::new(#value)))
                     } else {

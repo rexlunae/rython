@@ -17914,3 +17914,42 @@ fn rows_unpack_and_testcase_setup_fields_match_cpython() {
         ]
     );
 }
+
+#[test]
+fn optional_callable_parameters_match_cpython() {
+    // Issue #334's callable-valued parameters: an `Optional[Callable]`
+    // parameter takes a lambda or a function (built as the callable value
+    // inside the Some), a `fn = shout` store into it does too, and a call
+    // through the optional callable calls what it holds.
+    let scratch = Scratch::new("optcallable");
+    let krate = package_crate(
+        &scratch,
+        "optcallable",
+        &[(
+            "cli.py",
+            concat!(
+                "from typing import Callable, Optional\n",
+                "\n",
+                "\n",
+                "def shout(s: str) -> str:\n",
+                "    return s.upper() + \"!\"\n",
+                "\n",
+                "\n",
+                "def apply(text: str, fn: Optional[Callable[[str], str]] = None) -> str:\n",
+                "    if fn is None:\n",
+                "        fn = shout\n",
+                "    return fn(text)\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    print(apply(\"hi\"), apply(\"hi\", lambda s: s + \"?\"))\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "optcallable"), vec!["HI! hi?"]);
+}
