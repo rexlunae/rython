@@ -2681,7 +2681,15 @@ impl CodeGen for Module {
             );
         }
 
-        // If we collected any main code, generate a single consolidated main function
+        // If we collected any main code, generate a single consolidated main function.
+        //
+        // Every process entry point emitted below carries
+        // `#[allow(dead_code)]`, like `__module_init__`: rypip compiles an
+        // entry module twice — as the bin root, where `main` is the entry,
+        // and as a lib submodule (`pub mod <name>;`, so siblings can import
+        // from it), where nothing calls it. The dead `main` in the lib copy
+        // is an artifact of that split, not a weakness in the source
+        // Python, so it must not surface as a build warning.
         if has_main_code {
             if is_simple_main_call_pattern {
                 // Simple main() call pattern - use user's main function directly as Rust entry point
@@ -2707,7 +2715,7 @@ impl CodeGen for Module {
                         .replace(
                             "pub async fn main (",
                             &format!(
-                                "#[cfg_attr(feature = \"{}\", {})] async fn main(",
+                                "#[allow(dead_code)] #[cfg_attr(feature = \"{}\", {})] async fn main(",
                                 ASYNC_RUNTIME_FEATURE,
                                 runtime_attr
                             ),
@@ -2724,6 +2732,7 @@ impl CodeGen for Module {
                             .unwrap_or_else(|_| stream);
 
                         stream.extend(quote! {
+                            #[allow(dead_code)]
                             #[cfg_attr(feature = #ASYNC_RUNTIME_FEATURE, #attr_tokens)]
                             async fn main() {
                                 let __rython_result: Result<(), PyException> = async {
@@ -2763,6 +2772,7 @@ impl CodeGen for Module {
                             .unwrap_or_else(|_| stream);
 
                         stream.extend(quote! {
+                            #[allow(dead_code)]
                             fn main() {
                                 let __rython_result = (|| -> Result<(), PyException> {
                                     #startup_init
@@ -2820,6 +2830,7 @@ impl CodeGen for Module {
                              build the generated crate with --features async-tokio \
                              (rypip enables it by default)"
                         );
+                        #[allow(dead_code)]
                         #[cfg_attr(feature = #ASYNC_RUNTIME_FEATURE, #attr_tokens)]
                         async fn main() {
                             let __rython_result: Result<(), PyException> = async {
@@ -2836,6 +2847,7 @@ impl CodeGen for Module {
                 } else {
                     let init_call = &startup_init;
                     stream.extend(quote! {
+                        #[allow(dead_code)]
                         fn main() {
                             let __rython_result = (|| -> Result<(), PyException> {
                                 #init_call
@@ -2854,6 +2866,7 @@ impl CodeGen for Module {
             // No main block, but module initialization code (this module's
             // or a sibling's): a main that runs just the startup sequence.
             stream.extend(quote! {
+                #[allow(dead_code)]
                 fn main() {
                     let __rython_result = (|| -> Result<(), PyException> {
                         #startup_init
@@ -5983,8 +5996,10 @@ impl Module {
     fn convert_python_main_to_rust_entry_point(code: &str) -> String {
         use regex::Regex;
         
-        // Replace "pub fn main (" with "fn main("
-        let code = code.replace("pub fn main (", "fn main(");
+        // Replace "pub fn main (" with "fn main(". The entry point allows
+        // dead_code: the lib copy of the entry module never calls it (see
+        // the consolidated-main comment in to_rust).
+        let code = code.replace("pub fn main (", "#[allow(dead_code)] fn main(");
         
         // Handle return statements in the main function
         // We need to wrap the function body to ignore return values
@@ -5997,7 +6012,7 @@ impl Module {
             if body.contains("return ") {
                 // Wrap the original function as python_main and create new main that ignores return
                 let new_code = code.replace("fn main(", "fn python_main(");
-                format!("{}\n\nfn main() {{\n    let _ = python_main();\n}}", new_code)
+                format!("{}\n\n#[allow(dead_code)]\nfn main() {{\n    let _ = python_main();\n}}", new_code)
             } else {
                 // No return statements, use the function as-is
                 code
