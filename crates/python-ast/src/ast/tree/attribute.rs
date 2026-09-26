@@ -543,6 +543,15 @@ impl<'a> CodeGen for Attribute {
             CodeGenContext::Trait { class, generic: true, .. } => Some(class.clone()),
             _ => None,
         };
+        // A crate module's promoted STATIC read through the module
+        // (`idnadata.joining_types` after `from . import idnadata`),
+        // decided before `options` / `symbols` move.
+        let promoted_module_static = matches!(self.value.as_ref(), ExprType::Name(root)
+            if crate::ast::tree::module::crate_module_bound_to(&root.id, &symbols, &options)
+                .is_some_and(|path| {
+                    crate::ast::tree::module::module_promoted_static_names(&options, &path)
+                        .contains(&self.attr)
+                }));
         // The fallibility rule (the review's fix 2, round 99): a method
         let mut value_tokens = self.value.to_rust(ctx, options, symbols)?;
         if let Some(_inner) = option_receiver {
@@ -655,6 +664,12 @@ impl<'a> CodeGen for Attribute {
                 } else {
                     Ok(quote!(#value_tokens::#attr))
                 }
+            } else if promoted_module_static {
+                // A crate module's promoted STATIC read through the module:
+                // a LazyLock does not auto-deref in value position, so the
+                // read deref-clones exactly as a read of the name imported
+                // directly does (name.rs).
+                Ok(quote!((*#value_tokens::#attr).clone()))
             } else {
                 Ok(quote!(#value_tokens::#attr))
             }

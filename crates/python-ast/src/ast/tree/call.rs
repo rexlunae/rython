@@ -35,6 +35,16 @@ const ISINSTANCE_TARGET_NAMES: &[&str] = &[
     "Sequence",
 ];
 
+/// Whether the runtime function `fname` of the stdpython module `root`
+/// returns `Result` (a call threads `?`): the shared name list below, or a
+/// module whose surface is an enum that knows (unicodedata).
+fn stdlib_fn_fallible(root: &str, fname: &str) -> bool {
+    FALLIBLE_STDLIB_FN.contains(&fname)
+        || (crate::StdModule::from_name(root) == Some(crate::StdModule::Unicodedata)
+            && crate::ast::tree::std_module::UnicodedataItem::from_name(fname)
+                .is_some_and(|item| item.is_fallible_fn()))
+}
+
 /// Runtime-module functions that return `Result<T, PyException>` because
 /// they can raise like their Python counterparts. A call through a module
 /// path (`math.sqrt(x)`, `json.loads(s)`) into one of these threads `?`
@@ -378,6 +388,21 @@ fn box_assert_argument(
         | crate::TypeInfo::Bytes
         | crate::TypeInfo::Complex
         | crate::TypeInfo::PyValue => Ok(Some(quote!(PyValue::from(#r)))),
+        // A variable-length tuple of boxable scalars boxes as the tuple it
+        // is (issue #399).
+        crate::TypeInfo::PyTuple(inner)
+            if matches!(
+                *inner,
+                crate::TypeInfo::Int
+                    | crate::TypeInfo::Float
+                    | crate::TypeInfo::Bool
+                    | crate::TypeInfo::String
+                    | crate::TypeInfo::Bytes
+                    | crate::TypeInfo::PyValue
+            ) =>
+        {
+            Ok(Some(quote!(PyValue::from(#r))))
+        }
         // A fixed-arity TUPLE of boxable scalars (`(_encode_range(1, 2),)`
         // — idna's test_intranges, issue #334): the boxed tuple of its
         // boxed members.
@@ -2296,8 +2321,42 @@ pub(crate) fn callee_value_signature(
     };
     match inferred {
         crate::TypeInfo::Callable(params, ret) => Some((params, *ret)),
+        // An OPTIONAL callable (`fn: Optional[Callable[[str], str]] = None`,
+        // then `if fn is None: fn = default`): called as the callable it
+        // holds — see [`callee_value_is_optional`].
+        crate::TypeInfo::Option(inner) => match *inner {
+            crate::TypeInfo::Callable(params, ret) => Some((params, *ret)),
+            _ => None,
+        },
         _ => None,
     }
+}
+
+/// Whether a callable value's callee is an `Option` the call must unwrap:
+/// an Optional-callable name not narrowed by a guard (a narrowed read
+/// already unwraps — name.rs). Calling None is CPython's TypeError, the
+/// loud §12.2 panic here.
+fn callee_value_is_optional(
+    func: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    if let ExprType::Name(n) = func
+        && options.narrowed_names.contains_key(&n.id)
+    {
+        return false;
+    }
+    let inferred = match func {
+        ExprType::Name(n) => options
+            .name_types
+            .get(&n.id)
+            .cloned()
+            .unwrap_or_else(|| crate::infer_type(Some(ctx), func, options, symbols)),
+        _ => crate::infer_type(Some(ctx), func, options, symbols),
+    };
+    matches!(inferred, crate::TypeInfo::Option(inner)
+        if matches!(*inner, crate::TypeInfo::Callable(..)))
 }
 
 impl<'a> CodeGen for Call {
@@ -2560,7 +2619,15 @@ impl<'a> CodeGen for Call {
             } else {
                 quote!((#(#args),*))
             };
+            let optional = callee_value_is_optional(self.func.as_ref(), &ctx, &options, &symbols);
             let callee = self.func.clone().to_rust(ctx, options, symbols)?;
+            let callee = if optional {
+                quote!((#callee).clone().unwrap_or_else(|| {
+                    panic!("TypeError: 'NoneType' object is not callable")
+                }))
+            } else {
+                callee
+            };
             return Ok(quote!((#callee).call(#arg_tuple)?));
         }
         // A compat builtin ALIAS used as a callee (`builtin_str = str` —
@@ -2643,7 +2710,7 @@ impl<'a> CodeGen for Call {
                                 // bare import inside a `try:` swallows the
                                 // exception instead of reaching its `except`.
                                 let fname = import_canonical_fn_name(import, &name.id);
-                                FALLIBLE_STDLIB_FN.iter().any(|f| *f == fname)
+                                stdlib_fn_fallible(root, &fname)
                             }
                         }
                         // `from pylev import wf as w` — an aliased import of
@@ -2653,6 +2720,14 @@ impl<'a> CodeGen for Call {
                         // FALLIBLE, matching the qualified call.
                         Some(SymbolTableNode::Alias(canonical)) => {
                             FALLIBLE_STDLIB_FN.iter().any(|f| *f == canonical)
+                                || matches!(
+                                    symbols.get(canonical),
+                                    Some(SymbolTableNode::ImportFrom(import))
+                                        if stdlib_fn_fallible(
+                                            import.module.split('.').next().unwrap_or(""),
+                                            canonical,
+                                        )
+                                )
                                 || matches!(
                                     symbols.get(canonical),
                                     Some(SymbolTableNode::ImportFrom(import))
@@ -2705,7 +2780,7 @@ impl<'a> CodeGen for Call {
                         }
                     }
                     Some(root) if crate::is_stdpython_module(&root) => {
-                        FALLIBLE_STDLIB_FN.contains(&attr.attr.as_str())
+                        stdlib_fn_fallible(&root, &attr.attr)
                     }
                     _ => false,
                 }
@@ -4992,6 +5067,20 @@ impl<'a> CodeGen for Call {
                             options.clone(),
                             symbols.clone(),
                         )?;
+                        // A typed list or tuple builds a variable-length
+                        // tuple (issue #399) — it prints `(3, 4)`, where
+                        // the boxed factory's Vec printed as a list.
+                        if let Some(elem) = crate::ast::tree::type_ctx::tuple_call_element(
+                            &self,
+                            Some(&ctx),
+                            &options,
+                            &symbols,
+                        ) {
+                            let ty = elem.to_rust_type();
+                            return Ok(quote!(
+                                stdpython::PyTuple::<#ty>::from_iter((#a).into_iter())
+                            ));
+                        }
                         return Ok(quote!(PyValue::from(#a)));
                     }
                     // next(iterable[, default]): Python's iterator advance.
@@ -5101,6 +5190,11 @@ impl<'a> CodeGen for Call {
                                             | crate::TypeInfo::PyValue
                                             | crate::TypeInfo::PyValueMember(_)
                                             | crate::TypeInfo::PyObject
+                                            // A variable-length tuple
+                                            // displays by reference, so
+                                            // the name stays usable after
+                                            // (issue #399).
+                                            | crate::TypeInfo::PyTuple(_)
                                     )
                                     // A PyException-typed parameter (an
                                     // exception-class union — `str(err)`
@@ -6324,10 +6418,33 @@ impl<'a> CodeGen for Call {
                             Some(h) => quote!(Some(#h)),
                             None => quote!(None),
                         };
+                        // A BOXED sequence (idna's `uts46data`) searches
+                        // with the boxed `<` (the runtime's BisectSeq);
+                        // the probe boxes too.
+                        let seq_ty =
+                            crate::infer_type(Some(&ctx), &self.args[0], &options, &symbols);
+                        if !fname.starts_with("insort")
+                            && (matches!(seq_ty, crate::TypeInfo::PyValue)
+                                || matches!(
+                                    &seq_ty,
+                                    crate::TypeInfo::Vec(e) | crate::TypeInfo::PyTuple(e)
+                                        if matches!(**e, crate::TypeInfo::PyValue)
+                                ))
+                        {
+                            let x = crate::render_typed(
+                                &self.args[1],
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(crate::TypeInfo::PyValue),
+                            )?;
+                            let p = qual(&fname);
+                            return Ok(quote!(#p(&(#a), &(#x), #lo, #hi)?));
+                        }
                         // The probe takes the sequence's element type (a
                         // str literal into a list of str owns itself).
                         let x = match crate::infer_type(Some(&ctx), &self.args[0], &options, &symbols) {
-                            crate::TypeInfo::Vec(elem) => crate::render_typed(
+                            crate::TypeInfo::Vec(elem) | crate::TypeInfo::PyTuple(elem) => crate::render_typed(
                                 &self.args[1],
                                 ctx.clone(),
                                 options.clone(),
@@ -8384,6 +8501,55 @@ let mutating_self_field = boxed_self_ref_receiver
                 return Ok(quote!(stdpython::PyValue::None_));
             }
 
+            // A COMPILED PATTERN's split (`_unicode_dots_re.split(s)` —
+            // idna): the regex split, never the str method. The text may
+            // be a boxed `str | bytes` value (CPython's TypeError on bytes).
+            if attr.attr == "split"
+                && crate::ast::tree::call::is_compiled_regex_expr(&attr.value, &symbols, &options)
+            {
+                let mut text = self.args.first().cloned();
+                let mut maxsplit = self.args.get(1).cloned();
+                if self.args.len() > 2 {
+                    return Err(format!(
+                        "split() takes at most 2 arguments ({} given)",
+                        self.args.len()
+                    )
+                    .into());
+                }
+                for kw in &self.keywords {
+                    let slot = match kw.arg.as_deref() {
+                        Some("string") => &mut text,
+                        Some("maxsplit") => &mut maxsplit,
+                        other => {
+                            return Err(format!(
+                                "split() got an unexpected keyword argument '{}'",
+                                other.unwrap_or("**kwargs")
+                            )
+                            .into());
+                        }
+                    };
+                    if slot.is_some() {
+                        return Err(format!(
+                            "split() got multiple values for argument '{}'",
+                            kw.arg.as_deref().unwrap_or_default()
+                        )
+                        .into());
+                    }
+                    *slot = Some(kw.value.clone());
+                }
+                let Some(text) = text else {
+                    return Err("split() missing required argument 'string' (pos 1)"
+                        .to_string()
+                        .into());
+                };
+                let text = text.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                let maxsplit = match maxsplit {
+                    Some(m) => m.to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+                    None => quote!(0),
+                };
+                return Ok(quote!((#receiver).py_re_split(&(#text), #maxsplit)?));
+            }
+
             // str.split / str.rsplit take sep and maxsplit by position or
             // keyword, with sep=None (or absent) meaning whitespace mode.
             // Normalized here so every spelling maps to the right runtime
@@ -8951,7 +9117,7 @@ let mutating_self_field = boxed_self_ref_receiver
                                 let runtime = crate::safe_ident(&options.stdpython);
                                 if errors == "strict" {
                                     return Ok(quote!(
-                                        #runtime::stdlib::codec::encode_ascii(#receiver)?
+                                        #runtime::stdlib::codec::encode_ascii(&(#receiver))?
                                     ));
                                 }
                                 return Ok(quote!(
@@ -9111,7 +9277,7 @@ let mutating_self_field = boxed_self_ref_receiver
                         ) =>
                     {
                         let runtime = crate::safe_ident(&options.stdpython);
-                        return Ok(quote!(#runtime::bytes_join(&(#receiver), &(#parts))));
+                        return Ok(quote!(#runtime::bytes_join(&(#receiver), &(#parts))?));
                     }
                     // list.pop() returns the last element or raises IndexError
                     // (Vec::pop returns an Option). A GENERIC receiver (an
@@ -9981,6 +10147,23 @@ let mutating_self_field = boxed_self_ref_receiver
                 }
                 _ => None,
                 }
+            },
+            // A crate module's function called THROUGH the module (`lib.f(x,
+            // k=v)` after `from . import lib` — idna's tests calling
+            // `idna.check_bidi(s)`): the same signature mapping as the
+            // by-name call, so keywords bind by name and defaults fill
+            // (issue #401 — the keywords used to bind positionally in call
+            // order, silently).
+            ExprType::Attribute(a) => match a.value.as_ref() {
+                ExprType::Name(m)
+                    if !options.name_types.contains_key(&m.id)
+                        && !options.local_types.contains_key(&m.id) =>
+                {
+                    crate::ast::tree::module::crate_module_bound_to(&m.id, &symbols, &options)
+                        .and_then(|path| crate::module_function_def(&options, &path, &a.attr))
+                        .map(|(f, _)| f)
+                }
+                _ => None,
             },
             _ => None,
         };
@@ -13057,6 +13240,27 @@ fn map_call_arguments_inner(
             let name = n.id.clone();
             return Ok(quote!(#name.to_string()));
         }
+        // An OPTIONAL CALLABLE parameter (`fn: Optional[Callable[[str],
+        // str]] = None`): a lambda or a function name builds the callable
+        // value inside the Some (render_typed), as for a plain callable
+        // parameter.
+        if optional
+            && let Some(slot @ crate::TypeInfo::Option(_)) = param
+                .evaluated_annotation()
+                .as_ref()
+                .and_then(|ann| crate::resolve_alias_typeinfo(ann, symbols, options))
+            && matches!(&slot, crate::TypeInfo::Option(inner)
+                if matches!(inner.as_ref(), crate::TypeInfo::Callable(..)))
+            && !crate::is_none_expr(expr)
+        {
+            return crate::render_typed(
+                expr,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+                Some(slot),
+            );
+        }
         if optional {
             // An `X | None` parameter whose X has no Rust type
             // (`headers: ValidHTTPHeaderSource | None` — urllib3's
@@ -13731,7 +13935,9 @@ fn map_call_arguments_inner(
     let build_vararg = |items: &[(TokenStream, bool)]| -> TokenStream {
         if items.iter().all(|(_, is_spread)| !is_spread) {
             let vals: Vec<&TokenStream> = items.iter().map(|(v, _)| v).collect();
-            quote!(vec![#(#vals),*])
+            // The collected extras are a tuple, as Python's `args` is
+            // (issue #399).
+            quote!(stdpython::PyTuple(vec![#(#vals),*]))
         } else {
             let elt = vararg_elt.to_rust_type();
             let boxed_elt = matches!(vararg_elt, crate::TypeInfo::PyValue);
@@ -13754,7 +13960,7 @@ fn map_call_arguments_inner(
                     stmts.extend(quote!(__rython_varargs.push(#v);));
                 }
             }
-            quote!({ #stmts __rython_varargs })
+            quote!(stdpython::PyTuple({ #stmts __rython_varargs }))
         }
     };
 

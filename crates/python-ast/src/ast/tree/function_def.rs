@@ -2805,7 +2805,7 @@ impl FunctionDef {
                     vararg, &symbols, &options,
                 );
                 info.name_types
-                    .insert(vararg.arg.clone(), crate::TypeInfo::Vec(Box::new(elt)));
+                    .insert(vararg.arg.clone(), crate::TypeInfo::PyTuple(Box::new(elt)));
             }
             options.use_counts = std::rc::Rc::new(info.use_counts);
             options.name_types = std::rc::Rc::new(merge_module_static_types(
@@ -3691,6 +3691,7 @@ impl FunctionDef {
                             crate::TypeInfo::Vec(_)
                                 | crate::TypeInfo::Dict(_, _)
                                 | crate::TypeInfo::Tuple(_)
+                                | crate::TypeInfo::PyTuple(_)
                         ) && !options.fn_return_is_pyvalue
                             && !options.fn_return_is_option
                     })
@@ -4363,7 +4364,7 @@ fn renderable_return_typeinfo(t: &crate::TypeInfo) -> bool {
         // declares Result<PyValue, _>, and the body already emits the
         // boxed values. Only the NO-ANSWER PyObject keeps refusing.
         crate::TypeInfo::PyValue => true,
-        crate::TypeInfo::Vec(e) => renderable_return_typeinfo(e),
+        crate::TypeInfo::Vec(e) | crate::TypeInfo::PyTuple(e) => renderable_return_typeinfo(e),
         crate::TypeInfo::Dict(k, v) => {
             renderable_return_typeinfo(k) && renderable_return_typeinfo(v)
         }

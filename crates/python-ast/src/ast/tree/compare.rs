@@ -309,9 +309,24 @@ impl CodeGen for Compare {
                     }
                 }
             }
-            let comparator = comparator_ast
-                .clone()
-                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            // A tuple LITERAL compared with a variable-length tuple (`xs ==
+            // (1, 2, 3)` — issue #399) renders as that tuple type, so the
+            // comparison is tuple against tuple.
+            let comparator = match (
+                comparator_ast,
+                crate::infer_type(Some(&ctx), left_ast, &options, &symbols),
+            ) {
+                (ExprType::Tuple(_), left_ty @ crate::TypeInfo::PyTuple(_)) => crate::render_typed(
+                    comparator_ast,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                    Some(left_ty),
+                )?,
+                _ => comparator_ast
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+            };
             // A GENERIC (inferred) parameter compares with an integer
             // literal converted to the parameter's own type via
             // stdpython's PyFromInt (`B::py_from_int(0)`): Rust std has no
@@ -443,6 +458,22 @@ impl CodeGen for Compare {
             // membership READ unwraps the Option with a loud §12.2 panic
             // (CPython's TypeError on a None comparator), mirroring the
             // call path's receiver_option_inner.
+            // An OPTIONAL scalar probe (`joining_type in [ord("L"),
+            // ord("D")]` where joining_type is a `dict.get` result — idna's
+            // valid_contextj): None is never a member of a list of
+            // scalars, and a present value is tested as itself.
+            let optional_scalar_probe = matches!(
+                crate::infer_type(Some(&ctx), left_ast, &options, &symbols),
+                crate::TypeInfo::Option(inner)
+                    if matches!(*inner, crate::TypeInfo::Int | crate::TypeInfo::Float | crate::TypeInfo::Bool)
+            ) && !matches!(left_ast, ExprType::Name(n) if options.narrowed_names.contains_key(&n.id));
+            let membership = |recv: &TokenStream| {
+                if optional_scalar_probe {
+                    quote!((#left).as_ref().is_some_and(|__rython_m| (#recv).py_contains(__rython_m)))
+                } else {
+                    quote!((#recv).py_contains(&(#left)))
+                }
+            };
             let membership_receiver = || {
                 // A NARROWED comparator (`if character_range is None:
                 // continue` then `keyword in character_range` — charset's
@@ -651,7 +682,7 @@ impl CodeGen for Compare {
                             }
                             _ => membership_receiver(),
                         };
-                        quote!((#recv).py_contains(&(#left)))
+                        membership(&recv)
                     }
                 }
                 Compares::NotIn => {
@@ -747,7 +778,8 @@ impl CodeGen for Compare {
                             }
                             _ => membership_receiver(),
                         };
-                        quote!(!(#recv).py_contains(&(#left)))
+                        let test = membership(&recv);
+                        quote!(!#test)
                     }
                 }
 

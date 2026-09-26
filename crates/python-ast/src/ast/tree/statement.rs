@@ -972,6 +972,23 @@ impl CodeGen for StatementType {
                         symbols.clone(),
                         options.fn_return_typed.clone(),
                     )?
+                } else if let (
+                    ExprType::Tuple(_),
+                    Some(crate::TypeInfo::PyTuple(_) | crate::TypeInfo::Tuple(_)),
+                ) = (&e.value, options.fn_return_typed.as_ref())
+                {
+                    // A tuple literal returned from a `-> tuple[T, ...]`
+                    // function (issue #399): its members are the
+                    // variable-length tuple's. Into a fixed-shape
+                    // `-> tuple[str, int]`, each member renders against
+                    // its slot (`return "", 0` — idna's codec).
+                    crate::render_typed(
+                        &e.value,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                        options.fn_return_typed.clone(),
+                    )?
                 } else if options.fn_return_is_pyvalue
                     && crate::is_none_expr(&e.value)
                 {

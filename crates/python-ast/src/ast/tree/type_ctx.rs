@@ -51,6 +51,11 @@ pub enum TypeInfo {
     Bytes,
     /// `Vec<T>`
     Vec(Box<TypeInfo>),
+    /// `stdpython::PyTuple<T>` — a tuple whose length is not fixed
+    /// statically (`tuple[T, ...]`, `tuple(xs)` of a list, the
+    /// mixed-arity tuple values of one dict literal). A sequence like
+    /// `Vec` (it derefs to one), but it prints as a tuple — issue #399.
+    PyTuple(Box<TypeInfo>),
     /// `std::collections::HashSet<T>` — `set[T]` / `frozenset[T]`
     /// annotations: set literals lower to HashSet, so an annotated set is
     /// that type, not a Vec (the two resolvers disagreed here; the
@@ -150,6 +155,7 @@ pub(crate) fn type_mentions_heap(t: &TypeInfo) -> bool {
         | TypeInfo::Callable(..)
         | TypeInfo::Custom(_) => true,
         TypeInfo::Vec(inner)
+        | TypeInfo::PyTuple(inner)
         | TypeInfo::Option(inner)
         | TypeInfo::HashSet(inner)
         | TypeInfo::Borrowed(inner) => type_mentions_heap(inner),
@@ -168,6 +174,7 @@ pub(crate) fn type_mentions_pyobject(t: &TypeInfo) -> bool {
     match t {
         TypeInfo::PyObject => true,
         TypeInfo::Vec(inner)
+        | TypeInfo::PyTuple(inner)
         | TypeInfo::Option(inner)
         | TypeInfo::HashSet(inner)
         | TypeInfo::Borrowed(inner) => type_mentions_pyobject(inner),
@@ -193,6 +200,7 @@ pub(crate) fn type_contains_pyvalue(t: &TypeInfo) -> bool {
     match t {
         TypeInfo::PyValue | TypeInfo::PyValueMember(_) => true,
         TypeInfo::Vec(inner)
+        | TypeInfo::PyTuple(inner)
         | TypeInfo::Option(inner)
         | TypeInfo::HashSet(inner)
         | TypeInfo::Borrowed(inner) => type_contains_pyvalue(inner),
@@ -263,6 +271,10 @@ impl TypeInfo {
             TypeInfo::Vec(inner) => {
                 let t = inner.to_rust_type();
                 quote!(Vec<#t>)
+            }
+            TypeInfo::PyTuple(inner) => {
+                let t = inner.to_rust_type();
+                quote!(stdpython::PyTuple<#t>)
             }
             TypeInfo::HashSet(inner) => {
                 let t = inner.to_rust_type();
@@ -340,7 +352,7 @@ impl TypeInfo {
             TypeInfo::Vec(_) => "list".into(),
             TypeInfo::HashSet(_) => "set".into(),
             TypeInfo::Dict(_, _) => "dict".into(),
-            TypeInfo::Tuple(_) => "tuple".into(),
+            TypeInfo::Tuple(_) | TypeInfo::PyTuple(_) => "tuple".into(),
             TypeInfo::Option(_) => "Optional".into(),
             TypeInfo::Range => "range".into(),
             TypeInfo::NdArray => "ndarray".into(),
@@ -532,6 +544,37 @@ pub fn coerce_tokens(
         | (TypeInfo::PyValue, TypeInfo::String)
         | (TypeInfo::PyValue, TypeInfo::Bytes) => {
             Some(quote!((#tokens).into()))
+        }
+        // A boxed int sequence into a `tuple[int, ...]` slot (issue #399).
+        (TypeInfo::PyValue, TypeInfo::PyTuple(inner)) if matches!(**inner, TypeInfo::Int) => {
+            Some(quote!(stdpython::PyTuple::from(<Vec<i64>>::from((#tokens).clone()))))
+        }
+        // A list into a variable-length tuple slot, and back (issue
+        // #399): the same members, re-wrapped — `tuple[T, ...]` and
+        // `list[T]` share the Vec representation.
+        (TypeInfo::Vec(a), TypeInfo::PyTuple(b)) if a == b => {
+            Some(quote!(stdpython::PyTuple::from(#tokens)))
+        }
+        (TypeInfo::PyTuple(a), TypeInfo::Vec(b)) if a == b => {
+            Some(quote!(<Vec<_>>::from(#tokens)))
+        }
+        // A fixed-shape tuple into a variable-length tuple slot (`return
+        // (lo, hi)` from a `-> tuple[int, ...]` function): destructure and
+        // re-collect, each member converted to the element type.
+        (TypeInfo::Tuple(ts), TypeInfo::PyTuple(elem)) => {
+            let names: Vec<_> = (0..ts.len())
+                .map(|i| quote::format_ident!("__rython_t{}", i))
+                .collect();
+            let members = ts
+                .iter()
+                .zip(&names)
+                .map(|(t, n)| coerce_tokens(quote!(#n), t, elem))
+                .collect::<Option<Vec<_>>>()?;
+            let ty = elem.to_rust_type();
+            Some(quote!({
+                let (#(#names,)*) = #tokens;
+                stdpython::PyTuple::<#ty>(vec![#(#members),*])
+            }))
         }
         // A boxed int sequence into a `list[int]` slot (issue #335: a
         // boxed method parameter passed on to `def total(xs: List[int])`).
@@ -806,6 +849,25 @@ fn infer_type_inner(
                 let _entry = NameInferenceEntry::enter(n.id.clone());
                 return infer_type_inner(ctx, value, options, symbols);
             }
+            // 5. A literal table IMPORTED from another crate module (`from
+            // .idnadata import joining_types`): the defining module's
+            // static type.
+            if let Some(SymbolTableNode::ImportFrom(i)) = symbols.get(&n.id)
+                && options.module_defs.len() > 1
+            {
+                let defining = i
+                    .names
+                    .iter()
+                    .find(|a| a.asname.as_deref() == Some(n.id.as_str()))
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| n.id.clone());
+                let path = i.resolved_module_path(options);
+                if let Some(t) =
+                    crate::ast::tree::module::crate_module_static_type(options, &path, &defining)
+                {
+                    return t;
+                }
+            }
             // A CLASS NAME read as a VALUE (`[ChecksumError]`,
             // `EXCEPTION_MAP['k']` — botocore's retryhandler): classes as
             // values lower to their NAME STRINGS — the exception model is
@@ -861,6 +923,7 @@ fn infer_type_inner(
             // 100).
             let mut v_str_tuple_arity: Option<usize> = None;
             let mut v_str_tuple_mixed = false;
+            let mut v_tuple_elem: Option<TypeInfo> = None;
             let mut saw_value = false;
             for (key, value) in d.keys.iter().zip(d.values.iter()) {
                 let kt = match key {
@@ -878,14 +941,10 @@ fn infer_type_inner(
                     v = unify(v, vt.clone());
                     match vt {
                         TypeInfo::Tuple(ts)
-                            if !ts.is_empty()
-                                && ts.iter().all(|e| {
-                                    matches!(
-                                        e,
-                                        TypeInfo::StrRef | TypeInfo::String
-                                    )
-                                }) =>
+                            if let Some(elem) = uniform_tuple_scalar(&ts)
+                                && v_tuple_elem.as_ref().is_none_or(|e| *e == elem) =>
                         {
+                            v_tuple_elem = Some(elem);
                             let arity = ts.len();
                             match v_str_tuple_arity {
                                 Some(a) if a != arity => v_str_tuple_mixed = true,
@@ -900,8 +959,11 @@ fn infer_type_inner(
                     }
                 }
             }
-            if saw_value && v_str_tuple_mixed {
-                v = TypeInfo::Vec(Box::new(TypeInfo::String));
+            if saw_value
+                && v_str_tuple_mixed
+                && let Some(elem) = v_tuple_elem
+            {
+                v = TypeInfo::PyTuple(Box::new(elem));
             }
             TypeInfo::Dict(Box::new(k), Box::new(v))
         }
@@ -1242,6 +1304,21 @@ fn infer_type_inner(
         // context, no class) falls through to the PyObject arm below —
         // exactly the pre-ctx behavior (round 99).
         ExprType::Attribute(attr) => {
+            // A literal table of another crate module read through the
+            // module (`idnadata.joining_types` after `from . import
+            // idnadata` — idna's core.py): the defining module's static
+            // type. A local or parameter shadowing the module name is not
+            // the module.
+            if let ExprType::Name(m) = attr.value.as_ref()
+                && !options.name_types.contains_key(&m.id)
+                && !options.local_types.contains_key(&m.id)
+                && let Some(path) =
+                    crate::ast::tree::module::crate_module_bound_to(&m.id, symbols, options)
+                && let Some(t) =
+                    crate::ast::tree::module::crate_module_static_type(options, &path, &attr.attr)
+            {
+                return t;
+            }
             // Any attribute of a `threading.local()` object is a run-time
             // attribute: a boxed value (issue #356).
             if matches!(
@@ -1359,7 +1436,7 @@ fn infer_type_inner(
                 };
             }
             match container {
-            TypeInfo::Vec(inner) => *inner,
+            TypeInfo::Vec(inner) | TypeInfo::PyTuple(inner) => *inner,
             TypeInfo::Dict(_, v) => *v,
             // A TUPLE indexed by a constant (`pair[0]`, `pair[-1]`) is that
             // element's type (a tuple holds its elements as a list does —
@@ -1402,7 +1479,7 @@ fn infer_type_inner(
                 _ => TypeInfo::PyObject,
             },
             TypeInfo::Borrowed(inner) => match *inner {
-                TypeInfo::Vec(e) => *e,
+                TypeInfo::Vec(e) | TypeInfo::PyTuple(e) => *e,
                 TypeInfo::String => TypeInfo::StrRef,
                 other => other,
             },
@@ -1484,9 +1561,56 @@ pub(crate) fn tuple_iteration_element(members: &[TypeInfo]) -> Option<TypeInfo> 
     (!type_mentions_pyobject(&acc)).then_some(acc)
 }
 
+/// The one scalar member type of a non-empty tuple whose members all
+/// share it — `str` (a `&str` literal counts, as the owned String it
+/// renders as) or `int` — or None. The mixed-arity dict rule (issue
+/// #399) lowers such tuples of DIFFERENT lengths to one
+/// `PyTuple<elem>` value type.
+pub(crate) fn uniform_tuple_scalar(ts: &[TypeInfo]) -> Option<TypeInfo> {
+    let kind = |t: &TypeInfo| match t {
+        TypeInfo::StrRef | TypeInfo::String => Some(TypeInfo::String),
+        TypeInfo::Int => Some(TypeInfo::Int),
+        _ => None,
+    };
+    let (first, rest) = ts.split_first()?;
+    let elem = kind(first)?;
+    rest.iter().all(|t| kind(t).as_ref() == Some(&elem)).then_some(elem)
+}
+
+/// The element type of `tuple(xs)` when it builds a variable-length
+/// tuple (issue #399): the argument is a typed list or tuple whose
+/// element type is known. Any other argument keeps the boxed factory.
+/// The one predicate the lowering (call.rs) and the typing
+/// ([`iterator_builtin_type`]) share, so they cannot disagree.
+pub(crate) fn tuple_call_element(
+    call: &crate::Call,
+    ctx: Option<&CodeGenContext>,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<TypeInfo> {
+    if call.args.len() != 1 || !call.keywords.is_empty() {
+        return None;
+    }
+    match infer_type(ctx, &call.args[0], options, symbols) {
+        // Boxed members keep the boxed factory: `PyValue::from(xs)` is
+        // already a tuple that prints as one (PyValue::Tuple), and a
+        // function returning it stays typed as the boxed value its callers
+        // see (botocore's `return tuple(retryable)` into an unannotated
+        // `__init__` parameter).
+        TypeInfo::Vec(e) | TypeInfo::PyTuple(e)
+            if !type_mentions_pyobject(&e)
+                && !type_contains_pyvalue(&e)
+                && !matches!(*e, TypeInfo::StrRef) =>
+        {
+            Some(*e)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn iterable_element_type(t: &TypeInfo) -> Option<TypeInfo> {
     match t {
-        TypeInfo::Vec(e) | TypeInfo::HashSet(e) => Some((**e).clone()),
+        TypeInfo::Vec(e) | TypeInfo::PyTuple(e) | TypeInfo::HashSet(e) => Some((**e).clone()),
         // A tuple whose members share one type iterates as that type (the
         // loop lowers it to an array — issue #370).
         TypeInfo::Tuple(members) => tuple_iteration_element(members),
@@ -1576,6 +1700,9 @@ fn iterator_builtin_type(
         "filter" | "list" | "reversed" => {
             Some(TypeInfo::Vec(Box::new(elem_of(call.args.last()?)?)))
         }
+        "tuple" => Some(TypeInfo::PyTuple(Box::new(tuple_call_element(
+            call, ctx, options, symbols,
+        )?))),
         // map's element type is the CALLABLE's return type, not the
         // iterable's. Two arguments only: `map(f, a, b)` lowers through
         // map2 and is left to the name-only table.
@@ -1663,6 +1790,9 @@ pub fn unify(a: TypeInfo, b: TypeInfo) -> TypeInfo {
     match (&a, &b) {
         (TypeInfo::Vec(x), TypeInfo::Vec(y)) => {
             TypeInfo::Vec(Box::new(unify((**x).clone(), (**y).clone())))
+        }
+        (TypeInfo::PyTuple(x), TypeInfo::PyTuple(y)) => {
+            TypeInfo::PyTuple(Box::new(unify((**x).clone(), (**y).clone())))
         }
         (TypeInfo::Dict(k1, v1), TypeInfo::Dict(k2, v2)) => TypeInfo::Dict(
             Box::new(unify((**k1).clone(), (**k2).clone())),
@@ -1820,6 +1950,26 @@ pub fn render_typed(
             lam, params, ret, ctx, options, symbols,
         );
     }
+    // A lambda or a module function name where an OPTIONAL callable is
+    // expected (`apply(text, fn=shout)`, `fn = shout` into an
+    // `Optional[Callable[[str], str]]` slot): the present callable value,
+    // built as for the plain callable slot.
+    if let Some(TypeInfo::Option(inner)) = &expected
+        && let TypeInfo::Callable(params, ret) = inner.as_ref()
+    {
+        if let ExprType::Lambda(lam) = expr {
+            let c = crate::ast::tree::closure::render_lambda_callable(
+                lam, params, ret, ctx, options, symbols,
+            )?;
+            return Ok(quote!(Some(#c)));
+        }
+        if let Some(wrapped) = crate::ast::tree::closure::wrap_function_as_callable(
+            expr, params, &symbols, &options,
+        ) {
+            let c = wrapped?;
+            return Ok(quote!(Some(#c)));
+        }
+    }
     // A module FUNCTION NAME where a callable value is expected
     // (`guarded(checked, 4)`): the name denotes a definition, so it is
     // wrapped in the runtime callable type, which forwards to the item.
@@ -1869,6 +2019,56 @@ pub fn render_typed(
             )?;
             return Ok(quote!(stdpython::PyValue::from(<Vec<#ty>>::from(#inner))));
         }
+    }
+    // A tuple LITERAL into a variable-length tuple slot (`return (lo,
+    // hi)` from a `-> tuple[int, ...]` function, the mixed-arity dict's
+    // `("b", "c")` values — issue #399): each member renders against the
+    // element type, and the members are the tuple's.
+    if let (ExprType::Tuple(t), Some(TypeInfo::PyTuple(elem))) = (expr, &expected) {
+        let elts = t
+            .elts
+            .iter()
+            .map(|e| {
+                render_typed_reused(
+                    e,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                    Some((**elem).clone()),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let ty = elem.to_rust_type();
+        return Ok(quote!(stdpython::PyTuple::<#ty>(vec![#(#elts),*])));
+    }
+    // A tuple LITERAL into a fixed-shape tuple slot of its own arity
+    // (`return "", 0` from a `-> tuple[str, int]` function — idna's
+    // codec): each member renders against its slot, so a str literal
+    // owns itself where the slot holds a String.
+    if let (ExprType::Tuple(t), Some(TypeInfo::Tuple(slots))) = (expr, &expected)
+        && t.elts.len() == slots.len()
+        && !slots.is_empty()
+    {
+        let elts = t
+            .elts
+            .iter()
+            .zip(slots)
+            .map(|(e, slot)| {
+                render_typed_reused(
+                    e,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                    Some(slot.clone()),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(if elts.len() == 1 {
+            let only = &elts[0];
+            quote!((#only,))
+        } else {
+            quote!((#(#elts),*))
+        });
     }
     // A class name used as a VALUE (`[ChecksumError]`, `merge_setting(
     // ..., dict_class=OrderedDict)` — requests' sessions): classes as
@@ -2226,6 +2426,13 @@ pub fn render_typed_reused(
     // wrapped Option would move x into it first (Devin review on #342,
     // round 4).
     let some_wrapped = adapted && tokens.to_string() == format!("Some ({})", raw);
+    // A BOXING wrap (`PyValue::from(data)` — a str into a boxed
+    // parameter, then `len(data)` in the same statement: idna's codec
+    // `return encode(data), len(data)`): the clone belongs to the READ
+    // too, or the box consumes the name before the later read.
+    let box_wrapped = adapted
+        && (tokens.to_string() == format!("PyValue :: from ({})", raw)
+            || tokens.to_string() == format!("stdpython :: PyValue :: from ({})", raw));
     // A MODULE-attribute read (`socket.AF_INET` — a constant) never
     // clones: the root is a module, not a class instance, so the read
     // cannot move anything a later read needs (round 99).
@@ -2261,6 +2468,9 @@ pub fn render_typed_reused(
                         return Ok(quote!(Some(Clone::clone(&(#raw)))));
                     }
                     return Ok(quote!(Some((#raw).clone())));
+                }
+                if box_wrapped {
+                    return Ok(quote!(stdpython::PyValue::from((#raw).clone())));
                 }
                 if matches!(t, TypeInfo::Class(_)) {
                     return Ok(quote!(Clone::clone(&(#tokens))));
@@ -2353,6 +2563,7 @@ pub fn is_boxable_value_type(t: &TypeInfo) -> bool {
             | TypeInfo::StrRef
             | TypeInfo::Bytes
             | TypeInfo::Tuple(_)
+            | TypeInfo::PyTuple(_)
             | TypeInfo::Option(_)
             | TypeInfo::Vec(_)
             // A nested DICT value (`{'ProviderType': 'sso', 'Credentials':
@@ -2614,7 +2825,7 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
                             )
                         {
                             let inner = annotation_type_info(&t.elts[0])?;
-                            return Some(TypeInfo::Vec(Box::new(inner)));
+                            return Some(TypeInfo::PyTuple(Box::new(inner)));
                         }
                         let mut infos = Vec::with_capacity(t.elts.len());
                         for e in &t.elts {
@@ -4846,7 +5057,7 @@ fn resolve_alias_typeinfo_inner(
                                         .is_some_and(crate::ast::tree::constant::is_ellipsis_literal)
                             )
                         {
-                            return Some(TypeInfo::Vec(Box::new(resolve_alias_typeinfo(
+                            return Some(TypeInfo::PyTuple(Box::new(resolve_alias_typeinfo(
                                 &t.elts[0], symbols, options,
                             )?)));
                         }
@@ -5170,7 +5381,7 @@ fn resolve_type_inner(
                 && let Some(t) = info.name_types.get(&n.id)
             {
                 return match t {
-                    TypeInfo::Vec(inner) => (**inner).clone(),
+                    TypeInfo::Vec(inner) | TypeInfo::PyTuple(inner) => (**inner).clone(),
                     TypeInfo::Dict(_, v) => (**v).clone(),
                     other => other.clone(),
                 };

@@ -17469,3 +17469,487 @@ fn method_arguments_and_dict_defaults_box_like_cpython() {
     );
 }
 
+
+#[test]
+fn variable_length_tuples_print_as_tuples() {
+    // Issue #399: a tuple whose length is not fixed statically —
+    // `Tuple[int, ...]`, `tuple(xs)` of a typed list, the mixed-arity
+    // tuple values of one dict literal, `*args`, an `isinstance(x,
+    // tuple)`-narrowed boxed value — prints as a tuple, never the list
+    // its Vec representation used to print.
+    let scratch = Scratch::new("vtuple");
+    let krate = package_crate(
+        &scratch,
+        "vtuple",
+        &[(
+            "cli.py",
+            concat!(
+                "from typing import Any, Dict, List, Tuple\n",
+                "\n",
+                "\n",
+                "def pair(n: int) -> Tuple[int, ...]:\n",
+                "    return tuple([n, n + 1])\n",
+                "\n",
+                "\n",
+                "def bounds(lo: int, hi: int) -> Tuple[int, ...]:\n",
+                "    return (lo, hi)\n",
+                "\n",
+                "\n",
+                "def count(*vals: Any) -> int:\n",
+                "    print(vals)\n",
+                "    return len(vals)\n",
+                "\n",
+                "\n",
+                "def show(x: Any) -> None:\n",
+                "    if isinstance(x, tuple):\n",
+                "        print(x, len(x))\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    t = pair(3)\n",
+                "    print(t, len(t), t[0], t[-1], t[1:], list(t))\n",
+                "    xs: Tuple[int, ...] = (1, 2, 3)\n",
+                "    print(bounds(2, 9), xs == (1, 2, 3), sum(xs))\n",
+                "    codes = {1: (\"a\",), 2: (\"b\", \"c\")}\n",
+                "    spans = {1: (5,), 2: (6, 7, 8)}\n",
+                "    print(codes[2], codes[1], spans[2], spans[1])\n",
+                "    names: List[str] = [\"x\", \"y\"]\n",
+                "    print(tuple(names), tuple(names[:0]))\n",
+                "    print(count(1, \"x\"), count())\n",
+                "    show((1, \"a\"))\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "vtuple"),
+        vec!["(3, 4) 2 3 4 (4,) [3, 4]", "(2, 9) True 6", "('b', 'c') ('a',) (6, 7, 8) (5,)", "('x', 'y') ()", "(1, 'x')", "()", "2 0", "(1, 'a') 2"]
+    );
+}
+
+#[test]
+fn optional_probes_and_string_enumeration_match_cpython() {
+    // Issue #334 (idna's valid_contextj): `jt in [..]` / `jt not in [..]`
+    // where jt is a `dict.get` result — None is never a member — and
+    // `enumerate(s)` / `enumerate(s, 1)` over a str.
+    let scratch = Scratch::new("optprobe");
+    let krate = package_crate(
+        &scratch,
+        "optprobe",
+        &[(
+            "cli.py",
+            concat!(
+                "from typing import Dict\n",
+                "\n",
+                "\n",
+                "TABLE: Dict[int, int] = {65: 84, 66: 76}\n",
+                "\n",
+                "\n",
+                "def kind(c: str) -> str:\n",
+                "    jt = TABLE.get(ord(c))\n",
+                "    if jt == ord(\"T\"):\n",
+                "        return \"T\"\n",
+                "    if jt in [ord(\"L\"), ord(\"D\")]:\n",
+                "        return \"L\"\n",
+                "    if jt not in [ord(\"L\")]:\n",
+                "        return \"none\"\n",
+                "    return \"never\"\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    for i, ch in enumerate(\"ABC\"):\n",
+                "        print(i, ch, kind(ch))\n",
+                "    for i, ch in enumerate(\"xy\", 1):\n",
+                "        print(i, ch)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "optprobe"),
+        vec!["0 A T", "1 B L", "2 C none", "1 x", "2 y"]
+    );
+}
+
+#[test]
+fn a_literal_table_read_from_another_module_is_typed() {
+    // Issue #334 (idna's core.py reading `idnadata.joining_types`): a
+    // module-level literal table read from ANOTHER module — through the
+    // module or imported by name — has the defining module's type, so a
+    // `.get(...)` result is the Option it is and compares as CPython
+    // does, and a read through the module deref-clones the static.
+    let scratch = Scratch::new("xmodtable");
+    let krate = package_crate(
+        &scratch,
+        "xmod",
+        &[
+            (
+                "data.py",
+                concat!(
+                    "TABLE = {65: 84, 66: 76, 68: 68}\n",
+                    "WORDS = [\"alpha\", \"beta\"]\n",
+                ),
+            ),
+            (
+                "core.py",
+                concat!(
+                    "from . import data\n",
+                    "from .data import WORDS\n",
+                    "\n",
+                    "\n",
+                    "def kind(c: str) -> str:\n",
+                    "    jt = data.TABLE.get(ord(c))\n",
+                    "    if jt == ord(\"T\"):\n",
+                    "        return \"T\"\n",
+                    "    if jt in [ord(\"L\"), ord(\"D\")]:\n",
+                    "        return \"L/D\"\n",
+                    "    return \"none\"\n",
+                    "\n",
+                    "\n",
+                    "def run() -> None:\n",
+                    "    for ch in \"ABCD\":\n",
+                    "        print(ch, kind(ch))\n",
+                    "    print(WORDS, len(data.WORDS), data.TABLE)\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .core import run\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    run()\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "xmod"),
+        vec!["A T", "B L/D", "C none", "D L/D", "['alpha', 'beta'] 2 {65: 84, 66: 76, 68: 68}"]
+    );
+}
+
+#[test]
+fn a_compiled_pattern_splits_as_a_regex() {
+    // Issue #334 (idna's `_unicode_dots_re.split(s)`): a compiled
+    // pattern's split is the regex split — maxsplit included — and a
+    // bytes text is CPython's TypeError.
+    let scratch = Scratch::new("resplit");
+    let krate = package_crate(
+        &scratch,
+        "resplit",
+        &[(
+            "cli.py",
+            concat!(
+                "import re\n",
+                "from typing import Any, List\n",
+                "\n",
+                "_dots = re.compile(\"[.\\u3002]\")\n",
+                "\n",
+                "\n",
+                "def labels(s: Any) -> List[str]:\n",
+                "    return _dots.split(s)\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    print(_dots.split(\"a.b\\u3002c\"), _dots.split(\"a.b.c\", 1), _dots.split(\"\"))\n",
+                "    print(labels(\"x.y\"))\n",
+                "    try:\n",
+                "        labels(b\"x.y\")\n",
+                "    except TypeError as e:\n",
+                "        print(\"TypeError\", e)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "resplit"),
+        vec!["['a', 'b', 'c'] ['a', 'b.c'] ['']", "['x', 'y']", "TypeError cannot use a string pattern on a bytes-like object"]
+    );
+}
+
+#[test]
+fn bisect_over_a_table_of_boxed_rows_matches_cpython() {
+    // Issue #334 (idna's uts46_remap): `bisect_left(table, (cp, "Z"))`
+    // over a tuple of mixed-arity rows compares boxed tuples with CPython's
+    // `<`, and the row's members read back as the str they are.
+    let scratch = Scratch::new("boxbis");
+    let krate = package_crate(
+        &scratch,
+        "boxbis",
+        &[(
+            "cli.py",
+            concat!(
+                "import bisect\n",
+                "from typing import List, Optional, Tuple, Union\n",
+                "\n",
+                "\n",
+                "def _seg() -> List[Union[Tuple[int, str], Tuple[int, str, str]]]:\n",
+                "    return [(0, \"3\"), (65, \"M\", \"a\"), (91, \"V\"), (300, \"X\")]\n",
+                "\n",
+                "\n",
+                "table = tuple(_seg())\n",
+                "\n",
+                "\n",
+                "def remap(text: str) -> str:\n",
+                "    out = \"\"\n",
+                "    for ch in text:\n",
+                "        cp = ord(ch)\n",
+                "        row = table[bisect.bisect_left(table, (cp, \"Z\")) - 1]\n",
+                "        status = row[1]\n",
+                "        replacement: Optional[str] = None\n",
+                "        if len(row) == 3:\n",
+                "            replacement = row[2]\n",
+                "        if status == \"M\" and replacement is not None:\n",
+                "            out += replacement\n",
+                "        else:\n",
+                "            out += ch\n",
+                "    return out\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    print(remap(\"ABz!\"), bisect.bisect_right(table, (91, \"V\")), bisect.bisect_left(table, (91,)))\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "boxbis"), vec!["aaz! 3 2"]);
+}
+
+#[test]
+fn a_call_through_a_module_binds_keywords_and_defaults_by_name() {
+    // Issue #401: `lib.scale(2, offset=1, factor=100)` after `from . import
+    // lib` bound the keywords positionally in call order (102, silently)
+    // and never filled defaults; it now maps through the callee's
+    // signature exactly as the by-name call does — through an `as` alias
+    // of the module too (`from . import lib as L`).
+    let scratch = Scratch::new("modkw");
+    let krate = package_crate(
+        &scratch,
+        "dflt",
+        &[
+            (
+                "lib.py",
+                concat!(
+                    "def scale(x: int, factor: int = 10, offset: int = 0) -> int:\n",
+                    "    return x * factor + offset\n",
+                ),
+            ),
+            (
+                "core.py",
+                concat!(
+                    "from . import lib\n",
+                    "from . import lib as L\n",
+                    "\n",
+                    "\n",
+                    "def run() -> None:\n",
+                    "    print(lib.scale(2, offset=1, factor=100))\n",
+                    "    print(lib.scale(2), lib.scale(2, 3), lib.scale(2, offset=1))\n",
+                    "    print(L.scale(x=3, offset=2), L.scale(1, factor=5, offset=7))\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .core import run\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    run()\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "dflt"), vec!["201", "20 6 21", "32 12"]);
+}
+
+#[test]
+fn unicodedata_answers_like_cpython() {
+    // Issue #334 (idna's bidi/contextual rules and NFC checks): the
+    // unicodedata module — category, bidirectional, combining, name,
+    // lookup, normalize, is_normalized — with CPython's ValueErrors.
+    let scratch = Scratch::new("unicodedata");
+    let krate = package_crate(
+        &scratch,
+        "unicodedata_probe",
+        &[(
+            "cli.py",
+            concat!(
+                "import unicodedata\n",
+                "from unicodedata import normalize\n",
+                "\n",
+                "\n",
+                "def describe(ch: str) -> str:\n",
+                "    return unicodedata.category(ch) + \"/\" + unicodedata.bidirectional(ch) + \"/\" + str(unicodedata.combining(ch))\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    for ch in [\"a\", \"\\u0301\", \"\\u05d0\", \"1\", \"\\u0660\"]:\n",
+                "        print(describe(ch), unicodedata.name(ch))\n",
+                "    word = \"e\\u0301\"\n",
+                "    nfc = normalize(\"NFC\", word)\n",
+                "    print(len(word), len(nfc), nfc == \"\\u00e9\", unicodedata.is_normalized(\"NFC\", word))\n",
+                "    print(unicodedata.lookup(\"LATIN SMALL LETTER A\"), unicodedata.category(\"\\u4e00\")[0] == \"L\")\n",
+                "    try:\n",
+                "        unicodedata.name(\"\\x00\")\n",
+                "    except ValueError as e:\n",
+                "        print(\"ValueError\", e)\n",
+                "    try:\n",
+                "        unicodedata.normalize(\"XX\", \"a\")\n",
+                "    except ValueError as e:\n",
+                "        print(\"ValueError\", e)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "unicodedata_probe"),
+        vec![
+            "Ll/L/0 LATIN SMALL LETTER A",
+            "Mn/NSM/230 COMBINING ACUTE ACCENT",
+            "Lo/R/0 HEBREW LETTER ALEF",
+            "Nd/EN/0 DIGIT ONE",
+            "Nd/AN/0 ARABIC-INDIC DIGIT ZERO",
+            "2 1 True False",
+            "a True",
+            "ValueError no such name",
+            "ValueError invalid normalization form"
+        ]
+    );
+}
+
+#[test]
+fn rows_unpack_and_testcase_setup_fields_match_cpython() {
+    // Issue #334 (idna's tests): `for a, b in rows` over a list of lists
+    // unpacks each row (CPython's ValueError on a length mismatch); a
+    // nested str-list field owns its strings; a TestCase's setUp stores
+    // are its fields.
+    let scratch = Scratch::new("rows");
+    let krate = package_crate(
+        &scratch,
+        "rows",
+        &[(
+            "cli.py",
+            concat!(
+                "import unittest\n",
+                "from typing import List\n",
+                "\n",
+                "\n",
+                "class Box:\n",
+                "    def __init__(self) -> None:\n",
+                "        self.items = [[\"a\", \"b\"], [\"c\", \"d\"]]\n",
+                "\n",
+                "    def show(self) -> None:\n",
+                "        for a, b in self.items:\n",
+                "            print(a, b)\n",
+                "\n",
+                "\n",
+                "class RowTests(unittest.TestCase):\n",
+                "    def setUp(self) -> None:\n",
+                "        self.rows = [[\"x\", \"y\"], [\"p\", \"q\"]]\n",
+                "        self.count = 2\n",
+                "\n",
+                "    def test_rows(self) -> None:\n",
+                "        seen = 0\n",
+                "        for left, right in self.rows:\n",
+                "            print(\"row\", left, right)\n",
+                "            seen += 1\n",
+                "        self.assertEqual(seen, self.count)\n",
+                "\n",
+                "    def test_bad_row(self) -> None:\n",
+                "        bad: List[List[int]] = [[1, 2, 3]]\n",
+                "        try:\n",
+                "            for p, q in bad:\n",
+                "                print(p, q)\n",
+                "        except ValueError as e:\n",
+                "            print(\"ValueError\", e)\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    Box().show()\n",
+                "    unittest.main()\n",
+            ),
+        )],
+    );
+    // Verified against python3 (stdout; unittest's report is stderr).
+    assert_eq!(
+        run_package(&krate, "rows"),
+        vec![
+            "a b",
+            "c d",
+            "ValueError too many values to unpack (expected 2)",
+            "row x y",
+            "row p q"
+        ]
+    );
+}
+
+#[test]
+fn optional_callable_parameters_match_cpython() {
+    // Issue #334's callable-valued parameters: an `Optional[Callable]`
+    // parameter takes a lambda or a function (built as the callable value
+    // inside the Some), a `fn = shout` store into it does too, and a call
+    // through the optional callable calls what it holds.
+    let scratch = Scratch::new("optcallable");
+    let krate = package_crate(
+        &scratch,
+        "optcallable",
+        &[(
+            "cli.py",
+            concat!(
+                "from typing import Callable, Optional\n",
+                "\n",
+                "\n",
+                "def shout(s: str) -> str:\n",
+                "    return s.upper() + \"!\"\n",
+                "\n",
+                "\n",
+                "def apply(text: str, fn: Optional[Callable[[str], str]] = None) -> str:\n",
+                "    if fn is None:\n",
+                "        fn = shout\n",
+                "    return fn(text)\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    print(apply(\"hi\"), apply(\"hi\", lambda s: s + \"?\"))\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "optcallable"), vec!["HI! hi?"]);
+}

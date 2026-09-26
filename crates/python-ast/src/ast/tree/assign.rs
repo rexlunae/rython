@@ -215,6 +215,27 @@ impl<'a> CodeGen for Assign {
             return Ok(quote!(#ident = #value;));
         }
 
+        // An ANNOTATED variable-length tuple binding (`xs: tuple[int, ...]
+        // = (1, 2, 3)` — issue #399): the value renders against the
+        // annotation, so a tuple literal becomes the tuple type the
+        // annotation names rather than a fixed-shape Rust tuple.
+        if self.targets.len() == 1
+            && let ExprType::Name(target) = &self.targets[0]
+            && let Some(ann) = &self.annotation
+            && let Some(expected @ crate::TypeInfo::PyTuple(_)) =
+                crate::resolve_alias_typeinfo(ann, &symbols, &options)
+        {
+            let ident = crate::safe_ident(&target.id);
+            let value = crate::render_typed(
+                &self.value,
+                ctx,
+                options.clone(),
+                symbols,
+                Some(expected),
+            )?;
+            return Ok(quote!(#ident = #value;));
+        }
+
         // An ANNOTATED binding of a COMPREHENSION (`detectors:
         // list[MessDetectorPlugin] = [md_class() for ...]` —
         // charset_normalizer's mess_ratio, round 114): the annotation's
@@ -1773,7 +1794,26 @@ impl<'a> CodeGen for Assign {
                 // pinned element type above (Vec::<T>::new()); reuse it so
                 // the Some wrap lands on the typed container, not on a bare
                 // vec![] that rustc cannot infer.
-                let value = if is_empty_container_literal(&value_expr) {
+                let optional_callable = match options.name_types.get(&name.id) {
+                    Some(slot @ crate::TypeInfo::Option(inner))
+                        if matches!(inner.as_ref(), crate::TypeInfo::Callable(..)) =>
+                    {
+                        Some(slot.clone())
+                    }
+                    _ => None,
+                };
+                let value = if let Some(slot) = optional_callable {
+                    // An OPTIONAL CALLABLE local (`if fn is None: fn =
+                    // shout`): the function name or lambda builds the
+                    // callable value inside the Some.
+                    crate::render_typed(
+                        &value_expr,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                        Some(slot),
+                    )?
+                } else if is_empty_container_literal(&value_expr) {
                     if boxed_slot {
                         quote!(Some(Box::new(#value)))
                     } else {

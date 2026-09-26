@@ -4932,3 +4932,106 @@ fn a_boxed_range_is_still_a_range() {
     )
     .is_ok());
 }
+
+#[test]
+fn a_variable_length_tuple_prints_as_a_tuple() {
+    // issue #399: the runtime variable-length tuple.
+    let t = PyTuple(vec![3i64, 4]);
+    // repr((3, 4)) == '(3, 4)'; str((7,)) == '(7,)'; repr(()) == '()'
+    assert_eq!(py_display(&t), "(3, 4)");
+    assert_eq!(py_display(&PyTuple(vec![7i64])), "(7,)");
+    assert_eq!(py_display(&PyTuple::<i64>(vec![])), "()");
+    // repr(('b', 'c')) == "('b', 'c')"
+    assert_eq!(
+        py_display(&PyTuple(vec!["b".to_string(), "c".to_string()])),
+        "('b', 'c')"
+    );
+    // (3, 4)[1:] == (4,); (3, 4) + (5,) == (3, 4, 5); (1, 2) * 2 == (1, 2, 1, 2)
+    assert_eq!(py_display(&t.py_slice(Some(1), None, None)), "(4,)");
+    assert_eq!(py_display(&t.py_add(&PyTuple(vec![5]))), "(3, 4, 5)");
+    assert_eq!(py_display(&PyTuple(vec![1i64, 2]).py_mul(&2)), "(1, 2, 1, 2)");
+    // 3 in (3, 4); len(()) == 0; bool(()) is False; sum((1, 2, 3)) == 6
+    assert!(t.py_contains(&3));
+    assert_eq!(PyTuple::<i64>(vec![]).len(), 0);
+    assert!(!PyTuple::<i64>(vec![]).is_truthy());
+    assert_eq!(sum(PyTuple(vec![1i64, 2, 3])), 6);
+    // (3, 4)[5] -> IndexError: tuple index out of range
+    assert_eq!(t.py_index(5i64).unwrap_err().message, "tuple index out of range");
+    // (3, 4)[-1] == 4; list((3, 4)) == [3, 4]
+    assert_eq!(t.py_index(-1i64).unwrap(), 4);
+    assert_eq!(list(t.clone()), vec![3, 4]);
+    // A boxed tuple is still a tuple: repr(tuple([1, 2])) == '(1, 2)'
+    assert_eq!(py_display(&PyValue::from(t)), "(3, 4)");
+}
+
+#[test]
+fn fixed_tuples_of_every_arity_print_as_tuples() {
+    // repr((7,)) == '(7,)'
+    assert_eq!(py_display(&(7i64,)), "(7,)");
+    // repr((1, 'a', 2.5, None)) == "(1, 'a', 2.5, None)"
+    assert_eq!(
+        py_display(&(1i64, "a".to_string(), 2.5f64, None::<i64>)),
+        "(1, 'a', 2.5, None)"
+    );
+}
+
+#[test]
+fn enumerate_takes_strings_and_boxed_values() {
+    // list(enumerate('ab')) == [(0, 'a'), (1, 'b')]
+    assert_eq!(py_display(&enumerate("ab")), "[(0, 'a'), (1, 'b')]");
+    // list(enumerate('xy', 1)) == [(1, 'x'), (2, 'y')]
+    assert_eq!(py_display(&enumerate_start("xy".to_string(), 1)), "[(1, 'x'), (2, 'y')]");
+    // list(enumerate(b'ab')) == [(0, 97), (1, 98)]
+    assert_eq!(
+        py_display(&enumerate(PyValue::from(b"ab".to_vec()))),
+        "[(0, 97), (1, 98)]"
+    );
+    // list(enumerate(('x', 1))) == [(0, 'x'), (1, 1)]
+    let t = PyValue::from(PyTuple(vec![PyValue::from("x"), PyValue::from(1i64)]));
+    assert_eq!(py_display(&enumerate(t)), "[(0, 'x'), (1, 1)]");
+}
+
+#[test]
+fn boxed_values_order_like_cpython() {
+    let t = |v: Vec<PyValue>| PyValue::from(PyTuple(v));
+    let (i, s) = (|x: i64| PyValue::from(x), |x: &str| PyValue::from(x));
+    // (1, 'a') < (1, 'b'); (1,) < (1, 'a'); (2, 'Z') < (10, '3')
+    assert!(t(vec![i(1), s("a")]).py_lt_boxed(&t(vec![i(1), s("b")])).unwrap());
+    assert!(t(vec![i(1)]).py_lt_boxed(&t(vec![i(1), s("a")])).unwrap());
+    assert!(t(vec![i(2), s("Z")]).py_lt_boxed(&t(vec![i(10), s("3")])).unwrap());
+    // 1 < 2.5; True < 2; float('nan') < 1 is False; b'a' < b'b'
+    assert!(i(1).py_lt_boxed(&PyValue::from(2.5)).unwrap());
+    assert!(PyValue::from(true).py_lt_boxed(&i(2)).unwrap());
+    assert!(!PyValue::from(f64::NAN).py_lt_boxed(&i(1)).unwrap());
+    assert!(PyValue::from(b"a".to_vec()).py_lt_boxed(&PyValue::from(b"b".to_vec())).unwrap());
+    // (1, 'a') < ('x',) -> TypeError: '<' not supported between instances of 'int' and 'str'
+    let err = t(vec![i(1), s("a")]).py_lt_boxed(&t(vec![s("x")])).unwrap_err();
+    assert_eq!(err.message, "'<' not supported between instances of 'int' and 'str'");
+    // bisect.bisect_left(((0, '3'), (65, 'M', 'a'), (91, 'V')), (66, 'Z')) == 2
+    let table = t(vec![
+        t(vec![i(0), s("3")]),
+        t(vec![i(65), s("M"), s("a")]),
+        t(vec![i(91), s("V")]),
+    ]);
+    let probe = t(vec![i(66), s("Z")]);
+    assert_eq!(stdpython::stdlib::bisect::bisect_left(&table, &probe, 0, None).unwrap(), 2);
+    // bisect.bisect_right(table, (91, 'V')) == 3
+    let probe = t(vec![i(91), s("V")]);
+    assert_eq!(stdpython::stdlib::bisect::bisect_right(&table, &probe, 0, None).unwrap(), 3);
+}
+
+#[test]
+fn unpacking_a_sequence_checks_its_length() {
+    // a, b = [1, 2] -> 1, 2
+    assert_eq!(unpack_sequence::<i64, 2>(vec![1, 2]).unwrap(), [1, 2]);
+    // a, b = [1, 2, 3] -> ValueError: too many values to unpack (expected 2)
+    assert_eq!(
+        unpack_sequence::<i64, 2>(vec![1, 2, 3]).unwrap_err().message,
+        "too many values to unpack (expected 2)"
+    );
+    // a, b = [1] -> ValueError: not enough values to unpack (expected 2, got 1)
+    assert_eq!(
+        unpack_sequence::<i64, 2>(PyTuple(vec![1])).unwrap_err().message,
+        "not enough values to unpack (expected 2, got 1)"
+    );
+}

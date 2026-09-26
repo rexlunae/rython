@@ -432,7 +432,13 @@ fn value_unify(u: &crate::TypeInfo) -> bool {
             | crate::TypeInfo::StrRef
             | crate::TypeInfo::Bytes
             | crate::TypeInfo::StrOrBytes
-    ) || matches!(u, crate::TypeInfo::Vec(_) | crate::TypeInfo::HashSet(_) | crate::TypeInfo::Dict(_, _))
+    ) || matches!(
+        u,
+        crate::TypeInfo::Vec(_)
+            | crate::TypeInfo::PyTuple(_)
+            | crate::TypeInfo::HashSet(_)
+            | crate::TypeInfo::Dict(_, _)
+    )
 }
 
 /// Own a string-literal arm so both fold arms agree on `String` when the

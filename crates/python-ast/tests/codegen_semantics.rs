@@ -11976,10 +11976,10 @@ fn iter_builtin_boxes_its_argument() {
 #[test]
 fn tuple_builtin_boxes_its_argument() {
     // urllib3's poolmanager.py: `context["socket_options"] = tuple(socket_opts)`
-    // — the tuple constructor lowers to the boxed argument (values are already
-    // boxed; tuple() on a boxed iterable is identity in rython's model).
+    // — the tuple constructor of an UNTYPED iterable lowers to the boxed
+    // argument (tuple() on a boxed iterable is identity in rython's model).
     let out = compile(
-        "def f(socket_opts: list[bytes]) -> list[bytes]:\n    return tuple(socket_opts)\n",
+        "from typing import Any\n\ndef f(socket_opts: Any) -> Any:\n    return tuple(socket_opts)\n",
         "tupleb.py",
     );
     assert!(
@@ -13340,8 +13340,9 @@ fn iter_sentinel_outside_a_for_loop_is_loud() {
 
 #[test]
 fn varargs_lower_to_a_boxed_vector() {
-    // Issue #120: `*args` is Vec<PyValue>; extras box at the call site,
-    // an empty call still passes the vector, and `f(*args)` forwards it.
+    // Issue #120: `*args` is PyTuple<PyValue> (a tuple, as Python's is —
+    // issue #399); extras box at the call site, an empty call still
+    // passes the tuple, and `f(*args)` forwards it.
     let out = compile(
         concat!(
             "def tag(*args) -> int:\n",
@@ -13354,12 +13355,12 @@ fn varargs_lower_to_a_boxed_vector() {
         "varargs.py",
     );
     assert!(
-        out.contains("args : Vec < stdpython :: PyValue >"),
+        out.contains("args : stdpython :: PyTuple < stdpython :: PyValue >"),
         "generated: {}",
         out
     );
     assert!(out.contains("PyValue :: from"), "generated: {}", out);
-    assert!(out.contains("tag (vec ! [])"), "generated: {}", out);
+    assert!(out.contains("tag (stdpython :: PyTuple (vec ! []))"), "generated: {}", out);
     assert!(out.contains("__rython_varargs"), "generated: {}", out);
 }
 
@@ -24977,10 +24978,11 @@ fn a_refused_nested_def_is_loud_where_it_is_used() {
 
 #[test]
 fn an_annotated_star_args_keeps_its_element_type() {
-    // Issue #120's boxed `Vec<PyValue>` is the UNANNOTATED default:
-    // `*nums: int` says every extra positional is an int, so the vector
-    // is `Vec<i64>`, the call site passes plain values, and the body can
-    // sum it like any list of ints.
+    // Issue #120's boxed `PyTuple<PyValue>` is the UNANNOTATED default:
+    // `*nums: int` says every extra positional is an int, so the tuple
+    // is `PyTuple<i64>` (issue #399: `args` prints as the tuple it is),
+    // the call site passes plain values, and the body can sum it like
+    // any sequence of ints.
     let out = compile(
         "def total(*nums: int) -> int:\n\
          \x20   return sum(nums)\n\
@@ -24992,9 +24994,13 @@ fn an_annotated_star_args_keeps_its_element_type() {
          \x20   print(total(1, 2, 3))\n",
         "varargs.py",
     );
-    assert!(out.contains("total (nums : Vec < i64 >)"), "{}", out);
-    assert!(out.contains("loose (rest : Vec < stdpython :: PyValue >)"), "{}", out);
-    assert!(out.contains("total (vec ! [1 , 2 , 3])"), "{}", out);
+    assert!(out.contains("total (nums : stdpython :: PyTuple < i64 >)"), "{}", out);
+    assert!(
+        out.contains("loose (rest : stdpython :: PyTuple < stdpython :: PyValue >)"),
+        "{}",
+        out
+    );
+    assert!(out.contains("total (stdpython :: PyTuple (vec ! [1 , 2 , 3]))"), "{}", out);
 }
 
 #[test]
@@ -25276,4 +25282,88 @@ fn the_options_handle_is_pointer_sized() {
     let mut b = a.clone();
     b.with_std_python = !a.with_std_python;
     assert_ne!(a.with_std_python, b.with_std_python);
+}
+
+// ---- Variable-length tuples (issue #399) ----
+
+#[test]
+fn a_variadic_tuple_annotation_is_a_py_tuple() {
+    // `tuple[int, ...]` has no fixed shape: it lowers to the runtime
+    // variable-length tuple, which prints `(3, 4)` — the `Vec` it used to
+    // be printed `[3, 4]` (issue #399). A typed list's `tuple(xs)` builds
+    // one, and a tuple literal returned into it re-collects.
+    let out = compile(
+        "from typing import Tuple\n\n\
+         def pair(n: int) -> Tuple[int, ...]:\n\
+         \x20   return tuple([n, n + 1])\n\n\
+         def bounds(lo: int, hi: int) -> tuple[int, ...]:\n\
+         \x20   return (lo, hi)\n",
+        "vtuple.py",
+    );
+    assert!(out.contains("-> Result < stdpython :: PyTuple < i64 > , PyException >"), "{}", out);
+    assert!(out.contains("stdpython :: PyTuple :: < i64 > :: from_iter"), "{}", out);
+    assert!(out.contains("stdpython :: PyTuple :: < i64 > (vec ! [lo , hi])"), "{}", out);
+}
+
+#[test]
+fn mixed_arity_tuple_dict_values_share_a_py_tuple() {
+    // `{1: ("a",), 2: ("b", "c")}`: the arities do not unify as Rust
+    // tuples, so every value is one variable-length tuple type — for str
+    // AND int members (idna's range tables); `codes[2]` prints
+    // `('b', 'c')` (issue #399).
+    let out = compile(
+        "def main() -> None:\n\
+         \x20   codes = {1: (\"a\",), 2: (\"b\", \"c\")}\n\
+         \x20   spans = {1: (5,), 2: (6, 7)}\n\
+         \x20   print(codes[2], spans[2])\n",
+        "mixed.py",
+    );
+    assert!(out.contains("stdpython :: PyTuple :: < String >"), "{}", out);
+    assert!(out.contains("stdpython :: PyTuple :: < i64 >"), "{}", out);
+    assert!(!out.contains("vec ! [\"b\""), "{}", out);
+}
+
+#[test]
+fn a_narrowed_boxed_tuple_reads_as_a_py_tuple() {
+    // `isinstance(x, tuple)` narrows a boxed value to its members, which
+    // print as a tuple (issue #399), not the list the bare Vec printed.
+    let out = compile(
+        "from typing import Any\n\n\
+         def show(x: Any) -> None:\n\
+         \x20   if isinstance(x, tuple):\n\
+         \x20       print(x)\n",
+        "narrowt.py",
+    );
+    assert!(out.contains("stdpython :: PyTuple ((x) . as_tuple () . unwrap () . clone ())"), "{}", out);
+}
+
+#[test]
+fn a_tuple_literal_returned_into_a_fixed_tuple_renders_each_member_against_its_slot() {
+    // idna's codec: `return "", 0` from a `-> Tuple[str, int]` function —
+    // the str literal owns itself where the slot holds a String.
+    let out = compile(
+        "from typing import Tuple\n\n\
+         def dec(data: str) -> Tuple[str, int]:\n\
+         \x20   if not data:\n\
+         \x20       return \"\", 0\n\
+         \x20   return data, len(data)\n",
+        "rt.py",
+    );
+    assert!(out.contains("return Ok (((\"\") . to_string () , 0))"), "{}", out);
+}
+
+#[test]
+fn a_reused_name_boxed_into_a_parameter_clones_the_read() {
+    // idna's codec: `return encode(data), len(data)` where encode's
+    // parameter is a boxed union — the box must not consume `data` before
+    // the later read; the clone belongs to the read inside the box.
+    let out = compile(
+        "from typing import Tuple, Union\n\n\
+         def size(s: Union[str, bytes, int]) -> int:\n\
+         \x20   return 1\n\n\
+         def both(data: str) -> Tuple[int, int]:\n\
+         \x20   return size(data), len(data)\n",
+        "boxmove.py",
+    );
+    assert!(out.contains("size (stdpython :: PyValue :: from ((data) . clone ()))"), "{}", out);
 }

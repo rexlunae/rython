@@ -3107,6 +3107,65 @@ fn sibling_imported_names(options: &PythonOptions) -> std::collections::HashSet<
                 }
             }
         }
+        // A sibling that binds THIS MODULE itself (`from . import idnadata`,
+        // `import pkg.idnadata as d`) and reads `idnadata.scripts` through
+        // it needs `scripts` as a static exactly as a `from .idnadata
+        // import scripts` does — a module-init local is no item to reach
+        // (idna's core.py, whose table lookups were dropped as unmodeled
+        // module members).
+        let mut module_bindings: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        crate::ast::tree::visit::walk_stmts(
+            &module.raw.body,
+            crate::ast::tree::visit::Descend::All,
+            &mut |st| {
+                match &st.statement {
+                    ST::ImportFrom(ifm) => {
+                        let base = ifm.resolved_module_path(&sibling_options);
+                        for alias in &ifm.names {
+                            let mut full = base.clone();
+                            full.push(alias.name.clone());
+                            if full == *this_path {
+                                module_bindings
+                                    .insert(alias.asname.clone().unwrap_or_else(|| alias.name.clone()));
+                            }
+                        }
+                    }
+                    ST::Import(imp) => {
+                        for alias in &imp.names {
+                            let full: Vec<String> =
+                                alias.name.split('.').map(str::to_string).collect();
+                            if let Some(asname) = &alias.asname
+                                && full == *this_path
+                            {
+                                module_bindings.insert(asname.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                crate::ast::tree::visit::Flow::Continue
+            },
+        );
+        if !module_bindings.is_empty() {
+            crate::ast::tree::visit::walk_stmts(
+                &module.raw.body,
+                crate::ast::tree::visit::Descend::All,
+                &mut |st| {
+                    for e in crate::ast::tree::visit::stmt_all_exprs(st) {
+                        crate::ast::tree::visit::walk_expr(e, &mut |sub| {
+                            if let crate::ExprType::Attribute(a) = sub
+                                && let crate::ExprType::Name(m) = a.value.as_ref()
+                                && module_bindings.contains(&m.id)
+                            {
+                                names.insert(a.attr.clone());
+                            }
+                        });
+                    }
+                    crate::ast::tree::visit::Flow::Continue
+                },
+            );
+        }
     }
     names
 }
@@ -5650,7 +5709,10 @@ fn module_init_static_ty(
 pub(crate) fn type_contains_uninferred(t: &crate::TypeInfo) -> bool {
     match t {
         crate::TypeInfo::PyObject => true,
-        crate::TypeInfo::Vec(inner) | crate::TypeInfo::Option(inner) | crate::TypeInfo::Borrowed(inner) => {
+        crate::TypeInfo::Vec(inner)
+        | crate::TypeInfo::PyTuple(inner)
+        | crate::TypeInfo::Option(inner)
+        | crate::TypeInfo::Borrowed(inner) => {
             type_contains_uninferred(inner)
         }
         crate::TypeInfo::Dict(k, v) => type_contains_uninferred(k) || type_contains_uninferred(v),
@@ -6245,7 +6307,7 @@ pub(crate) fn collect_class_defs(stmts: &[crate::Statement], out: &mut Vec<crate
 
 /// Whether a class's BASE (a `bases` ExprType) resolves to `unittest.TestCase`:
 /// the bare name `TestCase` or a `unittest.TestCase` attribute.
-fn is_testcase_base(base: &crate::ExprType) -> bool {
+pub(crate) fn is_testcase_base(base: &crate::ExprType) -> bool {
     match base {
         crate::ExprType::Name(n) => n.id == "TestCase",
         crate::ExprType::Attribute(a) => a.attr == "TestCase",
@@ -6780,6 +6842,167 @@ pub fn module_defs_key<'a>(
     } else {
         None
     }
+}
+
+/// The crate module a NAME is bound to (`from . import idnadata`,
+/// `import pkg.idnadata as d`), by its `module_defs` key — None for a
+/// name bound to anything else.
+pub(crate) fn crate_module_bound_to(
+    name: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<Vec<String>> {
+    if options.module_defs.len() <= 1 {
+        return None;
+    }
+    // An `as` binding (`from . import core as idna`) is recorded as an
+    // alias of the imported name, whose import node carries the `as`.
+    let node = match symbols.get(name)? {
+        crate::SymbolTableNode::Alias(canonical) if canonical != name => {
+            symbols.get(canonical)?
+        }
+        other => other,
+    };
+    let path: Vec<String> = match node {
+        crate::SymbolTableNode::Import(im) => {
+            let alias = im.names.iter().find(|a| {
+                a.asname.as_deref().unwrap_or(a.name.as_str()) == name
+            })?;
+            // A bare `import pkg.sub` binds `pkg`, not the submodule.
+            if alias.asname.is_none() && alias.name.contains('.') {
+                return None;
+            }
+            alias.name.split('.').map(str::to_string).collect()
+        }
+        crate::SymbolTableNode::ImportFrom(ifm) => {
+            // The symbol table keeps ONE node per name, so `from . import
+            // lib` followed by `from . import lib as L` records `lib`
+            // under the aliased statement: the module's own name matches
+            // its `name` there too (the path rendering binds it the same
+            // way).
+            let alias = ifm
+                .names
+                .iter()
+                .find(|a| a.asname.as_deref().unwrap_or(a.name.as_str()) == name)
+                .or_else(|| ifm.names.iter().find(|a| a.name == name))?;
+            let mut full = ifm.resolved_module_path(options);
+            full.push(alias.name.clone());
+            full
+        }
+        _ => return None,
+    };
+    module_defs_key(options, &path).map(<[String]>::to_vec)
+}
+
+/// The type of `name`, a module-level LITERAL table of the crate module at
+/// `path` (`joining_types = {0x600: 85, ...}` in idna's idnadata.py), for
+/// a read from ANOTHER module (`idnadata.joining_types`, or the name
+/// imported by `from .idnadata import joining_types`): the importing
+/// module's analysis never saw the assignment, so without this the read
+/// is untyped and a `.get(...)` Option compares against a bare int. Only
+/// a name the defining module binds exactly ONCE, to a literal (a
+/// constant, or a dict / list / tuple / set display), whose type is fully
+/// known — the same inference the defining module's own static takes, so
+/// both sides name one type. A re-export (`from .x import t` in the
+/// defining module) follows the chain.
+pub(crate) fn crate_module_static_type(
+    options: &PythonOptions,
+    path: &[String],
+    name: &str,
+) -> Option<crate::TypeInfo> {
+    crate_module_static_type_depth(options, path, name, 0)
+}
+
+fn crate_module_static_type_depth(
+    options: &PythonOptions,
+    path: &[String],
+    name: &str,
+    depth: usize,
+) -> Option<crate::TypeInfo> {
+    if depth > 16 {
+        return None;
+    }
+    let key = module_defs_key(options, path)?.to_vec();
+    let cache_key = (key.clone(), name.to_string());
+    if let Some(cached) = options.cross_module_static_types.borrow().get(&cache_key) {
+        return cached.clone();
+    }
+    // Recorded as "no answer" while computing, so a cycle ends.
+    options
+        .cross_module_static_types
+        .borrow_mut()
+        .insert(cache_key.clone(), None);
+    let answer = (|| {
+        let module = options.module_defs.get(&key)?;
+        let ctx = defining_module_context(options, &key);
+        let syms = module.as_ref().clone().find_symbols(SymbolTableScopes::new());
+        if let Some(crate::SymbolTableNode::ImportFrom(i)) = syms.get(name) {
+            let defining = i
+                .names
+                .iter()
+                .find(|a| a.asname.as_deref() == Some(name))
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| name.to_string());
+            let source = i.resolved_module_path(&ctx);
+            return crate_module_static_type_depth(options, &source, &defining, depth + 1);
+        }
+        let mut bindings = 0usize;
+        let mut value: Option<&crate::ExprType> = None;
+        for stmt in &module.raw.body {
+            if crate::ast::tree::visit::stmt_targets(stmt)
+                .iter()
+                .any(|t| matches!(t, crate::ExprType::Name(n) if n.id == name))
+            {
+                bindings += 1;
+                if let crate::StatementType::Assign(a) = &stmt.statement
+                    && a.targets.len() == 1
+                {
+                    value = Some(&a.value);
+                }
+            }
+        }
+        let value = value.filter(|_| bindings == 1)?;
+        // A TUPLE display is left out: the defining module boxes a
+        // module-level tuple static, so its type is not the literal's.
+        if !matches!(
+            value,
+            crate::ExprType::Constant(_) | crate::ExprType::Dict(_) | crate::ExprType::List(_)
+        ) {
+            return None;
+        }
+        let mut ctx = ctx;
+        ctx.name_types = std::rc::Rc::new(std::collections::HashMap::new());
+        ctx.local_types = std::rc::Rc::new(std::collections::HashMap::new());
+        // Container members are owned in the static (`Vec<String>`,
+        // `PyDict<String, String>`); a bare str constant stays the
+        // `&'static str` its static holds.
+        fn owned(t: crate::TypeInfo) -> crate::TypeInfo {
+            use crate::TypeInfo as T;
+            match t {
+                T::StrRef => T::String,
+                T::Vec(e) => T::Vec(Box::new(owned(*e))),
+                T::PyTuple(e) => T::PyTuple(Box::new(owned(*e))),
+                T::Dict(k, v) => T::Dict(Box::new(owned(*k)), Box::new(owned(*v))),
+                other => other,
+            }
+        }
+        let t = match crate::infer_type(None, value, &ctx, &syms) {
+            t @ (crate::TypeInfo::Vec(_) | crate::TypeInfo::Dict(..)) => owned(t),
+            t @ (crate::TypeInfo::Int
+            | crate::TypeInfo::Float
+            | crate::TypeInfo::Bool
+            | crate::TypeInfo::StrRef) => t,
+            _ => return None,
+        };
+        (!crate::ast::tree::type_ctx::type_mentions_pyobject(&t)
+            && !crate::ast::tree::type_ctx::type_contains_pyvalue(&t))
+        .then_some(t)
+    })();
+    options
+        .cross_module_static_types
+        .borrow_mut()
+        .insert(cache_key, answer.clone());
+    answer
 }
 
 /// Whether `path` names a module of the converted crate — see

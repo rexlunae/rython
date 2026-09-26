@@ -99,6 +99,12 @@ pub mod textwrap;
 #[cfg(feature = "re-regex")]
 pub mod re;
 
+/// Python unicodedata module — the Unicode Character Database, pinned to
+/// Unicode 16.0.0 (CPython 3.14). Feature-gated per the platform-surface
+/// convention: `unicodedata-ucd` implies std and is on by default.
+#[cfg(feature = "unicodedata-ucd")]
+pub mod unicodedata;
+
 /// Python io module (StringIO/BytesIO); PyFile itself lives at the crate
 /// root. In-memory buffers are pure alloc, so the module lives on every
 /// tier — only the DISK backends of PyFile (and `open()`) are std-gated.

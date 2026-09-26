@@ -2461,7 +2461,7 @@ fn type_display(ty: &TypeInfo) -> String {
         TypeInfo::Vec(_) => "list".to_string(),
         TypeInfo::HashSet(_) => "set".to_string(),
         TypeInfo::Dict(..) => "dict".to_string(),
-        TypeInfo::Tuple(_) => "tuple".to_string(),
+        TypeInfo::Tuple(_) | TypeInfo::PyTuple(_) => "tuple".to_string(),
         TypeInfo::Option(_) => "optional".to_string(),
         TypeInfo::Range => "range".to_string(),
         TypeInfo::NdArray => "array".to_string(),
@@ -2602,6 +2602,7 @@ fn type_satisfies(ty: &TypeInfo, trait_name: &str, rhs: Option<&TypeInfo>) -> bo
                 | TypeInfo::NdArray
                 | TypeInfo::Class(_)
                 | TypeInfo::Tuple(_)
+                | TypeInfo::PyTuple(_)
                 | TypeInfo::Option(_)
                 | TypeInfo::Range
                 | TypeInfo::Bytes

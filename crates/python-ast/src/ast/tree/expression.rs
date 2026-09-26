@@ -1176,9 +1176,9 @@ fn narrowing_member_of(id: &str) -> Option<crate::TypeInfo> {
         "int" => Some(crate::TypeInfo::Int),
         "float" => Some(crate::TypeInfo::Float),
         "bool" => Some(crate::TypeInfo::Bool),
-        // A tuple member is read as its element vector
-        // (PyValue::as_tuple().unwrap().clone()).
-        "tuple" => Some(crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue))),
+        // A tuple member is read as a variable-length tuple of its boxed
+        // members (PyValue::as_tuple() — issue #399: it prints as a tuple).
+        "tuple" => Some(crate::TypeInfo::PyTuple(Box::new(crate::TypeInfo::PyValue))),
         _ => None,
     }
 }

@@ -136,6 +136,8 @@ error output), and a growing stdlib: `math`, `random`, `os`, `sys`,
 `json`, `re` (incl. flags, named groups, findall tuples),
 `datetime`/`time` (incl. `strptime`), `itertools`, `functools.reduce`,
 `heapq`, `bisect`, `copy`, `textwrap`, `hashlib`, `csv` (reader and writer),
+`unicodedata` (Unicode 16.0.0: category, bidirectional, combining, name,
+lookup, normalize),
 `collections`, `pathlib`, `glob`, `subprocess`, `tempfile`,
 `threading` (Thread with static targets, Lock/RLock/Event/Semaphore
 with a real `with lock:` acquire/release lowering, `local()` as a
@@ -184,7 +186,7 @@ a loud conversion error or build-time type error at the exact Python
 line, never a silent behaviour change:
 
 - **`*args`/`**kwargs` (variadic parameters)** — module functions box
-  them (`*args` → `Vec<PyValue>`, `**kwargs` → `PyDict<String,
+  them (`*args` → `PyTuple<PyValue>`, `**kwargs` → `PyDict<String,
   PyValue>`, issue #120): call sites pack the extras, `f(*args)`
   forwards, and bodies read them as ordinary containers of boxed
   values. Methods/`__init__` with variadics (urllib3's `PoolManager`)

@@ -90,6 +90,9 @@
     "valueor": {
       "status": "pass"
     },
+    "variadic_tuples": {
+      "status": "pass"
+    },
     "views": {
       "status": "pass"
     }

@@ -59,6 +59,9 @@ pub(crate) enum StdModule {
     /// unittest — the test-runner harness (issue #334). std-gated: the
     /// runner needs the process/panic machinery.
     Unittest,
+    /// unicodedata lives on the UCD-backed `unicodedata-ucd` stdpython
+    /// feature (Unicode 16.0.0); rypip enables it when a package imports it.
+    Unicodedata,
 }
 
 impl StdModule {
@@ -101,6 +104,7 @@ impl StdModule {
             "urllib" => StdModule::Urllib,
             "encodings" => StdModule::Encodings,
             "unittest" => StdModule::Unittest,
+            "unicodedata" => StdModule::Unicodedata,
             _ => return None,
         })
     }
@@ -143,6 +147,7 @@ impl StdModule {
             StdModule::Urllib => "urllib",
             StdModule::Encodings => "encodings",
             StdModule::Unittest => "unittest",
+            StdModule::Unicodedata => "unicodedata",
         }
     }
 
@@ -178,7 +183,8 @@ impl StdModule {
             // the runtime module lives beside the codec layer on the std
             // tier where the corpus imports it.
             | StdModule::Encodings
-             | StdModule::Unittest => true,
+             | StdModule::Unittest
+            | StdModule::Unicodedata => true,
             StdModule::Io
             | StdModule::Json
             | StdModule::Collections
@@ -256,6 +262,43 @@ impl StdModule {
     /// and math have qualified-only entries.
     pub(crate) fn dispatches_qualified(self) -> bool {
         self.dispatches_from_import() || matches!(self, StdModule::Json | StdModule::Math)
+    }
+}
+
+/// The unicodedata module's runtime surface: the items stdpython's
+/// `stdlib::unicodedata` defines. Every function raises like CPython's
+/// (a non-character argument, a missing name, an unknown form), so every
+/// call threads `?`; `unidata_version` is a constant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnicodedataItem {
+    Category,
+    Bidirectional,
+    Combining,
+    Name,
+    Lookup,
+    Normalize,
+    IsNormalized,
+    UnidataVersion,
+}
+
+impl UnicodedataItem {
+    pub(crate) fn from_name(name: &str) -> Option<UnicodedataItem> {
+        Some(match name {
+            "category" => UnicodedataItem::Category,
+            "bidirectional" => UnicodedataItem::Bidirectional,
+            "combining" => UnicodedataItem::Combining,
+            "name" => UnicodedataItem::Name,
+            "lookup" => UnicodedataItem::Lookup,
+            "normalize" => UnicodedataItem::Normalize,
+            "is_normalized" => UnicodedataItem::IsNormalized,
+            "unidata_version" => UnicodedataItem::UnidataVersion,
+            _ => return None,
+        })
+    }
+
+    /// Whether a call returns `Result` (every function; not the constant).
+    pub(crate) fn is_fallible_fn(self) -> bool {
+        !matches!(self, UnicodedataItem::UnidataVersion)
     }
 }
 
@@ -344,7 +387,7 @@ mod tests {
     /// Every module, for the exhaustive round-trip walk. Lives in the
     /// test module (its only consumer): CI builds with -D warnings, so a
     /// test-only item in the non-test build would be a dead-code error.
-    const ALL: [StdModule; 33] = [
+    const ALL: [StdModule; 34] = [
         StdModule::Os,
         StdModule::Sys,
         StdModule::Re,
@@ -378,6 +421,7 @@ mod tests {
         StdModule::Socket,
         StdModule::Ssl,
         StdModule::Urllib,
+        StdModule::Unicodedata,
     ];
 
     /// from_name and name() are the enum's only two string matches; the

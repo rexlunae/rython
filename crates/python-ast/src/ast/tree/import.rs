@@ -57,6 +57,7 @@ pub(crate) fn stdpython_module_class(module: &str, name: &str) -> bool {
         StdModule::Subprocess => matches!(name, "CompletedProcess"),
         StdModule::Csv => false,
         StdModule::Unittest => false,
+        StdModule::Unicodedata => false,
         StdModule::String => matches!(name, "Template"),
         StdModule::Venv => matches!(name, "EnvBuilder"),
         // Functions/constants only.
@@ -96,6 +97,7 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
         StdModule::Io => matches!(name, "StringIO" | "BytesIO" | "DEFAULT_BUFFER_SIZE"),
         // The dotted encodings.aliases submodule's table item.
         StdModule::Encodings => name == "aliases",
+        StdModule::Unicodedata => crate::ast::tree::std_module::UnicodedataItem::from_name(name).is_some(),
         StdModule::Unittest => matches!(
             name,
             "main" | "TestCase" | "SkipTest" | "skip" | "skipIf" | "skipUnless" | "expectedFailure"

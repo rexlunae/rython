@@ -129,12 +129,13 @@ declaration — loud, but at the wrong layer (§12.1).
 | `dict[K, V]` | `PyDict<K, V>` | `PyDict` is an insertion-ordered `IndexMap` alias — Python 3.7+ dict ordering is preserved |
 | `set[T]` | `std::collections::HashSet<T>` | |
 | `frozenset[T]` | `std::collections::HashSet<T>` (as an annotation) | The `frozenset(iterable)` *call* produces the distinct runtime type `FrozenSet<T>`; empty `frozenset()` is a loud error |
-| `tuple` (literal) | Rust tuple `(A, B, …)` | There is no `tuple[…]` annotation mapping; tuples exist structurally |
+| `tuple` (literal), `tuple[A, B]` | Rust tuple `(A, B, …)` | A fixed-shape tuple is the Rust tuple of its members |
+| `tuple[T, ...]` | `stdpython::PyTuple<T>` | A tuple whose length is not fixed statically (issue #399): a sequence over a `Vec<T>` (indexing, `len`, iteration, slicing, `in`, `+`, `*`, `sum`, `list(t)`) that prints as a tuple — `(3, 4)`, `(7,)`, `()`. `tuple(xs)` of a typed list builds one, a tuple literal stored or returned into one re-collects, `*args` is one, the mixed-arity tuple values of one dict literal (`{1: ("a",), 2: ("b", "c")}`, str or int members) share one, and an `isinstance(x, tuple)`-narrowed boxed value reads as `PyTuple<PyValue>` |
 | `None` / `Optional[T]` / `T \| None` | `Option<T>` | See §3.5 |
 | `Any` / `typing.Any` / `object` | `stdpython::PyValue` | The boxed heterogeneous value — both the bare `Any` name and the `typing.Any` spelling (urllib3's `dict[str, typing.Any]` returns), so a method annotated `-> dict[str, typing.Any]` types as `PyDict<String, PyValue>` instead of collapsing to unit (round 44) |
 | `bytes \| bytearray` | `Vec<u8>` | Members mapping to the same Rust type collapse to it |
 | `str \| bytes` (and `\| bytearray`) | `stdpython::StrOrBytes` | Heterogeneous pair; narrowed by `is_str()`/`is_bytes()`; `str()`/`print()` render bytes in their `b'...'` repr form |
-| any other all-boxable union (`str \| int`, `bool \| str \| None`, …) | `stdpython::PyValue` | The boxed heterogeneous value (issue #121): members keep concrete types, `isinstance` narrows at runtime; `str()`/`repr()`/`print()` render Python-faithfully. A boxed LEFT operand takes `+`, `-` and `*` (CPython's numeric tower, complex included, and sequence repetition, with CPython's TypeErrors) and `==` against a scalar; other operators on a boxed value fail the build loudly rather than guessing. A `range` held boxed stays a range (`range(3, 6)`, its len/index/`in`/`==`), never a tuple. A union containing None is NOT an Option slot — the box absorbs None, so `None`-defaulted parameters of such a type (`cert_reqs: int \| str \| None`, `retries: Retry \| bool \| int \| None` — urllib3) store plain values through `PyValue::from`, never a `Some(...)` wrap (rounds 40/42). A class-instance member has no boxed repr — storing one stays loudly unboxable (`PyValue: From<Retry>` fails) |
+| any other all-boxable union (`str \| int`, `bool \| str \| None`, …) | `stdpython::PyValue` | The boxed heterogeneous value (issue #121): members keep concrete types, `isinstance` narrows at runtime; `str()`/`repr()`/`print()` render Python-faithfully. A boxed LEFT operand takes `+`, `-` and `*` (CPython's numeric tower, complex included, and sequence repetition, with CPython's TypeErrors) and `==` against a scalar; other operators on a boxed value fail the build loudly rather than guessing. A `range` held boxed stays a range (`range(3, 6)`, its len/index/`in`/`==`), never a tuple. A boxed value used as a str (a str method, `ord`, `.encode("ascii")`, a compiled pattern's `split`, `str + boxed`) reads its str member, and `str(b, encoding)` / `b".".join(...)` read a bytes member; any other member raises CPython's TypeError (a panic where the str surface is infallible). Boxed values order with CPython's `<` (numbers on the tower, str/bytes lexicographically, tuples member by member), so `bisect` searches a table of boxed rows; an unorderable pair is CPython's TypeError (issue #334) A union containing None is NOT an Option slot — the box absorbs None, so `None`-defaulted parameters of such a type (`cert_reqs: int \| str \| None`, `retries: Retry \| bool \| int \| None` — urllib3) store plain values through `PyValue::from`, never a `Some(...)` wrap (rounds 40/42). A class-instance member has no boxed repr — storing one stays loudly unboxable (`PyValue: From<Retry>` fails) |
 | `np.ndarray`, `np.float64`, `np.int32`, … | `numpy::NdArray`, `f64`, `i32`, … | Provided by the runtime's `numpy` module |
 | `socket.socket` | `socket::Socket` | The runtime socket handle — `wait.py`'s `sock: socket.socket` parameters compile as real `Socket` values, not boxed PyValues |
 | `threading.Thread/Lock/RLock/Event/Semaphore/local` | `threading::*` | The runtime threading handles (`ready: threading.Event` — a real shared handle) |
@@ -1653,10 +1654,11 @@ conversion time:
   family is special-cased in the runtime.)
 
 `*args`/`**kwargs` on module functions lower to the boxed heterogeneous
-containers (issue #120): `*args` is `Vec<stdpython::PyValue>` and
+containers (issue #120): `*args` is `stdpython::PyTuple<stdpython::PyValue>` (a tuple, as
+Python's `args` is — it prints `(1, 'x')`, issue #399) and
 `**kwargs` is `PyDict<String, stdpython::PyValue>`. An ANNOTATED `*args`
 is not heterogeneous and does not box: `def total(*nums: int)` says every
-extra positional is an int, so the parameter is `Vec<i64>`, the call
+extra positional is an int, so the parameter is `PyTuple<i64>`, the call
 sites pass plain values, and the body uses it as the list of ints it is
 (`sum(nums)`); a forwarded `f(*args)` between two typed varargs passes
 through unboxed. Call sites with a
@@ -2497,6 +2499,7 @@ accepted as permanent spec:
 
 | Divergence | Status |
 |---|---|
+| `unicodedata` answers from the Unicode 16.0.0 database — CPython 3.14's `unidata_version` — for every CPython: an older CPython carries an older database (3.12: 15.0.0, 3.13: 15.1.0), so a code point assigned or re-classified since answers differently there (`category`, `bidirectional`, `combining`, `name`, `normalize`). Code points assigned before 15.0 agree | Model limit (issue #334); a per-CPython database would need one table set per version |
 | True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |
 | Exception message shapes: `int()`'s message carries "with base 10" and `float()`'s quotes the string as Python's repr (#339, round 10); `open` and stream errors are CPython's `[Errno N] text: 'path'` form (#339); the `KeyError` key quoting is single-quoted like CPython (round 99) | Correct (was a defect class in issue #82's family) |
 | An uncaught exception on the direct-`main` entry path prints Rust's `Debug` form instead of `Type: message` (exit code 1 either way) | Defect (cosmetic) |
