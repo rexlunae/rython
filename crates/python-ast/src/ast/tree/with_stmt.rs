@@ -246,6 +246,15 @@ impl CodeGen for With {
         let mut item_tokens = Vec::new();
         for (index, item) in self.items.into_iter().enumerate() {
             let is_sync = is_threading_sync_call(&item.context_expr, &symbols, &options);
+            // A text file's methods all take `&self` (the handle is a
+            // shared reference, like Python's), so its binding is never
+            // `mut`.
+            let is_file = crate::ast::tree::type_ctx::is_file_typeinfo(&crate::infer_type(
+                Some(&ctx),
+                &item.context_expr,
+                &options,
+                &symbols,
+            ));
             let context_expr =
                 item.context_expr
                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
@@ -271,7 +280,11 @@ impl CodeGen for With {
                         crate::ast::tree::visit::target_names(&vars).into_iter(),
                     );
                     let target = vars.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                    item_tokens.push(quote! { let mut #target = #context_expr; #bind });
+                    if is_file {
+                        item_tokens.push(quote! { let #target = #context_expr; #bind });
+                    } else {
+                        item_tokens.push(quote! { let mut #target = #context_expr; #bind });
+                    }
                 }
                 None if is_sync => {
                     let guard = crate::safe_ident(&format!("__rython_with_guard_{}", index));

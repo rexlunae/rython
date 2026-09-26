@@ -4167,6 +4167,176 @@ fn file_objects_and_csv_writer_match_python_at_runtime() {
 }
 
 #[test]
+fn file_lines_iterate_like_cpython() {
+    // `for line in f` over a text file (idna's IdnaTestV2 vector reader,
+    // issue #334): one readline() per turn until the empty string, the
+    // line terminators kept; a break leaves the rest of the file
+    // readable; a decode error is raised at the turn that reaches it —
+    // CPython decodes 8192-byte chunks, so the 1024 lines of the first
+    // chunk are seen before the undecodable byte in the second. Also
+    // pinned: `type(exc).__name__` of a caught exception (an alias names
+    // its class: IOError is OSError), and str.format arguments read
+    // again after the call (they used to be moved into the format).
+    let scratch = Scratch::new("filelines");
+    let file = scratch.path().join("file_lines.py");
+    fs::write(
+        &file,
+        concat!(
+            "def describe(op: str, status: str) -> str:\n",
+            "    message = \"{}() expected {}\".format(op, status)\n",
+            "    if status == \"[]\":\n",
+            "        return message + \" (none)\"\n",
+            "    return message + \" for \" + op\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    total = 0\n",
+            "    with open(\"data.txt\", encoding=\"utf-8\") as fh:\n",
+            "        for raw in fh:\n",
+            "            total += 1\n",
+            "            print(total, repr(raw.strip()))\n",
+            "    print(\"lines\", total)\n",
+            "    f = open(\"data.txt\")\n",
+            "    for line in f:\n",
+            "        if line.startswith(\"t\"):\n",
+            "            print(\"found\", repr(line))\n",
+            "            break\n",
+            "    else:\n",
+            "        print(\"no t\")\n",
+            "    print(\"rest\", repr(f.readline()))\n",
+            "    f.close()\n",
+            "    seen = 0\n",
+            "    try:\n",
+            "        with open(\"big.txt\") as big:\n",
+            "            for line in big:\n",
+            "                seen += 1\n",
+            "    except UnicodeDecodeError as exc:\n",
+            "        print(type(exc).__name__, seen)\n",
+            "    try:\n",
+            "        raise IOError(\"disk\")\n",
+            "    except OSError as exc:\n",
+            "        print(type(exc).__name__, str(exc))\n",
+            "    print(describe(\"decode\", \"[]\"))\n",
+            "    print(describe(\"encode\", \"[B1]\"))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(scratch.path().join("data.txt"), "one\ntwo\n\nlast").unwrap();
+    let mut big = b"abcdefg\n".repeat(1100);
+    big.extend_from_slice(b"\xff\n");
+    fs::write(scratch.path().join("big.txt"), big).unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/file_lines"))
+        .current_dir(scratch.path())
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "1 'one'",
+            "2 'two'",
+            "3 ''",
+            "4 'last'",
+            "lines 4",
+            "found 'two\\n'",
+            "rest '\\n'",
+            "UnicodeDecodeError 1024",
+            "OSError disk",
+            "decode() expected [] (none)",
+            "encode() expected [B1] for encode",
+        ],
+    );
+}
+
+#[test]
+fn os_file_functions_raise_like_cpython() {
+    // issue #404: `os.remove(path)` dropped its Result — a failed removal
+    // was silently ignored — and os.remove/os.replace/os.chdir raised a
+    // flat OSError/RuntimeError with their own text. Each now threads `?`
+    // and raises CPython's errno subclass with CPython's message (a pair
+    // of names for os.replace); `os.replace` is the module function, not
+    // str.replace; os.getcwd raises instead of panicking.
+    let scratch = Scratch::new("osfiles");
+    let file = scratch.path().join("osr.py");
+    fs::write(
+        &file,
+        concat!(
+            "import os\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    with open(\"osr_a.txt\", \"w\") as f:\n",
+            "        f.write(\"x\")\n",
+            "    os.replace(\"osr_a.txt\", \"osr_b.txt\")\n",
+            "    print(os.path.exists(\"osr_a.txt\"), os.path.exists(\"osr_b.txt\"))\n",
+            "    os.remove(\"osr_b.txt\")\n",
+            "    print(os.path.exists(\"osr_b.txt\"))\n",
+            "    name = \"osr_\" + \"b.txt\"\n",
+            "    try:\n",
+            "        os.remove(name)\n",
+            "        print(\"removed twice\")\n",
+            "    except FileNotFoundError as exc:\n",
+            "        print(type(exc).__name__, exc)\n",
+            "    try:\n",
+            "        os.remove(\".\")\n",
+            "    except OSError as exc:\n",
+            "        print(type(exc).__name__, exc)\n",
+            "    try:\n",
+            "        os.replace(\"osr_missing.txt\", \"osr_c.txt\")\n",
+            "    except OSError as exc:\n",
+            "        print(type(exc).__name__, exc)\n",
+            "    try:\n",
+            "        os.chdir(\"osr_no_such_dir\")\n",
+            "    except FileNotFoundError as exc:\n",
+            "        print(type(exc).__name__, exc)\n",
+            "    print(os.getcwd() == os.path.abspath(\".\"))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/osr"))
+        .current_dir(scratch.path())
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "False True",
+            "False",
+            "FileNotFoundError [Errno 2] No such file or directory: 'osr_b.txt'",
+            "IsADirectoryError [Errno 21] Is a directory: '.'",
+            "FileNotFoundError [Errno 2] No such file or directory: 'osr_missing.txt' -> 'osr_c.txt'",
+            "FileNotFoundError [Errno 2] No such file or directory: 'osr_no_such_dir'",
+            "True",
+        ],
+    );
+}
+
+#[test]
 fn functools_partial_matches_python_at_runtime() {
     // partial over statically-known functions: leading-argument binding,
     // full binding (zero-arg closure), multi-parameter tails, and
@@ -17952,6 +18122,60 @@ fn optional_callable_parameters_match_cpython() {
     );
     // Verified against python3.
     assert_eq!(run_package(&krate, "optcallable"), vec!["HI! hi?"]);
+}
+
+#[test]
+fn bytes_returned_through_a_module_alias_decode() {
+    // `idna.encode(s).decode("ascii")` after `from . import core as idna`
+    // (idna's IdnaTestV2 vectors, issue #334): the call's return
+    // annotation is read through the module, so the bytes result takes
+    // the bytes `.decode` — it used to stay untyped (E0599 on Vec<u8>).
+    // A caught user exception's `type(exc).__name__` is its class name.
+    let scratch = Scratch::new("modbytes");
+    let krate = package_crate(
+        &scratch,
+        "modbytes",
+        &[
+            (
+                "core.py",
+                concat!(
+                    "class CoreError(ValueError):\n",
+                    "    pass\n",
+                    "\n",
+                    "\n",
+                    "def encode(s: str, strict: bool = False) -> bytes:\n",
+                    "    if strict and not s:\n",
+                    "        raise CoreError(\"Empty label\")\n",
+                    "    return s.encode(\"ascii\")\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from . import core as lib\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(lib.encode(\"abc\").decode(\"ascii\"))\n",
+                    "    print(lib.encode(\"xyz\", strict=True).decode(\"utf-8\", \"strict\"))\n",
+                    "    for label in [\"ok\", \"\"]:\n",
+                    "        try:\n",
+                    "            print(repr(lib.encode(label, strict=True).decode(\"ascii\")))\n",
+                    "        except (lib.CoreError, UnicodeError) as exc:\n",
+                    "            print(type(exc).__name__, str(exc))\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "modbytes"),
+        vec!["abc", "xyz", "'ok'", "CoreError Empty label"]
+    );
 }
 
 #[test]

@@ -127,8 +127,9 @@ keyword `replace()` on the datetime family), the core builtins (`print`,
 `map`/`filter`, `zip`, `sum`, `pow`, `repr`, `hash`, `isinstance` on
 annotated locals, …), string/list/dict/set methods, file objects (disk
 handles and `io.StringIO` behind one surface, including `with open(...)
-as f:`; a literal binary mode is the bytes file, `io.BytesIO`'s type,
-and the mode grammar raises CPython's own `ValueError`s),
+as f:` and `for line in f`; a literal binary mode is the bytes file,
+`io.BytesIO`'s type, and the mode grammar raises CPython's own
+`ValueError`s),
 `functools.partial` over statically-known functions,
 `@functools.lru_cache`/`@cache` with CPython's exact LRU discipline,
 conversion-time `argparse` (typed namespace, byte-identical help and

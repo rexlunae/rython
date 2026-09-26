@@ -302,6 +302,32 @@ impl UnicodedataItem {
     }
 }
 
+/// The os module's FALLIBLE functions: each runtime function returns
+/// `Result` and raises CPython's OSError subclass (`FileNotFoundError:
+/// [Errno 2] No such file or directory: 'x'`), so a call threads `?` —
+/// without it a failed `os.remove` was silently ignored (issue #404).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OsFn {
+    Remove,
+    Replace,
+    Getcwd,
+    Chdir,
+    Urandom,
+}
+
+impl OsFn {
+    pub(crate) fn from_name(name: &str) -> Option<OsFn> {
+        Some(match name {
+            "remove" => OsFn::Remove,
+            "replace" => OsFn::Replace,
+            "getcwd" => OsFn::Getcwd,
+            "chdir" => OsFn::Chdir,
+            "urandom" => OsFn::Urandom,
+            _ => return None,
+        })
+    }
+}
+
 /// The arity/keyword VARIANT names of runtime functions — one Python
 /// name maps to several Rust functions split by call shape (accumulate
 /// with initial=, StringIO seeded, ...). Each name literal exists exactly

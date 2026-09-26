@@ -43,6 +43,8 @@ fn stdlib_fn_fallible(root: &str, fname: &str) -> bool {
         || (crate::StdModule::from_name(root) == Some(crate::StdModule::Unicodedata)
             && crate::ast::tree::std_module::UnicodedataItem::from_name(fname)
                 .is_some_and(|item| item.is_fallible_fn()))
+        || (crate::StdModule::from_name(root) == Some(crate::StdModule::Os)
+            && crate::ast::tree::std_module::OsFn::from_name(fname).is_some())
 }
 
 /// Runtime-module functions that return `Result<T, PyException>` because
@@ -62,8 +64,6 @@ const FALLIBLE_STDLIB_FN: &[&str] = &[
     "loads",
     // glob: filesystem access can fail.
     "glob", "rglob", "iglob",
-    // os: entropy source can fail (os.urandom raises OSError).
-    "urandom",
     // socket.socket() rejects unknown families/kinds with OSError.
     "socket",
     // socket.getaddrinfo raises gaierror (an OSError) on resolution failure.
@@ -9288,12 +9288,8 @@ let mutating_self_field = boxed_self_ref_receiver
                     ("decode", [enc, errors])
                         if crate::ast::tree::call::receiver_is_str_like(
                             &attr.value, &options, &symbols,
-                        ) || matches!(
-                            &*attr.value,
-                            ExprType::Name(n) if matches!(
-                                options.name_types.get(&n.id),
-                                Some(crate::TypeInfo::Bytes)
-                            )
+                        ) || crate::ast::tree::call::receiver_is_bytes_like(
+                            &attr.value, &options, &symbols,
                         ) =>
                     {
                         return Ok(quote!(
@@ -9305,6 +9301,8 @@ let mutating_self_field = boxed_self_ref_receiver
                     // bytes→String conversion is the codec's job).
                     ("decode", [enc])
                         if crate::ast::tree::call::receiver_is_str_like(
+                            &attr.value, &options, &symbols,
+                        ) || crate::ast::tree::call::receiver_is_bytes_like(
                             &attr.value, &options, &symbols,
                         ) =>
                     {
@@ -9707,7 +9705,14 @@ let mutating_self_field = boxed_self_ref_receiver
                                 // and Python's str.replace is the only
                                 // positional-replace surface.
                                 | crate::TypeInfo::PyObject
-                        )) && self.keywords.is_empty() =>
+                        )) && self.keywords.is_empty()
+                            // `os.replace(src, dst)` is the module
+                            // function, not str.replace (issue #404).
+                            && !crate::ast::tree::attribute::is_module_path_chain(
+                                &attr.value,
+                                &symbols,
+                                &options,
+                            ) =>
                     {
                         return Ok(quote!((#receiver).py_replace(&(#old), &(#new))));
                     }
@@ -11003,8 +11008,6 @@ let mutating_self_field = boxed_self_ref_receiver
             "subprocess :: run_with_env"
                 | "subprocess :: check_call"
                 | "subprocess :: check_output"
-                | "os :: getcwd"
-                | "os :: chdir"
                 | "os :: path :: abspath"
         );
 
@@ -11799,12 +11802,13 @@ fn lower_str_format(
         }
     }
 
-    // Bindings: every argument evaluates exactly once, in order.
+    // Bindings: every argument evaluates exactly once, in order. Each is
+    // bound by value, so a name read again later (`"{} {}".format(op,
+    // status)` then `if status == ...`) is cloned by the reuse rule —
+    // Python's format only reads its arguments.
     let mut bindings = TokenStream::new();
     for (i, arg) in args.iter().enumerate() {
-        let value = (*arg)
-            .clone()
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let value = crate::render_reused(arg, ctx.clone(), options.clone(), symbols.clone())?;
         if used_positions.contains(&i) {
             let ident = crate::safe_ident(&format!("__rython_fmt{}", i));
             bindings.extend(quote!(let #ident = #value;));
@@ -11814,10 +11818,8 @@ fn lower_str_format(
     }
     for kw in keywords {
         let name = kw.arg.as_deref().unwrap_or_default();
-        let value = kw
-            .value
-            .clone()
-            .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+        let value =
+            crate::render_reused(&kw.value, ctx.clone(), options.clone(), symbols.clone())?;
         if used_names.contains(name) {
             let ident = crate::safe_ident(&format!("__rython_fmt_{}", name));
             bindings.extend(quote!(let #ident = #value;));

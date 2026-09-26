@@ -433,6 +433,22 @@ impl CodeGen for For {
             }
             iter = quote!([#(#elts),*]);
         }
+        // A TEXT FILE iterable (`for line in f` — idna's IdnaTestV2 vector
+        // reader): Python reads a line per turn until the empty string. A
+        // read can fail (a UTF-8 decode error, a closed file), and that
+        // failure is the exception at THAT turn, after the earlier lines'
+        // bodies ran — so each line is a Result, propagated in the body.
+        let (loop_target, loop_inner) = if crate::ast::tree::type_ctx::is_file_typeinfo(
+            &crate::infer_type(Some(&ctx), &self.iter, &options, &symbols),
+        ) {
+            iter = quote!((#iter).py_lines());
+            (
+                quote!(__rython_line),
+                quote!(let #loop_target = __rython_line?; #loop_inner),
+            )
+        } else {
+            (loop_target, loop_inner)
+        };
 
         if !has_else {
             Ok(quote! {

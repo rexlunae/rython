@@ -9061,6 +9061,56 @@ fn a_binary_open_mode_is_the_bytes_file() {
     assert!(out.contains("open (& (dst) , None :: < & str >) ?"), "generated: {}", out);
 }
 
+#[test]
+fn a_text_file_iterates_its_lines_fallibly() {
+    // `for line in f` over a text file reads a line per turn; a read can
+    // raise (a decode error, a closed file) at that turn, so each line is
+    // a Result propagated in the body. The `with` binding of a file is
+    // never `mut` (every file method takes `&self`). A binary file is not
+    // this path.
+    let out = compile(
+        concat!(
+            "def count(path: str) -> int:\n",
+            "    n = 0\n",
+            "    with open(path, encoding=\"utf-8\") as f:\n",
+            "        for line in f:\n",
+            "            n += len(line)\n",
+            "    return n\n",
+        ),
+        "filelines.py",
+    );
+    assert!(out.contains("for __rython_line in (f) . py_lines ()"), "generated: {}", out);
+    assert!(out.contains("let line = __rython_line ? ;"), "generated: {}", out);
+    assert!(out.contains("let f = open ("), "generated: {}", out);
+    assert!(!out.contains("let mut f = open ("), "generated: {}", out);
+}
+
+#[test]
+fn fallible_os_functions_thread_their_exceptions() {
+    // issue #404: os.remove / os.replace / os.chdir / os.getcwd raise
+    // CPython's OSError subclasses; each call threads `?` (a dropped
+    // Result silently ignored a failed os.remove), and `os.replace` is
+    // the module function, never str.replace.
+    let out = compile(
+        concat!(
+            "import os\n",
+            "\n",
+            "def tidy(a: str, b: str) -> str:\n",
+            "    os.replace(a, b)\n",
+            "    os.remove(b)\n",
+            "    os.chdir(\"..\")\n",
+            "    return os.getcwd()\n",
+        ),
+        "tidy.py",
+    );
+    assert!(out.contains("os :: replace (a , (b) . clone ()) ?"), "generated: {}", out);
+    assert!(out.contains("os :: remove ((b) . clone ()) ?"), "generated: {}", out);
+    assert!(out.contains("os :: chdir (\"..\") ?"), "generated: {}", out);
+    assert!(out.contains("os :: getcwd () ?"), "generated: {}", out);
+    assert!(!out.contains("py_replace"), "generated: {}", out);
+    assert!(!out.contains("unwrap ()"), "generated: {}", out);
+}
+
 // ---- chained comparisons and loop control through try ----
 
 #[test]

@@ -567,6 +567,18 @@ fn py_exception_matches_handler_names() {
 }
 
 #[test]
+fn py_exception_type_name_is_the_raised_class() {
+    // type(ValueError()).__name__ -> 'ValueError'
+    assert_eq!(PyException::new("ValueError", "").type_name(), "ValueError");
+    // type(IOError()).__name__ -> 'OSError' (the alias IS the class);
+    // likewise EnvironmentError
+    assert_eq!(PyException::new("IOError", "").type_name(), "OSError");
+    assert_eq!(PyException::new("EnvironmentError", "").type_name(), "OSError");
+    // A user class (class IDNAError(UnicodeError)) keeps its own name.
+    assert_eq!(PyException::new("IDNAError", "").type_name(), "IDNAError");
+}
+
+#[test]
 fn truthiness_matches_python_bool() {
     // Python: bool("") is False, bool("x") is True
     assert!(!"".is_truthy());
@@ -3004,6 +3016,30 @@ mod file_objects {
         assert_eq!(two.readlines().unwrap(), vec!["y\n", "z"]);
         // Exhausted: empty line, empty list.
         assert_eq!(two.readline().unwrap(), "");
+    }
+
+    #[test]
+    fn file_line_iteration_matches_python() {
+        // list(io.StringIO("x\ny\n\nz")) -> ['x\n', 'y\n', '\n', 'z'],
+        // and the file is exhausted after: f.readline() -> ''
+        let f = io::StringIO_seeded("x\ny\n\nz");
+        let lines: Vec<String> = f.py_lines().map(Result::unwrap).collect();
+        assert_eq!(lines, vec!["x\n", "y\n", "\n", "z"]);
+        assert_eq!(f.readline().unwrap(), "");
+        // for l in f: break  -> 'a\n'; then list(f) -> ['b\n'] (the
+        // loop and the later reads share one cursor)
+        let f = io::StringIO_seeded("a\nb\n");
+        assert_eq!(f.py_lines().next().unwrap().unwrap(), "a\n");
+        let rest: Vec<String> = f.py_lines().map(Result::unwrap).collect();
+        assert_eq!(rest, vec!["b\n"]);
+        // f.close(); for l in f -> ValueError: I/O operation on closed
+        // file. — raised once, ending the iteration
+        f.close().unwrap();
+        let mut closed = f.py_lines();
+        let err = closed.next().unwrap().unwrap_err();
+        assert_eq!(err.type_name(), "ValueError");
+        assert_eq!(err.message, "I/O operation on closed file.");
+        assert!(closed.next().is_none());
     }
 
     #[test]

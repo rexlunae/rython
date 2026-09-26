@@ -39,6 +39,9 @@
     "ledger": {
       "status": "pass"
     },
+    "line_tally": {
+      "status": "pass"
+    },
     "math_bare_imports": {
       "status": "pass"
     },

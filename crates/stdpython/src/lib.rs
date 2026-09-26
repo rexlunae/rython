@@ -7354,6 +7354,14 @@ impl PyException {
     /// does NOT catch SystemExit, KeyboardInterrupt or GeneratorExit —
     /// the old hand-copied tree missed parts of that (spec §12.3 defect
     /// class, fixed here).
+    /// Python's `type(e).__name__`: the raised class's name. A builtin
+    /// alias names its class (`raise IOError` raises an `OSError`).
+    pub fn type_name(&self) -> alloc::string::String {
+        crate::builtin_exceptions::canonical_name(&self.exception_type)
+            .unwrap_or(&self.exception_type)
+            .to_string()
+    }
+
     pub fn matches(&self, name: &str) -> bool {
         use crate::builtin_exceptions::BUILTIN_EXCEPTION_MRO;
         // Exact name equality covers user-defined classes and builtins
@@ -8250,6 +8258,14 @@ pub fn input<P: AsRef<str>>(prompt: Option<P>) -> Result<String, PyException> {
 /// RuntimeError would never match, and the error would escape the try.
 #[cfg(feature = "std")]
 fn os_error(e: &std::io::Error, path: &str) -> PyException {
+    os_error_paths(e, &[path])
+}
+
+/// [`os_error`] over the failing call's filenames, as CPython renders
+/// them: none (`os.getcwd()` — `[Errno 2] No such file or directory`),
+/// one (`: 'path'`), or a pair (`os.replace` — `: 'src' -> 'dst'`).
+#[cfg(feature = "std")]
+pub(crate) fn os_error_paths(e: &std::io::Error, paths: &[&str]) -> PyException {
     let kind = os_error_kind(e);
     // CPython's str(OSError): `[Errno 2] No such file or directory:
     // 'path'` — the errno and the OS's own text (Rust's Display appends
@@ -8262,9 +8278,16 @@ fn os_error(e: &std::io::Error, path: &str) -> PyException {
     // The path is Python's repr (`"it's.txt"` switches quotes, as
     // CPython's `filename` rendering does — Devin review on #339,
     // round 4).
-    let message = match e.raw_os_error() {
-        Some(code) => format!("[Errno {}] {}: {}", code, text, py_str_repr(path)),
-        None => format!("{}: {}", text, py_str_repr(path)),
+    let names = paths
+        .iter()
+        .map(|p| py_str_repr(p))
+        .collect::<Vec<_>>()
+        .join(" -> ");
+    let message = match (e.raw_os_error(), names.is_empty()) {
+        (Some(code), false) => format!("[Errno {}] {}: {}", code, text, names),
+        (Some(code), true) => format!("[Errno {}] {}", code, text),
+        (None, false) => format!("{}: {}", text, names),
+        (None, true) => text,
     };
     PyException::new(kind, message)
 }
@@ -8508,6 +8531,35 @@ pub struct PyFile {
     /// Python `f.name`: the path a disk file was opened from (an
     /// in-memory StringIO has no name in Python; here it is "").
     pub name: String,
+}
+
+/// The line iterator of a text file ([`PyFile::py_lines`]): each item is
+/// the next `readline()`, ending at the empty string; a failed read is
+/// yielded once and ends the iteration.
+pub struct PyFileLines {
+    file: PyFile,
+    done: bool,
+}
+
+impl Iterator for PyFileLines {
+    type Item = Result<String, PyException>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self.file.readline() {
+            Ok(line) if line.is_empty() => {
+                self.done = true;
+                None
+            }
+            Ok(line) => Some(Ok(line)),
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
 }
 
 /// The text-mode reader of a disk file — CPython's TextIOWrapper over
@@ -8827,6 +8879,14 @@ impl PyFile {
             PyFileBackend::DiskWrite(_) => Err(unsupported_operation("not readable")),
             PyFileBackend::Closed => Err(closed_file_error()),
         }
+    }
+
+    /// Python's `for line in f`: one `readline()` per turn until the
+    /// empty string. Each line is a Result — a read that fails (a UTF-8
+    /// decode error, a closed file) is the exception at THAT turn, after
+    /// the earlier lines were seen, as CPython's iteration raises it.
+    pub fn py_lines(&self) -> PyFileLines {
+        PyFileLines { file: self.clone(), done: false }
     }
 
     /// Python file.readlines() method. Lines KEEP their terminators

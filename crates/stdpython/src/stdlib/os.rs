@@ -172,25 +172,29 @@ python_function! {
 python_function! {
     /// os.replace - atomically rename a file (requests' utils,
     /// `os.replace(tmp_name, filename)`).
-    pub fn replace(src: String, dst: String) -> Result<(), PyException>
+    /// A failure is CPython's errno subclass and text:
+    /// `FileNotFoundError: [Errno 2] No such file or directory: 'a' -> 'b'`.
+    pub fn replace<S, D>(src: S, dst: D) -> Result<(), PyException>
+    where [S: AsPathLike, D: AsPathLike]
     [signature: (src, dst)]
     [concrete_types: (String, String) -> Result<(), crate::PyException>]
     {
-        std::fs::rename(&src, &dst).map_err(|e| {
-            crate::PyException::new("OSError", format!("rename {} -> {}: {}", src, dst, e))
-        })
+        let (src, dst) = (src.as_path_like(), dst.as_path_like());
+        std::fs::rename(src, dst).map_err(|e| crate::os_error_paths(&e, &[src, dst]))
     }
 }
 
 python_function! {
     /// os.remove - delete a file (requests' utils, `os.remove(tmp_name)`).
-    pub fn remove(path: String) -> Result<(), PyException>
+    /// A failure is CPython's errno subclass and text:
+    /// `FileNotFoundError: [Errno 2] No such file or directory: 'x'`.
+    pub fn remove<P>(path: P) -> Result<(), PyException>
+    where [P: AsPathLike]
     [signature: (path)]
     [concrete_types: (String) -> Result<(), crate::PyException>]
     {
-        std::fs::remove_file(&path).map_err(|e| {
-            crate::PyException::new("OSError", format!("remove {}: {}", path, e))
-        })
+        let path = path.as_path_like();
+        std::fs::remove_file(path).map_err(|e| crate::os_error_paths(&e, &[path]))
     }
 }
 
@@ -261,7 +265,7 @@ python_function! {
     {
         std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
-            .map_err(|e| crate::runtime_error(&format!("Failed to get current directory: {}", e)))
+            .map_err(|e| crate::os_error_paths(&e, &[]))
     }
 }
 
@@ -273,7 +277,7 @@ python_function! {
     [concrete_types: (String) -> Result<(), crate::PyException>]
     {
         std::env::set_current_dir(path.as_path_like())
-            .map_err(|e| crate::runtime_error(&format!("Failed to change directory to {}: {}", path.as_path_like(), e)))
+            .map_err(|e| crate::os_error_paths(&e, &[path.as_path_like()]))
     }
 }
 
