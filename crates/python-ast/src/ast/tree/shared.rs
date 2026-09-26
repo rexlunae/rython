@@ -68,7 +68,33 @@ pub fn compute_shared(
     let mut defined_in: HashMap<String, usize> = HashMap::new();
     let mut stored: HashSet<String> = HashSet::new();
     let mut external_stores: HashSet<ExternalStore> = HashSet::new();
+    // Each class's fields that hold a `threading.local()` bag: a store
+    // through one (`self._tl.count = 1`) is interior — every clone of the
+    // object shares the per-thread bag — so it mutates nothing a second
+    // holder could miss (issue #356's scope rule, for the sharing
+    // decision).
+    let mut thread_local_fields: HashMap<String, HashSet<String>> = HashMap::new();
     let mut register = |body: &[Statement], defs: Vec<ClassDef>, symbols: &SymbolTableScopes, opts: &PythonOptions| {
+        for c in &defs {
+            let fields = thread_local_fields.entry(c.name.clone()).or_default();
+            for m in all_methods(c) {
+                crate::ast::tree::visit::walk_stmts(&m.body, crate::ast::tree::visit::Descend::SkipDefs, &mut |st| {
+                    if let StatementType::Assign(a) = &st.statement
+                        && let ExprType::Call(call) = &a.value
+                        && crate::ast::tree::type_ctx::threading_local_ctor(&call.func, symbols)
+                    {
+                        for t in &a.targets {
+                            if let ExprType::Attribute(attr) = t
+                                && is_self(&attr.value)
+                            {
+                                fields.insert(attr.attr.clone());
+                            }
+                        }
+                    }
+                    crate::ast::tree::visit::Flow::Continue
+                });
+            }
+        }
         for c in defs {
             *defined_in.entry(c.name.clone()).or_insert(0) += 1;
             classes.entry(c.name.clone()).or_insert(c);
@@ -141,7 +167,7 @@ pub fn compute_shared(
                 && !crate::ast::tree::class_def::is_exception_class(c)
                 && family
                     .iter()
-                    .any(|m| class_mutates(m, &classes, &external_stores, &mut memo));
+                    .any(|m| class_mutates(m, &classes, &external_stores, &thread_local_fields, &mut memo));
             if qualifies && defined_in.get(*name).copied().unwrap_or(0) > 1 {
                 options.definition_warnings.borrow_mut().push(format!(
                     "class `{}` is defined by more than one module of the crate: its \
@@ -184,10 +210,10 @@ pub fn compute_shared(
             continue;
         }
         let stored_family = stored.contains(name) || base_family.iter().any(|m| stored.contains(m));
-        let mutates = class_mutates(name, &classes, &external_stores, &mut memo)
+        let mutates = class_mutates(name, &classes, &external_stores, &thread_local_fields, &mut memo)
             || base_family
                 .iter()
-                .any(|m| class_mutates(m, &classes, &external_stores, &mut memo));
+                .any(|m| class_mutates(m, &classes, &external_stores, &thread_local_fields, &mut memo));
         if stored_family && mutates {
             let root = base_family.first().cloned().unwrap_or_default();
             options.definition_warnings.borrow_mut().push(format!(
@@ -552,6 +578,7 @@ fn class_mutates(
     name: &str,
     classes: &BTreeMap<String, ClassDef>,
     external_stores: &HashSet<ExternalStore>,
+    thread_local_fields: &HashMap<String, HashSet<String>>,
     memo: &mut HashMap<String, bool>,
 ) -> bool {
     if let Some(&m) = memo.get(name) {
@@ -562,13 +589,14 @@ fn class_mutates(
     let Some(c) = classes.get(name) else {
         return false;
     };
-    let own = has_mutating_method(c)
+    let empty = HashSet::new();
+    let own = has_mutating_method(c, thread_local_fields.get(name).unwrap_or(&empty))
         || own_field_names(c)
             .iter()
             .any(|f| external_stores.iter().any(|st| st.hits(name, f)));
     let inherited = c.bases.iter().any(|b| match b {
-        ExprType::Name(n) => class_mutates(&n.id, classes, external_stores, memo),
-        ExprType::Attribute(a) => class_mutates(&a.attr, classes, external_stores, memo),
+        ExprType::Name(n) => class_mutates(&n.id, classes, external_stores, thread_local_fields, memo),
+        ExprType::Attribute(a) => class_mutates(&a.attr, classes, external_stores, thread_local_fields, memo),
         _ => false,
     });
     let result = own || inherited;
@@ -590,7 +618,7 @@ fn own_field_names(c: &ClassDef) -> HashSet<String> {
 /// Whether any method other than `__init__` mutates `self`: a store or
 /// augmented store into a `self` field, a container-mutating call on
 /// one, a `del`, or a call to another such method of the class.
-fn has_mutating_method(c: &ClassDef) -> bool {
+fn has_mutating_method(c: &ClassDef, thread_local_fields: &HashSet<String>) -> bool {
     let mut direct: HashSet<String> = HashSet::new();
     let mut calls: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for m in all_methods(c) {
@@ -599,7 +627,10 @@ fn has_mutating_method(c: &ClassDef) -> bool {
         }
         let mut stores = Vec::new();
         let mut self_calls = Vec::new();
-        if self_stores(&m.body, &mut stores, &mut self_calls) {
+        // A store through a `threading.local()` field is interior (above).
+        if self_stores(&m.body, &mut stores, &mut self_calls)
+            && stores.iter().any(|f| !thread_local_fields.contains(f))
+        {
             direct.insert(m.name.clone());
         }
         calls.insert(m.name.clone(), self_calls);
