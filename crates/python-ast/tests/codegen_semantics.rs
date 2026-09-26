@@ -3,7 +3,7 @@
 //! mutability, loop else-clauses, with-statements, comprehensions, f-strings,
 //! statement separators, await handling, and from-imports.
 
-use python_ast::{CodeGen, CodeGenContext, PythonOptions, SymbolTableScopes, parse};
+use python_ast::{CodeGen, CodeGenContext, PythonOptions, PythonOptionsData, SymbolTableScopes, parse};
 
 /// Two-module crate for the cross-module trait-mut cache tests: module A
 /// defines a hierarchy whose trait widens (Dog's mutating `grow` override
@@ -30,10 +30,10 @@ fn cross_module_fixture() -> (std::rc::Rc<python_ast::Module>, PythonOptions) {
     .unwrap();
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["animals".to_string()], std::rc::Rc::new(a));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     (options.module_defs.values().next().unwrap().clone(), options)
 }
 
@@ -314,11 +314,11 @@ fn imported_function_keyword_args_resolve_cross_module() {
         vec!["helpers".to_string()],
         std::rc::Rc::new(helpers),
     );
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         python_namespace: "pkg".to_string(),
         ..Default::default()
-    };
+    });
     let caller = parse(
         "from helpers import greet\n\
          \ndef use() -> str:\n\
@@ -4528,10 +4528,10 @@ fn lossy_warnings_can_be_suppressed_by_options() {
     let src = "def f(x: int = 3) -> int:\n    if x:\n        return x\n";
     let module = parse(src, "suppress.py").unwrap();
     let symbols = module.clone().find_symbols(SymbolTableScopes::new());
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         lossy_warnings: false,
         ..Default::default()
-    };
+    });
     let out = module
         .to_rust(CodeGenContext::Module("suppress".into()), options, symbols)
         .unwrap()
@@ -6914,11 +6914,11 @@ fn sibling_imported_module_values_promote_to_statics() {
             .unwrap(),
         ),
     );
-    let mut options = PythonOptions {
+    let mut options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         module_path: vec!["pkg".to_string()],
         ..Default::default()
-    };
+    });
     // Convert the DEFINING module first: the promotion pass records the
     // promoted set into the shared cache that the importing module consults.
     options.this_module_path = vec!["pkg".to_string(), "constant".to_string()];
@@ -6974,10 +6974,10 @@ fn bitwise_module_constant_binop_lowers_to_plain_static() {
 fn compile_nostd(src: &str, name: &str) -> Result<String, String> {
     let module = parse(src, name).unwrap_or_else(|e| panic!("parse failed: {}", e));
     let symbols = module.clone().find_symbols(SymbolTableScopes::new());
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         no_std: true,
         ..Default::default()
-    };
+    });
     module
         .to_rust(
             CodeGenContext::Module(name.replace(".py", "")),
@@ -8744,10 +8744,10 @@ fn issubclass_external_fold_follows_the_alias_that_binds_the_name() {
     .unwrap();
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["local".to_string()], std::rc::Rc::new(local));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     // The external root folds, with the warning.
     let src = concat!(
         "import local, importlib\n",
@@ -10183,10 +10183,10 @@ fn async_binary_entry_is_feature_gated_and_imports_runtime() {
     let out = compile_with_options(
         src,
         "asyncbin.py",
-        PythonOptions {
+        PythonOptions::from(PythonOptionsData {
             async_runtime_dep: true,
             ..Default::default()
-        },
+        }),
     )
     .expect("async binary converts");
     assert!(
@@ -11594,10 +11594,10 @@ fn imported_class_constant_default_resolves_through_import() {
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["retry".to_string()], std::rc::Rc::new(retry_mod));
     defs.insert(vec!["adapters".to_string()], std::rc::Rc::new(adapters_mod));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let out = compile_with_options(adapters_src, "adapters.py", options).expect("converts");
     assert!(
         out.contains("Retry :: DEFAULT_ALLOWED_METHODS") || out.contains("Retry::DEFAULT_ALLOWED_METHODS"),
@@ -11628,13 +11628,13 @@ fn a_star_import_of_a_crate_module_honours_its_literal_all() {
             vec!["pkg".to_string(), "star".to_string()],
             std::rc::Rc::new(parse(src, "star.py").unwrap()),
         );
-        let options = PythonOptions {
+        let options = PythonOptions::from(PythonOptionsData {
             module_defs: std::rc::Rc::new(defs),
             module_path: vec!["pkg".to_string()],
             this_module_path: vec!["pkg".to_string(), "star".to_string()],
             python_namespace: "pkg".to_string(),
             ..Default::default()
-        };
+        });
         compile_with_options(src, "star.py", options).expect("the star import converts")
     };
     let listed = glob("__all__ = [\"other\"]\nthing = 1\nother = 2\n");
@@ -11665,13 +11665,13 @@ fn a_star_import_follows_the_latest_effective_all() {
             vec!["pkg".to_string(), "star".to_string()],
             std::rc::Rc::new(parse(src, "star.py").unwrap()),
         );
-        let options = PythonOptions {
+        let options = PythonOptions::from(PythonOptionsData {
             module_defs: std::rc::Rc::new(defs),
             module_path: vec!["pkg".to_string()],
             this_module_path: vec!["pkg".to_string(), "star".to_string()],
             python_namespace: "pkg".to_string(),
             ..Default::default()
-        };
+        });
         compile_with_options(src, "star.py", options).expect("the star import converts")
     };
     // Round 22: a read of the list (`__all__.copy()`, `len(__all__)`, a
@@ -11730,13 +11730,13 @@ fn a_star_import_re_exports_explicitly_when_the_source_deleted_a_public_name() {
             vec!["pkg".to_string(), "star".to_string()],
             std::rc::Rc::new(parse(src, "star.py").unwrap()),
         );
-        let options = PythonOptions {
+        let options = PythonOptions::from(PythonOptionsData {
             module_defs: std::rc::Rc::new(defs),
             module_path: vec!["pkg".to_string()],
             this_module_path: vec!["pkg".to_string(), "star".to_string()],
             python_namespace: "pkg".to_string(),
             ..Default::default()
-        };
+        });
         compile_with_options(src, "star.py", options).expect("the star import converts")
     };
     let out = glob("x = 1\ndel x\ny = 2\n");
@@ -11770,13 +11770,13 @@ fn a_walrus_that_may_not_run_is_a_runtime_alternative_of_an_imported_class() {
         vec!["pkg".to_string(), "m".to_string()],
         std::rc::Rc::new(parse(src, "m.py").unwrap()),
     );
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         module_path: vec!["pkg".to_string()],
         this_module_path: vec!["pkg".to_string(), "m".to_string()],
         python_namespace: "pkg".to_string(),
         ..Default::default()
-    };
+    });
     let warnings = options.definition_warnings.clone();
     let msg = compile_with_options(src, "m.py", options).expect_err("the ambiguous base is refused");
     assert!(
@@ -11811,13 +11811,13 @@ fn a_folded_guard_site_is_loud_for_what_its_handler_would_have_caught() {
             vec!["pkg".to_string(), "guard".to_string()],
             std::rc::Rc::new(parse(&src, "guard.py").unwrap()),
         );
-        let options = PythonOptions {
+        let options = PythonOptions::from(PythonOptionsData {
             module_defs: std::rc::Rc::new(defs),
             module_path: vec!["pkg".to_string()],
             this_module_path: vec!["pkg".to_string(), "guard".to_string()],
             python_namespace: "pkg".to_string(),
             ..Default::default()
-        };
+        });
         compile_with_options(&src, "guard.py", options).expect("the guard converts")
     };
     let typed = guarded("except ImportError:");
@@ -11883,13 +11883,13 @@ fn import_site_refusals_are_codegen_errors_of_the_importing_module() {
             vec!["pkg".to_string(), importer.to_string()],
             std::rc::Rc::new(parse(src, &format!("{}.py", importer)).unwrap()),
         );
-        let options = PythonOptions {
+        let options = PythonOptions::from(PythonOptionsData {
             module_defs: std::rc::Rc::new(defs),
             module_path: vec!["pkg".to_string()],
             this_module_path: vec!["pkg".to_string(), importer.to_string()],
             python_namespace: "pkg".to_string(),
             ..Default::default()
-        };
+        });
         compile_with_options(src, &format!("{}.py", importer), options)
             .expect_err("the import is refused")
     };
@@ -12072,10 +12072,10 @@ fn external_import_value_read_boxes_to_none() {
     // import may be a sibling).
     let other = parse("x = 1\n", "other.py").unwrap();
     defs.insert(vec!["other".to_string()], std::rc::Rc::new(other));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let out = compile_with_options(src, "logread.py", options).expect("converts");
     assert!(
         out.contains("stdpython :: PyValue :: None_") || out.contains("stdpython::PyValue::None_"),
@@ -12188,10 +12188,10 @@ fn tuple_import_error_handler_drops_with_import_body() {
     defs.insert(vec!["ssltry".to_string()], std::rc::Rc::new(m));
     let other = parse("x = 1\n", "other.py").unwrap();
     defs.insert(vec!["other".to_string()], std::rc::Rc::new(other));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let out = compile_with_options(src, "ssltry.py", options).expect("converts");
     assert!(
         !out.contains("ssl = None"),
@@ -12275,10 +12275,10 @@ fn trait_imports_dedupe_across_class_aliases() {
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["connectionpool".to_string()], std::rc::Rc::new(a));
     defs.insert(vec!["pkg".to_string()], std::rc::Rc::new(b));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let out = compile_with_options(
         "from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool\n",
         "pkg.py",
@@ -12341,10 +12341,10 @@ fn imported_class_method_keyword_values_resolve_in_caller_scope() {
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["models".to_string()], std::rc::Rc::new(a));
     defs.insert(vec!["sessions".to_string()], std::rc::Rc::new(b));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let out = compile_with_options(
         concat!(
             "from .models import PreparedRequest, OrderedDict\n",
@@ -12621,10 +12621,10 @@ fn sibling_import_of_reexported_and_submodule_names_is_kept() {
     );
     defs.insert(vec!["util".to_string(), "ssl_".to_string()], std::rc::Rc::new(ssl_sub));
     defs.insert(vec!["connection".to_string()], std::rc::Rc::new(c));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let out = compile_with_options(
         concat!(
             "from .util import SKIP_HEADER, SKIPPABLE_HEADERS, connection, ssl_\n",
@@ -12671,10 +12671,10 @@ fn import_reexport_of_stdpython_module_is_kept() {
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["compat".to_string()], std::rc::Rc::new(a));
     defs.insert(vec!["models".to_string()], std::rc::Rc::new(b));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let out = compile_with_options(
         "from .compat import json as complexjson\n\ndef f():\n    return complexjson.loads(\"{}\")\n",
         "models.py",
@@ -12712,10 +12712,10 @@ fn module_path_member_read_missing_item_boxes_to_none() {
     defs.insert(vec!["util".to_string(), "ssl_".to_string()], std::rc::Rc::new(a));
     defs.insert(vec!["util".to_string()], std::rc::Rc::new(util_init));
     defs.insert(vec!["pyopenssl".to_string()], std::rc::Rc::new(b));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let out = compile_with_options(
         "from . import util\n\n_versions = {\n    util.ssl_.PROTOCOL_TLS: 1,\n}\n",
         "pyopenssl.py",
@@ -12751,10 +12751,10 @@ fn stdpython_module_reexport_via_sibling_aliases_to_runtime() {
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["compat".to_string()], std::rc::Rc::new(a));
     defs.insert(vec!["models".to_string()], std::rc::Rc::new(b));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let out = compile_with_options(
         "from .compat import json as complexjson\n\ndef f():\n    return complexjson.dumps({})\n",
         "models.py",
@@ -14356,11 +14356,11 @@ fn shadowed_external_alias_annotation_boxes() {
     defs.insert(vec!["shadowfield".to_string()], std::rc::Rc::new(m));
     let other = parse("x = 1\n", "other.py").unwrap();
     defs.insert(vec!["other".to_string()], std::rc::Rc::new(other));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         this_module_path: vec!["shadowfield".to_string()],
         ..Default::default()
-    };
+    });
     let out = compile_with_options(src, "shadowfield.py", options).expect("converts");
     assert!(
         out.contains("_fp : stdpython :: PyValue"),
@@ -14450,10 +14450,10 @@ fn cross_module_subclass_options() -> PythonOptions {
     .unwrap();
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["animals".to_string()], std::rc::Rc::new(a));
-    PythonOptions {
+    PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    }
+    })
 }
 
 #[test]
@@ -14531,13 +14531,13 @@ fn absolute_import_of_src_layout_sibling_decorator_resolves() {
         vec!["reqmod".to_string()],
         std::rc::Rc::new(reqmod),
     );
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         // The stripped-prefix lookup applies only to the package's OWN
         // root-qualified name.
         python_namespace: "pkg".to_string(),
         ..Default::default()
-    };
+    });
     let usemod = parse(
         "from pkg.reqmod import with_cleanup\n\
          \n\
@@ -14580,11 +14580,11 @@ fn absolute_import_of_src_layout_sibling_emits_relative_use() {
         vec!["session".to_string()],
         std::rc::Rc::new(session),
     );
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         python_namespace: "pkg".to_string(),
         ..Default::default()
-    };
+    });
     let caller = parse(
         "from pkg.session import make\n\
          \n\
@@ -14630,11 +14630,11 @@ fn plain_import_of_root_qualified_sibling_binds_root_only() {
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["connection".to_string()], std::rc::Rc::new(connection));
     defs.insert(vec!["other".to_string()], std::rc::Rc::new(other));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         python_namespace: "pkg".to_string(),
         ..Default::default()
-    };
+    });
     let user = parse(
         "import pkg.connection\nimport pkg.connection as conn\n",
         "user.py",
@@ -14677,11 +14677,11 @@ fn plain_import_of_external_root_is_not_aliased_onto_crate_modules() {
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["connection".to_string()], std::rc::Rc::new(connection));
     defs.insert(vec!["other".to_string()], std::rc::Rc::new(other));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         python_namespace: "pkg".to_string(),
         ..Default::default()
-    };
+    });
     let warnings = options.definition_warnings.clone();
     let user = parse("import h2.connection\n", "user.py").unwrap();
     let symbols = user.clone().find_symbols(SymbolTableScopes::new());
@@ -14799,10 +14799,10 @@ fn type_checking_import_filters_per_name() {
     .unwrap();
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["sib".to_string()], std::rc::Rc::new(sib));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let user = parse(
         "import typing\n\nif typing.TYPE_CHECKING:\n    from sib import _RET, _RET_DICT\n\n\
          def f() -> bool:\n    return True\n",
@@ -14875,11 +14875,11 @@ fn cross_module_only_base_emits_accessor_only_trait() {
     .unwrap();
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["user".to_string()], std::rc::Rc::new(user_mod));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         this_module_path: vec!["mixmod".to_string()],
         ..Default::default()
-    };
+    });
     let module = parse(mixin_src, "mixmod.py").unwrap();
     let symbols = module.clone().find_symbols(SymbolTableScopes::new());
     let out = module
@@ -15145,10 +15145,10 @@ fn method_call_on_external_bound_name_drops_loudly() {
         vec!["other".to_string()],
         std::rc::Rc::new(parse("A = 1\n", "other.py").unwrap()),
     );
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let warnings = options.definition_warnings.clone();
     let out = module
         .to_rust(
@@ -15820,12 +15820,12 @@ fn returning_a_module_path_call_types_the_signature() {
             parse("def parse(s: str) -> str:\n    return s\n", "helper.py").unwrap(),
         ),
     );
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         module_path: vec!["mainmod".to_string()],
         this_module_path: vec!["mainmod".to_string()],
         ..Default::default()
-    };
+    });
     let out = compile_with_options(
         "from . import helper\n\ndef f(s: str):\n    return helper.parse(s)\n",
         "retmodcall.py",
@@ -16733,10 +16733,10 @@ fn super_method_factory_local_resolves_its_class() {
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["resp".to_string()], std::rc::Rc::new(resp));
     defs.insert(vec!["base".to_string()], std::rc::Rc::new(base.clone()));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let symbols = base.clone().find_symbols(SymbolTableScopes::new());
     let out = base
         .to_rust(
@@ -16783,10 +16783,10 @@ fn direct_imported_factory_call_property_read_resolves() {
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["url".to_string()], std::rc::Rc::new(url));
     defs.insert(vec!["main".to_string()], std::rc::Rc::new(main.clone()));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let symbols = main.clone().find_symbols(SymbolTableScopes::new());
     let out = main
         .to_rust(
@@ -16831,10 +16831,10 @@ fn construction_call_property_read_resolves_imported_classes_too() {
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["url".to_string()], std::rc::Rc::new(url));
     defs.insert(vec!["main".to_string()], std::rc::Rc::new(main.clone()));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let symbols = main.clone().find_symbols(SymbolTableScopes::new());
     let out = main
         .to_rust(
@@ -16983,10 +16983,10 @@ fn field_walk_follows_imported_bases() {
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["base".to_string()], std::rc::Rc::new(base));
     defs.insert(vec!["main".to_string()], std::rc::Rc::new(main.clone()));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let symbols = main.clone().find_symbols(SymbolTableScopes::new());
     let out = main
         .to_rust(
@@ -17037,10 +17037,10 @@ fn local_from_another_objects_option_field_is_option() {
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["url".to_string()], std::rc::Rc::new(url));
     defs.insert(vec!["main".to_string()], std::rc::Rc::new(main.clone()));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let symbols = main.clone().find_symbols(SymbolTableScopes::new());
     let out = main
         .to_rust(
@@ -18891,11 +18891,11 @@ fn compat_builtin_self_alias_import_drops_and_calls_dispatch_to_builtin() {
     // MULTI-module conversion (module_defs.len() > 1) — a lone module
     // must assume an unknown absolute import is a crate sibling.
     defs.insert(vec!["caller".to_string()], std::rc::Rc::new(caller.clone()));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         python_namespace: "pkg".to_string(),
         ..Default::default()
-    };
+    });
     let symbols = caller.clone().find_symbols(SymbolTableScopes::new());
     let out = caller
         .to_rust(
@@ -19328,11 +19328,11 @@ fn imported_factory_option_field_crosses_modules_unwrapped() {
         vec!["caller2".to_string()],
         std::rc::Rc::new(caller.clone()),
     );
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         python_namespace: "pkg".to_string(),
         ..Default::default()
-    };
+    });
     let symbols = caller.clone().find_symbols(SymbolTableScopes::new());
     let out = caller
         .to_rust(
@@ -19580,10 +19580,10 @@ fn imported_option_returning_callee_store_does_not_double_wrap() {
     .unwrap();
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["utils".to_string()], std::rc::Rc::new(utils));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         ..Default::default()
-    };
+    });
     let out = compile_with_options(
         "from .utils import unicode_range\n\
          def f(chunk: str) -> str | None:\n\
@@ -20332,11 +20332,11 @@ fn a_root_qualified_imported_factory_result_is_a_method_receiver() {
     .unwrap();
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["session".to_string()], std::rc::Rc::new(session));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         python_namespace: "pkg".to_string(),
         ..Default::default()
-    };
+    });
     let usemod = parse(
         "from pkg.session import make\n\ndef go() -> int:\n    return make().run()\n",
         "usemod.py",
@@ -20410,12 +20410,12 @@ fn a_field_read_on_a_type_checking_imported_root_takes_the_accessor_form() {
         vec!["pkg".to_string(), "response".to_string()],
         std::rc::Rc::new(response),
     );
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         module_path: vec!["pkg".to_string()],
         this_module_path: vec!["pkg".to_string(), "retry".to_string()],
         ..Default::default()
-    };
+    });
     let usemod = parse(
         concat!(
             "import typing\n",
@@ -20514,11 +20514,11 @@ fn a_root_qualified_imported_constructor_result_is_a_method_receiver() {
     .unwrap();
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["shapes".to_string()], std::rc::Rc::new(shapes));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         python_namespace: "pkg".to_string(),
         ..Default::default()
-    };
+    });
     let usemod = parse(
         "from pkg.shapes import Shape\n\ndef go() -> float:\n    return Shape().area()\n",
         "usemod2.py",
@@ -20548,11 +20548,11 @@ fn an_aliased_imported_constructor_result_is_a_method_receiver() {
     .unwrap();
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["shapes".to_string()], std::rc::Rc::new(shapes));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         python_namespace: "pkg".to_string(),
         ..Default::default()
-    };
+    });
     let usemod = parse(
         "from pkg.shapes import Shape as S\n\ndef go() -> float:\n    return S().area()\n",
         "usemod3.py",
@@ -22224,11 +22224,11 @@ fn a_cross_module_re_export_cycle_does_not_overflow() {
     let mut defs = std::collections::HashMap::new();
     defs.insert(vec!["a".to_string()], std::rc::Rc::new(a.clone()));
     defs.insert(vec!["b".to_string()], std::rc::Rc::new(b));
-    let options = PythonOptions {
+    let options = PythonOptions::from(PythonOptionsData {
         module_defs: std::rc::Rc::new(defs),
         python_namespace: "pkg".to_string(),
         ..Default::default()
-    };
+    });
     let symbols = a.clone().find_symbols(SymbolTableScopes::new());
     // Either outcome is acceptable; returning at all is the pin.
     let _ = a.to_rust(CodeGenContext::Module("a".to_string()), options, symbols);
@@ -25262,4 +25262,18 @@ fn a_class_default_a_subclass_assigns_is_no_trait_const() {
     assert_eq!(out.matches("const verified").count(), 1, "generated: {}", out);
     assert!(out.contains("pub const verified : bool = false"), "generated: {}", out);
     assert!(!out.contains("__rython_tuple . 0"), "generated: {}", out);
+}
+
+/// Issue #354: lowering passes the options by value at every level of
+/// recursion, so they are a pointer-sized copy-on-write handle — a field
+/// added to `PythonOptionsData` no longer grows every frame.
+#[test]
+fn the_options_handle_is_pointer_sized() {
+    assert_eq!(std::mem::size_of::<PythonOptions>(), std::mem::size_of::<usize>());
+    // A write through a clone does not reach the original (the old
+    // clone-then-mutate semantics).
+    let a = PythonOptions::default();
+    let mut b = a.clone();
+    b.with_std_python = !a.with_std_python;
+    assert_ne!(a.with_std_python, b.with_std_python);
 }

@@ -207,9 +207,40 @@ impl MutableGlobalKind {
     }
 }
 
-/// The global context for Python compilation.
+/// The global context for Python compilation, as a cheap copy-on-write
+/// HANDLE (issue #354): lowering recurses once per AST node and passes the
+/// options by value, so the handle keeps every frame at pointer size where
+/// the 768-byte struct used to be copied into each one. Field reads and
+/// writes go through `Deref`/`DerefMut`; a write on a shared handle clones
+/// the data first (`Rc::make_mut`), which is exactly the old
+/// clone-then-mutate semantics.
+#[derive(Clone, Debug, Default)]
+pub struct PythonOptions(std::rc::Rc<PythonOptionsData>);
+
+impl std::ops::Deref for PythonOptions {
+    type Target = PythonOptionsData;
+    fn deref(&self) -> &PythonOptionsData {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for PythonOptions {
+    fn deref_mut(&mut self) -> &mut PythonOptionsData {
+        std::rc::Rc::make_mut(&mut self.0)
+    }
+}
+
+impl From<PythonOptionsData> for PythonOptions {
+    fn from(data: PythonOptionsData) -> Self {
+        PythonOptions(std::rc::Rc::new(data))
+    }
+}
+
+/// The fields of [`PythonOptions`]; build one with struct-literal syntax
+/// (`PythonOptionsData { with_std_python: false, ..Default::default() }`)
+/// and convert it with `.into()` / `PythonOptions::from`.
 #[derive(Clone, Debug)]
-pub struct PythonOptions {
+pub struct PythonOptionsData {
     /// Python imports are mapped into a given namespace that can be changed.
     pub python_namespace: String,
 
@@ -730,7 +761,7 @@ pub struct PythonOptions {
         std::rc::Rc<std::cell::RefCell<std::collections::HashMap<Vec<String>, std::rc::Rc<std::collections::HashSet<String>>>>>,
 }
 
-impl Default for PythonOptions {
+impl Default for PythonOptionsData {
     fn default() -> Self {
         Self {
             python_namespace: String::from("__python_namespace__"),

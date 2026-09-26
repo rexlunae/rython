@@ -3230,7 +3230,7 @@ fn conversion_base_options(
     async_runtime_dep: bool,
     package_name: &str,
 ) -> PythonOptions {
-    PythonOptions {
+    PythonOptions::from(python_ast::PythonOptionsData {
         lossy_warnings: opts.warnings != WarningMode::Allow,
         no_std: opts.no_std,
         rust_modules: std::rc::Rc::new(rust_modules.clone()),
@@ -3243,7 +3243,7 @@ fn conversion_base_options(
         // relative keys — never an external root like `h2`.
         python_namespace: package_name.to_string(),
         ..Default::default()
-    }
+    })
 }
 
 /// The shim a crate root emits so the package root's init and bound
