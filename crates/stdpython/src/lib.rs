@@ -1506,6 +1506,78 @@ impl<T> PyListFrom for HashSet<T> {
     }
 }
 
+/// Bind a boxed call's positional arguments to a function's parameters
+/// (a function called through a boxed value — issue #334): each parameter
+/// gets its argument, or None where the caller falls back to the default.
+/// Too many arguments, or a missing parameter without a default, is
+/// CPython's TypeError, worded as CPython words it.
+pub fn bind_boxed_args(
+    name: &str,
+    params: &[&str],
+    required: usize,
+    (args, keywords): BoxedArgs,
+) -> Result<Vec<Option<PyValue>>, PyException> {
+    let given = args.len();
+    if given > params.len() {
+        let takes = if required == params.len() {
+            format!(
+                "{} positional argument{}",
+                params.len(),
+                if params.len() == 1 { "" } else { "s" }
+            )
+        } else {
+            format!("from {} to {} positional arguments", required, params.len())
+        };
+        return Err(PyException::new(
+            "TypeError",
+            format!(
+                "{name}() takes {takes} but {given} {} given",
+                if given == 1 { "was" } else { "were" }
+            ),
+        ));
+    }
+    let mut out: Vec<Option<PyValue>> = args.into_iter().map(Some).collect();
+    out.resize(params.len(), None);
+    for (key, value) in keywords {
+        let Some(i) = params.iter().position(|p| *p == key) else {
+            return Err(PyException::new(
+                "TypeError",
+                format!("{name}() got an unexpected keyword argument '{key}'"),
+            ));
+        };
+        if out[i].is_some() {
+            return Err(PyException::new(
+                "TypeError",
+                format!("{name}() got multiple values for argument '{key}'"),
+            ));
+        }
+        out[i] = Some(value);
+    }
+    let unbound: Vec<&str> = params[..required]
+        .iter()
+        .zip(&out)
+        .filter(|(_, v)| v.is_none())
+        .map(|(p, _)| *p)
+        .collect();
+    if !unbound.is_empty() {
+        let missing: Vec<String> = unbound.iter().map(|p| format!("'{p}'")).collect();
+        let list = match missing.len() {
+            1 => missing[0].clone(),
+            2 => format!("{} and {}", missing[0], missing[1]),
+            n => format!("{}, and {}", missing[..n - 1].join(", "), missing[n - 1]),
+        };
+        return Err(PyException::new(
+            "TypeError",
+            format!(
+                "{name}() missing {} required positional argument{}: {list}",
+                missing.len(),
+                if missing.len() == 1 { "" } else { "s" }
+            ),
+        ));
+    }
+    Ok(out)
+}
+
 /// Unpacking a sequence into `N` targets (`for a, b in rows` where each
 /// row is a list): the members as an array, or CPython's ValueError when
 /// the length is not `N`.
@@ -2794,6 +2866,12 @@ pub enum PyValue {
     /// slot — issue #335): iterates, sizes, indexes, tests membership and
     /// prints as the range it is (`range(3, 6)`), never as a tuple.
     Range(PyRange),
+    /// A FUNCTION held boxed (issue #334: `encode = idna.encode` into an
+    /// unannotated `encode=None` parameter): called through the boxed
+    /// value with boxed positional arguments ([`PyValue::call_boxed`]),
+    /// its own defaults filling the rest; it prints and compares as the
+    /// function object it is.
+    Function(crate::PyCallable<BoxedArgs, PyValue>),
     None_,
 }
 
@@ -2818,6 +2896,7 @@ impl IntoIterator for PyValue {
         let items: Vec<PyValue> = match &self {
             PyValue::Tuple(t) => t.iter().cloned().collect(),
             PyValue::Range(r) => r.map(PyValue::Int).collect(),
+            PyValue::Function(_) => panic!("TypeError: 'function' object is not iterable"),
             PyValue::Str(s) => s
                 .chars()
                 .map(|c| PyValue::Str(c.to_string()))
@@ -2940,6 +3019,7 @@ impl Truthy for PyValue {
             PyValue::Dict(d) => !d.is_empty(),
             PyValue::Complex(z) => z.real != 0.0 || z.imag != 0.0,
             PyValue::Range(r) => r.py_len() > 0,
+            PyValue::Function(_) => true,
             PyValue::None_ => false,
         }
     }
@@ -3208,7 +3288,121 @@ impl From<()> for PyValue {
     }
 }
 
+/// The arguments of a call through a boxed function value: the positional
+/// ones, then the keywords by name (issue #334).
+pub type BoxedArgs = (Vec<PyValue>, Vec<(String, PyValue)>);
+
+impl From<crate::PyCallable<BoxedArgs, PyValue>> for PyValue {
+    fn from(f: crate::PyCallable<BoxedArgs, PyValue>) -> Self {
+        PyValue::Function(f)
+    }
+}
+
 impl PyValue {
+    /// A call through a boxed value (`f("ab")` where `f` holds a function —
+    /// issue #334): the function's own binding of the positional arguments
+    /// runs; any other member is CPython's `TypeError: 'int' object is not
+    /// callable`.
+    pub fn call_boxed(&self, args: Vec<PyValue>) -> Result<PyValue, PyException> {
+        self.call_boxed_kw(args, Vec::new())
+    }
+
+    /// [`PyValue::call_boxed`] with keyword arguments, bound by name by
+    /// the function's own binder.
+    pub fn call_boxed_kw(
+        &self,
+        args: Vec<PyValue>,
+        keywords: Vec<(String, PyValue)>,
+    ) -> Result<PyValue, PyException> {
+        match self {
+            PyValue::Function(f) => f.call((args, keywords)),
+            other => Err(PyException::new(
+                "TypeError",
+                format!("'{}' object is not callable", other.py_type_name()),
+            )),
+        }
+    }
+
+    /// The callee's name as CPython's call-site errors spell it (`f()
+    /// argument after * must be ...`): the function's module-qualified
+    /// name — `__main__.f` for a script's function.
+    fn call_site_name(&self) -> String {
+        match self {
+            PyValue::Function(f) => match f.identity() {
+                Some(id) if id.contains('.') => id.to_string(),
+                Some(id) => format!("__main__.{}", id),
+                None => format!("__main__.{}", f.name()),
+            },
+            other => other.py_type_name().to_string(),
+        }
+    }
+
+    /// `f(..., *v)` through this boxed callable: `v`'s members append to
+    /// the positional arguments, in iteration order. A non-iterable is
+    /// CPython's TypeError (`__main__.f() argument after * must be an
+    /// iterable, not int`).
+    pub fn extend_spread_args(
+        &self,
+        args: &mut Vec<PyValue>,
+        spread: PyValue,
+    ) -> Result<(), PyException> {
+        match spread {
+            PyValue::Int(_)
+            | PyValue::Float(_)
+            | PyValue::Bool(_)
+            | PyValue::Complex(_)
+            | PyValue::Function(_)
+            | PyValue::None_ => Err(PyException::new(
+                "TypeError",
+                format!(
+                    "{}() argument after * must be an iterable, not {}",
+                    self.call_site_name(),
+                    spread.py_type_name()
+                ),
+            )),
+            iterable => {
+                args.extend(iterable);
+                Ok(())
+            }
+        }
+    }
+
+    /// `f(..., **d)` through this boxed callable: `d`'s items append to
+    /// the keyword arguments. A non-mapping is CPython's TypeError
+    /// (`... argument after ** must be a mapping, not int`); a name given
+    /// twice (explicitly and in `d`) is `... got multiple values for
+    /// keyword argument 'k'`.
+    pub fn extend_spread_kwargs(
+        &self,
+        keywords: &mut Vec<(String, PyValue)>,
+        spread: PyValue,
+    ) -> Result<(), PyException> {
+        let PyValue::Dict(d) = spread else {
+            return Err(PyException::new(
+                "TypeError",
+                format!(
+                    "{}() argument after ** must be a mapping, not {}",
+                    self.call_site_name(),
+                    spread.py_type_name()
+                ),
+            ));
+        };
+        for (k, v) in d.iter() {
+            if keywords.iter().any(|(name, _)| name == k) {
+                return Err(PyException::new(
+                    "TypeError",
+                    format!(
+                        "{}() got multiple values for keyword argument '{}'",
+                        self.call_site_name(),
+                        k
+                    ),
+                ));
+            }
+            keywords.push((k.clone(), v.clone()));
+        }
+        Ok(())
+    }
+
     /// CPython's `<` between two boxed values: numbers on the numeric tower
     /// (bool ⊂ int ⊂ float; a NaN compares False both ways), a str or a
     /// bytes lexicographically (a str by code point — UTF-8's byte order),
@@ -3262,6 +3456,7 @@ impl PyValue {
             PyValue::Dict(_) => "dict",
             PyValue::Complex(_) => "complex",
             PyValue::Range(_) => "range",
+            PyValue::Function(_) => "function",
             PyValue::None_ => "NoneType",
         }
     }
@@ -3528,6 +3723,7 @@ pub fn py_value_type_name(v: &PyValue) -> &'static str {
         PyValue::Dict(_) => "dict",
         PyValue::Complex(_) => "complex",
         PyValue::Range(_) => "range",
+        PyValue::Function(_) => "function",
         PyValue::None_ => "NoneType",
     }
 }
@@ -3541,6 +3737,7 @@ pub fn py_value_str(v: &PyValue) -> String {
         PyValue::Bytes(b) => py_bytes_repr(b),
         PyValue::Complex(z) => z.py_display(),
         PyValue::Range(r) => r.py_repr_string(),
+        PyValue::Function(f) => f.py_display(),
         PyValue::Tuple(items) => {
             let inner: Vec<String> = items.iter().map(py_value_repr).collect();
             if inner.len() == 1 {
@@ -3629,6 +3826,11 @@ impl core::hash::Hash for PyValue {
             PyValue::Range(r) => {
                 core::hash::Hash::hash(&9u8, state);
                 core::hash::Hash::hash(&(r.next, r.stop, r.step), state);
+            }
+            // A function hashes by identity, as its `==` compares.
+            PyValue::Function(f) => {
+                core::hash::Hash::hash(&10u8, state);
+                core::hash::Hash::hash(f.name(), state);
             }
             PyValue::None_ => core::hash::Hash::hash(&6u8, state),
         }

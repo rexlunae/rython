@@ -282,6 +282,22 @@ parameters, and the `__main__` block count as evidence exactly as
 module-level statements do. An UNANNOTATED parameter appended into it
 gives no element type and stays loud.
 
+A module function stored into a BOXED slot — an unannotated parameter
+defaulted to `None` and later assigned `encode = idna.encode`, idna's
+`test_encode(self, encode=None)` — is a boxed FUNCTION value
+(`PyValue::Function`, issue #334). A call through the boxed name binds
+its positional and keyword arguments by the function's own signature
+(the definition's defaults fill the rest), with CPython's TypeErrors for
+a wrong binding (`enc() missing 1 required positional argument: 's'`,
+`got an unexpected keyword argument`, `got multiple values`), and calling
+any other boxed member is `TypeError: '<type>' object is not callable`.
+It compares by identity (`encode is idna.encode`). A `*xs` / `**d`
+spread into such a call (urllib3's `key_class(**context)`) extends the
+arguments from the boxed iterable or mapping at run time, with CPython's
+TypeErrors naming the function module-qualified (`__main__.f() argument
+after * must be an iterable, not int`, `... argument after ** must be a
+mapping ...`, `... got multiple values for keyword argument 'k'`).
+
 A call through the value is `f.call((x,))?`: it returns the same
 `Result<R, PyException>` every generated function returns, so an
 exception raised INSIDE a callable propagates to its caller and is

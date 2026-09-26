@@ -4152,9 +4152,9 @@ fn boxed_values_convert_back_to_typed_members() {
     assert!(bl);
     // A wrong member is loud.
     let v = PyValue::from(3);
-    let r = std::panic::catch_unwind(|| {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _: String = v.into();
-    });
+    }));
     assert!(r.is_err(), "a non-str boxed value into a String slot must panic");
 }
 
@@ -5033,5 +5033,79 @@ fn unpacking_a_sequence_checks_its_length() {
     assert_eq!(
         unpack_sequence::<i64, 2>(PyTuple(vec![1])).unwrap_err().message,
         "not enough values to unpack (expected 2, got 1)"
+    );
+}
+
+#[test]
+fn boxed_argument_binding_raises_cpythons_type_errors() {
+    let params = ["s", "upper"];
+    let s = || PyValue::from("a");
+    // def enc(s, upper=False): enc() -> missing 1 required positional argument: 's'
+    assert_eq!(
+        bind_boxed_args("enc", &params, 1, (vec![], vec![])).unwrap_err().message,
+        "enc() missing 1 required positional argument: 's'"
+    );
+    // enc("a", True, 3) -> takes from 1 to 2 positional arguments but 3 were given
+    assert_eq!(
+        bind_boxed_args("enc", &params, 1, (vec![s(), s(), s()], vec![]))
+            .unwrap_err()
+            .message,
+        "enc() takes from 1 to 2 positional arguments but 3 were given"
+    );
+    // enc("a", colour=1) -> got an unexpected keyword argument 'colour'
+    assert_eq!(
+        bind_boxed_args("enc", &params, 1, (vec![s()], vec![("colour".into(), s())]))
+            .unwrap_err()
+            .message,
+        "enc() got an unexpected keyword argument 'colour'"
+    );
+    // enc("a", s="b") -> got multiple values for argument 's'
+    assert_eq!(
+        bind_boxed_args("enc", &params, 1, (vec![s()], vec![("s".into(), s())]))
+            .unwrap_err()
+            .message,
+        "enc() got multiple values for argument 's'"
+    );
+    // enc(upper=True, s="a") binds both by name
+    let bound =
+        bind_boxed_args("enc", &params, 1, (vec![], vec![("upper".into(), s()), ("s".into(), s())]))
+            .unwrap();
+    assert!(bound.iter().all(Option::is_some));
+    // None(1) -> TypeError: 'NoneType' object is not callable
+    assert_eq!(
+        PyValue::None_.call_boxed(vec![s()]).unwrap_err().message,
+        "'NoneType' object is not callable"
+    );
+}
+
+#[test]
+fn boxed_call_spreads_raise_cpythons_type_errors() {
+    // def f(*a, **k): return len(a) + len(k)   (the entry module's f)
+    let f = PyValue::Function(stdpython::PyCallable::function(
+        "f",
+        "__main__.f",
+        |(a, k): stdpython::BoxedArgs| Ok(PyValue::Int((a.len() + k.len()) as i64)),
+    ));
+    let mut args = vec![PyValue::Int(1)];
+    // f(1, *(2, 3)) -> the members append in order
+    f.extend_spread_args(&mut args, PyValue::from((2i64, 3i64))).unwrap();
+    assert_eq!(args.len(), 3);
+    // f(*5) -> __main__.f() argument after * must be an iterable, not int
+    assert_eq!(
+        f.extend_spread_args(&mut args, PyValue::Int(5)).unwrap_err().message,
+        "__main__.f() argument after * must be an iterable, not int"
+    );
+    // f(**5) -> __main__.f() argument after ** must be a mapping, not int
+    let mut kw: Vec<(String, PyValue)> = vec![("a".to_string(), PyValue::Int(1))];
+    assert_eq!(
+        f.extend_spread_kwargs(&mut kw, PyValue::Int(5)).unwrap_err().message,
+        "__main__.f() argument after ** must be a mapping, not int"
+    );
+    // f(a=1, **{"a": 2}) -> __main__.f() got multiple values for keyword argument 'a'
+    let mut d: stdpython::PyDict<String, PyValue> = stdpython::PyDict::new();
+    d.insert("a".to_string(), PyValue::Int(2));
+    assert_eq!(
+        f.extend_spread_kwargs(&mut kw, PyValue::from(d)).unwrap_err().message,
+        "__main__.f() got multiple values for keyword argument 'a'"
     );
 }

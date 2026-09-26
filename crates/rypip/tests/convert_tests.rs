@@ -18048,3 +18048,166 @@ fn duck_traits_are_generated_per_module() {
         vec!["woof", "nice tweet", "nice blub"]
     );
 }
+
+#[test]
+fn functions_held_boxed_are_called_like_cpython() {
+    // Issue #334 (idna's `test_encode(self, encode=None)` with `encode =
+    // idna.encode`): a module function stored into a boxed slot is a
+    // function value — called through the slot with positional and keyword
+    // arguments bound by its own signature (defaults filled, CPython's
+    // TypeErrors for a wrong binding), compared by identity, and calling
+    // None is CPython's TypeError.
+    let scratch = Scratch::new("boxedfn");
+    let krate = package_crate(
+        &scratch,
+        "boxedfn",
+        &[(
+            "cli.py",
+            concat!(
+                "def enc(s: str, upper: bool = False) -> str:\n",
+                "    if upper:\n",
+                "        return s.upper()\n",
+                "    return s + \"!\"\n",
+                "\n",
+                "\n",
+                "def other(s: str, upper: bool = False) -> str:\n",
+                "    return \"<\" + s + \">\"\n",
+                "\n",
+                "\n",
+                "class Runner:\n",
+                "    def run(self, f=None, tag=\"x\"):\n",
+                "        if f is None:\n",
+                "            f = enc\n",
+                "        print(f(\"ab\"), f(\"cd\", True), f(\"ef\", upper=True), tag)\n",
+                "        print(f == enc, f == other)\n",
+                "        for bad in range(4):\n",
+                "            try:\n",
+                "                if bad == 0:\n",
+                "                    f()\n",
+                "                elif bad == 1:\n",
+                "                    f(\"a\", True, 3)\n",
+                "                elif bad == 2:\n",
+                "                    f(\"a\", colour=1)\n",
+                "                else:\n",
+                "                    f(\"a\", s=\"b\")\n",
+                "            except TypeError as e:\n",
+                "                print(\"TypeError\", e)\n",
+                "\n",
+                "    def call_none(self, g=None):\n",
+                "        try:\n",
+                "            g(1)\n",
+                "        except TypeError as e:\n",
+                "            print(\"TypeError\", e)\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    r = Runner()\n",
+                "    r.run()\n",
+                "    r.run(other, \"y\")\n",
+                "    r.call_none()\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "boxedfn"),
+        vec![
+            "ab! CD EF x",
+            "True False",
+            "TypeError enc() missing 1 required positional argument: 's'",
+            "TypeError enc() takes from 1 to 2 positional arguments but 3 were given",
+            "TypeError enc() got an unexpected keyword argument 'colour'",
+            "TypeError enc() got multiple values for argument 's'",
+            "<ab> <cd> <ef> y",
+            "False True",
+            "TypeError other() missing 1 required positional argument: 's'",
+            "TypeError other() takes from 1 to 2 positional arguments but 3 were given",
+            "TypeError other() got an unexpected keyword argument 'colour'",
+            "TypeError other() got multiple values for argument 's'",
+            "TypeError 'NoneType' object is not callable"
+        ]
+    );
+}
+
+#[test]
+fn spreads_into_a_boxed_function_bind_like_cpython() {
+    // `f(*args, **opts)` through a boxed function value (urllib3's
+    // `key_class(**context)` — refused at conversion by the first cut of
+    // boxed calls, which failed the whole package): the arguments build
+    // in call order, each spread extending them at run time, and bind by
+    // the function's signature. A non-iterable `*`, a non-mapping `**`,
+    // and a keyword given twice raise CPython's TypeError, naming the
+    // function module-qualified (`__main__.scale` in the entry module).
+    let scratch = Scratch::new("spreadcalls");
+    let file = scratch.path().join("spread_calls.py");
+    fs::write(
+        &file,
+        concat!(
+            "def scale(x: int, factor: int = 2, offset: int = 0) -> int:\n",
+            "    return x * factor + offset\n",
+            "\n",
+            "\n",
+            "def run(fn=None):\n",
+            "    if fn is None:\n",
+            "        fn = scale\n",
+            "    args = (3,)\n",
+            "    opts = {\"offset\": 1}\n",
+            "    print(fn(*args, **opts))\n",
+            "    print(fn(2, *[5], offset=7))\n",
+            "    print(fn(**{\"x\": 4, \"factor\": 10}))\n",
+            "    try:\n",
+            "        fn(*5)\n",
+            "    except TypeError as exc:\n",
+            "        print(exc)\n",
+            "    try:\n",
+            "        fn(**5)\n",
+            "    except TypeError as exc:\n",
+            "        print(exc)\n",
+            "    try:\n",
+            "        fn(1, offset=1, **{\"offset\": 2})\n",
+            "    except TypeError as exc:\n",
+            "        print(exc)\n",
+            "    try:\n",
+            "        fn(*(1, 2, 3, 4))\n",
+            "    except TypeError as exc:\n",
+            "        print(exc)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    run()\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/spread_calls"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "7",
+            "17",
+            "40",
+            "__main__.scale() argument after * must be an iterable, not int",
+            "__main__.scale() argument after ** must be a mapping, not int",
+            "__main__.scale() got multiple values for keyword argument 'offset'",
+            "scale() takes from 1 to 3 positional arguments but 4 were given",
+        ],
+    );
+}

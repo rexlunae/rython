@@ -1985,6 +1985,13 @@ pub fn render_typed(
     // spelled out (a bare `PyDict::from([])` leaves K/V to
     // inference, which the boxing conversion cannot supply — E0283).
     if matches!(expected, Some(TypeInfo::PyValue)) {
+        // A module FUNCTION into a boxed slot (issue #334): the boxed
+        // function value.
+        if let Some(boxed) =
+            crate::ast::tree::closure::box_function_value(expr, &ctx, &symbols, &options)
+        {
+            return boxed;
+        }
         if let ExprType::Dict(d) = expr
             && d.keys.is_empty()
         {

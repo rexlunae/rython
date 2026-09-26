@@ -28,6 +28,7 @@
 //! refusal the caller turns into a loud error rather than a silently
 //! dropped definition.
 
+use crate::CodeGen;
 use std::collections::HashSet;
 
 use proc_macro2::TokenStream;
@@ -676,7 +677,9 @@ pub(crate) fn wrap_function_as_callable(
     // One `def` is one function object however many times it is named
     // (`register(hello)` ... `unregister(hello)`): the wrapper carries the
     // definition's module-qualified name as its identity.
-    let identity = if options.this_module_path.is_empty() {
+    let identity = if crate::ast::tree::module::module_is_entry(options, &options.this_module_path) {
+        format!("__main__.{}", n.id)
+    } else if options.this_module_path.is_empty() {
         n.id.clone()
     } else {
         format!("{}.{}", options.this_module_path.join("."), n.id)
@@ -687,6 +690,135 @@ pub(crate) fn wrap_function_as_callable(
             #identity,
             |#pattern: #arg_type| #item(#(#idents),*),
         )
+    }))
+}
+
+/// A module FUNCTION stored into a BOXED slot (issue #334: `encode =
+/// idna.encode` into an unannotated `encode=None` parameter): the boxed
+/// function value, `PyValue::Function`, whose wrapper binds the boxed
+/// positional arguments to the definition's parameters — CPython's
+/// TypeError on a wrong count, the definition's own defaults for the
+/// omitted ones — calls the item, and boxes its result. None when the
+/// expression is not such a function, or its signature has a shape a
+/// positional call cannot bind (keyword-only, `*args`, `**kwargs`): the
+/// caller keeps its loud path.
+pub(crate) fn box_function_value(
+    expr: &ExprType,
+    ctx: &crate::CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<Result<TokenStream, Box<dyn std::error::Error>>> {
+    // The DEFINING module's path names the one function object every
+    // reference is (two modules' references compare equal, as in CPython).
+    let (def, py_name, def_module) = match expr {
+        ExprType::Name(n) if !options.name_types.contains_key(&n.id) => match symbols.get(&n.id) {
+            Some(crate::SymbolTableNode::FunctionDef(def)) => {
+                (def.clone(), n.id.clone(), options.this_module_path.clone())
+            }
+            Some(crate::SymbolTableNode::ImportFrom(i)) => {
+                let path = i.resolved_module_path(options);
+                let canonical = i
+                    .names
+                    .iter()
+                    .find(|a| a.asname.as_deref() == Some(n.id.as_str()))
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| n.id.clone());
+                let def = crate::module_function_def(options, &path, &canonical)?.0;
+                (def, canonical, path)
+            }
+            _ => return None,
+        },
+        ExprType::Attribute(a) => match a.value.as_ref() {
+            ExprType::Name(m) if !options.name_types.contains_key(&m.id) => {
+                let path =
+                    crate::ast::tree::module::crate_module_bound_to(&m.id, symbols, options)?;
+                let def = crate::module_function_def(options, &path, &a.attr)?.0;
+                (def, a.attr.clone(), path)
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if !def.args.kwonlyargs.is_empty() || def.args.vararg.is_some() || def.args.kwarg.is_some() {
+        return None;
+    }
+    let params: Vec<&crate::Parameter> =
+        def.args.posonlyargs.iter().chain(def.args.args.iter()).collect();
+    // Python aligns the defaults with the LAST parameters.
+    let defaults = &def.args.defaults;
+    let required = params.len().saturating_sub(defaults.len());
+    let names: Vec<String> = params.iter().map(|p| p.arg.clone()).collect();
+    let mut binds = Vec::with_capacity(params.len());
+    let mut call_args = Vec::with_capacity(params.len());
+    for (i, param) in params.iter().enumerate() {
+        let slot = quote::format_ident!("__rython_a{}", i);
+        let default = if i >= required {
+            let d = &defaults[i - required];
+            let rendered = match crate::render_typed(
+                d,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+                Some(TypeInfo::PyValue),
+            ) {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e)),
+            };
+            quote!(#rendered)
+        } else {
+            // Unreachable: the binder raised for a missing required one.
+            quote!(stdpython::PyValue::None_)
+        };
+        binds.push(quote!(
+            let #slot: stdpython::PyValue = match __rython_it.next().flatten() {
+                Some(__rython_v) => __rython_v,
+                None => #default,
+            };
+        ));
+        // A `str` parameter is `impl Into<String>`, which the boxed value
+        // satisfies as it is; every other slot converts to its concrete
+        // type through the reverse From<PyValue> impls (a boxed-typed
+        // parameter is the identity).
+        let is_str = matches!(
+            param.annotation.as_deref(),
+            Some(ExprType::Name(t)) if t.id == "str"
+        );
+        call_args.push(if is_str || param.annotation.is_none() {
+            quote!(#slot)
+        } else {
+            quote!((#slot).into())
+        });
+    }
+    let callee = match expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone()) {
+        Ok(t) => t,
+        Err(e) => return Some(Err(e)),
+    };
+    // The entry module runs as `__main__` (its functions are
+    // `__main__.f` in CPython's call-site errors).
+    let identity = if crate::ast::tree::module::module_is_entry(options, &def_module) {
+        format!("__main__.{}", py_name)
+    } else if def_module.is_empty() {
+        py_name.clone()
+    } else {
+        format!("{}.{}", def_module.join("."), py_name)
+    };
+    let name_lits = names.iter();
+    Some(Ok(quote! {
+        stdpython::PyValue::Function(stdpython::PyCallable::function(
+            #py_name,
+            #identity,
+            |__rython_args: stdpython::BoxedArgs| {
+                let __rython_bound = stdpython::bind_boxed_args(
+                    #py_name,
+                    &[#(#name_lits),*],
+                    #required,
+                    __rython_args,
+                )?;
+                let mut __rython_it = __rython_bound.into_iter();
+                #(#binds)*
+                Ok(stdpython::PyValue::from(#callee(#(#call_args),*)?))
+            },
+        ))
     }))
 }
 
