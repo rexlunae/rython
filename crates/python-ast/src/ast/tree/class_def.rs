@@ -3856,10 +3856,26 @@ StatementType::Assign(a)
                     // of literals is a concrete set the boxed PyValue
                     // cannot hold); the PyValue wrap only as a fallback.
                     let ident = crate::class_const_static_ident(&self.name, &n.id);
+                    // A list LITERAL of strings (`names = ["a", "b"]`)
+                    // infers Vec<&'static str>, but the static owns its
+                    // elements: type it Vec<String> and render each
+                    // element owned, so the closure matches the type — the
+                    // module-level static's rule for the same shape
+                    // (round 78).
+                    let mut ti = crate::infer_type(Some(&ctx), &a.value, &options, &symbols);
+                    let mut value_options = options.clone();
+                    if matches!(&a.value, ExprType::List(_))
+                        && let crate::TypeInfo::Vec(elt) = &ti
+                        && matches!(elt.as_ref(), crate::TypeInfo::StrRef | crate::TypeInfo::String)
+                    {
+                        ti = crate::TypeInfo::Vec(Box::new(crate::TypeInfo::String));
+                        value_options.forced_list_elt =
+                            std::rc::Rc::new(Some(crate::TypeInfo::String));
+                    }
                     let rhs = a
                         .value
                         .clone()
-                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                        .to_rust(ctx.clone(), value_options, symbols.clone())?;
                     let stripped =
                         crate::ast::tree::call::strip_trailing_question(&rhs);
                     let value_tokens = if stripped.to_string() != rhs.to_string() {
@@ -3874,7 +3890,6 @@ StatementType::Assign(a)
                     } else {
                         stripped
                     };
-                    let ti = crate::infer_type(Some(&ctx), &a.value, &options, &symbols);
                     let concrete = !matches!(ti, crate::TypeInfo::PyObject)
                         && !crate::ast::tree::module::type_contains_uninferred(&ti);
                     let (ty, init) = if concrete {

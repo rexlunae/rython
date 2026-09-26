@@ -5754,6 +5754,41 @@ fn main_block_reads_promote_module_values_to_statics() {
 }
 
 #[test]
+fn class_level_string_list_static_owns_its_elements() {
+    // `names = ["a", "b"]` in a class body: the LazyLock static's type
+    // and its initializer must agree — Vec<String> with owned elements
+    // (the literal alone infers Vec<&'static str>).
+    let out = compile(
+        concat!(
+            "class Cfg:\n",
+            "    names = [\"a\", \"b\"]\n",
+            "    nums = [1, 2]\n",
+            "\n",
+            "    def first(self) -> str:\n",
+            "        return Cfg.names[0]\n",
+        ),
+        "clsnames.py",
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("Cfg_names:std::sync::LazyLock<Vec<String>>"),
+        "the string-list static must be Vec<String>: {}",
+        out
+    );
+    assert!(
+        !flat.contains("LazyLock<Vec<&'staticstr>>"),
+        "no borrowed-string element type may remain: {}",
+        out
+    );
+    assert!(
+        flat.contains("Cfg_nums:std::sync::LazyLock<Vec<i64>>"),
+        "a non-string list keeps its inferred type: {}",
+        out
+    );
+}
+
+
+#[test]
 fn every_entry_point_allows_dead_code_for_the_lib_copy() {
     // rypip compiles an entry module twice: as the bin root, where `main`
     // is the process entry point, and as a lib submodule (`pub mod br;`),

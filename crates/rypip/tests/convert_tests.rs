@@ -1037,6 +1037,52 @@ fn module_values_read_by_the_main_block_match_python_at_runtime() {
 }
 
 #[test]
+fn class_level_string_list_matches_python_at_runtime() {
+    // A class-body list literal of strings (`names = ["a", "b"]`) lowers
+    // to a class-mangled LazyLock static. Its type was inferred from the
+    // literal (Vec<&'static str>) while the initializer rendered owned
+    // elements (`("a").to_string()`) — E0308. The static is now typed
+    // Vec<String> with owned elements, the module-level static's rule.
+    let scratch = Scratch::new("clsnames");
+    let file = scratch.path().join("clsnames.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Cfg:\n",
+            "    names = [\"a\", \"b\"]\n",
+            "\n",
+            "    def describe(self) -> str:\n",
+            "        return \",\".join(Cfg.names)\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(Cfg().describe())\n",
+            "    for n in Cfg.names:\n",
+            "        print(n.upper())\n",
+            "    print(len(Cfg.names))\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/clsnames"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "a,b\nA\nB\n2\n");
+}
+
+
+
+#[test]
 fn functools_partial_keyword_bindings_match_python_at_runtime() {
     // Keyword bindings emitting in the callee's declared order
     // (botocore's `partial(delay_exponential, base=base,
