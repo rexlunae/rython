@@ -1811,7 +1811,19 @@ impl Point {
   used as one) lowers with the trait machinery: its methods live on a
   `{Name}Trait`, the derived struct embeds its base (`__rython_base`),
   and every ancestor trait is implemented for it, so `super()` and
-  inherited calls resolve. Rust structs have no subtyping, so a slot
+  inherited calls resolve. An attribute a class's methods use on
+  `self` that only its SUBCLASSES assign (a mixin's
+  `self.max_redirects`, issue #335) gets a reserved-name accessor pair
+  on the class's trait: each subclass that assigns it reaches the field
+  where its chain holds it, and every other implementor — the mixin's
+  own instances, a subclass without the field — raises CPython's
+  `AttributeError: 'C' object has no attribute 'f'` at the access
+  (§12.2). The attribute needs one type across the subclasses that
+  assign it, and the class's whole subtree must live in one module;
+  otherwise the read stays the loud unknown field. `type(self)` and
+  `type(self).__name__` in an inherited method name the INSTANCE's
+  class (the trait default's implementor, issue #411), as in CPython.
+  Rust structs have no subtyping, so a slot
   declared with a class that other classes derive from — a
   **polymorphic root**: a parameter `item: Item`, a field `dict[str,
   Item]`, a local `list[Shape]`, a return `-> Shape` — is the
@@ -2492,6 +2504,12 @@ catchable `PyException`:
 - `in` on a boxed value whose member is not a container (`1 in boxed_int`),
   or a non-str probe on the boxed str member — CPython 3.11's TypeError
   text, but a panic (the boxed-value iteration precedent).
+- An attribute a mixin's method reads that only its subclasses assign
+  (`self.max_redirects` in `SessionRedirectMixin`), on an instance whose
+  class never assigns it — the mixin itself, or a subclass without the
+  field — is CPython's `AttributeError: 'RedirectMixin' object has no
+  attribute 'max_redirects'`, but a panic with the exact text (the
+  accessor returns the value itself).
 - Access THROUGH an `Option`-typed receiver (`self.timeout.
   connect_timeout()` where the field is `Timeout | None`) unwraps the
   Option — CPython's AttributeError on a None receiver, but a panic with
@@ -2562,7 +2580,7 @@ accepted as permanent spec:
 | `functools.singledispatch` picks the FIRST registered type the argument matches, not CPython's MRO walk; a registration on a base class followed by one on its subclass resolves to the base | Model limit (issue #181); disjoint concrete registrations — what real code writes — agree exactly |
 | Dict literal values that are INSTANCES of two sibling classes of one hierarchy (`{"a": Cat("c"), "b": Dog("d")}` under `class Animal`) CONVERT to the hierarchy root, but the per-value `.into()` conversions are unanchored inside the inference-based `PyDict::from`, so the generated crate fails in rustc (E0277 `!: From<Cat>`) — a class-sum-in-dict shape that predates the round-100 dict gate; anchoring the literal's value type (a typed `PyDict::<K, Root>::from`) is the follow-up | Defect (issue #137 class-values family, round 100)
 | A CLASS NAME in value position lowers to its NAME STRING (`[ChecksumError]` → `vec!["ChecksumError".to_string()]`; `pool_classes_by_scheme` → `PyDict<String, String>`) — the class object's only runtime-relevant data, since exceptions are string-tagged; identity comparisons of class values compare names, and a dynamic `except <boxed value>:` matches the strings | Model limit (issue #137 round 33); the class's runtime attributes and hierarchy beyond exact-name matching are unmodeled, and a call THROUGH an indirect class value (`pool_cls(...)` read from the dict) fails in rustc (§12.1) |
-| A `type(x).__name__` on a non-`self` receiver lowers through the boxed value's runtime type name, and on an inferred generic parameter is dropped as the boxed None | Model limit; `type(self).__name__` is exact, and so is `type(exc).__name__` of a caught exception (the raised class's name — an alias names its class: `raise IOError` is an `OSError`) |
+| A `type(x).__name__` on a non-`self` receiver lowers through the boxed value's runtime type name, and on an inferred generic parameter is dropped as the boxed None | Model limit; `type(self).__name__` is exact — in an inherited method too, where it names the instance's class (issue #411) — and so is `type(exc).__name__` of a caught exception (the raised class's name — an alias names its class: `raise IOError` is an `OSError`) |
 | The default object repr of a class instance (`str(x)` without `__str__`/`__repr__`) prints `<module.ClassName object>` — CPython appends `at 0x…`, a nondeterministic address (CPython's own output varies run to run) that rython cannot model | Model limit (round 34); a `__str__`/`__repr__` that raises aborts loudly (the §12.2 raise-in-infallible family), and a class whose `__str__` uses `type(self).__name__` shows the defining class's name |
 | The boxed self-referential slot (`Optional[Box<Class>]`, fix 6) derefs a non-box when the STORED value comes from an ordinary optional source (an optional parameter or method result rather than the boxed field read) — the value-classes are indistinguishable at the codegen level; the owning PR must distinguish Option<Box<Class>> sources from ordinary Option<Class> sources at the lowering | Defect, issue #137 fix 6 follow-up |
 | A polymorphic hierarchy root's optional self-reference boxes the SUM type's concrete instances without conversion (the sum type and the Box indirection interact); needs the Any/sum-type store conversion and an end-to-end hierarchy test | Defect, issue #137 fix 6 follow-up |

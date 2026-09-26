@@ -3783,6 +3783,24 @@ pub fn py_global_mutate<T, R>(
     f(&mut guard)
 }
 
+/// `type(self).__name__` for a generated class `T`: the Python class
+/// name, read off the Rust type so that a method a subclass INHERITS
+/// names the instance's class (issue #411) — in a trait default, `T` is
+/// the implementor. The last path segment of the type's name, before any
+/// generics, with the identifier renames undone (`Self_` is `Self`; a raw
+/// identifier prints without `r#`).
+pub fn py_class_name<T: ?Sized>() -> &'static str {
+    let full = core::any::type_name::<T>();
+    let head = full.split('<').next().unwrap_or(full);
+    let last = head.rsplit("::").next().unwrap_or(head);
+    match last {
+        "Self_" => "Self",
+        "super_" => "super",
+        "crate_" => "crate",
+        name => name,
+    }
+}
+
 /// Python str() of a boxed heterogeneous value (issue #121): ints, floats,
 /// bools and None render as themselves; a str renders UNQUOTED; bytes use
 /// the `b'...'` repr form; tuple elements always render in REPR form

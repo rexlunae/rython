@@ -4907,6 +4907,11 @@ impl<'a> CodeGen for Call {
                                 Some(ExprType::Name(n)) if n.id == "self"
                             )
                         {
+                            // A trait default's `self` is the implementor
+                            // (issue #411): the name comes from `Self`.
+                            if ctx.in_generic_trait() {
+                                return Ok(quote!(stdpython::py_class_name::<Self>().to_string()));
+                            }
                             let name = crate::safe_ident(enclosing);
                             return Ok(quote!(stringify!(#name).to_string()));
                         }

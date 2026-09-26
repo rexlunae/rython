@@ -63,6 +63,9 @@
     "matrix": {
       "status": "pass"
     },
+    "mixin_fields": {
+      "status": "pass"
+    },
     "pipeline": {
       "status": "pass"
     },

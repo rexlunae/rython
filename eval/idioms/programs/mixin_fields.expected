@@ -1,0 +1,4 @@
+[True, True, False, True, False]
+Fetcher retries=2
+Uploader retries=3
+5

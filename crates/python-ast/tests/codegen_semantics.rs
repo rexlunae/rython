@@ -25491,3 +25491,50 @@ fn a_reused_name_boxed_into_a_parameter_clones_the_read() {
     );
     assert!(out.contains("size (stdpython :: PyValue :: from ((data) . clone ()))"), "{}", out);
 }
+
+#[test]
+fn a_mixin_declares_accessors_for_its_subclass_fields() {
+    // `self.max_redirects` in a mixin that never assigns it (requests'
+    // SessionRedirectMixin, issue #335): the mixin's trait declares a
+    // reserved-name accessor pair, the mixin's own instances answer
+    // CPython's AttributeError, and the subclass reaches its field.
+    let out = compile(
+        concat!(
+            "class RedirectMixin:\n",
+            "    def describe(self) -> str:\n",
+            "        return str(self.max_redirects)\n",
+            "\n",
+            "class Session(RedirectMixin):\n",
+            "    def __init__(self, limit: int) -> None:\n",
+            "        self.max_redirects = limit\n",
+        ),
+        "mixin.py",
+    );
+    assert!(out.contains("fn __rython_sub_max_redirects (& self) -> i64 ;"), "generated: {}", out);
+    assert!(
+        out.contains("AttributeError: 'RedirectMixin' object has no attribute 'max_redirects'"),
+        "generated: {}",
+        out
+    );
+    assert!(out.contains("self . max_redirects . clone ()"), "generated: {}", out);
+    assert!(out.contains("self . __rython_sub_max_redirects ()"), "generated: {}", out);
+}
+
+#[test]
+fn type_self_name_in_a_trait_default_reads_the_implementor() {
+    // Issue #411: in a method a subclass inherits, `type(self).__name__`
+    // is the instance's class — the trait default's `Self`, never the
+    // defining class's name as a constant.
+    let out = compile(
+        concat!(
+            "class Base:\n",
+            "    def name(self) -> str:\n",
+            "        return type(self).__name__\n",
+            "\n",
+            "class Sub(Base):\n",
+            "    pass\n",
+        ),
+        "tname.py",
+    );
+    assert!(out.contains("stdpython :: py_class_name :: < Self > ()"), "generated: {}", out);
+}

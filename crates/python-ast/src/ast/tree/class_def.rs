@@ -1733,6 +1733,83 @@ impl ClassDef {
         })
     }
 
+    /// The attributes this class's own methods use on `self` that no class
+    /// in its chain owns but that a SUBCLASS defines (issue #335: requests'
+    /// `SessionRedirectMixin` reading `self.max_redirects`, which only
+    /// `Session` assigns). Python finds them on the instance at runtime;
+    /// the class's trait declares an accessor for each, which a subclass
+    /// that has the field implements by reaching it, and every other
+    /// implementor (the mixin itself, a subclass without the field)
+    /// answers with CPython's AttributeError.
+    ///
+    /// Each attribute must have ONE type across the subclasses defining
+    /// it. The whole subtree must live in this class's module: both sides
+    /// of the trait (this class's declarations and each subclass's impl)
+    /// then compute the set from the same scope. Anything else is left out
+    /// and stays the loud unknown field it was.
+    pub(crate) fn subclass_fields(
+        &self,
+        symbols: &SymbolTableScopes,
+        options: &PythonOptions,
+    ) -> Vec<(String, crate::TypeInfo)> {
+        let Some(variants) = options.hierarchy_roots.get(&self.name) else {
+            return Vec::new();
+        };
+        let Some(home) = variants.first().map(|v| v.module_path.clone()) else {
+            return Vec::new();
+        };
+        if variants.iter().any(|v| v.module_path != home) {
+            return Vec::new();
+        }
+        let descendants: Vec<(ClassDef, SymbolTableScopes)> = variants
+            .iter()
+            .skip(1)
+            .filter_map(|v| match &v.module_path {
+                Some(path) => crate::module_class_def(options, path, &v.name),
+                None => match symbols.get(&v.name) {
+                    Some(SymbolTableNode::ClassDef(c)) => Some((c.clone(), symbols.clone())),
+                    _ => None,
+                },
+            })
+            .collect();
+        if descendants.is_empty() {
+            return Vec::new();
+        }
+        let mut reads = std::collections::BTreeSet::new();
+        for method in self.methods() {
+            collect_self_attr_reads(&method.body, &mut reads);
+        }
+        let mut out = Vec::new();
+        for attr in reads {
+            if attr.starts_with("__")
+                || self.method_on_mro(&attr, symbols).is_some()
+                || self.is_property_setter(&attr)
+                || self.field_owner_depth(&attr, symbols, options).is_some()
+                || self.literal_constant_on_mro(&attr, symbols, options).is_some()
+            {
+                continue;
+            }
+            let mut ty: Option<crate::TypeInfo> = None;
+            let mut agree = true;
+            for (d, d_syms) in &descendants {
+                let Ok(fields) = d.infer_fields(d_syms, options) else {
+                    continue;
+                };
+                if let Some((_, t)) = fields.iter().find(|(f, _)| *f == attr) {
+                    match &ty {
+                        None => ty = Some(t.clone()),
+                        Some(prev) if prev == t => {}
+                        Some(_) => agree = false,
+                    }
+                }
+            }
+            if let (Some(t), true) = (ty, agree) {
+                out.push((attr, t));
+            }
+        }
+        out
+    }
+
     /// Whether `attr` is a field assigned somewhere in this class's own
     /// `__init__`.
     pub(crate) fn owns_field(&self, attr: &str) -> bool {
@@ -4813,6 +4890,19 @@ impl ClassDef {
                 fn #f_mut(&mut self) -> &mut #fty;
             });
         }
+        // Accessors for the attributes only a SUBCLASS defines (a mixin's
+        // `self.max_redirects`): declared here, reached by each subclass
+        // that has the field (the ancestor impls below).
+        let subclass_fields = self.subclass_fields(symbols, options);
+        for (fname, fty) in &subclass_fields {
+            let f = format_ident!("{}", subclass_accessor(fname));
+            let f_mut = format_ident!("{}_mut", subclass_accessor(fname));
+            let fty = fty.to_rust_type();
+            own_accessor_decls.extend(quote! {
+                fn #f(&self) -> #fty;
+                fn #f_mut(&mut self) -> &mut #fty;
+            });
+        }
         // A method the class defines that no ancestor defines is a NEW
         // method: it lives as a default in this class's own trait.
         let own_methods: Vec<&FunctionDef> = methods
@@ -4932,6 +5022,11 @@ impl ClassDef {
                 }
             });
         }
+        // This class's own instances have no such attribute: CPython's
+        // AttributeError, at the access.
+        for (fname, fty) in &subclass_fields {
+            own_impl_body.extend(missing_attribute_accessors(&self.name, fname, fty));
+        }
 
         // Trait default bodies are generic over `Self: {Name}Trait` only,
         // so a new method that calls an inherited method (`def bar(self):
@@ -5044,6 +5139,33 @@ impl ClassDef {
                         &mut #accessor_self.#f
                     }
                 });
+            }
+            // The ancestor's SUBCLASS fields (a mixin's `self.max_redirects`):
+            // this class reaches the field where its own chain holds it, or
+            // answers CPython's AttributeError when it has none.
+            for (fname, fti) in &ancestor.subclass_fields(a_syms, a_opts) {
+                match self.field_owner_depth(fname, symbols, options) {
+                    Some(owner) => {
+                        let field = crate::safe_ident(fname);
+                        let f = format_ident!("{}", subclass_accessor(fname));
+                        let f_mut = format_ident!("{}_mut", subclass_accessor(fname));
+                        let fty = fti.to_rust_type();
+                        let mut accessor_self = quote!(self);
+                        for _ in 0..owner {
+                            accessor_self.extend(quote!(.__rython_base));
+                        }
+                        accessor_impls.extend(quote! {
+                            fn #f(&self) -> #fty {
+                                #accessor_self.#field.clone()
+                            }
+                            fn #f_mut(&mut self) -> &mut #fty {
+                                &mut #accessor_self.#field
+                            }
+                        });
+                    }
+                    None => accessor_impls
+                        .extend(missing_attribute_accessors(&self.name, fname, fti)),
+                }
             }
             // Overrides: for each TRAIT MEMBER of the ancestor (its own
             // methods that are not themselves overrides of ITS base — those
@@ -6883,6 +7005,33 @@ enum ObservedStore {
 /// attribute stays unknown and the generated crate fails loudly on it),
 /// which is always safer than synthesizing a field the class does not
 /// really have.
+/// The accessor name for a SUBCLASS field (`ClassDef::subclass_fields`):
+/// its own reserved name, since the subclass's trait also declares the
+/// plain `f()` accessor for the field it owns, and one method name in two
+/// traits of one type is ambiguous at every call (E0034).
+pub(crate) fn subclass_accessor(field: &str) -> String {
+    format!("__rython_sub_{}", field)
+}
+
+/// The accessor pair for a subclass field on a class whose instances do
+/// not have it: CPython's `AttributeError: 'C' object has no attribute
+/// 'f'` at the access. An accessor returns the value itself, so the
+/// exception is the loud panic (§12.2), never a default value.
+fn missing_attribute_accessors(class: &str, field: &str, ty: &crate::TypeInfo) -> TokenStream {
+    let f = format_ident!("{}", subclass_accessor(field));
+    let f_mut = format_ident!("{}_mut", subclass_accessor(field));
+    let fty = ty.to_rust_type();
+    let message = format!("AttributeError: '{}' object has no attribute '{}'", class, field);
+    quote! {
+        fn #f(&self) -> #fty {
+            panic!(#message)
+        }
+        fn #f_mut(&mut self) -> &mut #fty {
+            panic!(#message)
+        }
+    }
+}
+
 fn collect_self_attr_reads(body: &[Statement], out: &mut std::collections::BTreeSet<String>) {
     visit::walk_stmts(body, Descend::All, &mut |stmt| {
         // A nested class's `self` is another object: its reads say
@@ -7204,7 +7353,13 @@ impl ClassDef {
                     }
                 });
             }
-            let fields = ancestor.own_fields(a_syms, a_opts)?;
+            let mut fields = ancestor.own_fields(a_syms, a_opts)?;
+            fields.extend(
+                ancestor
+                    .subclass_fields(a_syms, a_opts)
+                    .into_iter()
+                    .map(|(f, t)| (subclass_accessor(&f), t)),
+            );
             for (fname, fty) in &fields {
                 if ancestor.base_class_with_options(a_syms, a_opts).is_some()
                     && matches!(fname.as_str(), "base" | "base_mut")
