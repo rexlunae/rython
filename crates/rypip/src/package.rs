@@ -77,8 +77,9 @@ pub fn sanitize_name(name: &str) -> String {
 /// Discover a Python package at `path`, which may be a single `.py` file, a
 /// package directory (with `__init__.py`), or a project directory resolved
 /// the way Python resolves it — `pyproject.toml` (PEP 621 +
-/// `[tool.setuptools]`), `setup.cfg`, or `setup.py` (executed via python3
-/// when available) determine the name, version, packages, py-modules, and
+/// `[tool.setuptools]`), `setup.cfg`, or `setup.py` (read statically; executed
+/// via python3 only on the `RYPIP_ALLOW_SETUP_PY_EXEC=1` opt-in) determine
+/// the name, version, packages, py-modules, and
 /// dependencies. Projects without any packaging metadata fall back to the
 /// historical layout heuristics (flat or `src/`).
 pub fn discover(path: &Path) -> Result<PyPackage> {

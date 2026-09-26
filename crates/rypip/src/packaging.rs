@@ -1,8 +1,8 @@
 //! Python package metadata and layout discovery, the way Python's own
 //! tooling resolves them: PEP 621 `pyproject.toml` `[project]` +
-//! `[tool.setuptools]`, legacy `setup.cfg`, and `setup.py` (executed through
-//! a `python3` shim when an interpreter is available — pip-style — with a
-//! static fallback when it is not).
+//! `[tool.setuptools]`, legacy `setup.cfg`, and `setup.py` (read statically
+//! first; executed through a `python3` shim only when the static read fails
+//! AND execution is opted into — see [`SetupPyExec`]).
 
 use std::collections::HashMap;
 use std::fs;
@@ -38,9 +38,65 @@ pub struct ProjectMetadata {
 /// Marker used by the setup.py shim and find-configs for `find_packages()`.
 pub const RYTHON_FIND_SENTINEL: &str = "__RYTHON_FIND_PACKAGES__";
 
+/// Whether metadata resolution may EXECUTE a setup.py (through the python3
+/// shim) when the static reader cannot determine its metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupPyExec {
+    /// Never run setup.py (the default).
+    Skip,
+    /// Run it under the shim: its top-level code executes on this host.
+    Allow,
+}
+
+impl SetupPyExec {
+    /// The process-wide opt-in: `Allow` exactly when
+    /// `RYPIP_ALLOW_SETUP_PY_EXEC=1`.
+    pub fn from_env() -> Self {
+        if std::env::var("RYPIP_ALLOW_SETUP_PY_EXEC").ok().as_deref() == Some("1") {
+            SetupPyExec::Allow
+        } else {
+            SetupPyExec::Skip
+        }
+    }
+}
+
+/// The `setup()` keyword arguments metadata resolution reads; every other
+/// keyword is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SetupKwarg {
+    Name,
+    Version,
+    InstallRequires,
+    Packages,
+    PyModules,
+    PackageDir,
+}
+
+impl SetupKwarg {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "name" => SetupKwarg::Name,
+            "version" => SetupKwarg::Version,
+            "install_requires" => SetupKwarg::InstallRequires,
+            "packages" => SetupKwarg::Packages,
+            "py_modules" => SetupKwarg::PyModules,
+            "package_dir" => SetupKwarg::PackageDir,
+            _ => return None,
+        })
+    }
+}
+
 /// Read the project's packaging metadata, merging pyproject.toml (PEP 621,
 /// authoritative), then setup.cfg, then setup.py for whatever is missing.
+/// Whether setup.py may be executed comes from `RYPIP_ALLOW_SETUP_PY_EXEC`
+/// ([`SetupPyExec::from_env`]).
 pub fn read_project_metadata(root: &Path) -> Result<ProjectMetadata> {
+    read_project_metadata_with(root, SetupPyExec::from_env())
+}
+
+/// [`read_project_metadata`] with the setup.py execution opt-in passed
+/// explicitly rather than read from the environment.
+pub fn read_project_metadata_with(root: &Path, exec: SetupPyExec) -> Result<ProjectMetadata> {
     let mut meta = ProjectMetadata::default();
 
     // PEP 621 + setuptools config in pyproject.toml.
@@ -154,46 +210,37 @@ pub fn read_project_metadata(root: &Path) -> Result<ProjectMetadata> {
     // static metadata wins and setup.py execution is the legacy fallback.
     let setup_py = root.join("setup.py");
     if setup_py.is_file() {
-        let captured = statically_parse_setup_py(&setup_py)
-            .ok()
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| run_setup_py_shim(&setup_py).unwrap_or_default());
+        let captured = match statically_parse_setup_py(&setup_py) {
+            Ok(captured) => captured,
+            Err(static_err) => run_setup_py_shim(&setup_py, exec, &static_err).unwrap_or_default(),
+        };
         if meta.name.is_none() {
-            meta.name = captured.get("name").cloned();
+            meta.name = captured.get(&SetupKwarg::Name).cloned();
         }
         if meta.version.is_none() {
-            meta.version = captured.get("version").cloned();
+            meta.version = captured.get(&SetupKwarg::Version).cloned();
         }
         if meta.dependencies.is_empty() {
-            if let Some(deps) = captured.get("install_requires") {
-                let deps = deps.trim().trim_matches(['[', ']']);
-                meta.dependencies = split_comma_list(deps);
+            if let Some(deps) = captured.get(&SetupKwarg::InstallRequires) {
+                meta.dependencies = split_python_list(deps);
             }
         }
         if meta.packages.is_empty() {
-            match captured.get("packages").map(String::as_str) {
+            match captured.get(&SetupKwarg::Packages).map(String::as_str) {
                 Some(RYTHON_FIND_SENTINEL) => {
                     meta.packages.push(RYTHON_FIND_SENTINEL.to_string());
                 }
-                Some(list) => {
-                    let list = list.trim_matches(['[', ']']);
-                    if !list.is_empty() {
-                        meta.packages = split_comma_list(list);
-                    }
-                }
+                Some(list) => meta.packages = split_python_list(list),
                 None => {}
             }
         }
         if meta.py_modules.is_empty() {
-            if let Some(list) = captured.get("py_modules") {
-                let list = list.trim_matches(['[', ']']);
-                if !list.is_empty() {
-                    meta.py_modules = split_comma_list(list);
-                }
+            if let Some(list) = captured.get(&SetupKwarg::PyModules) {
+                meta.py_modules = split_python_list(list);
             }
         }
         if meta.package_dir.is_empty() {
-            if let Some(dir) = captured.get("package_dir") {
+            if let Some(dir) = captured.get(&SetupKwarg::PackageDir) {
                 if let Ok(map) = parse_python_dict(dir) {
                     meta.package_dir = map;
                 }
@@ -318,13 +365,20 @@ fn collect_find(root: &Path, dir: &Path, found: &mut Vec<String>) -> Result<()> 
 /// when python3 is unavailable or the file cannot be executed.
 ///
 /// EXECUTION IS OPT-IN: the shim runs the sdist's own top-level code on
-/// this host, so it only fires when `RYPIP_ALLOW_SETUP_PY_EXEC=1` is set.
-/// Without it the call is skipped with a loud note and resolution falls
-/// back to whatever the static parse produced (correct-or-loud).
-fn run_setup_py_shim(setup_py: &Path) -> Option<HashMap<String, String>> {
-    if std::env::var("RYPIP_ALLOW_SETUP_PY_EXEC").ok().as_deref() != Some("1") {
+/// this host, so it only fires under [`SetupPyExec::Allow`]
+/// (`RYPIP_ALLOW_SETUP_PY_EXEC=1`). Without it the call is skipped with a
+/// loud note naming why the static reader gave up (`static_err`), and
+/// resolution falls back to the layout heuristics (correct-or-loud).
+fn run_setup_py_shim(
+    setup_py: &Path,
+    exec: SetupPyExec,
+    static_err: &anyhow::Error,
+) -> Option<HashMap<SetupKwarg, String>> {
+    if exec == SetupPyExec::Skip {
         eprintln!(
-            "note: skipping setup.py execution for `{}` (set RYPIP_ALLOW_SETUP_PY_EXEC=1              to allow running legacy sdists' setup.py during metadata resolution)",
+            "note: skipping setup.py execution for `{}`: {static_err:#} (set \
+             RYPIP_ALLOW_SETUP_PY_EXEC=1 to allow running legacy sdists' setup.py during \
+             metadata resolution)",
             setup_py.display()
         );
         return None;
@@ -375,12 +429,20 @@ print("RYTHON_SETUP_RESULT " + json.dumps(captured, sort_keys=True))
         .lines()
         .find(|l| l.starts_with("RYTHON_SETUP_RESULT "))?;
     let payload = line.trim_start_matches("RYTHON_SETUP_RESULT ");
-    serde_json::from_str(payload).ok()
+    let captured: HashMap<String, String> = serde_json::from_str(payload).ok()?;
+    Some(
+        captured
+            .into_iter()
+            .filter_map(|(k, v)| SetupKwarg::from_name(&k).map(|k| (k, v)))
+            .collect(),
+    )
 }
 
-/// Static fallback: pull the setup() keyword arguments out of the file
-/// without executing anything.
-fn statically_parse_setup_py(setup_py: &Path) -> Result<HashMap<String, String>> {
+/// Pull the setup() keyword arguments out of the file without executing
+/// anything. Only LITERAL values are read; a consumed keyword whose value
+/// is computed (`version=__version__`) fails the static read — loudly,
+/// through the caller's note — rather than being taken verbatim.
+fn statically_parse_setup_py(setup_py: &Path) -> Result<HashMap<SetupKwarg, String>> {
     let src = fs::read_to_string(setup_py)
         .with_context(|| format!("reading {}", setup_py.display()))?;
     let mut out = HashMap::new();
@@ -398,8 +460,18 @@ fn statically_parse_setup_py(setup_py: &Path) -> Result<HashMap<String, String>>
             }
             if j < bytes.len() && bytes[j] == '(' {
                 if let Some((kw, end)) = skim_setup_call(&bytes, j) {
-                    for (k, v) in kw {
-                        out.entry(k).or_insert(v);
+                    for (name, value) in kw {
+                        let Some(kwarg) = SetupKwarg::from_name(&name) else {
+                            continue;
+                        };
+                        let Some(value) = value else {
+                            bail!(
+                                "setup()'s `{name}=` in {} is not a literal, so it cannot be \
+                                 read without executing the file",
+                                setup_py.display()
+                            );
+                        };
+                        out.entry(kwarg).or_insert(value);
                     }
                     i = end;
                     continue;
@@ -411,24 +483,40 @@ fn statically_parse_setup_py(setup_py: &Path) -> Result<HashMap<String, String>>
 
     if out.is_empty() {
         bail!(
-            "could not determine the package from {} (no setuptools.setup(...) call found); \
-             convert a directory with pyproject.toml or setup.cfg instead",
+            "could not determine the package from {} (no setuptools.setup(...) call with \
+             literal metadata keywords found); convert a directory with pyproject.toml or \
+             setup.cfg instead",
             setup_py.display()
         );
     }
     Ok(out)
 }
 
-/// Skim one `setup(...)` call, returning its string-valued keyword
-/// arguments and the index just past the call's closing paren.
-fn skim_setup_call(bytes: &[char], open: usize) -> Option<(HashMap<String, String>, usize)> {
+/// A skimmed call's keyword arguments in source order: `None` marks a
+/// computed (non-literal) value.
+type SkimmedKwargs = Vec<(String, Option<String>)>;
+
+/// Skim one `setup(...)` call (`open` is the index of its `(`), returning
+/// its keyword arguments and the index just past the call's closing paren.
+/// A value is `Some(text)` when it is a literal — a string (quotes dropped),
+/// a list/dict of strings (element quotes kept, as in the shim's `repr`, so
+/// a comma inside an element stays inside it), or a bare `find_packages()`
+/// — and `None` when it is computed.
+fn skim_setup_call(bytes: &[char], open: usize) -> Option<(SkimmedKwargs, usize)> {
+    // Nesting INSIDE the argument list: the call's own `(` is not a level,
+    // so scanning starts just past it (counting it made every top-level
+    // `,` and the closing `)` look nested, and no call was ever read).
     let mut depth = 0usize;
-    let mut i = open;
+    let mut i = open + 1;
     let mut in_str: Option<char> = None;
-    let mut out = HashMap::new();
+    let mut out = Vec::new();
     let mut kw: Option<String> = None;
     let mut value_chars: Vec<char> = Vec::new();
     let mut seen_equals = false;
+    // Whether the value so far is literal, and whether the last token was
+    // a string (a second one adjacent to it is implicit concatenation).
+    let mut literal = true;
+    let mut after_string = false;
 
     while i < bytes.len() {
         let c = bytes[i];
@@ -441,18 +529,36 @@ fn skim_setup_call(bytes: &[char], open: usize) -> Option<(HashMap<String, Strin
                 }
             }
             if c == q {
-                // Closing quote: consumed, not part of the value.
+                // Closing quote: part of the value only inside a list/dict.
                 in_str = None;
+                after_string = true;
+                if depth > 0 {
+                    value_chars.push(c);
+                }
             } else {
                 value_chars.push(c);
             }
             i += 1;
             continue;
         }
+        let adjacent_string = after_string;
+        if !c.is_whitespace() {
+            after_string = false;
+        }
         match c {
+            '#' => {
+                // A comment runs to the end of the line.
+                while i < bytes.len() && bytes[i] != '\n' {
+                    i += 1;
+                }
+            }
             '\'' | '"' => {
                 if seen_equals {
                     in_str = Some(c);
+                    literal &= !adjacent_string;
+                    if depth > 0 {
+                        value_chars.push(c);
+                    }
                 }
                 i += 1;
             }
@@ -464,19 +570,21 @@ fn skim_setup_call(bytes: &[char], open: usize) -> Option<(HashMap<String, Strin
                 depth += 1;
                 if seen_equals {
                     value_chars.push(c);
+                    literal &= c != '(';
                 }
                 i += 1;
             }
             ')' => {
                 if depth == 0 {
                     if let (Some(k), true) = (kw, seen_equals) {
-                        out.insert(k, finalize_value(&value_chars));
+                        out.push((k, finalize_value(&value_chars, literal)));
                     }
                     return Some((out, i + 1));
                 }
                 depth -= 1;
                 if seen_equals {
                     value_chars.push(c);
+                    literal = false;
                 }
                 i += 1;
             }
@@ -489,16 +597,18 @@ fn skim_setup_call(bytes: &[char], open: usize) -> Option<(HashMap<String, Strin
             }
             ',' if depth == 0 => {
                 if let (Some(k), true) = (kw, seen_equals) {
-                    out.insert(k, finalize_value(&value_chars));
+                    out.push((k, finalize_value(&value_chars, literal)));
                 }
                 kw = None;
                 seen_equals = false;
+                literal = true;
                 value_chars.clear();
                 i += 1;
             }
             c if c.is_ascii_alphabetic() || c == '_' => {
                 if seen_equals {
                     value_chars.push(c);
+                    literal = false;
                     i += 1;
                 } else if kw.is_none() {
                     let start = i;
@@ -516,6 +626,9 @@ fn skim_setup_call(bytes: &[char], open: usize) -> Option<(HashMap<String, Strin
             _ => {
                 if seen_equals {
                     value_chars.push(c);
+                    // List/dict separators are literal; anything else
+                    // outside a string (a number, an operator) is not.
+                    literal &= c.is_whitespace() || c == ',' || c == ':';
                 }
                 i += 1;
             }
@@ -524,15 +637,48 @@ fn skim_setup_call(bytes: &[char], open: usize) -> Option<(HashMap<String, Strin
     None
 }
 
-fn finalize_value(chars: &[char]) -> String {
+fn finalize_value(chars: &[char], literal: bool) -> Option<String> {
     let s: String = chars.iter().collect();
-    let s = s.trim().to_string();
+    let s = s.trim();
     // `packages=find_packages()` / `find_namespace_packages()` lower to the
-    // discovery sentinel.
-    if s == "find_packages" || s == "find_namespace_packages" {
-        return RYTHON_FIND_SENTINEL.to_string();
+    // discovery sentinel. Only the bare call: a `where=` or `exclude=`
+    // argument changes what they find, so that form stays computed.
+    if s == "find_packages()" || s == "find_namespace_packages()" {
+        return Some(RYTHON_FIND_SENTINEL.to_string());
     }
-    s
+    literal.then(|| s.to_string())
+}
+
+/// Split a Python list/tuple literal (`['a>=1,<2', 'b']`, as the static
+/// reader and the shim's `repr` both render it) into its string elements.
+/// Commas inside a quoted element belong to it: a PEP 508 specifier set is
+/// itself comma-separated.
+fn split_python_list(s: &str) -> Vec<String> {
+    let s = s.trim();
+    let inner = s
+        .strip_prefix(['[', '('])
+        .and_then(|s| s.strip_suffix([']', ')']))
+        .unwrap_or(s);
+    let mut items = Vec::new();
+    let mut cur = String::new();
+    let mut in_str: Option<char> = None;
+    for c in inner.chars() {
+        match in_str {
+            Some(q) if c == q => in_str = None,
+            Some(_) => cur.push(c),
+            None => match c {
+                '\'' | '"' => in_str = Some(c),
+                ',' => items.push(std::mem::take(&mut cur)),
+                _ => cur.push(c),
+            },
+        }
+    }
+    items.push(cur);
+    items
+        .into_iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 fn split_comma_list(s: &str) -> Vec<String> {
