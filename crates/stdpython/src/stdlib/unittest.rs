@@ -190,6 +190,7 @@ fn pyvalue_isinstance(v: &PyValue, t: &str) -> bool {
         "bytes" => matches!(v, PyValue::Bytes(_)),
         "dict" => matches!(v, PyValue::Dict(_)),
         "tuple" => matches!(v, PyValue::Tuple(_)),
+        "range" => matches!(v, PyValue::Range(_)),
         "list" => matches!(v, PyValue::Tuple(_)),
         "NoneType" => matches!(v, PyValue::None_),
         _ => false,

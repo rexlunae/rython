@@ -4984,7 +4984,14 @@ impl<'a> CodeGen for Call {
                                 .to_string()
                                 .into());
                         }
-                        let a = &rendered[0];
+                        // The source is read, not consumed: a name read again
+                        // (in a loop, or later) takes the reuse-clone.
+                        let a = crate::render_reused(
+                            &self.args[0],
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                        )?;
                         return Ok(quote!(PyValue::from(#a)));
                     }
                     // next(iterable[, default]): Python's iterator advance.
@@ -5070,10 +5077,15 @@ impl<'a> CodeGen for Call {
                                 // machinery adds it); a concrete class
                                 // instance, Option, or boxed value routes
                                 // through py_display (round 34).
+                                // A BOXED parameter slot is concrete (issue #335:
+                                // an instance method's unannotated parameter),
+                                // not a type variable: it displays by reference.
                                 let generic = matches!(
                                     &self.args[0],
                                     crate::ExprType::Name(n)
-                                        if options.param_type_vars.contains_key(&n.id)
+                                        if options.param_type_vars.get(&n.id).is_some_and(|t| {
+                                            t.to_string() != "stdpython :: PyValue"
+                                        })
                                 );
                                 let arg_type = crate::infer_type(
                                     Some(&ctx),
@@ -7230,6 +7242,7 @@ impl<'a> CodeGen for Call {
                             &symbols,
                             Some(&class.name),
                             Some(&class_symbols),
+                            false,
                         );
                         let MappedArguments { prelude, args } = match mapped {
                             Ok(m) => m,
@@ -7888,6 +7901,9 @@ impl<'a> CodeGen for Call {
                         // Dropped DEFAULT constants resolve in the defining
                         // module's scope.
                         Some(&class_symbols),
+                        // An instance method: its unannotated parameters
+                        // are boxed slots (function_def.rs).
+                        !is_static && !is_classmethod,
                     )?;
                     // A @staticmethod or @classmethod called through an
                     // INSTANCE binds no receiver in Python (`w.helper(1)`,
@@ -9130,6 +9146,20 @@ let mutating_self_field = boxed_self_ref_receiver
                         return Ok(quote!((#receiver).py_pop(#arg)?));
                     }
                     ("pop", [key, default]) => {
+                        // The default is stored or returned as the dict's
+                        // VALUE: render it as one (a `bool` into a
+                        // `dict[str, Any]` boxes — issue #335, requests'
+                        // `kwargs.setdefault("allow_redirects", True)`).
+                        let default = match &dict_receiver_kv {
+                            Some((_, v)) => crate::render_typed(
+                                &self.args[1],
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(v.clone()),
+                            )?,
+                            None => default.clone(),
+                        };
                         if string_keyed_dict {
                             let key = crate::render_typed(
                                 &self.args[0],
@@ -9332,6 +9362,20 @@ let mutating_self_field = boxed_self_ref_receiver
                         return Ok(quote!((#receiver).clear()));
                     }
                     ("setdefault", [key, default]) => {
+                        // The default is stored or returned as the dict's
+                        // VALUE: render it as one (a `bool` into a
+                        // `dict[str, Any]` boxes — issue #335, requests'
+                        // `kwargs.setdefault("allow_redirects", True)`).
+                        let default = match &dict_receiver_kv {
+                            Some((_, v)) => crate::render_typed(
+                                &self.args[1],
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(v.clone()),
+                            )?,
+                            None => default.clone(),
+                        };
                         if string_keyed_dict {
                             let key = crate::render_typed(
                                 &self.args[0],
@@ -12822,7 +12866,7 @@ fn map_call_arguments(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Result<MappedArguments, Box<dyn std::error::Error>> {
-    map_call_arguments_inner(func, args, keywords, ctx, options, symbols, None, None)
+    map_call_arguments_inner(func, args, keywords, ctx, options, symbols, None, None, false)
 }
 
 /// [`map_call_arguments`] with the CONSTRUCTED class's name (when the call
@@ -12848,6 +12892,7 @@ fn map_call_arguments_inner(
     symbols: &SymbolTableScopes,
     constructed_class: Option<&str>,
     default_symbols: Option<&SymbolTableScopes>,
+    receiver_method: bool,
 ) -> Result<MappedArguments, Box<dyn std::error::Error>> {
     let fname = &func.name;
     // Optional-annotated parameters take Option values: the Option-slot
@@ -13324,7 +13369,19 @@ fn map_call_arguments_inner(
                     // suppress the box.
                     let arg_infers =
                         crate::ast::tree::type_ctx::infer_type(Some(&ctx), expr, &options, &symbols);
-                    if constructed_class.is_some()
+                    // An INSTANCE METHOD's unannotated parameter is the
+                    // same boxed slot (function_def.rs: "an unannotated
+                    // method parameter lowers as boxed PyValue"; issue
+                    // #335 — requests' `iter_content(128, False)`,
+                    // `resolve_redirects(..., False, ...)`): any value
+                    // PyValue holds boxes at the call. A None-defaulted
+                    // one is the rule above's.
+                    let method_slot = receiver_method
+                        && param.annotation.is_none()
+                        && !crate::param_has_none_default(param, func)
+                        && crate::ast::tree::type_ctx::is_boxable_value_type(&arg_infers);
+                    if method_slot
+                        || constructed_class.is_some()
                         && param.annotation.is_none()
                         && matches!(
                             arg_infers,

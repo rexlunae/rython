@@ -17350,3 +17350,122 @@ fn bisect_matches_cpython() {
     );
 }
 
+#[test]
+fn boxed_method_parameters_take_and_give_values_like_cpython() {
+    // Issue #335/#334 (idna's test_intranges shape): an instance method's
+    // unannotated parameters are boxed slots. A range, a list, or an
+    // empty list boxes at the call (a range stays a range — its repr and
+    // len are CPython's); inside, the boxed value unboxes into typed
+    // callees (`total(ints)`, `tuple(ints)`), and a loop over it yields
+    // boxed members.
+    let scratch = Scratch::new("boxedslots");
+    let krate = package_crate(
+        &scratch,
+        "boxedslots",
+        &[(
+            "cli.py",
+            concat!(
+                "from typing import List, Tuple\n",
+                "\n",
+                "\n",
+                "def total(xs: List[int]) -> int:\n",
+                "    return sum(xs)\n",
+                "\n",
+                "\n",
+                "def has(x: int, xs: Tuple[int, ...]) -> bool:\n",
+                "    return x in xs\n",
+                "\n",
+                "\n",
+                "class Checker:\n",
+                "    def check(self, ints, others):\n",
+                "        t = total(ints)\n",
+                "        for i in ints:\n",
+                "            assert has(i, tuple(ints))\n",
+                "        for o in others:\n",
+                "            assert not has(o, tuple(ints))\n",
+                "        return t\n",
+                "\n",
+                "    def describe(self, seq):\n",
+                "        return str(seq) + \" len=\" + str(len(seq))\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    c = Checker()\n",
+                "    print(c.check(range(3, 6), [1, 9]))\n",
+                "    print(c.check([7], [8]))\n",
+                "    print(c.check([], range(2)))\n",
+                "    print(c.describe(range(0, 10, 2)))\n",
+                "    print(c.describe(range(4)))\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "boxedslots"),
+        vec!["12", "7", "0", "range(0, 10, 2) len=5", "range(0, 4) len=4"]
+    );
+}
+
+#[test]
+fn method_arguments_and_dict_defaults_box_like_cpython() {
+    // Issue #335 (requests' sessions/models shapes): positional arguments
+    // into a method's boxed parameters box (`iter_content(128, False)`),
+    // a dict[str, Any]'s setdefault/pop default boxes, and a method that
+    // returns an expression over its boxed parameters is typed by it.
+    let scratch = Scratch::new("boxedcalls");
+    let krate = package_crate(
+        &scratch,
+        "boxedcalls",
+        &[(
+            "cli.py",
+            concat!(
+                "from typing import Any, Dict\n",
+                "\n",
+                "\n",
+                "class Session:\n",
+                "    def __init__(self, pool=10, block=False) -> None:\n",
+                "        self.pool = pool\n",
+                "        self.block = block\n",
+                "        self.stream = False\n",
+                "\n",
+                "    def iter_content(self, chunk_size=1, decode_unicode=False):\n",
+                "        return str(chunk_size) + \":\" + str(decode_unicode)\n",
+                "\n",
+                "    def request(self, method, url, stream=None, verify=None):\n",
+                "        return method + \" \" + url + \" \" + str(stream) + \" \" + str(verify)\n",
+                "\n",
+                "    def get(self, url, **kwargs):\n",
+                "        kwargs.setdefault(\"allow_redirects\", True)\n",
+                "        flag = kwargs.pop(\"stream\", False)\n",
+                "        return self.request(\"GET\", url, stream=flag, verify=True)\n",
+                "\n",
+                "\n",
+                "def opts(d: Dict[str, Any], quiet: bool) -> Dict[str, Any]:\n",
+                "    d[\"quiet\"] = quiet\n",
+                "    d.setdefault(\"level\", 3)\n",
+                "    return d\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    s = Session(10, True)\n",
+                "    print(s.iter_content(128, False))\n",
+                "    print(s.get(\"http://x\"))\n",
+                "    print(opts({}, True))\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "boxedcalls"),
+        vec!["128:False", "GET http://x False True", "{'quiet': True, 'level': 3}"]
+    );
+}
+

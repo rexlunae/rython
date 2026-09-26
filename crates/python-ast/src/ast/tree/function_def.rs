@@ -2534,6 +2534,31 @@ impl FunctionDef {
                         names.entry(p.arg.clone()).or_insert(t);
                     }
                 }
+                // An INSTANCE method's unannotated parameters are boxed
+                // slots (the signature's rule below): the body's loop
+                // targets over them iterate boxed members (issue #335).
+                let decorated = |name: &str| {
+                    self.decorator_list
+                        .iter()
+                        .any(|d| matches!(d, ExprType::Name(n) if n.id == name))
+                };
+                if matches!(&ctx, CodeGenContext::Class(_) | CodeGenContext::Trait { .. })
+                    && !decorated("classmethod")
+                    && !decorated("staticmethod")
+                {
+                    for p in self
+                        .args
+                        .posonlyargs
+                        .iter()
+                        .chain(self.args.args.iter())
+                        .chain(self.args.kwonlyargs.iter())
+                        .skip(1)
+                    {
+                        if p.annotation.is_none() && !crate::param_has_none_default(p, &self) {
+                            names.entry(p.arg.clone()).or_insert(crate::TypeInfo::PyValue);
+                        }
+                    }
+                }
                 seeded.name_types = std::rc::Rc::new(names);
                 seeded
             };
@@ -3032,6 +3057,19 @@ impl FunctionDef {
         };
 
         options.pyvalue_into_params = std::rc::Rc::new(pyvalue_into_params);
+        // A parameter the signature BOXES is a PyValue in the body too
+        // (issue #335): `total(ints)` / `has(i, ...)` inside a method with
+        // unannotated parameters must see boxed values to unbox them into
+        // typed callees. A type the analysis already recorded stands.
+        {
+            let mut name_types = (*options.name_types).clone();
+            for (name, ty) in &final_param_types {
+                if ty.to_string() == "stdpython :: PyValue" {
+                    name_types.entry(name.clone()).or_insert(crate::TypeInfo::PyValue);
+                }
+            }
+            options.name_types = std::rc::Rc::new(name_types);
+        }
         options.param_type_vars = std::rc::Rc::new(final_param_types);
         // An INFERRED String return needs the same literal-owning
         // treatment as an annotated `-> str`: `return "pos"` in a generic
@@ -6034,6 +6072,58 @@ impl FunctionDef {
                 self.self_field_return_type(self_class, symbols, options)
                     .map(|t| t.to_rust_type())
             })
+            .or_else(|| self.param_scoped_return_type(self_class, symbols, options))
+    }
+
+    /// The return inferred in the function's OWN parameter scope (issue
+    /// #335): the inferrers above read `name_types` from whatever scope
+    /// asks — the caller's, at a call site — so a return built from the
+    /// parameters (`return method + " " + url`, where an instance method's
+    /// unannotated parameters are boxed slots) had no type and the method
+    /// typed `()`. END of the chain, so nothing an earlier inferrer
+    /// answers changes.
+    fn param_scoped_return_type(
+        &self,
+        self_class: Option<&str>,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Option<TokenStream> {
+        let decorated = |name: &str| {
+            self.decorator_list
+                .iter()
+                .any(|d| matches!(d, ExprType::Name(n) if n.id == name))
+        };
+        let instance_method =
+            self_class.is_some() && !decorated("classmethod") && !decorated("staticmethod");
+        let mut types = (*options.name_types).clone();
+        let params = self.args.posonlyargs.iter().chain(self.args.args.iter());
+        for (i, p) in params.chain(self.args.kwonlyargs.iter()).enumerate() {
+            if instance_method && i == 0 {
+                continue;
+            }
+            match p
+                .evaluated_annotation()
+                .and_then(|a| crate::resolve_alias_typeinfo(&a, symbols, options))
+            {
+                Some(t) => {
+                    types.insert(p.arg.clone(), t);
+                }
+                None if instance_method
+                    && p.annotation.is_none()
+                    && !crate::param_has_none_default(p, self) =>
+                {
+                    types.insert(p.arg.clone(), crate::TypeInfo::PyValue);
+                }
+                None => {
+                    types.remove(&p.arg);
+                }
+            }
+        }
+        let mut scoped = options.clone();
+        scoped.name_types = std::rc::Rc::new(types);
+        self.inferred_return_typeinfo(symbols, &scoped)
+            .filter(renderable_return_typeinfo)
+            .map(|t| t.to_rust_type())
     }
 
     /// An unannotated METHOD whose returns are all reads of fields of its
@@ -6232,7 +6322,9 @@ impl FunctionDef {
                 }
                 ti.to_rust_type()
             } else {
-                method.unified_return_type(symbols, options)?
+                method
+                    .unified_return_type(symbols, options)
+                    .or_else(|| method.param_scoped_return_type(Some(class_name), symbols, options))?
             };
             match &unified {
                 None => unified = Some(ty),

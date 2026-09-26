@@ -12555,7 +12555,10 @@ fn tuple_call_return_types_as_boxed() {
     );
     assert!(
         out.contains("PyValue :: from (retryable)")
-            || out.contains("PyValue::from(retryable)"),
+            || out.contains("PyValue::from(retryable)")
+            // tuple(x) reads its source with the reuse-clone (issue #335:
+            // a loop body's `tuple(ints)` must not move `ints`).
+            || out.contains("PyValue :: from ((retryable) . clone ())"),
         "the return body must box the tuple: {}",
         out
     );

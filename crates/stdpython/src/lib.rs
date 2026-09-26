@@ -1592,6 +1592,34 @@ impl PyRange {
     }
 }
 
+impl PyRange {
+    /// CPython's repr: `range(3, 6)`, `range(0, 10, 2)` — the step only
+    /// when it is not 1.
+    pub fn py_repr_string(&self) -> String {
+        if self.step == 1 {
+            format!("range({}, {})", self.next, self.stop)
+        } else {
+            format!("range({}, {}, {})", self.next, self.stop, self.step)
+        }
+    }
+
+    /// CPython's range `==`: the same length, and when non-empty the same
+    /// first element and (for more than one) the same step.
+    pub fn eq_sequence(&self, other: &PyRange) -> bool {
+        let n = self.py_len();
+        if n != other.py_len() {
+            return false;
+        }
+        n == 0 || (self.next == other.next && (n == 1 || self.step == other.step))
+    }
+}
+
+impl From<PyRange> for PyValue {
+    fn from(r: PyRange) -> Self {
+        PyValue::Range(r)
+    }
+}
+
 impl Len for PyRange {
     fn len(&self) -> usize {
         self.py_len()
@@ -2735,6 +2763,10 @@ pub enum PyValue {
     /// A Python `complex` (issue #366): a heterogeneous container or an
     /// `assertEqual` over complex operands carries it boxed.
     Complex(Complex),
+    /// A Python `range` held boxed (a range passed into a boxed parameter
+    /// slot — issue #335): iterates, sizes, indexes, tests membership and
+    /// prints as the range it is (`range(3, 6)`), never as a tuple.
+    Range(PyRange),
     None_,
 }
 
@@ -2758,6 +2790,7 @@ impl IntoIterator for PyValue {
     fn into_iter(self) -> Self::IntoIter {
         let items: Vec<PyValue> = match &self {
             PyValue::Tuple(t) => t.iter().cloned().collect(),
+            PyValue::Range(r) => r.map(PyValue::Int).collect(),
             PyValue::Str(s) => s
                 .chars()
                 .map(|c| PyValue::Str(c.to_string()))
@@ -2805,6 +2838,7 @@ impl PyValue {
             PyValue::Str(s) => s.chars().count(),
             PyValue::Bytes(b) => b.len(),
             PyValue::Tuple(t) => t.len(),
+            PyValue::Range(r) => r.py_len(),
             other => panic!("len() of non-sized PyValue {other:?}"),
         }
     }
@@ -2868,6 +2902,7 @@ impl Truthy for PyValue {
             PyValue::Tuple(t) => !t.is_empty(),
             PyValue::Dict(d) => !d.is_empty(),
             PyValue::Complex(z) => z.real != 0.0 || z.imag != 0.0,
+            PyValue::Range(r) => r.py_len() > 0,
             PyValue::None_ => false,
         }
     }
@@ -3067,6 +3102,9 @@ impl From<Vec<bool>> for PyValue {
 /// anything else is the loud member panic every boxed conversion uses.
 impl From<PyValue> for Vec<i64> {
     fn from(value: PyValue) -> Vec<i64> {
+        if let PyValue::Range(r) = &value {
+            return r.collect();
+        }
         let PyValue::Tuple(items) = &value else {
             value_member_panic("list[int]")
         };
@@ -3146,6 +3184,7 @@ impl PyValue {
             PyValue::Tuple(_) => "tuple",
             PyValue::Dict(_) => "dict",
             PyValue::Complex(_) => "complex",
+            PyValue::Range(_) => "range",
             PyValue::None_ => "NoneType",
         }
     }
@@ -3411,6 +3450,7 @@ pub fn py_value_type_name(v: &PyValue) -> &'static str {
         PyValue::Tuple(_) => "tuple",
         PyValue::Dict(_) => "dict",
         PyValue::Complex(_) => "complex",
+        PyValue::Range(_) => "range",
         PyValue::None_ => "NoneType",
     }
 }
@@ -3423,6 +3463,7 @@ pub fn py_value_str(v: &PyValue) -> String {
         PyValue::Str(s) => s.clone(),
         PyValue::Bytes(b) => py_bytes_repr(b),
         PyValue::Complex(z) => z.py_display(),
+        PyValue::Range(r) => r.py_repr_string(),
         PyValue::Tuple(items) => {
             let inner: Vec<String> = items.iter().map(py_value_repr).collect();
             if inner.len() == 1 {
@@ -3507,6 +3548,10 @@ impl core::hash::Hash for PyValue {
                 let bits = |f: f64| if f == 0.0 { 0f64.to_bits() } else { f.to_bits() };
                 core::hash::Hash::hash(&bits(z.real), state);
                 core::hash::Hash::hash(&bits(z.imag), state);
+            }
+            PyValue::Range(r) => {
+                core::hash::Hash::hash(&9u8, state);
+                core::hash::Hash::hash(&(r.next, r.stop, r.step), state);
             }
             PyValue::None_ => core::hash::Hash::hash(&6u8, state),
         }
@@ -5618,6 +5663,12 @@ impl PyIndex<i64> for PyValue {
                     .ok_or_else(|| PyException::new("IndexError", "tuple index out of range"))?;
                 Ok(members[i].clone())
             }
+            PyValue::Range(r) => {
+                let i = normalize_index(key, r.py_len()).ok_or_else(|| {
+                    PyException::new("IndexError", "range object index out of range")
+                })?;
+                Ok(PyValue::Int(r.next + (i as i64) * r.step))
+            }
             PyValue::Str(s) => {
                 let n = s.chars().count();
                 let i = normalize_index(key, n)
@@ -6720,6 +6771,11 @@ impl PyContains<PyValue> for PyValue {
                 ),
             },
             PyValue::Tuple(t) => t.iter().any(|v| py_value_eq(v, item)),
+            PyValue::Range(r) => match item {
+                PyValue::Int(i) => r.py_contains(i),
+                PyValue::Bool(b) => r.py_contains(&(*b as i64)),
+                other => r.map(PyValue::Int).any(|v| py_value_eq(&v, other)),
+            },
             PyValue::Dict(d) => match item {
                 PyValue::Str(k) => d.contains_key(k),
                 // The boxed dict's keys are Strings; a non-str member is
@@ -6796,6 +6852,10 @@ pub(crate) fn py_value_eq(a: &PyValue, b: &PyValue) -> bool {
         (PyValue::Int(x), PyValue::Bool(y)) => *x == (*y as i64),
         (PyValue::Bool(x), PyValue::Float(y)) => ((*x as i64) as f64) == *y,
         (PyValue::Float(x), PyValue::Bool(y)) => *x == ((*y as i64) as f64),
+        // Two ranges are equal when they produce the same sequence
+        // (`range(0, 3, 2) == range(0, 4, 2)`); a range never equals a
+        // tuple.
+        (PyValue::Range(x), PyValue::Range(y)) => x.eq_sequence(y),
         // A complex equals a real number when its imaginary part is zero
         // and its real part equals the number (`-1+0j == -1`, issue #366).
         (PyValue::Complex(z), other) | (other, PyValue::Complex(z))
@@ -9346,6 +9406,10 @@ pub fn py_extend_values(out: &mut Vec<PyValue>, value: &PyValue) -> Result<(), P
     match value {
         PyValue::Tuple(t) => {
             out.extend(t.iter().cloned());
+            Ok(())
+        }
+        PyValue::Range(r) => {
+            out.extend(r.map(PyValue::Int));
             Ok(())
         }
         PyValue::Str(s) => {
