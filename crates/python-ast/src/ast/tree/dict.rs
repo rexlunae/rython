@@ -128,23 +128,30 @@ impl CodeGen for Dict {
             });
         if forced_kv.is_none() && v_distinct.len() > 1 && !v_unifiable
         {
-            // All values are TUPLES of strings of different lengths
-            // (`{100: ("continue",), 101: ("switching_protocols",), 103:
-            // ("processing", "early-hints"), ...}` — requests' status
-            // codes): unify to Vec<String>.
-            let all_str_tuples = v_distinct.iter().all(|t| match t {
-                crate::TypeInfo::Tuple(ts) => {
-                    !ts.is_empty()
-                        && ts.iter().all(|e| {
-                            matches!(
-                                e,
-                                crate::TypeInfo::StrRef | crate::TypeInfo::String
-                            )
-                        })
+            // All values are TUPLES of one scalar kind (str or int) of
+            // different lengths (`{100: ("continue",), 101:
+            // ("switching_protocols",), 103: ("processing",
+            // "early-hints"), ...}` — requests' status codes; idna's
+            // int-range tables): unify to one variable-length tuple type
+            // (issue #399).
+            let tuple_elem = {
+                let elems: Vec<_> = v_distinct
+                    .iter()
+                    .map(|t| match t {
+                        crate::TypeInfo::Tuple(ts) => {
+                            crate::ast::tree::type_ctx::uniform_tuple_scalar(ts)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                match elems.first() {
+                    Some(Some(first)) if elems.iter().all(|e| e.as_ref() == Some(first)) => {
+                        Some(first.clone())
+                    }
+                    _ => None,
                 }
-                _ => false,
-            });
-            if !all_str_tuples {
+            };
+            if tuple_elem.is_none() {
                 // A HETEROGENEOUS value set that is still BOXABLE
                 // (Optional + bool + str... — urllib3's socks_options
                 // dict: `socks_version` (Optional), `rdns` (bool)):
@@ -175,7 +182,9 @@ impl CodeGen for Dict {
                 // the shape but left v_expected untouched — the raw
                 // PyDict::from then failed to build; Devin review on the
                 // round-100 gate).
-                v_expected = crate::TypeInfo::Vec(Box::new(crate::TypeInfo::String));
+                v_expected = crate::TypeInfo::PyTuple(Box::new(
+                    tuple_elem.expect("checked above"),
+                ));
             }
         }
         let k_expected = if matches!(k_expected, crate::TypeInfo::PyObject) {

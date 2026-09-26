@@ -506,7 +506,7 @@ fn expected_name_types(
                 expected_name_types(e, inner, out);
             }
         }
-        (ExprType::Tuple(t), TypeInfo::Vec(inner)) => {
+        (ExprType::Tuple(t), TypeInfo::Vec(inner) | TypeInfo::PyTuple(inner)) => {
             for e in &t.elts {
                 expected_name_types(e, inner, out);
             }

@@ -309,9 +309,24 @@ impl CodeGen for Compare {
                     }
                 }
             }
-            let comparator = comparator_ast
-                .clone()
-                .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            // A tuple LITERAL compared with a variable-length tuple (`xs ==
+            // (1, 2, 3)` — issue #399) renders as that tuple type, so the
+            // comparison is tuple against tuple.
+            let comparator = match (
+                comparator_ast,
+                crate::infer_type(Some(&ctx), left_ast, &options, &symbols),
+            ) {
+                (ExprType::Tuple(_), left_ty @ crate::TypeInfo::PyTuple(_)) => crate::render_typed(
+                    comparator_ast,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                    Some(left_ty),
+                )?,
+                _ => comparator_ast
+                    .clone()
+                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+            };
             // A GENERIC (inferred) parameter compares with an integer
             // literal converted to the parameter's own type via
             // stdpython's PyFromInt (`B::py_from_int(0)`): Rust std has no

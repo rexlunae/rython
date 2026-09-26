@@ -17469,3 +17469,64 @@ fn method_arguments_and_dict_defaults_box_like_cpython() {
     );
 }
 
+
+#[test]
+fn variable_length_tuples_print_as_tuples() {
+    // Issue #399: a tuple whose length is not fixed statically —
+    // `Tuple[int, ...]`, `tuple(xs)` of a typed list, the mixed-arity
+    // tuple values of one dict literal, `*args`, an `isinstance(x,
+    // tuple)`-narrowed boxed value — prints as a tuple, never the list
+    // its Vec representation used to print.
+    let scratch = Scratch::new("vtuple");
+    let krate = package_crate(
+        &scratch,
+        "vtuple",
+        &[(
+            "cli.py",
+            concat!(
+                "from typing import Any, Dict, List, Tuple\n",
+                "\n",
+                "\n",
+                "def pair(n: int) -> Tuple[int, ...]:\n",
+                "    return tuple([n, n + 1])\n",
+                "\n",
+                "\n",
+                "def bounds(lo: int, hi: int) -> Tuple[int, ...]:\n",
+                "    return (lo, hi)\n",
+                "\n",
+                "\n",
+                "def count(*vals: Any) -> int:\n",
+                "    print(vals)\n",
+                "    return len(vals)\n",
+                "\n",
+                "\n",
+                "def show(x: Any) -> None:\n",
+                "    if isinstance(x, tuple):\n",
+                "        print(x, len(x))\n",
+                "\n",
+                "\n",
+                "def main() -> None:\n",
+                "    t = pair(3)\n",
+                "    print(t, len(t), t[0], t[-1], t[1:], list(t))\n",
+                "    xs: Tuple[int, ...] = (1, 2, 3)\n",
+                "    print(bounds(2, 9), xs == (1, 2, 3), sum(xs))\n",
+                "    codes = {1: (\"a\",), 2: (\"b\", \"c\")}\n",
+                "    spans = {1: (5,), 2: (6, 7, 8)}\n",
+                "    print(codes[2], codes[1], spans[2], spans[1])\n",
+                "    names: List[str] = [\"x\", \"y\"]\n",
+                "    print(tuple(names), tuple(names[:0]))\n",
+                "    print(count(1, \"x\"), count())\n",
+                "    show((1, \"a\"))\n",
+                "\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+        )],
+    );
+    // Verified against python3.
+    assert_eq!(
+        run_package(&krate, "vtuple"),
+        vec!["(3, 4) 2 3 4 (4,) [3, 4]", "(2, 9) True 6", "('b', 'c') ('a',) (6, 7, 8) (5,)", "('x', 'y') ()", "(1, 'x')", "()", "2 0", "(1, 'a') 2"]
+    );
+}

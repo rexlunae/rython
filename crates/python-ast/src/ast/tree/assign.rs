@@ -215,6 +215,27 @@ impl<'a> CodeGen for Assign {
             return Ok(quote!(#ident = #value;));
         }
 
+        // An ANNOTATED variable-length tuple binding (`xs: tuple[int, ...]
+        // = (1, 2, 3)` — issue #399): the value renders against the
+        // annotation, so a tuple literal becomes the tuple type the
+        // annotation names rather than a fixed-shape Rust tuple.
+        if self.targets.len() == 1
+            && let ExprType::Name(target) = &self.targets[0]
+            && let Some(ann) = &self.annotation
+            && let Some(expected @ crate::TypeInfo::PyTuple(_)) =
+                crate::resolve_alias_typeinfo(ann, &symbols, &options)
+        {
+            let ident = crate::safe_ident(&target.id);
+            let value = crate::render_typed(
+                &self.value,
+                ctx,
+                options.clone(),
+                symbols,
+                Some(expected),
+            )?;
+            return Ok(quote!(#ident = #value;));
+        }
+
         // An ANNOTATED binding of a COMPREHENSION (`detectors:
         // list[MessDetectorPlugin] = [md_class() for ...]` —
         // charset_normalizer's mess_ratio, round 114): the annotation's

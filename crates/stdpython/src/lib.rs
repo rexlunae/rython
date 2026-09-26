@@ -3980,54 +3980,6 @@ where
     }
 }
 
-/// Python-style tuple type
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PyTuple<T> {
-    inner: Vec<T>,
-}
-
-impl<T> PyTuple<T> {
-    pub fn new(items: Vec<T>) -> Self {
-        Self { inner: items }
-    }
-    
-    pub fn get(&self, index: usize) -> Option<&T> {
-        self.inner.get(index)
-    }
-    
-    pub fn as_slice(&self) -> &[T] {
-        &self.inner
-    }
-}
-
-impl<T> Len for PyTuple<T> {
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-
-impl<T> Truthy for PyTuple<T> {
-    fn is_truthy(&self) -> bool {
-        !self.inner.is_empty()
-    }
-}
-
-impl<T: Display> Display for PyTuple<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "(")?;
-        for (i, item) in self.inner.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
-            }
-            write!(f, "{}", item)?;
-        }
-        if self.inner.len() == 1 {
-            write!(f, ",")?;
-        }
-        write!(f, ")")
-    }
-}
-
 /// Python-style set type with all set methods
 #[derive(Debug, Clone)]
 pub struct PySet<T>
@@ -6359,7 +6311,7 @@ impl PyMul<&str> for i64 {
 
 /// Normalize a Python index against a length: negative counts from the
 /// end. Returns None when out of range (the caller raises).
-fn normalize_index(index: i64, len: usize) -> Option<usize> {
+pub(crate) fn normalize_index(index: i64, len: usize) -> Option<usize> {
     let len = len as i64;
     let idx = if index < 0 {
         // len + i64::MIN overflows; |index| >> len means out of range, so
@@ -7652,6 +7604,9 @@ complex_mul_scalar!(i64, f64);
 
 #[cfg(feature = "alloc")]
 mod callable;
+/// Variable-length tuples (issue #399).
+mod pytuple;
+pub use pytuple::PyTuple;
 /// Callables as VALUES (issue #122): the runtime type of a
 /// `Callable[[A], R]` annotation, a `lambda` and a nested `def`.
 #[cfg(feature = "alloc")]
@@ -8775,7 +8730,7 @@ impl From<crate::HashSet<String>> for PyValue {
 
 /// Helper function for tuple creation (common in compiled code)
 pub fn py_tuple<T>(items: Vec<T>) -> PyTuple<T> {
-    PyTuple::new(items)
+    PyTuple(items)
 }
 
 /// Helper for string formatting (common in f-strings compilation)

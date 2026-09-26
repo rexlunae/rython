@@ -5650,7 +5650,10 @@ fn module_init_static_ty(
 pub(crate) fn type_contains_uninferred(t: &crate::TypeInfo) -> bool {
     match t {
         crate::TypeInfo::PyObject => true,
-        crate::TypeInfo::Vec(inner) | crate::TypeInfo::Option(inner) | crate::TypeInfo::Borrowed(inner) => {
+        crate::TypeInfo::Vec(inner)
+        | crate::TypeInfo::PyTuple(inner)
+        | crate::TypeInfo::Option(inner)
+        | crate::TypeInfo::Borrowed(inner) => {
             type_contains_uninferred(inner)
         }
         crate::TypeInfo::Dict(k, v) => type_contains_uninferred(k) || type_contains_uninferred(v),

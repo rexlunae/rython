@@ -900,7 +900,8 @@ impl CodeGen for Arguments {
         if let Some(vararg) = self.vararg {
             let vararg_name = crate::safe_ident(&vararg.arg);
             let elt = vararg_element_type(&vararg, &symbols, &options).to_rust_type();
-            params.push(quote!(#vararg_name: Vec<#elt>));
+            // A tuple, as Python's `args` is (issue #399: it prints so).
+            params.push(quote!(#vararg_name: stdpython::PyTuple<#elt>));
         }
         
         // Process keyword-only arguments. Like positional defaults above,

@@ -217,7 +217,9 @@ fn collect_container_elements(
 ) {
     fn from_type(t: &TypeInfo, in_container: bool, out: &mut HashSet<String>) {
         match t {
-            TypeInfo::Vec(inner) | TypeInfo::HashSet(inner) => from_type(inner, true, out),
+            TypeInfo::Vec(inner) | TypeInfo::PyTuple(inner) | TypeInfo::HashSet(inner) => {
+                from_type(inner, true, out)
+            }
             TypeInfo::Dict(_, v) => from_type(v, true, out),
             // A tuple HOLDS its elements as a list does (`pair: tuple[Item,
             // Item]`; Devin review on #321).
@@ -313,7 +315,7 @@ impl Env {
     fn class_of(&self, receiver: &ExprType) -> Option<String> {
         let element = |t: &TypeInfo| -> Option<String> {
             match t {
-                TypeInfo::Vec(inner) | TypeInfo::HashSet(inner) => match inner.as_ref() {
+                TypeInfo::Vec(inner) | TypeInfo::PyTuple(inner) | TypeInfo::HashSet(inner) => match inner.as_ref() {
                     TypeInfo::Class(c) => Some(c.clone()),
                     _ => None,
                 },

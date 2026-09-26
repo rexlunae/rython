@@ -2338,12 +2338,12 @@ impl ClassDef {
             );
         }
         // The `*args` parameter collects extra positionals as a boxed
-        // heterogeneous Vec (`self._args = args` — s3transfer's
-        // FunctionContainer).
+        // heterogeneous tuple (`self._args = args` — s3transfer's
+        // FunctionContainer; issue #399).
         if let Some(vararg) = &init.args.vararg {
             name_types.insert(
                 vararg.arg.clone(),
-                crate::TypeInfo::Vec(Box::new(crate::TypeInfo::PyValue)),
+                crate::TypeInfo::PyTuple(Box::new(crate::TypeInfo::PyValue)),
             );
         }
 

@@ -561,6 +561,7 @@ fn option_inner_py_name(inner: &crate::TypeInfo) -> String {
         }
         crate::TypeInfo::Bytes => "bytes".to_string(),
         crate::TypeInfo::Vec(_) => "list".to_string(),
+        crate::TypeInfo::PyTuple(_) => "tuple".to_string(),
         crate::TypeInfo::Dict(_, _) => "dict".to_string(),
         _ => String::new(),
     }

@@ -129,7 +129,8 @@ declaration — loud, but at the wrong layer (§12.1).
 | `dict[K, V]` | `PyDict<K, V>` | `PyDict` is an insertion-ordered `IndexMap` alias — Python 3.7+ dict ordering is preserved |
 | `set[T]` | `std::collections::HashSet<T>` | |
 | `frozenset[T]` | `std::collections::HashSet<T>` (as an annotation) | The `frozenset(iterable)` *call* produces the distinct runtime type `FrozenSet<T>`; empty `frozenset()` is a loud error |
-| `tuple` (literal) | Rust tuple `(A, B, …)` | There is no `tuple[…]` annotation mapping; tuples exist structurally |
+| `tuple` (literal), `tuple[A, B]` | Rust tuple `(A, B, …)` | A fixed-shape tuple is the Rust tuple of its members |
+| `tuple[T, ...]` | `stdpython::PyTuple<T>` | A tuple whose length is not fixed statically (issue #399): a sequence over a `Vec<T>` (indexing, `len`, iteration, slicing, `in`, `+`, `*`, `sum`, `list(t)`) that prints as a tuple — `(3, 4)`, `(7,)`, `()`. `tuple(xs)` of a typed list builds one, a tuple literal stored or returned into one re-collects, `*args` is one, the mixed-arity tuple values of one dict literal (`{1: ("a",), 2: ("b", "c")}`, str or int members) share one, and an `isinstance(x, tuple)`-narrowed boxed value reads as `PyTuple<PyValue>` |
 | `None` / `Optional[T]` / `T \| None` | `Option<T>` | See §3.5 |
 | `Any` / `typing.Any` / `object` | `stdpython::PyValue` | The boxed heterogeneous value — both the bare `Any` name and the `typing.Any` spelling (urllib3's `dict[str, typing.Any]` returns), so a method annotated `-> dict[str, typing.Any]` types as `PyDict<String, PyValue>` instead of collapsing to unit (round 44) |
 | `bytes \| bytearray` | `Vec<u8>` | Members mapping to the same Rust type collapse to it |
@@ -1653,10 +1654,11 @@ conversion time:
   family is special-cased in the runtime.)
 
 `*args`/`**kwargs` on module functions lower to the boxed heterogeneous
-containers (issue #120): `*args` is `Vec<stdpython::PyValue>` and
+containers (issue #120): `*args` is `stdpython::PyTuple<stdpython::PyValue>` (a tuple, as
+Python's `args` is — it prints `(1, 'x')`, issue #399) and
 `**kwargs` is `PyDict<String, stdpython::PyValue>`. An ANNOTATED `*args`
 is not heterogeneous and does not box: `def total(*nums: int)` says every
-extra positional is an int, so the parameter is `Vec<i64>`, the call
+extra positional is an int, so the parameter is `PyTuple<i64>`, the call
 sites pass plain values, and the body uses it as the list of ints it is
 (`sum(nums)`); a forwarded `f(*args)` between two typed varargs passes
 through unboxed. Call sites with a

@@ -195,10 +195,11 @@ impl CodeGen for Name {
                             quote!((#name).as_bytes().unwrap().to_vec())
                         }
                         // A narrowed tuple member (isinstance(x, tuple))
-                        // reads as the element vector; indexing and len
-                        // then operate on it.
-                        crate::TypeInfo::Vec(_) => {
-                            quote!((#name).as_tuple().unwrap().clone())
+                        // reads as a variable-length tuple of the boxed
+                        // members; indexing and len then operate on it,
+                        // and it prints as a tuple (issue #399).
+                        crate::TypeInfo::PyTuple(_) => {
+                            quote!(stdpython::PyTuple((#name).as_tuple().unwrap().clone()))
                         }
                         _ => quote!((#name)),
                     },

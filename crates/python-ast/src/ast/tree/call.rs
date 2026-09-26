@@ -378,6 +378,21 @@ fn box_assert_argument(
         | crate::TypeInfo::Bytes
         | crate::TypeInfo::Complex
         | crate::TypeInfo::PyValue => Ok(Some(quote!(PyValue::from(#r)))),
+        // A variable-length tuple of boxable scalars boxes as the tuple it
+        // is (issue #399).
+        crate::TypeInfo::PyTuple(inner)
+            if matches!(
+                *inner,
+                crate::TypeInfo::Int
+                    | crate::TypeInfo::Float
+                    | crate::TypeInfo::Bool
+                    | crate::TypeInfo::String
+                    | crate::TypeInfo::Bytes
+                    | crate::TypeInfo::PyValue
+            ) =>
+        {
+            Ok(Some(quote!(PyValue::from(#r))))
+        }
         // A fixed-arity TUPLE of boxable scalars (`(_encode_range(1, 2),)`
         // — idna's test_intranges, issue #334): the boxed tuple of its
         // boxed members.
@@ -4992,6 +5007,20 @@ impl<'a> CodeGen for Call {
                             options.clone(),
                             symbols.clone(),
                         )?;
+                        // A typed list or tuple builds a variable-length
+                        // tuple (issue #399) — it prints `(3, 4)`, where
+                        // the boxed factory's Vec printed as a list.
+                        if let Some(elem) = crate::ast::tree::type_ctx::tuple_call_element(
+                            &self,
+                            Some(&ctx),
+                            &options,
+                            &symbols,
+                        ) {
+                            let ty = elem.to_rust_type();
+                            return Ok(quote!(
+                                stdpython::PyTuple::<#ty>::from_iter((#a).into_iter())
+                            ));
+                        }
                         return Ok(quote!(PyValue::from(#a)));
                     }
                     // next(iterable[, default]): Python's iterator advance.
@@ -5101,6 +5130,11 @@ impl<'a> CodeGen for Call {
                                             | crate::TypeInfo::PyValue
                                             | crate::TypeInfo::PyValueMember(_)
                                             | crate::TypeInfo::PyObject
+                                            // A variable-length tuple
+                                            // displays by reference, so
+                                            // the name stays usable after
+                                            // (issue #399).
+                                            | crate::TypeInfo::PyTuple(_)
                                     )
                                     // A PyException-typed parameter (an
                                     // exception-class union — `str(err)`
@@ -6327,7 +6361,7 @@ impl<'a> CodeGen for Call {
                         // The probe takes the sequence's element type (a
                         // str literal into a list of str owns itself).
                         let x = match crate::infer_type(Some(&ctx), &self.args[0], &options, &symbols) {
-                            crate::TypeInfo::Vec(elem) => crate::render_typed(
+                            crate::TypeInfo::Vec(elem) | crate::TypeInfo::PyTuple(elem) => crate::render_typed(
                                 &self.args[1],
                                 ctx.clone(),
                                 options.clone(),
@@ -13731,7 +13765,9 @@ fn map_call_arguments_inner(
     let build_vararg = |items: &[(TokenStream, bool)]| -> TokenStream {
         if items.iter().all(|(_, is_spread)| !is_spread) {
             let vals: Vec<&TokenStream> = items.iter().map(|(v, _)| v).collect();
-            quote!(vec![#(#vals),*])
+            // The collected extras are a tuple, as Python's `args` is
+            // (issue #399).
+            quote!(stdpython::PyTuple(vec![#(#vals),*]))
         } else {
             let elt = vararg_elt.to_rust_type();
             let boxed_elt = matches!(vararg_elt, crate::TypeInfo::PyValue);
@@ -13754,7 +13790,7 @@ fn map_call_arguments_inner(
                     stmts.extend(quote!(__rython_varargs.push(#v);));
                 }
             }
-            quote!({ #stmts __rython_varargs })
+            quote!(stdpython::PyTuple({ #stmts __rython_varargs }))
         }
     };
 

@@ -4932,3 +4932,34 @@ fn a_boxed_range_is_still_a_range() {
     )
     .is_ok());
 }
+
+#[test]
+fn a_variable_length_tuple_prints_as_a_tuple() {
+    // issue #399: the runtime variable-length tuple.
+    let t = PyTuple(vec![3i64, 4]);
+    // repr((3, 4)) == '(3, 4)'; str((7,)) == '(7,)'; repr(()) == '()'
+    assert_eq!(py_display(&t), "(3, 4)");
+    assert_eq!(py_display(&PyTuple(vec![7i64])), "(7,)");
+    assert_eq!(py_display(&PyTuple::<i64>(vec![])), "()");
+    // repr(('b', 'c')) == "('b', 'c')"
+    assert_eq!(
+        py_display(&PyTuple(vec!["b".to_string(), "c".to_string()])),
+        "('b', 'c')"
+    );
+    // (3, 4)[1:] == (4,); (3, 4) + (5,) == (3, 4, 5); (1, 2) * 2 == (1, 2, 1, 2)
+    assert_eq!(py_display(&t.py_slice(Some(1), None, None)), "(4,)");
+    assert_eq!(py_display(&t.py_add(&PyTuple(vec![5]))), "(3, 4, 5)");
+    assert_eq!(py_display(&PyTuple(vec![1i64, 2]).py_mul(&2)), "(1, 2, 1, 2)");
+    // 3 in (3, 4); len(()) == 0; bool(()) is False; sum((1, 2, 3)) == 6
+    assert!(t.py_contains(&3));
+    assert_eq!(PyTuple::<i64>(vec![]).len(), 0);
+    assert!(!PyTuple::<i64>(vec![]).is_truthy());
+    assert_eq!(sum(PyTuple(vec![1i64, 2, 3])), 6);
+    // (3, 4)[5] -> IndexError: tuple index out of range
+    assert_eq!(t.py_index(5i64).unwrap_err().message, "tuple index out of range");
+    // (3, 4)[-1] == 4; list((3, 4)) == [3, 4]
+    assert_eq!(t.py_index(-1i64).unwrap(), 4);
+    assert_eq!(list(t.clone()), vec![3, 4]);
+    // A boxed tuple is still a tuple: repr(tuple([1, 2])) == '(1, 2)'
+    assert_eq!(py_display(&PyValue::from(t)), "(3, 4)");
+}
