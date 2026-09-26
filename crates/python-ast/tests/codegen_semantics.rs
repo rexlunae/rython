@@ -5600,6 +5600,63 @@ fn value_returning_main_gets_a_wrapper_entry_point() {
 }
 
 #[test]
+fn every_entry_point_allows_dead_code_for_the_lib_copy() {
+    // rypip compiles an entry module twice: as the bin root, where `main`
+    // is the process entry point, and as a lib submodule (`pub mod br;`),
+    // where nothing calls it — rustc's dead_code warned on the lib copy
+    // (`function \`main\` is never used`). Every entry-point shape carries
+    // `#[allow(dead_code)]`, like `__module_init__`, so the generated crate
+    // builds warning-clean.
+    let cases = [
+        // The user's `def main` IS the entry (simple main() call).
+        (
+            "def main() -> None:\n    print(\"hi\")\n\nif __name__ == \"__main__\":\n    main()\n",
+            "simple.py",
+        ),
+        // Module init needed: the user's main becomes python_main behind a
+        // wrapper entry.
+        (
+            "from typing import List\nREG: List[int] = [1, 2]\n\ndef main() -> None:\n    REG.append(3)\n    print(REG)\n\nif __name__ == \"__main__\":\n    main()\n",
+            "initv.py",
+        ),
+        // A block with more than the main() call: consolidated wrapper.
+        (
+            "def main() -> None:\n    print(\"hi\")\n\nif __name__ == \"__main__\":\n    print(\"start\")\n    main()\n",
+            "complexb.py",
+        ),
+        // A value-returning main: wrapper entry discarding the value.
+        (
+            "def main() -> int:\n    return 0\n\nif __name__ == \"__main__\":\n    main()\n",
+            "intmain.py",
+        ),
+        // The user's async main is the entry under the runtime attribute.
+        (
+            "import asyncio\n\nasync def main() -> None:\n    print(\"hi\")\n\nif __name__ == \"__main__\":\n    asyncio.run(main())\n",
+            "asyncm.py",
+        ),
+        // No __main__ block, but top-level code: an init-only entry.
+        ("from typing import List\nREG: List[int] = [1, 2]\nprint(REG)\n", "nomain.py"),
+    ];
+    for (src, name) in cases {
+        let out = compile(src, name);
+        let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+        let entries: Vec<usize> = flat.match_indices("fnmain(").map(|(i, _)| i).collect();
+        assert_eq!(entries.len(), 1, "{}: exactly one entry point expected: {}", name, out);
+        let head = &flat[..entries[0]];
+        let head = head.strip_suffix("async").unwrap_or(head);
+        let head = head
+            .strip_suffix("#[cfg_attr(feature=\"async-tokio\",tokio::main)]")
+            .unwrap_or(head);
+        assert!(
+            head.ends_with("#[allow(dead_code)]"),
+            "{}: the entry point must allow dead_code: {}",
+            name,
+            out
+        );
+    }
+}
+
+#[test]
 fn unittest_main_emits_a_test_runner() {
     // issue #334: `unittest.main()` in a `__main__` block lowers to an
     // emitted runner that constructs each *TestCase subclass and calls its
