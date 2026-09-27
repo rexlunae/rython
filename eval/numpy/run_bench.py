@@ -22,6 +22,8 @@ import sys
 import time
 from pathlib import Path
 
+from _cargo import add_stdpython_features
+
 ROOT = Path(__file__).resolve().parents[2]
 BENCH = Path(__file__).resolve().parent / "bench"
 RYPIP = ROOT / "target" / "release" / "rypip"
@@ -121,11 +123,7 @@ def main() -> int:
                 continue
 
             toml = crate / "Cargo.toml"
-            feats = ", ".join(f'"{f}"' for f in FEATURES)
-            toml.write_text(re.sub(
-                r'^stdpython = \{ path = "([^"]+)" \}$',
-                lambda m: f'stdpython = {{ path = "{m.group(1)}", features = [{feats}] }}',
-                toml.read_text(), flags=re.M))
+            add_stdpython_features(toml, FEATURES)
 
             rc, out, err = run(["cargo", "build", "--release"], cwd=crate, env=env)
             if rc != 0:
