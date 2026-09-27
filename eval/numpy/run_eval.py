@@ -36,6 +36,8 @@ import sys
 import time
 from pathlib import Path
 
+from _cargo import add_stdpython_features
+
 ROOT = Path(__file__).resolve().parents[2]
 CASES = Path(__file__).resolve().parent / "cases"
 RYPIP = ROOT / "target" / "release" / "rypip"
@@ -68,14 +70,7 @@ def inject_backend(src: str, backend: str) -> str:
 
 
 def set_features(crate: Path, features: list[str]) -> None:
-    if not features:
-        return
-    toml = crate / "Cargo.toml"
-    feats = ", ".join(f'"{f}"' for f in features)
-    toml.write_text(re.sub(
-        r'^stdpython = \{ path = "([^"]+)" \}$',
-        lambda m: f'stdpython = {{ path = "{m.group(1)}", features = [{feats}] }}',
-        toml.read_text(), flags=re.M))
+    add_stdpython_features(crate / "Cargo.toml", features)
 
 
 def main() -> int:
