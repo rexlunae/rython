@@ -39,7 +39,11 @@ pub(crate) fn stdpython_module_class(module: &str, name: &str) -> bool {
         StdModule::Urllib => false,
         // The alias table is a static dict, not a constructible class.
         StdModule::Encodings => false,
-        StdModule::Collections => matches!(name, "OrderedDict" | "defaultdict" | "deque"),
+        // The collections names come from the CollectionsType enum (one
+        // source of truth); only the classes with a `::new` construction
+        // lowering are classes here.
+        StdModule::Collections => crate::CollectionsType::from_name(name)
+            .is_some_and(crate::CollectionsType::has_construction_lowering),
         StdModule::Re => false,
         StdModule::Itertools => false,
         StdModule::Functools => false,
@@ -184,7 +188,7 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
                 | "urldefrag",
         ),
         StdModule::Collections => {
-            matches!(name, "OrderedDict" | "defaultdict" | "deque" | "namedtuple")
+            crate::CollectionsType::from_name(name).is_some_and(crate::CollectionsType::is_module_item)
         }
         StdModule::Re => matches!(name, "compile" | "match" | "search" | "findall" | "finditer" | "sub" | "split" | "fullmatch" | "escape" | "IGNORECASE"),
         StdModule::Itertools => matches!(

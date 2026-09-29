@@ -19562,3 +19562,48 @@ fn a_mutation_through_a_class_parameter_reaches_the_callers_object() {
         ],
     );
 }
+
+#[test]
+fn collections_namedtuple_import_builds() {
+    // `from collections import namedtuple` emitted `use
+    // stdpython::collections::namedtuple`, but namedtuple is a
+    // conversion-time class factory with no runtime item: every program
+    // importing it failed E0432, including the supported `class
+    // T(namedtuple(...))` base (issue #367 drops the base with a warning).
+    // The import now drops like the other names with no runtime item.
+    let scratch = Scratch::new("ntimport");
+    let file = scratch.path().join("nt_import.py");
+    fs::write(
+        &file,
+        concat!(
+            "from collections import namedtuple\n",
+            "\n",
+            "\n",
+            "class Tag(namedtuple(\"_Tag\", [\"name\"])):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    total = 0\n",
+            "    for n in [3, 4]:\n",
+            "        total += n\n",
+            "    print(\"total\", total)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/nt_import"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "total 7\n");
+}
