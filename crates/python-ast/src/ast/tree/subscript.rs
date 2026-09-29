@@ -208,7 +208,7 @@ impl CodeGen for Subscript {
                 if options.cell_locals.contains(&n.id)
                     && matches!(
                         recv_type,
-                        crate::TypeInfo::Collection(crate::CollectionsType::DefaultDict, _)
+                        crate::TypeInfo::Collection(crate::CollectionsType::Defaultdict, _)
                     ) =>
             {
                 Some(crate::safe_ident(&n.id))

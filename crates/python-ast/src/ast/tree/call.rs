@@ -792,6 +792,59 @@ fn resolve_builtin_alias(
     None
 }
 
+/// The `collections` name a call's callee resolves to: a from-import
+/// (`from collections import ChainMap as CM` — the registry key is the
+/// ORIGINAL name), a re-export chain through sibling modules ending in
+/// one, or the qualified `collections.X` spelling (through an `import
+/// collections as c` alias too). `None` for anything else, including a
+/// local that shadows the module name.
+fn collections_callee(
+    func: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<crate::CollectionsType> {
+    use crate::StdModule;
+    let (module, name) = match func {
+        ExprType::Name(n) => match symbols.get(&n.id) {
+            Some(SymbolTableNode::ImportFrom(ifm)) if ifm.level == 0 => {
+                let canonical = ifm
+                    .names
+                    .iter()
+                    .find(|a| a.asname.as_deref() == Some(&n.id))
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| n.id.clone());
+                if StdModule::from_name(&ifm.module).is_some() {
+                    (ifm.module.clone(), canonical)
+                } else {
+                    stdpython_reexport_chain(&n.id, symbols, options)?
+                }
+            }
+            Some(SymbolTableNode::ImportFrom(_)) => stdpython_reexport_chain(&n.id, symbols, options)?,
+            Some(SymbolTableNode::Alias(canonical)) => {
+                stdpython_reexport_chain(canonical, symbols, options)?
+            }
+            _ => return None,
+        },
+        ExprType::Attribute(attr) => match attr.value.as_ref() {
+            ExprType::Name(m) if !module_name_shadowed(&m.id, symbols) => {
+                // `import collections as col` binds `col` as an Alias of
+                // the module name.
+                let module = match symbols.get(&m.id) {
+                    Some(SymbolTableNode::Alias(target)) => target.clone(),
+                    _ => m.id.clone(),
+                };
+                (module, attr.attr.clone())
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if StdModule::from_name(&module) != Some(StdModule::Collections) {
+        return None;
+    }
+    crate::CollectionsType::from_name(&name)
+}
+
 /// Follow an ImportFrom re-export chain (`from .compat import OrderedDict`
 /// where compat does `from collections import OrderedDict`) through the
 /// generated crate's modules; returns the terminal STDPYTHON
@@ -2465,6 +2518,21 @@ impl<'a> CodeGen for Call {
                     return Ok(TokenStream::new());
                 }
             }
+        }
+        // A `collections` class the runtime defines but the converter
+        // cannot construct (`ChainMap(d1, d2)`, `collections.Counter(xs)`):
+        // refuse at conversion, naming the rewrite, instead of emitting a
+        // bare `X(...)` that fails in rustc (E0425 / E0423).
+        if let Some(item) = collections_callee(self.func.as_ref(), &symbols, &options)
+            && let Some(rewrite) = item.unlowered_rewrite()
+        {
+            return Err(format!(
+                "`collections.{}(...)` is not supported yet: the converter has no \
+                 construction lowering for it; {}; rython refuses to silently ignore it",
+                item.name(),
+                rewrite
+            )
+            .into());
         }
         // `typing.cast(T, value)` — the MODULE-QUALIFIED form of the
         // runtime-identity cast (`typing.cast(ProxyConfig,
@@ -8659,7 +8727,8 @@ let mutating_self_field = boxed_self_ref_receiver
                             );
                         }
                     }
-                    crate::CollectionsType::DefaultDict => {}
+                    crate::CollectionsType::Defaultdict => {}
+                _ => {}
                 }
             }
 
@@ -10926,7 +10995,11 @@ let mutating_self_field = boxed_self_ref_receiver
         // the from-import spelling does.
         if let ExprType::Attribute(attr) = self.func.as_ref()
             && let ExprType::Name(m) = attr.value.as_ref()
-            && let Some(kind) = crate::ast::tree::collections_lower::ctor_of(&self.func, &symbols)
+            && crate::StdModule::from_name(&m.id) == Some(crate::StdModule::Collections)
+            && let Some(kind) =
+                crate::ast::tree::collections_lower::ctor_of(&self.func, &symbols)
+            && crate::CollectionsType::from_name(&attr.attr)
+                .is_some_and(crate::CollectionsType::has_construction_lowering)
         {
             let module = crate::safe_ident(&m.id);
             let cname = crate::safe_ident(&attr.attr);

@@ -14788,6 +14788,115 @@ fn qualified_collections_class_constructs_via_new() {
 }
 
 #[test]
+fn chainmap_construction_is_rejected_at_conversion() {
+    // collections.ChainMap has a runtime type but no construction
+    // lowering: every spelling of the call must fail CONVERSION, naming
+    // the class and the rewrite — before this it rendered as a bare
+    // `ChainMap(...)` and failed in rustc (E0425 / E0423).
+    for (src, name) in [
+        (
+            "from collections import ChainMap\n\
+             cm = ChainMap({\"a\": 1}, {\"b\": 2})\n",
+            "cm_from.py",
+        ),
+        (
+            "import collections\n\
+             cm = collections.ChainMap({\"a\": 1}, {\"b\": 2})\n",
+            "cm_qualified.py",
+        ),
+        (
+            "from collections import ChainMap as CM\n\
+             \n\
+             def f() -> int:\n\
+             \x20   return len(CM({\"a\": 1}))\n",
+            "cm_alias.py",
+        ),
+        (
+            "import collections as col\n\
+             cm = col.ChainMap({\"a\": 1})\n",
+            "cm_module_alias.py",
+        ),
+    ] {
+        let err = compile_err(src, name);
+        assert!(
+            err.contains("`collections.ChainMap(...)` is not supported yet")
+                && err.contains("{**d2, **d1}")
+                && err.contains("rython refuses to silently ignore it"),
+            "{}: ChainMap construction must fail conversion with the rewrite: {}",
+            name,
+            err
+        );
+    }
+}
+
+#[test]
+fn counter_construction_is_rejected_at_conversion() {
+    // collections.Counter: the same missing construction lowering as
+    // ChainMap (a bare `Counter(...)` failed in rustc) — loud at
+    // conversion, naming the plain-dict rewrite.
+    for (src, name) in [
+        (
+            "from collections import Counter\n\
+             c = Counter(\"abca\")\n",
+            "counter_from.py",
+        ),
+        (
+            "import collections\n\
+             \n\
+             def f() -> None:\n\
+             \x20   c = collections.Counter([1, 2, 1])\n",
+            "counter_qualified.py",
+        ),
+    ] {
+        let err = compile_err(src, name);
+        assert!(
+            err.contains("`collections.Counter(...)` is not supported yet")
+                && err.contains("counts.get(x, 0) + 1"),
+            "{}: Counter construction must fail conversion with the rewrite: {}",
+            name,
+            err
+        );
+    }
+}
+
+#[test]
+fn unconstructed_or_shadowed_collections_names_still_convert() {
+    // The rejection sits at the CONSTRUCTION, the exact point of
+    // divergence: an import that is never called still converts (its
+    // `use` drops with a warning, as before), and a local definition that
+    // shadows the name is the local's call.
+    compile(
+        "from collections import ChainMap, Counter\n\
+         print(1)\n",
+        "cm_unused.py",
+    );
+    let out = compile(
+        "def ChainMap(a: int) -> int:\n\
+         \x20   return a + 1\n\
+         \n\
+         print(ChainMap(1))\n",
+        "cm_shadowed.py",
+    );
+    assert!(out.contains("ChainMap (1)"), "the local function is called: {}", out);
+    // The classes WITH a lowering are untouched by the enum refactor.
+    let out = compile(
+        "import collections\n\
+         \n\
+         def f() -> None:\n\
+         \x20   d = collections.OrderedDict()\n\
+         \x20   e = collections.defaultdict(int)\n",
+        "cm_lowered.py",
+    );
+    assert!(
+        out.contains("collections :: OrderedDict") && out.contains(":: new ()")
+            && out.contains("collections :: defaultdict")
+            && out.contains(":: with_class"),
+        "qualified OrderedDict/defaultdict must still construct: {}",
+        out
+    );
+}
+
+#[test]
 fn from_imported_socket_function_calls_directly() {
     // `from socket import getdefaulttimeout` then `getdefaulttimeout()`
     // (urllib3's util/timeout): a stdlib FUNCTION import — a direct
