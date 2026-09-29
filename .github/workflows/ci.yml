@@ -41,6 +41,19 @@ jobs:
           rustup target add thumbv7m-none-eabi
           cargo check -p stdpython --no-default-features --features alloc --target thumbv7m-none-eabi
 
+  # The numpy backend features: the rayon kernels (including the x86_64
+  # AVX2 matmul, compiled only with numpy-rayon) have no other CI build,
+  # which is how #425's compile error reached main unnoticed.
+  numpy-backends:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Test stdpython (numpy-rayon + numpy-simd)
+        run: cargo test -p stdpython --features numpy-rayon,numpy-simd
+
   # The idiom corpus: small idiomatic programs that must convert, build, and
   # print exactly what CPython prints. A ratchet, not a gate: it fails only
   # when a program gets worse than eval/idioms/baseline.json records (a
