@@ -543,6 +543,21 @@ impl<'a> CodeGen for Attribute {
                         None
                     }
                 });
+        // A `urllib.parse` result's COMPUTED property (`parsed.hostname`,
+        // `parsed.port`): the runtime models it as a method, so the read is
+        // the call — `port` raises ValueError like CPython's, hence `?`.
+        let parse_result_property = crate::ast::tree::type_ctx::ParseResultAttr::from_name(
+            &self.attr,
+        )
+        .filter(|a| a.is_computed())
+        .filter(|_| {
+            crate::ast::tree::type_ctx::is_parse_result_typeinfo(&crate::infer_type(
+                Some(&ctx),
+                &self.value,
+                &options,
+                &symbols,
+            ))
+        });
         // Whether the getter needs `&mut self` (it stores a cache — a
         // SHARED receiver's read then borrows the one object MUTABLY;
         // computed before `options` is moved by the receiver render).
@@ -793,6 +808,13 @@ impl<'a> CodeGen for Attribute {
                     receiver, self.attr
                 ));
                 return Ok(quote!(stdpython::PyValue::None_));
+            }
+            if let Some(property) = parse_result_property {
+                return Ok(if property.is_fallible() {
+                    quote!((#value_tokens).#attr()?)
+                } else {
+                    quote!((#value_tokens).#attr())
+                });
             }
             // Use . for field/method access (Python's obj.field becomes obj.field).
             // A class field owned by an ancestor of the receiver's class is
@@ -1792,3 +1814,28 @@ pub(crate) fn threading_local_receiver(
     Ok(Some(value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?))
 }
 
+/// Whether reading `attr` lowers to a CALL whose result is a fresh owned
+/// value — a property getter on the receiver's class (`self.url()?`), or
+/// a `urllib.parse` result's computed property (`parsed.hostname()`) —
+/// rather than a place. A reused receiver needs no clone of such a read.
+pub(crate) fn attribute_read_is_call(
+    attr: &Attribute,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    if crate::ast::tree::type_ctx::ParseResultAttr::from_name(&attr.attr)
+        .is_some_and(|a| a.is_computed())
+        && crate::ast::tree::type_ctx::is_parse_result_typeinfo(&crate::infer_type(
+            Some(ctx),
+            &attr.value,
+            options,
+            symbols,
+        ))
+    {
+        return true;
+    }
+    crate::receiver_class_for_read(&attr.value, ctx, symbols, options).is_some_and(
+        |(class, class_symbols)| class.has_property_getter(&attr.attr, &class_symbols, options),
+    )
+}

@@ -1894,7 +1894,60 @@ impl ClassDef {
     /// `__init__` stores, either a direct construction or an
     /// annotated parameter whose annotation names a class. Walks the MRO so
     /// a base class's composed field resolves from a derived method.
+    ///
+    /// A field the `__init__` stores cannot place (`self.poolmanager =
+    /// PoolManager(...)` inside `init_poolmanager`, which `__init__` calls
+    /// — requests' HTTPAdapter) takes the class the STRUCT declares it
+    /// with: [`Self::infer_fields`], the authority that sees every method's
+    /// stores.
     pub(crate) fn field_class(
+        &self,
+        attr: &str,
+        symbols: &SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Option<String> {
+        self.field_class_from_init(attr, symbols, options)
+            .or_else(|| self.field_class_from_struct(attr, symbols, options))
+    }
+
+    fn field_class_from_struct(
+        &self,
+        attr: &str,
+        symbols: &SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Option<String> {
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            ("field-class-from-struct", &self.name, attr).hash(&mut h);
+            h.finish() as usize
+        };
+        crate::ast::tree::type_ctx::resolving_return(
+            key,
+            || None,
+            || {
+                let chain = self.base_chain(symbols);
+                let owner = chain.iter().find(|c| c.owns_field(attr))?;
+                let fields = owner.infer_fields(symbols, options).ok()?;
+                let class_name = match fields.iter().find(|(name, _)| name == attr)? {
+                    (_, crate::TypeInfo::Class(c)) => c.clone(),
+                    _ => return None,
+                };
+                match symbols.get(&class_name) {
+                    Some(SymbolTableNode::ClassDef(_)) => Some(class_name),
+                    Some(SymbolTableNode::ImportFrom(_))
+                        if crate::resolve_class_referenced(&class_name, symbols, options)
+                            .is_some() =>
+                    {
+                        Some(class_name)
+                    }
+                    _ => None,
+                }
+            },
+        )
+    }
+
+    fn field_class_from_init(
         &self,
         attr: &str,
         symbols: &SymbolTableScopes,

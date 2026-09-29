@@ -1128,6 +1128,16 @@ fn infer_type_inner(
             }
             // The builtin `open` in a text mode returns the text file.
             _ if is_text_open_call(call, symbols) => file_typeinfo(),
+            // `urlparse(url)` / `urlsplit(url)` return the runtime's
+            // ParseResult, whose attributes type below.
+            ExprType::Name(n)
+                if matches!(
+                    crate::ast::tree::call::urllib_parse_fn(&n.id, symbols, options),
+                    Some("urlparse" | "urlsplit")
+                ) =>
+            {
+                parse_result_typeinfo()
+            }
             // The ITERATOR builtins carry their argument's element type
             // through (issue #222), so they are typed before the
             // name-only table below, which cannot see arguments.
@@ -1338,10 +1348,16 @@ fn infer_type_inner(
                             resolve_alias_typeinfo(ann, symbols, options)
                         }) {
                             Some(t) => return t,
-                            None => TypeInfo::PyObject,
+                            None => instance_method_call_typeinfo(ctx, attr, options, symbols)
+                                .unwrap_or(TypeInfo::PyObject),
                         }
                     }
-                    _ => TypeInfo::PyObject,
+                    // A method call on an INSTANCE of a known class
+                    // (`self.manager.connection_from_host(h)`, `conn.m()`
+                    // with conn a class-typed local): the method's return
+                    // on the receiver class's MRO.
+                    _ => instance_method_call_typeinfo(ctx, attr, options, symbols)
+                        .unwrap_or(TypeInfo::PyObject),
                 }
             }
             _ => TypeInfo::PyObject,
@@ -1368,13 +1384,17 @@ fn infer_type_inner(
             {
                 return t;
             }
+            let receiver_type = infer_type_inner(ctx, &attr.value, options, symbols);
             // Any attribute of a `threading.local()` object is a run-time
             // attribute: a boxed value (issue #356).
-            if matches!(
-                infer_type_inner(ctx, &attr.value, options, symbols),
-                TypeInfo::Threading(crate::ThreadingType::Local)
-            ) {
+            if matches!(receiver_type, TypeInfo::Threading(crate::ThreadingType::Local)) {
                 return TypeInfo::PyValue;
+            }
+            // A `urllib.parse` result's component or computed property.
+            if is_parse_result_typeinfo(&receiver_type)
+                && let Some(a) = ParseResultAttr::from_name(&attr.attr)
+            {
+                return a.typeinfo();
             }
             // A class-level literal constant read through `self` or the
             // class (issue #367 — attribute.rs renders `Self::NAME` /
@@ -1396,18 +1416,24 @@ fn infer_type_inner(
                 }
             }
             // `self` needs the class context; a class-typed NAME (a local
-            // or parameter the analysis typed) resolves in any context.
-            if let ExprType::Name(recv) = attr.value.as_ref()
-                && ((recv.id == "self" && ctx.is_some())
-                    || matches!(options.name_types.get(&recv.id), Some(TypeInfo::Class(_))))
-            {
-                let class_name = if recv.id == "self" {
+            // or parameter the analysis typed) resolves in any context; a
+            // FIELD CHAIN or other receiver whose inferred type is a class
+            // (`h.reg.pools` where `h.reg` is a Reg) resolves through it.
+            let receiver_class_name = match attr.value.as_ref() {
+                ExprType::Name(recv) if recv.id == "self" => {
                     ctx.and_then(|c| c.enclosing_class_name()).map(str::to_string)
-                } else if let Some(TypeInfo::Class(cname)) = options.name_types.get(&recv.id) {
-                    Some(cname.clone())
-                } else {
-                    None
-                };
+                }
+                ExprType::Name(recv) => match options.name_types.get(&recv.id) {
+                    Some(TypeInfo::Class(cname)) => Some(cname.clone()),
+                    _ => None,
+                },
+                _ => match &receiver_type {
+                    TypeInfo::Class(cname) => Some(cname.clone()),
+                    _ => None,
+                },
+            };
+            if receiver_class_name.is_some() {
+                let class_name = receiver_class_name;
                 // Resolve through the SAME tail the codegen uses — a class
                 // name the local scope does not bind resolves across the
                 // crate's modules (`r.encoding` where `r` came from
@@ -1689,6 +1715,79 @@ pub(crate) fn file_typeinfo() -> TypeInfo {
 /// Whether a TypeInfo is the runtime's text-file type ([`file_typeinfo`]).
 pub(crate) fn is_file_typeinfo(t: &TypeInfo) -> bool {
     matches!(t, TypeInfo::Custom(tokens) if tokens.to_string() == "PyFile")
+}
+
+/// The runtime's `urllib.parse` result as a TypeInfo: the
+/// `stdpython::urllib::parse::ParseResult` struct that `urlparse` and
+/// `urlsplit` return (CPython's `ParseResult` / `SplitResult`).
+pub(crate) fn parse_result_typeinfo() -> TypeInfo {
+    TypeInfo::Custom(quote!(stdpython::urllib::parse::ParseResult))
+}
+
+/// Whether a TypeInfo is the runtime's `urllib.parse` result
+/// ([`parse_result_typeinfo`]).
+pub(crate) fn is_parse_result_typeinfo(t: &TypeInfo) -> bool {
+    *t == parse_result_typeinfo()
+}
+
+/// An attribute of a `urllib.parse` result (`ParseResult` / `SplitResult`).
+/// The six components are stored fields; `hostname`, `port`, `username`
+/// and `password` are CPython properties computed from the netloc, which
+/// the runtime models as methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParseResultAttr {
+    Scheme,
+    Netloc,
+    Path,
+    Params,
+    Query,
+    Fragment,
+    Hostname,
+    Port,
+    Username,
+    Password,
+}
+
+impl ParseResultAttr {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "scheme" => Self::Scheme,
+            "netloc" => Self::Netloc,
+            "path" => Self::Path,
+            "params" => Self::Params,
+            "query" => Self::Query,
+            "fragment" => Self::Fragment,
+            "hostname" => Self::Hostname,
+            "port" => Self::Port,
+            "username" => Self::Username,
+            "password" => Self::Password,
+            _ => return None,
+        })
+    }
+
+    /// Whether the attribute is a computed property (a runtime method
+    /// call) rather than a stored component (a field read).
+    pub(crate) fn is_computed(self) -> bool {
+        matches!(self, Self::Hostname | Self::Port | Self::Username | Self::Password)
+    }
+
+    /// Whether reading the attribute can raise: CPython's `port` raises
+    /// ValueError for a non-numeric or out-of-range port.
+    pub(crate) fn is_fallible(self) -> bool {
+        self == Self::Port
+    }
+
+    pub(crate) fn typeinfo(self) -> TypeInfo {
+        match self {
+            Self::Scheme | Self::Netloc | Self::Path | Self::Params | Self::Query | Self::Fragment => {
+                TypeInfo::String
+            }
+            Self::Hostname | Self::Username | Self::Password => {
+                TypeInfo::Option(Box::new(TypeInfo::String))
+            }
+            Self::Port => TypeInfo::Option(Box::new(TypeInfo::Int)),
+        }
+    }
 }
 
 /// Whether a call is the BUILTIN `open` in a text mode — no mode, or a
@@ -2439,6 +2538,13 @@ pub fn render_reused(
     // A loop BODY moves on every turn, so one textual use is many at run
     // time: a name consumed here is reused whatever the count says.
     let in_loop = ctx.in_loop_body();
+    // A property read lowers to the getter CALL: a fresh owned value,
+    // never a move out of the receiver.
+    if let ExprType::Attribute(a) = expr
+        && crate::ast::tree::attribute::attribute_read_is_call(a, &ctx, &symbols, &options)
+    {
+        return expr.clone().to_rust(ctx, options, symbols);
+    }
     let tokens = expr
         .clone()
         .to_rust(ctx, options.clone(), symbols.clone())?;
@@ -3644,7 +3750,7 @@ fn expr_walrus_writes(expr: &ExprType, name: &str) -> bool {
     }
 }
 
-fn analysis_view(options: &PythonOptions, info: &FunctionTypeInfo) -> PythonOptions {
+pub(crate) fn analysis_view(options: &PythonOptions, info: &FunctionTypeInfo) -> PythonOptions {
     if info.name_types.is_empty() && info.optional_names.is_empty() {
         return options.clone();
     }
@@ -3856,7 +3962,13 @@ fn analyze_statement_types(
                         // resolves (the context-free path saw an untyped
                         // element and the call fell to the callable-field
                         // form).
-                        ExprType::Subscript(_) => match (options, symbols) {
+                        // An ATTRIBUTE value (`port = parsed.port` where
+                        // `parsed = urlparse(url)`) likewise: the
+                        // receiver's type decides the attribute's, which
+                        // only the context-aware inferrer sees — so an
+                        // Option-typed read makes the local an Option
+                        // binding and a later `port = 80` Some-wraps.
+                        ExprType::Subscript(_) | ExprType::Attribute(_) => match (options, symbols) {
                             (Some(options), Some(symbols)) => {
                                 // The class context: `a = self.accounts[k]`
                                 // reads a field of the enclosing class.
@@ -5418,22 +5530,73 @@ fn self_method_return_typeinfo(
     let (class, class_symbols) =
         crate::ast::tree::call::receiver_class_tail(class_name, symbols.clone(), options)?;
     let method = class.method_on_mro(&attr.attr, &class_symbols)?;
+    method_return_typeinfo(class_name, &method, &class_symbols, options)
+}
+
+/// The type `recv.name(...)` returns when `recv` is an instance of a class
+/// the receiver resolution knows (a self field, a class-typed local or
+/// parameter, a construction, a field chain). None when the receiver's
+/// class or the method is unknown.
+fn instance_method_call_typeinfo(
+    ctx: Option<&CodeGenContext>,
+    attr: &crate::Attribute,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<TypeInfo> {
+    let module_ctx = CodeGenContext::Module(String::new());
+    let ctx = ctx.unwrap_or(&module_ctx);
+    let (class, class_symbols) =
+        crate::ast::tree::call::receiver_class(&attr.value, ctx, symbols, options)?;
+    let method = class.method_on_mro_with_options(&attr.attr, &class_symbols, options)?;
+    // A static/class method's first parameter is not the instance; its
+    // return still types the call, so no receiver-kind check is needed.
+    method_return_typeinfo(&class.name, &method, &class_symbols, options)
+}
+
+/// The type a call of `method` (found on `class_name`'s MRO) returns: its
+/// declared return, or — UNANNOTATED — the type its definition is emitted
+/// with. A primitive signature (`def subtotal(self, o): total = 0.0 ...
+/// return total` is emitted `-> f64`) maps back directly; any other
+/// inferred type counts only when it renders to exactly the emitted
+/// signature, so the caller and the definition agree by construction.
+/// Guarded against recursion through the method's own returns.
+pub(crate) fn method_return_typeinfo(
+    class_name: &str,
+    method: &crate::FunctionDef,
+    class_symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<TypeInfo> {
     if let Some(ann) = method.returns.as_deref() {
-        return resolve_alias_typeinfo(ann, &class_symbols, options);
+        return resolve_alias_typeinfo(ann, class_symbols, options);
     }
-    // An UNANNOTATED method: the return type its definition is emitted
-    // with, when that is a plain primitive (`def subtotal(self, o): total
-    // = 0.0 ... return total` is emitted `-> f64`), so a caller's
-    // `round(self.subtotal(o), 2)` is typed. Guarded against recursion
-    // through the method's own returns.
-    let tokens = self_method_resolved_return(class_name, &method, &class_symbols, options)?;
-    match tokens.to_string().as_str() {
-        "f64" => Some(TypeInfo::Float),
-        "i64" => Some(TypeInfo::Int),
-        "bool" => Some(TypeInfo::Bool),
-        "String" => Some(TypeInfo::String),
-        _ => None,
+    let tokens = self_method_resolved_return(class_name, method, class_symbols, options)?;
+    let emitted = tokens.to_string();
+    match emitted.as_str() {
+        "f64" => return Some(TypeInfo::Float),
+        "i64" => return Some(TypeInfo::Int),
+        "bool" => return Some(TypeInfo::Bool),
+        "String" => return Some(TypeInfo::String),
+        _ => {}
     }
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        ("method-return-typeinfo", class_name, &method.name).hash(&mut h);
+        h.finish() as usize
+    };
+    resolving_return(
+        key,
+        || None,
+        || {
+            [
+                method.inferred_return_typeinfo_in(class_name, class_symbols, options),
+                method.param_scoped_return_typeinfo(Some(class_name), class_symbols, options),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|t| t.to_rust_type().to_string() == emitted)
+        },
+    )
 }
 
 /// The return type `method` of `class` is emitted with (its whole

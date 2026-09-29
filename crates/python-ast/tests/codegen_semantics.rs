@@ -969,15 +969,77 @@ fn option_field_aug_assign_pyvalue_target_uses_runtime() {
 }
 
 #[test]
-fn option_field_bitor_aug_assign_unwraps_inner() {
-    // A `|=` on an `int | None` local (urllib3's `options |= ...` after
-    // `options = 0` inside the None guard): the Option unwrap is the INNER
-    // value OR'd with the RHS.
+fn a_store_of_a_non_none_value_narrows_the_option_local_for_the_rest_of_the_block() {
+    // urllib3's `if options is None: options = 0; options |= ...`: after
+    // the store of `0` the local cannot be None, so the `|=` reads the
+    // narrowed value — no None arm to raise from.
     let out = compile(
         "def orit(x: int | None) -> int | None:\n\
          \x20   if x is None:\n\
          \x20       x = 0\n\
          \x20       x |= 2\n\
+         \x20   return x\n",
+        "optnarrow.py",
+    );
+    assert!(
+        out.contains("x = Some ((x) . clone () . unwrap () | 2)")
+            || out.contains("x=Some((x).clone().unwrap()|2)"),
+        "the |= after a non-None store must read the narrowed value: {}",
+        out
+    );
+}
+
+#[test]
+fn get_or_create_narrows_the_local_after_the_none_guard() {
+    // `pool = pools.get(k); if pool is None: pool = Pool(); pools[k] =
+    // pool; return pool` — the body's last write of `pool` is a
+    // construction, so the store into the dict and the return read the
+    // narrowed value (requests/urllib3's pool caches).
+    let out = compile(
+        "class Pool:\n\
+         \x20   def __init__(self) -> None:\n\
+         \x20       self.n = 0\n\
+         \n\
+         def get(pools: dict[str, Pool], k: str) -> Pool:\n\
+         \x20   pool = pools.get(k)\n\
+         \x20   if pool is None:\n\
+         \x20       pool = Pool()\n\
+         \x20       pools[k] = pool\n\
+         \x20   return pool\n",
+        "getorcreate.py",
+    );
+    assert!(
+        out.contains("return Ok ((pool) . clone () . unwrap ())")
+            || out.contains("return Ok((pool).clone().unwrap())"),
+        "the return after get-or-create must read the narrowed local: {}",
+        out
+    );
+    // A value that MAY be None (another `.get`) narrows nothing.
+    let out = compile(
+        "def pick(a: dict[str, int], b: dict[str, int], k: str) -> int | None:\n\
+         \x20   v = a.get(k)\n\
+         \x20   if v is None:\n\
+         \x20       v = b.get(k)\n\
+         \x20   return v\n",
+        "getorget.py",
+    );
+    assert!(
+        !out.contains("unwrap ()") && !out.contains("unwrap()"),
+        "a fallback that may be None must not narrow: {}",
+        out
+    );
+}
+
+#[test]
+fn option_field_bitor_aug_assign_unwraps_inner() {
+    // A `|=` on an `int | None` local that may still be None (the store
+    // of `0` sits on one path only): the Option unwrap is the INNER value
+    // OR'd with the RHS, and a None target raises CPython's TypeError.
+    let out = compile(
+        "def orit(x: int | None, flag: bool) -> int | None:\n\
+         \x20   if flag:\n\
+         \x20       x = 0\n\
+         \x20   x |= 2\n\
          \x20   return x\n",
         "optor.py",
     );

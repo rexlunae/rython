@@ -3832,7 +3832,7 @@ fn urllib_parse_matches_cpython() {
     assert_eq!(p.query, "a=1&b=2");
     assert_eq!(p.fragment, "frag");
     assert_eq!(p.hostname(), Some("example.com".to_string()));
-    assert_eq!(p.port(), Some(8080));
+    assert_eq!(p.port().unwrap(), Some(8080));
     assert_eq!(p.username(), Some("user".to_string()));
     assert_eq!(p.password(), Some("pass".to_string()));
     assert_eq!(p.geturl(), "https://user:pass@example.com:8080/path/to?a=1&b=2#frag");
@@ -3873,6 +3873,27 @@ fn urllib_parse_matches_cpython() {
     let ui = urlparse("http://user@name:pass@example.com/").unwrap();
     assert_eq!(ui.username(), Some("user@name".to_string()));
     assert_eq!(ui.password(), Some("pass".to_string()));
+    // `.port` (CPython 3.11): urlparse succeeds, the read raises.
+    //   urlparse("http://h:0080/").port == 80
+    //   urlparse("http://h:/").port is None; urlparse("http://h/").port is None
+    //   urlparse("http://[::1]:8/").port == 8
+    //   urlparse("http://h:abc/").port  -> ValueError: Port could not be cast to integer value as 'abc'
+    //   urlparse("http://h:-1/").port   -> ValueError: Port could not be cast to integer value as '-1'
+    //   urlparse("http://h:70000/").port -> ValueError: Port out of range 0-65535
+    let port = |u: &str| urlparse(u).unwrap().port().map_err(|e| e.to_string());
+    assert_eq!(port("http://h:0080/"), Ok(Some(80)));
+    assert_eq!(port("http://h:/"), Ok(None));
+    assert_eq!(port("http://h/"), Ok(None));
+    assert_eq!(port("http://[::1]:8/"), Ok(Some(8)));
+    assert_eq!(
+        port("http://h:abc/"),
+        Err("ValueError: Port could not be cast to integer value as 'abc'".to_string())
+    );
+    assert_eq!(
+        port("http://h:-1/"),
+        Err("ValueError: Port could not be cast to integer value as '-1'".to_string())
+    );
+    assert_eq!(port("http://h:70000/"), Err("ValueError: Port out of range 0-65535".to_string()));
     assert_eq!(ui.hostname(), Some("example.com".to_string()));
     //   urlparse("HTTP://EXAMPLE.COM/").scheme == "http" (lowercased).
     assert_eq!(urlparse("HTTP://EXAMPLE.COM/").unwrap().scheme, "http");

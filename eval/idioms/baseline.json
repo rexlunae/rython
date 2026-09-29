@@ -24,6 +24,9 @@
     "detect": {
       "status": "pass"
     },
+    "factory_return": {
+      "status": "pass"
+    },
     "float_coercion": {
       "status": "pass"
     },
@@ -97,6 +100,9 @@
       "status": "pass"
     },
     "untyped_method_args": {
+      "status": "pass"
+    },
+    "url_parts": {
       "status": "pass"
     },
     "valueor": {

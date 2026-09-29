@@ -840,7 +840,7 @@ fn stdpython_reexport_chain(
 /// stdpython_reexport_chain (requests' compat re-exports them from
 /// `urllib.parse`). Returns the canonical runtime item name, or None
 /// when the name does not resolve to a urllib.parse function.
-fn urllib_parse_fn(
+pub(crate) fn urllib_parse_fn(
     name: &str,
     symbols: &SymbolTableScopes,
     options: &PythonOptions,

@@ -3810,7 +3810,7 @@ impl FunctionDef {
                     .to_rust(body_ctx.clone(), stmt_options, symbols.clone())?,
             );
             streams.extend(quote!(;));
-            crate::update_narrowed_after_statement(s, &mut narrowed, &options);
+            crate::update_narrowed_after_statement(s, &mut narrowed, &body_ctx, &options, &symbols);
         }
 
         // Every generated function returns Result<T, PyException> so raised
@@ -5465,6 +5465,20 @@ pub(crate) fn expr_yields_option(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> bool {
+    // A `urllib.parse` result's Option-typed property (`parsed.hostname`,
+    // `parsed.port`): the runtime method already returns the Option.
+    if let ExprType::Attribute(attr) = expr
+        && let Some(a) = crate::ast::tree::type_ctx::ParseResultAttr::from_name(&attr.attr)
+        && matches!(a.typeinfo(), crate::TypeInfo::Option(_))
+        && crate::ast::tree::type_ctx::is_parse_result_typeinfo(&crate::infer_type(
+            None,
+            &attr.value,
+            options,
+            symbols,
+        ))
+    {
+        return true;
+    }
     match expr {
         // A name that itself holds an Option (assigned None on some path,
         // an Optional-annotated parameter, or a local whose INFERRED type
@@ -5803,6 +5817,10 @@ pub(crate) fn lower_optional_value(
     // family). The ctx-aware predicate resolves the receiver's class
     // (self fields, typed params, factory-assigned locals).
     if crate::expr_yields_option_ctx(expr, &ctx, &options, &symbols) {
+        // A property read is the getter CALL: its Option is a fresh
+        // value, nothing to clone out of the receiver.
+        let getter_call = matches!(expr, ExprType::Attribute(a)
+            if crate::ast::tree::attribute::attribute_read_is_call(a, &ctx, &symbols, &options));
         let tokens = expr.clone().to_rust(ctx.clone(), options, symbols)?;
         // The pass-through MOVES the Option out of the receiver: a
         // `self.<field>` read borrows `&self` (E0507 — `headers =
@@ -5812,7 +5830,7 @@ pub(crate) fn lower_optional_value(
         // borrows the composed object the same way. Clone the value out —
         // the Python object is shared by reference, so the clone is the
         // faithful copy.
-        if matches!(expr, ExprType::Attribute(_)) {
+        if matches!(expr, ExprType::Attribute(_)) && !getter_call {
             // A boxed slot (round 99): the read's Option<Box<Class>>
             // map-derefs to Option<Class> — the slot's type.
             let read = if boxed {
@@ -6131,6 +6149,18 @@ impl FunctionDef {
         symbols: &crate::SymbolTableScopes,
         options: &crate::PythonOptions,
     ) -> Option<TokenStream> {
+        self.param_scoped_return_typeinfo(self_class, symbols, options)
+            .map(|t| t.to_rust_type())
+    }
+
+    /// The TypeInfo behind [`Self::param_scoped_return_type`], for a
+    /// caller that types the call's result.
+    pub(crate) fn param_scoped_return_typeinfo(
+        &self,
+        self_class: Option<&str>,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Option<crate::TypeInfo> {
         let decorated = |name: &str| {
             self.decorator_list
                 .iter()
@@ -6164,12 +6194,22 @@ impl FunctionDef {
         }
         let mut scoped = options.clone();
         scoped.name_types = std::rc::Rc::new(types);
+        // The function's own LOCALS join the scope: a returned local
+        // (`conn = self.manager.connection_from_host(host)` then `return
+        // conn` — requests' get_connection_with_tls_context) types from
+        // its assignment, as the body's own lowering types it.
+        let locals = crate::ast::tree::type_ctx::analyze_function_types_with_class(
+            &self.body,
+            Some(&scoped),
+            Some(symbols),
+            self_class.filter(|_| instance_method),
+        );
+        let scoped = crate::ast::tree::type_ctx::analysis_view(&scoped, &locals);
         match self_class.filter(|_| instance_method) {
             Some(class) => self.inferred_return_typeinfo_in(class, symbols, &scoped),
             None => self.inferred_return_typeinfo(symbols, &scoped),
         }
             .filter(renderable_return_typeinfo)
-            .map(|t| t.to_rust_type())
     }
 
     /// An unannotated METHOD whose returns are all reads of fields of its

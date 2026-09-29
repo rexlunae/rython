@@ -1530,10 +1530,27 @@ fn expr_walrus_binds(e: &crate::ExprType, name: &str) -> bool {
 pub fn update_narrowed_after_statement(
     stmt: &crate::Statement,
     narrowed: &mut std::collections::HashMap<String, crate::TypeInfo>,
+    ctx: &crate::CodeGenContext,
     options: &PythonOptions,
+    symbols: &crate::SymbolTableScopes,
 ) {
     match &stmt.statement {
         crate::StatementType::If(i) => {
+            // `if x is None: ... x = <non-None>` — the get-or-create
+            // idiom (`pool = self.pools.get(k); if pool is None: pool =
+            // Pool(k); self.pools[k] = pool`): the body's LAST write of x
+            // stores a value that is definitely not None, and the else
+            // (if any) never writes x, so x is not None after the if on
+            // either path.
+            if let Some(name) = is_none_test_name(&i.test)
+                && options.optional_names.contains(name)
+                && !narrowed.contains_key(name)
+                && body_leaves_name_non_none(&i.body, name, ctx, options, symbols)
+                && i.orelse.iter().all(|b| !stmt_writes_name(b, name))
+                && let Some(inner) = option_inner_of(options, name)
+            {
+                narrowed.insert(name.to_string(), inner);
+            }
             // The test narrows x in the body; both branches leaving x
             // non-None narrows x AFTER the if/else.
             if let Some((name, inner)) = narrowing_from_test(&i.test, options) {
@@ -1605,6 +1622,14 @@ pub fn update_narrowed_after_statement(
             if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
                 if narrowed.contains_key(&n.id) && !statically_non_none(&a.value) {
                     narrowed.remove(&n.id);
+                } else if !narrowed.contains_key(&n.id)
+                    && options.optional_names.contains(&n.id)
+                    && definitely_non_none(&a.value, ctx, options, symbols)
+                    && let Some(inner) = option_inner_of(options, &n.id)
+                {
+                    // An Option local just bound to a value that is not
+                    // None reads unwrapped until its next write.
+                    narrowed.insert(n.id.clone(), inner);
                 }
             }
         }
@@ -1615,6 +1640,95 @@ pub fn update_narrowed_after_statement(
         }
         _ => {}
     }
+}
+
+/// The name `x` of a single `x is None` test.
+fn is_none_test_name(test: &ExprType) -> Option<&str> {
+    let ExprType::Compare(cmp) = test else {
+        return None;
+    };
+    let ExprType::Name(n) = cmp.left.as_ref() else {
+        return None;
+    };
+    (cmp.ops.len() == 1
+        && matches!(cmp.ops[0], crate::Compares::Is)
+        && cmp.comparators.len() == 1
+        && crate::is_none_expr(&cmp.comparators[0]))
+    .then_some(n.id.as_str())
+}
+
+/// The inner type of an Option binding: its recorded `Option<inner>`, or —
+/// for a name the analysis tracks as Option through `optional_names` —
+/// its recorded plain type (`pool = self.pools.get(k)` records the
+/// element class).
+fn option_inner_of(options: &PythonOptions, name: &str) -> Option<crate::TypeInfo> {
+    match options.name_types.get(name) {
+        Some(crate::TypeInfo::Option(inner)) => Some((**inner).clone()),
+        Some(crate::TypeInfo::PyObject | crate::TypeInfo::PyValue) | None => None,
+        Some(t) if options.optional_names.contains(name) => Some(t.clone()),
+        _ => None,
+    }
+}
+
+/// Whether a value is DEFINITELY not None: not the None literal, and its
+/// inferred type is a concrete non-Option type. A boxed value, an
+/// unknown type or an Option-returning call (`d.get(k)`) may be None.
+fn definitely_non_none(
+    value: &ExprType,
+    ctx: &crate::CodeGenContext,
+    options: &PythonOptions,
+    symbols: &crate::SymbolTableScopes,
+) -> bool {
+    !crate::is_none_expr(value)
+        && !matches!(
+            crate::infer_type(Some(ctx), value, options, symbols),
+            crate::TypeInfo::Option(_)
+                | crate::TypeInfo::PyValue
+                | crate::TypeInfo::PyValueMember(_)
+                | crate::TypeInfo::PyObject
+        )
+}
+
+/// Whether a branch that falls through leaves `name` holding a value that
+/// is definitely not None: its last top-level write of `name` is a plain
+/// `name = <value>` store of such a value (a later exit never matters —
+/// only a fall-through reaches the following statements).
+fn body_leaves_name_non_none(
+    body: &[crate::Statement],
+    name: &str,
+    ctx: &crate::CodeGenContext,
+    options: &PythonOptions,
+    symbols: &crate::SymbolTableScopes,
+) -> bool {
+    let Some(last) = body.iter().rev().find(|s| stmt_writes_name(s, name)) else {
+        return false;
+    };
+    matches!(&last.statement, crate::StatementType::Assign(a)
+        if matches!(a.targets.as_slice(), [ExprType::Name(t)] if t.id == name)
+            && definitely_non_none(&a.value, ctx, options, symbols))
+}
+
+/// Lower a block's statements in order, threading `x is not None`
+/// narrowing from each statement to the next (the same flow the function
+/// body lowering applies): a store of a non-None value, a guard that
+/// exits, a get-or-create `if x is None:` all narrow the statements after
+/// them within the block.
+pub(crate) fn render_block(
+    stmts: Vec<crate::Statement>,
+    ctx: &crate::CodeGenContext,
+    options: &PythonOptions,
+    symbols: &crate::SymbolTableScopes,
+) -> Result<Vec<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
+    let mut narrowed = options.narrowed_names.as_ref().clone();
+    let mut out = Vec::with_capacity(stmts.len());
+    for stmt in stmts {
+        let mut stmt_options = options.clone();
+        stmt_options.narrowed_names = std::rc::Rc::new(narrowed.clone());
+        let next = stmt.clone();
+        out.push(stmt.to_rust(ctx.clone(), stmt_options, symbols.clone())?);
+        update_narrowed_after_statement(&next, &mut narrowed, ctx, options, symbols);
+    }
+    Ok(out)
 }
 
 /// Whether a statement list's last statement is an assignment of a

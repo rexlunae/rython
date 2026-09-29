@@ -784,6 +784,20 @@ the userinfo at the LAST `@` (`user@name:pass@host` -> username
 "user@name"). The `urllib.parse` tests are un-gated from the `http-ureq`
 feature so they run in the default workspace suite.
 
+A `urlparse`/`urlsplit` result is typed as the runtime `ParseResult`:
+its six components read as the `String` fields, and a read of the
+computed properties (`parsed.hostname`, `.port`, `.username`,
+`.password`) lowers to the runtime method, typed `Option<String>` /
+`Option<i64>` — so `port = parsed.port; if port is None: port = 80`
+keeps one Option binding. `.port` raises CPython's ValueError at the
+read: "Port could not be cast to integer value as 'abc'" for a port that
+is not all ASCII digits (`-1`, `+80` and ` 80` included), "Port out of
+range 0-65535" past 65535; `urlparse` itself succeeds. (Earlier rounds
+returned None for a malformed port — a silent divergence, now fixed.)
+Narrowing an attribute read (`if parsed.hostname is None: return` then
+`parsed.hostname.endswith(...)`) is not supported yet: the read stays
+Option-typed and the use fails in rustc — bind it to a local first.
+
 Round 56: the class-as-value model's value positions now cover the
 BUILTIN classes. A bare `str`/`bytes`/`int`/`float`/`bool`/`list`/
 `dict`/`tuple`/`set`/`frozenset`/`object`/`type`/`bytearray` name in a
@@ -1157,6 +1171,16 @@ continue` in encoding_unicode_range) — with the membership-comparison
 unwrapping guarded against already-narrowed receivers. Sweep −3
 (charset_normalizer 190→187, everything else flat). Pinned in codegen
 (the is-None early-exit guard narrows the following reads).
+
+Two more flow facts narrow an Option local for the statements that
+follow it in the same block (function bodies and `if`/`else` bodies
+thread the narrowing statement by statement): a STORE of a value that is
+definitely not None — its inferred type is a concrete non-Option type,
+so `x = Pool()` narrows and `x = d.get(k)` does not — and the
+GET-OR-CREATE guard, `if x is None:` whose body's last write of `x` is
+such a store while the else (if any) never writes `x`
+(`pool = pools.get(k); if pool is None: pool = Pool(k); pools[k] = pool;
+return pool`). Pinned in codegen.
 
 Round 78 (string-literal ownership in Vec contexts): charset's
 `String | &str` family — a `-> list[str]` function returning a list

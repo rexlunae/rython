@@ -44,11 +44,15 @@ impl ParseResult {
         Some(host.to_ascii_lowercase())
     }
 
-    /// The port as an int — `None` when absent, empty, or non-numeric
-    /// (CPython raises ValueError only for a non-int port; requests
-    /// never feeds one).
-    pub fn port(&self) -> Option<i64> {
-        let host = self.host_part()?;
+    /// The port as an int — `None` when absent or empty. Like CPython's,
+    /// a port that is not all ASCII digits raises ValueError ("Port could
+    /// not be cast to integer value as '80a'"), and one past 65535 raises
+    /// ValueError ("Port out of range 0-65535"): `urlparse` itself
+    /// succeeds, the read of `.port` raises.
+    pub fn port(&self) -> Result<Option<i64>, PyException> {
+        let Some(host) = self.host_part() else {
+            return Ok(None);
+        };
         // A bracketed IPv6 host has no port of its own: the port follows
         // the closing bracket.
         let after_bracket = host.starts_with('[').then(|| host.find(']')).flatten();
@@ -56,11 +60,27 @@ impl ParseResult {
             Some(end) => &host[end + 1..],
             None => host,
         };
-        let (_, port) = port_part.rsplit_once(':')?;
+        let Some((_, port)) = port_part.rsplit_once(':') else {
+            return Ok(None);
+        };
         if port.is_empty() {
-            return None;
+            return Ok(None);
         }
-        port.parse::<i64>().ok()
+        let cast_error = || {
+            crate::value_error(format!(
+                "Port could not be cast to integer value as {}",
+                crate::py_str_repr(port)
+            ))
+        };
+        if !port.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(cast_error());
+        }
+        // All digits: only an overflow of i64 can fail the parse, and
+        // that is out of range too.
+        match port.parse::<i64>() {
+            Ok(n) if n <= 65535 => Ok(Some(n)),
+            _ => Err(crate::value_error("Port out of range 0-65535")),
+        }
     }
 
     /// The userinfo's username (`None` without an `@`). The LAST `@`
