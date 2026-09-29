@@ -4,7 +4,8 @@
 > written — it is the measurement that produced issues #192–#208 — with a
 > [What changed](#what-changed) section at the end recording the result of
 > fixing them. The numbers in the body are the BEFORE state; `results/`
-> now holds the after.
+> holds the latest run — see [Re-run against main](#re-run-against-main)
+> for what changed after the fixes merged.
 
 An end-to-end evaluation of the `numpy` subset in `crates/stdpython`: does
 a converted program print what CPython + real numpy prints, and how fast is
@@ -628,3 +629,79 @@ one flat array instead of a matrix), and `np.concatenate` accepted only
 
 `ndarray.rs` went from zero tests to pinning every formatting, slicing
 and exception rule against real `python3` output.
+
+## Re-run against main
+
+The same harnesses re-run against `main` @ 8b5bcf7, after the fixes above
+and a series of performance PRs (#218, #220, #225, and the matmul kernels
+in 10b4954/bd53b60) had merged. Same machine class, CPython 3.11 + numpy
+2.4.6, rustc 1.98.1.
+
+### What main looked like
+
+| | committed baseline | main @ 8b5bcf7 |
+|---|---|---|
+| default backend, byte-identical | 48/58 | **41/58** |
+| any `numpy-rayon` / `numpy-simd` build | 48/58 | **0/58 — stdpython does not compile** |
+
+- **Harness bug first.** rypip's generated `stdpython = { ... }` line gained
+  `default-features = false, features = ["std"]`; the harnesses' regex only
+  matched the old bare-path shape, so every rayon/simd run *silently*
+  measured a build without its feature. `_cargo.py` now merges into
+  whatever feature list is there and raises when it cannot.
+- **Seven default-backend regressions** ([#423](https://github.com/rexlunae/rython/issues/423)),
+  all from the borrowed-operand refactor (#220/#225):
+  - array-vs-scalar comparisons compared element 0 only and ignored operand
+    order — `a[np.greater(a, 2.0)]` printed `[]` (a **silent** wrong
+    answer), printing the mask panicked, `np.greater(2.0, a)` computed
+    `a > 2.0` (`05`, `09`, `49`);
+  - `np.std`/`np.var` codegen still cloned into a now-borrowing runtime,
+    and `np.where` borrowed twice — rustc errors (`10`, `15`, `20`, `30`).
+- **`numpy-rayon` did not compile on x86_64**
+  ([#425](https://github.com/rexlunae/rython/issues/425)): the AVX2 matmul
+  kernel is compiled only on x86_64 with the feature, which no CI job
+  enabled. It also had no `n % 4` column tail (out-of-bounds stores) and
+  ran even under `np.set_backend("scalar")`.
+- **The AVX2 pairwise-sum block was slower than scalar**: #225's
+  `pairwise_block_avx2` lacked `#[target_feature(enable = "avx2")]`, so no
+  intrinsic inlined — `np.sum` over 100 000 elements went from 0.044 ms to
+  0.275 ms.
+
+### After the fixes: 48/58 on every backend
+
+| status | default | scalar | rayon | simd | auto |
+|---|---|---|---|---|---|
+| PASS | 48 | 48 | 48 | 48 | 48 |
+| DIVERGE | 8 | 8 | 8 | 8 | 8 |
+| CONVERT_FAIL | 2 | 2 | 2 | 2 | 2 |
+
+Identical to the committed baseline case-for-case — the same 10 ledgered
+non-PASS cases — and all five configurations agree byte-for-byte (290
+case-runs, zero disagreements). CI now builds and tests stdpython with
+`numpy-rayon,numpy-simd` (the `numpy-backends` job).
+
+### Speed: every program faster than the committed baseline
+
+Geometric mean vs CPython per program (higher is better; baseline → now):
+
+| program | scalar | simd | rayon |
+|---|---|---|---|
+| elementwise | 0.33x → **0.63x** | 0.34x → **0.63x** | 0.36x → **0.78x** |
+| scalar_operand | 0.34x → **0.51x** | 0.33x → **0.52x** | 0.36x → **0.61x** |
+| reduce | 0.22x → **0.61x** | 0.21x → **0.62x** | 0.22x → **0.57x** |
+| sort | 0.49x → **0.75x** | 0.46x → **0.74x** | 0.47x → **0.73x** |
+| linalg | 0.33x → **0.53x** | 0.35x → **0.48x** | 0.34x → **0.53x** |
+| sim (mixed workload) | 0.61x → **1.08x** | 0.66x → **1.04x** | 0.62x → **1.25x** |
+
+The mixed simulation now beats CPython + numpy on every backend (3.0x on
+the 1 000-element, 2 000-step oscillator), and `np.sum` beats numpy
+outright: 1.67x at 100 000 elements, 1.11x at 10M on the scalar backend.
+Startup is unchanged in kind (1.6 ms vs CPython's 94 ms).
+
+Remaining gaps worth a look: rayon's `sum` at 10M (0.72x) trails the
+scalar backend's 1.11x — the parallel reduction does not use the SIMD
+block — and `max`/`argmax` at 100k+ elements are still 0.03x–0.11x.
+The checksum differences are the same last-bit set as the baseline
+(`det|64`, `matmul|64`, `vdot`), except that rayon's FMA `matmul|64` now
+matches numpy's BLAS exactly.
+
