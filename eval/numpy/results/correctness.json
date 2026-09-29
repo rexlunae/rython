@@ -1017,35 +1017,35 @@
     "status": "CONVERT_FAIL",
     "rc": null,
     "errors": [
-     "Error: compiling /tmp/npeval7/26_std_ddof_positional.default-auto.py: code generation error at _26_std_ddof_positional_default_auto.py:8:1-11:23 [location=_26_std_ddof_positional_default_auto.py:8:1-11:23, message=code generation error at <module>:10:5-23 [location=<module>:10:5-23, message=np.std() takes exactly 1 positional argument (2 given); numpy's second positional parameter is `axis`, which is not supported in rython's numpy subset \u2014 pass ddof as a keyword (np.std(a, ddof=1)), help=], help=]"
+     "Error: compiling /tmp/claude-0/-home-user-rython/ca045483-42e8-5311-94d8-1fc2606c8065/scratchpad/evalfix/26_std_ddof_positional.default-auto.py: code generation error at _26_std_ddof_positional_default_auto.py:8:1-11:23 [location=_26_std_ddof_positional_default_auto.py:8:1-11:23, message=code generation error at <module>:10:5-23 [location=<module>:10:5-23, message=np.std() takes exactly 1 positional argument (2 given); numpy's second positional parameter is `axis`, which is not supported in rython's numpy subset \u2014 pass ddof as a keyword (np.std(a, ddof=1)), help=], help=]"
     ]
    },
    "cpu-scalar": {
     "status": "CONVERT_FAIL",
     "rc": null,
     "errors": [
-     "Error: compiling /tmp/npeval7/26_std_ddof_positional.cpu-scalar.py: code generation error at _26_std_ddof_positional_cpu_scalar.py:8:1-12:23 [location=_26_std_ddof_positional_cpu_scalar.py:8:1-12:23, message=code generation error at <module>:11:5-23 [location=<module>:11:5-23, message=np.std() takes exactly 1 positional argument (2 given); numpy's second positional parameter is `axis`, which is not supported in rython's numpy subset \u2014 pass ddof as a keyword (np.std(a, ddof=1)), help=], help=]"
+     "Error: compiling /tmp/claude-0/-home-user-rython/ca045483-42e8-5311-94d8-1fc2606c8065/scratchpad/evalfix/26_std_ddof_positional.cpu-scalar.py: code generation error at _26_std_ddof_positional_cpu_scalar.py:8:1-12:23 [location=_26_std_ddof_positional_cpu_scalar.py:8:1-12:23, message=code generation error at <module>:11:5-23 [location=<module>:11:5-23, message=np.std() takes exactly 1 positional argument (2 given); numpy's second positional parameter is `axis`, which is not supported in rython's numpy subset \u2014 pass ddof as a keyword (np.std(a, ddof=1)), help=], help=]"
     ]
    },
    "cpu-rayon": {
     "status": "CONVERT_FAIL",
     "rc": null,
     "errors": [
-     "Error: compiling /tmp/npeval7/26_std_ddof_positional.cpu-rayon.py: code generation error at _26_std_ddof_positional_cpu_rayon.py:8:1-12:23 [location=_26_std_ddof_positional_cpu_rayon.py:8:1-12:23, message=code generation error at <module>:11:5-23 [location=<module>:11:5-23, message=np.std() takes exactly 1 positional argument (2 given); numpy's second positional parameter is `axis`, which is not supported in rython's numpy subset \u2014 pass ddof as a keyword (np.std(a, ddof=1)), help=], help=]"
+     "Error: compiling /tmp/claude-0/-home-user-rython/ca045483-42e8-5311-94d8-1fc2606c8065/scratchpad/evalfix/26_std_ddof_positional.cpu-rayon.py: code generation error at _26_std_ddof_positional_cpu_rayon.py:8:1-12:23 [location=_26_std_ddof_positional_cpu_rayon.py:8:1-12:23, message=code generation error at <module>:11:5-23 [location=<module>:11:5-23, message=np.std() takes exactly 1 positional argument (2 given); numpy's second positional parameter is `axis`, which is not supported in rython's numpy subset \u2014 pass ddof as a keyword (np.std(a, ddof=1)), help=], help=]"
     ]
    },
    "cpu-simd": {
     "status": "CONVERT_FAIL",
     "rc": null,
     "errors": [
-     "Error: compiling /tmp/npeval7/26_std_ddof_positional.cpu-simd.py: code generation error at _26_std_ddof_positional_cpu_simd.py:8:1-12:23 [location=_26_std_ddof_positional_cpu_simd.py:8:1-12:23, message=code generation error at <module>:11:5-23 [location=<module>:11:5-23, message=np.std() takes exactly 1 positional argument (2 given); numpy's second positional parameter is `axis`, which is not supported in rython's numpy subset \u2014 pass ddof as a keyword (np.std(a, ddof=1)), help=], help=]"
+     "Error: compiling /tmp/claude-0/-home-user-rython/ca045483-42e8-5311-94d8-1fc2606c8065/scratchpad/evalfix/26_std_ddof_positional.cpu-simd.py: code generation error at _26_std_ddof_positional_cpu_simd.py:8:1-12:23 [location=_26_std_ddof_positional_cpu_simd.py:8:1-12:23, message=code generation error at <module>:11:5-23 [location=<module>:11:5-23, message=np.std() takes exactly 1 positional argument (2 given); numpy's second positional parameter is `axis`, which is not supported in rython's numpy subset \u2014 pass ddof as a keyword (np.std(a, ddof=1)), help=], help=]"
     ]
    },
    "cpu-auto": {
     "status": "CONVERT_FAIL",
     "rc": null,
     "errors": [
-     "Error: compiling /tmp/npeval7/26_std_ddof_positional.cpu-auto.py: code generation error at _26_std_ddof_positional_cpu_auto.py:8:1-11:23 [location=_26_std_ddof_positional_cpu_auto.py:8:1-11:23, message=code generation error at <module>:10:5-23 [location=<module>:10:5-23, message=np.std() takes exactly 1 positional argument (2 given); numpy's second positional parameter is `axis`, which is not supported in rython's numpy subset \u2014 pass ddof as a keyword (np.std(a, ddof=1)), help=], help=]"
+     "Error: compiling /tmp/claude-0/-home-user-rython/ca045483-42e8-5311-94d8-1fc2606c8065/scratchpad/evalfix/26_std_ddof_positional.cpu-auto.py: code generation error at _26_std_ddof_positional_cpu_auto.py:8:1-11:23 [location=_26_std_ddof_positional_cpu_auto.py:8:1-11:23, message=code generation error at <module>:10:5-23 [location=<module>:10:5-23, message=np.std() takes exactly 1 positional argument (2 given); numpy's second positional parameter is `axis`, which is not supported in rython's numpy subset \u2014 pass ddof as a keyword (np.std(a, ddof=1)), help=], help=]"
     ]
    }
   }
@@ -1492,35 +1492,35 @@
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"operands could not be broadcast together with shapes [2] [3]\", exception_type: \"ValueError\" }"
+     "Error: PyException { message: \"operands could not be broadcast together with shapes [2] [3]\", exception_type: \"ValueError\", discriminant: Some(ValueError), attrs: [], user_ancestors: [], args_repr: None }"
     ]
    },
    "cpu-scalar": {
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"operands could not be broadcast together with shapes [2] [3]\", exception_type: \"ValueError\" }"
+     "Error: PyException { message: \"operands could not be broadcast together with shapes [2] [3]\", exception_type: \"ValueError\", discriminant: Some(ValueError), attrs: [], user_ancestors: [], args_repr: None }"
     ]
    },
    "cpu-rayon": {
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"operands could not be broadcast together with shapes [2] [3]\", exception_type: \"ValueError\" }"
+     "Error: PyException { message: \"operands could not be broadcast together with shapes [2] [3]\", exception_type: \"ValueError\", discriminant: Some(ValueError), attrs: [], user_ancestors: [], args_repr: None }"
     ]
    },
    "cpu-simd": {
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"operands could not be broadcast together with shapes [2] [3]\", exception_type: \"ValueError\" }"
+     "Error: PyException { message: \"operands could not be broadcast together with shapes [2] [3]\", exception_type: \"ValueError\", discriminant: Some(ValueError), attrs: [], user_ancestors: [], args_repr: None }"
     ]
    },
    "cpu-auto": {
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"operands could not be broadcast together with shapes [2] [3]\", exception_type: \"ValueError\" }"
+     "Error: PyException { message: \"operands could not be broadcast together with shapes [2] [3]\", exception_type: \"ValueError\", discriminant: Some(ValueError), attrs: [], user_ancestors: [], args_repr: None }"
     ]
    }
   }
@@ -1533,35 +1533,35 @@
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"index 5 is out of bounds for axis 0 with size 2\", exception_type: \"IndexError\" }"
+     "Error: PyException { message: \"index 5 is out of bounds for axis 0 with size 2\", exception_type: \"IndexError\", discriminant: Some(IndexError), attrs: [], user_ancestors: [], args_repr: None }"
     ]
    },
    "cpu-scalar": {
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"index 5 is out of bounds for axis 0 with size 2\", exception_type: \"IndexError\" }"
+     "Error: PyException { message: \"index 5 is out of bounds for axis 0 with size 2\", exception_type: \"IndexError\", discriminant: Some(IndexError), attrs: [], user_ancestors: [], args_repr: None }"
     ]
    },
    "cpu-rayon": {
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"index 5 is out of bounds for axis 0 with size 2\", exception_type: \"IndexError\" }"
+     "Error: PyException { message: \"index 5 is out of bounds for axis 0 with size 2\", exception_type: \"IndexError\", discriminant: Some(IndexError), attrs: [], user_ancestors: [], args_repr: None }"
     ]
    },
    "cpu-simd": {
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"index 5 is out of bounds for axis 0 with size 2\", exception_type: \"IndexError\" }"
+     "Error: PyException { message: \"index 5 is out of bounds for axis 0 with size 2\", exception_type: \"IndexError\", discriminant: Some(IndexError), attrs: [], user_ancestors: [], args_repr: None }"
     ]
    },
    "cpu-auto": {
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"index 5 is out of bounds for axis 0 with size 2\", exception_type: \"IndexError\" }"
+     "Error: PyException { message: \"index 5 is out of bounds for axis 0 with size 2\", exception_type: \"IndexError\", discriminant: Some(IndexError), attrs: [], user_ancestors: [], args_repr: None }"
     ]
    }
   }
@@ -1574,35 +1574,35 @@
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"Singular matrix\", exception_type: \"LinAlgError\" }"
+     "Error: PyException { message: \"Singular matrix\", exception_type: \"LinAlgError\", discriminant: None, attrs: [], user_ancestors: [], args_repr: None }"
     ]
    },
    "cpu-scalar": {
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"Singular matrix\", exception_type: \"LinAlgError\" }"
+     "Error: PyException { message: \"Singular matrix\", exception_type: \"LinAlgError\", discriminant: None, attrs: [], user_ancestors: [], args_repr: None }"
     ]
    },
    "cpu-rayon": {
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"Singular matrix\", exception_type: \"LinAlgError\" }"
+     "Error: PyException { message: \"Singular matrix\", exception_type: \"LinAlgError\", discriminant: None, attrs: [], user_ancestors: [], args_repr: None }"
     ]
    },
    "cpu-simd": {
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"Singular matrix\", exception_type: \"LinAlgError\" }"
+     "Error: PyException { message: \"Singular matrix\", exception_type: \"LinAlgError\", discriminant: None, attrs: [], user_ancestors: [], args_repr: None }"
     ]
    },
    "cpu-auto": {
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"Singular matrix\", exception_type: \"LinAlgError\" }"
+     "Error: PyException { message: \"Singular matrix\", exception_type: \"LinAlgError\", discriminant: None, attrs: [], user_ancestors: [], args_repr: None }"
     ]
    }
   }
@@ -1615,35 +1615,35 @@
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"zero-size array to reduction operation maximum which has no identity\", exception_type: \"ValueError\" }"
+     "Error: PyException { message: \"zero-size array to reduction operation maximum which has no identity\", exception_type: \"ValueError\", discriminant: Some(ValueError), attrs: [], user_ancestors: [], args_repr: None }"
     ]
    },
    "cpu-scalar": {
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"zero-size array to reduction operation maximum which has no identity\", exception_type: \"ValueError\" }"
+     "Error: PyException { message: \"zero-size array to reduction operation maximum which has no identity\", exception_type: \"ValueError\", discriminant: Some(ValueError), attrs: [], user_ancestors: [], args_repr: None }"
     ]
    },
    "cpu-rayon": {
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"zero-size array to reduction operation maximum which has no identity\", exception_type: \"ValueError\" }"
+     "Error: PyException { message: \"zero-size array to reduction operation maximum which has no identity\", exception_type: \"ValueError\", discriminant: Some(ValueError), attrs: [], user_ancestors: [], args_repr: None }"
     ]
    },
    "cpu-simd": {
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"zero-size array to reduction operation maximum which has no identity\", exception_type: \"ValueError\" }"
+     "Error: PyException { message: \"zero-size array to reduction operation maximum which has no identity\", exception_type: \"ValueError\", discriminant: Some(ValueError), attrs: [], user_ancestors: [], args_repr: None }"
     ]
    },
    "cpu-auto": {
     "status": "PASS",
     "rc": 1,
     "stderr_head": [
-     "Error: PyException { message: \"zero-size array to reduction operation maximum which has no identity\", exception_type: \"ValueError\" }"
+     "Error: PyException { message: \"zero-size array to reduction operation maximum which has no identity\", exception_type: \"ValueError\", discriminant: Some(ValueError), attrs: [], user_ancestors: [], args_repr: None }"
     ]
    }
   }
@@ -1838,35 +1838,35 @@
     "status": "CONVERT_FAIL",
     "rc": null,
     "errors": [
-     "Error: compiling /tmp/npeval7/52_random.default-auto.py: code generation error at _52_random_default_auto.py:5:1-7:28 [location=_52_random_default_auto.py:5:1-7:28, message=code generation error at <module>:6:5-21 [location=<module>:6:5-21, message=np.random is not supported by rython's numpy subset (the only modeled numpy submodule is np.linalg, with inv, det and solve); rython refuses to emit a call it cannot reproduce, help=], help=]"
+     "Error: compiling /tmp/claude-0/-home-user-rython/ca045483-42e8-5311-94d8-1fc2606c8065/scratchpad/evalfix/52_random.default-auto.py: code generation error at _52_random_default_auto.py:5:1-7:28 [location=_52_random_default_auto.py:5:1-7:28, message=code generation error at <module>:6:5-21 [location=<module>:6:5-21, message=np.random is not supported by rython's numpy subset (the only modeled numpy submodule is np.linalg, with inv, det and solve); rython refuses to emit a call it cannot reproduce, help=], help=]"
     ]
    },
    "cpu-scalar": {
     "status": "CONVERT_FAIL",
     "rc": null,
     "errors": [
-     "Error: compiling /tmp/npeval7/52_random.cpu-scalar.py: code generation error at _52_random_cpu_scalar.py:5:1-8:28 [location=_52_random_cpu_scalar.py:5:1-8:28, message=code generation error at <module>:7:5-21 [location=<module>:7:5-21, message=np.random is not supported by rython's numpy subset (the only modeled numpy submodule is np.linalg, with inv, det and solve); rython refuses to emit a call it cannot reproduce, help=], help=]"
+     "Error: compiling /tmp/claude-0/-home-user-rython/ca045483-42e8-5311-94d8-1fc2606c8065/scratchpad/evalfix/52_random.cpu-scalar.py: code generation error at _52_random_cpu_scalar.py:5:1-8:28 [location=_52_random_cpu_scalar.py:5:1-8:28, message=code generation error at <module>:7:5-21 [location=<module>:7:5-21, message=np.random is not supported by rython's numpy subset (the only modeled numpy submodule is np.linalg, with inv, det and solve); rython refuses to emit a call it cannot reproduce, help=], help=]"
     ]
    },
    "cpu-rayon": {
     "status": "CONVERT_FAIL",
     "rc": null,
     "errors": [
-     "Error: compiling /tmp/npeval7/52_random.cpu-rayon.py: code generation error at _52_random_cpu_rayon.py:5:1-8:28 [location=_52_random_cpu_rayon.py:5:1-8:28, message=code generation error at <module>:7:5-21 [location=<module>:7:5-21, message=np.random is not supported by rython's numpy subset (the only modeled numpy submodule is np.linalg, with inv, det and solve); rython refuses to emit a call it cannot reproduce, help=], help=]"
+     "Error: compiling /tmp/claude-0/-home-user-rython/ca045483-42e8-5311-94d8-1fc2606c8065/scratchpad/evalfix/52_random.cpu-rayon.py: code generation error at _52_random_cpu_rayon.py:5:1-8:28 [location=_52_random_cpu_rayon.py:5:1-8:28, message=code generation error at <module>:7:5-21 [location=<module>:7:5-21, message=np.random is not supported by rython's numpy subset (the only modeled numpy submodule is np.linalg, with inv, det and solve); rython refuses to emit a call it cannot reproduce, help=], help=]"
     ]
    },
    "cpu-simd": {
     "status": "CONVERT_FAIL",
     "rc": null,
     "errors": [
-     "Error: compiling /tmp/npeval7/52_random.cpu-simd.py: code generation error at _52_random_cpu_simd.py:5:1-8:28 [location=_52_random_cpu_simd.py:5:1-8:28, message=code generation error at <module>:7:5-21 [location=<module>:7:5-21, message=np.random is not supported by rython's numpy subset (the only modeled numpy submodule is np.linalg, with inv, det and solve); rython refuses to emit a call it cannot reproduce, help=], help=]"
+     "Error: compiling /tmp/claude-0/-home-user-rython/ca045483-42e8-5311-94d8-1fc2606c8065/scratchpad/evalfix/52_random.cpu-simd.py: code generation error at _52_random_cpu_simd.py:5:1-8:28 [location=_52_random_cpu_simd.py:5:1-8:28, message=code generation error at <module>:7:5-21 [location=<module>:7:5-21, message=np.random is not supported by rython's numpy subset (the only modeled numpy submodule is np.linalg, with inv, det and solve); rython refuses to emit a call it cannot reproduce, help=], help=]"
     ]
    },
    "cpu-auto": {
     "status": "CONVERT_FAIL",
     "rc": null,
     "errors": [
-     "Error: compiling /tmp/npeval7/52_random.cpu-auto.py: code generation error at _52_random_cpu_auto.py:5:1-7:28 [location=_52_random_cpu_auto.py:5:1-7:28, message=code generation error at <module>:6:5-21 [location=<module>:6:5-21, message=np.random is not supported by rython's numpy subset (the only modeled numpy submodule is np.linalg, with inv, det and solve); rython refuses to emit a call it cannot reproduce, help=], help=]"
+     "Error: compiling /tmp/claude-0/-home-user-rython/ca045483-42e8-5311-94d8-1fc2606c8065/scratchpad/evalfix/52_random.cpu-auto.py: code generation error at _52_random_cpu_auto.py:5:1-7:28 [location=_52_random_cpu_auto.py:5:1-7:28, message=code generation error at <module>:6:5-21 [location=<module>:6:5-21, message=np.random is not supported by rython's numpy subset (the only modeled numpy submodule is np.linalg, with inv, det and solve); rython refuses to emit a call it cannot reproduce, help=], help=]"
     ]
    }
   }
