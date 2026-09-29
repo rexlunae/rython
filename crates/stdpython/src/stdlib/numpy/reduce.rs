@@ -114,7 +114,17 @@ fn pairwise_block_scalar(v: &[f64]) -> f64 {
 /// x86_64 AVX2 block: two f64x4 accumulators whose lanes map onto r0..r3
 /// and r4..r7 — the same eight per-lane chains the scalar block runs, so
 /// the combine tree gives bit-for-bit identical results.
+///
+/// `#[target_feature]` is what lets the intrinsics inline: without it the
+/// caller's baseline x86_64 target cannot inline an avx2 intrinsic, so
+/// every `_mm256_add_pd` was an out-of-line call and this "fast path" ran
+/// ~6x slower than the scalar block it replaced (np.sum on 100 000
+/// elements: 0.04 ms -> 0.28 ms in eval/numpy's bench_reduce).
+///
+/// # Safety
+/// The CPU must support avx2.
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 unsafe fn pairwise_block_avx2(v: &[f64]) -> f64 {
     use std::arch::x86_64::*;
     unsafe {
