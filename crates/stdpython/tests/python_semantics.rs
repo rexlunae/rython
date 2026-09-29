@@ -5213,3 +5213,15 @@ fn py_class_name_reads_the_python_class_name_off_the_type() {
     // generics never leak into the name
     assert_eq!(stdpython::py_class_name::<m::G<m::Session>>(), "G");
 }
+
+#[test]
+fn str_of_an_optional_value_matches_cpython() {
+    use stdpython::str;
+    // Verified against python3:
+    //   str(None) == 'None'; x: int | None = 5; str(x) == '5'
+    //   str(True) == 'True'
+    assert_eq!(str(None::<i64>), "None");
+    assert_eq!(str(Some(5i64)), "5");
+    assert_eq!(str(Some(true)), "True");
+    assert_eq!(str(Some("a".to_string())), "a");
+}

@@ -2621,6 +2621,17 @@ impl PyToString for String {
     }
 }
 
+/// `str(x)` of an Option binding (`x: int | None`): CPython's `"None"` for
+/// the None, the value's own `str` otherwise.
+impl<T: PyToString> PyToString for Option<T> {
+    fn py_str(self) -> String {
+        match self {
+            Some(v) => v.py_str(),
+            None => "None".to_string(),
+        }
+    }
+}
+
 // CPython's str(exc) is the exception's args rendered as a string — for a
 // `ZeroDivisionError("division by zero")` that is just "division by zero",
 // not "Type: message" (that is Display's job for the uncaught-exception

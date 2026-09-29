@@ -5485,6 +5485,12 @@ pub(crate) fn expr_yields_option(
         // is an Option — `netloc = self.netloc()?` in a Url method, where
         // netloc() returns `Result<Option<String>, _>`; the `?` strips the
         // Result layer, leaving an Option).
+        // A NARROWED name reads as its inner value (the read unwraps —
+        // name.rs), so it yields no Option: an Option slot it is stored or
+        // passed into takes the Some wrap (`release_this_conn =
+        // release_conn` after `if release_conn is None: release_conn =
+        // preload_content` — urllib3's urlopen).
+        ExprType::Name(name) if options.narrowed_names.contains_key(&name.id) => false,
         ExprType::Name(name) => {
             options.optional_names.contains(&name.id)
                 || matches!(
@@ -5802,6 +5808,7 @@ pub(crate) fn lower_optional_value(
     // with an annotation in local_types would otherwise report its
     // annotated (plain) type and wrap again.
     if let ExprType::Name(n) = expr
+        && !options.narrowed_names.contains_key(&n.id)
         && matches!(
             options.name_types.get(&n.id),
             Some(crate::TypeInfo::Option(_))
