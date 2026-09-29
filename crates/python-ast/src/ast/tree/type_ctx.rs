@@ -1160,6 +1160,13 @@ fn infer_type_inner(
                     _ => TypeInfo::PyObject,
                 }
             }
+            // `all(...)` / `any(...)` return a plain bool (the runtime's
+            // are infallible `-> bool`), unless the module binds its own.
+            ExprType::Name(n)
+                if matches!(n.id.as_str(), "all" | "any") && symbols.get(&n.id).is_none() =>
+            {
+                TypeInfo::Bool
+            }
             ExprType::Name(n) => match builtin_call_type(&n.id) {
                 Some(t) => t,
                 None => match symbols.get(&n.id) {
@@ -1230,6 +1237,20 @@ fn infer_type_inner(
                     }
                     "pop" | "setdefault" => TypeInfo::PyObject,
                     _ if on_numpy => TypeInfo::NdArray,
+                    // `seq.index(x)` / `seq.count(x)` on a list, tuple, str
+                    // or bytes receiver: a position / a tally, an int.
+                    "index" | "count"
+                        if matches!(
+                            infer_type_inner(ctx, &attr.value, options, symbols),
+                            TypeInfo::Vec(_)
+                                | TypeInfo::PyTuple(_)
+                                | TypeInfo::String
+                                | TypeInfo::StrRef
+                                | TypeInfo::Bytes
+                        ) =>
+                    {
+                        TypeInfo::Int
+                    }
                     // The str/bytes codec pair, as the lowering renders them
                     // (`decode_ascii(...)` is a String, `encode_ascii(...)`
                     // a Vec<u8>) on a STRING-SHAPED receiver — the plain

@@ -102,6 +102,9 @@
     "untyped_method_args": {
       "status": "pass"
     },
+    "untyped_returns": {
+      "status": "pass"
+    },
     "url_parts": {
       "status": "pass"
     },

@@ -5122,7 +5122,19 @@ impl<'a> CodeGen for Call {
                                 .to_string()
                                 .into());
                         }
-                        let a = &rendered[0];
+                        // The iterable is consumed: a field or a name read
+                        // again later takes the reuse-clone (`list(self.
+                        // names)` in a `&self` method would move the field
+                        // out — E0507).
+                        let a = match self.args.as_slice() {
+                            [arg] if !matches!(arg, ExprType::Starred(_)) => crate::render_reused(
+                                arg,
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                            )?,
+                            _ => rendered[0].clone(),
+                        };
                         return Ok(quote!(list(#a)));
                     }
                     // tuple(x): Python's tuple factory. rython's value

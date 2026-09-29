@@ -6669,11 +6669,35 @@ impl FunctionDef {
                 crate::TypeInfo::StrRef => crate::TypeInfo::String,
                 t => t,
             };
+            // A BOXED return beside a scalar one (`return
+            // self.names.index(n)` + `except ValueError: return default`
+            // where `default` is an unannotated, boxed parameter): the
+            // function returns the box, and the return site boxes the
+            // scalar (`PyValue::from(i)`).
+            let boxable = |t: &crate::TypeInfo| {
+                matches!(
+                    t,
+                    crate::TypeInfo::Int
+                        | crate::TypeInfo::Float
+                        | crate::TypeInfo::Bool
+                        | crate::TypeInfo::String
+                        | crate::TypeInfo::Bytes
+                        | crate::TypeInfo::PyValue
+                )
+            };
             match &unified {
                 None => unified = Some(t),
                 Some(prev) if *prev == t => {}
                 Some(_) if has_none => {
                     return Some(crate::TypeInfo::PyValue);
+                }
+                Some(prev)
+                    if boxable(prev)
+                        && boxable(&t)
+                        && (matches!(prev, crate::TypeInfo::PyValue)
+                            || matches!(t, crate::TypeInfo::PyValue)) =>
+                {
+                    unified = Some(crate::TypeInfo::PyValue);
                 }
                 Some(_) => return None,
             }
