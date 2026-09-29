@@ -139,7 +139,8 @@ error output), and a growing stdlib: `math`, `random`, `os`, `sys`,
 `heapq`, `bisect`, `copy`, `textwrap`, `hashlib`, `csv` (reader and writer),
 `unicodedata` (Unicode 16.0.0: category, bidirectional, combining, name,
 lookup, normalize),
-`collections`, `pathlib`, `glob`, `subprocess`, `tempfile`,
+`collections` (partial — issue #427), `pathlib`, `glob`,
+`subprocess`, `tempfile`,
 `threading` (Thread with static targets, Lock/RLock/Event/Semaphore
 with a real `with lock:` acquire/release lowering, `local()` as a
 per-thread bag of run-time attributes), `socket` (TCP/UDP
