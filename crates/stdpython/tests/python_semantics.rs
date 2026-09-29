@@ -6272,3 +6272,78 @@ mod boxed_numeric_equality {
         assert!(!(a != b));
     }
 }
+
+mod chainmap_ordering {
+    use stdpython::collections::ChainMap;
+    use stdpython::{Len, PyDict};
+
+    fn pd(pairs: &[(&'static str, i64)]) -> PyDict<&'static str, i64> {
+        PyDict::from_iter(pairs.iter().copied())
+    }
+
+    #[test]
+    fn iteration_walks_the_maps_in_reverse_first_seen_wins() {
+        // Verified against python3 (identical under PYTHONHASHSEED=0, 1, 999):
+        // cm = ChainMap({'a': 1, 'b': 2}, {'b': 3, 'c': 4})
+        let cm = ChainMap::new(vec![pd(&[("a", 1), ("b", 2)]), pd(&[("b", 3), ("c", 4)])]);
+        // list(cm.keys())   == ['b', 'c', 'a']  — the LAST map's keys first
+        assert_eq!(cm.keys(), vec!["b", "c", "a"]);
+        // list(cm.values()) == [2, 4, 1]        — first map wins for 'b'
+        assert_eq!(cm.values(), vec![2, 4, 1]);
+        // list(cm.items())  == [('b', 2), ('c', 4), ('a', 1)]
+        assert_eq!(cm.items(), vec![("b", 2), ("c", 4), ("a", 1)]);
+        // len(cm) == 3
+        assert_eq!(cm.len(), 3);
+
+        // cm3 = ChainMap({'x': 1}, {'y': 2, 'x': 9}, {'z': 3, 'y': 8})
+        let cm3 = ChainMap::new(vec![
+            pd(&[("x", 1)]),
+            pd(&[("y", 2), ("x", 9)]),
+            pd(&[("z", 3), ("y", 8)]),
+        ]);
+        // list(cm3) == ['z', 'y', 'x'];  list(cm3.values()) == [3, 2, 1]
+        assert_eq!(cm3.keys(), vec!["z", "y", "x"]);
+        assert_eq!(cm3.values(), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn order_is_deterministic_not_hash_randomized() {
+        // The HashMap/HashSet version produced a different key order on
+        // different runs of the same program. Rebuilding the same
+        // ChainMap must always yield CPython's one order.
+        for _ in 0..50 {
+            let cm = ChainMap::new(vec![pd(&[("a", 1), ("b", 2)]), pd(&[("b", 3), ("c", 4)])]);
+            assert_eq!(cm.keys(), vec!["b", "c", "a"]);
+        }
+    }
+
+    #[test]
+    fn deleting_from_the_first_map_keeps_the_rest_in_order() {
+        // d = ChainMap({'p': 1, 'q': 2, 'r': 3}, {'s': 4}); del d['p']
+        // list(d) == ['s', 'q', 'r']
+        // A swap_remove would move 'r' into 'p''s slot, giving
+        // ['s', 'r', 'q'] — the first map is a dict, which keeps order.
+        let mut d = ChainMap::new(vec![pd(&[("p", 1), ("q", 2), ("r", 3)]), pd(&[("s", 4)])]);
+        assert_eq!(d.remove(&"p"), Some(1));
+        assert_eq!(d.keys(), vec!["s", "q", "r"]);
+    }
+
+    #[test]
+    fn writes_go_to_the_first_map_and_shadow_later_ones() {
+        // w = ChainMap({'k': 1}, {'k': 2, 'm': 3}); w['k'] = 10
+        // dict(w) == {'k': 10, 'm': 3}
+        let mut w = ChainMap::new(vec![pd(&[("k", 1)]), pd(&[("k", 2), ("m", 3)])]);
+        w.insert("k", 10);
+        assert_eq!(w.items(), vec![("k", 10), ("m", 3)]);
+    }
+
+    #[test]
+    fn new_child_is_pushed_on_the_front_and_iterates_last() {
+        // c = ChainMap({'a': 1}).new_child({'b': 2})
+        // list(c) == ['a', 'b'];  c.maps == [{'b': 2}, {'a': 1}]
+        let mut c = ChainMap::new(vec![pd(&[("a", 1)])]);
+        c.new_child(pd(&[("b", 2)]));
+        assert_eq!(c.keys(), vec!["a", "b"]);
+        assert_eq!(c.num_maps(), 2);
+    }
+}

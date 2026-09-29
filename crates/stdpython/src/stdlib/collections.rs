@@ -8,9 +8,9 @@ use alloc::collections::VecDeque;
 use alloc::{format, string::{String, ToString}, vec, vec::Vec};
 use core::hash::Hash;
 #[cfg(feature = "std")]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 #[cfg(not(feature = "std"))]
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 
 /// Counter - dict subclass for counting hashable objects
 #[derive(Debug, Clone)]
@@ -1695,13 +1695,24 @@ fn boxed_key(key: crate::PyValue) -> Result<String, PyException> {
 }
 
 /// ChainMap - groups multiple mappings into single view
+
+/// ChainMap - groups multiple mappings into single view.
+///
+/// The maps are the crate's insertion-ordered `PyDict`, and iteration is
+/// built exactly as CPython's `ChainMap.__iter__` builds it: a dict
+/// seeded from the maps in REVERSE order (`dict.fromkeys` over
+/// `reversed(self.maps)`, merged with `|=`), so the LAST map's keys come
+/// first and a key keeps the position where it was first seen. A std
+/// `HashMap` per map, deduplicated through a `HashSet`, gave an arbitrary
+/// order that was also randomized per process — the same program printed
+/// different key orders run to run.
 #[derive(Debug)]
 pub struct ChainMap<K, V> 
 where 
     K: Hash + Eq + Clone,
     V: Clone,
 {
-    maps: Vec<HashMap<K, V>>,
+    maps: Vec<crate::PyDict<K, V>>,
 }
 
 impl<K, V> ChainMap<K, V> 
@@ -1710,16 +1721,16 @@ where
     V: Clone,
 {
     /// Create new ChainMap
-    pub fn new(maps: Vec<HashMap<K, V>>) -> Self {
+    pub fn new(maps: Vec<crate::PyDict<K, V>>) -> Self {
         Self { maps }
     }
     
     /// Create empty ChainMap
     pub fn empty() -> Self {
-        Self { maps: vec![HashMap::new()] }
+        Self { maps: vec![crate::PyDict::default()] }
     }
     
-    /// Get value by key (searches all maps)
+    /// Get value by key: the FIRST map holding it wins.
     pub fn get(&self, key: &K) -> Option<&V> {
         for map in &self.maps {
             if let Some(value) = map.get(key) {
@@ -1729,47 +1740,57 @@ where
         None
     }
     
-    /// Set value (in first map)
+    /// Set value (writes go to the first map only, as in Python).
     pub fn insert(&mut self, key: K, value: V) {
         if self.maps.is_empty() {
-            self.maps.push(HashMap::new());
+            self.maps.push(crate::PyDict::default());
         }
         self.maps[0].insert(key, value);
     }
     
-    /// Remove key from first map
+    /// Remove key from the first map. `shift_remove`, not `swap_remove`:
+    /// the first map is a Python dict, whose remaining keys keep their
+    /// relative order after a deletion.
     pub fn remove(&mut self, key: &K) -> Option<V> {
         if !self.maps.is_empty() {
-            self.maps[0].remove(key)
+            self.maps[0].shift_remove(key)
         } else {
             None
         }
     }
     
-    /// Get all keys
+    /// All keys, in CPython's iteration order: the maps walked from LAST
+    /// to first, each key placed where it is first seen. Re-inserting an
+    /// already-present key into the IndexMap keeps its original position,
+    /// which is exactly the `d |= mapping` behaviour CPython relies on.
     pub fn keys(&self) -> Vec<K> {
-        let mut keys = HashSet::new();
-        for map in &self.maps {
-            keys.extend(map.keys().cloned());
-        }
-        keys.into_iter().collect()
-    }
-    
-    /// Get all values
-    pub fn values(&self) -> Vec<V> {
-        let mut seen_keys = HashSet::new();
-        let mut values = Vec::new();
-        
-        for map in &self.maps {
-            for (key, value) in map {
-                if !seen_keys.contains(key) {
-                    seen_keys.insert(key.clone());
-                    values.push(value.clone());
-                }
+        let mut order: crate::PyDict<K, ()> = crate::PyDict::default();
+        for map in self.maps.iter().rev() {
+            for key in map.keys() {
+                order.insert(key.clone(), ());
             }
         }
-        
-        values
+        order.into_keys().collect()
+    }
+    
+    /// All values, in key order, each resolved with first-map-wins lookup
+    /// — CPython's ValuesView yields `self[key]` for each key it iterates.
+    pub fn values(&self) -> Vec<V> {
+        self.keys()
+            .iter()
+            .map(|key| self.get(key).cloned().expect("every iterated key is present"))
+            .collect()
+    }
+    
+    /// All (key, value) pairs, in key order, first-map-wins.
+    pub fn items(&self) -> Vec<(K, V)> {
+        self.keys()
+            .into_iter()
+            .map(|key| {
+                let value = self.get(&key).cloned().expect("every iterated key is present");
+                (key, value)
+            })
+            .collect()
     }
     
     /// Check if key exists
@@ -1777,8 +1798,9 @@ where
         self.maps.iter().any(|map| map.contains_key(key))
     }
     
-    /// Add new child map
-    pub fn new_child(&mut self, map: HashMap<K, V>) -> &mut Self {
+    /// Add new child map (pushed on the FRONT, so its keys shadow the
+    /// rest for lookup — and, being first, iterate last).
+    pub fn new_child(&mut self, map: crate::PyDict<K, V>) -> &mut Self {
         self.maps.insert(0, map);
         self
     }
