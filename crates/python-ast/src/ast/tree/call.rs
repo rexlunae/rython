@@ -1322,8 +1322,9 @@ type NpCtx = (CodeGenContext, PythonOptions, SymbolTableScopes, bool);
 fn numpy_borrows_arrays(plain_name: &str) -> bool {
     matches!(
         plain_name,
-        // reductions (1-arg)
+        // reductions (1-arg, plus std/var's ddof)
         "sum" | "prod" | "mean" | "max" | "min" | "all" | "any" | "argmax" | "argmin"
+            | "std" | "var"
         // unary elementwise ufuncs
             | "abs" | "negative" | "sqrt" | "exp" | "expm1" | "log" | "log1p" | "log2"
             | "log10" | "sin" | "cos" | "tan" | "sinh" | "cosh" | "tanh" | "arcsin"
@@ -1361,6 +1362,19 @@ fn np_render(expr: &ExprType, ctx: &NpCtx) -> Result<TokenStream, Box<dyn std::e
         }
         _ => Ok(quote!((#tokens))),
     }
+}
+
+/// Render a SCALAR parameter (`ddof=`): never borrowed, even when the
+/// function borrows its array arguments — the runtime takes it by value
+/// and casts it (`(#t) as f64`), which a `&i32` cannot do.
+fn np_render_scalar(
+    expr: &ExprType,
+    ctx: &NpCtx,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    let tokens = expr
+        .clone()
+        .to_rust(ctx.0.clone(), ctx.1.clone(), ctx.2.clone())?;
+    Ok(quote!((#tokens)))
 }
 
 /// Render an ARRAY-LIST argument (`np.concatenate([p, q], ...)`).
@@ -1923,7 +1937,7 @@ fn lower_numpy_call(
             }
             let a = np_render(&args[0], &npc)?;
             let ddof = match np_kw(keywords, "ddof") {
-                Some(d) => Some(np_render(d, &npc)?),
+                Some(d) => Some(np_render_scalar(d, &npc)?),
                 None => None,
             };
             let ddof = match ddof {
@@ -1980,7 +1994,10 @@ fn lower_numpy_call(
                 np_render(&args[1], &npc)?,
                 np_render(&args[2], &npc)?,
             );
-            Ok(quote!(numpy::where_(&#c, &#a, &#b)?))
+            // np_render already borrows every argument ("where" is in
+            // numpy_borrows_arrays); another `&` here made `&&NdArray`, which
+            // has no BinaryOperand conversion.
+            Ok(quote!(numpy::where_(#c, #a, #b)?))
         }
 
         "concatenate" => {
