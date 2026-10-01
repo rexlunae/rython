@@ -20068,7 +20068,9 @@ fn option_returning_functions_wrap_plain_members_and_narrowed_reads_unwrap() {
          def show(v: str | None) -> str:\n\
          \x20   if v is not None:\n\
          \x20       return v\n\
-         \x20   return \"none\"\n",
+         \x20   return \"none\"\n\
+         def cut(host: str | None, a: int, b: int) -> str:\n\
+         \x20   return host[a:b]\n",
         "regex_opt.py",
     );
     assert!(
@@ -20081,9 +20083,12 @@ fn option_returning_functions_wrap_plain_members_and_narrowed_reads_unwrap() {
         "return None in an Option-returning function lowers to the None member: {}",
         out
     );
+    // `host[start:end]` sits under `if host:`, so the narrowed read
+    // unwraps plainly; the loud TypeError unwrap is for an Option
+    // receiver no guard narrowed (`cut`).
     assert!(
         out.contains("is not subscriptable"),
-        "an Option-typed slice receiver unwraps with the TypeError panic: {}",
+        "an unnarrowed Option-typed slice receiver unwraps with the TypeError panic: {}",
         out
     );
     assert!(
