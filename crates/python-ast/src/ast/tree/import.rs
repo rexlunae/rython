@@ -1993,11 +1993,32 @@ impl CodeGen for Import {
             // (`import h2.config` — urllib3's http2: `h2.config.
             // H2Configuration(...)`).
             if let Some(root) = alias.name.split('.').next() {
-                if !root.is_empty() && root != &alias.name {
+                let root_bound_unaliased = alias.asname.is_some()
+                    && matches!(
+                        symbols.get(root),
+                        Some(SymbolTableNode::Import(prev))
+                            if prev.names.iter().any(|p| {
+                                p.asname.is_none() && p.name.split('.').next() == Some(root)
+                            })
+                    );
+                if !root.is_empty() && root != &alias.name && !root_bound_unaliased {
                     symbols.insert(root.to_string(), SymbolTableNode::Import(self.clone()));
                 }
             }
-            symbols.insert(alias.name.clone(), SymbolTableNode::Import(self.clone()));
+            // An ALIASED `import m as a` must not replace the entry an
+            // earlier unaliased `import m` made: Python keeps that binding
+            // of `m` live (`import collections; import collections as c`
+            // still reads `collections.deque`). Issue #435 tracks binding
+            // only `a` for an aliased import.
+            let keeps_unaliased = alias.asname.is_some()
+                && matches!(
+                    symbols.get(&alias.name),
+                    Some(SymbolTableNode::Import(prev))
+                        if prev.names.iter().any(|p| p.name == alias.name && p.asname.is_none())
+                );
+            if !keeps_unaliased {
+                symbols.insert(alias.name.clone(), SymbolTableNode::Import(self.clone()));
+            }
             if let Some(a) = alias.asname.clone() {
                 symbols.insert(a, SymbolTableNode::Alias(alias.name.clone()))
             }

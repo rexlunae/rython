@@ -26591,6 +26591,23 @@ fn defaultdict_deque_factory_resolves_through_the_import() {
         "dd_deque_module_alias.py",
     );
     assert!(flat_of(&module_alias).contains(want), "module alias: {module_alias}");
+    // Devin review on #429: a LATER aliased import of the same module must
+    // not unbind the earlier unaliased one (`collections` stays bound).
+    let repeat_import = compile(
+        "import collections\n\
+         import collections as c\n\
+         import collections.abc as cabc\n\
+         from collections import defaultdict\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = defaultdict(collections.deque)\n\
+         \x20   e = c.defaultdict(c.deque)\n\
+         \x20   d[\"a\"].append(1)\n\
+         \x20   e[\"b\"].append(2)\n\
+         \x20   return len(d) + len(e)\n",
+        "dd_deque_repeat_import.py",
+    );
+    assert!(flat_of(&repeat_import).contains(want), "repeat import: {repeat_import}");
     // Devin review on #429: `collections.deque` with `collections` UNBOUND
     // is a NameError in CPython; it must not quietly become a deque factory.
     let err = compile_err(
