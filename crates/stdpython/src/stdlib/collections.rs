@@ -687,6 +687,12 @@ where
     // process.
     inner: core::cell::RefCell<crate::PyDict<K, V>>,
     default_factory: Option<DefaultFactory<V>>,
+    /// Built by `Default::default()` (a class struct's placeholder before
+    /// its `__init__` assigns the real container), NOT by `defaultdict()` /
+    /// `defaultdict(None)`. A missing-key read of such a value would raise
+    /// a KeyError indistinguishable from a genuine one, so it panics
+    /// instead (see [`defaultdict::missing_key`]).
+    built_by_default: bool,
 }
 
 impl<K, V> defaultdict<K, V>
@@ -703,6 +709,7 @@ where
                 make: default_factory,
                 class: None,
             }),
+            built_by_default: false,
         }
     }
 
@@ -716,6 +723,7 @@ where
                 make: default_factory,
                 class: Some(class),
             }),
+            built_by_default: false,
         }
     }
 
@@ -725,6 +733,7 @@ where
         Self {
             inner: core::cell::RefCell::new(crate::PyDict::default()),
             default_factory: None,
+            built_by_default: false,
         }
     }
 
@@ -752,8 +761,23 @@ where
                     .insert(key.clone(), default_value.clone());
                 Ok(default_value)
             }
-            None => Err(crate::key_error(key.py_repr())),
+            None => Err(self.missing_key(key)),
         }
+    }
+
+    /// The error for a missing key of a container with no factory: CPython's
+    /// `KeyError` for a genuine `defaultdict()` / `defaultdict(None)`. A
+    /// container built by `Default::default()` never received its
+    /// default_factory (a converter bug), and a KeyError would be mistaken for
+    /// the real thing by `except KeyError:`, so it panics.
+    fn missing_key(&self, key: &K) -> PyException
+    where
+        K: crate::PyRepr,
+    {
+        if self.built_by_default {
+            panic!("defaultdict built without its default_factory — rython bug, please report");
+        }
+        crate::key_error(key.py_repr())
     }
 
     /// Get value without creating default
@@ -819,7 +843,7 @@ where
                     let value = (factory.make)();
                     self.inner.get_mut().insert(key.clone(), value);
                 }
-                None => return Err(crate::key_error(key.py_repr())),
+                None => return Err(self.missing_key(&key)),
             }
         }
         // The key is present: this lookup cannot fail.
@@ -1014,7 +1038,9 @@ where
     V: Clone,
 {
     fn default() -> Self {
-        Self::without_factory()
+        let mut d = Self::without_factory();
+        d.built_by_default = true;
+        d
     }
 }
 
@@ -1050,6 +1076,9 @@ where
     V: Clone + crate::PyRepr,
 {
     fn py_repr(&self) -> String {
+        if self.built_by_default {
+            panic!("defaultdict built without its default_factory — rython bug, please report");
+        }
         let factory = match self.default_factory {
             None => String::from("None"),
             Some(DefaultFactory { class: Some(name), .. }) => format!("<class '{}'>", name),

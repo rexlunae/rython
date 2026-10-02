@@ -5437,6 +5437,42 @@ mod collections_containers {
     }
 
     #[test]
+    fn a_factoryless_defaultdict_raises_a_genuine_keyerror() {
+        // defaultdict()["k"] / defaultdict(None)["k"] -> KeyError: 'k' — a
+        // program may catch it with `except KeyError`.
+        let d = defaultdict::<String, i64>::without_factory();
+        let err = d.py_index("k").unwrap_err();
+        assert_eq!(err.exception_type, "KeyError");
+        assert_eq!(err.message, "'k'");
+    }
+
+    #[test]
+    #[should_panic(expected = "built without its default_factory")]
+    fn a_default_built_defaultdict_panics_on_a_missing_key_read() {
+        // `Default::default()` is a class struct's placeholder, NOT a
+        // `defaultdict()`: a KeyError here would be mistaken for CPython's
+        // by `except KeyError:`, so a missing-key read panics naming the bug.
+        let d: defaultdict<String, i64> = Default::default();
+        let _ = d.py_index("k");
+    }
+
+    #[test]
+    #[should_panic(expected = "built without its default_factory")]
+    fn a_default_built_defaultdict_panics_on_a_missing_key_slot() {
+        let mut d: defaultdict<String, Vec<i64>> = Default::default();
+        let _ = d.py_index_mut("k");
+    }
+
+    #[test]
+    fn a_default_built_defaultdict_still_serves_present_keys_and_reads_that_never_insert() {
+        let mut d: defaultdict<String, i64> = Default::default();
+        d.py_set_index("a".to_string(), 1).unwrap();
+        assert_eq!(d.py_index("a").unwrap(), 1);
+        assert_eq!(d.py_get(&"zz".to_string()), None);
+        assert!(!d.py_contains("zz"));
+    }
+
+    #[test]
     #[should_panic(expected = "memory address")]
     fn defaultdict_repr_with_a_lambda_factory_is_loud() {
         // repr(defaultdict(lambda: 5)) prints `<function <lambda> at 0x...>`: an
