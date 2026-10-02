@@ -46,15 +46,34 @@ pub(crate) fn ctor_of(func: &ExprType, symbols: &SymbolTableScopes) -> Option<Co
             let ExprType::Name(m) = a.value.as_ref() else {
                 return None;
             };
-            if crate::StdModule::from_name(&m.id) == Some(crate::StdModule::Collections)
-                && !crate::ast::tree::call::module_name_shadowed(&m.id, symbols)
-            {
+            if binds_collections_module(&m.id, symbols) {
                 CollectionsType::from_class_name(&a.attr)
             } else {
                 None
             }
         }
         _ => None,
+    }
+}
+
+/// Whether `name` is bound to the `collections` MODULE by an import: an
+/// unaliased `import collections` (or `import collections.abc`, which
+/// binds the root), or `import collections as c` read through `c`. An
+/// unbound `collections` (a NameError in CPython) or one an `import` binds
+/// under a different alias does not count — the qualified constructor
+/// would otherwise build a container where CPython raises.
+fn binds_collections_module(name: &str, symbols: &SymbolTableScopes) -> bool {
+    let is_collections = |module: &str| {
+        crate::StdModule::from_name(module) == Some(crate::StdModule::Collections)
+    };
+    match symbols.get(name) {
+        Some(SymbolTableNode::Import(im)) => im.names.iter().any(|alias| {
+            alias.asname.is_none()
+                && alias.name.split('.').next() == Some(name)
+                && is_collections(name)
+        }),
+        Some(SymbolTableNode::Alias(target)) => is_collections(target),
+        _ => false,
     }
 }
 

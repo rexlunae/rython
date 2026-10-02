@@ -26579,6 +26579,41 @@ fn defaultdict_deque_factory_resolves_through_the_import() {
         "dd_deque_qualified.py",
     );
     assert!(flat_of(&qualified).contains(want), "qualified: {qualified}");
+    // The module under an alias (`import collections as c`) is the same
+    // module.
+    let module_alias = compile(
+        "import collections as c\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = c.defaultdict(c.deque)\n\
+         \x20   d[\"a\"].append(1)\n\
+         \x20   return len(d)\n",
+        "dd_deque_module_alias.py",
+    );
+    assert!(flat_of(&module_alias).contains(want), "module alias: {module_alias}");
+    // Devin review on #429: `collections.deque` with `collections` UNBOUND
+    // is a NameError in CPython; it must not quietly become a deque factory.
+    let err = compile_err(
+        "from collections import defaultdict\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = defaultdict(collections.deque)\n\
+         \x20   return len(d)\n",
+        "dd_deque_unbound_module.py",
+    );
+    assert!(err.contains("defaultdict(...) takes only a builtin class"), "{err}");
+    // Nor when the module is imported only under another name: `import
+    // collections as c` binds `c`, not `collections`.
+    let err = compile_err(
+        "import collections as c\n\
+         from collections import defaultdict\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = defaultdict(collections.deque)\n\
+         \x20   return len(d)\n",
+        "dd_deque_other_alias.py",
+    );
+    assert!(err.contains("defaultdict(...) takes only a builtin class"), "{err}");
     // A local class named `deque` shadows the import: not the collections
     // class, so not a supported factory.
     let err = compile_err(

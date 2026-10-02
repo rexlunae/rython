@@ -20651,3 +20651,32 @@ fn a_narrowed_optional_revalidates_on_every_store_and_per_branch() {
         vec!["2", "None", "2", "1", "unset", "None", "set", "4", "None", "7", "0"]
     );
 }
+
+#[test]
+fn a_collections_module_alias_constructs_like_the_module() {
+    // Devin review on #429: the qualified `collections.X` constructors now
+    // require the module to be BOUND (an unbound `collections` is a
+    // NameError in CPython and stays loud); `import collections as c`
+    // reaches the same module through its alias.
+    let got = run_global_alias_program(
+        "collections_module_alias",
+        "collections_module_alias.py",
+        concat!(
+            "import collections as c\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    q = c.deque([1, 2])\n",
+            "    q.append(3)\n",
+            "    d = c.defaultdict(c.deque)\n",
+            "    d[\"a\"].append(1)\n",
+            "    print(len(q), len(d))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    // Verified against python3.
+    assert_eq!(got, vec!["3 1"]);
+}
