@@ -33,6 +33,12 @@
     "fsum_compensation": {
       "status": "pass"
     },
+    "global_shared_singleton": {
+      "status": "pass"
+    },
+    "global_singleton_handles": {
+      "status": "pass"
+    },
     "handoff": {
       "status": "pass"
     },

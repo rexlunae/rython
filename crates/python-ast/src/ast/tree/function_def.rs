@@ -5969,7 +5969,7 @@ impl FunctionDef {
                 return None;
             };
             match options.mutable_statics.get(&name.id) {
-                Some(crate::MutableGlobalKind::Class { class: c }) => {
+                Some(crate::MutableGlobalKind::Class { class: c, .. }) => {
                     if class.is_some() && class.as_deref() != Some(c.as_str()) {
                         return None;
                     }
@@ -6803,7 +6803,7 @@ impl FunctionDef {
                     // representation), so `return HISTORY_RECORDER` types
                     // the function as the class.
                     None => match options.mutable_statics.get(&name.id) {
-                        Some(crate::MutableGlobalKind::Class { class }) => {
+                        Some(crate::MutableGlobalKind::Class { class, .. }) => {
                             crate::TypeInfo::Class(class.clone())
                         }
                         // Issue #222: a returned PARAMETER is not a local,

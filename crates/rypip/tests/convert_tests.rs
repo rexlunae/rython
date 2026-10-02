@@ -19324,6 +19324,197 @@ fn a_module_global_holding_a_shared_object_is_the_one_object() {
 }
 
 #[test]
+fn a_global_singleton_and_a_mutated_registry_hold_the_one_object() {
+    // Issue #422: a `global`-rebound singleton (`_instance`) and a module
+    // value mutated in place (`reg`, whose list holds shared Counters) are
+    // `Mutex` statics holding a shared class's `PyRef`: thread-bound, so the
+    // crate compiles, and every handle reaches the ONE object (`a is b`,
+    // a bump through `held` is seen through `reg.items`).
+    let scratch = Scratch::new("globalsingleton");
+    let file = scratch.path().join("global_shared_singleton.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self, k: int) -> int:\n",
+            "        self.n += k\n",
+            "        return self.n\n",
+            "\n",
+            "\n",
+            "class Registry:\n",
+            "    def __init__(self):\n",
+            "        self.items: list[Counter] = []\n",
+            "\n",
+            "    def add(self, c: Counter) -> None:\n",
+            "        self.items.append(c)\n",
+            "\n",
+            "\n",
+            "_instance = None\n",
+            "\n",
+            "\n",
+            "def get_instance() -> Counter:\n",
+            "    global _instance\n",
+            "    if _instance is None:\n",
+            "        _instance = Counter()\n",
+            "    return _instance\n",
+            "\n",
+            "\n",
+            "reg = Registry()\n",
+            "reg.add(Counter())\n",
+            "held = Counter()\n",
+            "reg.add(held)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    a = get_instance()\n",
+            "    a.bump(2)\n",
+            "    b = get_instance()\n",
+            "    print(b.bump(3))\n",
+            "    print(a is b)\n",
+            "    print(get_instance().n)\n",
+            "\n",
+            "    held.bump(7)\n",
+            "    reg.items[0].bump(1)\n",
+            "    total = 0\n",
+            "    for c in reg.items:\n",
+            "        total += c.n\n",
+            "        print(c.n)\n",
+            "    print(total)\n",
+            "    print(sum(c.n for c in reg.items))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/global_shared_singleton"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "5",
+            "True",
+            "5",
+            "1",
+            "7",
+            "8",
+            "8",
+        ],
+    );
+}
+
+#[test]
+fn a_global_singleton_is_shared_so_its_handles_alias() {
+    // Issue #422: a class a `global`-rebound static holds is a holder of the
+    // one object, so it takes the shared representation even when nothing
+    // else holds it: a mutation through a handle the getter returned
+    // (`p.label = ...`, `p.c.bump(...)`, `old.bump(...)`) is seen by the
+    // global, and a REBOUND global leaves the old handle on the old object.
+    let scratch = Scratch::new("globalhandles");
+    let file = scratch.path().join("global_singleton_handles.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self, k: int) -> int:\n",
+            "        self.n += k\n",
+            "        return self.n\n",
+            "\n",
+            "\n",
+            "class Pool:\n",
+            "    def __init__(self):\n",
+            "        self.label = \"pool\"\n",
+            "        self.c = Counter()\n",
+            "\n",
+            "\n",
+            "_instance = None\n",
+            "_pool = None\n",
+            "current = Counter()\n",
+            "\n",
+            "\n",
+            "def get_instance() -> Counter:\n",
+            "    global _instance\n",
+            "    if _instance is None:\n",
+            "        _instance = Counter()\n",
+            "    return _instance\n",
+            "\n",
+            "\n",
+            "def get_pool() -> Pool:\n",
+            "    global _pool\n",
+            "    if _pool is None:\n",
+            "        _pool = Pool()\n",
+            "    return _pool\n",
+            "\n",
+            "\n",
+            "def swap() -> None:\n",
+            "    global current\n",
+            "    current = Counter()\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    a = get_instance()\n",
+            "    a.bump(2)\n",
+            "    b = get_instance()\n",
+            "    print(b.bump(3))\n",
+            "    print(a is b)\n",
+            "    p = get_pool()\n",
+            "    p.label = \"changed\"\n",
+            "    p.c.bump(9)\n",
+            "    print(get_pool().label, get_pool().c.n)\n",
+            "    old = current\n",
+            "    old.bump(4)\n",
+            "    print(current.n)\n",
+            "    swap()\n",
+            "    print(current.n, old.n)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/global_singleton_handles"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "5",
+            "True",
+            "changed 9",
+            "4",
+            "0 4",
+        ],
+    );
+}
+
+#[test]
 fn a_list_of_boxed_values_field_keeps_its_own_methods() {
     // Issue #421: `self.q: list[Any]` is a Vec<PyValue> — a typed
     // container, not a boxed receiver — so `append`/`pop` on it are real.

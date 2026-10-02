@@ -1575,7 +1575,7 @@ pub(crate) fn is_boxed_global_read(
     matches!(
         options.mutable_statics.get(&n.id),
         Some(crate::MutableGlobalKind::Boxed)
-            | Some(crate::MutableGlobalKind::Computed { boxed: true })
+            | Some(crate::MutableGlobalKind::Computed { boxed: true, .. })
     )
 }
 

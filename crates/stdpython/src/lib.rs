@@ -4842,9 +4842,16 @@ impl<T: PyInherits<Base>, Base> PyInherits<Base> for PyRef<T> {}
 /// instance (`PyRef` — an `Rc`, which a `static` cannot hold): the value
 /// is bound to the thread that initialized it. CPython lets every thread
 /// reach the one object; rython's single-threaded reference cells cannot,
-/// so a read from any other thread panics at that read — loud at the
+/// so an access from any other thread panics at that access — loud at the
 /// divergence (§12.2), never a data race. Reads deref to the value, so a
 /// global's `(*NAME).clone()` and method calls are unchanged.
+///
+/// A global REBOUND through `global` (the singleton pattern) or mutated in
+/// place is a `Mutex` static; its `Mutex<T>` is only `Sync` for `T: Send`,
+/// which a `PyRef` is not, so the Mutex itself sits inside the bound
+/// (`LazyLock<ThreadBound<Mutex<T>>>`) and `py_global_read` /
+/// `py_global_write` / `py_global_mutate` take `&**NAME` — the second
+/// deref is the thread check (issue #422).
 #[cfg(feature = "std")]
 pub struct ThreadBound<T> {
     owner: std::thread::ThreadId,
@@ -4867,7 +4874,7 @@ impl<T> core::ops::Deref for ThreadBound<T> {
     fn deref(&self) -> &T {
         if std::thread::current().id() != self.owner {
             panic!(
-                "RuntimeError: a module global holding a shared object is read from a \
+                "RuntimeError: a module global holding a shared object is accessed from a \
                  thread other than the one that created it; rython's shared objects are \
                  single-threaded (issue #414)"
             );
@@ -4922,6 +4929,54 @@ mod thread_bound_tests {
             .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
             .unwrap_or_default();
         assert!(msg.contains("from a thread other than the one that created it"), "{}", msg);
+    }
+
+    // Issue #422: a REBOUND / mutated-in-place global holding a shared
+    // object is `LazyLock<ThreadBound<Mutex<T>>>`; the helpers take
+    // `&**NAME` (the second deref is the thread check).
+    type Slot = std::sync::LazyLock<ThreadBound<std::sync::Mutex<Option<PyRef<i64>>>>>;
+
+    #[test]
+    fn a_thread_bound_mutex_global_reads_writes_and_mutates_on_its_own_thread() {
+        static G: Slot = std::sync::LazyLock::new(|| ThreadBound::new(std::sync::Mutex::new(None)));
+        assert!(py_global_read(&**G).is_none());
+        py_global_write(&**G, Some(PyRef::new(1)));
+        // A read is the ONE object: a write through the handle is seen by
+        // the next read.
+        let handle = py_global_read(&**G).unwrap();
+        *handle.borrow_mut() += 4;
+        assert_eq!(*py_global_read(&**G).unwrap().borrow(), 5);
+        let got = py_global_mutate(&**G, |slot| {
+            *slot.as_ref().unwrap().borrow_mut() += 1;
+            *slot.as_ref().unwrap().borrow()
+        });
+        assert_eq!(got, 6);
+        assert_eq!(*handle.borrow(), 6);
+    }
+
+    #[test]
+    fn a_thread_bound_mutex_global_touched_from_another_thread_panics() {
+        static G: Slot = std::sync::LazyLock::new(|| ThreadBound::new(std::sync::Mutex::new(None)));
+        py_global_write(&**G, Some(PyRef::new(1)));
+        for op in 0..3 {
+            let err = std::thread::spawn(move || match op {
+                0 => {
+                    py_global_read(&**G);
+                }
+                1 => py_global_write(&**G, None),
+                _ => py_global_mutate(&**G, |_| ()),
+            })
+            .join()
+            .expect_err("another thread's access must panic");
+            let msg = err
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            assert!(msg.contains("from a thread other than the one that created it"), "{}", msg);
+        }
+        // The owner is unaffected.
+        assert_eq!(*py_global_read(&**G).unwrap().borrow(), 1);
     }
 }
 

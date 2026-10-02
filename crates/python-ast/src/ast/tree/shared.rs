@@ -183,6 +183,10 @@ pub fn compute_shared(
         // as a container slot is (issue #414): `def bump(order: Order):
         // order.total += 1` mutates the caller's `o`.
         collect_parameter_holders(body, symbols, opts, &mut stored);
+        // A `global`-rebound class-instance module static is a holder too
+        // (the singleton pattern, issue #422): every handle the getter
+        // returns is another reference to the one object.
+        stored.extend(crate::ast::tree::module::module_global_held_classes(body, symbols, opts));
         collect_external_store_fields(body, &Env::default(), symbols, opts, &mut external_stores);
     };
     register(this_body, this_classes.to_vec(), this_symbols, options);

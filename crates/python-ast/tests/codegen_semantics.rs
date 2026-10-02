@@ -26100,6 +26100,93 @@ fn a_module_global_holding_a_shared_object_is_thread_bound() {
     );
 }
 
+/// Issue #422: a `global`-rebound singleton of a class is a holder of the
+/// one object, so the class is shared (`PyRef`) and the static holds
+/// `Option<PyRef<Class>>` inside a thread-bound Mutex — `Mutex<T>` is only
+/// `Sync` for `T: Send`, which an `Rc` is not.
+#[test]
+fn a_global_singleton_of_a_shared_class_is_a_thread_bound_mutex_of_the_ref() {
+    let out = compile(
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self, k: int) -> int:\n",
+            "        self.n += k\n",
+            "        return self.n\n",
+            "\n",
+            "_instance = None\n",
+            "\n",
+            "def get_instance() -> Counter:\n",
+            "    global _instance\n",
+            "    if _instance is None:\n",
+            "        _instance = Counter()\n",
+            "    return _instance\n",
+        ),
+        "singleton_422.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains(
+            "pubstatic_instance:std::sync::LazyLock<stdpython::ThreadBound<std::sync::Mutex<Option<stdpython::PyRef<Counter>>>>"
+        ),
+        "the static holds the shared ref behind a thread bound: {}",
+        out
+    );
+    assert!(
+        flat.contains("py_global_write(&**_instance,Some(stdpython::PyRef::new(Counter::new()?)))"),
+        "the write goes through the bound: {}",
+        out
+    );
+    assert!(
+        flat.contains("py_global_read(&**_instance)"),
+        "the read goes through the bound: {}",
+        out
+    );
+}
+
+/// Issue #422: a module value mutated in place whose field holds shared
+/// objects (`Registry.items: list[Counter]`) is a `Mutex` static too — it is
+/// thread-bound like the immutable form, and the mutation runs under the
+/// lock through the bound.
+#[test]
+fn a_mutated_module_global_holding_shared_objects_is_a_thread_bound_mutex() {
+    let out = compile(
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self, k: int) -> int:\n",
+            "        self.n += k\n",
+            "        return self.n\n",
+            "\n",
+            "class Registry:\n",
+            "    def __init__(self):\n",
+            "        self.items: list[Counter] = []\n",
+            "\n",
+            "    def add(self, c: Counter) -> None:\n",
+            "        self.items.append(c)\n",
+            "\n",
+            "reg = Registry()\n",
+            "reg.add(Counter())\n",
+        ),
+        "registry_422.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("pubstaticreg:std::sync::LazyLock<stdpython::ThreadBound<std::sync::Mutex<Registry>>"),
+        "the mutated global is a thread-bound Mutex: {}",
+        out
+    );
+    assert!(
+        flat.contains("py_global_mutate(&**reg,"),
+        "the mutation locks through the bound: {}",
+        out
+    );
+}
+
 /// A FIELD read of a LOCAL passed as an argument (`show(o.inner)` twice)
 /// is reuse-cloned like a name read: the local is an instance, not a
 /// module, so the first call must not move the field out of it.

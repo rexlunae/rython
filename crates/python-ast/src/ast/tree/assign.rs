@@ -803,7 +803,7 @@ impl<'a> CodeGen for Assign {
                 && let Some(kind) = options.mutable_statics.get(&name.id)
             {
                 let ident = crate::safe_ident(&name.id);
-                let stored = if let crate::MutableGlobalKind::Class { class } = kind {
+                let stored = if let crate::MutableGlobalKind::Class { class, .. } = kind {
                     // Issue #189: the class-instance global holds exactly
                     // None and the detected class construction. The call's
                     // `?` propagates from the enclosing scope's Result.

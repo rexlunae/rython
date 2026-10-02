@@ -821,7 +821,7 @@ fn infer_type_inner(
             if let Some(kind) = options.mutable_statics.get(&n.id) {
                 match kind {
                     crate::MutableGlobalKind::Boxed
-                    | crate::MutableGlobalKind::Computed { boxed: true } => {
+                    | crate::MutableGlobalKind::Computed { boxed: true, .. } => {
                         return TypeInfo::PyValue;
                     }
                     crate::MutableGlobalKind::Str => return TypeInfo::String,

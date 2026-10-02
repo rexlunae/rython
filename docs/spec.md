@@ -570,9 +570,13 @@ through subscript/attribute stores marks the chain's base variable.
   holds a shared object is a `stdpython::ThreadBound` static — an `Rc`
   cannot live in a plain static — bound to the thread that initialized
   it: every read on that thread is the one object, and a read from any
-  other thread panics at the read (§12.2). A global of that kind that is
-  REBOUND or mutated in place (a `Mutex` static) is not supported yet and
-  fails in rustc (issue #422). Every other class stays a plain struct
+  other thread panics at the access (§12.2). A global of that kind that
+  is REBOUND through `global` (the singleton: `_instance = None`, then
+  `_instance = Counter()` in a getter) or mutated in place is a `Mutex`
+  static inside the same bound (`LazyLock<ThreadBound<Mutex<T>>>`), and a
+  class a `global`-rebound static holds is itself shared — the static and
+  every handle the getter returns are the one object (issue #422). Every
+  other class stays a plain struct
   (cloning an immutable object, or one no container or parameter holds,
   is unobservable). The
   `shared.rs` analysis is the one authority; a shared class's method
@@ -2540,8 +2544,8 @@ catchable `PyException`:
   overflow-adjacent arithmetic as out of contract until the opt-in
   bigint tier exists.
 - Sorting a `NaN`; `hash(nan)`.
-- Reading a module global (or class attribute) that holds a shared
-  object from a thread other than the one that initialized it
+- Reading, writing or mutating a module global (or class attribute) that
+  holds a shared object from a thread other than the one that initialized it
   (`stdpython::ThreadBound` — CPython lets every thread reach the one
   object; rython's shared objects are single-threaded, §5).
 - Arithmetic on `None` (including aug-assign `-=`/`|=` on an `Option`
