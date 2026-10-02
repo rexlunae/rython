@@ -1,0 +1,19 @@
+2
+1
+0
+2
+['a', 'missing']
+True False
+None
+2
+a ['apple', 'avocado']
+b ['banana', 'blueberry']
+c ['cherry']
+['a', 'b', 'c']
+[['apple', 'avocado'], ['banana', 'blueberry'], ['cherry']]
+a 2
+b 2
+c 1
+[('x', 3), ('y', 1), ('z', 1)]
+defaultdict(<class 'int'>, {'a': 2, 'missing': 0})
+2

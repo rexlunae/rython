@@ -5647,6 +5647,13 @@ fn infer_field_type(
             func if crate::ast::tree::type_ctx::threading_local_ctor(func, symbols) => {
                 Some(crate::TypeInfo::Threading(crate::ThreadingType::Local))
             }
+            // `self.queue = deque()` / `self.cache = OrderedDict()` /
+            // `self.index = defaultdict(list)`: the runtime collections
+            // struct; parts the constructor leaves unknown box like an
+            // untyped `[]` / `{}` field (a String key, a PyValue value).
+            _ if crate::ast::tree::collections_lower::ctor_of(&call.func, symbols).is_some() => {
+                crate::ast::tree::collections_lower::field_type(call, None, options, symbols)
+            }
             ExprType::Name(n) if n.id == "bool" => Some(crate::TypeInfo::Bool),
             // A `cast(T, ...)` typing no-op (`self.frames = cast(List[str],
             // spinner["frames"])[:]` — rich's Spinner): the cast's FIRST

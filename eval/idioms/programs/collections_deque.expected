@@ -1,0 +1,19 @@
+4
+deque([0, 1, 2, 3])
+[0, 1, 2, 3]
+0 3
+3 0
+[1, 2]
+[8, 9, 1, 2, 7]
+[9, 1, 2, 7, 8]
+True False
+[10, 20, 30]
+[6, 9, 12, 15]
+[2, 3, 4] 3
+[0, 2, 3]
+None
+IndexError: pop from an empty deque
+IndexError: pop from an empty deque
+a
+b
+c

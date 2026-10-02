@@ -299,10 +299,10 @@ impl CodeGen for For {
         // with-q comprehension, round 99): Python iterates the dict's
         // KEYS, but the typed PyDict's IntoIterator yields the (K, V)
         // pairs. Route through the keys view.
-        if matches!(
-            crate::infer_type(Some(&ctx), &self.iter, &options, &symbols),
-            crate::TypeInfo::Dict(_, _)
-        ) {
+        if crate::infer_type(Some(&ctx), &self.iter, &options, &symbols)
+            .dict_kv()
+            .is_some()
+        {
             iter = quote!(#iter . py_keys ());
         }
         // A STRING-typed iterable (`for ch in buf` where `buf: str` —

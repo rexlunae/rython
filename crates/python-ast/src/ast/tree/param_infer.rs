@@ -2477,7 +2477,7 @@ fn type_display(ty: &TypeInfo) -> String {
         TypeInfo::Threading(_) => "threading object".to_string(),
         TypeInfo::Socket => "socket".to_string(),
         TypeInfo::ClassValue => "type".to_string(),
-        TypeInfo::Callable(..) => ty.display(),
+        TypeInfo::Callable(..) | TypeInfo::Collection(..) => ty.display(),
         TypeInfo::PyObject => "unknown".to_string(),
     }
 }

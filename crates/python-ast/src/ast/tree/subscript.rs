@@ -99,9 +99,26 @@ pub(crate) fn subscript_receiver_place(
             )?;
             match &sub.kind {
                 SubscriptKind::Index(index) => {
-                    let index = index
-                        .clone()
-                        .to_rust(ctx, options, symbols)?;
+                    // A str literal into a collections mapping whose key
+                    // type is still unknown owns itself (an owned String
+                    // key); any other key is read-reused (a name used again
+                    // later — `d[a].append(b); d[b].append(a)` — clones
+                    // instead of moving).
+                    let owned_literal_key = crate::ast::tree::collections_lower::owns_literal_key(
+                        &crate::infer_type(Some(&ctx), &sub.value, &options, &symbols),
+                        index,
+                    );
+                    let index = if owned_literal_key {
+                        crate::render_typed(
+                            index,
+                            ctx,
+                            options,
+                            symbols,
+                            Some(crate::TypeInfo::String),
+                        )?
+                    } else {
+                        crate::render_reused(index, ctx, options, symbols)?
+                    };
                     Ok(quote!((#inner).py_index_mut(#index)?))
                 }
                 SubscriptKind::Slice { .. } => Err(
@@ -180,6 +197,24 @@ impl CodeGen for Subscript {
         // Computed BEFORE self.value is moved by the to_rust below.
         let value_yields_option =
             crate::expr_yields_option_ctx(&self.value, &ctx, &options, &symbols);
+        let recv_type = crate::infer_type(Some(&ctx), &self.value, &options, &symbols);
+        // A `defaultdict` held in a CLOSURE CELL (captured by a nested
+        // function or lambda): a name read yields a SNAPSHOT clone, which
+        // would lose the insert `d[k]` of a missing key performs. The read
+        // borrows the cell's one object instead (the guard lives only for
+        // the read, so a nested access in the key cannot deadlock the cell).
+        let defaultdict_cell = match self.value.as_ref() {
+            ExprType::Name(n)
+                if options.cell_locals.contains(&n.id)
+                    && matches!(
+                        recv_type,
+                        crate::TypeInfo::Collection(crate::CollectionsType::DefaultDict, _)
+                    ) =>
+            {
+                Some(crate::safe_ident(&n.id))
+            }
+            _ => None,
+        };
         // A RUST TUPLE receiver: the runtime PyIndex impl covers only
         // HOMOGENEOUS tuples (`(T, T)` — ledger's tuple-of-PyRef). A
         // heterogeneous tuple (`(String, i64)` — text_stats's sorted-key
@@ -312,13 +347,29 @@ impl CodeGen for Subscript {
                 // reuse-aware renderer: an index read from a REUSED
                 // receiver's field moves the value out of the field (the
                 // reuse-clone keeps the receiver intact, round 98).
+                // A str literal into a collections mapping whose key type
+                // is still unknown owns itself (an owned String key).
+                let owned_literal_key = crate::ast::tree::collections_lower::owns_literal_key(
+                    &recv_type, &index,
+                );
                 let index = crate::render_typed_reused(
                     &index,
                     ctx,
                     options,
                     symbols,
-                    Some(crate::TypeInfo::Int),
+                    Some(if owned_literal_key {
+                        crate::TypeInfo::String
+                    } else {
+                        crate::TypeInfo::Int
+                    }),
                 )?;
+                if let Some(cell) = defaultdict_cell {
+                    return Ok(quote! {{
+                        let __rython_key = #index;
+                        let __rython_cell = #cell.borrow();
+                        (*__rython_cell).py_index(__rython_key)?
+                    }});
+                }
                 Ok(quote! { (#value).py_index(#index)? })
             }
             // Slices clamp and never raise.

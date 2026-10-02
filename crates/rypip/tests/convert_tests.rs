@@ -20148,3 +20148,291 @@ fn aliased_crate_imports_resolve_their_defining_items_at_runtime() {
     // Verified against python3.
     assert_eq!(run_package(&krate, "aliaspkg"), vec!["6", "5", "11", "7"]);
 }
+
+#[test]
+fn collections_containers_match_python_at_runtime() {
+    // Issue #427: deque / defaultdict / OrderedDict constructed fine but had
+    // no method surface, so ordinary programs failed in rustc. The first
+    // three prints are the issue's reproducer.
+    let scratch = Scratch::new("collections");
+    let file = scratch.path().join("containers.py");
+    fs::write(
+        &file,
+        concat!(
+            "from collections import deque, defaultdict, OrderedDict\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    d = deque([1, 2])\n",
+            "    d.append(3)\n",
+            "    print(len(d))\n",
+            "    dd = defaultdict(int)\n",
+            "    dd[\"a\"] += 2\n",
+            "    print(dd[\"a\"])\n",
+            "    od = OrderedDict()\n",
+            "    od[\"b\"] = 1\n",
+            "    od[\"a\"] = 2\n",
+            "    print(list(od.keys()))\n",
+            "\n",
+            "\n",
+            "def window_sums(values: list[int], size: int) -> list[int]:\n",
+            "    window: deque[int] = deque(maxlen=size)\n",
+            "    sums: list[int] = []\n",
+            "    for v in values:\n",
+            "        window.append(v)\n",
+            "        if len(window) == size:\n",
+            "            sums.append(sum(window))\n",
+            "    return sums\n",
+            "\n",
+            "\n",
+            "def group_by_initial(words: list[str]) -> dict[str, list[str]]:\n",
+            "    groups: defaultdict[str, list[str]] = defaultdict(list)\n",
+            "    for w in words:\n",
+            "        groups[w[0]].append(w)\n",
+            "    return dict(groups)\n",
+            "\n",
+            "\n",
+            "def lru(keys: list[str], capacity: int) -> list[str]:\n",
+            "    cache: OrderedDict[str, int] = OrderedDict()\n",
+            "    for k in keys:\n",
+            "        if k in cache:\n",
+            "            cache.move_to_end(k)\n",
+            "        cache[k] = len(k)\n",
+            "        if len(cache) > capacity:\n",
+            "            cache.popitem(last=False)\n",
+            "    return list(cache)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+            "    print(window_sums([1, 2, 3, 4, 5, 6], 3))\n",
+            "    print(group_by_initial([\"apple\", \"avocado\", \"banana\"]))\n",
+            "    print(lru([\"a\", \"b\", \"a\", \"c\", \"d\", \"a\"], 2))\n",
+            "    q = deque([1, 2, 3, 4, 5])\n",
+            "    q.rotate(2)\n",
+            "    print(q)\n",
+            "    q.appendleft(0)\n",
+            "    print(q.pop(), q.popleft(), q)\n",
+            "    seen = defaultdict(int)\n",
+            "    print(seen[\"x\"], len(seen), list(seen))\n",
+            "    print(seen)\n",
+            "    try:\n",
+            "        deque().pop()\n",
+            "    except IndexError as exc:\n",
+            "        print(\"IndexError:\", exc)\n",
+            "    try:\n",
+            "        OrderedDict()[\"k\"]\n",
+            "    except KeyError as exc:\n",
+            "        print(\"KeyError:\", exc)\n",
+            "    print(OrderedDict([(\"b\", 1), (\"a\", 2)]))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/containers"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3 (3.12: the OrderedDict repr form changed in
+    // 3.12). The defaultdict read `seen["x"]` INSERTS the key (len 1, listed).
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "3",
+            "2",
+            "['b', 'a']",
+            "[6, 9, 12, 15]",
+            "{'a': ['apple', 'avocado'], 'b': ['banana']}",
+            "['d', 'a']",
+            "deque([4, 5, 1, 2, 3])",
+            "3 0 deque([4, 5, 1, 2])",
+            "0 1 ['x']",
+            "defaultdict(<class 'int'>, {'x': 0})",
+            "IndexError: pop from an empty deque",
+            "KeyError: 'k'",
+            "OrderedDict({'b': 1, 'a': 2})",
+        ],
+        "collections container semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn collections_containers_in_classes_globals_and_closures_match_python_at_runtime() {
+    // Issue #427, the shapes beyond a single function: annotated class
+    // fields, module-level deque/OrderedDict (typed statics), `del d[i]`,
+    // and a defaultdict READ inside a closure — `peek("zz")` inserts the
+    // key into the one shared object, visible to the enclosing scope.
+    let scratch = Scratch::new("collections2");
+    let file = scratch.path().join("shapes.py");
+    fs::write(
+        &file,
+        concat!(
+            "from collections import deque, defaultdict, OrderedDict\n",
+            "\n",
+            "HISTORY: deque[int] = deque(maxlen=3)\n",
+            "SEEN: OrderedDict[str, int] = OrderedDict()\n",
+            "\n",
+            "\n",
+            "class Hub:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.queue: deque[str] = deque()\n",
+            "        self.index: defaultdict[str, list[int]] = defaultdict(list)\n",
+            "\n",
+            "    def push(self, name: str, n: int) -> None:\n",
+            "        self.queue.append(name)\n",
+            "        self.index[name].append(n)\n",
+            "\n",
+            "    def pop(self) -> str:\n",
+            "        return self.queue.popleft()\n",
+            "\n",
+            "\n",
+            "def record(x: int) -> None:\n",
+            "    HISTORY.append(x)\n",
+            "    SEEN[\"k\" + str(x)] = x\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    for i in range(5):\n",
+            "        record(i)\n",
+            "    print(HISTORY, list(SEEN))\n",
+            "\n",
+            "    hub = Hub()\n",
+            "    hub.push(\"a\", 1)\n",
+            "    hub.push(\"b\", 2)\n",
+            "    hub.push(\"a\", 3)\n",
+            "    print(hub.pop(), len(hub.queue), sorted(hub.index.items()))\n",
+            "    try:\n",
+            "        Hub().pop()\n",
+            "    except IndexError as exc:\n",
+            "        print(\"IndexError:\", exc)\n",
+            "\n",
+            "    counts = defaultdict(int)\n",
+            "\n",
+            "    def bump(k: str) -> None:\n",
+            "        counts[k] += 1\n",
+            "\n",
+            "    def peek(k: str) -> int:\n",
+            "        return counts[k]\n",
+            "\n",
+            "    bump(\"a\")\n",
+            "    bump(\"a\")\n",
+            "    print(peek(\"zz\"))\n",
+            "    print(len(counts), counts)\n",
+            "\n",
+            "    d = deque([1, 2, 3, 4])\n",
+            "    del d[1]\n",
+            "    d.extendleft([9, 8])\n",
+            "    print(d, sorted(d), max(d))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/shapes"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3 (3.12).
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "deque([2, 3, 4], maxlen=3) ['k0', 'k1', 'k2', 'k3', 'k4']",
+            "a 2 [('a', [1, 3]), ('b', [2])]",
+            "IndexError: pop from an empty deque",
+            "0",
+            "2 defaultdict(<class 'int'>, {'a': 2, 'zz': 0})",
+            "deque([8, 9, 1, 3, 4]) [1, 3, 4, 8, 9] 9",
+        ],
+        "collections container semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn aliased_collections_imports_match_python_at_runtime() {
+    // Issue #427 with #428's alias binding: `from collections import deque
+    // as dq, defaultdict as dd, OrderedDict as OD` binds ONLY the aliases,
+    // yet constructors, annotations (`dd[str, int]`) and the method
+    // lowerings must still resolve to the runtime containers.
+    let scratch = Scratch::new("collections_alias");
+    let file = scratch.path().join("aliased.py");
+    fs::write(
+        &file,
+        concat!(
+            "from collections import deque as dq, defaultdict as dd, OrderedDict as OD\n",
+            "\n",
+            "\n",
+            "def tally(words: list[str]) -> dict[str, int]:\n",
+            "    counts: dd[str, int] = dd(int)\n",
+            "    for w in words:\n",
+            "        counts[w] += 1\n",
+            "    return dict(counts)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    q = dq([1, 2], maxlen=3)\n",
+            "    q.append(3)\n",
+            "    q.append(4)\n",
+            "    first = q.popleft()\n",
+            "    print(first, q, q.maxlen)\n",
+            "    groups = dd(list)\n",
+            "    groups[\"a\"].append(1)\n",
+            "    print(groups[\"a\"], groups[\"zz\"], len(groups))\n",
+            "    od = OD()\n",
+            "    od[\"b\"] = 1\n",
+            "    od[\"a\"] = 2\n",
+            "    od.move_to_end(\"b\")\n",
+            "    print(od, list(od))\n",
+            "    print(sorted(tally([\"x\", \"y\", \"x\"]).items()))\n",
+            "    try:\n",
+            "        dq().pop()\n",
+            "    except IndexError as exc:\n",
+            "        print(\"IndexError:\", exc)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/aliased"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3 (3.12).
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "2 deque([3, 4], maxlen=3) 3",
+            "[1] [] 2",
+            "OrderedDict({'a': 2, 'b': 1}) ['a', 'b']",
+            "[('x', 2), ('y', 1)]",
+            "IndexError: pop from an empty deque",
+        ],
+        "aliased collections semantics diverged from CPython"
+    );
+}

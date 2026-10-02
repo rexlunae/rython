@@ -14740,8 +14740,10 @@ fn qualified_collections_class_constructs_via_new() {
          \x20   buf.append(1)\n",
         "cdeque.py",
     );
+    // The `buf.append(1)` use pins the element type, which the
+    // construction spells as a turbofish.
     assert!(
-        out.contains("collections :: deque :: new ()"),
+        out.contains("collections :: deque :: < i64 > :: new ()"),
         "qualified deque() must construct via ::new: {}",
         out
     );
@@ -26438,4 +26440,564 @@ fn a_module_instance_of_an_unmutated_class_stays_unshared() {
         "neither class takes the shared representation: {}",
         out
     );
+}
+
+// ---------------------------------------------------------------------------
+// collections.deque / defaultdict / OrderedDict (issue #427): construction
+// and method lowering, and the loud rejections.
+// ---------------------------------------------------------------------------
+
+fn flat_of(out: &str) -> String {
+    out.split_whitespace().collect()
+}
+
+#[test]
+fn deque_methods_lower_to_the_runtime_deque_surface() {
+    let out = compile(
+        "from collections import deque\n\
+         \n\
+         def f(xs: list[int]) -> int:\n\
+         \x20   d = deque(xs)\n\
+         \x20   d.append(3)\n\
+         \x20   d.appendleft(0)\n\
+         \x20   d.extend([7, 8])\n\
+         \x20   d.rotate()\n\
+         \x20   d.rotate(2)\n\
+         \x20   a = d.pop()\n\
+         \x20   b = d.popleft()\n\
+         \x20   return a + b\n",
+        "dq_methods.py",
+    );
+    let flat = flat_of(&out);
+    assert!(flat.contains("deque::<i64>::construct(xs,None)?"), "construction: {out}");
+    assert!(flat.contains("(d).append(3)"), "append (not list push): {out}");
+    assert!(flat.contains("(d).appendleft(0)"), "appendleft: {out}");
+    assert!(flat.contains("(d).extend(vec![7,8])"), "extend: {out}");
+    assert!(flat.contains("(d).rotate(1)"), "rotate() defaults to one step: {out}");
+    assert!(flat.contains("(d).rotate(2)"), "rotate(n): {out}");
+    // pop/popleft raise CPython's own IndexError text through the runtime,
+    // never the list lowering's "pop from empty list".
+    assert!(flat.contains("(d).pop()?"), "pop: {out}");
+    assert!(flat.contains("(d).popleft()?"), "popleft: {out}");
+    assert!(!flat.contains("pop from empty list"), "list text leaked: {out}");
+}
+
+#[test]
+fn deque_maxlen_forms_lower_to_the_checked_constructor() {
+    let out = compile(
+        "from collections import deque\n\
+         \n\
+         def f(n: int) -> int:\n\
+         \x20   a = deque([1, 2, 3], maxlen=2)\n\
+         \x20   b = deque([1], 5)\n\
+         \x20   c = deque(maxlen=n)\n\
+         \x20   c.append(1)\n\
+         \x20   d = deque([1], maxlen=None)\n\
+         \x20   return len(a) + len(b) + len(c) + len(d)\n",
+        "dq_maxlen.py",
+    );
+    let flat = flat_of(&out);
+    assert!(flat.contains("::construct(vec![1,2,3],Some(2))?"), "{out}");
+    assert!(flat.contains("::construct(vec![1],Some(5))?"), "{out}");
+    assert!(flat.contains("::construct(Vec::new(),Some(n))?"), "{out}");
+    assert!(flat.contains("::construct(vec![1],None)?"), "{out}");
+}
+
+#[test]
+fn deque_maxlen_attribute_reads_the_accessor() {
+    let out = compile(
+        "from collections import deque\n\
+         \n\
+         def f() -> None:\n\
+         \x20   d = deque([1], maxlen=3)\n\
+         \x20   print(d.maxlen)\n",
+        "dq_maxlen_attr.py",
+    );
+    assert!(flat_of(&out).contains("(d).maxlen()"), "{out}");
+}
+
+#[test]
+fn defaultdict_factories_carry_their_class_name() {
+    let out = compile(
+        "from collections import defaultdict\n\
+         \n\
+         def f(words: list[str]) -> int:\n\
+         \x20   counts = defaultdict(int)\n\
+         \x20   groups = defaultdict(list)\n\
+         \x20   free = defaultdict(lambda: 7)\n\
+         \x20   none = defaultdict()\n\
+         \x20   for w in words:\n\
+         \x20       counts[w] += 1\n\
+         \x20       groups[w].append(w)\n\
+         \x20       free[w] += 1\n\
+         \x20       none[w] = 1\n\
+         \x20   return len(counts)\n",
+        "dd_factories.py",
+    );
+    let flat = flat_of(&out);
+    assert!(flat.contains("with_class(||0i64,\"int\")"), "int factory: {out}");
+    assert!(flat.contains("with_class(||Vec::new(),\"list\")"), "list factory: {out}");
+    // A lambda is an UNNAMED factory (its repr is an address in CPython).
+    assert!(flat.contains("::new(||->i64{7})"), "lambda factory: {out}");
+    assert!(flat.contains("::without_factory()"), "no factory: {out}");
+}
+
+#[test]
+fn defaultdict_str_literal_keys_are_owned_strings() {
+    // With the key type still unknown, `dd["a"]` must not leave `&str` /
+    // String index impls ambiguous for rustc: the literal key owns itself.
+    let out = compile(
+        "from collections import defaultdict\n\
+         \n\
+         def f() -> int:\n\
+         \x20   dd = defaultdict(int)\n\
+         \x20   dd[\"a\"] += 2\n\
+         \x20   return dd[\"a\"]\n",
+        "dd_literal_key.py",
+    );
+    let flat = flat_of(&out);
+    assert!(flat.contains("(\"a\").to_string()"), "{out}");
+}
+
+#[test]
+fn ordereddict_methods_lower_with_the_last_flag() {
+    let out = compile(
+        "from collections import OrderedDict\n\
+         \n\
+         def f() -> int:\n\
+         \x20   od = OrderedDict()\n\
+         \x20   od[\"b\"] = 1\n\
+         \x20   od[\"a\"] = 2\n\
+         \x20   od.move_to_end(\"b\")\n\
+         \x20   od.move_to_end(\"a\", last=False)\n\
+         \x20   x = od.popitem()\n\
+         \x20   y = od.popitem(last=False)\n\
+         \x20   return len(od)\n",
+        "od_methods.py",
+    );
+    let flat = flat_of(&out);
+    assert!(flat.contains("OrderedDict::<String,i64>::new()"), "pinned types: {out}");
+    assert!(flat.contains("(od).move_to_end(&((\"b\").to_string()),true)?"), "{out}");
+    assert!(flat.contains("(od).move_to_end(&((\"a\").to_string()),false)?"), "{out}");
+    assert!(flat.contains("(od).popitem(true)?"), "{out}");
+    assert!(flat.contains("(od).popitem(false)?"), "{out}");
+}
+
+#[test]
+fn collections_annotations_resolve_to_the_runtime_types() {
+    let out = compile(
+        "from collections import deque, defaultdict, OrderedDict\n\
+         from typing import Deque\n\
+         \n\
+         def f(a: deque[int], b: defaultdict[str, list[int]], c: OrderedDict[str, int],\n\
+         \x20     d: Deque[str]) -> deque[int]:\n\
+         \x20   return a\n",
+        "coll_annotations.py",
+    );
+    let flat = flat_of(&out);
+    assert!(flat.contains("a:stdpython::collections::deque<i64>"), "{out}");
+    assert!(
+        flat.contains("b:stdpython::collections::defaultdict<String,Vec<i64>>"),
+        "{out}"
+    );
+    assert!(
+        flat.contains("c:stdpython::collections::OrderedDict<String,i64>"),
+        "{out}"
+    );
+    assert!(flat.contains("d:stdpython::collections::deque<String>"), "{out}");
+    assert!(
+        flat.contains("->Result<stdpython::collections::deque<i64>,PyException>"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_user_class_named_like_a_collections_class_is_not_the_runtime_type() {
+    // The annotation resolver is symbol-aware: a local class called
+    // `OrderedDict` is that class, not the stdlib container.
+    let out = compile(
+        "class OrderedDict:\n\
+         \x20   def __init__(self) -> None:\n\
+         \x20       self.n = 0\n\
+         \n\
+         def f(x: OrderedDict) -> int:\n\
+         \x20   return x.n\n",
+        "user_ordereddict.py",
+    );
+    assert!(!out.contains("stdpython :: collections"), "{out}");
+}
+
+#[test]
+fn bare_collections_annotations_are_loud() {
+    let err = compile_err(
+        "from collections import deque\n\
+         \n\
+         def drain(q: deque) -> int:\n\
+         \x20   return len(q)\n",
+        "bare_deque_param.py",
+    );
+    assert!(
+        err.contains("parameter `q` annotation `deque` has no element/key type")
+            && err.contains("deque[int]"),
+        "{err}"
+    );
+    let err = compile_err(
+        "from collections import OrderedDict\n\
+         \n\
+         def f() -> OrderedDict:\n\
+         \x20   return OrderedDict()\n",
+        "bare_od_return.py",
+    );
+    assert!(err.contains("return annotation `OrderedDict` has no element/key type"), "{err}");
+    let err = compile_err(
+        "from collections import defaultdict\n\
+         \n\
+         def f() -> int:\n\
+         \x20   counts: defaultdict = defaultdict(int)\n\
+         \x20   return len(counts)\n",
+        "bare_dd_var.py",
+    );
+    assert!(err.contains("variable annotation `defaultdict` has no element/key type"), "{err}");
+}
+
+#[test]
+fn module_level_defaultdict_is_loud() {
+    let err = compile_err(
+        "from collections import defaultdict\n\
+         \n\
+         COUNTS = defaultdict(int)\n\
+         \n\
+         def bump() -> None:\n\
+         \x20   COUNTS[\"a\"] += 1\n",
+        "module_dd.py",
+    );
+    assert!(
+        err.contains("module-level `COUNTS = defaultdict(...)` is not supported yet")
+            && err.contains("build the defaultdict inside a function")
+            && err.contains("rython refuses to silently ignore it"),
+        "{err}"
+    );
+}
+
+#[test]
+fn unsupported_collections_constructions_are_loud() {
+    // A named function is not a representable default_factory.
+    let err = compile_err(
+        "from collections import defaultdict\n\
+         \n\
+         def make() -> int:\n\
+         \x20   return 1\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = defaultdict(make)\n\
+         \x20   return len(d)\n",
+        "dd_named_factory.py",
+    );
+    assert!(
+        err.contains("defaultdict(...) takes only a builtin class")
+            && err.contains("rython refuses to silently ignore it"),
+        "{err}"
+    );
+    // Keyword items.
+    let err = compile_err(
+        "from collections import OrderedDict\n\
+         \n\
+         def f() -> int:\n\
+         \x20   od = OrderedDict(a=1)\n\
+         \x20   return len(od)\n",
+        "od_kwargs.py",
+    );
+    assert!(err.contains("OrderedDict(key=value) keyword items are not supported yet"), "{err}");
+    let err = compile_err(
+        "from collections import defaultdict\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = defaultdict(int, a=1)\n\
+         \x20   return len(d)\n",
+        "dd_kwargs.py",
+    );
+    assert!(err.contains("defaultdict(..., key=value) keyword items are not supported yet"), "{err}");
+    // deque takes (iterable, maxlen) only.
+    let err = compile_err(
+        "from collections import deque\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = deque([1], 2, 3)\n\
+         \x20   return len(d)\n",
+        "dq_args.py",
+    );
+    assert!(err.contains("deque() takes at most 2 arguments"), "{err}");
+    let err = compile_err(
+        "from collections import deque\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = deque([1], size=2)\n\
+         \x20   return len(d)\n",
+        "dq_kw.py",
+    );
+    assert!(err.contains("only `maxlen=` is supported"), "{err}");
+}
+
+#[test]
+fn deque_method_arity_errors_are_loud() {
+    let err = compile_err(
+        "from collections import deque\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = deque([1])\n\
+         \x20   d.append(1, 2)\n\
+         \x20   return len(d)\n",
+        "dq_append_arity.py",
+    );
+    assert!(err.contains("deque.append() takes exactly one argument"), "{err}");
+    let err = compile_err(
+        "from collections import deque\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = deque([1])\n\
+         \x20   d.pop(0)\n\
+         \x20   return len(d)\n",
+        "dq_pop_arity.py",
+    );
+    assert!(err.contains("deque.pop() takes no arguments"), "{err}");
+}
+
+#[test]
+fn deque_aliasing_is_guarded_like_every_container() {
+    // `b = a` shares ONE deque in CPython; rython copies containers, so the
+    // mutation after the alias would not be visible through `b`.
+    let err = compile_err(
+        "from collections import deque\n\
+         \n\
+         def f() -> int:\n\
+         \x20   a = deque([1])\n\
+         \x20   b = a\n\
+         \x20   a.append(2)\n\
+         \x20   return len(b)\n",
+        "dq_alias.py",
+    );
+    assert!(err.contains("shares one container between two names"), "{err}");
+}
+
+#[test]
+fn a_defaultdict_index_read_counts_as_a_mutation_for_the_aliasing_guard() {
+    // `dd[k]` of a missing key INSERTS: passing a defaultdict to a function
+    // that merely READS it, then using it again, would lose the insert.
+    let err = compile_err(
+        "from collections import defaultdict\n\
+         \n\
+         def touch(d: defaultdict[str, int]) -> int:\n\
+         \x20   return d[\"x\"]\n\
+         \n\
+         def f() -> int:\n\
+         \x20   dd: defaultdict[str, int] = defaultdict(int)\n\
+         \x20   touch(dd)\n\
+         \x20   return len(dd)\n",
+        "dd_read_alias.py",
+    );
+    assert!(err.contains("is passed to a function that mutates it"), "{err}");
+}
+
+#[test]
+fn dict_of_a_collections_mapping_collects_its_items() {
+    let out = compile(
+        "from collections import defaultdict\n\
+         \n\
+         def f(words: list[str]) -> dict[str, int]:\n\
+         \x20   counts: defaultdict[str, int] = defaultdict(int)\n\
+         \x20   for w in words:\n\
+         \x20       counts[w] += 1\n\
+         \x20   return dict(counts)\n",
+        "dd_dict.py",
+    );
+    let flat = flat_of(&out);
+    assert!(
+        flat.contains("stdpython::PyDict::from_iter(") && flat.contains(".py_items())"),
+        "{out}"
+    );
+}
+
+#[test]
+fn deque_arguments_to_slice_builtins_become_vecs() {
+    let out = compile(
+        "from collections import deque\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = deque([3, 1, 2])\n\
+         \x20   print(sorted(d), max(d), min(d))\n\
+         \x20   return len(d)\n",
+        "dq_builtins.py",
+    );
+    let flat = flat_of(&out);
+    assert!(flat.contains("sorted(&((d).to_vec()))"), "{out}");
+    assert!(flat.contains("max(&((d).to_vec()))?"), "{out}");
+}
+
+#[test]
+fn a_defaultdict_read_in_a_closure_borrows_the_shared_cell() {
+    // `peek` only READS the captured defaultdict, but `counts[k]` of a
+    // missing key INSERTS: the read must go through the cell's one object
+    // (a name read would yield a snapshot clone and lose the insert).
+    let out = compile(
+        "from collections import defaultdict\n\
+         \n\
+         def f() -> int:\n\
+         \x20   counts = defaultdict(int)\n\
+         \n\
+         \x20   def bump(k: str) -> None:\n\
+         \x20       counts[k] += 1\n\
+         \n\
+         \x20   def peek(k: str) -> int:\n\
+         \x20       return counts[k]\n\
+         \n\
+         \x20   bump(\"a\")\n\
+         \x20   peek(\"zz\")\n\
+         \x20   return len(counts)\n",
+        "dd_closure.py",
+    );
+    let flat = flat_of(&out);
+    assert!(
+        flat.contains("let__rython_cell=counts.borrow();(*__rython_cell).py_index(__rython_key)?"),
+        "{out}"
+    );
+}
+
+#[test]
+fn del_of_a_deque_item_and_map_over_a_deque_lower() {
+    let out = compile(
+        "from collections import deque\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = deque([1, 2, 3])\n\
+         \x20   del d[1]\n\
+         \x20   return len(list(map(lambda x: x + 1, d)))\n",
+        "dq_del_map.py",
+    );
+    let flat = flat_of(&out);
+    assert!(flat.contains("(d).py_pop(1)?"), "{out}");
+    assert!(flat.contains("(d).to_vec()"), "{out}");
+}
+
+#[test]
+fn module_level_deque_and_ordereddict_are_typed_statics_when_pinned() {
+    let out = compile(
+        "from collections import deque, OrderedDict\n\
+         \n\
+         HISTORY = deque(maxlen=3)\n\
+         CACHE: OrderedDict[str, int] = OrderedDict()\n\
+         \n\
+         def record(x: int) -> None:\n\
+         \x20   HISTORY.append(x)\n\
+         \x20   CACHE[str(x)] = x\n",
+        "module_containers.py",
+    );
+    let flat = flat_of(&out);
+    assert!(
+        flat.contains("HISTORY:std::sync::LazyLock<std::sync::Mutex<stdpython::collections::deque<i64>>>"),
+        "{out}"
+    );
+    assert!(
+        flat.contains("CACHE:std::sync::LazyLock<std::sync::Mutex<stdpython::collections::OrderedDict<String,i64>>>"),
+        "{out}"
+    );
+}
+
+#[test]
+fn module_level_collections_without_an_inferable_type_are_loud() {
+    let err = compile_err(
+        "from collections import deque\n\
+         \n\
+         QUEUE = deque()\n\
+         \n\
+         def size() -> int:\n\
+         \x20   return len(QUEUE)\n",
+        "module_unpinned_deque.py",
+    );
+    assert!(
+        err.contains("module-level `QUEUE = deque(...)` has no inferable element/key type")
+            && err.contains("annotate it (`QUEUE: deque[int] = deque(...)`)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn dataclass_field_factories_build_the_annotated_collections_container() {
+    // `Default::default()` would give a defaultdict NO default_factory (a
+    // KeyError where CPython returns the default): the factory is honored.
+    let out = compile(
+        "from collections import deque, defaultdict\n\
+         from dataclasses import dataclass, field\n\
+         \n\
+         @dataclass\n\
+         class Log:\n\
+         \x20   entries: deque[str] = field(default_factory=deque)\n\
+         \x20   counts: defaultdict[str, int] = field(default_factory=lambda: defaultdict(int))\n\
+         \n\
+         def f() -> int:\n\
+         \x20   log = Log()\n\
+         \x20   return len(log.entries)\n",
+        "dc_fields.py",
+    );
+    let flat = flat_of(&out);
+    assert!(flat.contains("Log::new(deque::<String>::new(),"), "{out}");
+    assert!(
+        flat.contains("defaultdict::<String,i64>::with_class(||0i64,\"int\")"),
+        "{out}"
+    );
+    assert!(!flat.contains("Default::default()"), "{out}");
+}
+
+#[test]
+fn an_unsupported_dataclass_collections_factory_is_loud() {
+    // A named function is not a representable factory: the argument
+    // mapping fails (a -W warning), the construction keeps no default, and
+    // the arity error surfaces in rustc — never a factory-less defaultdict
+    // filled from `Default::default()`.
+    let (out, warnings) = compile_with_warnings(
+        "from collections import defaultdict\n\
+         from dataclasses import dataclass, field\n\
+         \n\
+         def make():\n\
+         \x20   return defaultdict(int)\n\
+         \n\
+         @dataclass\n\
+         class Log:\n\
+         \x20   counts: defaultdict[str, int] = field(default_factory=make)\n\
+         \n\
+         def f() -> int:\n\
+         \x20   log = Log()\n\
+         \x20   return len(log.counts)\n",
+        "dc_bad_factory.py",
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("argument mapping failed")),
+        "{warnings:?}"
+    );
+    assert!(!flat_of(&out).contains("Default::default()"), "{out}");
+}
+
+#[test]
+fn aliased_and_qualified_collections_spellings_lower_like_the_plain_ones() {
+    let out = compile(
+        "import collections\n\
+         from collections import deque as dq, OrderedDict as OD\n\
+         from typing import Deque\n\
+         \n\
+         def f(q: Deque[int], c: collections.deque[str]) -> int:\n\
+         \x20   a = dq([1, 2])\n\
+         \x20   a.append(3)\n\
+         \x20   b = OD()\n\
+         \x20   b[\"k\"] = 1\n\
+         \x20   d = collections.defaultdict(list)\n\
+         \x20   d[\"q\"].append(3)\n\
+         \x20   return len(a) + len(q) + len(c) + len(b)\n",
+        "coll_spellings.py",
+    );
+    let flat = flat_of(&out);
+    assert!(flat.contains("dq::<i64>::construct(vec![1,2],None)?"), "{out}");
+    assert!(flat.contains("(a).append(3)"), "{out}");
+    assert!(flat.contains("OD::<String,i64>::new()"), "{out}");
+    assert!(flat.contains("collections::defaultdict::<String,Vec<i64>>::with_class(||Vec::new(),\"list\")"), "{out}");
+    assert!(flat.contains("q:stdpython::collections::deque<i64>"), "{out}");
+    assert!(flat.contains("c:stdpython::collections::deque<String>"), "{out}");
 }

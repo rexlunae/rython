@@ -97,3 +97,6 @@ as an improvement over any recorded error count.
 | `pipeline` | closures, functions as values, `map`/`filter`/`lambda`, a dispatch table, `*args`/keyword args |
 | `records` | `@property` with setter, `@classmethod`/`@staticmethod`, `__eq__`/`__lt__`, `__str__` |
 | `schedule` | dict of lists, tuple sorting, `list.remove`/`index`, `del` of a key, sets |
+| `collections_deque` | a `deque` work queue and a `maxlen` sliding window: `append`/`appendleft`/`pop`/`popleft`/`extend`/`rotate`, `maxlen`, indexing, `IndexError` on an empty pop, `repr` |
+| `collections_defaultdict` | `defaultdict(int)` counting and `defaultdict(list)` grouping: the missing-key insert on a READ, `get`/`in` not inserting, views, `repr` |
+| `collections_ordereddict` | `OrderedDict` insertion order, `move_to_end`, `popitem(last=...)`, `KeyError` text, `repr` (the 3.12 form) |

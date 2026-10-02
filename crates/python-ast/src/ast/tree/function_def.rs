@@ -3835,6 +3835,33 @@ impl FunctionDef {
             )
             .into());
         }
+        // The same for a bare `collections` annotation on the return or
+        // any parameter (`q: deque`, `-> OrderedDict`): the Rust type
+        // needs the element / key / value types, which only the
+        // subscripted spelling names.
+        if let Some(ann) = self.returns.as_deref()
+            && let Some(msg) =
+                crate::ast::tree::collections_lower::bare_annotation_message(ann, &symbols, "return")
+        {
+            return Err(msg.into());
+        }
+        for param in self
+            .args
+            .posonlyargs
+            .iter()
+            .chain(self.args.args.iter())
+            .chain(self.args.kwonlyargs.iter())
+        {
+            if let Some(ann) = param.annotation.as_deref()
+                && let Some(msg) = crate::ast::tree::collections_lower::bare_annotation_message(
+                    ann,
+                    &symbols,
+                    &format!("parameter `{}`", param.arg),
+                )
+            {
+                return Err(msg.into());
+            }
+        }
         // A GENERATOR returns its collected list (`Generator[str, ...]`
         // → Vec<String>), overriding any other inference.
         let return_type = if let Some(t) = &gen_elt_tokens {

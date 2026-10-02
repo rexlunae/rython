@@ -91,6 +91,17 @@ impl<'a> CodeGen for Attribute {
             let name = self.attr.as_str();
             return Ok(quote!((#recv).py_getattr(#name)?));
         }
+        // `d.maxlen` of a deque: the bound as an `Optional[int]` (the
+        // runtime keeps the field private; reads go through its accessor).
+        if self.attr == "maxlen"
+            && matches!(
+                crate::infer_type(Some(&ctx), &self.value, &options, &symbols),
+                crate::TypeInfo::Collection(crate::CollectionsType::Deque, _)
+            )
+        {
+            let recv = self.value.to_rust(ctx, options, symbols)?;
+            return Ok(quote!((#recv).maxlen()));
+        }
         // `type(self).__name__` — the class name string for repr/error
         // messages (urllib3's ConnectionPool/Retry/Timeout reprs). The
         // `type(self)` call alone lowers to the name string (call.rs's

@@ -1572,6 +1572,60 @@ impl CodeGen for Module {
             // Module-level constants become static items visible to every
             // function in the module.
             if let crate::StatementType::Assign(a) = &s.statement {
+                // A module-level `defaultdict`: a READ `d[k]` of a missing
+                // key INSERTS the default, but a module global is read
+                // through a copy — the insert would be lost (and the
+                // container is not `Sync`, so it cannot be an immutable
+                // static anyway). Loud, with the rewrite.
+                if crate::ast::tree::collections_lower::construction_kind(&a.value, &symbols)
+                    == Some(crate::CollectionsType::DefaultDict)
+                {
+                    let name = assign_name_targets(a)
+                        .map(|n| n.join(", "))
+                        .unwrap_or_else(|| "<target>".to_string());
+                    return Err(wrap_module_error(
+                        &module_filename,
+                        format!(
+                            "module-level `{name} = defaultdict(...)` is not supported yet: a \
+                             read `{name}[key]` of a missing key inserts the default, and \
+                             rython reads module globals through a copy, so the insert would \
+                             be lost; build the defaultdict inside a function (and pass it to \
+                             the functions that use it), or use a plain dict with `.get` / \
+                             `.setdefault`. rython refuses to silently ignore it"
+                        )
+                        .into(),
+                    ));
+                }
+                // A module-level `deque` / `OrderedDict` whose element /
+                // key / value types nothing pins (no annotation, no use that
+                // fixes them): a static needs a concrete Rust type, and the
+                // boxed fallback has no `PyValue` form for these containers.
+                if let Some(kind) =
+                    crate::ast::tree::collections_lower::construction_kind(&a.value, &symbols)
+                    && let [crate::ExprType::Name(target)] = a.targets.as_slice()
+                    && !options.name_types.get(&target.id).is_some_and(|t| {
+                        matches!(t, crate::TypeInfo::Collection(k, _) if *k == kind)
+                            && !crate::ast::tree::type_ctx::type_mentions_pyobject(t)
+                    })
+                {
+                    let example = match kind {
+                        crate::CollectionsType::Deque => "deque[int]",
+                        crate::CollectionsType::DefaultDict => "defaultdict[str, int]",
+                        crate::CollectionsType::OrderedDict => "OrderedDict[str, int]",
+                    };
+                    return Err(wrap_module_error(
+                        &module_filename,
+                        format!(
+                            "module-level `{name} = {class}(...)` has no inferable \
+                             element/key type, and a module global needs a concrete Rust \
+                             type: annotate it (`{name}: {example} = {class}(...)`) or give \
+                             it a use that pins the type. rython refuses to silently ignore it",
+                            name = target.id,
+                            class = kind.name(),
+                        )
+                        .into(),
+                    ));
+                }
                 // A module-level assign to a name the module ALSO imports
                 // (`SSLTransport = None` then `from .ssltransport import
                 // SSLTransport` — urllib3's ssl_.py): Python's LAST binding
@@ -5927,6 +5981,7 @@ pub(crate) fn type_contains_uninferred(t: &crate::TypeInfo) -> bool {
         }
         crate::TypeInfo::Dict(k, v) => type_contains_uninferred(k) || type_contains_uninferred(v),
         crate::TypeInfo::Tuple(ts) => ts.iter().any(type_contains_uninferred),
+        crate::TypeInfo::Collection(_, args) => args.iter().any(type_contains_uninferred),
         _ => false,
     }
 }

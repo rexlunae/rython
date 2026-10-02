@@ -353,15 +353,10 @@ fn build_comprehension_loops(
                 // A DICT-typed iterable (`for w in counts` in a
                 // comprehension — text_stats's starts-with-q, round 99):
                 // Python iterates the KEYS.
-                if matches!(
-                    crate::infer_type(
-                        Some(ctx),
-                        &generator.iter,
-                        iter_options,
-                        symbols
-                    ),
-                    crate::TypeInfo::Dict(_, _)
-                ) {
+                if crate::infer_type(Some(ctx), &generator.iter, iter_options, symbols)
+                    .dict_kv()
+                    .is_some()
+                {
                     it = quote!(#it . py_keys ());
                 }
                 // A STRING-typed iterable (`all(_.isupper() for _ in

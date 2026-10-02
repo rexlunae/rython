@@ -88,6 +88,9 @@ pub(crate) fn type_holds_shared(
                 holds(k, symbols, options, seen) || holds(v, symbols, options, seen)
             }
             TypeInfo::Tuple(xs) => xs.iter().any(|x| holds(x, symbols, options, seen)),
+            TypeInfo::Collection(_, args) => {
+                args.iter().any(|x| holds(x, symbols, options, seen))
+            }
             _ => false,
         }
     }
@@ -370,6 +373,13 @@ fn collect_container_elements(
                 from_type(inner, true, out)
             }
             TypeInfo::Dict(_, v) => from_type(v, true, out),
+            // A deque's elements and a collections mapping's values are
+            // HELD like a list's / dict's.
+            TypeInfo::Collection(..) => {
+                if let Some(held) = t.collection_held() {
+                    from_type(held, true, out)
+                }
+            }
             // A tuple HOLDS its elements as a list does (`pair: tuple[Item,
             // Item]`; Devin review on #321).
             TypeInfo::Tuple(items) => items.iter().for_each(|i| from_type(i, true, out)),
@@ -506,6 +516,10 @@ impl Env {
                 },
                 TypeInfo::Dict(_, v) => match v.as_ref() {
                     TypeInfo::Class(c) => Some(c.clone()),
+                    _ => None,
+                },
+                TypeInfo::Collection(..) => match t.collection_held() {
+                    Some(TypeInfo::Class(c)) => Some(c.clone()),
                     _ => None,
                 },
                 _ => None,
@@ -670,6 +684,7 @@ fn class_names_in(t: &TypeInfo, out: &mut HashSet<String>) {
             class_names_in(v, out);
         }
         TypeInfo::Tuple(xs) => xs.iter().for_each(|x| class_names_in(x, out)),
+        TypeInfo::Collection(_, args) => args.iter().for_each(|x| class_names_in(x, out)),
         _ => {}
     }
 }

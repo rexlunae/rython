@@ -129,6 +129,9 @@ declaration — loud, but at the wrong layer (§12.1).
 | `dict[K, V]` | `PyDict<K, V>` | `PyDict` is an insertion-ordered `IndexMap` alias — Python 3.7+ dict ordering is preserved |
 | `set[T]` | `std::collections::HashSet<T>` | |
 | `frozenset[T]` | `std::collections::HashSet<T>` (as an annotation) | The `frozenset(iterable)` *call* produces the distinct runtime type `FrozenSet<T>`; empty `frozenset()` is a loud error |
+| `deque[T]` / `typing.Deque[T]` | `stdpython::collections::deque<T>` | §10.2.2. A bare `deque` annotation is a loud conversion error (it names no element type) |
+| `defaultdict[K, V]` / `typing.DefaultDict[K, V]` | `stdpython::collections::defaultdict<K, V>` | §10.2.2. An insertion-ordered map whose `d[k]` READ of a missing key inserts the factory's value, as in CPython |
+| `OrderedDict[K, V]` / `typing.OrderedDict[K, V]` | `stdpython::collections::OrderedDict<K, V>` | §10.2.2 |
 | `tuple` (literal), `tuple[A, B]` | Rust tuple `(A, B, …)` | A fixed-shape tuple is the Rust tuple of its members |
 | `tuple[T, ...]` | `stdpython::PyTuple<T>` | A tuple whose length is not fixed statically (issue #399): a sequence over a `Vec<T>` (indexing, `len`, iteration, slicing, `in`, `+`, `*`, `sum`, `list(t)`) that prints as a tuple — `(3, 4)`, `(7,)`, `()`. `tuple(xs)` of a typed list builds one, a tuple literal stored or returned into one re-collects, `*args` is one, the mixed-arity tuple values of one dict literal (`{1: ("a",), 2: ("b", "c")}`, str or int members) share one, and an `isinstance(x, tuple)`-narrowed boxed value reads as `PyTuple<PyValue>` |
 | `None` / `Optional[T]` / `T \| None` | `Option<T>` | See §3.5 |
@@ -2149,8 +2152,8 @@ groups; backreferences/lookarounds are a loud `re.error`),
 reader/writer thread a literal `delimiter=` and a named dialect from a
 std-gated `register_dialect`/`get_dialect` registry — dialect OBJECTS,
 `DictReader`/`DictWriter`/`Sniffer`/`field_size_limit` stay unsupported),
-`collections` (`Counter`, `deque`, `defaultdict`, `OrderedDict`,
-`ChainMap`), `pathlib`, `glob`, `subprocess`, `tempfile`, `argparse`
+`collections` (`deque`, `defaultdict`, `OrderedDict` — exactly the surface
+§10.2.2 lists; `Counter`, `ChainMap`), `pathlib`, `glob`, `subprocess`, `tempfile`, `argparse`
 (conversion-time; §10.3), `string`, `io` (`StringIO`/`BytesIO`),
 `threading` (§10.5), `socket` (§10.5), `numpy` (a sizable subset with
 pluggable execution backends). `urllib.request` (§10.5) rides the
@@ -2162,6 +2165,75 @@ Available on the `alloc` (no-OS) tier: `string`, `json`, `collections`,
 profile's file I/O; `open()` and disk files stay std-only). Everything
 OS-touching is std-only and is a loud conversion error under
 `--no-std`.
+
+#### 10.2.2 `collections`: `deque`, `defaultdict`, `OrderedDict`
+
+The three containers are real runtime structs (`stdpython::collections`),
+typed like `list` / `dict`: `d = deque([1, 2])` is a `deque<i64>`, an
+annotation `deque[int]` / `defaultdict[str, list[int]]` /
+`OrderedDict[str, int]` (or the `typing` spelling) names the same type, and
+`dd = defaultdict(int)` is typed from its factory and PINNED from its uses
+(`dd["a"] += 1` makes it `defaultdict<String, i64>`, as an empty `{}` is
+pinned). Every claim below is pinned by transcripts verified against
+python3.12 (`crates/stdpython/tests/python_semantics.rs`,
+`crates/rypip/tests/convert_tests.rs`, `eval/idioms/programs/collections_*.py`).
+
+- **Construction.** `deque()`, `deque(iterable)`, `deque(iterable, maxlen)`,
+  `deque(maxlen=n)` (`maxlen=None` unbounded; a negative bound is
+  `ValueError: maxlen must be non-negative`); `defaultdict(factory)` with
+  `int`, `float`, `str`, `bool`, `list`, `dict`, `set`, `deque`, `None` (no
+  factory: a missing key is `KeyError`) or a no-argument `lambda` (an unnamed
+  factory), optionally followed by an initial dict; `OrderedDict()`,
+  `OrderedDict(dict)`, `OrderedDict([(k, v), ...])`. Any other factory (a
+  named function), keyword items (`OrderedDict(a=1)`,
+  `defaultdict(int, a=1)`), or an argument the compiler cannot see the shape
+  of is a conversion error naming the rewrite.
+- **deque methods.** `append`, `appendleft`, `pop`, `popleft`
+  (`IndexError: pop from an empty deque`), `extend`, `extendleft`
+  (CPython's reversal), `rotate([n])`, `remove` (`ValueError: 9 is not in
+  deque`), `clear`, `copy`, `reverse`, `count`, `index`, `insert`, the
+  `maxlen` attribute, `len`, `in`, indexing and index assignment
+  (`IndexError: deque index out of range`), iteration, `list(d)`, `sum` /
+  `sorted` / `min` / `max` / `enumerate` / `reversed` (a deque argument is
+  taken as a list), truthiness, `==` (contents). A bounded deque trims the
+  OPPOSITE end exactly as CPython does. Not supported (a rustc error, never
+  a different answer): `d + e`, `d += xs`, `d * n`, ordering comparisons,
+  slicing (a TypeError in CPython too), `tuple(d)`, `deque.index(x, start)`.
+- **dict surface** (`defaultdict`, `OrderedDict`): `d[k]`, `d[k] = v`,
+  `d[k] += v`, `d[k].append(x)`, `del d[k]`, `get`, `pop` (with or without a
+  default), `setdefault`, `update`, `keys` / `values` / `items`, `in`, `len`,
+  `clear`, `copy`, `list(d)` / iteration (keys, in INSERTION order),
+  `sorted(d)`, `dict(d)`, `==` against a dict (order-insensitive).
+  `defaultdict`'s missing-key INSERT happens on `d[k]` READS — and only
+  there (`get`, `in`, `pop` never insert) — so it is visible to a later
+  `len(d)` / iteration, as in CPython; an index read therefore counts as a
+  mutation for the aliasing guard (§12.1). `OrderedDict` adds
+  `move_to_end(key, last=True)`, `popitem(last=True)`, and an order-sensitive
+  `==` between two OrderedDicts (`KeyError: 'dictionary is empty'` /
+  `KeyError: 'x'` texts as CPython).
+- **`print` / `repr`**: `deque([1, 2, 3])` (`, maxlen=3` when bounded),
+  `defaultdict(<class 'int'>, {'a': 2})`, `OrderedDict({'b': 1, 'a': 2})` and
+  `OrderedDict()` — the CPython 3.12+ forms (3.11 and earlier print
+  `OrderedDict([('b', 1), ('a', 2)])`). A `defaultdict` whose factory is a
+  lambda prints a memory address in CPython: rython panics at the print
+  rather than print a different string (§12.2).
+- **Dataclass fields.** `x: deque[str] = field(default_factory=deque)` and
+  `field(default_factory=lambda: defaultdict(int))` build the annotated
+  container (a defaultdict keeps its factory); another factory fails the
+  constructor's argument mapping (a `-W` warning, then a rustc arity error).
+- **Keys.** A str literal key into a container whose key type is not yet
+  known is an owned `String`; mixing a literal with a computed non-str key
+  is a rustc error.
+- **Loud edges.** A bare `deque` / `defaultdict` / `OrderedDict` annotation
+  (parameter, return, or variable) is a conversion error (`use
+  deque[int]`). A MODULE-LEVEL `defaultdict` is a conversion error: a module
+  global is read through a copy, which would lose the insert a read performs
+  — build it inside a function (module-level `deque` and `OrderedDict` work,
+  as typed statics). An unannotated empty container whose element types
+  nothing pins (`print(defaultdict(list))`) is a rustc type-inference error;
+  an unannotated FIELD (`self.q = deque()`) takes the boxed element type an
+  untyped `[]` field takes (a `String` key, a `PyValue` value) — annotate
+  fields (`self.q: deque[str] = deque()`) for typed use.
 
 #### 10.2.1 Feature-gated platform surfaces
 
@@ -2603,6 +2675,11 @@ of these cases into that model wherever CPython defines an exception
 for it (arithmetic on `None` as a catchable `TypeError`, exceptions
 propagating through lambdas), and to eliminate the overflow panic
 entirely via the bigint tier.
+- `repr` / `print` of a `defaultdict` whose `default_factory` is a lambda
+  or a user function: CPython prints the function's memory address
+  (`<function <lambda> at 0x...>`), which no run reproduces, so the print
+  panics (a builtin-class factory — `int`, `list`, ... — prints
+  `<class 'int'>` exactly).
 
 ### 12.3 Known silent divergences (defects and model limits)
 
@@ -2611,6 +2688,7 @@ accepted as permanent spec:
 
 | Divergence | Status |
 |---|---|
+| `deque.index(x)` lowers through the shared list-ops arm and raises `ValueError: deque.index(x): x not in deque` (the 3.14 wording the list arm pinned), where CPython 3.12/3.13 say `9 is not in deque` — the wording `deque.remove` and the inherent `deque::index(x, start, stop)` already use. The exception TYPE agrees | Documented version choice, pinned in `python_semantics.rs`; the list arm's wording is the project-wide pin |
 | `unicodedata` answers from the Unicode 16.0.0 database — CPython 3.14's `unidata_version` — for every CPython: an older CPython carries an older database (3.12: 15.0.0, 3.13: 15.1.0), so a code point assigned or re-classified since answers differently there (`category`, `bidirectional`, `combining`, `name`, `normalize`). Code points assigned before 15.0 agree | Model limit (issue #334); a per-CPython database would need one table set per version |
 | Unpacking's ValueError text is CPython 3.11–3.13's: `too many values to unpack (expected 2)`. CPython 3.14 appends the length for a sized sequence (`(expected 2, got 3)` for a tuple, list or dict; not for a str). `not enough values to unpack (expected 2, got 1)` and `cannot unpack non-iterable int object` agree across versions | Model limit; one message set, pinned to the 3.11 transcripts |
 | True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |

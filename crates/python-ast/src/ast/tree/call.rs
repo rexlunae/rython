@@ -3154,6 +3154,13 @@ impl<'a> CodeGen for Call {
         // user definition of the same name shadows the builtin, and
         // unknown or duplicate keywords are loud errors, as Python raises
         // TypeError for them.
+        // `dict(counts)` of a defaultdict / OrderedDict: the items as a
+        // plain dict.
+        if let Some(lowered) =
+            crate::ast::tree::collections_lower::lower_dict_of_mapping(&self, &ctx, &options, &symbols)
+        {
+            return lowered;
+        }
         if let ExprType::Name(n) = self.func.as_ref() {
             let bname = n.id.as_str();
             // `zip` takes the builtin arm only in its star-args splat form
@@ -3228,11 +3235,24 @@ impl<'a> CodeGen for Call {
                     // Builtin args are borrowed or copied by the runtime;
                     // render them plain — clone-on-reuse is only inserted
                     // for user-function calls, whose params are owned.
-                    rendered.push(arg.clone().to_rust(
+                    let mut tokens = arg.clone().to_rust(
                         ctx.clone(),
                         options.clone(),
                         symbols.clone(),
-                    )?);
+                    )?;
+                    // A deque argument to a slice-taking builtin
+                    // (`sorted(d)`, `max(d)`, `enumerate(d)`): its elements
+                    // as a Vec (ring-buffer storage is not a slice).
+                    if crate::ast::tree::collections_types::SliceBuiltin::from_name(bname)
+                        .is_some()
+                        && matches!(
+                            crate::infer_type(Some(&ctx), arg, &options, &symbols),
+                            crate::TypeInfo::Collection(crate::CollectionsType::Deque, _)
+                        )
+                    {
+                        tokens = quote!((#tokens).to_vec());
+                    }
+                    rendered.push(tokens);
                 }
                 let unexpected = |kw: Option<&str>| -> Box<dyn std::error::Error> {
                     format!(
@@ -3399,10 +3419,10 @@ impl<'a> CodeGen for Call {
                         // A DICT arg (`sorted(self.accounts)` in a finally
                         // — bank's audit, round 99): CPython sorts the
                         // dict's KEYS.
-                        if matches!(
-                            crate::infer_type(Some(&ctx), &self.args[0], &options, &symbols),
-                            crate::TypeInfo::Dict(_, _)
-                        ) {
+                        if crate::infer_type(Some(&ctx), &self.args[0], &options, &symbols)
+                            .dict_kv()
+                            .is_some()
+                        {
                             a = quote!(#a . py_keys ());
                         }
                         let a = &a;
@@ -5038,6 +5058,14 @@ impl<'a> CodeGen for Call {
                                 options.clone(),
                                 symbols.clone(),
                             )?;
+                            // A deque iterable is consumed as its Vec.
+                            if matches!(
+                                crate::infer_type(Some(&ctx), arg, &options, &symbols),
+                                crate::TypeInfo::Collection(crate::CollectionsType::Deque, _)
+                            ) {
+                                let r = &rendered[i];
+                                rendered[i] = quote!((#r).to_vec());
+                            }
                         }
                         let fallible = matches!(self.args.first(), Some(ExprType::Name(f))
                             if matches!(symbols.get(&f.id), Some(SymbolTableNode::FunctionDef(_))));
@@ -5292,6 +5320,10 @@ impl<'a> CodeGen for Call {
                                             // the name stays usable after
                                             // (issue #399).
                                             | crate::TypeInfo::PyTuple(_)
+                                            // A collections container
+                                            // (`str(d)` of a deque): its
+                                            // repr, by reference.
+                                            | crate::TypeInfo::Collection(..)
                                     )
                                     // A PyException-typed parameter (an
                                     // exception-class union — `str(err)`
@@ -7603,6 +7635,21 @@ impl<'a> CodeGen for Call {
                 };
             if stdpython_class {
                 let cname = crate::safe_ident(&n.id);
+                // The `collections` containers have typed constructors
+                // (the arguments are not positional `::new` arguments).
+                if let Some(kind) =
+                    crate::ast::tree::collections_lower::ctor_of(&self.func, &symbols)
+                {
+                    return crate::ast::tree::collections_lower::lower_construction(
+                        kind,
+                        &quote!(#cname),
+                        &self,
+                        None,
+                        &ctx,
+                        &options,
+                        &symbols,
+                    );
+                }
                 let mut args = Vec::new();
                 for arg in &self.args {
                     args.push(arg.clone().to_rust(
@@ -8444,19 +8491,26 @@ let mutating_self_field = boxed_self_ref_receiver
                 attr.value.as_ref(),
                 ExprType::Name(n)
                     if (matches!(
-                        options.name_types.get(&n.id),
-                        Some(crate::TypeInfo::Dict(k, _))
-                            if matches!(**k, crate::TypeInfo::String)
+                        options.name_types.get(&n.id).and_then(|t| t.dict_kv()),
+                        Some((k, _)) if matches!(k, crate::TypeInfo::String)
                     ) || matches!(
                         options.name_types.get(&n.id),
                         Some(crate::TypeInfo::Option(inner))
                             if matches!(
-                                &**inner,
-                                crate::TypeInfo::Dict(k, _)
-                                    if matches!(**k, crate::TypeInfo::String)
+                                inner.dict_kv(),
+                                Some((k, _)) if matches!(k, crate::TypeInfo::String)
                             )
                     ))
             );
+            // A str-literal key into a collections mapping whose key type
+            // is still unknown owns itself like a String key.
+            let string_keyed_dict = string_keyed_dict
+                || self.args.first().is_some_and(|key| {
+                    crate::ast::tree::collections_lower::owns_literal_key(
+                        &crate::infer_type(Some(&ctx), &attr.value, &options, &symbols),
+                        key,
+                    )
+                });
             // The receiver's (k, v) pair for dict methods whose ARGUMENT
             // must match the element types (`dict.update(other)` — the
             // stdpython PyDictOps method takes the other dict by value):
@@ -8464,13 +8518,46 @@ let mutating_self_field = boxed_self_ref_receiver
             // the receiver's name holds (round 88).
             let dict_receiver_kv: Option<(crate::TypeInfo, crate::TypeInfo)> =
                 match crate::infer_type(Some(&ctx), &attr.value, &options, &symbols) {
-                    crate::TypeInfo::Dict(k, v) => Some(((*k).clone(), (*v).clone())),
-                    crate::TypeInfo::Option(inner) => match &*inner {
-                        crate::TypeInfo::Dict(k, v) => Some(((**k).clone(), (**v).clone())),
-                        _ => None,
-                    },
-                    _ => None,
+                    crate::TypeInfo::Option(inner) => {
+                        inner.dict_kv().map(|(k, v)| (k.clone(), v.clone()))
+                    }
+                    other => other.dict_kv().map(|(k, v)| (k.clone(), v.clone())),
                 };
+
+            // The `collections` containers' own methods, decided by the
+            // receiver's type: a deque's `append`/`pop`/`popleft`/...
+            // (CPython's `IndexError: pop from an empty deque`, `maxlen`
+            // trimming) and OrderedDict's `move_to_end`/`popitem(last)`.
+            // The rest of their surface shares the list/dict arms below.
+            if let crate::TypeInfo::Collection(kind, targs) =
+                crate::infer_type(Some(&ctx), &attr.value, &options, &symbols)
+            {
+                match kind {
+                    crate::CollectionsType::Deque => {
+                        if let Some(m) = crate::ast::tree::collections_types::DequeMethod::from_name(
+                            &attr.attr,
+                        ) {
+                            let elem = targs.first().cloned().unwrap_or(crate::TypeInfo::PyObject);
+                            return crate::ast::tree::collections_lower::lower_deque_method(
+                                m, &receiver, &elem, &self, &ctx, &options, &symbols,
+                            );
+                        }
+                    }
+                    crate::CollectionsType::OrderedDict => {
+                        if let Some(m) =
+                            crate::ast::tree::collections_types::OrderedDictMethod::from_name(
+                                &attr.attr,
+                            )
+                        {
+                            let key = targs.first().cloned().unwrap_or(crate::TypeInfo::PyObject);
+                            return crate::ast::tree::collections_lower::lower_ordered_dict_method(
+                                m, &receiver, &key, &self, &ctx, &options, &symbols,
+                            );
+                        }
+                    }
+                    crate::CollectionsType::DefaultDict => {}
+                }
+            }
 
             // list.sort(): in-place, stable, with Python's keyword-only
             // key=/reverse=. Vec's inherent sort demands a total order
@@ -10717,16 +10804,19 @@ let mutating_self_field = boxed_self_ref_receiver
         // the from-import spelling does.
         if let ExprType::Attribute(attr) = self.func.as_ref()
             && let ExprType::Name(m) = attr.value.as_ref()
-            && crate::StdModule::from_name(&m.id) == Some(crate::StdModule::Collections)
-            && matches!(attr.attr.as_str(), "deque" | "OrderedDict" | "defaultdict")
+            && let Some(kind) = crate::ast::tree::collections_lower::ctor_of(&self.func, &symbols)
         {
             let module = crate::safe_ident(&m.id);
             let cname = crate::safe_ident(&attr.attr);
-            let mut args = Vec::new();
-            for arg in &self.args {
-                args.push(arg.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?);
-            }
-            return Ok(quote!(#module::#cname::new(#(#args),*)));
+            return crate::ast::tree::collections_lower::lower_construction(
+                kind,
+                &quote!(#module::#cname),
+                &self,
+                None,
+                &ctx,
+                &options,
+                &symbols,
+            );
         }
 
         // The fallibility rule's mutation half (the review's fix 2 +
@@ -13287,6 +13377,14 @@ fn map_call_arguments_inner(
                         {
                             let t = inner.to_rust_type();
                             return Ok(quote!(Vec::<#t>::new()));
+                        }
+                        // A collections container: the container the
+                        // factory builds (`Default::default()` would drop a
+                        // defaultdict's default_factory).
+                        t @ crate::TypeInfo::Collection(..) => {
+                            return crate::ast::tree::collections_lower::lower_field_factory(
+                                expr, &t, &ctx, &options, symbols,
+                            );
                         }
                         _ => {}
                     }
