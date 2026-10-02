@@ -2302,6 +2302,14 @@ impl ImportFrom {
     /// `resolve_imported_class`, `module_function_def`, ...) must use `X`.
     /// An unaliased import, or a name this import does not bind, is its own
     /// defining name.
+    pub(crate) fn defining_name(&self, local: &str) -> String {
+        self.names
+            .iter()
+            .find(|a| a.asname.as_deref() == Some(local))
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| local.to_string())
+    }
+
     /// Whether `local` is bound by this import as a rename of `module`'s
     /// `item` (`from re import compile as re_compile`): the module matches
     /// exactly and the local name is the item's `as` name.
@@ -2311,14 +2319,6 @@ impl ImportFrom {
                 .names
                 .iter()
                 .any(|a| a.asname.as_deref() == Some(local) && a.name == item)
-    }
-
-    pub(crate) fn defining_name(&self, local: &str) -> String {
-        self.names
-            .iter()
-            .find(|a| a.asname.as_deref() == Some(local))
-            .map(|a| a.name.clone())
-            .unwrap_or_else(|| local.to_string())
     }
 
     /// The module path this import resolves to inside the generated crate:

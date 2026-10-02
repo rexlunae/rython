@@ -5472,6 +5472,10 @@ impl<'a> CodeGen for Call {
             );
             if from_itertools && handled {
                 let name = itertools_item.as_deref().unwrap_or(&n.id);
+                // The item's own runtime function is in scope under the
+                // BOUND name (`use ...::pairwise as pw`); only the arity
+                // variants are imported under their own names.
+                let bound = crate::safe_ident(&n.id);
                 let mut rendered = Vec::new();
                 for arg in &self.args {
                     rendered.push(arg.clone().to_rust(
@@ -5597,7 +5601,7 @@ impl<'a> CodeGen for Call {
                                 let v = render(v)?;
                                 { let f = crate::safe_ident(rt_variant::ZIP_LONGEST_FILL); quote!(#f(&(#a), &(#b), #v)) }
                             }
-                            None => quote!(zip_longest(&(#a), &(#b))),
+                            None => quote!(#bound(&(#a), &(#b))),
                         });
                     }
                     "groupby" => {
@@ -5618,7 +5622,7 @@ impl<'a> CodeGen for Call {
                                 let f = render(f)?;
                                 { let v = crate::safe_ident(rt_variant::GROUPBY_KEY); quote!(#v(&(#xs), #f)) }
                             }
-                            None => quote!(groupby(&(#xs))),
+                            None => quote!(#bound(&(#xs))),
                         });
                     }
                     "pairwise" => {
@@ -5627,14 +5631,14 @@ impl<'a> CodeGen for Call {
                             return Err("pairwise() takes one iterable".to_string().into());
                         }
                         let xs = &rendered[0];
-                        return Ok(quote!(pairwise(&(#xs))));
+                        return Ok(quote!(#bound(&(#xs))));
                     }
                     "combinations" | "combinations_with_replacement" => {
                         kw_of(&[])?;
                         if rendered.len() != 2 {
                             return Err(format!("{}() takes an iterable and r", name).into());
                         }
-                        let f = format_ident!("{}", name);
+                        let f = &bound;
                         let (xs, r) = (&rendered[0], &rendered[1]);
                         // Negative r raises ValueError, hence the `?`.
                         return Ok(quote!(#f(&(#xs), #r)?));
@@ -5642,8 +5646,8 @@ impl<'a> CodeGen for Call {
                     "permutations" => {
                         kw_of(&[])?;
                         return match rendered.as_slice() {
-                            [xs] => Ok(quote!(permutations(&(#xs), None)?)),
-                            [xs, r] => Ok(quote!(permutations(&(#xs), Some(#r))?)),
+                            [xs] => Ok(quote!(#bound(&(#xs), None)?)),
+                            [xs, r] => Ok(quote!(#bound(&(#xs), Some(#r))?)),
                             _ => Err("permutations() takes an iterable and optional r"
                                 .to_string()
                                 .into()),
@@ -5657,7 +5661,7 @@ impl<'a> CodeGen for Call {
                                 .into());
                         }
                         let (f, xs) = (&rendered[0], &rendered[1]);
-                        return Ok(quote!(starmap(#f, &(#xs))));
+                        return Ok(quote!(#bound(#f, &(#xs))));
                     }
                     // takewhile/dropwhile/filterfalse: the runtime takes
                     // (iterable, predicate) — Python's (predicate,
@@ -5671,8 +5675,7 @@ impl<'a> CodeGen for Call {
                                 .into());
                         }
                         let (pred, xs) = (&rendered[0], &rendered[1]);
-                        let ident = crate::safe_ident(name);
-                        return Ok(quote!(#ident(#xs, #pred)));
+                        return Ok(quote!(#bound(#xs, #pred)));
                     }
                     _ => unreachable!(),
                 }

@@ -19809,3 +19809,193 @@ fn an_aliased_from_import_does_not_rebind_the_original_name_at_runtime() {
         ],
     );
 }
+
+#[test]
+fn aliased_itertools_imports_dispatch_like_the_original_names_at_runtime() {
+    // Issue #428 follow-up: the symbol table binds only the alias, so the
+    // itertools dispatch resolves the DEFINING name (`product as prod` is
+    // itertools.product, with its `repeat=` / `initial=` / `fillvalue=`
+    // keyword spellings).
+    let scratch = Scratch::new("itaalias");
+    let file = scratch.path().join("it_alias.py");
+    fs::write(
+        &file,
+        concat!(
+            "from itertools import accumulate as acc, pairwise as pw, product as prod, zip_longest as zl\n",
+            "from itertools import combinations as comb, groupby as gb, permutations as perms, starmap as sm, takewhile as tw\n",
+            "\n",
+            "\n",
+            "def main() -> int:\n",
+            "    for v in acc([1, 2, 3, 4]):\n",
+            "        print(f\"acc={v}\")\n",
+            "    for v in acc([1, 2, 3], initial=100):\n",
+            "        print(f\"acci={v}\")\n",
+            "    for a, b in prod([1, 2], [10, 20]):\n",
+            "        print(f\"prod={a},{b}\")\n",
+            "    for a, b in prod([0, 1], repeat=2):\n",
+            "        print(f\"rep={a},{b}\")\n",
+            "    for a, b in pw([1, 2, 3]):\n",
+            "        print(f\"pw={a},{b}\")\n",
+            "    for a, b in zl([1], [10, 20], fillvalue=0):\n",
+            "        print(f\"zl={a},{b}\")\n",
+            "    for c in comb([1, 2, 3], 2):\n",
+            "        print(f\"comb={c[0]},{c[1]}\")\n",
+            "    for p in perms([1, 2]):\n",
+            "        print(f\"perm={p[0]},{p[1]}\")\n",
+            "    for k, g in gb([1, 1, 2]):\n",
+            "        n = 0\n",
+            "        for _x in g:\n",
+            "            n += 1\n",
+            "        print(f\"gb={k}:{n}\")\n",
+            "    for v in sm(lambda a, b: a * b, [(2, 3), (4, 5)]):\n",
+            "        print(f\"sm={v}\")\n",
+            "    for v in tw(lambda x: x < 3, [1, 2, 3, 1]):\n",
+            "        print(f\"tw={v}\")\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/it_alias"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "acc=1", "acc=3", "acc=6", "acc=10",
+            "acci=100", "acci=101", "acci=103", "acci=106",
+            "prod=1,10", "prod=1,20", "prod=2,10", "prod=2,20",
+            "rep=0,0", "rep=0,1", "rep=1,0", "rep=1,1",
+            "pw=1,2", "pw=2,3",
+            "zl=1,10", "zl=0,20",
+            "comb=1,2", "comb=1,3", "comb=2,3",
+            "perm=1,2", "perm=2,1",
+            "gb=1:2", "gb=2:1",
+            "sm=6", "sm=20",
+            "tw=1", "tw=2",
+        ],
+    );
+}
+
+#[test]
+fn aliased_datetime_imports_construct_like_the_original_names_at_runtime() {
+    // Issue #428 follow-up: `from datetime import date as D, datetime as DT,
+    // timedelta as TD` constructs by the DEFINING name.
+    let scratch = Scratch::new("dtalias");
+    let file = scratch.path().join("dt_alias.py");
+    fs::write(
+        &file,
+        concat!(
+            "from datetime import date as D, datetime as DT, timedelta as TD\n",
+            "\n",
+            "\n",
+            "def main() -> int:\n",
+            "    d1 = D(2024, 3, 1)\n",
+            "    d2 = D(2024, 2, 27)\n",
+            "    gap = d1 - d2\n",
+            "    print(f\"gap={gap} days={gap.days}\")\n",
+            "    print(f\"shift={d1 + TD(days=3)} back={d1 - TD(weeks=1)}\")\n",
+            "    dt = DT(2024, 2, 29, 13, 5, 7)\n",
+            "    print(f\"dt={dt}\")\n",
+            "    dt2 = dt + TD(hours=25, minutes=90)\n",
+            "    print(f\"dt2={dt2}\")\n",
+            "    print(f\"diff={dt2 - dt}\")\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/dt_alias"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "gap=3 days, 0:00:00 days=3",
+            "shift=2024-03-04 back=2024-02-23",
+            "dt=2024-02-29 13:05:07",
+            "dt2=2024-03-01 15:35:07",
+            "diff=1 day, 2:30:00",
+        ],
+    );
+}
+
+#[test]
+fn aliased_crate_imports_resolve_their_defining_items_at_runtime() {
+    // Issue #428 follow-up: `from .helpers import scale as sc` (a keyword
+    // call, so the signature must be found under the DEFINING name `scale`)
+    // and `from . import sub as s; s.Cls()` (the submodule is `sub`, not
+    // `s`).
+    let scratch = Scratch::new("aliaspkg");
+    let krate = package_crate(
+        &scratch,
+        "aliaspkg",
+        &[
+            (
+                "helpers.py",
+                concat!(
+                    "def scale(x: int, factor: int = 1) -> int:\n",
+                    "    return x * factor\n",
+                    "\n",
+                    "\n",
+                    "def offset(x: int, by: int = 0) -> int:\n",
+                    "    return x + by\n",
+                ),
+            ),
+            (
+                "sub.py",
+                concat!(
+                    "class Cls:\n",
+                    "    def __init__(self) -> None:\n",
+                    "        self.value = 7\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from . import sub as s\n",
+                    "from .helpers import offset as off\n",
+                    "from .helpers import scale as sc\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(sc(x=2, factor=3))\n",
+                    "    print(sc(5))\n",
+                    "    print(off(1, by=10))\n",
+                    "    c = s.Cls()\n",
+                    "    print(c.value)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "aliaspkg"), vec!["6", "5", "11", "7"]);
+}
