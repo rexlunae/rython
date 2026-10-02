@@ -575,7 +575,11 @@ through subscript/attribute stores marks the chain's base variable.
   `_instance = Counter()` in a getter) or mutated in place is a `Mutex`
   static inside the same bound (`LazyLock<ThreadBound<Mutex<T>>>`), and a
   class a `global`-rebound static holds is itself shared — the static and
-  every handle the getter returns are the one object (issue #422). Every
+  every handle the getter returns are the one object (issue #422). So is
+  the class of any module-level instance a function reads or mutates
+  (`current = Box()` with `current.n += 1`, or a read-only `DEFAULT =
+  Box()`): `x = current; x.n = 5` mutates the global's object, as
+  `x is current` is True (issue #430). Every
   other class stays a plain struct
   (cloning an immutable object, or one no container or parameter holds,
   is unobservable). The

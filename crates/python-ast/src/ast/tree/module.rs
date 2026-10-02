@@ -4191,14 +4191,22 @@ pub(crate) fn fold_static_import_trys(
     (out, newly_live, folded_imports)
 }
 
-/// The classes whose instances a `global`-REBOUND module static holds
-/// (issue #422): the singleton (`_instance = None`, later `_instance =
-/// Counter()` inside a function — the class-instance kind, issue #189) and
-/// a computed class-instance value some function rebinds (`current =
-/// Counter()`, `global current; current = Counter()`). The static is one
-/// holder of the object and every `a = get_instance()` another, so the
-/// class takes the shared representation when it is mutated — the
-/// sharing analysis counts these classes as held, like a container slot.
+/// The classes whose instances a module-level value holds across scopes
+/// (issues #422, #430): the value is one more holder of the object, and
+/// every `x = current` a function binds is another, so the class takes the
+/// shared representation when it is mutated — the sharing analysis counts
+/// these classes as held, like a container slot.
+///
+/// Three shapes:
+/// - the singleton (`_instance = None`, later `_instance = Counter()`
+///   inside a function — the class-instance kind, issue #189);
+/// - a computed class-instance value a function REBINDS (`current =
+///   Counter()`, `global current; current = Counter()`, issue #422) or
+///   mutates in place (`current.n += 1`, issue #430);
+/// - a class instance bound ONCE at module level and READ by a function
+///   (a read-only `DEFAULT = Counter()` a function aliases and mutates,
+///   issue #430). Without the holder, every read of the static clones the
+///   object and a mutation through the alias never reaches the global.
 pub(crate) fn module_global_held_classes(
     body: &[crate::Statement],
     symbols: &crate::SymbolTableScopes,
@@ -4207,11 +4215,26 @@ pub(crate) fn module_global_held_classes(
     let mut counts = std::collections::HashMap::new();
     count_module_stores(body, &mut counts);
     let mutables = module_global_mutable_names(body, &counts, symbols, options);
-    if mutables.is_empty() {
-        return Vec::new();
-    }
     let class_stores = module_global_class_stores(body, symbols);
-    let (global_written, _) = module_global_write_sets(body);
+    let (global_written, bound_without_global) = module_global_write_sets(body);
+    let free_reads = module_function_free_reads(body);
+    // The class a module-level `name = <value>` store constructs.
+    let stored_class = |name: &str| -> Vec<String> {
+        body.iter()
+            .filter_map(|s| match &s.statement {
+                crate::StatementType::Assign(a)
+                    if let [crate::ExprType::Name(n)] = a.targets.as_slice()
+                        && n.id == name =>
+                {
+                    match crate::infer_type(None, &a.value, options, symbols) {
+                        crate::TypeInfo::Class(c) => Some(c),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    };
     let mut out = Vec::new();
     for (name, kind) in &mutables {
         match kind {
@@ -4220,19 +4243,30 @@ pub(crate) fn module_global_held_classes(
                     out.push(class.clone());
                 }
             }
-            crate::MutableGlobalKind::Computed { .. } if global_written.contains(name) => {
-                for s in body {
-                    if let crate::StatementType::Assign(a) = &s.statement
-                        && let [crate::ExprType::Name(n)] = a.targets.as_slice()
-                        && n.id == *name
-                        && let crate::TypeInfo::Class(c) =
-                            crate::infer_type(None, &a.value, options, symbols)
-                    {
-                        out.push(c);
-                    }
-                }
-            }
+            // Rebound (`global`) or mutated in place: either way the
+            // static is a holder of the instance.
+            crate::MutableGlobalKind::Computed { .. } => out.extend(stored_class(name)),
             _ => {}
+        }
+    }
+    // A READ-only module instance: one top-level store, never rebound,
+    // read by a function (which is what promotes it to a static the
+    // function can alias).
+    for (name, count) in &counts {
+        if *count == 1
+            && free_reads.contains(name)
+            && !mutables.contains_key(name)
+            && !global_written.contains(name)
+            && !bound_without_global.contains(name)
+            && !matches!(
+                symbols.get(name),
+                Some(crate::SymbolTableNode::ImportFrom(_))
+                    | Some(crate::SymbolTableNode::Import(_))
+                    | Some(crate::SymbolTableNode::ClassDef(_))
+                    | Some(crate::SymbolTableNode::FunctionDef(_))
+            )
+        {
+            out.extend(stored_class(name));
         }
     }
     out

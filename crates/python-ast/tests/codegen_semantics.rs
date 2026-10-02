@@ -26149,7 +26149,9 @@ fn a_global_singleton_of_a_shared_class_is_a_thread_bound_mutex_of_the_ref() {
 /// Issue #422: a module value mutated in place whose field holds shared
 /// objects (`Registry.items: list[Counter]`) is a `Mutex` static too — it is
 /// thread-bound like the immutable form, and the mutation runs under the
-/// lock through the bound.
+/// lock through the bound. The instance is itself held by the static
+/// (issue #430), so `Registry` is shared and the static holds its `PyRef`:
+/// an alias bound from the global is the one object.
 #[test]
 fn a_mutated_module_global_holding_shared_objects_is_a_thread_bound_mutex() {
     let out = compile(
@@ -26176,7 +26178,7 @@ fn a_mutated_module_global_holding_shared_objects_is_a_thread_bound_mutex() {
     );
     let flat: String = out.split_whitespace().collect();
     assert!(
-        flat.contains("pubstaticreg:std::sync::LazyLock<stdpython::ThreadBound<std::sync::Mutex<Registry>>"),
+        flat.contains("pubstaticreg:std::sync::LazyLock<stdpython::ThreadBound<std::sync::Mutex<stdpython::PyRef<Registry>>>"),
         "the mutated global is a thread-bound Mutex: {}",
         out
     );
@@ -26332,4 +26334,108 @@ fn an_alias_imported_before_the_plain_name_keeps_both_modules() {
         }
         other => panic!("both names stay bound to their own module: {:?}", other),
     }
+}
+
+/// Issue #430: a module instance mutated in place (`current.n += 1`) is a
+/// holder of the one object — the class is shared, the static holds its
+/// `PyRef` behind a thread bound, and `x = current` reads another handle
+/// to the same object instead of a clone of the value.
+#[test]
+fn a_module_instance_mutated_in_place_is_a_shared_ref_static() {
+    let out = compile(
+        concat!(
+            "class Box:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "current = Box()\n",
+            "\n",
+            "def bump() -> None:\n",
+            "    current.n += 1\n",
+            "\n",
+            "def run() -> None:\n",
+            "    x = current\n",
+            "    x.n = 5\n",
+        ),
+        "alias_inplace_430.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains(
+            "pubstaticcurrent:std::sync::LazyLock<stdpython::ThreadBound<std::sync::Mutex<stdpython::PyRef<Box>>>"
+        ),
+        "the static holds the shared ref behind a thread bound: {}",
+        out
+    );
+    assert!(
+        flat.contains("x=stdpython::py_global_read(&**current)"),
+        "the alias is a handle read through the bound: {}",
+        out
+    );
+}
+
+/// Issue #430: a module instance a function reads (never rebound, never
+/// mutated through its own name) is a holder too: `x = DEFAULT; x.n = 3`
+/// must reach `DEFAULT`, so the class is shared and the LazyLock static
+/// holds the `PyRef` behind a thread bound.
+#[test]
+fn a_read_only_module_instance_aliased_and_mutated_is_a_shared_ref_static() {
+    let out = compile(
+        concat!(
+            "class Box:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "DEFAULT = Box()\n",
+            "\n",
+            "def run() -> None:\n",
+            "    x = DEFAULT\n",
+            "    x.n = 3\n",
+            "    print(DEFAULT.n)\n",
+        ),
+        "alias_readonly_430.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("pubstaticDEFAULT:std::sync::LazyLock<stdpython::ThreadBound<stdpython::PyRef<Box>>"),
+        "the static holds the shared ref behind a thread bound: {}",
+        out
+    );
+}
+
+/// Issue #430, no over-widening: a module instance of a class that nothing
+/// mutates stays a plain value (cloning an immutable object is
+/// unobservable), and a mutated class with no module-level instance stays
+/// unshared.
+#[test]
+fn a_module_instance_of_an_unmutated_class_stays_unshared() {
+    let out = compile(
+        concat!(
+            "class Const:\n",
+            "    def __init__(self):\n",
+            "        self.n = 7\n",
+            "\n",
+            "DEFAULT = Const()\n",
+            "\n",
+            "def run() -> int:\n",
+            "    x = DEFAULT\n",
+            "    return x.n\n",
+            "\n",
+            "class Local:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "def make() -> int:\n",
+            "    v = Local()\n",
+            "    v.n = 4\n",
+            "    return v.n\n",
+        ),
+        "no_widen_430.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        !flat.contains("PyRef<Const>") && !flat.contains("PyRef<Local>"),
+        "neither class takes the shared representation: {}",
+        out
+    );
 }

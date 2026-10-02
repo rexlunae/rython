@@ -19514,6 +19514,155 @@ fn a_global_singleton_is_shared_so_its_handles_alias() {
     );
 }
 
+/// Convert a one-file program, build it and return its stdout lines.
+fn run_global_alias_program(tag: &str, file_name: &str, source: &str) -> Vec<String> {
+    let scratch = Scratch::new(tag);
+    let file = scratch.path().join(file_name);
+    fs::write(&file, source).unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = file_name.trim_end_matches(".py");
+    let output = Command::new(krate.root.join("target/debug").join(bin))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn a_global_mutated_in_place_is_one_object_with_its_local_aliases() {
+    // Issue #430: `current = Box()` is never rebound, only mutated in place
+    // (`current.n += 1`), so it was a Mutex static whose every read cloned
+    // the instance — `x = current; x.n = 5` mutated a copy and `bump()`
+    // mutated the static, printing `1 5` for CPython's `6 6`. The static is
+    // a holder, so `Box` is shared and the local is another handle to the
+    // one object, in both directions and under `is`.
+    let got = run_global_alias_program(
+        "globalalias",
+        "global_alias_inplace.py",
+        concat!(
+            "class Box:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "\n",
+            "current = Box()\n",
+            "\n",
+            "\n",
+            "def bump() -> None:\n",
+            "    current.n += 1\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    x = current\n",
+            "    x.n = 5\n",
+            "    bump()\n",
+            "    print(current.n, x.n)\n",
+            "    y = current\n",
+            "    print(x is y, y is current)\n",
+            "    y.n = 20\n",
+            "    print(current.n, x.n)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    );
+    // Verified against python3.
+    assert_eq!(got, vec!["6 6", "True True", "20 20"]);
+}
+
+#[test]
+fn a_read_only_global_instance_is_one_object_with_its_local_aliases() {
+    // Issue #430: a module instance nothing rebinds or mutates through its
+    // own name was a plain LazyLock read by clone: `x = DEFAULT; x.n = 3`
+    // left `DEFAULT.n` at 0 (CPython: 3). A function that reads the global
+    // is a holder, so the class is shared and `x` is the global's object.
+    let got = run_global_alias_program(
+        "globalreadonly",
+        "global_readonly_alias.py",
+        concat!(
+            "class Box:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "\n",
+            "DEFAULT = Box()\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    x = DEFAULT\n",
+            "    x.n = 3\n",
+            "    print(DEFAULT.n, x.n)\n",
+            "    print(x is DEFAULT)\n",
+            "    DEFAULT.n += 1\n",
+            "    print(x.n)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    );
+    // Verified against python3.
+    assert_eq!(got, vec!["3 3", "True", "4"]);
+}
+
+#[test]
+fn a_global_instance_passed_or_listed_is_the_one_object() {
+    // Issue #430: the parameter and container holders of a module instance
+    // (`set5(current)`, `items = [current]; items[0].n += 1`) see the one
+    // object the global names (the `global_alias_holders` idiom program).
+    let got = run_global_alias_program(
+        "globalshapes",
+        "global_alias_holders.py",
+        concat!(
+            "class Box:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "\n",
+            "current = Box()\n",
+            "\n",
+            "\n",
+            "def bump() -> None:\n",
+            "    current.n += 1\n",
+            "\n",
+            "\n",
+            "def set5(b: Box) -> None:\n",
+            "    b.n = 5\n",
+            "\n",
+            "\n",
+            "def run_param() -> None:\n",
+            "    set5(current)\n",
+            "    print(current.n)\n",
+            "\n",
+            "\n",
+            "def run_list() -> None:\n",
+            "    items = [current]\n",
+            "    items[0].n += 1\n",
+            "    bump()\n",
+            "    print(current.n, items[0].n)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    run_param()\n",
+            "    run_list()\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    // Verified against python3.
+    assert_eq!(got, vec!["5", "7 7"]);
+}
+
 #[test]
 fn a_list_of_boxed_values_field_keeps_its_own_methods() {
     // Issue #421: `self.q: list[Any]` is a Vec<PyValue> — a typed

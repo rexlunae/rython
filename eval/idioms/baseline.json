@@ -33,6 +33,12 @@
     "fsum_compensation": {
       "status": "pass"
     },
+    "global_alias_holders": {
+      "status": "pass"
+    },
+    "global_alias_mutation": {
+      "status": "pass"
+    },
     "global_shared_singleton": {
       "status": "pass"
     },
