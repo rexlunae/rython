@@ -19753,3 +19753,59 @@ fn a_mutation_through_a_class_parameter_reaches_the_callers_object() {
         ],
     );
 }
+
+#[test]
+fn an_aliased_from_import_does_not_rebind_the_original_name_at_runtime() {
+    // Issue #428: `from m import X as Y` binds only `Y`. The symbol table
+    // also bound `X` (to the aliasing statement's module), overwriting an
+    // earlier `from other import X`, so a later `X(...)` resolved against
+    // the wrong module: `os.path.split` became `re.split` (a conversion
+    // error) and `re.escape` became `glob.escape` (a SILENT wrong string:
+    // same signature, different output). Each pair is imported in the
+    // order the bug needs: plain then aliased for `split`, aliased then
+    // plain for `escape`.
+    let scratch = Scratch::new("aliasnames");
+    let file = scratch.path().join("alias_names.py");
+    fs::write(
+        &file,
+        concat!(
+            "from glob import escape as gescape\n",
+            "from os.path import split\n",
+            "from re import escape\n",
+            "from re import split as rsplit\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(split(\"a/b\"))\n",
+            "    print(rsplit(\",\", \"x,y,z\"))\n",
+            "    print(escape(\"a.b*c\"))\n",
+            "    print(gescape(\"a.b*c\"))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/alias_names"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "('a', 'b')",
+            "['x', 'y', 'z']",
+            "a\\.b\\*c",
+            "a.b[*]c",
+        ],
+    );
+}

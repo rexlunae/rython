@@ -1333,8 +1333,12 @@ pub(crate) fn is_module_path_chain(
                 // to `use <stdpython>::json as complexjson;`, so
                 // `complexjson.dumps(...)` resolves as `complexjson::dumps`.
                 Some(SymbolTableNode::ImportFrom(ifm)) if ifm.level > 0 => {
+                    // The submodule the import names is the DEFINING name
+                    // (`from .compat import json as complexjson` binds
+                    // `complexjson` to compat's `json`).
+                    let defining = ifm.defining_name(&n.id);
                     let mut sub = ifm.resolved_module_path(options);
-                    sub.push(n.id.clone());
+                    sub.push(defining.clone());
                     if crate::module_defs_contains(options, &sub) {
                         return true;
                     }
@@ -1344,7 +1348,7 @@ pub(crate) fn is_module_path_chain(
                             crate::ast::tree::module::module_reexports_stdpython_module(
                                 options,
                                 key,
-                                &n.id,
+                                &defining,
                             )
                             .is_some()
                         })
@@ -1359,7 +1363,7 @@ pub(crate) fn is_module_path_chain(
                 // (`module + name` is not a crate module).
                 Some(SymbolTableNode::ImportFrom(ifm)) if ifm.level == 0 => {
                     let mut sub = ifm.resolved_module_path(options);
-                    sub.push(n.id.clone());
+                    sub.push(ifm.defining_name(&n.id));
                     crate::module_defs_contains(options, &sub)
                 }
                 _ => false,

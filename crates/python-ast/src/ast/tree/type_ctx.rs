@@ -1843,7 +1843,7 @@ fn named_fn_return_type(
         }
         Some(SymbolTableNode::ImportFrom(i)) => {
             let path = i.resolved_module_path(options);
-            let (f, _) = crate::module_function_def(options, &path, &n.id)?;
+            let (f, _) = crate::module_function_def(options, &path, &i.defining_name(&n.id))?;
             resolve_alias_typeinfo(
                 f.returns.as_deref()?,
                 &module_symbols(options, &path),
@@ -5133,7 +5133,10 @@ fn resolve_alias_typeinfo_inner(
                 let module = options.module_defs.get(&path)?;
                 let module: &crate::Module = module;
                 let syms = module.clone().find_symbols(SymbolTableScopes::new());
-                match syms.get(&n.id) {
+                // The DEFINING module binds the original item name
+                // (`from m import T as U` reads `T` there).
+                let defining = i.defining_name(&n.id);
+                match syms.get(&defining) {
                     Some(SymbolTableNode::Assign { value, .. }) => {
                         if is_typevar_call(value) {
                             return Some(TypeInfo::PyValue);
@@ -5159,7 +5162,7 @@ fn resolve_alias_typeinfo_inner(
                         if crate::ast::tree::module::module_def_has_runtime_item(
                             options,
                             &path,
-                            &n.id,
+                            &defining,
                         ) {
                             Some(TypeInfo::Class(n.id.clone()))
                         } else {
@@ -5171,7 +5174,7 @@ fn resolve_alias_typeinfo_inner(
                     // import ProxyConfig` — urllib3): follow the chain in
                     // the DEFINING module's scope.
                     Some(SymbolTableNode::ImportFrom(_)) | Some(SymbolTableNode::Alias(_)) => {
-                        resolve_alias_named_in(&path.join("."), &n.id, &syms, options)
+                        resolve_alias_named_in(&path.join("."), &defining, &syms, options)
                     }
                     _ => None,
                 }

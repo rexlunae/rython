@@ -26247,3 +26247,89 @@ fn a_subscript_of_self_takes_the_mutability_of_getitem() {
         out
     );
 }
+
+/// Issue #428: `from m import X as Y` binds ONLY `Y`. The symbol table
+/// used to also bind `X` (to the aliasing statement's module), which
+/// overwrote an earlier `from other import X` — so later `X(...)` calls
+/// resolved against the wrong module.
+#[test]
+fn an_aliased_from_import_binds_only_the_alias() {
+    let module = parse(
+        concat!(
+            "from collections import Counter\n",
+            "from typing import Counter as TypeCounter\n",
+            "from math import floor as mfloor\n",
+        ),
+        "alias_binding.py",
+    )
+    .unwrap();
+    let symbols = module.find_symbols(SymbolTableScopes::new());
+    match symbols.get("Counter") {
+        Some(python_ast::SymbolTableNode::ImportFrom(i)) => {
+            assert_eq!(i.module, "collections", "Counter stays collections.Counter");
+        }
+        other => panic!("Counter must stay bound by `from collections`: {:?}", other),
+    }
+    match symbols.get("TypeCounter") {
+        Some(python_ast::SymbolTableNode::ImportFrom(i)) => {
+            assert_eq!(i.module, "typing");
+            assert_eq!(i.names.len(), 1, "the entry carries the one alias it binds");
+            assert_eq!(i.names[0].name, "Counter");
+            assert_eq!(i.names[0].asname.as_deref(), Some("TypeCounter"));
+        }
+        other => panic!("TypeCounter must bind the typing import: {:?}", other),
+    }
+    assert!(
+        symbols.get("floor").is_none(),
+        "`from math import floor as mfloor` binds only `mfloor` (CPython: NameError on `floor`)"
+    );
+    assert!(symbols.get("mfloor").is_some());
+}
+
+/// Issue #428 reproducer 3: an aliased numpy import of the same item name
+/// must not hijack the earlier `from math import floor`. CPython (with
+/// numpy installed) prints `2` for `floor(2.5)`.
+#[test]
+fn an_aliased_import_of_the_same_item_name_does_not_hijack_the_plain_import() {
+    let out = compile(
+        concat!(
+            "from math import floor\n",
+            "from numpy import floor as npfloor\n",
+            "\n",
+            "def go() -> int:\n",
+            "    return floor(2.5)\n",
+        ),
+        "alias_floor.py",
+    );
+    assert!(
+        !out.contains("numpy :: floor") && !out.contains("numpy::floor"),
+        "floor is math.floor, not numpy's: {}",
+        out
+    );
+    assert!(out.contains("floor"), "{}", out);
+}
+
+/// Same shape, reverse order: the aliased import first, the plain import of
+/// the shared item name after. Each name keeps its own module.
+#[test]
+fn an_alias_imported_before_the_plain_name_keeps_both_modules() {
+    let module = parse(
+        concat!(
+            "from glob import escape as gescape\n",
+            "from re import escape\n",
+        ),
+        "alias_order.py",
+    )
+    .unwrap();
+    let symbols = module.find_symbols(SymbolTableScopes::new());
+    match (symbols.get("escape"), symbols.get("gescape")) {
+        (
+            Some(python_ast::SymbolTableNode::ImportFrom(plain)),
+            Some(python_ast::SymbolTableNode::ImportFrom(aliased)),
+        ) => {
+            assert_eq!(plain.module, "re");
+            assert_eq!(aliased.module, "glob");
+        }
+        other => panic!("both names stay bound to their own module: {:?}", other),
+    }
+}

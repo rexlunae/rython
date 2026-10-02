@@ -1299,7 +1299,7 @@ pub fn isinstance_narrowing(
                     let syms = module
                         .clone()
                         .find_symbols(SymbolTableScopes::new());
-                    resolve_type_name_depth(id, options, &syms, depth + 1)
+                    resolve_type_name_depth(&i.defining_name(id), options, &syms, depth + 1)
                 } else {
                     None
                 }

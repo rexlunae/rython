@@ -1292,7 +1292,8 @@ fn numpy_target(func: &ExprType, symbols: &SymbolTableScopes) -> Option<String> 
                     import.module.split('.').next().unwrap_or("")
                 ) == Some(crate::StdModule::Numpy) =>
             {
-                let name = n.id.clone();
+                // `from numpy import floor as npfloor` calls numpy's `floor`.
+                let name = import.defining_name(&n.id);
                 Some(if import.module == "numpy.linalg" {
                     format!("linalg.{name}")
                 } else {
@@ -4089,7 +4090,7 @@ impl<'a> CodeGen for Call {
                                     let module: &crate::Module = module;
                                     let syms =
                                         module.clone().find_symbols(SymbolTableScopes::new());
-                                    return resolve_type_tuple(id, options, &syms);
+                                    return resolve_type_tuple(&i.defining_name(id), options, &syms);
                                 }
                                 _ => return None,
                             };
@@ -4163,7 +4164,12 @@ impl<'a> CodeGen for Call {
                                         let syms = module
                                             .clone()
                                             .find_symbols(SymbolTableScopes::new());
-                                        resolve_type_name_depth(id, options, &syms, depth + 1)
+                                        resolve_type_name_depth(
+                                            &i.defining_name(id),
+                                            options,
+                                            &syms,
+                                            depth + 1,
+                                        )
                                     } else {
                                         None
                                     }
@@ -5391,20 +5397,18 @@ impl<'a> CodeGen for Call {
         // signatures and lower to the runtime ::new constructors
         // (Option-typed for the defaulted parameters). date/datetime
         // validate and propagate with `?`.
-        let datetime_name: Option<&str> = match self.func.as_ref() {
-            ExprType::Name(n) => {
-                let from_datetime = matches!(
-                    symbols.get(&n.id),
-                    Some(SymbolTableNode::ImportFrom(import))
-                        if crate::StdModule::from_name(&import.module)
-                            == Some(crate::StdModule::Datetime)
-                );
-                if from_datetime {
-                    Some(n.id.as_str())
-                } else {
-                    None
+        let datetime_name: Option<String> = match self.func.as_ref() {
+            ExprType::Name(n) => match symbols.get(&n.id) {
+                // The DEFINING name: `from datetime import datetime as date`
+                // constructs a datetime, whatever the local spelling.
+                Some(SymbolTableNode::ImportFrom(import))
+                    if crate::StdModule::from_name(&import.module)
+                        == Some(crate::StdModule::Datetime) =>
+                {
+                    Some(import.defining_name(&n.id))
                 }
-            }
+                _ => None,
+            },
             ExprType::Attribute(a) => {
                 // `datetime.date(...)`: the receiver is the stdlib module,
                 // not shadowed by a user binding.
@@ -5414,7 +5418,7 @@ impl<'a> CodeGen for Call {
                         if crate::StdModule::from_name(&n.id) == Some(crate::StdModule::Datetime)
                 ) && !crate::module_name_shadowed(crate::StdModule::Datetime.name(), &symbols);
                 if is_datetime_module {
-                    Some(a.attr.as_str())
+                    Some(a.attr.clone())
                 } else {
                     None
                 }
@@ -5423,7 +5427,7 @@ impl<'a> CodeGen for Call {
         };
         if let Some(name) = datetime_name {
             if let Some(tokens) = render_datetime_ctor(
-                name,
+                &name,
                 &self.args,
                 &self.keywords,
                 ctx.clone(),
@@ -5439,14 +5443,20 @@ impl<'a> CodeGen for Call {
         // arity-specific runtime variants, and iterable arguments are
         // borrowed (the runtime takes slices; Python calls never consume).
         if let ExprType::Name(n) = self.func.as_ref() {
-            let from_itertools = matches!(
-                symbols.get(&n.id),
+            // The DEFINING name: `from itertools import product as prod`
+            // is itertools.product, whatever the local spelling.
+            let itertools_item = match symbols.get(&n.id) {
                 Some(SymbolTableNode::ImportFrom(import))
                     if crate::StdModule::from_name(&import.module)
-                        == Some(crate::StdModule::Itertools)
-            );
+                        == Some(crate::StdModule::Itertools) =>
+                {
+                    Some(import.defining_name(&n.id))
+                }
+                _ => None,
+            };
+            let from_itertools = itertools_item.is_some();
             let handled = matches!(
-                n.id.as_str(),
+                itertools_item.as_deref().unwrap_or(""),
                 "accumulate"
                     | "product"
                     | "zip_longest"
@@ -5461,7 +5471,7 @@ impl<'a> CodeGen for Call {
                     | "filterfalse"
             );
             if from_itertools && handled {
-                let name = n.id.as_str();
+                let name = itertools_item.as_deref().unwrap_or(&n.id);
                 let mut rendered = Vec::new();
                 for arg in &self.args {
                     rendered.push(arg.clone().to_rust(
@@ -7624,7 +7634,9 @@ impl<'a> CodeGen for Call {
             && ifm.level > 0
         {
             let mut mod_path = ifm.resolved_module_path(&options);
-            mod_path.push(receiver.id.clone());
+            // The submodule the import names (`from . import sessions as s`
+            // binds `s` to `sessions`).
+            mod_path.push(ifm.defining_name(&receiver.id));
             if options.module_defs.contains_key(&mod_path)
                 && let Some((_class, _cs)) =
                     crate::module_class_def(&options, &mod_path, &attr.attr)
@@ -10253,7 +10265,8 @@ let mutating_self_field = boxed_self_ref_receiver
                 Some(SymbolTableNode::ImportFrom(i)) => {
                     let path = i.resolved_module_path(&options);
                     if options.module_defs.contains_key(&path) {
-                        crate::module_function_def(&options, &path, &n.id).map(|(f, _)| f)
+                        crate::module_function_def(&options, &path, &i.defining_name(&n.id))
+                            .map(|(f, _)| f)
                     } else {
                         None
                     }
@@ -12198,12 +12211,16 @@ fn named_call_class(
             let key = crate::module_defs_key(options, &path);
             // An imported CLASS constructor: the class itself, with its
             // defining module's symbols (the same key).
+            // The DEFINING module knows only the original item name
+            // (`from pkg.shapes import Shape as S` defines `Shape` there).
+            let defining = ifm.defining_name(&name);
             if let Some(key) = key
-                && let Some((class, class_symbols)) = crate::module_class_def(options, key, &name)
+                && let Some((class, class_symbols)) =
+                    crate::module_class_def(options, key, &defining)
             {
                 return Some((class.name, class_symbols));
             }
-            key.and_then(|key| crate::module_function_def(options, key, &name))
+            key.and_then(|key| crate::module_function_def(options, key, &defining))
         }
         _ => None,
     };
@@ -12280,15 +12297,12 @@ pub(crate) fn is_compiled_regex_expr(
                     && a.attr == "compile"
             }
             ExprType::Name(cn) => {
+                // `from re import compile as X`: the local name is ALIASED
+                // (the bare `compile` spelling is not a pattern source here).
                 matches!(
                     symbols.get(&cn.id),
-                    Some(crate::SymbolTableNode::Alias(member))
-                        if matches!(
-                            symbols.get(member),
-                            Some(crate::SymbolTableNode::ImportFrom(i))
-                                if i.module == "re"
-                                    && i.names.iter().any(|a| a.name == *member && a.name == "compile")
-                        )
+                    Some(crate::SymbolTableNode::ImportFrom(i))
+                        if i.aliases_item(&cn.id, "re", "compile")
                 )
             }
             _ => false,
@@ -12367,7 +12381,7 @@ pub(crate) fn receiver_class_tail(
         Some(SymbolTableNode::ImportFrom(i)) => {
             let path = i.resolved_module_path(options);
             if options.module_defs.contains_key(&path) {
-                crate::module_class_def(options, &path, class_name)
+                crate::module_class_def(options, &path, &i.defining_name(class_name))
             } else {
                 None
             }

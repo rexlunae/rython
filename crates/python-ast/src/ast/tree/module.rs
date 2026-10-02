@@ -5841,10 +5841,8 @@ fn module_init_static_ty(
         // the from-import it was bound by, so the static holds the raw
         // Regex exactly like the module-qualified spelling below.
         && let crate::ExprType::Name(cn) = c.func.as_ref()
-        && let Some(crate::SymbolTableNode::Alias(member)) = symbols.get(&cn.id)
-        && let Some(crate::SymbolTableNode::ImportFrom(i)) = symbols.get(member)
-        && i.module == "re"
-        && i.names.iter().any(|a| a.name == *member && a.name == "compile")
+        && let Some(crate::SymbolTableNode::ImportFrom(i)) = symbols.get(&cn.id)
+        && i.aliases_item(&cn.id, "re", "compile")
     {
         return Some(quote!(stdpython::stdlib::re::Regex));
     }

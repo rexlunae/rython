@@ -1438,7 +1438,7 @@ impl ClassDef {
             Some(SymbolTableNode::ClassDef(c)) => Some(c.clone()),
             Some(SymbolTableNode::ImportFrom(i)) => {
                 let path = i.resolved_module_path(options);
-                crate::module_class_def(options, &path, &n.id)
+                crate::module_class_def(options, &path, &i.defining_name(&n.id))
                     .map(|(c, _)| c)
             }
             _ => None,
@@ -1507,7 +1507,12 @@ impl ClassDef {
             };
             let resolve_import = |i: &crate::ImportFrom, name: &str| {
                 let path = i.resolved_module_path(last_opts);
-                crate::resolve_imported_class_with_path(options, &path, name, 0)
+                crate::resolve_imported_class_with_path(
+                    options,
+                    &path,
+                    &i.defining_name(name),
+                    0,
+                )
                     .map(|(c, s, defining)| {
                         let mut o = options.clone();
                         // The package context: an __init__ module IS its
@@ -2045,8 +2050,12 @@ impl ClassDef {
                                 if !options.module_defs.contains_key(&path) {
                                     return None;
                                 }
-                                crate::module_function_def(options, &path, &callee.id)
-                                    .map(|(f, _)| f)?
+                                crate::module_function_def(
+                                    options,
+                                    &path,
+                                    &i.defining_name(&callee.id),
+                                )
+                                .map(|(f, _)| f)?
                             }
                             _ => return None,
                         };
@@ -2369,10 +2378,11 @@ impl ClassDef {
                                         ),
                                         Some(SymbolTableNode::ImportFrom(i)) => {
                                             let path = i.resolved_module_path(options);
-                                            if crate::module_class_def(options, &path, &n.id)
+                                            let defining = i.defining_name(&n.id);
+                                            if crate::module_class_def(options, &path, &defining)
                                                 .is_some()
                                                 || crate::resolve_imported_class(
-                                                    options, &path, &n.id, 0,
+                                                    options, &path, &defining, 0,
                                                 )
                                                 .is_some()
                                             {
@@ -3185,7 +3195,10 @@ fn qualify_tokens(
                                     .contains_key(&p)
                                     .then(|| {
                                         crate::resolve_imported_class_with_path(
-                                            a_opts, &p, &name, 0,
+                                            a_opts,
+                                            &p,
+                                            &i.defining_name(&name),
+                                            0,
                                         )
                                         .map(|(_, _, terminal)| terminal)
                                     })
@@ -3752,7 +3765,12 @@ impl CodeGen for ClassDef {
                 // behavior is the documented divergence.
                 Some(SymbolTableNode::ImportFrom(i)) => {
                     let path = i.resolved_module_path(&options);
-                    match crate::resolve_imported_class(&options, &path, base_name, 0) {
+                    match crate::resolve_imported_class(
+                        &options,
+                        &path,
+                        &i.defining_name(base_name),
+                        0,
+                    ) {
                         Some((c, _)) => Some(c),
                         None => None,
                     }
@@ -5595,7 +5613,7 @@ fn infer_field_type(
                     let module = options.module_defs.get(&path)?;
                     let module: &crate::Module = module;
                     let syms = module.clone().find_symbols(SymbolTableScopes::new());
-                    match syms.get(&n.id) {
+                    match syms.get(&i.defining_name(&n.id)) {
                         Some(SymbolTableNode::Assign { value, .. }) => const_type(value).or_else(
                             || {
                                 // An imported DICT constant
@@ -5762,8 +5780,9 @@ fn infer_field_type(
                 // re-exports it from ._base_connection — urllib3).
                 Some(SymbolTableNode::ImportFrom(i)) => {
                     let path = i.resolved_module_path(options);
-                    if crate::module_class_def(options, &path, &n.id).is_some()
-                        || crate::resolve_imported_class(options, &path, &n.id, 0).is_some()
+                    let defining = i.defining_name(&n.id);
+                    if crate::module_class_def(options, &path, &defining).is_some()
+                        || crate::resolve_imported_class(options, &path, &defining, 0).is_some()
                     {
                         Some(crate::TypeInfo::Class(n.id.clone()))
                     } else {
@@ -6200,8 +6219,9 @@ fn infer_field_type(
                             }
                             Some(SymbolTableNode::ImportFrom(i)) => {
                                 let path = i.resolved_module_path(options);
-                                if crate::module_class_def(options, &path, &cn.id).is_some()
-                                    || crate::resolve_imported_class(options, &path, &cn.id, 0)
+                                let defining = i.defining_name(&cn.id);
+                                if crate::module_class_def(options, &path, &defining).is_some()
+                                    || crate::resolve_imported_class(options, &path, &defining, 0)
                                         .is_some()
                                 {
                                     Some(crate::TypeInfo::Class(cn.id.clone()))
@@ -6219,10 +6239,11 @@ fn infer_field_type(
                             Some(SymbolTableNode::ClassDef(c)) => Some(c.clone()),
                             Some(SymbolTableNode::ImportFrom(i)) => {
                                 let path = i.resolved_module_path(options);
-                                crate::module_class_def(options, &path, &cn.id)
+                                let defining = i.defining_name(&cn.id);
+                                crate::module_class_def(options, &path, &defining)
                                     .map(|(c, _)| c)
                                     .or_else(|| {
-                                        crate::resolve_imported_class(options, &path, &cn.id, 0)
+                                        crate::resolve_imported_class(options, &path, &defining, 0)
                                             .map(|(c, _)| c)
                                     })
                             }
@@ -6278,11 +6299,12 @@ fn infer_field_type(
                         // receiver is a SUBMODULE with the class as the
                         // attribute (`functions.Functions()` — jmespath's
                         // TreeInterpreter, class = `a.attr` in path+sub).
-                        if crate::module_class_def(options, &path, &class.id).is_some() {
+                        let defining = i.defining_name(&class.id);
+                        if crate::module_class_def(options, &path, &defining).is_some() {
                             Some(crate::TypeInfo::Class(class.id.clone()))
                         } else {
                             let mut p2 = path.clone();
-                            p2.push(class.id.clone());
+                            p2.push(defining);
                             if crate::module_class_def(options, &path, &a.attr).is_some()
                                 || crate::module_class_def(options, &p2, &a.attr).is_some()
                             {
@@ -6527,10 +6549,11 @@ fn infer_field_type(
                     Some(SymbolTableNode::ClassDef(c)) => Some(c.clone()),
                     Some(SymbolTableNode::ImportFrom(i)) => {
                         let path = i.resolved_module_path(options);
-                        crate::module_class_def(options, &path, &cn.id)
+                        let defining = i.defining_name(&cn.id);
+                        crate::module_class_def(options, &path, &defining)
                             .map(|(c, _)| c)
                             .or_else(|| {
-                                crate::resolve_imported_class(options, &path, &cn.id, 0)
+                                crate::resolve_imported_class(options, &path, &defining, 0)
                                     .map(|(c, _)| c)
                             })
                     }

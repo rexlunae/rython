@@ -42,6 +42,9 @@
     "handoff": {
       "status": "pass"
     },
+    "import_alias_names": {
+      "status": "pass"
+    },
     "inventory": {
       "status": "pass"
     },
