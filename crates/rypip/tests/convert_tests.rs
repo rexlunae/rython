@@ -20099,7 +20099,7 @@ fn aliased_crate_imports_resolve_their_defining_items_at_runtime() {
     // call, so the signature must be found under the DEFINING name `scale`)
     // and `from . import sub as s; s.Cls()` (the submodule is `sub`, not
     // `s`).
-    let scratch = Scratch::new("aliaspkg");
+    let scratch = Scratch::new("aliasdefs");
     let krate = package_crate(
         &scratch,
         "aliaspkg",
