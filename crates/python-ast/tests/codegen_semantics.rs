@@ -27001,3 +27001,65 @@ fn aliased_and_qualified_collections_spellings_lower_like_the_plain_ones() {
     assert!(flat.contains("q:stdpython::collections::deque<i64>"), "{out}");
     assert!(flat.contains("c:stdpython::collections::deque<String>"), "{out}");
 }
+
+// `OrderedDict(x)` over an UNTYPED parameter (requests' from_key_val_list):
+// the parameter is the boxed PyValue (not a generic with unprovable bounds),
+// its isinstance guard is a RUNTIME test on the boxed value (not the
+// class-as-value `false`), and the construction hands the boxed value to the
+// runtime constructor, which builds the boxed OrderedDict.
+#[test]
+fn ordereddict_of_an_untyped_parameter_lowers_to_the_boxed_constructor() {
+    let out = compile(
+        "from collections import OrderedDict\n\
+         \n\
+         def from_key_val_list(value):\n\
+         \x20   if value is None:\n\
+         \x20       return None\n\
+         \x20   if isinstance(value, (str, bytes, bool, int)):\n\
+         \x20       raise ValueError(\"cannot encode objects that are not 2-tuples\")\n\
+         \x20   return OrderedDict(value)\n",
+        "od_boxed.py",
+    );
+    let flat = flat_of(&out);
+    assert!(
+        flat.contains("value:implInto<stdpython::PyValue>"),
+        "the parameter is boxed, not a generic: {out}"
+    );
+    assert!(
+        flat.contains("OrderedDict::from_boxed((value).clone())?"),
+        "boxed constructor: {out}"
+    );
+    assert!(
+        flat.contains("(value).is_str()||(value).is_bytes()||(value).is_bool()||(value).is_int()"),
+        "the isinstance guard is a runtime test on the boxed value: {out}"
+    );
+    // A typed argument keeps its typed lowering (#427).
+    let typed = compile(
+        "from collections import OrderedDict\n\
+         \n\
+         def f(d: dict[str, int]) -> int:\n\
+         \x20   od = OrderedDict(d)\n\
+         \x20   return len(od)\n",
+        "od_typed_dict.py",
+    );
+    assert!(flat_of(&typed).contains("::from_dict(d)"), "{typed}");
+    assert!(!flat_of(&typed).contains("from_boxed"), "{typed}");
+}
+
+#[test]
+fn ordereddict_of_an_unrepresentable_argument_stays_a_loud_error() {
+    // An int is no dict and no pairs: the compiler refuses rather than
+    // hand the runtime a shape it cannot build from.
+    let err = compile_err(
+        "from collections import OrderedDict\n\
+         \n\
+         def f(x: int):\n\
+         \x20   return OrderedDict(x)\n",
+        "od_int_arg.py",
+    );
+    assert!(
+        err.contains("OrderedDict(x): the argument must be a dict")
+            && err.contains("rython refuses to silently ignore it"),
+        "{err}"
+    );
+}

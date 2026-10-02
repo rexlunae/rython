@@ -1558,6 +1558,142 @@ where
     }
 }
 
+/// An OrderedDict boxed into a [`crate::PyValue`] slot (a return of an
+/// untyped function, an argument of a boxed parameter): it stays an
+/// OrderedDict — it prints, compares and iterates as one. Keys convert to
+/// the boxed dict's `String` keys, values to boxed values.
+impl<K, V> From<OrderedDict<K, V>> for crate::PyValue
+where
+    K: Hash + Eq + Clone + Into<String>,
+    V: Clone + Into<crate::PyValue>,
+{
+    fn from(od: OrderedDict<K, V>) -> Self {
+        let mut boxed: OrderedDict<String, crate::PyValue> = OrderedDict::new();
+        for (k, v) in od.inner {
+            boxed.inner.insert(k.into(), v.into());
+        }
+        crate::PyValue::OrderedDict(alloc::sync::Arc::new(boxed))
+    }
+}
+
+impl OrderedDict<String, crate::PyValue> {
+    /// `OrderedDict(x)` where `x` is a BOXED value (an untyped parameter —
+    /// requests' `from_key_val_list`): CPython's `update` over the value,
+    /// producing the boxed OrderedDict.
+    ///
+    /// - a dict or OrderedDict contributes its items in order;
+    /// - any other iterable contributes one (key, value) pair per member,
+    ///   each member itself unpacked to exactly two values (a 2-tuple, a
+    ///   2-element list, a 2-character str ...); a repeated key keeps its
+    ///   first position and takes the last value;
+    /// - everything else is CPython 3.12's own error, whose text differs
+    ///   from `dict()`'s (the OrderedDict constructor unpacks each member
+    ///   with the interpreter's unpack messages): `OrderedDict(5)` is
+    ///   `TypeError: 'int' object is not iterable`, `OrderedDict([1])`
+    ///   the same for the member, `OrderedDict([(1, 2, 3)])`
+    ///   `ValueError: too many values to unpack (expected 2)` and
+    ///   `OrderedDict([(1,)])` `ValueError: need more than 1 value to
+    ///   unpack`.
+    ///
+    /// LIMITATION (loud): a boxed OrderedDict holds `str` keys, like the
+    /// boxed dict. A pair whose key is not a str panics with a message
+    /// naming the key instead of stringifying it (CPython accepts any
+    /// hashable key); an unhashable key is CPython's TypeError.
+    pub fn from_boxed(value: crate::PyValue) -> Result<crate::PyValue, PyException> {
+        use crate::PyValue;
+        let mut od: OrderedDict<String, PyValue> = OrderedDict::new();
+        match value {
+            PyValue::Dict(d) => {
+                for (k, v) in d.iter() {
+                    od.inner.insert(k.clone(), v.clone());
+                }
+            }
+            // `OrderedDict(od)` copies: the result is a new mapping.
+            PyValue::OrderedDict(o) => {
+                return Ok(PyValue::OrderedDict(alloc::sync::Arc::new((*o).clone())));
+            }
+            PyValue::Int(_)
+            | PyValue::Float(_)
+            | PyValue::Bool(_)
+            | PyValue::Complex(_)
+            | PyValue::Function(_)
+            | PyValue::None_ => return Err(not_iterable(&value)),
+            iterable @ (PyValue::Str(_)
+            | PyValue::Bytes(_)
+            | PyValue::Tuple(_)
+            | PyValue::Range(_)) => {
+                for member in iterable {
+                    let [k, v] = unpack_two(member)?;
+                    od.inner.insert(boxed_key(k)?, v);
+                }
+            }
+        }
+        Ok(PyValue::OrderedDict(alloc::sync::Arc::new(od)))
+    }
+}
+
+/// `TypeError: 'int' object is not iterable` for a boxed non-iterable.
+fn not_iterable(value: &crate::PyValue) -> PyException {
+    PyException::new(
+        "TypeError",
+        format!("'{}' object is not iterable", value.py_type_name()),
+    )
+}
+
+/// Unpack one member of the pairs iterable into exactly two values the
+/// way CPython 3.12's OrderedDict constructor does (the interpreter's
+/// unpack messages, not `dict()`'s).
+fn unpack_two(member: crate::PyValue) -> Result<[crate::PyValue; 2], PyException> {
+    use crate::PyValue;
+    if matches!(
+        member,
+        PyValue::Int(_)
+            | PyValue::Float(_)
+            | PyValue::Bool(_)
+            | PyValue::Complex(_)
+            | PyValue::Function(_)
+            | PyValue::None_
+    ) {
+        return Err(not_iterable(&member));
+    }
+    let parts: Vec<PyValue> = member.into_iter().collect();
+    match <[PyValue; 2]>::try_from(parts) {
+        Ok(pair) => Ok(pair),
+        Err(parts) if parts.len() > 2 => Err(PyException::new(
+            "ValueError",
+            "too many values to unpack (expected 2)",
+        )),
+        Err(parts) if parts.len() == 1 => Err(PyException::new(
+            "ValueError",
+            "need more than 1 value to unpack",
+        )),
+        Err(parts) => Err(PyException::new(
+            "ValueError",
+            format!("need more than {} values to unpack", parts.len()),
+        )),
+    }
+}
+
+/// A pair's key as the boxed OrderedDict's `String` key.
+fn boxed_key(key: crate::PyValue) -> Result<String, PyException> {
+    use crate::PyValue;
+    match key {
+        PyValue::Str(s) => Ok(s),
+        PyValue::Dict(_) => Err(PyException::new("TypeError", "unhashable type: 'dict'")),
+        PyValue::OrderedDict(_) => Err(PyException::new(
+            "TypeError",
+            "unhashable type: 'collections.OrderedDict'",
+        )),
+        other => panic!(
+            "NotImplementedError: a boxed OrderedDict holds str keys only; got the {} key {} \
+             (CPython accepts any hashable key; rython refuses to stringify it. Build a typed \
+             OrderedDict first)",
+            other.py_type_name(),
+            crate::py_value_repr(&other)
+        ),
+    }
+}
+
 /// ChainMap - groups multiple mappings into single view
 #[derive(Debug)]
 pub struct ChainMap<K, V> 

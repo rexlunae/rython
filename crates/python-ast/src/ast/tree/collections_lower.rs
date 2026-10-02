@@ -204,6 +204,14 @@ pub(crate) fn construction_type(
                     }
                 })
                 .unwrap_or_else(|| (unknown.clone(), unknown.clone()));
+            // `OrderedDict(boxed)` IS the boxed OrderedDict (`PyValue`),
+            // not a typed container whose parameters are unknown.
+            if matches!(
+                call.args.first().map(|a| crate::infer_type(ctx, a, options, symbols)),
+                Some(TypeInfo::PyValue)
+            ) {
+                return TypeInfo::PyValue;
+            }
             TypeInfo::Collection(kind, vec![k, v])
         }
     }
@@ -569,10 +577,27 @@ pub(crate) fn lower_construction(
                         };
                         return Ok(quote!(#path::from_pairs(#items)));
                     }
+                    // A BOXED argument (an untyped parameter — requests'
+                    // `from_key_val_list(value)`): the runtime inspects the
+                    // value as CPython's constructor does (a dict's items,
+                    // or an iterable of 2-item pairs; CPython's own
+                    // TypeError / ValueError otherwise) and builds the
+                    // BOXED OrderedDict, which prints, compares and
+                    // iterates as one.
+                    if matches!(ty, TypeInfo::PyValue) {
+                        let boxed = crate::render_reused(
+                            src,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                        )?;
+                        return Ok(quote!(#path::from_boxed(#boxed)?));
+                    }
                     Err(unsupported(
-                        "OrderedDict(x): the argument must be a dict or a list of (key, \
-                         value) pairs the compiler can see; build the OrderedDict first \
-                         and assign the items. rython refuses to silently ignore it"
+                        "OrderedDict(x): the argument must be a dict, a list of (key, \
+                         value) pairs, or an untyped (boxed) value the compiler can \
+                         hand to the runtime; build the OrderedDict first and assign \
+                         the items. rython refuses to silently ignore it"
                             .to_string(),
                     ))
                 }

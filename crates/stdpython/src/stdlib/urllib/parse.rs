@@ -410,9 +410,15 @@ pub fn urlencode(query: &crate::PyValue, doseq: bool) -> Result<String, PyExcept
             _ => String::new(),
         }
     };
+    // A dict and an OrderedDict are both mappings: their items in order.
+    let mapping_items: Option<Vec<(String, PyValue)>> = match query {
+        PyValue::Dict(d) => Some(d.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        PyValue::OrderedDict(d) => Some(d.items()),
+        _ => None,
+    };
     match query {
-        PyValue::Dict(d) => {
-            for (k, v) in d.iter() {
+        PyValue::Dict(_) | PyValue::OrderedDict(_) => {
+            for (k, v) in mapping_items.iter().flatten() {
                 if doseq && matches!(v, PyValue::Tuple(_)) {
                     if let PyValue::Tuple(members) = v {
                         for member in members.iter() {

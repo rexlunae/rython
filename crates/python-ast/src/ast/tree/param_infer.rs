@@ -3655,6 +3655,21 @@ impl<'a> Collector<'a> {
                         _ => {}
                     }
                 }
+                // `OrderedDict(p)` over an unannotated parameter
+                // (requests' `from_key_val_list`): the runtime builds the
+                // boxed OrderedDict from a boxed value — a dict's items or
+                // an iterable of pairs, with CPython's own errors for
+                // anything else — so the parameter IS the boxed PyValue
+                // (the same pin as a call-result reassignment), not a
+                // generic with bounds no runtime trait provides.
+                if crate::ast::tree::collections_lower::ctor_of(&c.func, self.symbols)
+                    == Some(crate::CollectionsType::OrderedDict)
+                    && let [ExprType::Name(n)] = c.args.as_slice()
+                    && c.keywords.is_empty()
+                    && let Some(root) = self.root_unannotated(&n.id)
+                {
+                    self.value_pinned.insert(root);
+                }
                 // `p.method(args)` on a parameter: record the stdlib method
                 // requirement (M2) — the trait bound; pop's bound carries
                 // the index argument's type.

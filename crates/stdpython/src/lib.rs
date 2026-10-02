@@ -2937,7 +2937,7 @@ impl PyDisplay for StrOrBytes {
 /// `Any`, `Literal[False] | str | None`, ... Every member keeps its concrete
 /// type; isinstance checks dispatch at runtime (`is_str()`, `as_int()`, ...)
 /// and narrow the value in the branch, mirroring StrOrBytes.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum PyValue {
     Int(i64),
     Float(f64),
@@ -2946,6 +2946,15 @@ pub enum PyValue {
     Bytes(Vec<u8>),
     Tuple(Arc<Vec<PyValue>>),
     Dict(Arc<PyDict<String, PyValue>>),
+    /// A `collections.OrderedDict` held boxed (`OrderedDict(value)` where
+    /// `value` is an untyped parameter — requests' `from_key_val_list`):
+    /// it prints as `OrderedDict({'a': 1})` (never as a plain dict), is
+    /// ORDER-sensitive against another OrderedDict and order-insensitive
+    /// against a dict, and is unhashable. Like [`PyValue::Dict`] its keys
+    /// are `String`s: building one with any other key is a loud panic
+    /// ([`collections::OrderedDict::from_boxed`]), never a silent
+    /// stringification.
+    OrderedDict(Arc<crate::collections::OrderedDict<String, PyValue>>),
     /// A Python `complex` (issue #366): a heterogeneous container or an
     /// `assertEqual` over complex operands carries it boxed.
     Complex(Complex),
@@ -2960,6 +2969,46 @@ pub enum PyValue {
     /// function object it is.
     Function(crate::PyCallable<BoxedArgs, PyValue>),
     None_,
+}
+
+/// Structural equality of boxed values. Same-variant members compare
+/// structurally (a boxed dict ignores order; two boxed OrderedDicts are
+/// ORDER-sensitive, as CPython's are); an OrderedDict equals a dict with
+/// the same items in any order (`OrderedDict(a=1, b=2) == {'b': 2, 'a': 1}`
+/// is True, both ways). Every other cross-variant pair is unequal. The
+/// match names every variant on purpose: a new member must decide its
+/// equality here.
+impl PartialEq for PyValue {
+    fn eq(&self, other: &PyValue) -> bool {
+        match (self, other) {
+            (PyValue::Int(a), PyValue::Int(b)) => a == b,
+            (PyValue::Float(a), PyValue::Float(b)) => a == b,
+            (PyValue::Bool(a), PyValue::Bool(b)) => a == b,
+            (PyValue::Str(a), PyValue::Str(b)) => a == b,
+            (PyValue::Bytes(a), PyValue::Bytes(b)) => a == b,
+            (PyValue::Tuple(a), PyValue::Tuple(b)) => a == b,
+            (PyValue::Dict(a), PyValue::Dict(b)) => a == b,
+            (PyValue::OrderedDict(a), PyValue::OrderedDict(b)) => a == b,
+            (PyValue::OrderedDict(o), PyValue::Dict(d))
+            | (PyValue::Dict(d), PyValue::OrderedDict(o)) => **o == **d,
+            (PyValue::Complex(a), PyValue::Complex(b)) => a == b,
+            (PyValue::Range(a), PyValue::Range(b)) => a == b,
+            (PyValue::Function(a), PyValue::Function(b)) => a == b,
+            (PyValue::None_, PyValue::None_) => true,
+            (PyValue::Int(_), _)
+            | (PyValue::Float(_), _)
+            | (PyValue::Bool(_), _)
+            | (PyValue::Str(_), _)
+            | (PyValue::Bytes(_), _)
+            | (PyValue::Tuple(_), _)
+            | (PyValue::Dict(_), _)
+            | (PyValue::OrderedDict(_), _)
+            | (PyValue::Complex(_), _)
+            | (PyValue::Range(_), _)
+            | (PyValue::Function(_), _)
+            | (PyValue::None_, _) => false,
+        }
+    }
 }
 
 /// The codegen hoists uninitialized locals and derives `Default` on
@@ -2991,6 +3040,8 @@ impl IntoIterator for PyValue {
             PyValue::Bytes(b) => b.iter().map(|&o| PyValue::Int(o as i64)).collect(),
             // Python iterates a dict's KEYS.
             PyValue::Dict(d) => d.keys().map(|k| PyValue::Str(k.clone())).collect(),
+            // An OrderedDict iterates its keys in insertion order.
+            PyValue::OrderedDict(d) => d.keys().into_iter().map(PyValue::Str).collect(),
             PyValue::Int(_) => panic!("TypeError: 'int' object is not iterable"),
             PyValue::Float(_) => panic!("TypeError: 'float' object is not iterable"),
             PyValue::Bool(_) => panic!("TypeError: 'bool' object is not iterable"),
@@ -3042,6 +3093,8 @@ impl PyValue {
             PyValue::Bytes(b) => b.len(),
             PyValue::Tuple(t) => t.len(),
             PyValue::Range(r) => r.py_len(),
+            PyValue::Dict(d) => d.len(),
+            PyValue::OrderedDict(d) => Len::len(d.as_ref()),
             other => panic!("len() of non-sized PyValue {other:?}"),
         }
     }
@@ -3104,6 +3157,7 @@ impl Truthy for PyValue {
             PyValue::Bytes(b) => !b.is_empty(),
             PyValue::Tuple(t) => !t.is_empty(),
             PyValue::Dict(d) => !d.is_empty(),
+            PyValue::OrderedDict(d) => d.is_truthy(),
             PyValue::Complex(z) => z.real != 0.0 || z.imag != 0.0,
             PyValue::Range(r) => r.py_len() > 0,
             PyValue::Function(_) => true,
@@ -3189,6 +3243,31 @@ pyvalue_tuple_from!(A, B, C);
 pyvalue_tuple_from!(A, B, C, D);
 pyvalue_tuple_from!(A, B, C, D, E);
 pyvalue_tuple_from!(A, B, C, D, E, F);
+
+/// A list of (key, value) PAIRS boxed (`[("b", 1), ("a", 2)]` passed to a
+/// boxed parameter — requests' `from_key_val_list`): a Tuple of 2-Tuples,
+/// the boxed model's list-as-tuple form. A pairs-specific impl, not a
+/// blanket `Vec<T>`: `Vec<u8>` is `bytes` (above), never a tuple of ints.
+impl<A: Into<PyValue>, B: Into<PyValue>> From<Vec<(A, B)>> for PyValue {
+    fn from(pairs: Vec<(A, B)>) -> Self {
+        PyValue::Tuple(Arc::new(pairs.into_iter().map(PyValue::from).collect()))
+    }
+}
+
+impl<A: Into<PyValue>, B: Into<PyValue>, C: Into<PyValue>> From<Vec<(A, B, C)>> for PyValue {
+    fn from(rows: Vec<(A, B, C)>) -> Self {
+        PyValue::Tuple(Arc::new(rows.into_iter().map(PyValue::from).collect()))
+    }
+}
+
+/// A typed dict compared with a boxed value (`boxed == {"a": 1}`):
+/// CPython's `==` — a boxed dict (or OrderedDict) with the same items, in
+/// any order, is equal; any other member is not.
+impl<V: Clone + Into<PyValue>> PartialEq<PyDict<String, V>> for PyValue {
+    fn eq(&self, other: &PyDict<String, V>) -> bool {
+        *self == PyValue::from(other.clone())
+    }
+}
 
 impl From<&str> for PyValue {
     fn from(value: &str) -> Self {
@@ -3541,6 +3620,7 @@ impl PyValue {
             PyValue::Bytes(_) => "bytes",
             PyValue::Tuple(_) => "tuple",
             PyValue::Dict(_) => "dict",
+            PyValue::OrderedDict(_) => "OrderedDict",
             PyValue::Complex(_) => "complex",
             PyValue::Range(_) => "range",
             PyValue::Function(_) => "function",
@@ -3826,6 +3906,7 @@ pub fn py_value_type_name(v: &PyValue) -> &'static str {
         PyValue::Bytes(_) => "bytes",
         PyValue::Tuple(_) => "tuple",
         PyValue::Dict(_) => "dict",
+        PyValue::OrderedDict(_) => "OrderedDict",
         PyValue::Complex(_) => "complex",
         PyValue::Range(_) => "range",
         PyValue::Function(_) => "function",
@@ -3864,6 +3945,8 @@ pub fn py_value_str(v: &PyValue) -> String {
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
+        // CPython 3.12: `OrderedDict({'a': 1})`, `OrderedDict()` empty.
+        PyValue::OrderedDict(d) => d.py_repr(),
         PyValue::None_ => "None".to_string(),
     }
 }
@@ -3920,6 +4003,11 @@ impl core::hash::Hash for PyValue {
                     core::hash::Hash::hash(k, state);
                     core::hash::Hash::hash(v, state);
                 }
+            }
+            // CPython: `hash(OrderedDict())` is a TypeError. The Hash trait
+            // has no error channel, so it is a loud panic at the use.
+            PyValue::OrderedDict(_) => {
+                panic!("TypeError: unhashable type: 'collections.OrderedDict'")
             }
             PyValue::Complex(z) => {
                 core::hash::Hash::hash(&8u8, state);
@@ -6243,6 +6331,9 @@ impl PyIndex<i64> for PyValue {
                 "TypeError",
                 "'NoneType' object is not subscriptable",
             )),
+            // A boxed dict / OrderedDict holds str keys only, so an int
+            // key is never present: CPython's `KeyError: 1`.
+            PyValue::Dict(_) | PyValue::OrderedDict(_) => Err(key_error(key.py_repr())),
             _ => Err(PyException::new(
                 "TypeError",
                 "indices must be integers or slices",
@@ -6256,6 +6347,7 @@ impl PyIndex<&str> for PyValue {
     fn py_index(&self, key: &str) -> Result<PyValue, PyException> {
         match self {
             PyValue::Dict(d) => d.py_index(key),
+            PyValue::OrderedDict(d) => d.py_index(key),
             other => Err(PyException::new(
                 "TypeError",
                 format!(
@@ -6276,6 +6368,7 @@ impl PyIndex<String> for PyValue {
     fn py_index(&self, key: String) -> Result<PyValue, PyException> {
         match self {
             PyValue::Dict(d) => d.py_index(key),
+            PyValue::OrderedDict(d) => d.py_index(key),
             other => Err(PyException::new(
                 "TypeError",
                 format!(
@@ -6292,6 +6385,7 @@ impl PyIndexMut<&str> for PyValue {
     fn py_index_mut(&mut self, key: &str) -> Result<&mut PyValue, PyException> {
         match self {
             PyValue::Dict(d) => Arc::make_mut(d).py_index_mut(key),
+            PyValue::OrderedDict(d) => Arc::make_mut(d).py_index_mut(key),
             other => Err(PyException::new(
                 "TypeError",
                 format!(
@@ -7357,6 +7451,11 @@ impl PyContains<PyValue> for PyValue {
                 // The boxed dict's keys are Strings; a non-str member is
                 // never a key (an unhashable key would be CPython's
                 // TypeError, but the boxed dict cannot hold one).
+                _ => false,
+            },
+            // The same holds for a boxed OrderedDict (String keys only).
+            PyValue::OrderedDict(d) => match item {
+                PyValue::Str(k) => d.contains_key(k),
                 _ => false,
             },
             other => panic!(

@@ -3787,8 +3787,18 @@ impl<'a> CodeGen for Call {
                         // fold in — the documented class-as-value
                         // divergence, false with a warning naming the
                         // specializable shape.
+                        // A parameter the signature BOXES (a value-pinned
+                        // one — `OrderedDict(value)` over an untyped
+                        // `value`) is a PyValue: its isinstance is the
+                        // RUNTIME dispatch below, not this divergence.
                         if let ExprType::Name(n) = &self.args[0]
                             && options.param_type_vars.contains_key(&n.id)
+                            && !options.name_types.get(&n.id).is_some_and(|t| {
+                                matches!(
+                                    t,
+                                    crate::TypeInfo::StrOrBytes | crate::TypeInfo::PyValue
+                                )
+                            })
                         {
                             options.definition_warnings.borrow_mut().push(format!(
                                 "isinstance({0}, ...) on an inferred-generic \

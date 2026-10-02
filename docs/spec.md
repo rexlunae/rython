@@ -131,7 +131,7 @@ declaration — loud, but at the wrong layer (§12.1).
 | `frozenset[T]` | `std::collections::HashSet<T>` (as an annotation) | The `frozenset(iterable)` *call* produces the distinct runtime type `FrozenSet<T>`; empty `frozenset()` is a loud error |
 | `deque[T]` / `typing.Deque[T]` | `stdpython::collections::deque<T>` | §10.2.2. A bare `deque` annotation is a loud conversion error (it names no element type) |
 | `defaultdict[K, V]` / `typing.DefaultDict[K, V]` | `stdpython::collections::defaultdict<K, V>` | §10.2.2. An insertion-ordered map whose `d[k]` READ of a missing key inserts the factory's value, as in CPython |
-| `OrderedDict[K, V]` / `typing.OrderedDict[K, V]` | `stdpython::collections::OrderedDict<K, V>` | §10.2.2 |
+| `OrderedDict[K, V]` / `typing.OrderedDict[K, V]` | `stdpython::collections::OrderedDict<K, V>` | §10.2.2. `OrderedDict(x)` over an untyped parameter is the boxed `PyValue::OrderedDict` (`str` keys only; §10.2.2) |
 | `tuple` (literal), `tuple[A, B]` | Rust tuple `(A, B, …)` | A fixed-shape tuple is the Rust tuple of its members |
 | `tuple[T, ...]` | `stdpython::PyTuple<T>` | A tuple whose length is not fixed statically (issue #399): a sequence over a `Vec<T>` (indexing, `len`, iteration, slicing, `in`, `+`, `*`, `sum`, `list(t)`) that prints as a tuple — `(3, 4)`, `(7,)`, `()`. `tuple(xs)` of a typed list builds one, a tuple literal stored or returned into one re-collects, `*args` is one, the mixed-arity tuple values of one dict literal (`{1: ("a",), 2: ("b", "c")}`, str or int members) share one, and an `isinstance(x, tuple)`-narrowed boxed value reads as `PyTuple<PyValue>` |
 | `None` / `Optional[T]` / `T \| None` | `Option<T>` | See §3.5 |
@@ -2184,10 +2184,37 @@ python3.12 (`crates/stdpython/tests/python_semantics.rs`,
   `int`, `float`, `str`, `bool`, `list`, `dict`, `set`, `deque`, `None` (no
   factory: a missing key is `KeyError`) or a no-argument `lambda` (an unnamed
   factory), optionally followed by an initial dict; `OrderedDict()`,
-  `OrderedDict(dict)`, `OrderedDict([(k, v), ...])`. Any other factory (a
-  named function), keyword items (`OrderedDict(a=1)`,
-  `defaultdict(int, a=1)`), or an argument the compiler cannot see the shape
-  of is a conversion error naming the rewrite.
+  `OrderedDict(dict)`, `OrderedDict([(k, v), ...])`, and `OrderedDict(x)`
+  over an UNTYPED parameter (the boxed OrderedDict, below). Any other factory
+  (a named function), keyword items (`OrderedDict(a=1)`,
+  `defaultdict(int, a=1)`), or an argument that is neither a shape the
+  compiler can see nor an untyped parameter is a conversion error naming the
+  rewrite.
+- **Boxed `OrderedDict`.** `def from_key_val_list(value): ... return
+  OrderedDict(value)` (requests' `utils.py`): an unannotated parameter that
+  is the argument of `OrderedDict(...)` is the boxed `PyValue` (callers pass
+  a dict or a list of pairs unchanged), its `isinstance` tests are RUNTIME
+  tests on the boxed value, and the construction is
+  `OrderedDict::from_boxed(value)?`, which yields `PyValue::OrderedDict`. A
+  boxed OrderedDict prints as `OrderedDict({'a': 1})` / `OrderedDict()`
+  (never as a dict), is `==` order-sensitively to another OrderedDict and
+  order-insensitively to a dict (both ways), reports `type(...).__name__ ==
+  'OrderedDict'`, is an instance of `dict` for `isinstance`, iterates its
+  keys in insertion order, supports `len`, truthiness, `in`, `v[k]` (`KeyError:
+  'k'`, `KeyError: 1` for a non-str key), `json.dumps` and
+  `urllib.parse.urlencode` as a mapping, and is unhashable (`hash()` is a
+  panic carrying `TypeError: unhashable type: 'collections.OrderedDict'`,
+  the Hash trait having no error channel). The constructor follows CPython
+  3.12's own errors, which are NOT `dict()`'s: `OrderedDict(5)` is
+  `TypeError: 'int' object is not iterable`, `OrderedDict([1])` the same,
+  `OrderedDict([(1, 2, 3)])` `ValueError: too many values to unpack
+  (expected 2)`, `OrderedDict([("a",)])` `ValueError: need more than 1 value
+  to unpack`. **Limitation (loud):** like the boxed dict, its keys are
+  `str`; a pair whose key is not a str (`OrderedDict([(1, 2)])`, legal in
+  CPython) panics with a `NotImplementedError` naming the key rather than
+  stringifying it. A typed OrderedDict flowing into a boxed slot (an untyped
+  return) converts with `PyValue::from`, keeping its type; a list of pairs
+  boxes as a tuple of 2-tuples (the list-as-tuple form).
 - **deque methods.** `append`, `appendleft`, `pop`, `popleft`
   (`IndexError: pop from an empty deque`), `extend`, `extendleft`
   (CPython's reversal), `rotate([n])`, `remove` (`ValueError: 9 is not in

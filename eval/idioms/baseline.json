@@ -99,6 +99,9 @@
     "nested_param_mutation": {
       "status": "pass"
     },
+    "ordereddict_boxed": {
+      "status": "pass"
+    },
     "pipeline": {
       "status": "pass"
     },

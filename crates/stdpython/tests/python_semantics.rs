@@ -5553,3 +5553,235 @@ mod collections_containers {
         assert_eq!(ints.py_repr(), "OrderedDict({1: 'x', 2: 'y'})");
     }
 }
+
+// A BOXED OrderedDict (`PyValue::OrderedDict` — `OrderedDict(value)` over an
+// untyped parameter, requests' `from_key_val_list`). Every expected value was
+// captured from python3.12; the Python expression is in the comment above it.
+mod boxed_ordereddict {
+    use stdpython::collections::OrderedDict;
+    use stdpython::*;
+
+    fn s(v: &str) -> PyValue {
+        PyValue::Str(v.to_string())
+    }
+
+    fn tup(items: Vec<PyValue>) -> PyValue {
+        PyValue::Tuple(std::sync::Arc::new(items))
+    }
+
+    fn pair(k: &str, v: i64) -> PyValue {
+        tup(vec![s(k), PyValue::Int(v)])
+    }
+
+    fn pairs(items: &[(&str, i64)]) -> PyValue {
+        tup(items.iter().map(|(k, v)| pair(k, *v)).collect())
+    }
+
+    fn build(v: PyValue) -> PyValue {
+        OrderedDict::from_boxed(v).unwrap()
+    }
+
+    fn err(v: PyValue) -> (String, String) {
+        let e = OrderedDict::from_boxed(v).unwrap_err();
+        (e.exception_type.clone(), e.message.clone())
+    }
+
+    fn dict(items: &[(&str, i64)]) -> PyDict<String, PyValue> {
+        let mut d = PyDict::default();
+        for (k, v) in items {
+            d.insert(k.to_string(), PyValue::Int(*v));
+        }
+        d
+    }
+
+    #[test]
+    fn repr_and_str_are_the_ordereddict_form() {
+        // repr(OrderedDict([("b", 1), ("a", 2)])) -> OrderedDict({'b': 1, 'a': 2})
+        let od = build(pairs(&[("b", 1), ("a", 2)]));
+        assert_eq!(od.py_repr(), "OrderedDict({'b': 1, 'a': 2})");
+        // str(OrderedDict([("a", "x")])) -> OrderedDict({'a': 'x'})
+        let ax = build(tup(vec![tup(vec![s("a"), s("x")])]));
+        assert_eq!(ax.py_display(), "OrderedDict({'a': 'x'})");
+        // repr(OrderedDict()) -> OrderedDict()
+        assert_eq!(build(tup(vec![])).py_repr(), "OrderedDict()");
+        // repr(OrderedDict([("a", OrderedDict([("b", None)]))]))
+        //   -> OrderedDict({'a': OrderedDict({'b': None})})
+        let inner = build(tup(vec![tup(vec![s("b"), PyValue::None_])]));
+        let outer = build(tup(vec![tup(vec![s("a"), inner])]));
+        assert_eq!(outer.py_repr(), "OrderedDict({'a': OrderedDict({'b': None})})");
+    }
+
+    #[test]
+    fn constructs_from_a_dict_and_from_pairs() {
+        // OrderedDict({"x": 1, "y": 2}) -> OrderedDict({'x': 1, 'y': 2})
+        let from_dict = build(PyValue::Dict(std::sync::Arc::new(dict(&[("x", 1), ("y", 2)]))));
+        assert_eq!(from_dict.py_repr(), "OrderedDict({'x': 1, 'y': 2})");
+        // OrderedDict([("a", 1), ("a", 2)]) -> OrderedDict({'a': 2}); a repeated key
+        // keeps its first position and takes the last value.
+        assert_eq!(build(pairs(&[("a", 1), ("a", 2)])).py_repr(), "OrderedDict({'a': 2})");
+        // OrderedDict(["ab"]) -> OrderedDict({'a': 'b'}): a 2-character str is a pair.
+        assert_eq!(build(tup(vec![s("ab")])).py_repr(), "OrderedDict({'a': 'b'})");
+        // OrderedDict(OrderedDict([("a", 1)])) -> OrderedDict({'a': 1}), a copy.
+        let first = build(pairs(&[("a", 1)]));
+        assert_eq!(build(first).py_repr(), "OrderedDict({'a': 1})");
+    }
+
+    #[test]
+    fn constructor_errors_are_cpythons() {
+        // OrderedDict(5) -> TypeError: 'int' object is not iterable
+        assert_eq!(
+            err(PyValue::Int(5)),
+            ("TypeError".to_string(), "'int' object is not iterable".to_string())
+        );
+        // OrderedDict(5.5) -> TypeError: 'float' object is not iterable
+        assert_eq!(err(PyValue::Float(5.5)).1, "'float' object is not iterable");
+        // OrderedDict(True) -> TypeError: 'bool' object is not iterable
+        assert_eq!(err(PyValue::Bool(true)).1, "'bool' object is not iterable");
+        // OrderedDict(None) -> TypeError: 'NoneType' object is not iterable
+        assert_eq!(err(PyValue::None_).1, "'NoneType' object is not iterable");
+        // OrderedDict([1]) -> TypeError: 'int' object is not iterable
+        assert_eq!(
+            err(tup(vec![PyValue::Int(1)])),
+            ("TypeError".to_string(), "'int' object is not iterable".to_string())
+        );
+        // OrderedDict([(1, 2, 3)]) -> ValueError: too many values to unpack (expected 2)
+        let three = tup(vec![tup(vec![PyValue::Int(1), PyValue::Int(2), PyValue::Int(3)])]);
+        assert_eq!(
+            err(three),
+            (
+                "ValueError".to_string(),
+                "too many values to unpack (expected 2)".to_string()
+            )
+        );
+        // OrderedDict([("a",)]) -> ValueError: need more than 1 value to unpack
+        assert_eq!(
+            err(tup(vec![tup(vec![s("a")])])),
+            (
+                "ValueError".to_string(),
+                "need more than 1 value to unpack".to_string()
+            )
+        );
+        // OrderedDict([()]) -> ValueError: need more than 0 values to unpack
+        assert_eq!(err(tup(vec![tup(vec![])])).1, "need more than 0 values to unpack");
+        // OrderedDict("ab") -> ValueError: need more than 1 value to unpack
+        assert_eq!(err(s("ab")).1, "need more than 1 value to unpack");
+        // OrderedDict([("a", 1), 5]) -> TypeError: 'int' object is not iterable
+        assert_eq!(
+            err(tup(vec![pair("a", 1), PyValue::Int(5)])).1,
+            "'int' object is not iterable"
+        );
+        // OrderedDict([({"a": 1}, 2)]) -> TypeError: unhashable type: 'dict'
+        let unhashable = tup(vec![tup(vec![
+            PyValue::Dict(std::sync::Arc::new(dict(&[("a", 1)]))),
+            PyValue::Int(2),
+        ])]);
+        assert_eq!(
+            err(unhashable),
+            ("TypeError".to_string(), "unhashable type: 'dict'".to_string())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a boxed OrderedDict holds str keys only")]
+    fn a_non_str_key_is_a_loud_panic_never_a_stringified_key() {
+        // OrderedDict([(1, 2)]) -> OrderedDict({1: 2}) in CPython; the boxed
+        // OrderedDict holds str keys only, so rython refuses loudly.
+        let _ = OrderedDict::from_boxed(tup(vec![tup(vec![PyValue::Int(1), PyValue::Int(2)])]));
+    }
+
+    #[test]
+    fn equality_is_order_sensitive_only_against_another_ordereddict() {
+        let ab = build(pairs(&[("a", 1), ("b", 2)]));
+        let ba = build(pairs(&[("b", 2), ("a", 1)]));
+        // OrderedDict([("a",1),("b",2)]) == OrderedDict([("b",2),("a",1)]) -> False
+        assert!(ab != ba);
+        // OrderedDict([("a",1),("b",2)]) == OrderedDict([("a",1),("b",2)]) -> True
+        assert!(ab == build(pairs(&[("a", 1), ("b", 2)])));
+        // OrderedDict([("a",1),("b",2)]) == {"b": 2, "a": 1} -> True, and the reverse
+        let d = dict(&[("b", 2), ("a", 1)]);
+        let plain = PyValue::Dict(std::sync::Arc::new(d.clone()));
+        assert!(ab == plain);
+        assert!(plain == ab);
+        assert!(ab == d);
+        // OrderedDict([("a",1)]) == {"a": 2} -> False
+        let other = PyValue::Dict(std::sync::Arc::new(dict(&[("a", 2)])));
+        assert!(build(pairs(&[("a", 1)])) != other);
+        // [("a", 1)] == OrderedDict([("a", 1)]) -> False; OrderedDict() == () -> False;
+        // OrderedDict() == None -> False
+        assert!(pairs(&[("a", 1)]) != build(pairs(&[("a", 1)])));
+        assert!(build(tup(vec![])) != tup(vec![]));
+        assert!(build(tup(vec![])) != PyValue::None_);
+    }
+
+    #[test]
+    fn truthiness_len_iteration_membership_and_index() {
+        let od = build(pairs(&[("b", 1), ("a", 2), ("c", 3)]));
+        // bool(OrderedDict()) -> False; bool(OrderedDict([("b", 1)])) -> True
+        assert!(!build(tup(vec![])).is_truthy());
+        assert!(od.is_truthy());
+        // len(OrderedDict([("b",1),("a",2),("c",3)])) -> 3
+        assert_eq!(od.len(), 3);
+        // list(OrderedDict([("b",1),("a",2),("c",3)])) -> ['b', 'a', 'c']
+        let keys: Vec<PyValue> = od.clone().into_iter().collect();
+        assert_eq!(keys, vec![s("b"), s("a"), s("c")]);
+        // "a" in od -> True; "q" in od -> False; 1 in od -> False
+        assert!(od.py_contains(&s("a")));
+        assert!(!od.py_contains(&s("q")));
+        assert!(!od.py_contains(&PyValue::Int(1)));
+        // od["a"] -> 2
+        assert_eq!(od.py_index("a").unwrap(), PyValue::Int(2));
+        // od["nope"] -> KeyError: 'nope' ; od[1] -> KeyError: 1
+        assert_eq!(od.py_index("nope").unwrap_err().message, "'nope'");
+        assert_eq!(od.py_index(1i64).unwrap_err().message, "1");
+        // od["b"] = 10 through a boxed index-mut keeps b's position
+        let mut od = od;
+        *od.py_index_mut("b").unwrap() = PyValue::Int(10);
+        assert_eq!(od.py_repr(), "OrderedDict({'b': 10, 'a': 2, 'c': 3})");
+    }
+
+    #[test]
+    fn type_name_and_unhashability() {
+        // type(OrderedDict()).__name__ -> 'OrderedDict'
+        assert_eq!(build(tup(vec![])).py_type_name(), "OrderedDict");
+        // hash(OrderedDict()) -> TypeError: unhashable type: 'collections.OrderedDict'
+        let od = build(tup(vec![]));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            use std::hash::Hash;
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            od.hash(&mut h);
+        }));
+        let payload = caught.unwrap_err();
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|m| m.to_string()))
+            .unwrap();
+        assert_eq!(msg, "TypeError: unhashable type: 'collections.OrderedDict'");
+    }
+
+    #[test]
+    fn typed_ordereddict_boxes_without_losing_its_type() {
+        // A typed OrderedDict flowing into a boxed slot stays an OrderedDict.
+        let typed = OrderedDict::from_pairs(vec![("b".to_string(), 1i64), ("a".to_string(), 2)]);
+        let boxed = PyValue::from(typed);
+        assert_eq!(boxed.py_repr(), "OrderedDict({'b': 1, 'a': 2})");
+        // A list of pairs boxes as a tuple of 2-tuples (the list-as-tuple form).
+        assert_eq!(PyValue::from(vec![("a", 1i64)]), pairs(&[("a", 1)]));
+    }
+
+    #[test]
+    fn json_and_urlencode_treat_it_as_a_mapping() {
+        // json.dumps(OrderedDict([("b", 1), ("a", [1, 2])])) -> {"b": 1, "a": [1, 2]}
+        let od = build(tup(vec![
+            pair("b", 1),
+            tup(vec![s("a"), tup(vec![PyValue::Int(1), PyValue::Int(2)])]),
+        ]));
+        assert_eq!(
+            stdpython::json::dumps_pyvalue(od, None).unwrap(),
+            "{\"b\": 1, \"a\": [1, 2]}"
+        );
+        // urllib.parse.urlencode(OrderedDict([("b", 1), ("a", 2)])) -> b=1&a=2
+        let q = build(pairs(&[("b", 1), ("a", 2)]));
+        assert_eq!(stdpython::urllib::parse::urlencode(&q, false).unwrap(), "b=1&a=2");
+    }
+}

@@ -20436,3 +20436,97 @@ fn aliased_collections_imports_match_python_at_runtime() {
         "aliased collections semantics diverged from CPython"
     );
 }
+
+#[test]
+fn ordereddict_of_an_untyped_argument_matches_python_at_runtime() {
+    // requests' `from_key_val_list`: `OrderedDict(value)` over an UNTYPED
+    // parameter used to be a conversion error that failed the whole package.
+    // The parameter is the boxed PyValue, the construction a runtime
+    // OrderedDict build with CPython's own errors, and the result a boxed
+    // OrderedDict that prints, compares and iterates as one.
+    let scratch = Scratch::new("boxed_ordereddict");
+    let file = scratch.path().join("boxed_od.py");
+    fs::write(
+        &file,
+        concat!(
+            "from collections import OrderedDict\n",
+            "\n",
+            "\n",
+            "def from_key_val_list(value):\n",
+            "    if value is None:\n",
+            "        return None\n",
+            "    if isinstance(value, (str, bytes, bool, int)):\n",
+            "        raise ValueError(\"cannot encode objects that are not 2-tuples\")\n",
+            "    return OrderedDict(value)\n",
+            "\n",
+            "\n",
+            "def to_od(value):\n",
+            "    return OrderedDict(value)\n",
+            "\n",
+            "\n",
+            "def main():\n",
+            "    od = from_key_val_list([(\"b\", 1), (\"a\", 2), (\"b\", 3)])\n",
+            "    print(od)\n",
+            "    print(len(od), list(od), od[\"b\"], \"a\" in od, \"z\" in od)\n",
+            "    print(from_key_val_list({\"x\": 1}))\n",
+            "    print(from_key_val_list({\"x\": 1}) == {\"x\": 1})\n",
+            "    print(from_key_val_list(None))\n",
+            "    print(from_key_val_list([(\"a\", 1), (\"b\", 2)]) == from_key_val_list([(\"b\", 2), (\"a\", 1)]))\n",
+            "    print(from_key_val_list([(\"a\", 1), (\"b\", 2)]) == {\"b\": 2, \"a\": 1})\n",
+            "    try:\n",
+            "        from_key_val_list(\"text\")\n",
+            "    except ValueError as exc:\n",
+            "        print(\"ValueError:\", exc)\n",
+            "    try:\n",
+            "        to_od(5)\n",
+            "    except TypeError as exc:\n",
+            "        print(\"TypeError:\", exc)\n",
+            "    try:\n",
+            "        to_od([(\"a\", 1, 2)])\n",
+            "    except ValueError as exc:\n",
+            "        print(\"ValueError:\", exc)\n",
+            "    try:\n",
+            "        print(od[\"nope\"])\n",
+            "    except KeyError as exc:\n",
+            "        print(\"KeyError:\", exc)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/boxed_od"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3 (3.12). The OrderedDict constructor's own
+    // unpack errors differ from dict()'s: `OrderedDict([("a", 1, 2)])` is
+    // "too many values to unpack (expected 2)", not "dictionary update
+    // sequence element #0 has length 3; 2 is required".
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "OrderedDict({'b': 3, 'a': 2})",
+            "2 ['b', 'a'] 3 True False",
+            "OrderedDict({'x': 1})",
+            "True",
+            "None",
+            "False",
+            "True",
+            "ValueError: cannot encode objects that are not 2-tuples",
+            "TypeError: 'int' object is not iterable",
+            "ValueError: too many values to unpack (expected 2)",
+            "KeyError: 'nope'",
+        ],
+        "boxed OrderedDict semantics diverged from CPython"
+    );
+}
