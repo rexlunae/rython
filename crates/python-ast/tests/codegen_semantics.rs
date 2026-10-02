@@ -26542,6 +26542,95 @@ fn defaultdict_factories_carry_their_class_name() {
     assert!(flat.contains("::without_factory()"), "no factory: {out}");
 }
 
+/// `defaultdict(deque)` resolves the factory through the `collections`
+/// import (PR #429 review): plain, renamed, and module-qualified spellings
+/// lower with the CPython repr name; a shadowing binding or an unimported
+/// bare `deque` is a loud conversion error.
+#[test]
+fn defaultdict_deque_factory_resolves_through_the_import() {
+    let want = "with_class(||stdpython::collections::deque::new(),\"collections.deque\")";
+    let plain = compile(
+        "from collections import defaultdict, deque\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = defaultdict(deque)\n\
+         \x20   d[\"a\"].append(1)\n\
+         \x20   return len(d)\n",
+        "dd_deque_plain.py",
+    );
+    assert!(flat_of(&plain).contains(want), "plain: {plain}");
+    let aliased = compile(
+        "from collections import defaultdict as dd, deque as dq\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = dd(dq)\n\
+         \x20   d[\"a\"].append(1)\n\
+         \x20   return len(d)\n",
+        "dd_deque_aliased.py",
+    );
+    assert!(flat_of(&aliased).contains(want), "aliased: {aliased}");
+    let qualified = compile(
+        "import collections\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = collections.defaultdict(collections.deque)\n\
+         \x20   d[\"a\"].append(1)\n\
+         \x20   return len(d)\n",
+        "dd_deque_qualified.py",
+    );
+    assert!(flat_of(&qualified).contains(want), "qualified: {qualified}");
+    // A local class named `deque` shadows the import: not the collections
+    // class, so not a supported factory.
+    let err = compile_err(
+        "from collections import defaultdict\n\
+         \n\
+         class deque:\n\
+         \x20   pass\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = defaultdict(deque)\n\
+         \x20   return len(d)\n",
+        "dd_deque_shadow_class.py",
+    );
+    assert!(err.contains("defaultdict(...) takes only a builtin class"), "{err}");
+    // So does a function, even with the import present.
+    let err = compile_err(
+        "from collections import defaultdict, deque\n\
+         \n\
+         def deque() -> int:\n\
+         \x20   return 1\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = defaultdict(deque)\n\
+         \x20   return len(d)\n",
+        "dd_deque_shadow_fn.py",
+    );
+    assert!(err.contains("defaultdict(...) takes only a builtin class"), "{err}");
+    // Without the import `deque` is unbound (a NameError in CPython).
+    let err = compile_err(
+        "from collections import defaultdict\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = defaultdict(deque)\n\
+         \x20   return len(d)\n",
+        "dd_deque_unbound.py",
+    );
+    assert!(err.contains("defaultdict(...) takes only a builtin class"), "{err}");
+    // A shadowed builtin factory stays rejected too.
+    let err = compile_err(
+        "from collections import defaultdict\n\
+         \n\
+         def list() -> int:\n\
+         \x20   return 1\n\
+         \n\
+         def f() -> int:\n\
+         \x20   d = defaultdict(list)\n\
+         \x20   return len(d)\n",
+        "dd_list_shadow.py",
+    );
+    assert!(err.contains("defaultdict(...) takes only a builtin class"), "{err}");
+}
+
 #[test]
 fn defaultdict_str_literal_keys_are_owned_strings() {
     // With the key type still unknown, `dd["a"]` must not leave `&str` /

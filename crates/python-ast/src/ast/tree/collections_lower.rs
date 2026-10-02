@@ -107,17 +107,32 @@ fn factory_value_type(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> TypeInfo {
+    if let Some(class) = factory_class(factory, symbols) {
+        return factory_class_type(class);
+    }
     match factory {
-        ExprType::Name(n) if symbols.get(&n.id).is_none() => {
-            match DefaultFactoryClass::from_name(&n.id) {
-                Some(class) => factory_class_type(class),
-                None => TypeInfo::PyObject,
-            }
-        }
         ExprType::Lambda(lam) if lambda_is_nullary(lam) => {
             owned(crate::infer_type(ctx, &lam.body, options, symbols))
         }
         _ => TypeInfo::PyObject,
+    }
+}
+
+/// The builtin class a `defaultdict` factory names, or `None` when it is not
+/// one rython can lower. A builtin (`int`, `list`, ...) counts only while no
+/// symbol shadows it; `deque` is not a builtin, so it resolves through
+/// `ctor_of` — `from collections import deque` (aliases followed) or
+/// `collections.deque` — and a local class or function named `deque`, or an
+/// unimported bare `deque` (a NameError in CPython), is not the factory.
+fn factory_class(factory: &ExprType, symbols: &SymbolTableScopes) -> Option<DefaultFactoryClass> {
+    if ctor_of(factory, symbols) == Some(CollectionsType::Deque) {
+        return Some(DefaultFactoryClass::Deque);
+    }
+    match factory {
+        ExprType::Name(n) if symbols.get(&n.id).is_none() => {
+            DefaultFactoryClass::from_builtin_name(&n.id)
+        }
+        _ => None,
     }
 }
 
@@ -341,25 +356,21 @@ fn defaultdict_ctor(
     if crate::is_none_expr(factory) {
         return Ok(quote!(#path::without_factory()));
     }
+    if let Some(class) = factory_class(factory, symbols) {
+        let make = match class {
+            DefaultFactoryClass::Int => quote!(|| 0i64),
+            DefaultFactoryClass::Float => quote!(|| 0.0f64),
+            DefaultFactoryClass::Str => quote!(|| String::new()),
+            DefaultFactoryClass::Bool => quote!(|| false),
+            DefaultFactoryClass::List => quote!(|| Vec::new()),
+            DefaultFactoryClass::Dict => quote!(|| stdpython::PyDict::default()),
+            DefaultFactoryClass::Set => quote!(|| std::collections::HashSet::new()),
+            DefaultFactoryClass::Deque => quote!(|| stdpython::collections::deque::new()),
+        };
+        let name = class.name();
+        return Ok(quote!(#path::with_class(#make, #name)));
+    }
     match factory {
-        ExprType::Name(n) if symbols.get(&n.id).is_none() => {
-            if let Some(class) = DefaultFactoryClass::from_name(&n.id) {
-                let make = match class {
-                    DefaultFactoryClass::Int => quote!(|| 0i64),
-                    DefaultFactoryClass::Float => quote!(|| 0.0f64),
-                    DefaultFactoryClass::Str => quote!(|| String::new()),
-                    DefaultFactoryClass::Bool => quote!(|| false),
-                    DefaultFactoryClass::List => quote!(|| Vec::new()),
-                    DefaultFactoryClass::Dict => quote!(|| stdpython::PyDict::default()),
-                    DefaultFactoryClass::Set => quote!(|| std::collections::HashSet::new()),
-                    DefaultFactoryClass::Deque => {
-                        quote!(|| stdpython::collections::deque::new())
-                    }
-                };
-                let name = class.name();
-                return Ok(quote!(#path::with_class(#make, #name)));
-            }
-        }
         ExprType::Lambda(lam) if lambda_is_nullary(lam) => {
             let value_ty = factory_value_type(factory, Some(ctx), options, symbols);
             let expected = (!type_mentions_pyobject(&value_ty)).then(|| value_ty.clone());
@@ -382,7 +393,8 @@ fn defaultdict_ctor(
     }
     Err(unsupported(
         "defaultdict(...) takes only a builtin class (int, float, str, bool, list, dict, \
-         set, deque), None, or a no-argument lambda as its default_factory; a named \
+         set), `collections.deque` (imported from collections, not shadowed), None, or a \
+         no-argument lambda as its default_factory; a named \
          function or any other callable is not supported yet (a callable cannot be stored \
          as a runtime value); rewrite it as `lambda: your_function()`, or use \
          `d.setdefault(key, ...)`. rython refuses to silently ignore it"

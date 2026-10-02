@@ -97,9 +97,11 @@ pub enum DefaultFactoryClass {
 }
 
 impl DefaultFactoryClass {
-    /// Parse a factory NAME at the AST boundary (the caller has checked the
-    /// builtin is not shadowed).
-    pub(crate) fn from_name(name: &str) -> Option<DefaultFactoryClass> {
+    /// Parse a BUILTIN factory name at the AST boundary (the caller has
+    /// checked the builtin is not shadowed). `deque` is not a builtin: it
+    /// resolves through the `collections` import (`factory_class` in
+    /// `collections_lower.rs`), never from a bare unbound name.
+    pub(crate) fn from_builtin_name(name: &str) -> Option<DefaultFactoryClass> {
         match name {
             "int" => Some(DefaultFactoryClass::Int),
             "float" => Some(DefaultFactoryClass::Float),
@@ -108,12 +110,12 @@ impl DefaultFactoryClass {
             "list" => Some(DefaultFactoryClass::List),
             "dict" => Some(DefaultFactoryClass::Dict),
             "set" => Some(DefaultFactoryClass::Set),
-            "deque" => Some(DefaultFactoryClass::Deque),
             _ => None,
         }
     }
 
-    /// The class's Python name (`repr` prints it as `<class 'int'>`).
+    /// The class's qualified Python name (`repr` prints it as
+    /// `<class 'int'>`, `<class 'collections.deque'>`).
     pub(crate) fn name(self) -> &'static str {
         match self {
             DefaultFactoryClass::Int => "int",
@@ -123,7 +125,7 @@ impl DefaultFactoryClass {
             DefaultFactoryClass::List => "list",
             DefaultFactoryClass::Dict => "dict",
             DefaultFactoryClass::Set => "set",
-            DefaultFactoryClass::Deque => "deque",
+            DefaultFactoryClass::Deque => "collections.deque",
         }
     }
 }

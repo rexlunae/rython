@@ -2181,7 +2181,11 @@ python3.12 (`crates/stdpython/tests/python_semantics.rs`,
 - **Construction.** `deque()`, `deque(iterable)`, `deque(iterable, maxlen)`,
   `deque(maxlen=n)` (`maxlen=None` unbounded; a negative bound is
   `ValueError: maxlen must be non-negative`); `defaultdict(factory)` with
-  `int`, `float`, `str`, `bool`, `list`, `dict`, `set`, `deque`, `None` (no
+  `int`, `float`, `str`, `bool`, `list`, `dict`, `set` (unshadowed builtins),
+  `deque` (the `collections` class: `from collections import deque`, a
+  renamed `deque as dq`, or `collections.deque`; a local class / function
+  named `deque`, or an unimported bare `deque`, is a conversion error; its
+  repr is `defaultdict(<class 'collections.deque'>, {...})`), `None` (no
   factory: a missing key is `KeyError`) or a no-argument `lambda` (an unnamed
   factory), optionally followed by an initial dict; `OrderedDict()`,
   `OrderedDict(dict)`, `OrderedDict([(k, v), ...])`, and `OrderedDict(x)`

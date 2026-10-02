@@ -20438,6 +20438,69 @@ fn aliased_collections_imports_match_python_at_runtime() {
 }
 
 #[test]
+fn defaultdict_deque_factory_matches_python_at_runtime() {
+    // PR #429 review: `defaultdict(deque)` after `from collections import
+    // deque` was rejected at the factory check because the import made the
+    // name a symbol. Plain, renamed and module-qualified spellings must all
+    // resolve to the collections class, and the repr must name it
+    // `collections.deque` as CPython does.
+    let scratch = Scratch::new("collections_dd_deque");
+    let file = scratch.path().join("ddq.py");
+    fs::write(
+        &file,
+        concat!(
+            "import collections\n",
+            "from collections import defaultdict, deque\n",
+            "from collections import defaultdict as dd, deque as dq\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    d = defaultdict(deque)\n",
+            "    d[\"a\"].append(1)\n",
+            "    d[\"a\"].appendleft(0)\n",
+            "    d[\"b\"]\n",
+            "    print(len(d), list(d[\"a\"]), len(d[\"b\"]))\n",
+            "    print(d)\n",
+            "    e = dd(dq)\n",
+            "    e[1].extend([3, 4])\n",
+            "    print(e[1].popleft(), e)\n",
+            "    f = collections.defaultdict(collections.deque)\n",
+            "    f[\"k\"].append(\"v\")\n",
+            "    missing = len(f[\"missing\"])\n",
+            "    print(f, missing)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/ddq"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "2 [0, 1] 0",
+            "defaultdict(<class 'collections.deque'>, {'a': deque([0, 1]), 'b': deque([])})",
+            "3 defaultdict(<class 'collections.deque'>, {1: deque([4])})",
+            "defaultdict(<class 'collections.deque'>, {'k': deque(['v']), 'missing': deque([])}) 0",
+        ],
+        "defaultdict(deque) semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn ordereddict_of_an_untyped_argument_matches_python_at_runtime() {
     // requests' `from_key_val_list`: `OrderedDict(value)` over an UNTYPED
     // parameter used to be a conversion error that failed the whole package.
