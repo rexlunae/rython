@@ -20530,3 +20530,61 @@ fn ordereddict_of_an_untyped_argument_matches_python_at_runtime() {
         "boxed OrderedDict semantics diverged from CPython"
     );
 }
+
+#[test]
+fn a_narrowed_optional_revalidates_on_every_store_and_per_branch() {
+    // Devin review on #429: a narrowed `int | None` local stayed narrowed
+    // across `x = d.get(key)` (any call counted as non-None), so the next
+    // read unwrapped None and panicked. Post-`if` narrowing likewise judged
+    // each branch by its last store to ANY name: `if x is not None: note =
+    // ... else: note = ...` narrowed `x` after the if, panicking for None.
+    // Both now ask the type-aware `definitely_non_none` about the narrowed
+    // name itself.
+    let got = run_global_alias_program(
+        "narrowrevalidate",
+        "narrow_revalidate.py",
+        concat!(
+            "def lookup(d: dict[str, int], key: str) -> str:\n",
+            "    x: int | None = 1\n",
+            "    print(x + 1)\n",
+            "    x = d.get(key)\n",
+            "    return str(x)\n",
+            "\n",
+            "\n",
+            "def pick(x: int | None) -> str:\n",
+            "    if x is not None:\n",
+            "        note = \"set\"\n",
+            "    else:\n",
+            "        note = \"unset\"\n",
+            "    print(note)\n",
+            "    return str(x)\n",
+            "\n",
+            "\n",
+            "def refresh(x: int | None, d: dict[str, int]) -> str:\n",
+            "    if x is not None:\n",
+            "        x = d.get(\"k\")\n",
+            "    else:\n",
+            "        x = 0\n",
+            "    return str(x)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(lookup({\"a\": 1}, \"absent\"))\n",
+            "    print(lookup({\"a\": 1}, \"a\"))\n",
+            "    print(pick(None))\n",
+            "    print(pick(4))\n",
+            "    print(refresh(3, {}))\n",
+            "    print(refresh(3, {\"k\": 7}))\n",
+            "    print(refresh(None, {}))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    // Verified against python3.
+    assert_eq!(
+        got,
+        vec!["2", "None", "2", "1", "unset", "None", "set", "4", "None", "7", "0"]
+    );
+}

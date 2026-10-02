@@ -1553,9 +1553,14 @@ pub fn update_narrowed_after_statement(
             }
             // The test narrows x in the body; both branches leaving x
             // non-None narrows x AFTER the if/else.
+            // Both judgements are about the NARROWED name: the body keeps
+            // the test's narrowing unless it rebinds the name (then its last
+            // store must be non-None); the else branch starts with the name
+            // possibly None, so it must store a non-None value itself.
             if let Some((name, inner)) = narrowing_from_test(&i.test, options) {
-                let body_ok = branch_ends_non_none(&i.body);
-                let else_ok = branch_ends_non_none(&i.orelse);
+                let body_ok = !i.body.iter().any(|s| stmt_writes_name(s, &name))
+                    || body_leaves_name_non_none(&i.body, &name, ctx, options, symbols);
+                let else_ok = body_leaves_name_non_none(&i.orelse, &name, ctx, options, symbols);
                 if body_ok && else_ok {
                     narrowed.insert(
                         name,
@@ -1620,7 +1625,10 @@ pub fn update_narrowed_after_statement(
         // narrowing; an assignment of a statically non-None value keeps it.
         crate::StatementType::Assign(a) => {
             if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
-                if narrowed.contains_key(&n.id) && !statically_non_none(&a.value) {
+                // The KEEP test is the type-aware one: a call is not
+                // statically non-None (`x = d.get(k)` may store None), so
+                // a narrowed name revalidates on every store.
+                if narrowed.contains_key(&n.id) && !definitely_non_none(&a.value, ctx, options, symbols) {
                     narrowed.remove(&n.id);
                 } else if !narrowed.contains_key(&n.id)
                     && options.optional_names.contains(&n.id)
@@ -1731,48 +1739,3 @@ pub(crate) fn render_block(
     Ok(out)
 }
 
-/// Whether a statement list's last statement is an assignment of a
-/// statically non-None value to some name (the "branch leaves the name
-/// non-None" check for post-if narrowing). Only the LAST store matters:
-/// earlier stores are overwritten.
-fn branch_ends_non_none(body: &[crate::Statement]) -> bool {
-    for stmt in body.iter().rev() {
-        match &stmt.statement {
-            crate::StatementType::Assign(a) => {
-                return statically_non_none(&a.value);
-            }
-            crate::StatementType::Pass => continue,
-            // A nested if/else is treated conservatively: only when its own
-            // branches both assign non-None does it count as ending non-None.
-            crate::StatementType::If(i) => {
-                if i.orelse.is_empty() {
-                    return false;
-                }
-                return branch_ends_non_none(&i.body) && branch_ends_non_none(&i.orelse);
-            }
-            _ => return false,
-        }
-    }
-    false
-}
-
-/// Whether an expression is statically NOT None: a literal other than None,
-/// a non-None constant, a call (functions never return the None literal
-/// here — conservative), a non-Option name, or a container literal.
-fn statically_non_none(expr: &crate::ExprType) -> bool {
-    match expr {
-        crate::ExprType::Constant(c) => c.0.is_some(),
-        crate::ExprType::Name(n) => !matches!(n.id.as_str(), "None" | "True" | "False"),
-        crate::ExprType::List(_)
-        | crate::ExprType::Dict(_)
-        | crate::ExprType::Set(_)
-        | crate::ExprType::Tuple(_)
-        | crate::ExprType::ListComp(_)
-        | crate::ExprType::DictComp(_)
-        | crate::ExprType::SetComp(_)
-        | crate::ExprType::Call(_)
-        | crate::ExprType::JoinedStr(_)
-        | crate::ExprType::FormattedValue(_) => true,
-        _ => false,
-    }
-}
