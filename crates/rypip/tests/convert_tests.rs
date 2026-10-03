@@ -20680,3 +20680,68 @@ fn a_collections_module_alias_constructs_like_the_module() {
     // Verified against python3.
     assert_eq!(got, vec!["3 1"]);
 }
+
+#[test]
+fn numeric_equality_holds_inside_boxed_containers() {
+    // Issue #434: `{"n": 1, "s": "x"} == {"n": 1.0, "s": "x"}` compared the
+    // boxed members element-wise with the derived-style `PyValue == PyValue`
+    // (Int(1) != Float(1.0)) and printed False for CPython's True. The
+    // numeric tower now holds at every depth of a boxed tuple / dict /
+    // OrderedDict / list, and `in` over a boxed container.
+    let got = run_global_alias_program(
+        "boxed_numeric_equality",
+        "boxed_numeric_equality.py",
+        concat!(
+            "from collections import OrderedDict\n",
+            "from typing import Any\n",
+            "\n",
+            "\n",
+            "def same(a: Any, b: Any) -> bool:\n",
+            "    return a == b\n",
+            "\n",
+            "\n",
+            "def differ(a: Any, b: Any) -> bool:\n",
+            "    return a != b\n",
+            "\n",
+            "\n",
+            "def has(items: Any, x: Any) -> bool:\n",
+            "    return x in items\n",
+            "\n",
+            "\n",
+            "def as_ordered(value: Any) -> Any:\n",
+            "    return OrderedDict(value)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    a = {\"n\": 1, \"s\": \"x\"}\n",
+            "    b = {\"n\": 1.0, \"s\": \"x\"}\n",
+            "    print(a == b)\n",
+            "    print(a != b)\n",
+            "    print(same((1, \"x\"), (1.0, \"x\")))\n",
+            "    print(same({\"n\": 1, \"s\": \"x\"}, {\"n\": True, \"s\": \"x\"}))\n",
+            "    print(differ({\"n\": 1, \"s\": \"x\"}, {\"n\": 2.0, \"s\": \"x\"}))\n",
+            "    print(differ({\"n\": 1, \"s\": \"x\"}, {\"n\": 1.5, \"s\": \"x\"}))\n",
+            "    print(same((1, (2, \"a\")), (1.0, (2.0, \"a\"))))\n",
+            "    print(same({\"k\": {\"j\": 1}, \"t\": \"v\"}, {\"k\": {\"j\": True}, \"t\": \"v\"}))\n",
+            "    print(same(as_ordered({\"n\": 1, \"s\": \"x\"}), as_ordered({\"n\": 1.0, \"s\": \"x\"})))\n",
+            "    print(same(as_ordered({\"n\": 1, \"s\": \"x\"}), {\"s\": \"x\", \"n\": 1.0}))\n",
+            "    print(same(as_ordered({\"n\": 1, \"s\": \"x\"}), as_ordered({\"s\": \"x\", \"n\": 1})))\n",
+            "    items = [1, \"x\", 2.0, True]\n",
+            "    print(has(items, 1.0))\n",
+            "    print(has(items, 3))\n",
+            "    print(has([(2,), \"y\"], (2.0,)))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    // Verified against python3.
+    assert_eq!(
+        got,
+        vec![
+            "True", "False", "True", "True", "True", "True", "True", "True", "True", "True",
+            "False", "True", "False", "True",
+        ]
+    );
+}

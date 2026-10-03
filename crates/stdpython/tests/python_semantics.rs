@@ -5785,3 +5785,189 @@ mod boxed_ordereddict {
         assert_eq!(stdpython::urllib::parse::urlencode(&q, false).unwrap(), "b=1&a=2");
     }
 }
+
+/// Issue #434: the numeric tower (`1 == 1.0 == True == 1+0j`) holds INSIDE
+/// boxed containers, not only at the top-level `py_value_eq`. Every
+/// expected value below was captured from python3.12.
+mod boxed_numeric_equality {
+    use std::hash::{Hash, Hasher};
+    use std::sync::Arc;
+    use stdpython::collections::OrderedDict;
+    use stdpython::*;
+
+    fn s(v: &str) -> PyValue {
+        PyValue::Str(v.to_string())
+    }
+    fn tup(items: Vec<PyValue>) -> PyValue {
+        PyValue::Tuple(Arc::new(items))
+    }
+    fn dict(items: Vec<(&str, PyValue)>) -> PyValue {
+        PyValue::Dict(Arc::new(
+            items.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        ))
+    }
+    fn od(items: Vec<(&str, PyValue)>) -> PyValue {
+        OrderedDict::from_boxed(dict(items)).unwrap()
+    }
+    fn h(v: &PyValue) -> u64 {
+        let mut st = std::collections::hash_map::DefaultHasher::new();
+        v.hash(&mut st);
+        st.finish()
+    }
+    fn cplx(re: f64, im: f64) -> PyValue {
+        PyValue::Complex(Complex::new(re, im))
+    }
+
+    #[test]
+    fn scalars() {
+        // True == 1 -> True; 1 == 1+0j -> True; 1.0 == 1+0j -> True;
+        // True == 1+0j -> True; 1 == 1+1j -> False; 0.5 == 1 -> False
+        assert!(PyValue::Bool(true) == PyValue::Int(1));
+        assert!(PyValue::Int(1) == PyValue::Bool(true));
+        assert!(PyValue::Int(1) == cplx(1.0, 0.0));
+        assert!(cplx(1.0, 0.0) == PyValue::Float(1.0));
+        assert!(PyValue::Bool(true) == cplx(1.0, 0.0));
+        assert!(PyValue::Int(1) != cplx(1.0, 1.0));
+        assert!(PyValue::Float(0.5) != PyValue::Int(1));
+        // Float(nan) != Float(nan) stays.
+        assert!(PyValue::Float(f64::NAN) != PyValue::Float(f64::NAN));
+    }
+
+    #[test]
+    fn inside_tuple() {
+        // (1, "x") == (1.0, "x") -> True; (1,) == (1.5,) -> False
+        assert!(tup(vec![PyValue::Int(1), s("x")]) == tup(vec![PyValue::Float(1.0), s("x")]));
+        assert!(tup(vec![PyValue::Int(1)]) != tup(vec![PyValue::Float(1.5)]));
+        // (1, "x") != (1.0, "x") -> False
+        assert!(!(tup(vec![PyValue::Int(1), s("x")]) != tup(vec![PyValue::Float(1.0), s("x")])));
+    }
+
+    #[test]
+    fn inside_dict_and_ordereddict() {
+        // {"n": 1, "s": "x"} == {"n": 1.0, "s": "x"} -> True (the issue)
+        assert!(
+            dict(vec![("n", PyValue::Int(1)), ("s", s("x"))])
+                == dict(vec![("n", PyValue::Float(1.0)), ("s", s("x"))])
+        );
+        // {"n": True} == {"n": 1} -> True
+        assert!(dict(vec![("n", PyValue::Bool(true))]) == dict(vec![("n", PyValue::Int(1))]));
+        // OrderedDict(n=1) == OrderedDict(n=1.0) -> True
+        assert!(od(vec![("n", PyValue::Int(1))]) == od(vec![("n", PyValue::Float(1.0))]));
+        // OrderedDict(n=1) == {"n": 1.0} -> True (both directions)
+        assert!(od(vec![("n", PyValue::Int(1))]) == dict(vec![("n", PyValue::Float(1.0))]));
+        assert!(dict(vec![("n", PyValue::Float(1.0))]) == od(vec![("n", PyValue::Int(1))]));
+    }
+
+    #[test]
+    fn nested() {
+        // (1, (2, "a")) == (1.0, (2.0, "a")) -> True
+        assert!(
+            tup(vec![PyValue::Int(1), tup(vec![PyValue::Int(2), s("a")])])
+                == tup(vec![PyValue::Float(1.0), tup(vec![PyValue::Float(2.0), s("a")])])
+        );
+        // {"k": (1, 2)} == {"k": (1.0, 2.0)} -> True
+        assert!(
+            dict(vec![("k", tup(vec![PyValue::Int(1), PyValue::Int(2)]))])
+                == dict(vec![("k", tup(vec![PyValue::Float(1.0), PyValue::Float(2.0)]))])
+        );
+        // {"k": {"j": 1}} == {"k": {"j": True}} -> True
+        assert!(
+            dict(vec![("k", dict(vec![("j", PyValue::Int(1))]))])
+                == dict(vec![("k", dict(vec![("j", PyValue::Bool(true))]))])
+        );
+    }
+
+    #[test]
+    fn hash_agrees_with_equality() {
+        // hash(1) == hash(1.0) == hash(True) == hash(1+0j) -> True
+        let one = [
+            PyValue::Int(1),
+            PyValue::Float(1.0),
+            PyValue::Bool(true),
+            cplx(1.0, 0.0),
+        ];
+        for v in &one {
+            assert_eq!(h(v), h(&one[0]), "{v:?}");
+        }
+        // hash(0) == hash(False) == hash(0.0) == hash(-0.0) -> True
+        let zero = [
+            PyValue::Int(0),
+            PyValue::Bool(false),
+            PyValue::Float(0.0),
+            PyValue::Float(-0.0),
+            cplx(0.0, 0.0),
+        ];
+        for v in &zero {
+            assert_eq!(h(v), h(&zero[0]), "{v:?}");
+        }
+        // hash(2.5) == hash(2) -> False
+        assert_ne!(h(&PyValue::Float(2.5)), h(&PyValue::Int(2)));
+        // Hash recurses through a tuple key.
+        assert_eq!(
+            h(&tup(vec![PyValue::Int(1), s("x")])),
+            h(&tup(vec![PyValue::Float(1.0), s("x")]))
+        );
+    }
+
+    #[test]
+    fn dict_keys_and_sets() {
+        // {1: 'a'}[1.0] -> 'a'; {1: 'a', 1.0: 'b'} -> {1: 'b'};
+        // {1: 'a', True: 'b'} -> {1: 'b'}; {1, 1.0, True} -> {1}
+        let mut d: PyDict<PyValue, &str> = PyDict::default();
+        d.insert(PyValue::Int(1), "a");
+        assert_eq!(d.get(&PyValue::Float(1.0)), Some(&"a"));
+        d.insert(PyValue::Float(1.0), "b");
+        d.insert(PyValue::Bool(true), "c");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d.get(&PyValue::Int(1)), Some(&"c"));
+        let set: std::collections::HashSet<PyValue> =
+            [PyValue::Int(1), PyValue::Float(1.0), PyValue::Bool(true)]
+                .into_iter()
+                .collect();
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn int_float_comparison_is_exact() {
+        // 2**53 + 1 == float(2**53) -> False; 2**53 == float(2**53) -> True;
+        // (2**53 + 1,) == (float(2**53),) -> False
+        let big = 9007199254740992i64;
+        assert!(PyValue::Int(big + 1) != PyValue::Float(big as f64));
+        assert!(PyValue::Int(big) == PyValue::Float(big as f64));
+        assert!(tup(vec![PyValue::Int(big + 1)]) != tup(vec![PyValue::Float(big as f64)]));
+        // i64::MAX == 9.223372036854775807e18 -> False;
+        // i64::MIN == -9.223372036854775808e18 -> True
+        assert!(PyValue::Int(i64::MAX) != PyValue::Float(9.223372036854775807e18));
+        assert!(PyValue::Int(i64::MIN) == PyValue::Float(-9.223372036854775808e18));
+    }
+
+    #[test]
+    fn equal_ranges_hash_alike() {
+        // (range(0, 3, 2),) == (range(0, 4, 2),) -> True;
+        // hash(range(0, 3, 2)) == hash(range(0, 4, 2)) -> True
+        let a = PyValue::Range(range_start_stop_step(0, 3, 2).unwrap());
+        let b = PyValue::Range(range_start_stop_step(0, 4, 2).unwrap());
+        assert!(tup(vec![a.clone()]) == tup(vec![b.clone()]));
+        assert_eq!(h(&a), h(&b));
+    }
+
+    #[test]
+    fn list_neighbours() {
+        // l = [1, "x", 2.0, True]
+        // 1.0 in l -> True; l.index(2) -> 2; l.count(1) -> 2; l.count(1.0) -> 2
+        // l.index(True) -> 0; 2 in l -> True; (2.0,) in [(2,)] -> True
+        let l = vec![PyValue::Int(1), s("x"), PyValue::Float(2.0), PyValue::Bool(true)];
+        assert!(l.py_contains(&PyValue::Float(1.0)));
+        assert_eq!(l.py_index_of(&PyValue::Int(2)).unwrap(), 2);
+        assert_eq!(l.count(&PyValue::Int(1)), 2);
+        assert_eq!(l.count(&PyValue::Float(1.0)), 2);
+        assert_eq!(l.py_index_of(&PyValue::Bool(true)).unwrap(), 0);
+        assert!(l.py_contains(&PyValue::Int(2)));
+        assert!(vec![tup(vec![PyValue::Int(2)])].py_contains(&tup(vec![PyValue::Float(2.0)])));
+        // [1, "x"] == [1.0, "x"] -> True; != -> False
+        let a = vec![PyValue::Int(1), s("x")];
+        let b = vec![PyValue::Float(1.0), s("x")];
+        assert!(a == b);
+        assert!(!(a != b));
+    }
+}

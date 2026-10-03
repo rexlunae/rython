@@ -6,6 +6,9 @@
     "boxed_constructor": {
       "status": "pass"
     },
+    "boxed_numeric_equality": {
+      "status": "pass"
+    },
     "boxed_slots": {
       "status": "pass"
     },
