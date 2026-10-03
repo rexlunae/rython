@@ -10459,6 +10459,24 @@ fn np_std_var_reject_the_axis_positional() {
 }
 
 #[test]
+fn np_std_var_where_borrow_their_arrays_once() {
+    // The runtime's std/var/where take `&NdArray` (the #220/#225 borrow
+    // refactor): std/var must pass `&a`, not `a.clone()`, with ddof by
+    // value; where must not add a second `&` over np_render's borrow
+    // (`&&NdArray` has no BinaryOperand conversion).
+    let out = compile(
+        "import numpy as np\ndef f() -> None:\n    a = np.zeros(4)\n    \
+         s = np.std(a, ddof=1)\n    v = np.var(a)\n    \
+         w = np.where(np.greater(a, 1.0), a, 0.0)\n",
+        "npborrow.py",
+    );
+    assert!(out.contains("numpy :: std (& (a) , ((1)) as f64)"), "generated: {}", out);
+    assert!(out.contains("numpy :: var (& (a) , 0.0)"), "generated: {}", out);
+    assert!(!out.contains("& & ("), "where double-borrows: {}", out);
+    assert!(!out.contains("(a) . clone ()"), "a borrowed arg was cloned: {}", out);
+}
+
+#[test]
 fn np_set_backend_lowers_to_a_raisable_runtime_error() {
     // np.set_backend's runtime helper errors with a plain String (unknown
     // backend name), which `?` alone cannot convert in the generated

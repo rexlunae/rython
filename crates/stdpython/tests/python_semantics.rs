@@ -6086,3 +6086,23 @@ mod boxed_container_ops {
         assert_eq!(err.exception_type, "ValueError");
     }
 }
+
+#[test]
+fn numpy_array_scalar_comparisons_broadcast_and_keep_operand_order() {
+    use stdpython::stdlib::numpy;
+    let a = numpy::array(vec![1.0, 5.0, 2.0, 8.0]);
+    // np.greater(a, 2.0) -> [False  True False  True]
+    let m = numpy::greater(&a, &2.0).unwrap();
+    assert_eq!(m.to_string(), "[False  True False  True]");
+    // a[np.greater(a, 2.0)] -> [5. 8.]
+    assert_eq!(a.py_index(m).unwrap().to_string(), "[5. 8.]");
+    // np.greater(2.0, a) -> [ True False False False]
+    let r = numpy::greater(&2.0, &a).unwrap();
+    assert_eq!(r.to_string(), "[ True False False False]");
+    // np.greater(np.array([[1, 2], [3, 4]]), 2) -> [[False False]\n [ True  True]]
+    let g = numpy::greater(&numpy::array(vec![vec![1i64, 2], vec![3, 4]]), &2i64).unwrap();
+    assert_eq!(g.to_string(), "[[False False]\n [ True  True]]");
+    // np.equal(np.array([0, 1, 2]), True) -> [False  True False]
+    let e = numpy::equal(&numpy::array(vec![0i64, 1, 2]), &true).unwrap();
+    assert_eq!(e.to_string(), "[False  True False]");
+}

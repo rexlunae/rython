@@ -20680,3 +20680,68 @@ fn a_collections_module_alias_constructs_like_the_module() {
     // Verified against python3.
     assert_eq!(got, vec!["3 1"]);
 }
+
+#[test]
+fn numpy_scalar_comparisons_masks_where_and_std_match_numpy_at_runtime() {
+    // The borrowed-operand refactor (#220/#225) regressed three paths the
+    // numpy evaluation (eval/numpy) pins: an array-vs-scalar comparison
+    // returned a length-1 buffer under the array's shape (a silent `[]`
+    // from `a[m]`, an out-of-bounds panic printing `m`) and ignored the
+    // operand order; `np.std`/`np.var` still passed `a.clone()` to the
+    // now-borrowing runtime; `np.where` borrowed its already-borrowed
+    // arguments a second time. None of it reached rustc in a codegen-only
+    // test, so this builds and runs the program.
+    // Verified against python3.
+    let scratch = Scratch::new("numpy-cmp-mask");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "import numpy as np\n",
+            "\n",
+            "def main() -> None:\n",
+            "    a = np.array([1.0, 5.0, 2.0, 8.0])\n",
+            "    m = np.greater(a, 2.0)\n",
+            "    print(m)\n",
+            "    print(a[m])\n",
+            "    print(np.greater(2.0, a))\n",
+            "    print(np.greater(np.array([[1, 2], [3, 4]]), 2))\n",
+            "    print(np.equal(np.array([0, 1, 2]), True))\n",
+            "    print(np.where(m, a, 0.0))\n",
+            "    print(np.std(a), np.var(a), np.std(a, ddof=1))\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout,
+        concat!(
+            "[False  True False  True]\n",
+            "[5. 8.]\n",
+            "[ True False False False]\n",
+            "[[False False]\n",
+            " [ True  True]]\n",
+            "[False  True False]\n",
+            "[0. 5. 0. 8.]\n",
+            "2.7386127875258306 7.5 3.1622776601683795\n",
+        ),
+        "stderr: {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
