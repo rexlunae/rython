@@ -68,6 +68,29 @@ This library uses a generic trait-based design that mirrors Python's built-in be
 ✅ **Set Operations**: `union()`, `intersection()`, `difference()`  
 ✅ **Membership**: `contains()`  
 
+#### PyValue (the boxed value)
+The heterogeneous runtime value — `Int`, `Float`, `Bool`, `Str`, `Bytes`,
+`Tuple`, `Dict`, `OrderedDict`, `Complex`, `Range`, `Function`, `None_`. There
+is deliberately **no instance variant**, so a value that inference files into a
+`PyValue` slot loses its attributes; that boundary is the largest single
+blocker on the issue #137 frontier (477 sites at `aca31b3`).
+
+What a boxed value *can* do is the container surface its own members have,
+dispatched by member the same way `PyIndex<&str>` already dispatched indexing:
+✅ **Dict member**: `get`, `get` with a default, `keys`, `values`, `items`,
+`setdefault`, `pop`, `update`, `k in d`, `d[k] = v`
+✅ **Sequence members**: `xs[a:b:c]` — str by character, bytes by octet, a
+tuple stays a tuple, a range stays a range (CPython's `slice.indices`
+semantics, negative steps included)
+✅ **Refusals, never silent defaults**: a member that is not a container
+raises CPython's `TypeError` naming its real type. The `PyDictOps` methods are
+*infallible* by trait signature, so they panic with that message rather than
+returning `None`, an empty `Vec`, or a caller-supplied default — a default
+here would be indistinguishable from a real miss.
+
+Slice **mutation** is refused on every boxed member: a tuple is immutable in
+Python, so `t[0:1] = [9]` raises rather than editing the tuple's contents.
+
 ### Standard Library Modules
 `argparse`, `asyncio` (tokio-backed), `collections`, `copy`, `csv`,
 `datetime`, `functools`, `glob`, `hashlib`, `heapq`, `io` (StringIO
