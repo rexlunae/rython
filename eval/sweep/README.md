@@ -219,7 +219,7 @@ a default, `d.items`/`keys`/`values`, `d.setdefault`, `d.pop`, `d[k] = v`,
 `k in d`, `xs[a:b:c]`), plus the codegen fix that renders a `get` default as
 the dict's *value* type rather than a bare `String`.
 
-Measured against `28efebd` with [`run-pyvalue-ops2.json`](results/run-pyvalue-ops.json):
+Measured against `28efebd` with [`run-pyvalue-ops2.json`](results/run-pyvalue-ops2.json):
 
 | | `28efebd` | this branch |
 |---|---:|---:|
