@@ -81,6 +81,14 @@ enum ReadOnlyBuiltin {
 }
 
 impl ReadOnlyBuiltin {
+    /// Builtins that only look at the object itself and never call one of
+    /// its protocol methods (`__str__`, `__iter__`, `__eq__`, ...), so a
+    /// user-class operand does not make them run user code.
+    fn inspects_object_only(self) -> bool {
+        use ReadOnlyBuiltin as B;
+        matches!(self, B::Id | B::Type | B::Callable | B::Isinstance | B::Issubclass)
+    }
+
     /// The one string match: a builtin's name to its classification.
     fn from_name(name: &str) -> Option<ReadOnlyBuiltin> {
         use ReadOnlyBuiltin as B;
@@ -212,23 +220,40 @@ fn call_is_read_only(
     {
         return false;
     }
+    // Converting, iterating, hashing or comparing a user-class operand calls
+    // its protocol methods (`str(obj)` runs `obj.__str__`, `sorted(objs)`
+    // runs `__lt__`, `sum` runs `__add__`, `all` / `any` run `__bool__`,
+    // `xs.index(obj)` runs `__eq__`), so every operand must be made of
+    // builtin values (Devin review on #439).
+    let operands_inert = || {
+        call.args
+            .iter()
+            .chain(call.keywords.iter().map(|k| &k.value))
+            .all(|a| inert_type(&crate::infer_type(Some(ctx), a, options, symbols)))
+    };
     match call.func.as_ref() {
         // A builtin spelling not shadowed by a user definition.
-        ExprType::Name(n) => symbols.get(&n.id).is_none() && ReadOnlyBuiltin::from_name(&n.id).is_some(),
+        ExprType::Name(n) => {
+            symbols.get(&n.id).is_none()
+                && ReadOnlyBuiltin::from_name(&n.id)
+                    .is_some_and(|b| b.inspects_object_only() || operands_inert())
+        }
         // A method on a builtin value: read-only unless it is a known
         // in-place mutator. A user class (or anything unresolved) may run
         // arbitrary code.
         ExprType::Attribute(a) => {
             let recv = crate::infer_type(Some(ctx), &a.value, options, symbols);
-            builtin_value_type(&recv) && !mutates_receiver(&a.attr)
+            inert_type(&recv) && !mutates_receiver(&a.attr) && operands_inert()
         }
         _ => false,
     }
 }
 
-/// Whether a receiver type is a builtin value (whose methods are the
-/// runtime's, never user code).
-fn builtin_value_type(t: &TypeInfo) -> bool {
+/// Whether converting, iterating, hashing or comparing a value of this
+/// type can never run user code: every component is a builtin value. A
+/// user-class instance (its `__str__`, `__iter__`, `__eq__`, `__lt__`, ...)
+/// or a value of unresolved type may run arbitrary code.
+fn inert_type(t: &TypeInfo) -> bool {
     match t {
         TypeInfo::Int
         | TypeInfo::Float
@@ -236,14 +261,16 @@ fn builtin_value_type(t: &TypeInfo) -> bool {
         | TypeInfo::StrRef
         | TypeInfo::String
         | TypeInfo::Bytes
-        | TypeInfo::Vec(_)
-        | TypeInfo::PyTuple(_)
-        | TypeInfo::HashSet(_)
-        | TypeInfo::Dict(..)
-        | TypeInfo::Tuple(_)
-        | TypeInfo::Collection(..)
+        | TypeInfo::Range
         | TypeInfo::Complex => true,
-        TypeInfo::Borrowed(inner) | TypeInfo::Option(inner) => builtin_value_type(inner),
+        TypeInfo::Vec(inner)
+        | TypeInfo::PyTuple(inner)
+        | TypeInfo::HashSet(inner)
+        | TypeInfo::Borrowed(inner)
+        | TypeInfo::Option(inner) => inert_type(inner),
+        TypeInfo::Dict(k, v) => inert_type(k) && inert_type(v),
+        TypeInfo::Tuple(items) => items.iter().all(inert_type),
+        TypeInfo::Collection(_, args) => args.iter().all(inert_type),
         _ => false,
     }
 }
@@ -282,12 +309,22 @@ fn place_of(
                 return None;
             }
             let root = chain_root(e)?;
-            // Every link must itself be a place (no call in the chain).
+            // Every link must itself be a place (no call in the chain), and
+            // no INTERMEDIATE link may be a property: its getter runs when
+            // the chain is read, so a late read would pick up whatever the
+            // later arguments changed (Devin review on #439).
             let mut cur = a.value.as_ref();
             loop {
                 match cur {
                     ExprType::Name(_) => break,
-                    ExprType::Attribute(inner) => cur = inner.value.as_ref(),
+                    ExprType::Attribute(inner) => {
+                        if crate::ast::tree::attribute::attribute_read_is_call(
+                            inner, ctx, symbols, options,
+                        ) {
+                            return None;
+                        }
+                        cur = inner.value.as_ref();
+                    }
                     _ => return None,
                 }
             }

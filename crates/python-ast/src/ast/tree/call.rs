@@ -4512,13 +4512,6 @@ impl<'a> CodeGen for Call {
                         let deferred = crate::ast::tree::print_order::deferred_renders(
                             &self.args, &kw_values, &ctx, &options, &symbols,
                         )?;
-                        let late_kw = |e: &Option<crate::ExprType>| {
-                            e.as_ref().is_some_and(|e| {
-                                crate::ast::tree::print_order::needs_hoist(
-                                    e, &ctx, &options, &symbols,
-                                )
-                            })
-                        };
                         let sep_tokens = match sep.clone() {
                             Some(s) => render(s)?,
                             None => quote!(" "),
@@ -4546,25 +4539,68 @@ impl<'a> CodeGen for Call {
                                     items.push(quote!(#id));
                                 }
                             }
-                            let (sep_tokens, end_tokens) = {
-                                let mut hoist = |name: &str, hoisted: bool, tok: TokenStream| {
-                                    if !hoisted {
-                                        return tok;
-                                    }
+                            // Python evaluates the keyword values in SOURCE
+                            // order (`end=` before `sep=` when written so),
+                            // after every positional and before converting
+                            // any argument (Devin review on #439). A keyword
+                            // that can run code is hoisted into a `let`, and
+                            // while any keyword can, every non-constant
+                            // keyword is, so none of them is read later than
+                            // CPython reads it. `flush=` takes part: it is
+                            // evaluated before the deferred places render.
+                            let kw_pos = |name: &str| {
+                                self.keywords
+                                    .iter()
+                                    .position(|k| k.arg.as_deref() == Some(name))
+                                    .unwrap_or(usize::MAX)
+                            };
+                            let kw_runs_code = |e: &crate::ExprType| {
+                                crate::ast::tree::print_order::needs_hoist(e, &ctx, &options, &symbols)
+                            };
+                            let any_kw_runs_code = kw_values.iter().any(|e| kw_runs_code(e));
+                            let flush_tokens = match flush.clone() {
+                                Some(f) => Some(render(f)?),
+                                None => None,
+                            };
+                            let mut kw_list: Vec<(usize, &str, Option<&crate::ExprType>, TokenStream)> = vec![
+                                (kw_pos("sep"), "__rython_print_sep", sep.as_ref(), sep_tokens),
+                                (kw_pos("end"), "__rython_print_end", end.as_ref(), end_tokens),
+                                (
+                                    kw_pos("flush"),
+                                    "__rython_print_flush",
+                                    flush.as_ref(),
+                                    flush_tokens.clone().unwrap_or_else(|| quote!(false)),
+                                ),
+                            ];
+                            kw_list.sort_by_key(|k| k.0);
+                            let mut kw_final: Vec<(&str, TokenStream)> = Vec::new();
+                            for (_, name, expr, tok) in kw_list {
+                                let hoisted = expr.is_some_and(|e| {
+                                    kw_runs_code(e)
+                                        || (any_kw_runs_code
+                                            && !matches!(e, crate::ExprType::Constant(_)))
+                                });
+                                if hoisted {
                                     let id = crate::safe_ident(name);
                                     lets.extend(quote!(let #id = #tok;));
-                                    quote!(#id)
-                                };
-                                let sep_tokens =
-                                    hoist("__rython_print_sep", late_kw(&sep), sep_tokens);
-                                let end_tokens =
-                                    hoist("__rython_print_end", late_kw(&end), end_tokens);
-                                (sep_tokens, end_tokens)
+                                    kw_final.push((name, quote!(#id)));
+                                } else {
+                                    kw_final.push((name, tok));
+                                }
+                            }
+                            let kw_tok = |name: &str| {
+                                kw_final
+                                    .iter()
+                                    .find(|(n, _)| *n == name)
+                                    .map(|(_, t)| t.clone())
+                                    .unwrap_or_default()
                             };
-                            let call = match flush {
+                            let (sep_tokens, end_tokens) =
+                                (kw_tok("__rython_print_sep"), kw_tok("__rython_print_end"));
+                            let call = match flush_tokens {
                                 None => quote!(print_parts(&[#(#items),*], #sep_tokens, #end_tokens)?),
-                                Some(f) => {
-                                    let f = render(f)?;
+                                Some(_) => {
+                                    let f = kw_tok("__rython_print_flush");
                                     quote!(print_parts_flush(&[#(#items),*], #sep_tokens, #end_tokens, #f)?)
                                 }
                             };
