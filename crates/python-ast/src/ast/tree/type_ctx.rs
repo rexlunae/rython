@@ -3029,7 +3029,7 @@ pub(crate) fn collections_class_of(
                         crate::StdModule::from_name(&i.module) == Some(crate::StdModule::Collections);
                     let from_typing = crate::is_typing(&i.module);
                     if from_collections {
-                        CollectionsType::from_class_name(canonical)
+                        CollectionsType::from_name(canonical)
                     } else if from_typing {
                         CollectionsType::from_annotation_name(canonical)
                     } else {
@@ -3044,7 +3044,7 @@ pub(crate) fn collections_class_of(
                 return None;
             };
             if crate::StdModule::from_name(&m.id) == Some(crate::StdModule::Collections) {
-                CollectionsType::from_class_name(&a.attr)
+                CollectionsType::from_name(&a.attr)
             } else if crate::is_typing(&m.id) {
                 CollectionsType::from_annotation_name(&a.attr)
             } else {

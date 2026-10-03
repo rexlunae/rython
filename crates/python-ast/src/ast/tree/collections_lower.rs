@@ -38,7 +38,7 @@ pub(crate) fn ctor_of(func: &ExprType, symbols: &SymbolTableScopes) -> Option<Co
                 if crate::StdModule::from_name(&i.module)
                     == Some(crate::StdModule::Collections) =>
             {
-                CollectionsType::from_class_name(&i.defining_name(&n.id))
+                CollectionsType::from_name(&i.defining_name(&n.id))
             }
             _ => None,
         },
@@ -47,7 +47,7 @@ pub(crate) fn ctor_of(func: &ExprType, symbols: &SymbolTableScopes) -> Option<Co
                 return None;
             };
             if binds_collections_module(&m.id, symbols) {
-                CollectionsType::from_class_name(&a.attr)
+                CollectionsType::from_name(&a.attr)
             } else {
                 None
             }
@@ -87,10 +87,10 @@ pub(crate) fn is_empty_construction(call: &Call, symbols: Option<&SymbolTableSco
     let kind = match symbols {
         Some(symbols) => ctor_of(&call.func, symbols),
         None => match call.func.as_ref() {
-            ExprType::Name(n) => CollectionsType::from_class_name(&n.id),
+            ExprType::Name(n) => CollectionsType::from_name(&n.id),
             ExprType::Attribute(a) => match a.value.as_ref() {
                 ExprType::Name(m) if m.id == "collections" => {
-                    CollectionsType::from_class_name(&a.attr)
+                    CollectionsType::from_name(&a.attr)
                 }
                 _ => None,
             },
@@ -99,7 +99,7 @@ pub(crate) fn is_empty_construction(call: &Call, symbols: Option<&SymbolTableSco
     };
     match kind {
         // The factory is the one positional argument.
-        Some(CollectionsType::DefaultDict) => call.args.len() <= 1,
+        Some(CollectionsType::Defaultdict) => call.args.len() <= 1,
         Some(_) => call.args.is_empty(),
         None => false,
     }
@@ -203,7 +203,7 @@ pub(crate) fn construction_type(
                 .unwrap_or(unknown);
             TypeInfo::Collection(kind, vec![elem])
         }
-        CollectionsType::DefaultDict => {
+        CollectionsType::Defaultdict => {
             let v = call
                 .args
                 .first()
@@ -248,6 +248,11 @@ pub(crate) fn construction_type(
             }
             TypeInfo::Collection(kind, vec![k, v])
         }
+        // `Counter`/`ChainMap`/`namedtuple` have no construction lowering:
+        // their construction is refused at conversion, so this arm is
+        // unreachable today. Listed so the match stays exhaustive if a
+        // lowering is ever added for them.
+        _ => TypeInfo::PyValue,
     }
 }
 
@@ -472,7 +477,7 @@ pub(crate) fn lower_construction(
             };
             Ok(quote!(#path::construct(#items, #maxlen)?))
         }
-        CollectionsType::DefaultDict => {
+        CollectionsType::Defaultdict => {
             if !call.keywords.is_empty() {
                 return Err(unsupported(
                     "defaultdict(..., key=value) keyword items are not supported yet; pass \
@@ -637,6 +642,12 @@ pub(crate) fn lower_construction(
                 )),
             }
         }
+        // The unlowered classes are refused at conversion before a
+        // field type is computed from this constructor.
+        _ => Err(unsupported(format!(
+            "{}() has no construction lowering; rython refuses to silently ignore it",
+            kind.name()
+        ))),
     }
 }
 
@@ -655,8 +666,11 @@ pub(crate) fn bare_annotation_message(
     let kind = crate::ast::tree::type_ctx::collections_class_of(ann, Some(symbols))?;
     let example = match kind {
         CollectionsType::Deque => "deque[int]",
-        CollectionsType::DefaultDict => "defaultdict[str, int]",
+        CollectionsType::Defaultdict => "defaultdict[str, int]",
         CollectionsType::OrderedDict => "OrderedDict[str, int]",
+        // The unlowered classes are refused at conversion before an
+        // annotation reaches here.
+        _ => "object",
     };
     Some(format!(
         "{place} annotation `{}` has no element/key type; use a subscripted annotation \

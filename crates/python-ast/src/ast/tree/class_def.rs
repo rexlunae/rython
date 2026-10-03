@@ -3801,7 +3801,9 @@ impl CodeGen for ClassDef {
                 Some(SymbolTableNode::Assign {
                     value: ExprType::Call(call),
                     ..
-                }) if matches!(call.func.as_ref(), ExprType::Name(n) if n.id == "namedtuple")
+                }) if matches!(call.func.as_ref(), ExprType::Name(n)
+                    if crate::CollectionsType::from_name(&n.id)
+                        == Some(crate::CollectionsType::Namedtuple))
                     || matches!(call.func.as_ref(), ExprType::Attribute(a)
                         if a.attr == "NamedTuple"
                             && matches!(a.value.as_ref(), ExprType::Name(n)
@@ -5723,7 +5725,9 @@ fn infer_field_type(
             // (urllib3's RecentlyUsedContainer._container): the boxed
             // PyDict, matching `dict[str, Any]` lowering.
             ExprType::Name(n)
-                if matches!(n.id.as_str(), "dict" | "OrderedDict" | "defaultdict") =>
+                if n.id == "dict"
+                    || crate::CollectionsType::from_name(&n.id)
+                        .is_some_and(crate::CollectionsType::is_map_field) =>
             {
                 Some(crate::TypeInfo::Dict(
                     Box::new(crate::TypeInfo::String),

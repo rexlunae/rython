@@ -20864,3 +20864,160 @@ fn print_keywords_properties_and_conversions_follow_cpythons_evaluation_order() 
     // Verified against python3 (3.12).
     assert_eq!(got, vec!["[1]", "[1]3", "[1] 0", "[1, 2] done"]);
 }
+
+#[test]
+fn collections_namedtuple_import_builds() {
+    // `from collections import namedtuple` emitted `use
+    // stdpython::collections::namedtuple`, but namedtuple is a
+    // conversion-time class factory with no runtime item: every program
+    // importing it failed E0432, including the supported `class
+    // T(namedtuple(...))` base (issue #367 drops the base with a warning).
+    // The import now drops like the other names with no runtime item.
+    let scratch = Scratch::new("ntimport");
+    let file = scratch.path().join("nt_import.py");
+    fs::write(
+        &file,
+        concat!(
+            "from collections import namedtuple\n",
+            "\n",
+            "\n",
+            "class Tag(namedtuple(\"_Tag\", [\"name\"])):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    total = 0\n",
+            "    for n in [3, 4]:\n",
+            "        total += n\n",
+            "    print(\"total\", total)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/nt_import"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "total 7\n");
+}
+
+#[test]
+fn a_reexported_alias_still_reports_the_collections_refusal() {
+    // `compat.py` re-exports `ChainMap` under the alias `CM`, and the caller
+    // writes `CM({...})`. The terminal hop of the re-export chain returned the
+    // ALIAS rather than resolving the imported name, so the constructor was
+    // unrecognised and the refusal never fired — the call fell through to a
+    // bare rustc error instead of the conversion message naming the rewrite.
+    let scratch = Scratch::new("reexport_alias");
+    let pkg = scratch.path().join("reexport_alias");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"reexport_alias\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    let file = pkg.join("use_alias.py");
+    fs::write(
+        pkg.join("compat.py"),
+        concat!(
+            "from collections import ChainMap as CM\n",
+            "\n",
+            "\n",
+            "class Other:\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &file,
+        concat!(
+            "from .compat import CM\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    c = CM({'a': 1})\n",
+            "    print(len(c))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let err = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect_err("ChainMap construction must fail conversion, naming the rewrite");
+    let message = err.to_string();
+    assert!(
+        message.contains("`collections.ChainMap(...)` is not supported yet")
+            && message.contains("**d2, **d1"),
+        "the aliased re-export must still report the ChainMap refusal: {message}"
+    );
+}
+
+#[test]
+fn an_unrelated_alias_named_collections_is_not_a_collections_call() {
+    // `from .helpers import collections as col` binds a SIBLING's own export
+    // under the name `collections`. The resolver trusted the alias text
+    // alone, so `col.Counter()` was rejected as though the caller had
+    // imported the standard library's Counter — a valid call turned into a
+    // conversion error.
+    let scratch = Scratch::new("unrelated_collections_alias");
+    let pkg = scratch.path().join("unrelated_alias");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"unrelated_alias\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    let file = pkg.join("use_unrelated.py");
+    fs::write(
+        pkg.join("helpers.py"),
+        concat!(
+            "class collections:\n",
+            "    @staticmethod\n",
+            "    def Counter() -> int:\n",
+            "        return 41\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &file,
+        concat!(
+            "from .helpers import collections as col\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(col.Counter())\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect("an unrelated `collections` alias is not a collections call");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join(format!("target/debug/{}", krate.name)))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "41\n");
+}

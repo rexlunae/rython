@@ -61,7 +61,7 @@ pub fn check_aliasing(
             .filter(|(_, t)| {
                 matches!(
                     t,
-                    TypeInfo::Collection(crate::CollectionsType::DefaultDict, _)
+                    TypeInfo::Collection(crate::CollectionsType::Defaultdict, _)
                 )
             })
             .map(|(n, _)| n.clone())
@@ -475,7 +475,7 @@ fn function_mutates_param(func: &FunctionDef, index: usize) -> bool {
         };
         matches!(
             crate::ast::tree::type_ctx::collections_class_of(head, None),
-            Some(crate::CollectionsType::DefaultDict)
+            Some(crate::CollectionsType::Defaultdict)
         )
     });
     scan_mutations(&func.body, &param.arg)

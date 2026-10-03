@@ -2152,8 +2152,11 @@ groups; backreferences/lookarounds are a loud `re.error`),
 reader/writer thread a literal `delimiter=` and a named dialect from a
 std-gated `register_dialect`/`get_dialect` registry — dialect OBJECTS,
 `DictReader`/`DictWriter`/`Sniffer`/`field_size_limit` stay unsupported),
-`collections` (`deque`, `defaultdict`, `OrderedDict` — exactly the surface
-§10.2.2 lists; `Counter`, `ChainMap`), `pathlib`, `glob`, `subprocess`, `tempfile`, `argparse`
+`collections` (`deque`, `defaultdict`, `OrderedDict` construct, but most
+of their methods fail in rustc — §12.1, issue #427; a `Counter(...)` or
+`ChainMap(...)` construction is a conversion error naming a plain-dict
+rewrite; `namedtuple` only as a dropped class base, issue #367),
+`pathlib`, `glob`, `subprocess`, `tempfile`, `argparse`
 (conversion-time; §10.3), `string`, `io` (`StringIO`/`BytesIO`),
 `threading` (§10.5), `socket` (§10.5), `numpy` (a sizable subset with
 pluggable execution backends). `urllib.request` (§10.5) rides the
@@ -2631,6 +2634,9 @@ in generated code rather than a conversion-time message:
   likewise surfaces only when rustc sees a use.
 - Most aliasing shapes (`b = a` then mutate) fail in rustc's move
   checker (issue #79 proposes conversion-time detection).
+- `collections.deque`/`defaultdict`/`OrderedDict` construct, but their
+  basic methods (`append`, `d[k]`, `d[k] += v`, `keys()`) and their use
+  as module-level globals fail in rustc (issue #427).
 
 - `m.groups()` returns `Vec<String>` and FAILS LOUDLY (a ValueError-
   typed panic) when a capture group did not participate: Python yields
@@ -2747,7 +2753,6 @@ accepted as permanent spec:
 | `math.gamma`/`math.lgamma` pole ValueError message matches CPython **<= 3.12** (`math domain error`), not 3.14's `expected a noninteger or positive integer, got ...` — the message changed across CPython versions and rython keeps the 3.12 oracle's wording (version-robust); the pole is still a ValueError either way | Documented version choice |
 | `np.dot` returns an ARRAY for the 1-D x 1-D case unless both operands are provably 1-D at conversion time, where numpy returns a scalar; the printed form is identical either way, so only arithmetic on the result differs | Model limit of one static type per expression (issue #206) |
 | numpy `RuntimeWarning`s (integer divide by zero, invalid value) are not emitted; the VALUES match numpy exactly | Model limit; no `warnings` machinery on the numpy path |
-| Verified stdlib divergences (json/defaultdict ordering, `math.remainder`, `strftime` edge cases, `glob` paths, `pathlib` edges, `string.Template`, …) | Tracked as defects in issue #82 |
 | `functools.singledispatch` picks the FIRST registered type the argument matches, not CPython's MRO walk; a registration on a base class followed by one on its subclass resolves to the base | Model limit (issue #181); disjoint concrete registrations — what real code writes — agree exactly |
 | Dict literal values that are INSTANCES of two sibling classes of one hierarchy (`{"a": Cat("c"), "b": Dog("d")}` under `class Animal`) CONVERT to the hierarchy root, but the per-value `.into()` conversions are unanchored inside the inference-based `PyDict::from`, so the generated crate fails in rustc (E0277 `!: From<Cat>`) — a class-sum-in-dict shape that predates the round-100 dict gate; anchoring the literal's value type (a typed `PyDict::<K, Root>::from`) is the follow-up | Defect (issue #137 class-values family, round 100)
 | A CLASS NAME in value position lowers to its NAME STRING (`[ChecksumError]` → `vec!["ChecksumError".to_string()]`; `pool_classes_by_scheme` → `PyDict<String, String>`) — the class object's only runtime-relevant data, since exceptions are string-tagged; identity comparisons of class values compare names, and a dynamic `except <boxed value>:` matches the strings | Model limit (issue #137 round 33); the class's runtime attributes and hierarchy beyond exact-name matching are unmodeled, and a call THROUGH an indirect class value (`pool_cls(...)` read from the dict) fails in rustc (§12.1) |

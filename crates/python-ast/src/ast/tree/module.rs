@@ -1578,7 +1578,7 @@ impl CodeGen for Module {
                 // container is not `Sync`, so it cannot be an immutable
                 // static anyway). Loud, with the rewrite.
                 if crate::ast::tree::collections_lower::construction_kind(&a.value, &symbols)
-                    == Some(crate::CollectionsType::DefaultDict)
+                    == Some(crate::CollectionsType::Defaultdict)
                 {
                     let name = assign_name_targets(a)
                         .map(|n| n.join(", "))
@@ -1602,6 +1602,7 @@ impl CodeGen for Module {
                 // boxed fallback has no `PyValue` form for these containers.
                 if let Some(kind) =
                     crate::ast::tree::collections_lower::construction_kind(&a.value, &symbols)
+                    && kind.has_construction_lowering()
                     && let [crate::ExprType::Name(target)] = a.targets.as_slice()
                     && !options.name_types.get(&target.id).is_some_and(|t| {
                         matches!(t, crate::TypeInfo::Collection(k, _) if *k == kind)
@@ -1610,8 +1611,11 @@ impl CodeGen for Module {
                 {
                     let example = match kind {
                         crate::CollectionsType::Deque => "deque[int]",
-                        crate::CollectionsType::DefaultDict => "defaultdict[str, int]",
+                        crate::CollectionsType::Defaultdict => "defaultdict[str, int]",
                         crate::CollectionsType::OrderedDict => "OrderedDict[str, int]",
+                        // Construction for the other names is refused at
+                        // conversion, so `kind` cannot be one of them here.
+                        _ => "object",
                     };
                     return Err(wrap_module_error(
                         &module_filename,
