@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import rank_causes
 import run_sweep
 import summarize
 
@@ -301,6 +302,92 @@ class EntryPointTests(unittest.TestCase):
             self.assertEqual(p.returncode, 1)
             self.assertIn("grand total delta: unavailable", p.stdout)
 
+class RankCausesTests(unittest.TestCase):
+    """The ranking must count the boundary it names, or it misleads the next round."""
+
+    METHOD_ON_PYVALUE = ("no method named `close` found for enum `stdpython::PyValue` "
+                         "in the current scope")
+    METHOD_ON_OTHER = ("no method named `push` found for enum `PyList` "
+                       "in the current scope")
+    FIELD_ON_PYVALUE = "no field `timeout` on type `stdpython::PyValue`"
+
+    def message(self, code, text, file_name="src/demo.rs"):
+        return {"level": "error", "code": {"code": code}, "message": text,
+                "spans": [{"is_primary": True, "file_name": file_name}]}
+
+    def write_workdir(self, tmp, messages, package="demo"):
+        workdir = Path(tmp)
+        lines = [json.dumps({"reason": "compiler-message",
+                             "message": m}) for m in messages]
+        (workdir / f"{package}-cargo.jsonl").write_text("\n".join(lines) + "\n")
+        return workdir
+
+    def record(self, tmp, histogram):
+        path = Path(tmp) / "run.json"
+        path.write_text(json.dumps({
+            "rypip_commit": "abc1234",
+            "packages": {"demo": {"status": "build-failed", "histogram": histogram}}}))
+        return path
+
+    def run_rank(self, histogram, messages):
+        with tempfile.TemporaryDirectory() as tmp:
+            record = self.record(tmp, histogram)
+            workdir = self.write_workdir(tmp, messages)
+            argv = ["rank_causes.py", str(record), "--workdir", str(workdir)]
+            with patch.object(sys, "argv", argv), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                code = rank_causes.main()
+            return code, out.getvalue()
+
+    def test_pyvalue_boundary_is_counted_apart_from_other_receivers(self):
+        code, text = self.run_rank(
+            {"E0599": 2, "E0609": 1},
+            [self.message("E0599", self.METHOD_ON_PYVALUE),
+             self.message("E0599", self.METHOD_ON_OTHER),
+             self.message("E0609", self.FIELD_ON_PYVALUE)])
+        self.assertEqual(code, 0)
+        # 2 of 3 sites are the boundary; the other-receiver site is separate.
+        self.assertIn("the PyValue attribute boundary: 2 sites", text)
+        self.assertIn("E0599 no method on PyValue", text)
+        self.assertIn("E0599 no method (other receiver)", text)
+        self.assertIn("E0609 no field on PyValue", text)
+
+    def test_percentages_use_the_record_histogram_not_the_event_count(self):
+        # One event for a 100-error code: the share must come from the
+        # record's histogram, so a sampled log cannot inflate the ranking.
+        code, text = self.run_rank(
+            {"E0599": 99, "E0609": 1},
+            [self.message("E0599", self.METHOD_ON_PYVALUE)])
+        self.assertEqual(code, 0)
+        self.assertIn("total  : 100 E-coded errors", text)
+        self.assertIn("(1.0% of 100)", text)
+
+    def test_missing_workdir_is_an_explicit_failure_not_an_empty_ranking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record = self.record(tmp, {"E0599": 1})
+            argv = ["rank_causes.py", str(record),
+                    "--workdir", str(Path(tmp) / "absent")]
+            with patch.object(sys, "argv", argv), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(rank_causes.main(), 1)
+            self.assertIn("no E0599/E0609 events found", out.getvalue())
+
+    def test_non_record_input_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "bad.json"
+            bad.write_text(json.dumps({"packages": "not-a-dict"}))
+            with self.assertRaises(SystemExit):
+                rank_causes.load_record(bad)
+
+    def test_a_zero_error_corpus_is_an_explicit_refusal_not_an_empty_ranking(self):
+        # A clean build is not a frontier: ranking must say so, not divide by zero.
+        code, text = self.run_rank({}, [])
+        self.assertEqual(code, 1)
+        self.assertIn("Nothing to rank", text)
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 if __name__ == "__main__":
     unittest.main()

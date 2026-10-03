@@ -156,3 +156,47 @@ Recorded baselines are per-commit, not per-corpus: a record is only a valid
 comparison point when its provenance matches the candidate's checkout and
 binary. `summarize.py` will refuse a whole-corpus delta rather than compare
 runs it cannot account for.
+
+## Ranking the shared causes (`rank_causes.py`)
+
+`run_sweep.py` answers "how many errors?"; `rank_causes.py` answers "which fix
+moves the frontier?" by merging the per-package histograms into one corpus
+histogram and splitting each code by the shape of its messages:
+
+```sh
+python3 eval/sweep/rank_causes.py results/run-28efebd-accounting.json \
+  --workdir /tmp/rython-sweep
+```
+
+It needs the workdir the sweep ran in — the record carries histograms and E0308
+pairs, but only the Cargo JSONL events carry message text.
+
+At `28efebd` the top four codes are **90% of the corpus**: E0308 (941), E0599
+(600), E0277 (550), E0609 (406). Within E0599/E0609 the dominant shape is
+**attribute access on a statically-`PyValue` receiver** — 598 sites, 21.6% of
+all errors, spread across 31 generated files:
+
+| | on `PyValue` | other receiver |
+|---|---:|---:|
+| E0599 no method | 298 | 200 |
+| E0609 no field | 300 | 106 |
+
+**Why:** `stdpython::PyValue` has twelve variants (`Int`, `Float`, `Bool`,
+`Str`, `Bytes`, `Tuple`, `Dict`, `OrderedDict`, `Complex`, `Range`, `Function`,
+`None_`) and **no instance variant**, plus no attribute accessor at all. So a
+value that inference files into a `PyValue` slot has nowhere to keep its
+fields, and every `x.attr` / `x.method()` on it fails to resolve — the
+generated crate stops compiling at that line. Top casualties: `.close()` (53),
+`.py_set_index()` (30), `.py_items()` (24), `.domain` (24), `.timeout` (19),
+`.py_get()` (19), `.is_closed` (19).
+
+This is a **model limit, not a codegen bug**: a typed inference run could name
+the slot's concrete type, but the boundary recurs in 31 files, so it is best
+attacked as a class of value-loss rather than per-site. The E0277 overlap (347
+of 550) is the same boundary seen as trait bounds. Any fix here must stay
+correct-or-loud: widening a slot's type must not silently accept an attribute
+the Python source would raise `AttributeError` for.
+
+`rank_causes.py` is analysis, not measurement: it reads an existing record and
+never rebuilds, so a stale workdir yields a ranking of stale logs. Check the
+record's `rypip_commit` before trusting its output.
