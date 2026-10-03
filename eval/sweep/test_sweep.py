@@ -328,11 +328,11 @@ class RankCausesTests(unittest.TestCase):
         (workdir / f"{package}-cargo.jsonl").write_text("\n".join(lines) + "\n")
         return workdir
 
-    def record(self, tmp, histogram):
+    def record(self, tmp, histogram, package="demo"):
         path = Path(tmp) / "run.json"
         path.write_text(json.dumps({
             "rypip_commit": "abc1234",
-            "packages": {"demo": {"status": "build-failed", "histogram": histogram}}}))
+            "packages": {package: {"status": "build-failed", "histogram": histogram}}}))
         return path
 
     def run_rank(self, histogram, messages):
@@ -359,14 +359,19 @@ class RankCausesTests(unittest.TestCase):
         self.assertIn("E0609 no field on PyValue", text)
 
     def test_percentages_use_the_record_histogram_not_the_event_count(self):
-        # One event for a 100-error code: the share must come from the
-        # record's histogram, so a sampled log cannot inflate the ranking.
-        code, text = self.run_rank(
-            {"E0599": 99, "E0609": 1},
-            [self.message("E0599", self.METHOD_ON_PYVALUE)])
-        self.assertEqual(code, 0)
-        self.assertIn("total  : 100 E-coded errors", text)
-        self.assertIn("(1.0% of 100)", text)
+        # The shape share comes from the corpus total (the record's
+        # histogram), so it stays meaningful when only a sample of the
+        # events for a code is present in the workdir.
+        with tempfile.TemporaryDirectory() as tmp:
+            record = self.record(tmp, {"E0599": 99, "E0609": 1})
+            workdir = self.write_workdir(tmp, [], package="demo")
+            argv = ["rank_causes.py", str(record), "--workdir", str(workdir)]
+            with patch.object(sys, "argv", argv), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                # Reconciled counts differ, so the log set is refused rather
+                # than ranked against a histogram it does not match.
+                self.assertEqual(rank_causes.main(), 1)
+            self.assertIn("do not match what was measured", out.getvalue())
 
     def test_missing_workdir_is_an_explicit_failure_not_an_empty_ranking(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -438,14 +443,20 @@ class RankCausesTests(unittest.TestCase):
             self.assertIn("NOT COMPARABLE", text)
             self.assertIn("gone", text)
 
-    def test_shapes_report_the_unattributed_remainder(self):
+    def test_shapes_separate_unmatched_attribute_errors_from_other_codes(self):
+        # An E0609 whose message matches no shape is still E0609, so it must
+        # not be reported as "another code".
         code, text = self.run_rank(
-            {"E0599": 1, "E0308": 5},
+            {"E0599": 1, "E0609": 1, "E0308": 2},
             [self.message("E0599", self.METHOD_ON_PYVALUE),
+             self.message("E0609", "some future rustc wording for a missing field"),
+             self.message("E0308", "mismatched types"),
              self.message("E0308", "mismatched types")])
         self.assertEqual(code, 0)
-        # The E0308 site must be visible, not silently dropped by the shapes.
-        self.assertIn("outside E0599/E0609", text)
+        self.assertIn("E0599/E0609 not matching a shape above", text)
+        self.assertIn("(other codes", text)
+        # E0308's 2 errors are the "other codes" row; the unmatched E0609 is not.
+        self.assertIn("     2  (other codes", text)
 
     def test_a_zero_error_corpus_is_an_explicit_refusal_not_an_empty_ranking(self):
         # A clean build is not a frontier: ranking must say so, not divide by zero.

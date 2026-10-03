@@ -50,7 +50,7 @@ class MissingLog:
 
 
 def read_events(workdir: Path, packages: list[str]):
-    """Yield error-level compiler messages for the GENERATED CRATE only.
+    """Yield (package, error-level compiler message) for the GENERATED CRATE only.
 
     Mirrors `run_sweep.parse_build`: a diagnostic whose target is outside
     the crate (a dependency) belongs to `dependency_errors` in the record,
@@ -61,7 +61,7 @@ def read_events(workdir: Path, packages: list[str]):
         crate = workdir / f"crate-{name}"
         path = workdir / f"{name}-cargo.jsonl"
         if not path.is_file():
-            yield MissingLog(name)  # the caller refuses a partial ranking
+            yield name, MissingLog(name)  # the caller refuses a partial ranking
             continue
         for line in path.read_text(errors="replace").splitlines():
             line = line.strip()
@@ -81,7 +81,7 @@ def read_events(workdir: Path, packages: list[str]):
                 target = str(crate / target)
             if target is None or not Path(target).resolve().is_relative_to(crate.resolve()):
                 continue
-            yield message
+            yield name, message
 
 
 def is_plain_pyvalue(receiver: str) -> bool:
@@ -98,6 +98,16 @@ def is_plain_pyvalue(receiver: str) -> bool:
 
 def code_of(message: dict):
     return (message.get("code") or {}).get("code")
+
+
+def is_e_coded(code) -> bool:
+    """Only E-numbers are the corpus metric.
+
+    A denied lint also has a JSON `code`, but it is a lint name rather than
+    an E-number, and `parse_build` records it as uncoded. Counting one here
+    would put a non-historical error into a ranking of E-coded errors.
+    """
+    return bool(code) and re.fullmatch(r"E[0-9]{4}", code) is not None
 
 
 def site_file(message: dict):
@@ -146,15 +156,17 @@ def main() -> int:
     code_pyvalue = collections.Counter()
     files = collections.Counter()
     missing = []
+    seen = collections.Counter()
 
-    for message in read_events(args.workdir, sorted(packages)):
+    for package, message in read_events(args.workdir, sorted(packages)):
         if isinstance(message, MissingLog):
-            missing.append(message.package)
+            missing.append(package)
             continue
         code = code_of(message)
         text = message.get("message", "")
-        if code:
+        if is_e_coded(code):
             code_total[code] += 1
+            seen[package] += 1
         if code == "E0599":
             found = METHOD.search(text)
             if found:
@@ -191,6 +203,21 @@ def main() -> int:
         print("   Refusing to rank a partial log set against the full corpus.")
         return 1
 
+    # A reused workdir can hold a complete-looking log set from a DIFFERENT
+    # sweep. Presence is not provenance: require each package's E-coded
+    # event count to match the histogram the record recorded for it.
+    mismatched = [name for name, result in packages.items()
+                  if seen[name] != sum((result.get("histogram") or {}).values())]
+    if mismatched:
+        print("== NOT COMPARABLE: Cargo logs disagree with the record ==")
+        for name in sorted(mismatched):
+            recorded = sum((packages[name].get("histogram") or {}).values())
+            print(f"   {name}: record records {recorded} E-coded errors, "
+                  f"log has {seen[name]}")
+        print("   The workdir does not belong to this record's sweep.")
+        print("   Refusing to rank logs that do not match what was measured.")
+        return 1
+
     if not shapes:
         print("== no E0599/E0609 events found in the generated crates ==")
         print(f"(looked for <package>-cargo.jsonl in {args.workdir})")
@@ -199,10 +226,17 @@ def main() -> int:
     print("== E0599/E0609 message shapes ==")
     for shape, count in shapes.most_common():
         print(f"{count:6}  {shape}")
-    # Everything else the crates reported, so the shapes never look like the
-    # whole corpus. Ranked by code in the histogram above.
-    print(f"{sum(code_total.values()) - sum(shapes.values()):6}  "
-          "(outside E0599/E0609 — ranked by code above)")
+    # An E0599/E0609 the patterns did not match is still one of those codes,
+    # so it gets its own row rather than being folded into "other codes".
+    classified = sum(shapes.values())
+    attribute_codes = corpus.get("E0599", 0) + corpus.get("E0609", 0)
+    unmatched = max(attribute_codes - classified, 0)
+    # Everything else comes from the RECORD's histogram, so this is the true
+    # non-attribute share and cannot absorb lint codes or unmatched shapes.
+    other = sum(n for c, n in corpus.items() if c not in ("E0599", "E0609"))
+    if unmatched:
+        print(f"{unmatched:6}  E0599/E0609 not matching a shape above")
+    print(f"{other:6}  (other codes — ranked in the histogram above)")
     print()
 
     boundary = sum(methods.values()) + sum(fields.values())
