@@ -3210,6 +3210,44 @@ fn dict_literals_and_methods_lower_through_pydict() {
 }
 
 #[test]
+fn a_boxed_dict_get_default_matches_the_boxed_value_type() {
+    // `dict[str, Any]` infers the receiver's VALUE type as PyValue, so the
+    // default must render AS a PyValue too. Rendering it as a bare String
+    // emitted `.py_get_default(&k, "D")` against a PyDict<String, PyValue>
+    // receiver — a type mismatch that stopped the generated crate compiling
+    // (issue #137's frontier). The `pop(key, default)` arm already rendered
+    // the default as the dict's value type; `get` now matches it.
+    let out = compile(
+        "def f(d: dict[str, typing.Any]) -> typing.Any:\n    return d.get(\"k\", \"D\")\n",
+        "boxedget.py",
+    );
+    assert!(
+        out.contains("py_get_default"),
+        "generated: {}",
+        out
+    );
+    // The default arrives boxed, never as a `&'static str` literal: a
+    // `&'static str` default cannot be produced from a stored member without
+    // inventing a lifetime.
+    assert!(
+        !out.contains("py_get_default (& ((\"k\") . to_string ()) , \"D\")"),
+        "the str default must be boxed for a PyValue-valued dict: {}",
+        out
+    );
+    // A concretely-typed dict keeps its own value type — the fix must not
+    // over-box a `dict[str, int]`'s default.
+    let out = compile(
+        "def g(d: dict[str, int]) -> int:\n    return d.get(\"k\", 0)\n",
+        "typedget.py",
+    );
+    assert!(
+        out.contains("py_get_default (& ((\"k\") . to_string ()) , 0)"),
+        "generated: {}",
+        out
+    );
+}
+
+#[test]
 fn del_full_slice_clears_in_place() {
     // Python: `del xs[:]` on ["a","b","c"] leaves []; the lowering is the
     // container's in-place clear. Verified against python3.

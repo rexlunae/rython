@@ -3136,6 +3136,219 @@ impl PyValue {
             _ => None,
         }
     }
+
+    // ── Container operations on a boxed value ─────────────────────────────
+    //
+    // A value inference files into a `PyValue` slot keeps its runtime type
+    // but loses its static one, so `d.get(k)`, `d.items()` and `xs[a:b]` on it
+    // had no method to call and the generated crate failed to compile (589
+    // such sites in the #137 corpus at 28efebd). `PyValue` already dispatches
+    // indexing this way (`PyIndex<&str>`); these are the same model extended
+    // to the rest of the container surface, per the member-view convention
+    // (`is_*` / `as_*` on `StrOrBytes`).
+    //
+    // CPython is the authority: a dict member gets the dict operation, a
+    // str/bytes/tuple member the sequence one (str by CHARACTER, bytes by
+    // OCTET — the line `len` already draws), and anything else raises
+    // CPython's own TypeError. A boxed value that is not a container must
+    // fail loudly, never default silently.
+
+    fn as_dict_like(&self) -> Option<&PyDict<String, PyValue>> {
+        match self {
+            PyValue::Dict(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    fn as_ordered_like(&self) -> Option<&Arc<crate::collections::OrderedDict<String, PyValue>>> {
+        match self {
+            PyValue::OrderedDict(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// CPython's refusal for a container operation on a member that is not a
+    /// container. Public so generated code (and tests) can raise the same
+    /// error the infallible trait methods panic with.
+    pub fn not_a_container(&self, op: &str) -> PyException {
+        PyException::new(
+            "TypeError",
+            format!("'{}' object does not support {}", py_value_type_name(self), op),
+        )
+    }
+
+    /// `d.items()` over a boxed dict, (String, PyValue) in insertion order.
+    fn py_dict_items(&self) -> Result<Vec<(String, PyValue)>, PyException> {
+        if let Some(d) = self.as_dict_like() {
+            return Ok(d.py_items());
+        }
+        if let Some(d) = self.as_ordered_like() {
+            return Ok(PyDictOps::py_items(d.as_ref()));
+        }
+        Err(self.not_a_container("items()"))
+    }
+
+    /// `d.get(k)` on a boxed dict: the member, or None when absent.
+    fn boxed_get(&self, key: &str) -> Result<Option<PyValue>, PyException> {
+        let owned = key.to_string();
+        if let Some(d) = self.as_dict_like() {
+            return Ok(d.py_get(&owned));
+        }
+        if let Some(d) = self.as_ordered_like() {
+            return Ok(PyDictOps::py_get(d.as_ref(), &owned));
+        }
+        Err(self.not_a_container("a dict lookup"))
+    }
+}
+
+// ── The container ops codegen emits on a boxed receiver ───────────────────
+//
+// The names and argument types here are fixed by what call.rs / attribute.rs
+// generate for a receiver that inference boxed to `PyValue`; the SEMANTICS are
+// CPython's, delegated to the same traits the concrete containers implement,
+// so a boxed dict and a typed dict cannot drift apart.
+
+impl PyDictOps<String, PyValue> for PyValue {
+    fn py_get(&self, key: &String) -> Option<PyValue> {
+        self.boxed_get(key).ok().flatten()
+    }
+    fn py_get_default(&self, key: &String, default: PyValue) -> PyValue {
+        self.boxed_get(key).ok().flatten().unwrap_or(default)
+    }
+    fn py_keys(&self) -> Vec<String> {
+        self.py_dict_items()
+            .map(|items| items.into_iter().map(|(k, _)| k).collect())
+            .unwrap_or_default()
+    }
+    fn py_values(&self) -> Vec<PyValue> {
+        self.py_dict_items()
+            .map(|items| items.into_iter().map(|(_, v)| v).collect())
+            .unwrap_or_default()
+    }
+    fn py_items(&self) -> Vec<(String, PyValue)> {
+        self.py_dict_items().unwrap_or_default()
+    }
+    fn py_setdefault(&mut self, key: String, default: PyValue) -> PyValue {
+        match self {
+            PyValue::Dict(d) => PyDictOps::py_setdefault(Arc::make_mut(d), key, default),
+            PyValue::OrderedDict(d) => PyDictOps::py_setdefault(Arc::make_mut(d), key, default),
+            // The trait is infallible, so a non-dict member cannot report
+            // CPython's TypeError through it; panic with CPython's message
+            // rather than return a value Python would never produce.
+            other => panic!("{}", other.not_a_container("setdefault()")),
+        }
+    }
+    fn update(&mut self, other: PyDict<String, PyValue>) {
+        match self {
+            PyValue::Dict(d) => PyDictOps::update(Arc::make_mut(d), other),
+            PyValue::OrderedDict(d) => PyDictOps::update(Arc::make_mut(d), other),
+            other => {
+                other.not_a_container("update()");
+            }
+        }
+    }
+}
+
+impl PySetIndex<String, PyValue> for PyValue {
+    fn py_set_index(&mut self, key: String, value: PyValue) -> Result<(), PyException> {
+        match self {
+            PyValue::Dict(d) => PySetIndex::py_set_index(Arc::make_mut(d), key, value),
+            PyValue::OrderedDict(d) => PySetIndex::py_set_index(Arc::make_mut(d), key, value),
+            other => Err(other.not_a_container("item assignment")),
+        }
+    }
+}
+
+impl PySetIndex<&str, PyValue> for PyValue {
+    fn py_set_index(&mut self, key: &str, value: PyValue) -> Result<(), PyException> {
+        PySetIndex::py_set_index(self, key.to_string(), value)
+    }
+}
+
+impl PyPop<String> for PyValue {
+    type Output = PyValue;
+    /// `d.pop(k)` on a boxed dict. `PyPop` already raises CPython's KeyError
+    /// for a missing key, so the dict arm propagates it unchanged.
+    fn py_pop(&mut self, key: String) -> Result<PyValue, PyException> {
+        match self {
+            PyValue::Dict(d) => PyPop::py_pop(Arc::make_mut(d), key),
+            PyValue::OrderedDict(d) => PyPop::py_pop(Arc::make_mut(d), key),
+            other => Err(other.not_a_container("pop()")),
+        }
+    }
+}
+
+impl PyPop<&str> for PyValue {
+    type Output = PyValue;
+    fn py_pop(&mut self, key: &str) -> Result<PyValue, PyException> {
+        PyPop::py_pop(self, key.to_string())
+    }
+}
+
+impl PySlice for PyValue {
+    type Output = PyValue;
+    /// `xs[a:b:c]` on a boxed value: str by character, bytes by octet (the
+    /// same line `len` draws), and a tuple member stays a tuple.
+    fn py_slice(&self, start: Option<i64>, stop: Option<i64>, step: Option<i64>) -> PyValue {
+        match self {
+            PyValue::Str(s) => PyValue::Str(s.as_str().py_slice(start, stop, step)),
+            PyValue::Bytes(b) => PyValue::Bytes(slice(b.as_slice(), start, stop, step).to_vec()),
+            PyValue::Tuple(members) => {
+                PyValue::Tuple(Arc::new(slice(members.as_slice(), start, stop, step)))
+            }
+            // The str surface is infallible by construction, so there is no
+            // Result to carry CPython's TypeError through; panic with its
+            // message rather than return a wrong value.
+            other => panic!("'{}' object is not subscriptable", py_value_type_name(other)),
+        }
+    }
+}
+
+impl PySliceReplace for PyValue {
+    type Item = PyValue;
+    /// `xs[a:b] = replacement` on a boxed value (step 1 only; the
+    /// extended-slice path is separate).
+    fn py_slice_assign(&mut self, start: Option<i64>, stop: Option<i64>, replacement: Vec<PyValue>) {
+        if let PyValue::Tuple(members) = self {
+            let mut out = (**members).clone();
+            PySliceReplace::py_slice_assign(&mut out, start, stop, replacement);
+            *members = Arc::new(out);
+        }
+    }
+    fn py_slice_assign_step(
+        &mut self,
+        start: Option<i64>,
+        stop: Option<i64>,
+        step: i64,
+        replacement: Vec<PyValue>,
+    ) -> Result<(), PyException> {
+        match self {
+            PyValue::Tuple(members) => {
+                let mut out = (**members).clone();
+                PySliceReplace::py_slice_assign_step(&mut out, start, stop, step, replacement)
+            }
+            other => Err(other.not_a_container("slice assignment")),
+        }
+    }
+    fn py_slice_delete(&mut self, start: Option<i64>, stop: Option<i64>) {
+        if let PyValue::Tuple(members) = self {
+            let mut out = (**members).clone();
+            PySliceReplace::py_slice_delete(&mut out, start, stop);
+            *members = Arc::new(out);
+        }
+    }
+    fn py_slice_delete_step(
+        &mut self,
+        start: Option<i64>,
+        stop: Option<i64>,
+        step: i64,
+    ) -> Result<(), PyException> {
+        if let PyValue::Tuple(members) = self {
+            let mut out = (**members).clone();
+            return PySliceReplace::py_slice_delete_step(&mut out, start, stop, step);
+        }
+        Err(self.not_a_container("slice deletion"))
+    }
 }
 
 impl AsStrLike for PyValue {

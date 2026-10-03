@@ -5785,3 +5785,143 @@ mod boxed_ordereddict {
         assert_eq!(stdpython::urllib::parse::urlencode(&q, false).unwrap(), "b=1&a=2");
     }
 }
+
+// ── Container operations on a boxed value (issue #137 frontier) ─────────────
+//
+// A value inference files into a `PyValue` slot lost its static type, so
+// `d.get(k)`, `d.items()`, `d.pop(k)` and `xs[a:b]` on it had no method to
+// call and the generated crate failed to compile (111 such sites in the #137
+// corpus at 28efebd). Each test carries the CPython expression it pins,
+// verified against python3 3.14.1.
+
+mod boxed_container_ops {
+    use stdpython::{
+        PyContains, PyDict, PyDictOps, PyException, PyPop, PySetIndex, PySlice, PyValue,
+    };
+
+    fn boxed_dict(pairs: &[(&str, &str)]) -> PyValue {
+        let mut d = PyDict::new();
+        for (k, v) in pairs {
+            PySetIndex::py_set_index(&mut d, k.to_string(), PyValue::Str(v.to_string())).unwrap();
+        }
+        PyValue::Dict(std::sync::Arc::new(d))
+    }
+
+    #[test]
+    fn get_hit_miss_and_default() {
+        // d = {"a": "1", "b": "2"}; d.get("a") == "1"; d.get("zz") is None;
+        // d.get("zz", "D") == "D"
+        let d = boxed_dict(&[("a", "1"), ("b", "2")]);
+        assert_eq!(PyDictOps::py_get(&d, &"a".to_string()), Some(PyValue::Str("1".into())));
+        assert_eq!(PyDictOps::py_get(&d, &"zz".to_string()), None);
+        assert_eq!(
+            PyDictOps::py_get_default(&d, &"zz".to_string(), PyValue::Str("D".into())),
+            PyValue::Str("D".into())
+        );
+    }
+
+    #[test]
+    fn items_keys_and_values_keep_insertion_order() {
+        // dict({"b": "2", "a": "1"}).items() == [("b","2"), ("a","1")]
+        let d = boxed_dict(&[("b", "2"), ("a", "1")]);
+        assert_eq!(PyDictOps::py_items(&d), vec![
+            ("b".to_string(), PyValue::Str("2".into())),
+            ("a".to_string(), PyValue::Str("1".into())),
+        ]);
+        assert_eq!(PyDictOps::py_keys(&d), vec!["b".to_string(), "a".to_string()]);
+        assert_eq!(
+            PyDictOps::py_values(&d),
+            vec![PyValue::Str("2".into()), PyValue::Str("1".into())]
+        );
+    }
+
+    #[test]
+    fn pop_removes_and_raises_cpython_keyerror_on_a_miss() {
+        // d = {"a": "1", "b": "2"}; d.pop("a") == "1", leaving {"b": "2"};
+        // d.pop("zz") raises KeyError: 'zz'
+        let mut d = boxed_dict(&[("a", "1"), ("b", "2")]);
+        assert_eq!(PyPop::py_pop(&mut d, "a".to_string()).unwrap(), PyValue::Str("1".into()));
+        assert_eq!(PyDictOps::py_items(&d), vec![("b".to_string(), PyValue::Str("2".into()))]);
+        let err = PyPop::py_pop(&mut d, "zz".to_string()).unwrap_err();
+        assert_eq!(err.exception_type, "KeyError");
+        assert!(
+            err.message.contains("zz"),
+            "message was {:?}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn setdefault_inserts_only_when_absent() {
+        // d = {"a": "1"}; d.setdefault("n", "N") == "N" and stores it;
+        // d.setdefault("a", "OTHER") == "1" (the stored value wins)
+        let mut d = boxed_dict(&[("a", "1")]);
+        assert_eq!(
+            PyDictOps::py_setdefault(&mut d, "n".to_string(), PyValue::Str("N".into())),
+            PyValue::Str("N".into())
+        );
+        assert_eq!(PyDictOps::py_get(&d, &"n".to_string()), Some(PyValue::Str("N".into())));
+        assert_eq!(
+            PyDictOps::py_setdefault(&mut d, "a".to_string(), PyValue::Str("OTHER".into())),
+            PyValue::Str("1".into())
+        );
+    }
+
+    #[test]
+    fn set_index_then_contains() {
+        // d = {}; d["k"] = "v"; "k" in d is True; "z" in d is False
+        let mut d = boxed_dict(&[]);
+        PySetIndex::py_set_index(&mut d, "k".to_string(), PyValue::Str("v".into())).unwrap();
+        assert_eq!(PyDictOps::py_get(&d, &"k".to_string()), Some(PyValue::Str("v".into())));
+        assert!(PyContains::py_contains(&d, "k"));
+        assert!(!PyContains::py_contains(&d, "z"));
+    }
+
+    #[test]
+    fn str_slices_by_character_and_bytes_by_octet() {
+        // "abcdef"[1:3] == "bc"; [::2] == "ace"; [::-1] == "fedcba";
+        // [9:99] == "" (bounds clamp, never raise); [-2:] == "ef"
+        let s = PyValue::Str("abcdef".into());
+        assert_eq!(s.py_slice(Some(1), Some(3), None), PyValue::Str("bc".into()));
+        assert_eq!(s.py_slice(None, None, Some(2)), PyValue::Str("ace".into()));
+        assert_eq!(s.py_slice(None, None, Some(-1)), PyValue::Str("fedcba".into()));
+        assert_eq!(s.py_slice(Some(9), Some(99), None), PyValue::Str("".into()));
+        assert_eq!(s.py_slice(Some(-2), None, None), PyValue::Str("ef".into()));
+        // b"abcdef"[1:3] == b"bc" — bytes slice by OCTET, the line len draws.
+        let b = PyValue::Bytes(b"abcdef".to_vec());
+        assert_eq!(b.py_slice(Some(1), Some(3), None), PyValue::Bytes(b"bc".to_vec()));
+    }
+
+    #[test]
+    fn a_tuple_member_stays_a_tuple_when_sliced() {
+        // (1, 2, 3, 4)[1:3] == (2, 3) — a tuple, never a list.
+        let t = PyValue::Tuple(std::sync::Arc::new(vec![
+            PyValue::Int(1),
+            PyValue::Int(2),
+            PyValue::Int(3),
+            PyValue::Int(4),
+        ]));
+        let sliced = t.py_slice(Some(1), Some(3), None);
+        assert_eq!(
+            sliced,
+            PyValue::Tuple(std::sync::Arc::new(vec![PyValue::Int(2), PyValue::Int(3)]))
+        );
+        assert_eq!(stdpython::py_value_repr(&sliced), "(2, 3)");
+    }
+
+    #[test]
+    fn a_non_container_member_refuses_rather_than_returning_a_wrong_value() {
+        // 5.get("a") and "x".items() are both errors in CPython. The dict
+        // surface is infallible, so these refuse instead of yielding an empty
+        // list Python would never produce. The fallible helper carries the
+        // TypeError; assert on it rather than on the panic path.
+        let n = PyValue::Int(5);
+        let err: PyException = n.not_a_container("items()");
+        assert_eq!(err.exception_type, "TypeError");
+        assert!(err.message.contains("int"), "message was {:?}", err.message);
+        let s = PyValue::Str("x".into());
+        let err: PyException = s.not_a_container("items()");
+        assert_eq!(err.exception_type, "TypeError");
+        assert!(err.message.contains("str"), "message was {:?}", err.message);
+    }
+}
