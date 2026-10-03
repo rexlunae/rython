@@ -125,23 +125,34 @@ The accounting tests are fast and run in CI without downloading the corpus:
 python3 -m unittest discover -s eval/sweep -p 'test_*.py'
 ```
 
-## Recorded post-#373 baseline
+## Recorded baseline at `28efebd`
 
-[`run-e05416c-accounting.json`](results/run-e05416c-accounting.json) measures
-converter commit `e05416c` (merged into main as `419b143`) with schema 2:
+[`run-28efebd-accounting.json`](results/run-28efebd-accounting.json) measures
+converter commit `28efebd` (main, after #429) with schema 2:
 
 | Package | E-coded errors | Other error diagnostics | Build |
 |---|---:|---:|---|
-| urllib3 | 681 | 53 | failed |
+| urllib3 | 605 | 54 | failed |
 | certifi | 0 | 0 | built |
-| idna | 44 | 0 | failed |
-| charset_normalizer | 44 | 3 | failed |
-| requests | 2185 | 195 | failed |
-| **Total** | **2954** | **251** | **1/5 built** |
+| idna | 0 | 0 | built |
+| charset_normalizer | 41 | 3 | failed |
+| requests | 2127 | 205 | failed |
+| **Total** | **2773** | **262** | **2/5 built** |
 
-The JSON E-code histograms match the historical text counter on the same
-build logs. This is a new measurement of existing compiler code, not a
-compiler improvement made by the accounting change. Its matching
-[idiom record](../idioms/results/run-e05416c.json) is **16/17 passing**, with
-the existing baseline holding. Neither measurement establishes coverage of
-omitted modules or unexecuted operations.
+Against the [`24d1987`](results/run-main-24d1987.json) record (a legacy schema
+with unknown uncoded counts, so `summarize.py` reports a coded-only delta):
+urllib3 650 -> 605, charset_normalizer 42 -> 41, requests 2249 -> 2127, certifi
+and idna unchanged at 0 — **-168 coded errors** overall. `idna` builds at this
+commit; it last failed with 44 errors in earlier records. This is a
+measurement of existing compiler code, not an improvement made by the
+accounting change itself. Its matching [idiom
+record](../idioms/results/run-28efebd.json) is **48/49 passing** with
+`--check-baseline` reporting `baseline holds: 49 program(s)`; the single
+failure is `schedule`, an intentional conversion refusal. Neither
+measurement establishes coverage of omitted modules or unexecuted
+operations.
+
+Recorded baselines are per-commit, not per-corpus: a record is only a valid
+comparison point when its provenance matches the candidate's checkout and
+binary. `summarize.py` will refuse a whole-corpus delta rather than compare
+runs it cannot account for.
