@@ -1,14 +1,14 @@
 {
   "schema_version": 2,
-  "rypip_commit": "28efebdd9287f6560c357df47152b7d35dd203d3",
-  "repo_head": "47a0ce0ed1bf0b939c82c2cc13291ee20963cd0b",
+  "rypip_commit": "33356a59f549ee44e1c6f0db2baea783799f5110",
+  "repo_head": "aca31b31475875673fb1845ece66dc2e1b51954d",
   "provenance": {
-    "source_commit": "28efebdd9287f6560c357df47152b7d35dd203d3",
-    "source_sha256": "a5c97c7452770b41b54abfa762185f5140bdc3bc0b6ee2f6c791e2a23bf40da2",
+    "source_commit": "33356a59f549ee44e1c6f0db2baea783799f5110",
+    "source_sha256": "a0ab8e6ed82aa8445a240ff9d32808308d1efc02a5e5618741c203d5d349c74e",
     "source_dirty": true
   },
   "rypip_path": "/Users/tserica/rython-sweep-accounting/target/debug/rypip",
-  "rypip_sha256": "745b570863134f1adca14b05be83a99dfb261a1bad313e9568c0954c534fd8c6",
+  "rypip_sha256": "5cf14063474e396bcb95b734999421a433863d2ee4532bf1004be41f24f9ae34",
   "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: aarch64-apple-darwin\nrelease: 1.97.1\nLLVM version: 22.1.6",
   "python": "3.14.1",
   "packages": {
@@ -524,5 +524,5 @@
     }
   },
   "measurement_complete": true,
-  "elapsed_seconds": 242.3
+  "elapsed_seconds": 250.8
 }
