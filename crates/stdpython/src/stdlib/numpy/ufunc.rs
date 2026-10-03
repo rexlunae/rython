@@ -137,14 +137,6 @@ fn scalar_arr_bool(v: bool) -> NdArray {
     NdArray::new(vec![], Dtype::Bool, Data::Bool(vec![v]))
 }
 
-fn scalar_arr_i32(v: i32) -> NdArray {
-    NdArray::new(vec![], Dtype::Int32, Data::I32(vec![v]))
-}
-
-fn scalar_arr_f32(v: f32) -> NdArray {
-    NdArray::new(vec![], Dtype::Float32, Data::F32(vec![v]))
-}
-
 /// NEP 50 weak promotion of a Python scalar against an array dtype: a
 /// Python float never widens a float32 array (f32 + 0.0 stays f32) and a
 /// Python int never widens an int32 array (i32 + 1 stays i32), while a
@@ -378,40 +370,34 @@ fn binary_array_scalar(
     // promotion — the arithmetic kernels below cannot express that. Route
     // them through the array-array kernel by materializing the scalar
     // (comparisons are not in the hot elementwise-arithmetic path).
+    //
+    // `binary_same_shape` pairs elements positionally, so the scalar is
+    // broadcast to the array's full shape, and the operands keep their
+    // Python order (`2.0 > a` is not `a > 2.0`). A bare 0-d scalar here
+    // compared only element 0 and returned a length-1 buffer under the
+    // array's shape: `a[np.greater(a, 2.0)]` printed `[]` and printing the
+    // mask panicked out of bounds.
     if matches!(
         op,
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
     ) {
-        let scalar_arr = match (d, scalar) {
-            (Dtype::Int32, BinaryOperand::I64(x)) => {
-                match i32::try_from(*x) {
-                    Ok(v) => scalar_arr_i32(v),
-                    Err(_) => panic!(
-                        "{}",
-                        PyException::new(
-                            "OverflowError",
-                            format!("Python integer {x} out of bounds for int32")
-                        )
-                    ),
-                }
-            }
-            (Dtype::Int64, BinaryOperand::I64(x)) => scalar_arr_i64(*x),
-            (Dtype::Float32, BinaryOperand::I64(x)) => scalar_arr_f32(*x as f32),
-            (Dtype::Float32, BinaryOperand::F64(x)) => scalar_arr_f32(*x as f32),
-            (Dtype::Float64, BinaryOperand::F64(x)) => scalar_arr_f64(*x),
-            (Dtype::Float64, BinaryOperand::I64(x)) => scalar_arr_f64(*x as f64),
-            (Dtype::Bool, BinaryOperand::Bool(x)) => scalar_arr_bool(*x),
-            _ => {
-                panic!(
-                    "{}",
-                    PyException::new(
-                        "TypeError",
-                        "unsupported array/scalar dtype combination"
-                    )
-                )
-            }
-        };
-        return Ok(NdArray::binary_same_shape(op, a, &scalar_arr));
+        // The weak-promoted dtype `d` is the array's dtype or float64, so
+        // converting the Python scalar's natural 0-d array to it is exact
+        // for every combination (a bool scalar against an int or float
+        // array included); the int32 overflow case already raised above.
+        let scalar_arr = match scalar {
+            BinaryOperand::I64(x) => scalar_arr_i64(*x),
+            BinaryOperand::F64(x) => scalar_arr_f64(*x),
+            BinaryOperand::Bool(x) => scalar_arr_bool(*x),
+            BinaryOperand::Array(_) => unreachable!("binary_array_scalar needs a scalar"),
+        }
+        .astype(d);
+        let scalar_arr = broadcast_to(&scalar_arr, &a.shape);
+        return Ok(if s_left {
+            NdArray::binary_same_shape(op, &scalar_arr, a)
+        } else {
+            NdArray::binary_same_shape(op, a, &scalar_arr)
+        });
     }
     // A python float on an int/bool array widens to float64: promote the
     // array (one convert pass — numpy does the same), then compute in the
