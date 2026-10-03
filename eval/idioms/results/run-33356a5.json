@@ -1,11 +1,12 @@
 {
-  "converter_commit": "28efebd",
-  "repo_head": "47a0ce0",
+  "converter_commit": "33356a5",
+  "repo_head": "33356a5",
   "rypip_path": "target/debug/rypip",
   "oracle": "CPython 3.14.1 (pins captured under 3.11)",
-  "passed": 48,
+  "passed": 49,
   "total": 50,
   "passing": [
+    "__main__",
     "bank",
     "boxed_constructor",
     "boxed_slots",
@@ -56,6 +57,11 @@
     "views"
   ],
   "programs": {
+    "__main__": {
+      "program": "__main__",
+      "warnings": 0,
+      "status": "pass"
+    },
     "bank": {
       "program": "bank",
       "warnings": 0,
@@ -170,10 +176,6 @@
       "program": "line_tally",
       "warnings": 0,
       "status": "pass"
-    },
-    "main": {
-      "program": "main",
-      "status": "no-expected"
     },
     "math_bare_imports": {
       "program": "math_bare_imports",

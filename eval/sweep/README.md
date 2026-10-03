@@ -210,3 +210,34 @@ not silently accept an attribute the Python source would raise
 `rank_causes.py` is analysis, not measurement: it reads an existing record and
 never rebuilds, so a stale workdir yields a ranking of stale logs. Check the
 record's `rypip_commit` before trusting its output.
+
+### Progress: the container-op cluster (measured)
+
+The first slice of this ranking has landed. `PyValue` now implements the eight
+container operations codegen emits on a boxed receiver (`d.get`, `d.get` with
+a default, `d.items`/`keys`/`values`, `d.setdefault`, `d.pop`, `d[k] = v`,
+`k in d`, `xs[a:b:c]`), plus the codegen fix that renders a `get` default as
+the dict's *value* type rather than a bare `String`.
+
+Measured against `28efebd` with [`run-pyvalue-ops.json`](results/run-pyvalue-ops.json):
+
+| | `28efebd` | this branch |
+|---|---:|---:|
+| PyValue attribute boundary | 589 sites | **477 sites (-112, -19%)** |
+| Container-op sites on `PyValue` | 111 | **0** |
+| E0599 (no method) | 600 | 494 |
+| E0308 (mismatched types) | 941 | 1012 |
+| **Total E-coded** | 2773 | **2748 (-25)** |
+
+**Read the two rows separately.** The net total only moved 25 because
+resolving 112 missing-method sites *revealed* 71 type errors at the same
+lines — the E0308 rise is this fix exposing the next defect, not introducing
+one. The honest statement of what landed: the entire container-op cluster is
+gone (111 → 0), the boundary shrank by a fifth, and the code that remains at
+those sites is a different, narrower problem (value typing, not a missing
+method). A round that fixed the boundary but not the revealed types would show
+a net *rise* here, which is why the per-code breakdown is not optional.
+
+The remaining 477 sites are user-class attributes and methods (`.close()` 53,
+`.data_to_send()` 21, `.copy()` 9, …) — 40 distinct methods — which need an
+instance variant or narrowed inference, not another container impl.
