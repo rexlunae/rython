@@ -3049,19 +3049,87 @@ pub enum PyValue {
     None_,
 }
 
+/// The numeric view of a boxed value: Python's numeric tower, which
+/// `==` and `hash` must agree on (`1 == 1.0 == True == (1+0j)` and
+/// `hash(1) == hash(1.0) == hash(True) == hash(1+0j)`). `bool` is an
+/// `int`; a `complex` carries both parts.
+#[derive(Clone, Copy)]
+enum PyNum {
+    Int(i64),
+    Float(f64),
+    Complex(f64, f64),
+}
+
+impl PyNum {
+    fn of(v: &PyValue) -> Option<PyNum> {
+        match v {
+            PyValue::Int(i) => Some(PyNum::Int(*i)),
+            PyValue::Bool(b) => Some(PyNum::Int(*b as i64)),
+            PyValue::Float(f) => Some(PyNum::Float(*f)),
+            PyValue::Complex(z) => Some(PyNum::Complex(z.real, z.imag)),
+            _ => None,
+        }
+    }
+
+    /// The exact integer a float denotes, when it denotes one that fits
+    /// an `i64` (`1.0` -> 1, `-0.0` -> 0; `2.5`, nan, inf and `1e30` are
+    /// none). CPython compares int and float EXACTLY — `2**53 + 1 ==
+    /// float(2**53)` is False — so an `as f64` cast of the int is wrong.
+    fn float_as_int(f: f64) -> Option<i64> {
+        // -2^63 is representable; 2^63 is the first float past i64::MAX.
+        if f >= -9223372036854775808.0 && f < 9223372036854775808.0 && (f as i64) as f64 == f {
+            Some(f as i64)
+        } else {
+            None
+        }
+    }
+
+    /// Normalize to the one form equal numbers share: an integral value
+    /// in `i64` range is an `Int`; a complex with a zero imaginary part
+    /// is its real part. `Float` keeps only values with no `i64`
+    /// equivalent; `Complex` only those with a non-zero imaginary part.
+    fn canonical(self) -> PyNum {
+        match self {
+            PyNum::Float(f) => match PyNum::float_as_int(f) {
+                Some(i) => PyNum::Int(i),
+                None => PyNum::Float(f),
+            },
+            PyNum::Complex(re, im) if im == 0.0 => PyNum::Float(re).canonical(),
+            other => other,
+        }
+    }
+
+    fn eq_num(self, other: PyNum) -> bool {
+        match (self.canonical(), other.canonical()) {
+            (PyNum::Int(a), PyNum::Int(b)) => a == b,
+            (PyNum::Float(a), PyNum::Float(b)) => a == b,
+            (PyNum::Complex(ar, ai), PyNum::Complex(br, bi)) => ar == br && ai == bi,
+            // Canonical forms never mix kinds for equal values (an Int
+            // vs a non-integral Float, or a real vs a true complex).
+            _ => false,
+        }
+    }
+}
+
 /// Structural equality of boxed values. Same-variant members compare
 /// structurally (a boxed dict ignores order; two boxed OrderedDicts are
 /// ORDER-sensitive, as CPython's are); an OrderedDict equals a dict with
 /// the same items in any order (`OrderedDict(a=1, b=2) == {'b': 2, 'a': 1}`
-/// is True, both ways). Every other cross-variant pair is unequal. The
-/// match names every variant on purpose: a new member must decide its
-/// equality here.
+/// is True, both ways). The numeric members (`Int`, `Float`, `Bool`,
+/// `Complex`) follow Python's numeric tower — `1 == 1.0 == True ==
+/// (1+0j)` — wherever they sit, because tuples, dicts, OrderedDicts and
+/// `Vec<PyValue>` all compare their elements through THIS impl (issue
+/// #434); [`PyValue`]'s `Hash` hashes numerically-equal members alike.
+/// Every other cross-variant pair is unequal. The match names every
+/// variant on purpose: a new member must decide its equality here.
 impl PartialEq for PyValue {
     fn eq(&self, other: &PyValue) -> bool {
+        if let (Some(a), Some(b)) = (PyNum::of(self), PyNum::of(other)) {
+            return a.eq_num(b);
+        }
         match (self, other) {
-            (PyValue::Int(a), PyValue::Int(b)) => a == b,
-            (PyValue::Float(a), PyValue::Float(b)) => a == b,
-            (PyValue::Bool(a), PyValue::Bool(b)) => a == b,
+            // Numeric-vs-numeric pairs were decided above; a numeric
+            // member against anything else falls to the `false` arms.
             (PyValue::Str(a), PyValue::Str(b)) => a == b,
             (PyValue::Bytes(a), PyValue::Bytes(b)) => a == b,
             (PyValue::Tuple(a), PyValue::Tuple(b)) => a == b,
@@ -3069,8 +3137,10 @@ impl PartialEq for PyValue {
             (PyValue::OrderedDict(a), PyValue::OrderedDict(b)) => a == b,
             (PyValue::OrderedDict(o), PyValue::Dict(d))
             | (PyValue::Dict(d), PyValue::OrderedDict(o)) => **o == **d,
-            (PyValue::Complex(a), PyValue::Complex(b)) => a == b,
-            (PyValue::Range(a), PyValue::Range(b)) => a == b,
+            // Two ranges are equal when they produce the same sequence
+            // (`range(0, 3, 2) == range(0, 4, 2)`); a range never equals a
+            // tuple.
+            (PyValue::Range(a), PyValue::Range(b)) => a.eq_sequence(b),
             (PyValue::Function(a), PyValue::Function(b)) => a == b,
             (PyValue::None_, PyValue::None_) => true,
             (PyValue::Int(_), _)
@@ -4265,30 +4335,39 @@ pub fn py_value_repr(v: &PyValue) -> String {
     }
 }
 
-/// Structural equality is already derived; `Eq` plus a matching
-/// structural [`Hash`] let boxed values serve as dict KEYS and set
-/// members (`{"k": 1, 2: "v"}` boxes to `PyDict<PyValue, PyValue>`).
-/// Any consistent hash is correct for Rust's maps — CPython's
-/// type-differentiated hashes are not required for agreement between
-/// Hash and PartialEq.
+/// `Eq` plus a structural [`Hash`] let boxed values serve as dict KEYS and
+/// set members (`{"k": 1, 2: "v"}` boxes to `PyDict<PyValue, PyValue>`).
+/// The hash MUST agree with `==` (issue #434): numerically-equal members
+/// hash alike — `hash(1) == hash(1.0) == hash(True) == hash(1+0j)` — so
+/// `{1: 'a'}[1.0]` finds its key, exactly as CPython's does. Any
+/// consistent hash is correct for Rust's maps; CPython's own hash VALUES
+/// are not reproduced.
 impl core::hash::Hash for PyValue {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         match self {
-            PyValue::Int(i) => {
+            // Int, Float, Bool and Complex hash their CANONICAL numeric
+            // form (see [`PyNum::canonical`]): an integral float and a
+            // bool hash as the int they equal, a zero-imaginary complex
+            // as its real part. -0.0 is the int 0.
+            PyValue::Int(_) | PyValue::Float(_) | PyValue::Bool(_) | PyValue::Complex(_) => {
                 core::hash::Hash::hash(&0u8, state);
-                core::hash::Hash::hash(i, state);
-            }
-            PyValue::Float(f) => {
-                core::hash::Hash::hash(&1u8, state);
-                // 0.0 and -0.0 compare equal (derived PartialEq), so they
-                // must hash IDENTICALLY or equal keys miss in HashMaps
-                // (CPython: {0.0: 'a'}[-0.0] == 'a'). Normalize -0.0.
-                let bits = if *f == 0.0 { 0f64.to_bits() } else { f.to_bits() };
-                core::hash::Hash::hash(&bits, state);
-            }
-            PyValue::Bool(b) => {
-                core::hash::Hash::hash(&2u8, state);
-                core::hash::Hash::hash(b, state);
+                match PyNum::of(self).expect("numeric member").canonical() {
+                    PyNum::Int(i) => {
+                        core::hash::Hash::hash(&0u8, state);
+                        core::hash::Hash::hash(&i, state);
+                    }
+                    PyNum::Float(f) => {
+                        core::hash::Hash::hash(&1u8, state);
+                        core::hash::Hash::hash(&f.to_bits(), state);
+                    }
+                    PyNum::Complex(re, im) => {
+                        core::hash::Hash::hash(&2u8, state);
+                        // Signed zeros compare equal, so they hash alike.
+                        let bits = |f: f64| if f == 0.0 { 0f64.to_bits() } else { f.to_bits() };
+                        core::hash::Hash::hash(&bits(re), state);
+                        core::hash::Hash::hash(&bits(im), state);
+                    }
+                }
             }
             PyValue::Str(s) => {
                 core::hash::Hash::hash(&3u8, state);
@@ -4314,16 +4393,18 @@ impl core::hash::Hash for PyValue {
             PyValue::OrderedDict(_) => {
                 panic!("TypeError: unhashable type: 'collections.OrderedDict'")
             }
-            PyValue::Complex(z) => {
-                core::hash::Hash::hash(&8u8, state);
-                // Signed zeros compare equal, so they hash alike (as Float).
-                let bits = |f: f64| if f == 0.0 { 0f64.to_bits() } else { f.to_bits() };
-                core::hash::Hash::hash(&bits(z.real), state);
-                core::hash::Hash::hash(&bits(z.imag), state);
-            }
+            // Equal ranges (same sequence) hash alike: length, then the
+            // first element and step as `eq_sequence` compares them.
             PyValue::Range(r) => {
                 core::hash::Hash::hash(&9u8, state);
-                core::hash::Hash::hash(&(r.next, r.stop, r.step), state);
+                let n = r.py_len();
+                core::hash::Hash::hash(&n, state);
+                if n > 0 {
+                    core::hash::Hash::hash(&r.next, state);
+                }
+                if n > 1 {
+                    core::hash::Hash::hash(&r.step, state);
+                }
             }
             // A function hashes by identity, as its `==` compares.
             PyValue::Function(f) => {
@@ -7824,33 +7905,10 @@ scalar_eq_pyvalue! {
     bool => |b| PyValue::Bool(*b),
 }
 
+/// Python `==` on two boxed values: [`PyValue`]'s own `==` already is the
+/// numeric tower, at every depth (issue #434).
 pub(crate) fn py_value_eq(a: &PyValue, b: &PyValue) -> bool {
-    match (a, b) {
-        (PyValue::Int(x), PyValue::Float(y)) => (*x as f64) == *y,
-        (PyValue::Float(x), PyValue::Int(y)) => *x == (*y as f64),
-        (PyValue::Bool(x), PyValue::Int(y)) => (*x as i64) == *y,
-        (PyValue::Int(x), PyValue::Bool(y)) => *x == (*y as i64),
-        (PyValue::Bool(x), PyValue::Float(y)) => ((*x as i64) as f64) == *y,
-        (PyValue::Float(x), PyValue::Bool(y)) => *x == ((*y as i64) as f64),
-        // Two ranges are equal when they produce the same sequence
-        // (`range(0, 3, 2) == range(0, 4, 2)`); a range never equals a
-        // tuple.
-        (PyValue::Range(x), PyValue::Range(y)) => x.eq_sequence(y),
-        // A complex equals a real number when its imaginary part is zero
-        // and its real part equals the number (`-1+0j == -1`, issue #366).
-        (PyValue::Complex(z), other) | (other, PyValue::Complex(z))
-            if !matches!(other, PyValue::Complex(_)) =>
-        {
-            let real = match other {
-                PyValue::Int(i) => *i as f64,
-                PyValue::Float(f) => *f,
-                PyValue::Bool(b) => (*b as i64) as f64,
-                _ => return false,
-            };
-            z.imag == 0.0 && z.real == real
-        }
-        _ => a == b,
-    }
+    a == b
 }
 
 impl PyContains<String> for str {
