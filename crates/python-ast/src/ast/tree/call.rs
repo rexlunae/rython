@@ -813,7 +813,13 @@ fn collections_callee(
                     .find(|a| a.asname.as_deref() == Some(&n.id))
                     .map(|a| a.name.clone())
                     .unwrap_or_else(|| n.id.clone());
-                if StdModule::from_name(&ifm.module).is_some() {
+                // The import's own module is not evidence that it is the
+                // STDLIB `collections`: `from .helpers import collections
+                // as col` binds a sibling's own export under that name. Only
+                // a direct stdlib module qualifies; anything else goes
+                // through the re-export chain, which ends in the stdpython
+                // module the item actually came from (or returns None).
+                if ifm.module.split('.').next() == Some("collections") {
                     (ifm.module.clone(), canonical)
                 } else {
                     stdpython_reexport_chain(&n.id, symbols, options)?
@@ -864,19 +870,26 @@ fn stdpython_reexport_chain(
         match syms.get(&current) {
             Some(SymbolTableNode::ImportFrom(ifm)) => {
                 let path = ifm.resolved_module_path(options);
-                let Some(key) = crate::module_defs_key(options, &path) else {
-                    // Terminal hop: the import binds into a stdpython (or
-                    // external) module — `current` is the item name there.
-                    let root = ifm.module.split('.').next().unwrap_or("").to_string();
-                    return crate::is_stdpython_module(&root).then(|| (root, current.clone()));
-                };
-                // Re-export chain: hop into the defining module's scope.
+                // The `as` name is what the CALLER wrote; the original name
+                // is what the imported module exports. Resolve it at EVERY
+                // hop, terminal included: a final
+                // `from collections import ChainMap as CM` binds `CM`, and
+                // reporting `CM` as the item name left the constructor
+                // unrecognised and the failure to surface later as a bare
+                // rustc error.
                 let defining = ifm
                     .names
                     .iter()
-                    .find(|a| a.asname.as_deref() == Some(&current))
+                    .find(|a| a.asname.as_deref() == Some(&current.as_str()))
                     .map(|a| a.name.clone())
                     .unwrap_or_else(|| current.clone());
+                let Some(key) = crate::module_defs_key(options, &path) else {
+                    // Terminal hop: the import binds into a stdpython (or
+                    // external) module — `defining` is the item name there.
+                    let root = ifm.module.split('.').next().unwrap_or("").to_string();
+                    return crate::is_stdpython_module(&root).then(|| (root, defining));
+                };
+                // Re-export chain: hop into the defining module's scope.
                 let module = &options.module_defs[key];
                 let module: &crate::Module = module;
                 syms = module.clone().find_symbols(SymbolTableScopes::new());

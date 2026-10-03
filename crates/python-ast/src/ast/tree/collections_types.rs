@@ -32,8 +32,8 @@ impl CollectionsType {
     pub(crate) fn from_name(name: &str) -> Option<CollectionsType> {
         match name {
             "Counter" => Some(CollectionsType::Counter),
-            "deque" | "Deque" => Some(CollectionsType::Deque),
-            "defaultdict" | "DefaultDict" => Some(CollectionsType::Defaultdict),
+            "deque" => Some(CollectionsType::Deque),
+            "defaultdict" => Some(CollectionsType::Defaultdict),
             "OrderedDict" => Some(CollectionsType::OrderedDict),
             "ChainMap" => Some(CollectionsType::ChainMap),
             "namedtuple" => Some(CollectionsType::Namedtuple),
@@ -41,11 +41,16 @@ impl CollectionsType {
         }
     }
 
-    /// An ANNOTATION spelling. `from_name` covers every name this enum
-    /// knows, annotation or not, so this is the same parse under the name
-    /// the annotation paths already call.
+    /// An ANNOTATION spelling. CPython's `collections` names are
+    /// case-sensitive, so `from_name` stays exact; an annotation may also use
+    /// the CamelCase alias (`typing.Deque[int]`, `DefaultDict[str, int]`),
+    /// which is why this is a separate parse and not the same function.
     pub(crate) fn from_annotation_name(name: &str) -> Option<CollectionsType> {
-        CollectionsType::from_name(name)
+        match name {
+            "Deque" => Some(CollectionsType::Deque),
+            "DefaultDict" => Some(CollectionsType::Defaultdict),
+            other => CollectionsType::from_name(other),
+        }
     }
 
     /// Whether the class is a MAPPING (two type arguments, the dict method

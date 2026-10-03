@@ -7,10 +7,6 @@ use crate::{PyException, Len, Truthy, PyRepr, python_function};
 use alloc::collections::VecDeque;
 use alloc::{format, string::{String, ToString}, vec, vec::Vec};
 use core::hash::Hash;
-#[cfg(feature = "std")]
-use std::collections::HashMap;
-#[cfg(not(feature = "std"))]
-use hashbrown::HashMap;
 
 /// Counter - dict subclass for counting hashable objects
 #[derive(Debug, Clone)]
