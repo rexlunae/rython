@@ -6009,4 +6009,80 @@ mod boxed_container_ops {
             "range(0, 10, 4)"
         );
     }
+
+    #[test]
+    fn an_empty_range_slice_keeps_cpython_s_start_and_step() {
+        // range(6)[2:4:-1] == range(2, 4, -1) — CPython keeps the NORMALISED
+        // start and step even when nothing is selected, so the repr differs
+        // from the range(4, 4) a naive empty branch would build.
+        let r = PyValue::from(stdpython::range(6));
+        assert_eq!(
+            stdpython::py_value_repr(&r.py_slice(Some(2), Some(4), Some(-1))),
+            "range(2, 4, -1)"
+        );
+        // range(6)[4:2] == range(4, 2): empty forward, start and stop kept.
+        assert_eq!(
+            stdpython::py_value_repr(&r.py_slice(Some(4), Some(2), None)),
+            "range(4, 2)"
+        );
+        // range(6)[4:2:-1] == range(4, 2, -1): also empty, step preserved.
+        assert_eq!(
+            stdpython::py_value_repr(&r.py_slice(Some(4), Some(2), Some(-1))),
+            "range(4, 2, -1)"
+        );
+    }
+
+    #[test]
+    fn a_range_slice_past_the_i64_endpoint_refuses_rather_than_wrapping() {
+        // CPython's range(2**63-2, 2**63-1, 2)[:] is
+        // range(9223372036854775806, 9223372036854775808, 2). Its repr needs an
+        // endpoint of 2**63 — outside PyRange's i64 fields.
+        //
+        // The old code cast `py_len()` (a usize) to i64 up front, so a length
+        // above i64::MAX wrapped NEGATIVE and a full slice silently became the
+        // EMPTY range. The arithmetic is now done in i128, and `narrow` refuses
+        // an endpoint that cannot be represented rather than wrapping to a
+        // range different from CPython's.
+        let big = stdpython::range_start_stop_step(i64::MAX - 2, i64::MAX - 1, 2).unwrap();
+        assert_eq!(big.py_len(), 1);
+        // The full slice's endpoints are i128-only: next + len*step is 2**63-1,
+        // which fits, but CPython's exclusive stop is one element PAST it. The
+        // arithmetic must therefore stay wide; if it were narrowed to i64 the
+        // result would be a different (wrong) range, so this asserts the
+        // element is still there rather than that it panicked.
+        let full = big.py_slice(None, None, None);
+        assert_eq!(full.py_len(), 1, "a full slice must keep the element");
+        assert_eq!(
+            full.clone().next(),
+            Some(i64::MAX - 2),
+            "the element must be the range's first value, not a wrapped one"
+        );
+        assert!(full.py_contains(&(i64::MAX - 2)));
+        // A boundary range whose whole slice fits works cleanly: CPython's
+        // range(2**63-4, 2**63-2, 2) holds one value and slices to it.
+        let edge = stdpython::range_start_stop_step(i64::MAX - 3, i64::MAX - 1, 2).unwrap();
+        assert_eq!(edge.py_slice(None, None, None).py_len(), 1);
+    }
+
+    #[test]
+    fn a_zero_slice_step_is_cpythons_value_error() {
+        // xs[::0] raises ValueError: slice step cannot be zero — on READS too.
+        let r = PyValue::from(stdpython::range(6));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                r.py_slice(None, None, Some(0))
+            }))
+            .is_err(),
+            "a zero step must raise, not divide by zero"
+        );
+        // On the STEP mutation arms it is a typed ValueError. (For an
+        // immutable receiver CPython reports the TypeError first — verified
+        // with `t = (1,); t[::0] = []` — so this pins the step check itself.)
+        let mut t = PyValue::Tuple(std::sync::Arc::new(vec![PyValue::Int(1)]));
+        let err = PySliceReplace::py_slice_assign_step(&mut t, None, None, 0, vec![]).unwrap_err();
+        assert_eq!(err.exception_type, "ValueError");
+        assert!(err.message.contains("step"), "message was {:?}", err.message);
+        let err = PySliceReplace::py_slice_delete_step(&mut t, None, None, 0).unwrap_err();
+        assert_eq!(err.exception_type, "ValueError");
+    }
 }

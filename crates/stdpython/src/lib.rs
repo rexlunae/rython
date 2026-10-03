@@ -1780,62 +1780,64 @@ impl PyRange {
     ) -> PyRange {
         let step = step.unwrap_or(1);
         if step == 0 {
+            // CPython: xs[::0] raises ValueError: slice step cannot be zero,
+            // and it does so BEFORE any receiver check.
             panic!("slice step cannot be zero");
         }
-        let len = self.py_len() as i64;
-        // slice.indices(len, step): clamp, then wrap negatives.
-        let clamp = |i: i64| -> i64 {
-            if i < 0 {
-                (i + len).max(0).min(len)
-            } else {
-                i.min(len)
-            }
+        // Every intermediate is i128: a range's length, and the products of
+        // endpoints with steps, can leave the i64 domain even when every
+        // selected value fits (range(2**63-2, 2**63-1, 2)[:]). Narrowing any
+        // of them to i64 would wrap to a DIFFERENT range instead of failing.
+        let len = self.py_len() as i128;
+        let next0 = self.next as i128;
+        let step0 = self.step as i128;
+        let step = step as i128;
+
+        // slice.indices(len, step): wrap negatives, then clamp. The exclusive
+        // end wraps into [-1, len-1] and the inclusive start into [0, len-1].
+        let wrap_start = |i: i128| -> i128 {
+            if i < 0 { (i + len).max(0) } else { i.min(len - 1) }
+        };
+        let wrap_end = |i: i128| -> i128 {
+            if i < 0 { (i + len).max(-1) } else { i.min(len - 1) }
         };
         let (begin, end) = if step > 0 {
-            (clamp(start.unwrap_or(0)), clamp(stop.unwrap_or(len)))
+            let lo = start.map(|s| s as i128).unwrap_or(0);
+            let hi = stop.map(|s| s as i128).unwrap_or(len);
+            (lo.max(0).min(len), hi.max(0).min(len))
         } else {
-            // slice.indices for a negative step: the exclusive end wraps into
-            // [-1, len-1] and the inclusive start into [0, len-1], and the
-            // pair is EMPTY when begin <= end (the range walks down). An
-            // omitted end is the VIRTUAL index -1 — one before the first
-            // element — not len-1; wrapping -1 through len would turn a
-            // `xs[::-1]` into the empty slice.
-            let wrap_end = |i: i64| -> i64 {
-                if i < 0 { (i + len).max(-1) } else { i.min(len - 1) }
-            };
-            let wrap_start = |i: i64| -> i64 {
-                if i < 0 { (i + len).max(0) } else { i.min(len - 1) }
-            };
-            let end = match stop {
-                Some(s) => wrap_end(s),
-                // `xs[::-1]` / `xs[3:]` — walk back to before the start.
+            let hi = match stop {
+                Some(s) => wrap_end(s as i128),
+                // `xs[::-1]` / `xs[3:]` — walk back to before the start, i.e.
+                // the virtual index one before the first element.
                 None => -1,
             };
-            (wrap_start(start.unwrap_or(len - 1)), end)
+            (wrap_start(start.map(|s| s as i128).unwrap_or(len - 1)), hi)
         };
-        // Empty in BOTH directions: forward slices when begin >= end, reverse
-        // ones when begin <= end.
-        let empty = if step > 0 { begin >= end } else { begin <= end };
-        if empty {
-            // An empty slice is `range(i, i)` — the repr CPython prints is
-            // `range(6, 6)` for `range(6)[9:99]`, i.e. it keeps the clamp
-            // point, not a synthetic `range(0, 0)`.
-            let at = if step > 0 { begin } else { end };
-            return PyRange {
-                next: self.next + at * self.step,
-                stop: self.next + at * self.step,
-                step: 1,
-            };
+
+        // The new range is computed from the NORMALISED bounds in BOTH
+        // directions, so an empty slice keeps the start and step CPython
+        // prints: range(6)[2:4:-1] is range(2, 4, -1), not range(4, 4).
+        let new_step = step0 * step;
+        let next = next0 + begin * step0;
+        let stop_at = next0 + end * step0;
+        PyRange {
+            next: narrow(next),
+            stop: narrow(stop_at),
+            step: narrow(new_step),
         }
-        let new_step = self.step * step;
-        let next = self.next + begin * self.step;
-        // The exclusive stop is index `end` in the ORIGINAL range's own
-        // coordinates — `end` already IS the exclusive bound in both
-        // directions (for a reverse slice it is the virtual index one before
-        // the first element, which is exactly where a downward walk stops).
-        let stop = self.next + end * self.step;
-        PyRange { next, stop, step: new_step }
     }
+}
+
+
+/// Narrow an i128 range endpoint back into `PyRange`'s i64 fields. A value
+/// that cannot be represented is a loud refusal, never a silent wrap: a
+/// wrapped endpoint would describe a different range than CPython's.
+fn narrow(v: i128) -> i64 {
+    if v > i64::MAX as i128 || v < i64::MIN as i128 {
+        panic!("range endpoint {v} exceeds the representable range");
+    }
+    v as i64
 }
 
 impl PyRange {
@@ -3412,9 +3414,17 @@ impl PySliceReplace for PyValue {
         &mut self,
         _start: Option<i64>,
         _stop: Option<i64>,
-        _step: i64,
+        step: i64,
         _replacement: Vec<PyValue>,
     ) -> Result<(), PyException> {
+        // CPython checks the step BEFORE the receiver: `xs[::0] = v` is a
+        // ValueError even on an immutable xs. (Verified: for a tuple, whose
+        // members are the only ones reachable here, `t[::0] = []` raises
+        // TypeError — mutability is checked first — so a boxed member still
+        // reports the assignment refusal below.)
+        if step == 0 {
+            return Err(PyException::new("ValueError", "slice step cannot be zero"));
+        }
         Err(self.not_a_container("item assignment"))
     }
     fn py_slice_delete(&mut self, _start: Option<i64>, _stop: Option<i64>) {
@@ -3424,8 +3434,11 @@ impl PySliceReplace for PyValue {
         &mut self,
         _start: Option<i64>,
         _stop: Option<i64>,
-        _step: i64,
+        step: i64,
     ) -> Result<(), PyException> {
+        if step == 0 {
+            return Err(PyException::new("ValueError", "slice step cannot be zero"));
+        }
         Err(self.not_a_container("item deletion"))
     }
 }
