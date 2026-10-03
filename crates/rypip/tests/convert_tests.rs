@@ -20801,3 +20801,62 @@ fn print_renders_after_every_argument_has_evaluated() {
         ]
     );
 }
+
+#[test]
+fn print_keywords_properties_and_conversions_follow_cpythons_evaluation_order() {
+    // Devin review on #439: `flush=` and the keyword values evaluate in the
+    // order written before any deferred place renders; a chain through a
+    // property getter is a fresh value (it is read at its own position); and
+    // `str(obj)` of a user class runs its `__str__`, which pops the module
+    // list an earlier argument names.
+    let got = run_global_alias_program(
+        "printdevin",
+        "print_devin.py",
+        concat!(
+            "class Child:\n",
+            "    def __init__(self, n: int) -> None:\n",
+            "        self.items: list[int] = [n]\n",
+            "\n",
+            "\n",
+            "class Holder:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.kids = [Child(1), Child(2)]\n",
+            "        self.i = 0\n",
+            "\n",
+            "    @property\n",
+            "    def child(self) -> Child:\n",
+            "        return self.kids[self.i]\n",
+            "\n",
+            "    def advance(self) -> int:\n",
+            "        self.i = 1\n",
+            "        return 0\n",
+            "\n",
+            "\n",
+            "LOG: list[int] = [1, 2, 3]\n",
+            "\n",
+            "\n",
+            "class Loud:\n",
+            "    def __str__(self) -> str:\n",
+            "        LOG.pop()\n",
+            "        return \"done\"\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    a = [1, 2]\n",
+            "    print(a, flush=bool(a.pop()))\n",
+            "    b = [1, 2, 3]\n",
+            "    print(b, end=str(b.pop()), sep=str(b.pop()))\n",
+            "    print()\n",
+            "    h = Holder()\n",
+            "    print(h.child.items, h.advance())\n",
+            "    loud = Loud()\n",
+            "    print(LOG, str(loud))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    // Verified against python3 (3.12).
+    assert_eq!(got, vec!["[1]", "[1]3", "[1] 0", "[1, 2] done"]);
+}
