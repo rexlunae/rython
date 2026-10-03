@@ -157,6 +157,7 @@ def main() -> int:
     files = collections.Counter()
     missing = []
     seen = collections.Counter()
+    seen_by_code = collections.defaultdict(collections.Counter)
 
     for package, message in read_events(args.workdir, sorted(packages)):
         if isinstance(message, MissingLog):
@@ -167,6 +168,7 @@ def main() -> int:
         if is_e_coded(code):
             code_total[code] += 1
             seen[package] += 1
+            seen_by_code[package][code] += 1
         if code == "E0599":
             found = METHOD.search(text)
             if found:
@@ -204,16 +206,18 @@ def main() -> int:
         return 1
 
     # A reused workdir can hold a complete-looking log set from a DIFFERENT
-    # sweep. Presence is not provenance: require each package's E-coded
-    # event count to match the histogram the record recorded for it.
+    # sweep, and presence is not provenance. Compare each package's full
+    # per-CODE histogram against the one the record recorded for it: a
+    # matching total is not enough, since equal totals can hide different
+    # codes (and therefore entirely different causes) in the shapes below.
     mismatched = [name for name, result in packages.items()
-                  if seen[name] != sum((result.get("histogram") or {}).values())]
+                  if dict(seen_by_code[name]) != dict(result.get("histogram") or {})]
     if mismatched:
         print("== NOT COMPARABLE: Cargo logs disagree with the record ==")
         for name in sorted(mismatched):
-            recorded = sum((packages[name].get("histogram") or {}).values())
-            print(f"   {name}: record records {recorded} E-coded errors, "
-                  f"log has {seen[name]}")
+            recorded = sorted((packages[name].get("histogram") or {}).items())
+            print(f"   {name}: record records {dict(recorded) or '{}'}, "
+                  f"log has {dict(seen_by_code[name]) or '{}'}")
         print("   The workdir does not belong to this record's sweep.")
         print("   Refusing to rank logs that do not match what was measured.")
         return 1

@@ -443,6 +443,21 @@ class RankCausesTests(unittest.TestCase):
             self.assertIn("NOT COMPARABLE", text)
             self.assertIn("gone", text)
 
+    def test_logs_with_equal_totals_but_different_codes_are_rejected(self):
+        # A total-only comparison lets one E0609 masquerade as a recorded
+        # E0599, attaching the log's shapes to a code the record never had.
+        with tempfile.TemporaryDirectory() as tmp:
+            record = self.record(tmp, {"E0599": 1})
+            workdir = self.write_workdir(tmp, [self.message("E0609", "no field `x` on type `T`")])
+            argv = ["rank_causes.py", str(record), "--workdir", str(workdir)]
+            with patch.object(sys, "argv", argv), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(rank_causes.main(), 1)
+            text = out.getvalue()
+            self.assertIn("disagree with the record", text)
+            self.assertIn("E0599", text)
+            self.assertIn("E0609", text)
+
     def test_shapes_separate_unmatched_attribute_errors_from_other_codes(self):
         # An E0609 whose message matches no shape is still E0609, so it must
         # not be reported as "another code".
