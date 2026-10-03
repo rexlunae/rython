@@ -1,5 +1,8 @@
 {
   "programs": {
+    "__main__": {
+      "status": "pass"
+    },
     "bank": {
       "status": "pass"
     },

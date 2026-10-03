@@ -4,27 +4,27 @@
     {
       "name": "urllib3",
       "requirement": "urllib3==2.0.7",
-      "note": "The historical #137 corpus. Round 72: compiled-regex statics type as the runtime Regex; .match/.search/.fullmatch dispatch through PyRegexOps (988 -> 978). Sweep at 24d1987 (2026-09-25): 650 (687 at round 118)."
+      "note": "The historical #137 corpus. Round 72: compiled-regex statics type as the runtime Regex; .match/.search/.fullmatch dispatch through PyRegexOps (988 -> 978). Sweep at 28efebd (schema 2): 605 coded + 54 other diagnostics (650 at 24d1987; 687 at round 118)."
     },
     {
       "name": "certifi",
       "requirement": "certifi==2025.1.31",
-      "note": "Close to a fully-clean package (was ~8 errors); a clean package is a far better regression canary than a 1600-error crate. Sweep at 24d1987 (2026-09-25): 0 (0 at round 118)."
+      "note": "Close to a fully-clean package (was ~8 errors); a clean package is a far better regression canary than a 1600-error crate. Sweep at 28efebd (schema 2): 0, builds."
     },
     {
       "name": "idna",
       "requirement": "idna==3.10",
-      "note": "Round 61: boxed-operand membership on literal lists (64). Sweep at 24d1987 (2026-09-25): 0 (44 at round 118; clean since #402)."
+      "note": "Round 61: boxed-operand membership on literal lists (64). Sweep at 28efebd (schema 2): 0, builds (44 at round 118; clean since #402)."
     },
     {
       "name": "charset_normalizer",
       "requirement": "charset-normalizer==3.4.1",
-      "note": "Round 66: tuple-literal for-iteration (289 -> 285). Issue #332: the dynamic issubclass in utils.py no longer blocks conversion; 121 at that round. Sweep at 24d1987 (2026-09-25): 42 (47 at round 118)."
+      "note": "Round 66: tuple-literal for-iteration (289 -> 285). Issue #332: the dynamic issubclass in utils.py no longer blocks conversion; 121 at that round. Sweep at 28efebd (schema 2): 41 coded + 3 other diagnostics (42 at 24d1987; 47 at round 118)."
     },
     {
       "name": "requests",
       "requirement": "requests==2.32.3",
-      "note": "The dependent-package frontier (imports urllib3/charset_normalizer/idna/certifi; 112 errors at the round-54 baseline). Round 55: urllib.parse + class registry (69). Round 56: builtin-class values, tuple boxing, compat imports, del reads, range annotations (29). Round 57: module tuple-unpack promotion (25). Sweep at 24d1987 (2026-09-25): 2249 (2245 at round 118)."
+      "note": "The dependent-package frontier (imports urllib3/charset_normalizer/idna/certifi; 112 errors at the round-54 baseline). Round 55: urllib.parse + class registry (69). Round 56: builtin-class values, tuple boxing, compat imports, del reads, range annotations (29). Round 57: module tuple-unpack promotion (25). Sweep at 28efebd (schema 2): 2127 coded + 205 other diagnostics (2249 at 24d1987; 2245 at round 118)."
     }
   ]
 }

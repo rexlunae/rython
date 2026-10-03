@@ -9687,6 +9687,24 @@ let mutating_self_field = boxed_self_ref_receiver
                         return Ok(quote!((#receiver).py_get(&(#key))));
                     }
                     ("get", [key, default]) => {
+                        // The default is returned as the dict's VALUE, so it
+                        // must be rendered as one — the same rule the
+                        // `pop(key, default)` arm above already follows. A
+                        // boxed receiver's value type is `PyValue`, and
+                        // rendering the default as a bare `String` would emit
+                        // `.py_get_default(&k, "D")` against a `PyDictOps<
+                        // String, PyValue>` receiver: a type mismatch in the
+                        // generated crate (issue #137's frontier).
+                        let get_default = match &dict_receiver_kv {
+                            Some((_, v)) => crate::render_typed(
+                                &self.args[1],
+                                ctx.clone(),
+                                options.clone(),
+                                symbols.clone(),
+                                Some(v.clone()),
+                            )?,
+                            None => default.clone(),
+                        };
                         if let Some((class, class_symbols)) =
                             crate::receiver_class(&attr.value, &ctx, &symbols, &options)
                             && class.method_on_mro("__getitem__", &class_symbols).is_some()
@@ -9785,9 +9803,9 @@ let mutating_self_field = boxed_self_ref_receiver
                                 symbols.clone(),
                                 Some(crate::TypeInfo::String),
                             )?;
-                            return Ok(quote!((#receiver).py_get_default(&(#key), #default)));
+                            return Ok(quote!((#receiver).py_get_default(&(#key), #get_default)));
                         }
-                        return Ok(quote!((#receiver).py_get_default(&(#key), #default)));
+                        return Ok(quote!((#receiver).py_get_default(&(#key), #get_default)));
                     }
                     // Views materialize as Vecs in insertion order.
                     ("keys", []) => {
