@@ -27204,3 +27204,186 @@ fn ordereddict_of_an_unrepresentable_argument_stays_a_loud_error() {
         "{err}"
     );
 }
+
+// ---- print argument evaluation order (issue #433) ----
+//
+// CPython evaluates every argument of print() and only then converts
+// each with str(): `print(xs, xs.pop())` shows the list AFTER the pop.
+
+#[test]
+fn print_renders_an_earlier_mutable_place_after_later_arguments_ran() {
+    // Verified against python3 (3.12): `[1, 2] 3`.
+    let out = compile(
+        "def f(xs: list[int]):\n    print(xs, xs.pop())\n",
+        "pr_order1.py",
+    );
+    let flat = flat_of(&out);
+    assert!(
+        flat.contains("let__rython_print_arg1=py_display(")
+            && flat.contains("print_parts(&[py_display(&(xs)),__rython_print_arg1],\"\",\"\\n\")?"),
+        "the place must render after the pop evaluated: {out}"
+    );
+    // The pop evaluates BEFORE the deferred render reads `xs`.
+    assert!(
+        out.find("pop").unwrap() < out.find("print_parts").unwrap(),
+        "{out}"
+    );
+
+    // Dict and keyword forms: the keyword values stay inline when they
+    // cannot run code.
+    let out = compile(
+        "def f(d: dict[str, int]):\n    print(d, d.pop('a'), sep=' | ', end='<\\n')\n",
+        "pr_order2.py",
+    );
+    assert!(
+        flat_of(&out).contains("print_parts(&[py_display(&(d)),__rython_print_arg1],\"|\",\"<\\n\")?"),
+        "{out}"
+    );
+}
+
+#[test]
+fn print_keeps_every_eager_argument_in_source_order_around_a_deferred_place() {
+    // Verified against python3 (3.12): `[1, 2] 3 [1, 2]`.
+    let out = compile(
+        "def f(xs: list[int]):\n    print(xs, xs.pop(), xs)\n",
+        "pr_order3.py",
+    );
+    let flat = flat_of(&out);
+    let a1 = flat.find("let__rython_print_arg1=").unwrap();
+    let a2 = flat.find("let__rython_print_arg2=").unwrap();
+    assert!(a1 < a2, "eager arguments evaluate in source order: {out}");
+}
+
+#[test]
+fn print_shape_is_unchanged_when_no_later_argument_can_mutate() {
+    // Verified against python3 (3.12): nothing observable differs, so
+    // the original inline shape must stay.
+    for (src, name) in [
+        ("def f(xs: list[int]):\n    print(xs, len(xs))\n", "pr_order4.py"),
+        ("def f(xs: list[int], ys: list[int]):\n    print(xs, ys)\n", "pr_order5.py"),
+        ("def f(xs: list[int]):\n    print(xs, xs[0:2], sorted(xs))\n", "pr_order6.py"),
+        ("def f(d: dict[str, int]):\n    print(d, d.get('a'), d.keys())\n", "pr_order7.py"),
+    ] {
+        let out = compile(src, name);
+        assert!(
+            !out.contains("__rython_print_arg") && out.contains("print_parts (& [py_display"),
+            "{src}: {out}"
+        );
+    }
+}
+
+#[test]
+fn print_snapshots_scalars_and_slices_eagerly() {
+    // Verified against python3 (3.12): `[1, 2] 3` (the slice is a copy)
+    // and `0 1` (an int read is a value, not a place).
+    let out = compile(
+        "def f(xs: list[int]):\n    print(xs[:2], xs.pop())\n",
+        "pr_order8.py",
+    );
+    assert!(!out.contains("__rython_print_arg"), "{out}");
+    let out = compile(
+        "class C:\n\
+         \x20   def __init__(self) -> None:\n\
+         \x20       self.n = 0\n\
+         \x20   def bump(self) -> int:\n\
+         \x20       self.n += 1\n\
+         \x20       return self.n\n\
+         \n\
+         def f(c: C):\n\
+         \x20   print(c.n, c.bump())\n",
+        "pr_order9.py",
+    );
+    assert!(!out.contains("__rython_print_arg"), "{out}");
+}
+
+#[test]
+fn print_defers_a_class_instance_and_an_attribute_container() {
+    // Verified against python3 (3.12): the instance and the list both
+    // render in their post-call state.
+    let src = "class H:\n\
+               \x20   def __init__(self) -> None:\n\
+               \x20       self.items: list[int] = [1, 2, 3]\n\
+               \x20   def take(self) -> int:\n\
+               \x20       return self.items.pop()\n\
+               \n\
+               def f(h: H):\n\
+               \x20   print(h, h.take())\n\
+               \x20   print(h.items, h.take())\n";
+    let out = compile(src, "pr_order10.py");
+    assert_eq!(out.matches("__rython_print_arg1 =").count(), 2, "{out}");
+    let flat = flat_of(&out);
+    assert!(flat.contains("print_parts(&[py_display(&(h)),__rython_print_arg1]"), "{out}");
+    assert!(
+        flat.contains("print_parts(&[py_display(&((h).borrow().items.clone())),__rython_print_arg1]"),
+        "{out}"
+    );
+}
+
+#[test]
+fn print_hoists_a_keyword_that_runs_code_after_the_positionals() {
+    // CPython evaluates keyword values after the positionals, before
+    // rendering anything.
+    let out = compile(
+        "def f(xs: list[int]):\n    print(xs, sep=str(xs.pop()))\n",
+        "pr_order11.py",
+    );
+    assert!(flat_of(&out).contains("let__rython_print_sep="), "{out}");
+}
+
+#[test]
+fn print_rebinding_walrus_after_a_mutable_place_is_a_loud_error() {
+    // CPython captured the OLD object for `xs`; neither eager nor
+    // deferred rendering is right in general.
+    let err = compile_err(
+        "def f(xs: list[int]):\n    print(xs, xs.pop(), (xs := [9]))\n",
+        "pr_order12.py",
+    );
+    assert!(
+        err.contains("rebinds `xs` with `:=`") && err.contains("rython refuses to silently pick one"),
+        "{err}"
+    );
+}
+
+#[test]
+fn print_a_later_call_that_assigns_the_attribute_is_a_loud_error() {
+    let err = compile_err(
+        "class H:\n\
+         \x20   def __init__(self) -> None:\n\
+         \x20       self.items: list[int] = [1, 2, 3]\n\
+         \x20   def reset(self) -> int:\n\
+         \x20       self.items = []\n\
+         \x20       return 0\n\
+         \n\
+         def f(h: H):\n\
+         \x20   print(h.items, h.reset())\n",
+        "pr_order13.py",
+    );
+    assert!(
+        err.contains("assigns `.items`") && err.contains("rython refuses to silently pick one"),
+        "{err}"
+    );
+}
+
+#[test]
+fn print_a_subscripted_mutable_element_with_a_later_mutation_is_a_loud_error() {
+    let err = compile_err(
+        "def f(grid: list[list[int]]):\n    print(grid[0], grid[0].pop())\n",
+        "pr_order14.py",
+    );
+    assert!(
+        err.contains("is a mutable element") && err.contains("Bind the element to a name first"),
+        "{err}"
+    );
+}
+
+#[test]
+fn fstring_print_has_no_deferral() {
+    // Verified against python3 (3.12): `[1, 2, 3] 3` — an f-string
+    // formats each field as it is evaluated, so the in-order lowering is
+    // already right and print must not touch it.
+    let out = compile(
+        "def f(xs: list[int]):\n    print(f'{xs} {xs.pop()}')\n",
+        "pr_order15.py",
+    );
+    assert!(!out.contains("__rython_print_arg"), "{out}");
+}
