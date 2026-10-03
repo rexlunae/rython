@@ -342,6 +342,36 @@ fn place_of(
     }
 }
 
+/// The root name of an attribute chain (`root.a.b`) in which at least one
+/// link is a property: its getter runs at the argument's own position and
+/// returns an object whose identity the print cannot track across a later
+/// call (a late read would run the getter again, an early rendering shows
+/// the state before the later mutation). `None` for anything else.
+fn property_chain_root(
+    e: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<String> {
+    let ExprType::Attribute(a) = e else {
+        return None;
+    };
+    let mut has_getter =
+        crate::ast::tree::attribute::attribute_read_is_call(a, ctx, symbols, options);
+    let mut cur = a.value.as_ref();
+    loop {
+        match cur {
+            ExprType::Name(n) => return has_getter.then(|| n.id.clone()),
+            ExprType::Attribute(inner) => {
+                has_getter |=
+                    crate::ast::tree::attribute::attribute_read_is_call(inner, ctx, symbols, options);
+                cur = inner.value.as_ref();
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// The user function or method a call resolves to, with the class it
 /// belongs to (for `self.m()` inside its own methods).
 fn resolve_callee<'s>(
@@ -459,6 +489,48 @@ pub(crate) fn deferred_renders(
     let mut mask = vec![false; args.len()];
     for (i, arg) in args.iter().enumerate() {
         let Some(place) = place_of(arg, ctx, options, symbols) else {
+            // A chain through a property getter is read at its own position
+            // (it is not a place). That is right when a later argument
+            // REPLACES what the getter returned, and wrong when it MUTATES
+            // the returned object (`print(h.child.items, h.child.items.pop())`
+            // shows the list after the pop); which one the later call does
+            // cannot be told statically, so a later call on the same root is
+            // refused rather than guessed (Devin review on #439).
+            if let Some(root) = property_chain_root(arg, ctx, options, symbols) {
+                let ty = crate::infer_type(Some(ctx), arg, options, symbols);
+                let acts_on_root = args[i + 1..]
+                    .iter()
+                    .chain(later_extra.iter().copied())
+                    .any(|e| {
+                        visit::any_expr(e, |sub| match sub {
+                            ExprType::Call(c) => {
+                                !call_is_read_only(c, ctx, options, symbols)
+                                    && (matches!(c.func.as_ref(),
+                                            ExprType::Attribute(a)
+                                                if chain_root(&a.value).as_deref()
+                                                    == Some(root.as_str()))
+                                        || c.args.iter().any(|a| {
+                                            chain_root(a).as_deref() == Some(root.as_str())
+                                        }))
+                            }
+                            _ => false,
+                        })
+                    });
+                if observably_mutable(&ty) && acts_on_root {
+                    let text = place_text(arg);
+                    return Err(format!(
+                        "print(): argument `{text}` reads through a property getter, and a \
+                         later argument calls code on `{root}`. CPython evaluates every \
+                         argument before converting any of them, so the output depends on \
+                         whether that call mutates the object the getter returned (shown \
+                         after the mutation) or replaces it (shown as it was); rython cannot \
+                         track the getter's result across the call and refuses to silently \
+                         pick one. Evaluate the later argument in its own statement first \
+                         (`v = ...; print({text}, v)`)."
+                    )
+                    .into());
+                }
+            }
             continue;
         };
         let ty = crate::infer_type(Some(ctx), arg, options, symbols);

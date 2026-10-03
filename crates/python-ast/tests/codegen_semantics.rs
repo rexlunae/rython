@@ -27489,13 +27489,17 @@ fn print_hoists_keywords_in_the_order_they_are_written() {
 }
 
 #[test]
-fn print_keeps_a_chain_with_a_property_link_eager() {
-    // `h.child` is a property: its getter runs when the chain is READ, so a
-    // late read would see whatever `h.advance()` changed. The chain stays
-    // eager (CPython read the old child's list before the call).
+fn print_reads_a_property_chain_at_its_own_position_and_refuses_a_later_call_on_its_root() {
+    // `h.child` is a property: its getter runs when the chain is READ. A late
+    // read would see whatever a later argument replaced; an early rendering
+    // shows the state before a later argument MUTATED the returned object
+    // (`print(h.child.items, h.child.items.pop())` is `[1] 2`). Which one the
+    // later call does is not decidable here, so a later call on the same
+    // root is loud; a later call that does not touch the root keeps the
+    // chain eager.
     let class_src = "class Child:\n\
          \x20   def __init__(self) -> None:\n\
-         \x20       self.items: list[int] = [1]\n\
+         \x20       self.items: list[int] = [1, 2]\n\
          \n\
          class H:\n\
          \x20   def __init__(self) -> None:\n\
@@ -27508,12 +27512,37 @@ fn print_keeps_a_chain_with_a_property_link_eager() {
          \x20   def advance(self) -> int:\n\
          \x20       self.i = 1\n\
          \x20       return 0\n\
+         \n\
+         def side() -> int:\n\
+         \x20   return 0\n\
          \n";
+    // No later call on the root: eager, at its own position.
     let eager = compile(
-        &format!("{class_src}def f(h: H):\n    print(h.child.items, h.advance())\n"),
+        &format!("{class_src}def f(h: H):\n    print(h.child.items, side())\n"),
         "pr_order25.py",
     );
     assert!(!eager.contains("__rython_print_arg"), "{eager}");
+    // A later call on the root: loud, for the replacing and the mutating one.
+    for (call, name) in [
+        ("h.advance()", "pr_order25b.py"),
+        ("h.child.items.pop()", "pr_order25c.py"),
+    ] {
+        let err = compile_err(
+            &format!("{class_src}def f(h: H):\n    print(h.child.items, {call})\n"),
+            name,
+        );
+        assert!(
+            err.contains("reads through a property getter")
+                && err.contains("rython cannot track the getter's result"),
+            "{call}: {err}"
+        );
+    }
+    // The property itself (one link) is the same case.
+    let err = compile_err(
+        &format!("{class_src}def f(h: H):\n    print(h.child, h.child.items.pop())\n"),
+        "pr_order25d.py",
+    );
+    assert!(err.contains("reads through a property getter"), "{err}");
     // The same chain through a plain field is a place and does defer.
     let deferred = compile(
         &format!("{class_src}def f(h: H):\n    print(h.kid.items, h.advance())\n"),
