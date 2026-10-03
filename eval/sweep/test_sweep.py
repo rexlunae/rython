@@ -311,14 +311,20 @@ class RankCausesTests(unittest.TestCase):
                        "in the current scope")
     FIELD_ON_PYVALUE = "no field `timeout` on type `stdpython::PyValue`"
 
-    def message(self, code, text, file_name="src/demo.rs"):
+    def message(self, code, text, file_name="src/demo.rs", crate=None):
         return {"level": "error", "code": {"code": code}, "message": text,
                 "spans": [{"is_primary": True, "file_name": file_name}]}
 
-    def write_workdir(self, tmp, messages, package="demo"):
+    def event(self, message, crate):
+        return {"reason": "compiler-message",
+                "target": {"src_path": f"{crate}/src/demo.rs"}, "message": message}
+
+    def write_workdir(self, tmp, messages, package="demo", extra=None):
         workdir = Path(tmp)
-        lines = [json.dumps({"reason": "compiler-message",
-                             "message": m}) for m in messages]
+        crate = workdir / f"crate-{package}"
+        (crate / "src").mkdir(parents=True, exist_ok=True)
+        lines = [json.dumps(self.event(m, crate)) for m in messages]
+        lines += [json.dumps(e) for e in (extra or [])]
         (workdir / f"{package}-cargo.jsonl").write_text("\n".join(lines) + "\n")
         return workdir
 
@@ -370,7 +376,7 @@ class RankCausesTests(unittest.TestCase):
             with patch.object(sys, "argv", argv), \
                  contextlib.redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(rank_causes.main(), 1)
-            self.assertIn("no E0599/E0609 events found", out.getvalue())
+            self.assertIn("NOT COMPARABLE", out.getvalue())
 
     def test_non_record_input_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -378,6 +384,68 @@ class RankCausesTests(unittest.TestCase):
             bad.write_text(json.dumps({"packages": "not-a-dict"}))
             with self.assertRaises(SystemExit):
                 rank_causes.load_record(bad)
+
+    def test_dependency_diagnostics_are_not_ranked_as_generated_code(self):
+        # parse_build excludes dependency diagnostics from the histogram, so
+        # counting them here would inflate shapes against a denominator that
+        # never included them.
+        with tempfile.TemporaryDirectory() as tmp:
+            crate = Path(tmp) / "crate-demo"
+            (crate / "src").mkdir(parents=True, exist_ok=True)
+            dependency = {"reason": "compiler-message",
+                          "target": {"src_path": "/registry/src/hashdep/src/dep.rs"},
+                          "message": self.message("E0599", self.METHOD_ON_PYVALUE)}
+            workdir = self.write_workdir(tmp, [], extra=[dependency])
+            record = self.record(tmp, {"E0308": 2})
+            argv = ["rank_causes.py", str(record), "--workdir", str(workdir)]
+            with patch.object(sys, "argv", argv), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(rank_causes.main(), 1)
+            self.assertNotIn("PyValue attribute boundary: 1", out.getvalue())
+
+    def test_wrapper_receivers_are_not_counted_as_the_pyvalue_boundary(self):
+        # Option<PyValue>/Vec<PyValue> fail at the wrapper, which is a
+        # different defect; reference sugar is still a PyValue receiver.
+        code, text = self.run_rank(
+            {"E0599": 3},
+            [self.message("E0599", "no method named `close` found for enum "
+                                   "`Option<stdpython::PyValue>` in the current scope"),
+             self.message("E0599", "no field `x` on type `(stdpython::PyValue,)`"),
+             self.message("E0599", "no method named `close` found for mutable "
+                                   "reference `&mut stdpython::PyValue` in the current scope")])
+        self.assertEqual(code, 0)
+        self.assertIn("the PyValue attribute boundary: 1 sites", text)
+        self.assertIn("E0599 no method (other receiver)", text)
+        self.assertTrue(rank_causes.is_plain_pyvalue("&mut stdpython::PyValue"))
+        self.assertFalse(rank_causes.is_plain_pyvalue("Option<stdpython::PyValue>"))
+        self.assertFalse(rank_causes.is_plain_pyvalue("Vec<stdpython::PyValue>"))
+        self.assertFalse(rank_causes.is_plain_pyvalue("PyRef<HTTPHeaderDict>"))
+
+    def test_a_missing_package_log_refuses_the_whole_ranking(self):
+        # A partial log set must not be ranked against the full denominator.
+        with tempfile.TemporaryDirectory() as tmp:
+            record = Path(tmp) / "run.json"
+            record.write_text(json.dumps({"rypip_commit": "abc1234", "packages": {
+                "present": {"status": "build-failed", "histogram": {"E0599": 1}},
+                "gone": {"status": "build-failed", "histogram": {"E0599": 100}}}}))
+            workdir = self.write_workdir(tmp, [self.message("E0599", self.METHOD_ON_PYVALUE)],
+                                         package="present")
+            argv = ["rank_causes.py", str(record), "--workdir", str(workdir)]
+            with patch.object(sys, "argv", argv), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(rank_causes.main(), 1)
+            text = out.getvalue()
+            self.assertIn("NOT COMPARABLE", text)
+            self.assertIn("gone", text)
+
+    def test_shapes_report_the_unattributed_remainder(self):
+        code, text = self.run_rank(
+            {"E0599": 1, "E0308": 5},
+            [self.message("E0599", self.METHOD_ON_PYVALUE),
+             self.message("E0308", "mismatched types")])
+        self.assertEqual(code, 0)
+        # The E0308 site must be visible, not silently dropped by the shapes.
+        self.assertIn("outside E0599/E0609", text)
 
     def test_a_zero_error_corpus_is_an_explicit_refusal_not_an_empty_ranking(self):
         # A clean build is not a frontier: ranking must say so, not divide by zero.
