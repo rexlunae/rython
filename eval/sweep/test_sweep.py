@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import rank_causes
 import run_sweep
 import summarize
 
@@ -301,6 +302,186 @@ class EntryPointTests(unittest.TestCase):
             self.assertEqual(p.returncode, 1)
             self.assertIn("grand total delta: unavailable", p.stdout)
 
+class RankCausesTests(unittest.TestCase):
+    """The ranking must count the boundary it names, or it misleads the next round."""
+
+    METHOD_ON_PYVALUE = ("no method named `close` found for enum `stdpython::PyValue` "
+                         "in the current scope")
+    METHOD_ON_OTHER = ("no method named `push` found for enum `PyList` "
+                       "in the current scope")
+    FIELD_ON_PYVALUE = "no field `timeout` on type `stdpython::PyValue`"
+
+    def message(self, code, text, file_name="src/demo.rs", crate=None):
+        return {"level": "error", "code": {"code": code}, "message": text,
+                "spans": [{"is_primary": True, "file_name": file_name}]}
+
+    def event(self, message, crate):
+        return {"reason": "compiler-message",
+                "target": {"src_path": f"{crate}/src/demo.rs"}, "message": message}
+
+    def write_workdir(self, tmp, messages, package="demo", extra=None):
+        workdir = Path(tmp)
+        crate = workdir / f"crate-{package}"
+        (crate / "src").mkdir(parents=True, exist_ok=True)
+        lines = [json.dumps(self.event(m, crate)) for m in messages]
+        lines += [json.dumps(e) for e in (extra or [])]
+        (workdir / f"{package}-cargo.jsonl").write_text("\n".join(lines) + "\n")
+        return workdir
+
+    def record(self, tmp, histogram, package="demo"):
+        path = Path(tmp) / "run.json"
+        path.write_text(json.dumps({
+            "rypip_commit": "abc1234",
+            "packages": {package: {"status": "build-failed", "histogram": histogram}}}))
+        return path
+
+    def run_rank(self, histogram, messages):
+        with tempfile.TemporaryDirectory() as tmp:
+            record = self.record(tmp, histogram)
+            workdir = self.write_workdir(tmp, messages)
+            argv = ["rank_causes.py", str(record), "--workdir", str(workdir)]
+            with patch.object(sys, "argv", argv), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                code = rank_causes.main()
+            return code, out.getvalue()
+
+    def test_pyvalue_boundary_is_counted_apart_from_other_receivers(self):
+        code, text = self.run_rank(
+            {"E0599": 2, "E0609": 1},
+            [self.message("E0599", self.METHOD_ON_PYVALUE),
+             self.message("E0599", self.METHOD_ON_OTHER),
+             self.message("E0609", self.FIELD_ON_PYVALUE)])
+        self.assertEqual(code, 0)
+        # 2 of 3 sites are the boundary; the other-receiver site is separate.
+        self.assertIn("the PyValue attribute boundary: 2 sites", text)
+        self.assertIn("E0599 no method on PyValue", text)
+        self.assertIn("E0599 no method (other receiver)", text)
+        self.assertIn("E0609 no field on PyValue", text)
+
+    def test_percentages_use_the_record_histogram_not_the_event_count(self):
+        # The shape share comes from the corpus total (the record's
+        # histogram), so it stays meaningful when only a sample of the
+        # events for a code is present in the workdir.
+        with tempfile.TemporaryDirectory() as tmp:
+            record = self.record(tmp, {"E0599": 99, "E0609": 1})
+            workdir = self.write_workdir(tmp, [], package="demo")
+            argv = ["rank_causes.py", str(record), "--workdir", str(workdir)]
+            with patch.object(sys, "argv", argv), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                # Reconciled counts differ, so the log set is refused rather
+                # than ranked against a histogram it does not match.
+                self.assertEqual(rank_causes.main(), 1)
+            self.assertIn("do not match what was measured", out.getvalue())
+
+    def test_missing_workdir_is_an_explicit_failure_not_an_empty_ranking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record = self.record(tmp, {"E0599": 1})
+            argv = ["rank_causes.py", str(record),
+                    "--workdir", str(Path(tmp) / "absent")]
+            with patch.object(sys, "argv", argv), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(rank_causes.main(), 1)
+            self.assertIn("NOT COMPARABLE", out.getvalue())
+
+    def test_non_record_input_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "bad.json"
+            bad.write_text(json.dumps({"packages": "not-a-dict"}))
+            with self.assertRaises(SystemExit):
+                rank_causes.load_record(bad)
+
+    def test_dependency_diagnostics_are_not_ranked_as_generated_code(self):
+        # parse_build excludes dependency diagnostics from the histogram, so
+        # counting them here would inflate shapes against a denominator that
+        # never included them.
+        with tempfile.TemporaryDirectory() as tmp:
+            crate = Path(tmp) / "crate-demo"
+            (crate / "src").mkdir(parents=True, exist_ok=True)
+            dependency = {"reason": "compiler-message",
+                          "target": {"src_path": "/registry/src/hashdep/src/dep.rs"},
+                          "message": self.message("E0599", self.METHOD_ON_PYVALUE)}
+            workdir = self.write_workdir(tmp, [], extra=[dependency])
+            record = self.record(tmp, {"E0308": 2})
+            argv = ["rank_causes.py", str(record), "--workdir", str(workdir)]
+            with patch.object(sys, "argv", argv), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(rank_causes.main(), 1)
+            self.assertNotIn("PyValue attribute boundary: 1", out.getvalue())
+
+    def test_wrapper_receivers_are_not_counted_as_the_pyvalue_boundary(self):
+        # Option<PyValue>/Vec<PyValue> fail at the wrapper, which is a
+        # different defect; reference sugar is still a PyValue receiver.
+        code, text = self.run_rank(
+            {"E0599": 3},
+            [self.message("E0599", "no method named `close` found for enum "
+                                   "`Option<stdpython::PyValue>` in the current scope"),
+             self.message("E0599", "no field `x` on type `(stdpython::PyValue,)`"),
+             self.message("E0599", "no method named `close` found for mutable "
+                                   "reference `&mut stdpython::PyValue` in the current scope")])
+        self.assertEqual(code, 0)
+        self.assertIn("the PyValue attribute boundary: 1 sites", text)
+        self.assertIn("E0599 no method (other receiver)", text)
+        self.assertTrue(rank_causes.is_plain_pyvalue("&mut stdpython::PyValue"))
+        self.assertFalse(rank_causes.is_plain_pyvalue("Option<stdpython::PyValue>"))
+        self.assertFalse(rank_causes.is_plain_pyvalue("Vec<stdpython::PyValue>"))
+        self.assertFalse(rank_causes.is_plain_pyvalue("PyRef<HTTPHeaderDict>"))
+
+    def test_a_missing_package_log_refuses_the_whole_ranking(self):
+        # A partial log set must not be ranked against the full denominator.
+        with tempfile.TemporaryDirectory() as tmp:
+            record = Path(tmp) / "run.json"
+            record.write_text(json.dumps({"rypip_commit": "abc1234", "packages": {
+                "present": {"status": "build-failed", "histogram": {"E0599": 1}},
+                "gone": {"status": "build-failed", "histogram": {"E0599": 100}}}}))
+            workdir = self.write_workdir(tmp, [self.message("E0599", self.METHOD_ON_PYVALUE)],
+                                         package="present")
+            argv = ["rank_causes.py", str(record), "--workdir", str(workdir)]
+            with patch.object(sys, "argv", argv), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(rank_causes.main(), 1)
+            text = out.getvalue()
+            self.assertIn("NOT COMPARABLE", text)
+            self.assertIn("gone", text)
+
+    def test_logs_with_equal_totals_but_different_codes_are_rejected(self):
+        # A total-only comparison lets one E0609 masquerade as a recorded
+        # E0599, attaching the log's shapes to a code the record never had.
+        with tempfile.TemporaryDirectory() as tmp:
+            record = self.record(tmp, {"E0599": 1})
+            workdir = self.write_workdir(tmp, [self.message("E0609", "no field `x` on type `T`")])
+            argv = ["rank_causes.py", str(record), "--workdir", str(workdir)]
+            with patch.object(sys, "argv", argv), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(rank_causes.main(), 1)
+            text = out.getvalue()
+            self.assertIn("disagree with the record", text)
+            self.assertIn("E0599", text)
+            self.assertIn("E0609", text)
+
+    def test_shapes_separate_unmatched_attribute_errors_from_other_codes(self):
+        # An E0609 whose message matches no shape is still E0609, so it must
+        # not be reported as "another code".
+        code, text = self.run_rank(
+            {"E0599": 1, "E0609": 1, "E0308": 2},
+            [self.message("E0599", self.METHOD_ON_PYVALUE),
+             self.message("E0609", "some future rustc wording for a missing field"),
+             self.message("E0308", "mismatched types"),
+             self.message("E0308", "mismatched types")])
+        self.assertEqual(code, 0)
+        self.assertIn("E0599/E0609 not matching a shape above", text)
+        self.assertIn("(other codes", text)
+        # E0308's 2 errors are the "other codes" row; the unmatched E0609 is not.
+        self.assertIn("     2  (other codes", text)
+
+    def test_a_zero_error_corpus_is_an_explicit_refusal_not_an_empty_ranking(self):
+        # A clean build is not a frontier: ranking must say so, not divide by zero.
+        code, text = self.run_rank({}, [])
+        self.assertEqual(code, 1)
+        self.assertIn("Nothing to rank", text)
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 if __name__ == "__main__":
     unittest.main()
