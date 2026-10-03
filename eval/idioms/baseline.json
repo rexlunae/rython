@@ -111,6 +111,9 @@
     "pipeline": {
       "status": "pass"
     },
+    "print_eval_order": {
+      "status": "pass"
+    },
     "records": {
       "status": "pass"
     },

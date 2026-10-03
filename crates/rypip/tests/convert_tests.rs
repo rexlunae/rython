@@ -20745,3 +20745,59 @@ fn numeric_equality_holds_inside_boxed_containers() {
         ]
     );
 }
+
+#[test]
+fn print_renders_after_every_argument_has_evaluated() {
+    // Issue #433: CPython evaluates all of print's arguments and only then
+    // converts each with str(), so `print(xs, xs.pop())` shows the list
+    // AFTER the pop. rython rendered each argument as it was evaluated and
+    // printed `[1, 2, 3] 3`. Snapshots (a slice, `len`) and an f-string
+    // (which formats each field as it is evaluated) keep their order.
+    // Verified against python3.
+    let got = run_global_alias_program(
+        "printorder",
+        "print_order.py",
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self) -> int:\n",
+            "        self.n += 1\n",
+            "        return self.n\n",
+            "\n",
+            "    def __str__(self) -> str:\n",
+            "        return f\"Counter({self.n})\"\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    xs = [1, 2, 3]\n",
+            "    print(xs, xs.pop())\n",
+            "    d = {\"a\": 1}\n",
+            "    print(d, d.pop(\"a\"))\n",
+            "    c = Counter()\n",
+            "    print(c, c.bump(), c.bump())\n",
+            "    ys = [7, 8, 9]\n",
+            "    print(ys, ys.pop(), sep=\" | \", end=\" <\\n\")\n",
+            "    zs = [1, 2, 3]\n",
+            "    print(zs[:2], len(zs), zs.pop(), zs)\n",
+            "    fs = [1, 2, 3]\n",
+            "    print(f\"{fs} {fs.pop()}\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    assert_eq!(
+        got,
+        [
+            "[1, 2] 3",
+            "{} 1",
+            "Counter(2) 1 2",
+            "[7, 8] | 9 <",
+            "[1, 2] 3 3 [1, 2]",
+            "[1, 2, 3] 3",
+        ]
+    );
+}

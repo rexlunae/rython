@@ -4503,16 +4503,74 @@ impl<'a> CodeGen for Call {
                                 _ => {}
                             }
                         }
-                        let sep = match sep {
+                        // CPython evaluates every argument before it
+                        // converts any (issue #433): an earlier mutable
+                        // place (`xs` in `print(xs, xs.pop())`) renders
+                        // AFTER the later arguments ran.
+                        let kw_values: Vec<&crate::ExprType> =
+                            sep.iter().chain(end.iter()).chain(flush.iter()).collect();
+                        let deferred = crate::ast::tree::print_order::deferred_renders(
+                            &self.args, &kw_values, &ctx, &options, &symbols,
+                        )?;
+                        let late_kw = |e: &Option<crate::ExprType>| {
+                            e.as_ref().is_some_and(|e| {
+                                crate::ast::tree::print_order::needs_hoist(
+                                    e, &ctx, &options, &symbols,
+                                )
+                            })
+                        };
+                        let sep_tokens = match sep.clone() {
                             Some(s) => render(s)?,
                             None => quote!(" "),
                         };
-                        let end = match end {
+                        let end_tokens = match end.clone() {
                             Some(e) => render(e)?,
                             None => quote!("\n"),
                         };
                         // print(end="") with no arguments still needs an
                         // element type for the empty parts slice.
+                        if deferred.iter().any(|d| *d) {
+                            // Evaluate (and render) every eager argument in
+                            // source order first; the deferred places render
+                            // last. Keyword values that can run code evaluate
+                            // after the positionals, before any rendering of
+                            // a deferred place.
+                            let mut lets = TokenStream::new();
+                            let mut items = Vec::new();
+                            for (i, tok) in rendered.iter().enumerate() {
+                                if deferred[i] {
+                                    items.push(quote!(py_display(&(#tok))));
+                                } else {
+                                    let id = crate::safe_ident(&format!("__rython_print_arg{i}"));
+                                    lets.extend(quote!(let #id = py_display(&(#tok));));
+                                    items.push(quote!(#id));
+                                }
+                            }
+                            let (sep_tokens, end_tokens) = {
+                                let mut hoist = |name: &str, hoisted: bool, tok: TokenStream| {
+                                    if !hoisted {
+                                        return tok;
+                                    }
+                                    let id = crate::safe_ident(name);
+                                    lets.extend(quote!(let #id = #tok;));
+                                    quote!(#id)
+                                };
+                                let sep_tokens =
+                                    hoist("__rython_print_sep", late_kw(&sep), sep_tokens);
+                                let end_tokens =
+                                    hoist("__rython_print_end", late_kw(&end), end_tokens);
+                                (sep_tokens, end_tokens)
+                            };
+                            let call = match flush {
+                                None => quote!(print_parts(&[#(#items),*], #sep_tokens, #end_tokens)?),
+                                Some(f) => {
+                                    let f = render(f)?;
+                                    quote!(print_parts_flush(&[#(#items),*], #sep_tokens, #end_tokens, #f)?)
+                                }
+                            };
+                            return Ok(quote!({ #lets #call }));
+                        }
+                        let (sep, end) = (sep_tokens, end_tokens);
                         let parts = if rendered.is_empty() {
                             quote!(&[] as &[&str])
                         } else {
