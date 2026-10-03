@@ -1763,6 +1763,82 @@ impl PyRange {
 }
 
 impl PyRange {
+    /// CPython's `range[start:stop:step]`: a RANGE, keeping the range type
+    /// (range(6)[1:4] is range(1, 4), not a tuple or a list). Bounds resolve
+    /// through `slice.indices` semantics — negatives count from the end, and
+    /// an out-of-range bound clamps — then the new range's step is the
+    /// product of the old step and the slice step.
+    ///
+    /// CPython references, run under python3 3.14.1:
+    ///   range(6)[1:4] -> range(1, 4)      range(6)[::2] -> range(0, 6, 2)
+    ///   range(6)[::-1] -> range(5, -1, -1) range(6)[9:99] -> range(6, 6)
+    pub fn py_slice(
+        &self,
+        start: Option<i64>,
+        stop: Option<i64>,
+        step: Option<i64>,
+    ) -> PyRange {
+        let step = step.unwrap_or(1);
+        if step == 0 {
+            panic!("slice step cannot be zero");
+        }
+        let len = self.py_len() as i64;
+        // slice.indices(len, step): clamp, then wrap negatives.
+        let clamp = |i: i64| -> i64 {
+            if i < 0 {
+                (i + len).max(0).min(len)
+            } else {
+                i.min(len)
+            }
+        };
+        let (begin, end) = if step > 0 {
+            (clamp(start.unwrap_or(0)), clamp(stop.unwrap_or(len)))
+        } else {
+            // slice.indices for a negative step: the exclusive end wraps into
+            // [-1, len-1] and the inclusive start into [0, len-1], and the
+            // pair is EMPTY when begin <= end (the range walks down). An
+            // omitted end is the VIRTUAL index -1 — one before the first
+            // element — not len-1; wrapping -1 through len would turn a
+            // `xs[::-1]` into the empty slice.
+            let wrap_end = |i: i64| -> i64 {
+                if i < 0 { (i + len).max(-1) } else { i.min(len - 1) }
+            };
+            let wrap_start = |i: i64| -> i64 {
+                if i < 0 { (i + len).max(0) } else { i.min(len - 1) }
+            };
+            let end = match stop {
+                Some(s) => wrap_end(s),
+                // `xs[::-1]` / `xs[3:]` — walk back to before the start.
+                None => -1,
+            };
+            (wrap_start(start.unwrap_or(len - 1)), end)
+        };
+        // Empty in BOTH directions: forward slices when begin >= end, reverse
+        // ones when begin <= end.
+        let empty = if step > 0 { begin >= end } else { begin <= end };
+        if empty {
+            // An empty slice is `range(i, i)` — the repr CPython prints is
+            // `range(6, 6)` for `range(6)[9:99]`, i.e. it keeps the clamp
+            // point, not a synthetic `range(0, 0)`.
+            let at = if step > 0 { begin } else { end };
+            return PyRange {
+                next: self.next + at * self.step,
+                stop: self.next + at * self.step,
+                step: 1,
+            };
+        }
+        let new_step = self.step * step;
+        let next = self.next + begin * self.step;
+        // The exclusive stop is index `end` in the ORIGINAL range's own
+        // coordinates — `end` already IS the exclusive bound in both
+        // directions (for a reverse slice it is the virtual index one before
+        // the first element, which is exactly where a downward walk stops).
+        let stop = self.next + end * self.step;
+        PyRange { next, stop, step: new_step }
+    }
+}
+
+impl PyRange {
     /// CPython's repr: `range(3, 6)`, `range(0, 10, 2)` — the step only
     /// when it is not 1.
     pub fn py_repr_string(&self) -> String {
@@ -3178,18 +3254,26 @@ impl PyValue {
     }
 
     /// `d.items()` over a boxed dict, (String, PyValue) in insertion order.
-    fn py_dict_items(&self) -> Result<Vec<(String, PyValue)>, PyException> {
+    /// The dict-view methods below are INFALLIBLE (their trait signatures
+    /// return plain values), so a non-dict member cannot report CPython's
+    /// error through them. They panic with CPython's refusal instead of
+    /// returning None or an empty Vec: an empty collection here would be
+    /// indistinguishable from an empty dict and would silently diverge.
+    /// The fallible `boxed_get` is the path that carries a `PyException`.
+    fn py_dict_items(&self) -> Vec<(String, PyValue)> {
         if let Some(d) = self.as_dict_like() {
-            return Ok(d.py_items());
+            return d.py_items();
         }
         if let Some(d) = self.as_ordered_like() {
-            return Ok(PyDictOps::py_items(d.as_ref()));
+            return PyDictOps::py_items(d.as_ref());
         }
-        Err(self.not_a_container("items()"))
+        panic!("{}", self.not_a_container("items()"));
     }
 
-    /// `d.get(k)` on a boxed dict: the member, or None when absent.
-    fn boxed_get(&self, key: &str) -> Result<Option<PyValue>, PyException> {
+    /// `d.get(k)` on a boxed dict: the member, or None when absent. The
+    /// FALLIBLE entry point — a non-dict member raises CPython's TypeError
+    /// here rather than reading as an absent key.
+    pub fn boxed_get(&self, key: &str) -> Result<Option<PyValue>, PyException> {
         let owned = key.to_string();
         if let Some(d) = self.as_dict_like() {
             return Ok(d.py_get(&owned));
@@ -3210,23 +3294,25 @@ impl PyValue {
 
 impl PyDictOps<String, PyValue> for PyValue {
     fn py_get(&self, key: &String) -> Option<PyValue> {
-        self.boxed_get(key).ok().flatten()
+        // `boxed_get` raises for a non-dict member. The trait returns a plain
+        // Option, so that error cannot travel through it — propagate it as a
+        // panic rather than letting `None` read as an absent key (CPython
+        // raises AttributeError for `5.get("a")`).
+        self.boxed_get(key).unwrap_or_else(|e| panic!("{}", e.message))
     }
     fn py_get_default(&self, key: &String, default: PyValue) -> PyValue {
-        self.boxed_get(key).ok().flatten().unwrap_or(default)
+        self.boxed_get(key)
+            .unwrap_or_else(|e| panic!("{}", e.message))
+            .unwrap_or(default)
     }
     fn py_keys(&self) -> Vec<String> {
-        self.py_dict_items()
-            .map(|items| items.into_iter().map(|(k, _)| k).collect())
-            .unwrap_or_default()
+        self.py_dict_items().into_iter().map(|(k, _)| k).collect()
     }
     fn py_values(&self) -> Vec<PyValue> {
-        self.py_dict_items()
-            .map(|items| items.into_iter().map(|(_, v)| v).collect())
-            .unwrap_or_default()
+        self.py_dict_items().into_iter().map(|(_, v)| v).collect()
     }
     fn py_items(&self) -> Vec<(String, PyValue)> {
-        self.py_dict_items().unwrap_or_default()
+        self.py_dict_items()
     }
     fn py_setdefault(&mut self, key: String, default: PyValue) -> PyValue {
         match self {
@@ -3242,9 +3328,9 @@ impl PyDictOps<String, PyValue> for PyValue {
         match self {
             PyValue::Dict(d) => PyDictOps::update(Arc::make_mut(d), other),
             PyValue::OrderedDict(d) => PyDictOps::update(Arc::make_mut(d), other),
-            other => {
-                other.not_a_container("update()");
-            }
+            // Never a silent no-op: `[].update({})` is an AttributeError in
+            // CPython, so a non-dict receiver must not "succeed".
+            other => panic!("{}", other.not_a_container("update()")),
         }
     }
 }
@@ -3296,6 +3382,10 @@ impl PySlice for PyValue {
             PyValue::Tuple(members) => {
                 PyValue::Tuple(Arc::new(slice(members.as_slice(), start, stop, step)))
             }
+            // A range slices to a RANGE (range(6)[1:4] == range(1, 4)), never a
+            // tuple — it keeps the sequence type, as every other arm above
+            // keeps its own.
+            PyValue::Range(r) => PyValue::Range(r.py_slice(start, stop, step)),
             // The str surface is infallible by construction, so there is no
             // Result to carry CPython's TypeError through; panic with its
             // message rather than return a wrong value.
@@ -3307,47 +3397,36 @@ impl PySlice for PyValue {
 impl PySliceReplace for PyValue {
     type Item = PyValue;
     /// `xs[a:b] = replacement` on a boxed value (step 1 only; the
-    /// extended-slice path is separate).
-    fn py_slice_assign(&mut self, start: Option<i64>, stop: Option<i64>, replacement: Vec<PyValue>) {
-        if let PyValue::Tuple(members) = self {
-            let mut out = (**members).clone();
-            PySliceReplace::py_slice_assign(&mut out, start, stop, replacement);
-            *members = Arc::new(out);
-        }
+    /// extended-slice path is separate). A boxed TUPLE is immutable in
+    /// Python — `t[0:1] = [9]` raises TypeError — so this refuses rather
+    /// than editing the tuple's contents.
+    fn py_slice_assign(
+        &mut self,
+        _start: Option<i64>,
+        _stop: Option<i64>,
+        _replacement: Vec<PyValue>,
+    ) {
+        panic!("{}", self.not_a_container("item assignment"));
     }
     fn py_slice_assign_step(
         &mut self,
-        start: Option<i64>,
-        stop: Option<i64>,
-        step: i64,
-        replacement: Vec<PyValue>,
+        _start: Option<i64>,
+        _stop: Option<i64>,
+        _step: i64,
+        _replacement: Vec<PyValue>,
     ) -> Result<(), PyException> {
-        match self {
-            PyValue::Tuple(members) => {
-                let mut out = (**members).clone();
-                PySliceReplace::py_slice_assign_step(&mut out, start, stop, step, replacement)
-            }
-            other => Err(other.not_a_container("slice assignment")),
-        }
+        Err(self.not_a_container("item assignment"))
     }
-    fn py_slice_delete(&mut self, start: Option<i64>, stop: Option<i64>) {
-        if let PyValue::Tuple(members) = self {
-            let mut out = (**members).clone();
-            PySliceReplace::py_slice_delete(&mut out, start, stop);
-            *members = Arc::new(out);
-        }
+    fn py_slice_delete(&mut self, _start: Option<i64>, _stop: Option<i64>) {
+        panic!("{}", self.not_a_container("item deletion"));
     }
     fn py_slice_delete_step(
         &mut self,
-        start: Option<i64>,
-        stop: Option<i64>,
-        step: i64,
+        _start: Option<i64>,
+        _stop: Option<i64>,
+        _step: i64,
     ) -> Result<(), PyException> {
-        if let PyValue::Tuple(members) = self {
-            let mut out = (**members).clone();
-            return PySliceReplace::py_slice_delete_step(&mut out, start, stop, step);
-        }
-        Err(self.not_a_container("slice deletion"))
+        Err(self.not_a_container("item deletion"))
     }
 }
 

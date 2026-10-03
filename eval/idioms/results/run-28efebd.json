@@ -1,10 +1,10 @@
 {
   "converter_commit": "28efebd",
-  "repo_head": "47a0ce0",
+  "repo_head": "3e2ae4e",
   "rypip_path": "target/debug/rypip",
   "oracle": "CPython 3.14.1 (pins captured under 3.11)",
   "passed": 48,
-  "total": 50,
+  "total": 49,
   "passing": [
     "bank",
     "boxed_constructor",
@@ -170,10 +170,6 @@
       "program": "line_tally",
       "warnings": 0,
       "status": "pass"
-    },
-    "main": {
-      "program": "main",
-      "status": "no-expected"
     },
     "math_bare_imports": {
       "program": "math_bare_imports",

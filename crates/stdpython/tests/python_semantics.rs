@@ -5796,7 +5796,8 @@ mod boxed_ordereddict {
 
 mod boxed_container_ops {
     use stdpython::{
-        PyContains, PyDict, PyDictOps, PyException, PyPop, PySetIndex, PySlice, PyValue,
+        PyContains, PyDict, PyDictOps, PyException, PyPop, PySetIndex, PySlice, PySliceReplace,
+        PyValue,
     };
 
     fn boxed_dict(pairs: &[(&str, &str)]) -> PyValue {
@@ -5911,17 +5912,102 @@ mod boxed_container_ops {
 
     #[test]
     fn a_non_container_member_refuses_rather_than_returning_a_wrong_value() {
-        // 5.get("a") and "x".items() are both errors in CPython. The dict
-        // surface is infallible, so these refuse instead of yielding an empty
-        // list Python would never produce. The fallible helper carries the
-        // TypeError; assert on it rather than on the panic path.
+        // 5.get("a", 9) and "x".items() are AttributeError in CPython. The
+        // dict trait is INFALLIBLE, so these panic with the refusal instead of
+        // returning the default or an empty list — a default here would be
+        // indistinguishable from a real miss and would diverge silently.
         let n = PyValue::Int(5);
-        let err: PyException = n.not_a_container("items()");
+        let k = "a".to_string();
+        let d = 9i64;
+        // AssertUnwindSafe: the trait carries interior mutability, but these
+        // closures only borrow an immutable receiver and own their arguments.
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let key = k.clone();
+                PyDictOps::py_get_default(&PyValue::Int(5), &key, PyValue::Int(d))
+            }))
+            .is_err()
+        );
+        assert!(std::panic::catch_unwind(|| PyDictOps::py_get(&PyValue::Int(5), &k)).is_err());
+        assert!(std::panic::catch_unwind(|| PyDictOps::py_items(&PyValue::Int(5))).is_err());
+        assert!(std::panic::catch_unwind(|| PyDictOps::py_keys(&PyValue::Int(5))).is_err());
+        assert!(std::panic::catch_unwind(|| PyDictOps::py_values(&PyValue::Int(5))).is_err());
+        // setdefault and update must refuse too, never silently no-op.
+        assert!(std::panic::catch_unwind(|| {
+            let mut s = PyValue::Str("x".into());
+            let key = k.clone();
+            PyDictOps::py_setdefault(&mut s, key, PyValue::Int(1))
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            let mut n2 = PyValue::Int(5);
+            PyDictOps::update(&mut n2, PyDict::new())
+        })
+        .is_err());
+        // The fallible entry point carries CPython's TypeError by name.
+        let err = n.not_a_container("items()");
         assert_eq!(err.exception_type, "TypeError");
         assert!(err.message.contains("int"), "message was {:?}", err.message);
-        let s = PyValue::Str("x".into());
-        let err: PyException = s.not_a_container("items()");
+    }
+
+    #[test]
+    fn a_tuple_member_is_immutable_under_slice_assignment() {
+        // t = (1, 2); t[0:1] = [9] raises TypeError: 'tuple' object does not
+        // support item assignment — a boxed tuple must NOT be edited in place,
+        // and del t[0:1] raises TypeError the same way.
+        let mut t = PyValue::Tuple(std::sync::Arc::new(vec![
+            PyValue::Int(1),
+            PyValue::Int(2),
+        ]));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                PySliceReplace::py_slice_assign(&mut t, Some(0), Some(1), vec![PyValue::Int(9)]);
+            }))
+            .is_err(),
+            "a boxed tuple must refuse slice assignment"
+        );
+        // The stepped (fallible) arm reports the same refusal as an exception.
+        let mut t2 = PyValue::Tuple(std::sync::Arc::new(vec![PyValue::Int(1)]));
+        let err = PySliceReplace::py_slice_assign_step(
+            &mut t2,
+            None,
+            None,
+            2,
+            vec![PyValue::Int(9)],
+        )
+        .unwrap_err();
         assert_eq!(err.exception_type, "TypeError");
-        assert!(err.message.contains("str"), "message was {:?}", err.message);
+        // Deletion refuses too.
+        let mut t3 = PyValue::Tuple(std::sync::Arc::new(vec![PyValue::Int(1)]));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            PySliceReplace::py_slice_delete(&mut t3, None, None);
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn a_range_member_slices_to_a_range() {
+        // range(6)[1:4] == range(1, 4); [::2] == range(0, 6, 2);
+        // [::-1] == range(5, -1, -1); [9:99] == range(6, 6)
+        let r = PyValue::from(stdpython::range(6));
+        assert_eq!(stdpython::py_value_repr(&r.py_slice(Some(1), Some(4), None)), "range(1, 4)");
+        assert_eq!(
+            stdpython::py_value_repr(&r.py_slice(None, None, Some(2))),
+            "range(0, 6, 2)"
+        );
+        assert_eq!(
+            stdpython::py_value_repr(&r.py_slice(None, None, Some(-1))),
+            "range(5, -1, -1)"
+        );
+        assert_eq!(
+            stdpython::py_value_repr(&r.py_slice(Some(9), Some(99), None)),
+            "range(6, 6)"
+        );
+        // A step-2 range keeps its own step: range(0, 10, 2)[::2] == range(0, 10, 4)
+        let r2 = PyValue::from(stdpython::range_start_stop_step(0, 10, 2).unwrap());
+        assert_eq!(
+            stdpython::py_value_repr(&r2.py_slice(None, None, Some(2))),
+            "range(0, 10, 4)"
+        );
     }
 }
