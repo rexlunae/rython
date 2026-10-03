@@ -385,6 +385,16 @@ impl<'a> CodeGen for Assign {
             return Ok(TokenStream::new());
         }
 
+        // `x: deque = deque()` — a bare collections annotation.
+        if let Some(ann) = &self.annotation
+            && let Some(msg) = crate::ast::tree::collections_lower::bare_annotation_message(
+                ann,
+                &symbols,
+                "variable",
+            )
+        {
+            return Err(msg.into());
+        }
         let value_is_none_early = crate::is_none_expr(&self.value);
         let value_yields_option =
             crate::expr_yields_option_ctx(&self.value, &ctx, &options, &symbols);
@@ -411,6 +421,27 @@ impl<'a> CodeGen for Assign {
             .value
             .clone()
             .to_rust(ctx.clone(), value_options, symbols.clone())?;
+
+        // `d = deque()` / `dd = defaultdict(int)` / `od = OrderedDict()`
+        // bound to a name whose FINAL type is known (an annotation, or
+        // the uses pinned it): the construction spells the type arguments
+        // rustc cannot see from the constructor alone (a str-literal-only
+        // `dd["a"] += 1` would otherwise leave the key type open).
+        if let [ExprType::Name(name)] = self.targets.as_slice()
+            && let Some(bound @ crate::TypeInfo::Collection(kind, _)) =
+                options.name_types.get(&name.id)
+            && crate::ast::tree::collections_lower::construction_kind(&value_expr, &symbols)
+                == Some(*kind)
+            && let Some(lowered) = crate::ast::tree::collections_lower::lower_ctor_call(
+                &value_expr,
+                Some(bound),
+                &ctx,
+                &options,
+                &symbols,
+            )
+        {
+            value = lowered?;
+        }
 
         // `x = []` / `x = {}` with a pinned element type (from a later
         // append/insert/indexed-store/use, or a later typed assignment):
@@ -803,7 +834,7 @@ impl<'a> CodeGen for Assign {
                 && let Some(kind) = options.mutable_statics.get(&name.id)
             {
                 let ident = crate::safe_ident(&name.id);
-                let stored = if let crate::MutableGlobalKind::Class { class } = kind {
+                let stored = if let crate::MutableGlobalKind::Class { class, .. } = kind {
                     // Issue #189: the class-instance global holds exactly
                     // None and the detected class construction. The call's
                     // `?` propagates from the enclosing scope's Result.
@@ -1437,15 +1468,14 @@ impl<'a> CodeGen for Assign {
             // the store unwraps it (round 63).
             let value = if let ExprType::Name(n) = sub.value.as_ref()
                 && (matches!(
-                    options.name_types.get(&n.id),
-                    Some(crate::TypeInfo::Dict(_, v)) if matches!(**v, crate::TypeInfo::PyValue)
+                    options.name_types.get(&n.id).and_then(|t| t.dict_kv()),
+                    Some((_, v)) if matches!(v, crate::TypeInfo::PyValue)
                 ) || matches!(
                     options.name_types.get(&n.id),
                     Some(crate::TypeInfo::Option(inner))
                         if matches!(
-                            &**inner,
-                            crate::TypeInfo::Dict(_, v)
-                                if matches!(**v, crate::TypeInfo::PyValue)
+                            inner.dict_kv(),
+                            Some((_, v)) if matches!(v, crate::TypeInfo::PyValue)
                         )
                 ))
                 && !crate::expr_yields_pyvalue(&value_expr, &options, &symbols)
@@ -1514,16 +1544,10 @@ impl<'a> CodeGen for Assign {
                     // (round 63).
                     let receiver_dict = || -> Option<(crate::TypeInfo, crate::TypeInfo)> {
                         let through_option = |t: &crate::TypeInfo| match t {
-                            crate::TypeInfo::Dict(k, v) => {
-                                Some(((**k).clone(), (**v).clone()))
-                            }
-                            crate::TypeInfo::Option(inner) => match inner.as_ref() {
-                                crate::TypeInfo::Dict(k, v) => {
-                                    Some(((**k).clone(), (**v).clone()))
-                                }
-                                _ => None,
-                            },
-                            _ => None,
+                            crate::TypeInfo::Option(inner) => inner
+                                .dict_kv()
+                                .map(|(k, v)| (k.clone(), v.clone())),
+                            other => other.dict_kv().map(|(k, v)| (k.clone(), v.clone())),
                         };
                         match sub.value.as_ref() {
                             ExprType::Name(n) => options
@@ -1546,7 +1570,11 @@ impl<'a> CodeGen for Assign {
                         }
                     };
                     let string_keyed = receiver_dict()
-                        .is_some_and(|(k, _)| matches!(k, crate::TypeInfo::String));
+                        .is_some_and(|(k, _)| matches!(k, crate::TypeInfo::String))
+                        || crate::ast::tree::collections_lower::owns_literal_key(
+                            &crate::infer_type(Some(&ctx), &sub.value, &options, &symbols),
+                            index,
+                        );
                     let index = if string_keyed {
                         crate::render_typed(
                             index,

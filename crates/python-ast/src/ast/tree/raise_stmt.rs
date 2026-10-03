@@ -1130,6 +1130,21 @@ pub(crate) fn canonical_exception_base(
     )
 }
 
+/// The original name an ALIASING binding of `name` stands for: `X` for
+/// `from m import X as name` (the symbol table binds only `name`, as
+/// Python does), or the target of a local alias (`name = X`). `None` for a
+/// name that is not an alias (an unaliased or self-aliased import).
+fn import_alias_original(name: &str, scope: &SymbolTableScopes) -> Option<String> {
+    match scope.get(name) {
+        Some(SymbolTableNode::Alias(canonical)) => Some(canonical.clone()),
+        Some(SymbolTableNode::ImportFrom(i)) => {
+            let original = i.defining_name(name);
+            (original != name).then_some(original)
+        }
+        _ => None,
+    }
+}
+
 /// `external`: the module binds `name` by an external import;
 /// `crate_import`: the module binds `name` by `from <crate module>
 /// import <defining> as name`, with that module's path and the name
@@ -1156,8 +1171,8 @@ fn canonical_exception_class_bound(
     // `except HTTPError:` does not, as in Python — with its own ancestors,
     // and a definition warning says so.
     if let Some((source, defining)) = crate_import
-        && let Some(SymbolTableNode::Alias(canonical)) = scope.get(name)
-        && matches!(scope.get(canonical), Some(SymbolTableNode::ClassDef(_)))
+        && let Some(canonical) = import_alias_original(name, scope)
+        && matches!(scope.get(&canonical), Some(SymbolTableNode::ClassDef(_)))
     {
         if let Some((cls, cls_scope)) =
             crate::ast::tree::module::resolve_imported_class(options, &source, &defining, 0)
@@ -1187,7 +1202,8 @@ fn canonical_exception_class_bound(
     // JSONDecodeError as CompatJSONDecodeError`): the bare name would
     // otherwise read as a builtin by its spelling alone (Devin review on
     // #331).
-    if external && let Some(SymbolTableNode::Alias(canonical)) = scope.get(name) {
+    if external && let Some(canonical) = import_alias_original(name, scope) {
+        let canonical = &canonical;
         if let Some(builtin) = imported_exception_alias(name, scope, Some(options)) {
             return Some((builtin.to_string(), None));
         }

@@ -173,7 +173,12 @@ pub enum MutableGlobalKind {
     /// `static name: LazyLock<Mutex<T>>` where T is the inferred type, or
     /// the boxed PyValue when none infers (`boxed` records which — stores
     /// wrap in PyValue::from exactly when the static is boxed).
-    Computed { boxed: bool },
+    ///
+    /// `bound` (issue #422): the value holds a shared class's `PyRef` (an
+    /// `Rc`, not `Send`), so the Mutex is wrapped in a `ThreadBound`
+    /// (`LazyLock<ThreadBound<Mutex<T>>>`) — a `Mutex<T>` is only `Sync`
+    /// for `T: Send`. Decided once the shared-class set is known.
+    Computed { boxed: bool, bound: bool },
     /// Issue #189: a None-initialized module global whose `global`-writing
     /// functions store exactly one local class instance (`HISTORY_RECORDER
     /// = HistoryRecorder()` — botocore's history.py) among None stores:
@@ -181,7 +186,11 @@ pub enum MutableGlobalKind {
     /// the INSTANCE (a read while None is a loud runtime panic, §12.2);
     /// `is None` compares read the Option (compare.rs); stores are None
     /// and `Some(instance)` — anything else is a loud conversion error.
-    Class { class: String },
+    ///
+    /// The static holds `Option<PyRef<Class>>` when the class is shared
+    /// (a stored instance is the ONE object every holder sees), and is
+    /// `bound` like `Computed` when the class holds shared objects.
+    Class { class: String, bound: bool },
 }
 
 impl MutableGlobalKind {
@@ -189,17 +198,32 @@ impl MutableGlobalKind {
     /// deref: `&*name` instead of `&name`).
     pub fn lazy(&self) -> bool {
         matches!(self, MutableGlobalKind::Str | MutableGlobalKind::Computed { .. })
+            || self.thread_bound()
+    }
+    /// Whether the Mutex sits inside a `stdpython::ThreadBound` because
+    /// its value holds a shared instance (issue #422).
+    pub fn thread_bound(&self) -> bool {
+        matches!(
+            self,
+            MutableGlobalKind::Computed { bound: true, .. }
+                | MutableGlobalKind::Class { bound: true, .. }
+        )
     }
     /// Whether stores must box their value in `PyValue::from`.
     pub fn boxed(&self) -> bool {
         matches!(
             self,
-            MutableGlobalKind::Boxed | MutableGlobalKind::Computed { boxed: true }
+            MutableGlobalKind::Boxed | MutableGlobalKind::Computed { boxed: true, .. }
         )
     }
-    /// The `&name` / `&*name` reference the py_global helpers take.
+    /// The `&name` / `&*name` reference the py_global helpers take (a
+    /// thread-bound static derefs twice: LazyLock, then ThreadBound — the
+    /// second deref is the thread check, so every read, write and
+    /// mutation of the global goes through it).
     pub fn static_ref(&self, ident: &proc_macro2::Ident) -> proc_macro2::TokenStream {
-        if self.lazy() {
+        if self.thread_bound() {
+            quote::quote!(&**#ident)
+        } else if self.lazy() {
             quote::quote!(&*#ident)
         } else {
             quote::quote!(&#ident)

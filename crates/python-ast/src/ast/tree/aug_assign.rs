@@ -125,15 +125,24 @@ impl CodeGen for AugAssign {
                 sub.value.as_ref(),
                 ExprType::Name(n)
                     if matches!(
-                        options.name_types.get(&n.id),
-                        Some(crate::TypeInfo::Dict(k, _))
-                            if matches!(**k, crate::TypeInfo::String)
+                        options.name_types.get(&n.id).and_then(|t| t.dict_kv()),
+                        Some((k, _)) if matches!(k, crate::TypeInfo::String)
                     )
             );
             let index = match &sub.kind {
                 crate::SubscriptKind::Index(index) => {
+                    // A str literal into a collections mapping whose key is
+                    // still unknown owns itself like a String key.
+                    let string_keyed_dict = string_keyed_dict
+                        || crate::ast::tree::collections_lower::owns_literal_key(
+                            &crate::infer_type(Some(&ctx), &sub.value, &options, &symbols),
+                            index,
+                        );
+                    // The key is read again later when it is a name used
+                    // after this statement (`d[k] += 1; e[k] = 2`): the
+                    // reuse-aware renderers clone instead of moving it.
                     if string_keyed_dict {
-                        crate::render_typed(
+                        crate::render_typed_reused(
                             index,
                             ctx.clone(),
                             options.clone(),
@@ -141,9 +150,7 @@ impl CodeGen for AugAssign {
                             Some(crate::TypeInfo::String),
                         )?
                     } else {
-                        index
-                            .clone()
-                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?
+                        crate::render_reused(index, ctx.clone(), options.clone(), symbols.clone())?
                     }
                 }
                 crate::SubscriptKind::Slice { .. } => {

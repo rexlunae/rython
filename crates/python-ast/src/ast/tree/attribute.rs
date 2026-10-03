@@ -91,6 +91,17 @@ impl<'a> CodeGen for Attribute {
             let name = self.attr.as_str();
             return Ok(quote!((#recv).py_getattr(#name)?));
         }
+        // `d.maxlen` of a deque: the bound as an `Optional[int]` (the
+        // runtime keeps the field private; reads go through its accessor).
+        if self.attr == "maxlen"
+            && matches!(
+                crate::infer_type(Some(&ctx), &self.value, &options, &symbols),
+                crate::TypeInfo::Collection(crate::CollectionsType::Deque, _)
+            )
+        {
+            let recv = self.value.to_rust(ctx, options, symbols)?;
+            return Ok(quote!((#recv).maxlen()));
+        }
         // `type(self).__name__` — the class name string for repr/error
         // messages (urllib3's ConnectionPool/Retry/Timeout reprs). The
         // `type(self)` call alone lowers to the name string (call.rs's
@@ -543,6 +554,21 @@ impl<'a> CodeGen for Attribute {
                         None
                     }
                 });
+        // A `urllib.parse` result's COMPUTED property (`parsed.hostname`,
+        // `parsed.port`): the runtime models it as a method, so the read is
+        // the call — `port` raises ValueError like CPython's, hence `?`.
+        let parse_result_property = crate::ast::tree::type_ctx::ParseResultAttr::from_name(
+            &self.attr,
+        )
+        .filter(|a| a.is_computed())
+        .filter(|_| {
+            crate::ast::tree::type_ctx::is_parse_result_typeinfo(&crate::infer_type(
+                Some(&ctx),
+                &self.value,
+                &options,
+                &symbols,
+            ))
+        });
         // Whether the getter needs `&mut self` (it stores a cache — a
         // SHARED receiver's read then borrows the one object MUTABLY;
         // computed before `options` is moved by the receiver render).
@@ -793,6 +819,13 @@ impl<'a> CodeGen for Attribute {
                     receiver, self.attr
                 ));
                 return Ok(quote!(stdpython::PyValue::None_));
+            }
+            if let Some(property) = parse_result_property {
+                return Ok(if property.is_fallible() {
+                    quote!((#value_tokens).#attr()?)
+                } else {
+                    quote!((#value_tokens).#attr())
+                });
             }
             // Use . for field/method access (Python's obj.field becomes obj.field).
             // A class field owned by an ancestor of the receiver's class is
@@ -1311,8 +1344,12 @@ pub(crate) fn is_module_path_chain(
                 // to `use <stdpython>::json as complexjson;`, so
                 // `complexjson.dumps(...)` resolves as `complexjson::dumps`.
                 Some(SymbolTableNode::ImportFrom(ifm)) if ifm.level > 0 => {
+                    // The submodule the import names is the DEFINING name
+                    // (`from .compat import json as complexjson` binds
+                    // `complexjson` to compat's `json`).
+                    let defining = ifm.defining_name(&n.id);
                     let mut sub = ifm.resolved_module_path(options);
-                    sub.push(n.id.clone());
+                    sub.push(defining.clone());
                     if crate::module_defs_contains(options, &sub) {
                         return true;
                     }
@@ -1322,7 +1359,7 @@ pub(crate) fn is_module_path_chain(
                             crate::ast::tree::module::module_reexports_stdpython_module(
                                 options,
                                 key,
-                                &n.id,
+                                &defining,
                             )
                             .is_some()
                         })
@@ -1337,7 +1374,7 @@ pub(crate) fn is_module_path_chain(
                 // (`module + name` is not a crate module).
                 Some(SymbolTableNode::ImportFrom(ifm)) if ifm.level == 0 => {
                     let mut sub = ifm.resolved_module_path(options);
-                    sub.push(n.id.clone());
+                    sub.push(ifm.defining_name(&n.id));
                     crate::module_defs_contains(options, &sub)
                 }
                 _ => false,
@@ -1553,7 +1590,7 @@ pub(crate) fn is_boxed_global_read(
     matches!(
         options.mutable_statics.get(&n.id),
         Some(crate::MutableGlobalKind::Boxed)
-            | Some(crate::MutableGlobalKind::Computed { boxed: true })
+            | Some(crate::MutableGlobalKind::Computed { boxed: true, .. })
     )
 }
 
@@ -1792,3 +1829,28 @@ pub(crate) fn threading_local_receiver(
     Ok(Some(value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?))
 }
 
+/// Whether reading `attr` lowers to a CALL whose result is a fresh owned
+/// value — a property getter on the receiver's class (`self.url()?`), or
+/// a `urllib.parse` result's computed property (`parsed.hostname()`) —
+/// rather than a place. A reused receiver needs no clone of such a read.
+pub(crate) fn attribute_read_is_call(
+    attr: &Attribute,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    if crate::ast::tree::type_ctx::ParseResultAttr::from_name(&attr.attr)
+        .is_some_and(|a| a.is_computed())
+        && crate::ast::tree::type_ctx::is_parse_result_typeinfo(&crate::infer_type(
+            Some(ctx),
+            &attr.value,
+            options,
+            symbols,
+        ))
+    {
+        return true;
+    }
+    crate::receiver_class_for_read(&attr.value, ctx, symbols, options).is_some_and(
+        |(class, class_symbols)| class.has_property_getter(&attr.attr, &class_symbols, options),
+    )
+}

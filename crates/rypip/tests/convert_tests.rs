@@ -19324,6 +19324,346 @@ fn a_module_global_holding_a_shared_object_is_the_one_object() {
 }
 
 #[test]
+fn a_global_singleton_and_a_mutated_registry_hold_the_one_object() {
+    // Issue #422: a `global`-rebound singleton (`_instance`) and a module
+    // value mutated in place (`reg`, whose list holds shared Counters) are
+    // `Mutex` statics holding a shared class's `PyRef`: thread-bound, so the
+    // crate compiles, and every handle reaches the ONE object (`a is b`,
+    // a bump through `held` is seen through `reg.items`).
+    let scratch = Scratch::new("globalsingleton");
+    let file = scratch.path().join("global_shared_singleton.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self, k: int) -> int:\n",
+            "        self.n += k\n",
+            "        return self.n\n",
+            "\n",
+            "\n",
+            "class Registry:\n",
+            "    def __init__(self):\n",
+            "        self.items: list[Counter] = []\n",
+            "\n",
+            "    def add(self, c: Counter) -> None:\n",
+            "        self.items.append(c)\n",
+            "\n",
+            "\n",
+            "_instance = None\n",
+            "\n",
+            "\n",
+            "def get_instance() -> Counter:\n",
+            "    global _instance\n",
+            "    if _instance is None:\n",
+            "        _instance = Counter()\n",
+            "    return _instance\n",
+            "\n",
+            "\n",
+            "reg = Registry()\n",
+            "reg.add(Counter())\n",
+            "held = Counter()\n",
+            "reg.add(held)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    a = get_instance()\n",
+            "    a.bump(2)\n",
+            "    b = get_instance()\n",
+            "    print(b.bump(3))\n",
+            "    print(a is b)\n",
+            "    print(get_instance().n)\n",
+            "\n",
+            "    held.bump(7)\n",
+            "    reg.items[0].bump(1)\n",
+            "    total = 0\n",
+            "    for c in reg.items:\n",
+            "        total += c.n\n",
+            "        print(c.n)\n",
+            "    print(total)\n",
+            "    print(sum(c.n for c in reg.items))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/global_shared_singleton"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "5",
+            "True",
+            "5",
+            "1",
+            "7",
+            "8",
+            "8",
+        ],
+    );
+}
+
+#[test]
+fn a_global_singleton_is_shared_so_its_handles_alias() {
+    // Issue #422: a class a `global`-rebound static holds is a holder of the
+    // one object, so it takes the shared representation even when nothing
+    // else holds it: a mutation through a handle the getter returned
+    // (`p.label = ...`, `p.c.bump(...)`, `old.bump(...)`) is seen by the
+    // global, and a REBOUND global leaves the old handle on the old object.
+    let scratch = Scratch::new("globalhandles");
+    let file = scratch.path().join("global_singleton_handles.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self, k: int) -> int:\n",
+            "        self.n += k\n",
+            "        return self.n\n",
+            "\n",
+            "\n",
+            "class Pool:\n",
+            "    def __init__(self):\n",
+            "        self.label = \"pool\"\n",
+            "        self.c = Counter()\n",
+            "\n",
+            "\n",
+            "_instance = None\n",
+            "_pool = None\n",
+            "current = Counter()\n",
+            "\n",
+            "\n",
+            "def get_instance() -> Counter:\n",
+            "    global _instance\n",
+            "    if _instance is None:\n",
+            "        _instance = Counter()\n",
+            "    return _instance\n",
+            "\n",
+            "\n",
+            "def get_pool() -> Pool:\n",
+            "    global _pool\n",
+            "    if _pool is None:\n",
+            "        _pool = Pool()\n",
+            "    return _pool\n",
+            "\n",
+            "\n",
+            "def swap() -> None:\n",
+            "    global current\n",
+            "    current = Counter()\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    a = get_instance()\n",
+            "    a.bump(2)\n",
+            "    b = get_instance()\n",
+            "    print(b.bump(3))\n",
+            "    print(a is b)\n",
+            "    p = get_pool()\n",
+            "    p.label = \"changed\"\n",
+            "    p.c.bump(9)\n",
+            "    print(get_pool().label, get_pool().c.n)\n",
+            "    old = current\n",
+            "    old.bump(4)\n",
+            "    print(current.n)\n",
+            "    swap()\n",
+            "    print(current.n, old.n)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/global_singleton_handles"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "5",
+            "True",
+            "changed 9",
+            "4",
+            "0 4",
+        ],
+    );
+}
+
+/// Convert a one-file program, build it and return its stdout lines.
+fn run_global_alias_program(tag: &str, file_name: &str, source: &str) -> Vec<String> {
+    let scratch = Scratch::new(tag);
+    let file = scratch.path().join(file_name);
+    fs::write(&file, source).unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let bin = file_name.trim_end_matches(".py");
+    let output = Command::new(krate.root.join("target/debug").join(bin))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn a_global_mutated_in_place_is_one_object_with_its_local_aliases() {
+    // Issue #430: `current = Box()` is never rebound, only mutated in place
+    // (`current.n += 1`), so it was a Mutex static whose every read cloned
+    // the instance — `x = current; x.n = 5` mutated a copy and `bump()`
+    // mutated the static, printing `1 5` for CPython's `6 6`. The static is
+    // a holder, so `Box` is shared and the local is another handle to the
+    // one object, in both directions and under `is`.
+    let got = run_global_alias_program(
+        "globalalias",
+        "global_alias_inplace.py",
+        concat!(
+            "class Box:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "\n",
+            "current = Box()\n",
+            "\n",
+            "\n",
+            "def bump() -> None:\n",
+            "    current.n += 1\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    x = current\n",
+            "    x.n = 5\n",
+            "    bump()\n",
+            "    print(current.n, x.n)\n",
+            "    y = current\n",
+            "    print(x is y, y is current)\n",
+            "    y.n = 20\n",
+            "    print(current.n, x.n)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    );
+    // Verified against python3.
+    assert_eq!(got, vec!["6 6", "True True", "20 20"]);
+}
+
+#[test]
+fn a_read_only_global_instance_is_one_object_with_its_local_aliases() {
+    // Issue #430: a module instance nothing rebinds or mutates through its
+    // own name was a plain LazyLock read by clone: `x = DEFAULT; x.n = 3`
+    // left `DEFAULT.n` at 0 (CPython: 3). A function that reads the global
+    // is a holder, so the class is shared and `x` is the global's object.
+    let got = run_global_alias_program(
+        "globalreadonly",
+        "global_readonly_alias.py",
+        concat!(
+            "class Box:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "\n",
+            "DEFAULT = Box()\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    x = DEFAULT\n",
+            "    x.n = 3\n",
+            "    print(DEFAULT.n, x.n)\n",
+            "    print(x is DEFAULT)\n",
+            "    DEFAULT.n += 1\n",
+            "    print(x.n)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+    );
+    // Verified against python3.
+    assert_eq!(got, vec!["3 3", "True", "4"]);
+}
+
+#[test]
+fn a_global_instance_passed_or_listed_is_the_one_object() {
+    // Issue #430: the parameter and container holders of a module instance
+    // (`set5(current)`, `items = [current]; items[0].n += 1`) see the one
+    // object the global names (the `global_alias_holders` idiom program).
+    let got = run_global_alias_program(
+        "globalshapes",
+        "global_alias_holders.py",
+        concat!(
+            "class Box:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "\n",
+            "current = Box()\n",
+            "\n",
+            "\n",
+            "def bump() -> None:\n",
+            "    current.n += 1\n",
+            "\n",
+            "\n",
+            "def set5(b: Box) -> None:\n",
+            "    b.n = 5\n",
+            "\n",
+            "\n",
+            "def run_param() -> None:\n",
+            "    set5(current)\n",
+            "    print(current.n)\n",
+            "\n",
+            "\n",
+            "def run_list() -> None:\n",
+            "    items = [current]\n",
+            "    items[0].n += 1\n",
+            "    bump()\n",
+            "    print(current.n, items[0].n)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    run_param()\n",
+            "    run_list()\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    // Verified against python3.
+    assert_eq!(got, vec!["5", "7 7"]);
+}
+
+#[test]
 fn a_list_of_boxed_values_field_keeps_its_own_methods() {
     // Issue #421: `self.q: list[Any]` is a Vec<PyValue> — a typed
     // container, not a boxed receiver — so `append`/`pop` on it are real.
@@ -19561,4 +19901,782 @@ fn a_mutation_through_a_class_parameter_reaches_the_callers_object() {
             "7",
         ],
     );
+}
+
+#[test]
+fn an_aliased_from_import_does_not_rebind_the_original_name_at_runtime() {
+    // Issue #428: `from m import X as Y` binds only `Y`. The symbol table
+    // also bound `X` (to the aliasing statement's module), overwriting an
+    // earlier `from other import X`, so a later `X(...)` resolved against
+    // the wrong module: `os.path.split` became `re.split` (a conversion
+    // error) and `re.escape` became `glob.escape` (a SILENT wrong string:
+    // same signature, different output). Each pair is imported in the
+    // order the bug needs: plain then aliased for `split`, aliased then
+    // plain for `escape`.
+    let scratch = Scratch::new("aliasnames");
+    let file = scratch.path().join("alias_names.py");
+    fs::write(
+        &file,
+        concat!(
+            "from glob import escape as gescape\n",
+            "from os.path import split\n",
+            "from re import escape\n",
+            "from re import split as rsplit\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(split(\"a/b\"))\n",
+            "    print(rsplit(\",\", \"x,y,z\"))\n",
+            "    print(escape(\"a.b*c\"))\n",
+            "    print(gescape(\"a.b*c\"))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/alias_names"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "('a', 'b')",
+            "['x', 'y', 'z']",
+            "a\\.b\\*c",
+            "a.b[*]c",
+        ],
+    );
+}
+
+#[test]
+fn aliased_itertools_imports_dispatch_like_the_original_names_at_runtime() {
+    // Issue #428 follow-up: the symbol table binds only the alias, so the
+    // itertools dispatch resolves the DEFINING name (`product as prod` is
+    // itertools.product, with its `repeat=` / `initial=` / `fillvalue=`
+    // keyword spellings).
+    let scratch = Scratch::new("itaalias");
+    let file = scratch.path().join("it_alias.py");
+    fs::write(
+        &file,
+        concat!(
+            "from itertools import accumulate as acc, pairwise as pw, product as prod, zip_longest as zl\n",
+            "from itertools import combinations as comb, groupby as gb, permutations as perms, starmap as sm, takewhile as tw\n",
+            "\n",
+            "\n",
+            "def main() -> int:\n",
+            "    for v in acc([1, 2, 3, 4]):\n",
+            "        print(f\"acc={v}\")\n",
+            "    for v in acc([1, 2, 3], initial=100):\n",
+            "        print(f\"acci={v}\")\n",
+            "    for a, b in prod([1, 2], [10, 20]):\n",
+            "        print(f\"prod={a},{b}\")\n",
+            "    for a, b in prod([0, 1], repeat=2):\n",
+            "        print(f\"rep={a},{b}\")\n",
+            "    for a, b in pw([1, 2, 3]):\n",
+            "        print(f\"pw={a},{b}\")\n",
+            "    for a, b in zl([1], [10, 20], fillvalue=0):\n",
+            "        print(f\"zl={a},{b}\")\n",
+            "    for c in comb([1, 2, 3], 2):\n",
+            "        print(f\"comb={c[0]},{c[1]}\")\n",
+            "    for p in perms([1, 2]):\n",
+            "        print(f\"perm={p[0]},{p[1]}\")\n",
+            "    for k, g in gb([1, 1, 2]):\n",
+            "        n = 0\n",
+            "        for _x in g:\n",
+            "            n += 1\n",
+            "        print(f\"gb={k}:{n}\")\n",
+            "    for v in sm(lambda a, b: a * b, [(2, 3), (4, 5)]):\n",
+            "        print(f\"sm={v}\")\n",
+            "    for v in tw(lambda x: x < 3, [1, 2, 3, 1]):\n",
+            "        print(f\"tw={v}\")\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/it_alias"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "acc=1", "acc=3", "acc=6", "acc=10",
+            "acci=100", "acci=101", "acci=103", "acci=106",
+            "prod=1,10", "prod=1,20", "prod=2,10", "prod=2,20",
+            "rep=0,0", "rep=0,1", "rep=1,0", "rep=1,1",
+            "pw=1,2", "pw=2,3",
+            "zl=1,10", "zl=0,20",
+            "comb=1,2", "comb=1,3", "comb=2,3",
+            "perm=1,2", "perm=2,1",
+            "gb=1:2", "gb=2:1",
+            "sm=6", "sm=20",
+            "tw=1", "tw=2",
+        ],
+    );
+}
+
+#[test]
+fn aliased_datetime_imports_construct_like_the_original_names_at_runtime() {
+    // Issue #428 follow-up: `from datetime import date as D, datetime as DT,
+    // timedelta as TD` constructs by the DEFINING name.
+    let scratch = Scratch::new("dtalias");
+    let file = scratch.path().join("dt_alias.py");
+    fs::write(
+        &file,
+        concat!(
+            "from datetime import date as D, datetime as DT, timedelta as TD\n",
+            "\n",
+            "\n",
+            "def main() -> int:\n",
+            "    d1 = D(2024, 3, 1)\n",
+            "    d2 = D(2024, 2, 27)\n",
+            "    gap = d1 - d2\n",
+            "    print(f\"gap={gap} days={gap.days}\")\n",
+            "    print(f\"shift={d1 + TD(days=3)} back={d1 - TD(weeks=1)}\")\n",
+            "    dt = DT(2024, 2, 29, 13, 5, 7)\n",
+            "    print(f\"dt={dt}\")\n",
+            "    dt2 = dt + TD(hours=25, minutes=90)\n",
+            "    print(f\"dt2={dt2}\")\n",
+            "    print(f\"diff={dt2 - dt}\")\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/dt_alias"))
+        .output()
+        .expect("running generated binary");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "gap=3 days, 0:00:00 days=3",
+            "shift=2024-03-04 back=2024-02-23",
+            "dt=2024-02-29 13:05:07",
+            "dt2=2024-03-01 15:35:07",
+            "diff=1 day, 2:30:00",
+        ],
+    );
+}
+
+#[test]
+fn aliased_crate_imports_resolve_their_defining_items_at_runtime() {
+    // Issue #428 follow-up: `from .helpers import scale as sc` (a keyword
+    // call, so the signature must be found under the DEFINING name `scale`)
+    // and `from . import sub as s; s.Cls()` (the submodule is `sub`, not
+    // `s`).
+    let scratch = Scratch::new("aliasdefs");
+    let krate = package_crate(
+        &scratch,
+        "aliaspkg",
+        &[
+            (
+                "helpers.py",
+                concat!(
+                    "def scale(x: int, factor: int = 1) -> int:\n",
+                    "    return x * factor\n",
+                    "\n",
+                    "\n",
+                    "def offset(x: int, by: int = 0) -> int:\n",
+                    "    return x + by\n",
+                ),
+            ),
+            (
+                "sub.py",
+                concat!(
+                    "class Cls:\n",
+                    "    def __init__(self) -> None:\n",
+                    "        self.value = 7\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from . import sub as s\n",
+                    "from .helpers import offset as off\n",
+                    "from .helpers import scale as sc\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(sc(x=2, factor=3))\n",
+                    "    print(sc(5))\n",
+                    "    print(off(1, by=10))\n",
+                    "    c = s.Cls()\n",
+                    "    print(c.value)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "aliaspkg"), vec!["6", "5", "11", "7"]);
+}
+
+#[test]
+fn collections_containers_match_python_at_runtime() {
+    // Issue #427: deque / defaultdict / OrderedDict constructed fine but had
+    // no method surface, so ordinary programs failed in rustc. The first
+    // three prints are the issue's reproducer.
+    let scratch = Scratch::new("collections");
+    let file = scratch.path().join("containers.py");
+    fs::write(
+        &file,
+        concat!(
+            "from collections import deque, defaultdict, OrderedDict\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    d = deque([1, 2])\n",
+            "    d.append(3)\n",
+            "    print(len(d))\n",
+            "    dd = defaultdict(int)\n",
+            "    dd[\"a\"] += 2\n",
+            "    print(dd[\"a\"])\n",
+            "    od = OrderedDict()\n",
+            "    od[\"b\"] = 1\n",
+            "    od[\"a\"] = 2\n",
+            "    print(list(od.keys()))\n",
+            "\n",
+            "\n",
+            "def window_sums(values: list[int], size: int) -> list[int]:\n",
+            "    window: deque[int] = deque(maxlen=size)\n",
+            "    sums: list[int] = []\n",
+            "    for v in values:\n",
+            "        window.append(v)\n",
+            "        if len(window) == size:\n",
+            "            sums.append(sum(window))\n",
+            "    return sums\n",
+            "\n",
+            "\n",
+            "def group_by_initial(words: list[str]) -> dict[str, list[str]]:\n",
+            "    groups: defaultdict[str, list[str]] = defaultdict(list)\n",
+            "    for w in words:\n",
+            "        groups[w[0]].append(w)\n",
+            "    return dict(groups)\n",
+            "\n",
+            "\n",
+            "def lru(keys: list[str], capacity: int) -> list[str]:\n",
+            "    cache: OrderedDict[str, int] = OrderedDict()\n",
+            "    for k in keys:\n",
+            "        if k in cache:\n",
+            "            cache.move_to_end(k)\n",
+            "        cache[k] = len(k)\n",
+            "        if len(cache) > capacity:\n",
+            "            cache.popitem(last=False)\n",
+            "    return list(cache)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+            "    print(window_sums([1, 2, 3, 4, 5, 6], 3))\n",
+            "    print(group_by_initial([\"apple\", \"avocado\", \"banana\"]))\n",
+            "    print(lru([\"a\", \"b\", \"a\", \"c\", \"d\", \"a\"], 2))\n",
+            "    q = deque([1, 2, 3, 4, 5])\n",
+            "    q.rotate(2)\n",
+            "    print(q)\n",
+            "    q.appendleft(0)\n",
+            "    print(q.pop(), q.popleft(), q)\n",
+            "    seen = defaultdict(int)\n",
+            "    print(seen[\"x\"], len(seen), list(seen))\n",
+            "    print(seen)\n",
+            "    try:\n",
+            "        deque().pop()\n",
+            "    except IndexError as exc:\n",
+            "        print(\"IndexError:\", exc)\n",
+            "    try:\n",
+            "        OrderedDict()[\"k\"]\n",
+            "    except KeyError as exc:\n",
+            "        print(\"KeyError:\", exc)\n",
+            "    print(OrderedDict([(\"b\", 1), (\"a\", 2)]))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/containers"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3 (3.12: the OrderedDict repr form changed in
+    // 3.12). The defaultdict read `seen["x"]` INSERTS the key (len 1, listed).
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "3",
+            "2",
+            "['b', 'a']",
+            "[6, 9, 12, 15]",
+            "{'a': ['apple', 'avocado'], 'b': ['banana']}",
+            "['d', 'a']",
+            "deque([4, 5, 1, 2, 3])",
+            "3 0 deque([4, 5, 1, 2])",
+            "0 1 ['x']",
+            "defaultdict(<class 'int'>, {'x': 0})",
+            "IndexError: pop from an empty deque",
+            "KeyError: 'k'",
+            "OrderedDict({'b': 1, 'a': 2})",
+        ],
+        "collections container semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn collections_containers_in_classes_globals_and_closures_match_python_at_runtime() {
+    // Issue #427, the shapes beyond a single function: annotated class
+    // fields, module-level deque/OrderedDict (typed statics), `del d[i]`,
+    // and a defaultdict READ inside a closure — `peek("zz")` inserts the
+    // key into the one shared object, visible to the enclosing scope.
+    let scratch = Scratch::new("collections2");
+    let file = scratch.path().join("shapes.py");
+    fs::write(
+        &file,
+        concat!(
+            "from collections import deque, defaultdict, OrderedDict\n",
+            "\n",
+            "HISTORY: deque[int] = deque(maxlen=3)\n",
+            "SEEN: OrderedDict[str, int] = OrderedDict()\n",
+            "\n",
+            "\n",
+            "class Hub:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.queue: deque[str] = deque()\n",
+            "        self.index: defaultdict[str, list[int]] = defaultdict(list)\n",
+            "\n",
+            "    def push(self, name: str, n: int) -> None:\n",
+            "        self.queue.append(name)\n",
+            "        self.index[name].append(n)\n",
+            "\n",
+            "    def pop(self) -> str:\n",
+            "        return self.queue.popleft()\n",
+            "\n",
+            "\n",
+            "def record(x: int) -> None:\n",
+            "    HISTORY.append(x)\n",
+            "    SEEN[\"k\" + str(x)] = x\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    for i in range(5):\n",
+            "        record(i)\n",
+            "    print(HISTORY, list(SEEN))\n",
+            "\n",
+            "    hub = Hub()\n",
+            "    hub.push(\"a\", 1)\n",
+            "    hub.push(\"b\", 2)\n",
+            "    hub.push(\"a\", 3)\n",
+            "    print(hub.pop(), len(hub.queue), sorted(hub.index.items()))\n",
+            "    try:\n",
+            "        Hub().pop()\n",
+            "    except IndexError as exc:\n",
+            "        print(\"IndexError:\", exc)\n",
+            "\n",
+            "    counts = defaultdict(int)\n",
+            "\n",
+            "    def bump(k: str) -> None:\n",
+            "        counts[k] += 1\n",
+            "\n",
+            "    def peek(k: str) -> int:\n",
+            "        return counts[k]\n",
+            "\n",
+            "    bump(\"a\")\n",
+            "    bump(\"a\")\n",
+            "    print(peek(\"zz\"))\n",
+            "    print(len(counts), counts)\n",
+            "\n",
+            "    d = deque([1, 2, 3, 4])\n",
+            "    del d[1]\n",
+            "    d.extendleft([9, 8])\n",
+            "    print(d, sorted(d), max(d))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/shapes"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3 (3.12).
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "deque([2, 3, 4], maxlen=3) ['k0', 'k1', 'k2', 'k3', 'k4']",
+            "a 2 [('a', [1, 3]), ('b', [2])]",
+            "IndexError: pop from an empty deque",
+            "0",
+            "2 defaultdict(<class 'int'>, {'a': 2, 'zz': 0})",
+            "deque([8, 9, 1, 3, 4]) [1, 3, 4, 8, 9] 9",
+        ],
+        "collections container semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn aliased_collections_imports_match_python_at_runtime() {
+    // Issue #427 with #428's alias binding: `from collections import deque
+    // as dq, defaultdict as dd, OrderedDict as OD` binds ONLY the aliases,
+    // yet constructors, annotations (`dd[str, int]`) and the method
+    // lowerings must still resolve to the runtime containers.
+    let scratch = Scratch::new("collections_alias");
+    let file = scratch.path().join("aliased.py");
+    fs::write(
+        &file,
+        concat!(
+            "from collections import deque as dq, defaultdict as dd, OrderedDict as OD\n",
+            "\n",
+            "\n",
+            "def tally(words: list[str]) -> dict[str, int]:\n",
+            "    counts: dd[str, int] = dd(int)\n",
+            "    for w in words:\n",
+            "        counts[w] += 1\n",
+            "    return dict(counts)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    q = dq([1, 2], maxlen=3)\n",
+            "    q.append(3)\n",
+            "    q.append(4)\n",
+            "    first = q.popleft()\n",
+            "    print(first, q, q.maxlen)\n",
+            "    groups = dd(list)\n",
+            "    groups[\"a\"].append(1)\n",
+            "    print(groups[\"a\"], groups[\"zz\"], len(groups))\n",
+            "    od = OD()\n",
+            "    od[\"b\"] = 1\n",
+            "    od[\"a\"] = 2\n",
+            "    od.move_to_end(\"b\")\n",
+            "    print(od, list(od))\n",
+            "    print(sorted(tally([\"x\", \"y\", \"x\"]).items()))\n",
+            "    try:\n",
+            "        dq().pop()\n",
+            "    except IndexError as exc:\n",
+            "        print(\"IndexError:\", exc)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/aliased"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3 (3.12).
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "2 deque([3, 4], maxlen=3) 3",
+            "[1] [] 2",
+            "OrderedDict({'a': 2, 'b': 1}) ['a', 'b']",
+            "[('x', 2), ('y', 1)]",
+            "IndexError: pop from an empty deque",
+        ],
+        "aliased collections semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn defaultdict_deque_factory_matches_python_at_runtime() {
+    // PR #429 review: `defaultdict(deque)` after `from collections import
+    // deque` was rejected at the factory check because the import made the
+    // name a symbol. Plain, renamed and module-qualified spellings must all
+    // resolve to the collections class, and the repr must name it
+    // `collections.deque` as CPython does.
+    let scratch = Scratch::new("collections_dd_deque");
+    let file = scratch.path().join("ddq.py");
+    fs::write(
+        &file,
+        concat!(
+            "import collections\n",
+            "from collections import defaultdict, deque\n",
+            "from collections import defaultdict as dd, deque as dq\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    d = defaultdict(deque)\n",
+            "    d[\"a\"].append(1)\n",
+            "    d[\"a\"].appendleft(0)\n",
+            "    d[\"b\"]\n",
+            "    print(len(d), list(d[\"a\"]), len(d[\"b\"]))\n",
+            "    print(d)\n",
+            "    e = dd(dq)\n",
+            "    e[1].extend([3, 4])\n",
+            "    print(e[1].popleft(), e)\n",
+            "    f = collections.defaultdict(collections.deque)\n",
+            "    f[\"k\"].append(\"v\")\n",
+            "    missing = len(f[\"missing\"])\n",
+            "    print(f, missing)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/ddq"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "2 [0, 1] 0",
+            "defaultdict(<class 'collections.deque'>, {'a': deque([0, 1]), 'b': deque([])})",
+            "3 defaultdict(<class 'collections.deque'>, {1: deque([4])})",
+            "defaultdict(<class 'collections.deque'>, {'k': deque(['v']), 'missing': deque([])}) 0",
+        ],
+        "defaultdict(deque) semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn ordereddict_of_an_untyped_argument_matches_python_at_runtime() {
+    // requests' `from_key_val_list`: `OrderedDict(value)` over an UNTYPED
+    // parameter used to be a conversion error that failed the whole package.
+    // The parameter is the boxed PyValue, the construction a runtime
+    // OrderedDict build with CPython's own errors, and the result a boxed
+    // OrderedDict that prints, compares and iterates as one.
+    let scratch = Scratch::new("boxed_ordereddict");
+    let file = scratch.path().join("boxed_od.py");
+    fs::write(
+        &file,
+        concat!(
+            "from collections import OrderedDict\n",
+            "\n",
+            "\n",
+            "def from_key_val_list(value):\n",
+            "    if value is None:\n",
+            "        return None\n",
+            "    if isinstance(value, (str, bytes, bool, int)):\n",
+            "        raise ValueError(\"cannot encode objects that are not 2-tuples\")\n",
+            "    return OrderedDict(value)\n",
+            "\n",
+            "\n",
+            "def to_od(value):\n",
+            "    return OrderedDict(value)\n",
+            "\n",
+            "\n",
+            "def main():\n",
+            "    od = from_key_val_list([(\"b\", 1), (\"a\", 2), (\"b\", 3)])\n",
+            "    print(od)\n",
+            "    print(len(od), list(od), od[\"b\"], \"a\" in od, \"z\" in od)\n",
+            "    print(from_key_val_list({\"x\": 1}))\n",
+            "    print(from_key_val_list({\"x\": 1}) == {\"x\": 1})\n",
+            "    print(from_key_val_list(None))\n",
+            "    print(from_key_val_list([(\"a\", 1), (\"b\", 2)]) == from_key_val_list([(\"b\", 2), (\"a\", 1)]))\n",
+            "    print(from_key_val_list([(\"a\", 1), (\"b\", 2)]) == {\"b\": 2, \"a\": 1})\n",
+            "    try:\n",
+            "        from_key_val_list(\"text\")\n",
+            "    except ValueError as exc:\n",
+            "        print(\"ValueError:\", exc)\n",
+            "    try:\n",
+            "        to_od(5)\n",
+            "    except TypeError as exc:\n",
+            "        print(\"TypeError:\", exc)\n",
+            "    try:\n",
+            "        to_od([(\"a\", 1, 2)])\n",
+            "    except ValueError as exc:\n",
+            "        print(\"ValueError:\", exc)\n",
+            "    try:\n",
+            "        print(od[\"nope\"])\n",
+            "    except KeyError as exc:\n",
+            "        print(\"KeyError:\", exc)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/boxed_od"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3 (3.12). The OrderedDict constructor's own
+    // unpack errors differ from dict()'s: `OrderedDict([("a", 1, 2)])` is
+    // "too many values to unpack (expected 2)", not "dictionary update
+    // sequence element #0 has length 3; 2 is required".
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "OrderedDict({'b': 3, 'a': 2})",
+            "2 ['b', 'a'] 3 True False",
+            "OrderedDict({'x': 1})",
+            "True",
+            "None",
+            "False",
+            "True",
+            "ValueError: cannot encode objects that are not 2-tuples",
+            "TypeError: 'int' object is not iterable",
+            "ValueError: too many values to unpack (expected 2)",
+            "KeyError: 'nope'",
+        ],
+        "boxed OrderedDict semantics diverged from CPython"
+    );
+}
+
+#[test]
+fn a_narrowed_optional_revalidates_on_every_store_and_per_branch() {
+    // Devin review on #429: a narrowed `int | None` local stayed narrowed
+    // across `x = d.get(key)` (any call counted as non-None), so the next
+    // read unwrapped None and panicked. Post-`if` narrowing likewise judged
+    // each branch by its last store to ANY name: `if x is not None: note =
+    // ... else: note = ...` narrowed `x` after the if, panicking for None.
+    // Both now ask the type-aware `definitely_non_none` about the narrowed
+    // name itself.
+    let got = run_global_alias_program(
+        "narrowrevalidate",
+        "narrow_revalidate.py",
+        concat!(
+            "def lookup(d: dict[str, int], key: str) -> str:\n",
+            "    x: int | None = 1\n",
+            "    print(x + 1)\n",
+            "    x = d.get(key)\n",
+            "    return str(x)\n",
+            "\n",
+            "\n",
+            "def pick(x: int | None) -> str:\n",
+            "    if x is not None:\n",
+            "        note = \"set\"\n",
+            "    else:\n",
+            "        note = \"unset\"\n",
+            "    print(note)\n",
+            "    return str(x)\n",
+            "\n",
+            "\n",
+            "def refresh(x: int | None, d: dict[str, int]) -> str:\n",
+            "    if x is not None:\n",
+            "        x = d.get(\"k\")\n",
+            "    else:\n",
+            "        x = 0\n",
+            "    return str(x)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(lookup({\"a\": 1}, \"absent\"))\n",
+            "    print(lookup({\"a\": 1}, \"a\"))\n",
+            "    print(pick(None))\n",
+            "    print(pick(4))\n",
+            "    print(refresh(3, {}))\n",
+            "    print(refresh(3, {\"k\": 7}))\n",
+            "    print(refresh(None, {}))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    // Verified against python3.
+    assert_eq!(
+        got,
+        vec!["2", "None", "2", "1", "unset", "None", "set", "4", "None", "7", "0"]
+    );
+}
+
+#[test]
+fn a_collections_module_alias_constructs_like_the_module() {
+    // Devin review on #429: the qualified `collections.X` constructors now
+    // require the module to be BOUND (an unbound `collections` is a
+    // NameError in CPython and stays loud); `import collections as c`
+    // reaches the same module through its alias.
+    let got = run_global_alias_program(
+        "collections_module_alias",
+        "collections_module_alias.py",
+        concat!(
+            "import collections as c\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    q = c.deque([1, 2])\n",
+            "    q.append(3)\n",
+            "    d = c.defaultdict(c.deque)\n",
+            "    d[\"a\"].append(1)\n",
+            "    print(len(q), len(d))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    // Verified against python3.
+    assert_eq!(got, vec!["3 1"]);
 }

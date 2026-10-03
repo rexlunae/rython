@@ -1,0 +1,16 @@
+OrderedDict({'b': 1, 'a': 2, 'c': 3})
+3
+b
+a
+c
+['b', 'a', 'c']
+OrderedDict({'x': 1, 'y': 2})
+2
+None
+True
+False
+True
+True False
+2
+KeyError: 'nope'
+ValueError: cannot encode objects that are not 2-tuples

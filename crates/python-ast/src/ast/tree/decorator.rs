@@ -590,7 +590,7 @@ pub fn try_lru_cache_factory(
             let Some(key) = crate::module_defs_key(&options, &path) else {
                 return None;
             };
-            let (mut f, f_symbols) = crate::module_function_def(&options, key, &fn_name.id)?;
+            let (mut f, f_symbols) = crate::module_function_def(&options, key, &i.defining_name(&fn_name.id))?;
             // The wrapper renders in THIS module, where the wrapped
             // function's return annotation may name a type alias only ITS
             // module binds (`-> CoherenceMatches` — charset_normalizer's

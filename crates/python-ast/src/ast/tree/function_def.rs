@@ -3810,7 +3810,7 @@ impl FunctionDef {
                     .to_rust(body_ctx.clone(), stmt_options, symbols.clone())?,
             );
             streams.extend(quote!(;));
-            crate::update_narrowed_after_statement(s, &mut narrowed, &options);
+            crate::update_narrowed_after_statement(s, &mut narrowed, &body_ctx, &options, &symbols);
         }
 
         // Every generated function returns Result<T, PyException> so raised
@@ -3834,6 +3834,33 @@ impl FunctionDef {
                 n.id
             )
             .into());
+        }
+        // The same for a bare `collections` annotation on the return or
+        // any parameter (`q: deque`, `-> OrderedDict`): the Rust type
+        // needs the element / key / value types, which only the
+        // subscripted spelling names.
+        if let Some(ann) = self.returns.as_deref()
+            && let Some(msg) =
+                crate::ast::tree::collections_lower::bare_annotation_message(ann, &symbols, "return")
+        {
+            return Err(msg.into());
+        }
+        for param in self
+            .args
+            .posonlyargs
+            .iter()
+            .chain(self.args.args.iter())
+            .chain(self.args.kwonlyargs.iter())
+        {
+            if let Some(ann) = param.annotation.as_deref()
+                && let Some(msg) = crate::ast::tree::collections_lower::bare_annotation_message(
+                    ann,
+                    &symbols,
+                    &format!("parameter `{}`", param.arg),
+                )
+            {
+                return Err(msg.into());
+            }
         }
         // A GENERATOR returns its collected list (`Generator[str, ...]`
         // → Vec<String>), overriding any other inference.
@@ -5465,12 +5492,32 @@ pub(crate) fn expr_yields_option(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> bool {
+    // A `urllib.parse` result's Option-typed property (`parsed.hostname`,
+    // `parsed.port`): the runtime method already returns the Option.
+    if let ExprType::Attribute(attr) = expr
+        && let Some(a) = crate::ast::tree::type_ctx::ParseResultAttr::from_name(&attr.attr)
+        && matches!(a.typeinfo(), crate::TypeInfo::Option(_))
+        && crate::ast::tree::type_ctx::is_parse_result_typeinfo(&crate::infer_type(
+            None,
+            &attr.value,
+            options,
+            symbols,
+        ))
+    {
+        return true;
+    }
     match expr {
         // A name that itself holds an Option (assigned None on some path,
         // an Optional-annotated parameter, or a local whose INFERRED type
         // is an Option — `netloc = self.netloc()?` in a Url method, where
         // netloc() returns `Result<Option<String>, _>`; the `?` strips the
         // Result layer, leaving an Option).
+        // A NARROWED name reads as its inner value (the read unwraps —
+        // name.rs), so it yields no Option: an Option slot it is stored or
+        // passed into takes the Some wrap (`release_this_conn =
+        // release_conn` after `if release_conn is None: release_conn =
+        // preload_content` — urllib3's urlopen).
+        ExprType::Name(name) if options.narrowed_names.contains_key(&name.id) => false,
         ExprType::Name(name) => {
             options.optional_names.contains(&name.id)
                 || matches!(
@@ -5788,6 +5835,7 @@ pub(crate) fn lower_optional_value(
     // with an annotation in local_types would otherwise report its
     // annotated (plain) type and wrap again.
     if let ExprType::Name(n) = expr
+        && !options.narrowed_names.contains_key(&n.id)
         && matches!(
             options.name_types.get(&n.id),
             Some(crate::TypeInfo::Option(_))
@@ -5803,6 +5851,10 @@ pub(crate) fn lower_optional_value(
     // family). The ctx-aware predicate resolves the receiver's class
     // (self fields, typed params, factory-assigned locals).
     if crate::expr_yields_option_ctx(expr, &ctx, &options, &symbols) {
+        // A property read is the getter CALL: its Option is a fresh
+        // value, nothing to clone out of the receiver.
+        let getter_call = matches!(expr, ExprType::Attribute(a)
+            if crate::ast::tree::attribute::attribute_read_is_call(a, &ctx, &symbols, &options));
         let tokens = expr.clone().to_rust(ctx.clone(), options, symbols)?;
         // The pass-through MOVES the Option out of the receiver: a
         // `self.<field>` read borrows `&self` (E0507 — `headers =
@@ -5812,7 +5864,7 @@ pub(crate) fn lower_optional_value(
         // borrows the composed object the same way. Clone the value out —
         // the Python object is shared by reference, so the clone is the
         // faithful copy.
-        if matches!(expr, ExprType::Attribute(_)) {
+        if matches!(expr, ExprType::Attribute(_)) && !getter_call {
             // A boxed slot (round 99): the read's Option<Box<Class>>
             // map-derefs to Option<Class> — the slot's type.
             let read = if boxed {
@@ -5944,7 +5996,7 @@ impl FunctionDef {
                 return None;
             };
             match options.mutable_statics.get(&name.id) {
-                Some(crate::MutableGlobalKind::Class { class: c }) => {
+                Some(crate::MutableGlobalKind::Class { class: c, .. }) => {
                     if class.is_some() && class.as_deref() != Some(c.as_str()) {
                         return None;
                     }
@@ -6131,6 +6183,18 @@ impl FunctionDef {
         symbols: &crate::SymbolTableScopes,
         options: &crate::PythonOptions,
     ) -> Option<TokenStream> {
+        self.param_scoped_return_typeinfo(self_class, symbols, options)
+            .map(|t| t.to_rust_type())
+    }
+
+    /// The TypeInfo behind [`Self::param_scoped_return_type`], for a
+    /// caller that types the call's result.
+    pub(crate) fn param_scoped_return_typeinfo(
+        &self,
+        self_class: Option<&str>,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Option<crate::TypeInfo> {
         let decorated = |name: &str| {
             self.decorator_list
                 .iter()
@@ -6164,12 +6228,22 @@ impl FunctionDef {
         }
         let mut scoped = options.clone();
         scoped.name_types = std::rc::Rc::new(types);
+        // The function's own LOCALS join the scope: a returned local
+        // (`conn = self.manager.connection_from_host(host)` then `return
+        // conn` — requests' get_connection_with_tls_context) types from
+        // its assignment, as the body's own lowering types it.
+        let locals = crate::ast::tree::type_ctx::analyze_function_types_with_class(
+            &self.body,
+            Some(&scoped),
+            Some(symbols),
+            self_class.filter(|_| instance_method),
+        );
+        let scoped = crate::ast::tree::type_ctx::analysis_view(&scoped, &locals);
         match self_class.filter(|_| instance_method) {
             Some(class) => self.inferred_return_typeinfo_in(class, symbols, &scoped),
             None => self.inferred_return_typeinfo(symbols, &scoped),
         }
             .filter(renderable_return_typeinfo)
-            .map(|t| t.to_rust_type())
     }
 
     /// An unannotated METHOD whose returns are all reads of fields of its
@@ -6629,11 +6703,35 @@ impl FunctionDef {
                 crate::TypeInfo::StrRef => crate::TypeInfo::String,
                 t => t,
             };
+            // A BOXED return beside a scalar one (`return
+            // self.names.index(n)` + `except ValueError: return default`
+            // where `default` is an unannotated, boxed parameter): the
+            // function returns the box, and the return site boxes the
+            // scalar (`PyValue::from(i)`).
+            let boxable = |t: &crate::TypeInfo| {
+                matches!(
+                    t,
+                    crate::TypeInfo::Int
+                        | crate::TypeInfo::Float
+                        | crate::TypeInfo::Bool
+                        | crate::TypeInfo::String
+                        | crate::TypeInfo::Bytes
+                        | crate::TypeInfo::PyValue
+                )
+            };
             match &unified {
                 None => unified = Some(t),
                 Some(prev) if *prev == t => {}
                 Some(_) if has_none => {
                     return Some(crate::TypeInfo::PyValue);
+                }
+                Some(prev)
+                    if boxable(prev)
+                        && boxable(&t)
+                        && (matches!(prev, crate::TypeInfo::PyValue)
+                            || matches!(t, crate::TypeInfo::PyValue)) =>
+                {
+                    unified = Some(crate::TypeInfo::PyValue);
                 }
                 Some(_) => return None,
             }
@@ -6732,7 +6830,7 @@ impl FunctionDef {
                     // representation), so `return HISTORY_RECORDER` types
                     // the function as the class.
                     None => match options.mutable_statics.get(&name.id) {
-                        Some(crate::MutableGlobalKind::Class { class }) => {
+                        Some(crate::MutableGlobalKind::Class { class, .. }) => {
                             crate::TypeInfo::Class(class.clone())
                         }
                         // Issue #222: a returned PARAMETER is not a local,

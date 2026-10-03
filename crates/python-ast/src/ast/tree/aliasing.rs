@@ -48,7 +48,22 @@ pub fn check_aliasing(
         symbols,
         containers: name_types
             .iter()
-            .filter(|(_, t)| matches!(t, TypeInfo::Vec(_) | TypeInfo::Dict(_, _)))
+            .filter(|(_, t)| {
+                matches!(
+                    t,
+                    TypeInfo::Vec(_) | TypeInfo::Dict(_, _) | TypeInfo::Collection(..)
+                )
+            })
+            .map(|(n, _)| n.clone())
+            .collect(),
+        defaultdicts: name_types
+            .iter()
+            .filter(|(_, t)| {
+                matches!(
+                    t,
+                    TypeInfo::Collection(crate::CollectionsType::DefaultDict, _)
+                )
+            })
             .map(|(n, _)| n.clone())
             .collect(),
         aliases: Vec::new(),
@@ -119,6 +134,9 @@ struct AliasingGuard<'a> {
     /// source and target of every alias (an alias target's own type is not
     /// inferred — `b = a` has no syntactic type — but it IS a container).
     containers: HashSet<String>,
+    /// Names holding a `defaultdict`: a READ `d[k]` of a missing key
+    /// inserts the default, so an index read mutates it.
+    defaultdicts: HashSet<String>,
     /// `(target, source, lineno, position)` — the position is the
     /// statement counter at the alias, so a mutation that happens BEFORE
     /// the alias is not a conflict (`chunks.append(...)` then `chunks =
@@ -358,6 +376,15 @@ impl<'a> AliasingGuard<'a> {
             }
             ExprType::Attribute(a) => self.visit_expr(&a.value),
             ExprType::Subscript(s) => {
+                // `dd[k]` on a defaultdict inserts a missing key.
+                if let Some(name) = root_name_of(&s.value)
+                    && self.defaultdicts.contains(name)
+                {
+                    self.mutated
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(self.pos);
+                }
                 self.visit_expr(&s.value);
                 match &s.kind {
                     crate::SubscriptKind::Index(e) => self.visit_expr(e),
@@ -439,7 +466,28 @@ fn function_mutates_param(func: &FunctionDef, index: usize) -> bool {
     else {
         return false;
     };
+    // A `defaultdict` parameter is mutated by a mere index READ (the
+    // missing key is inserted).
+    let reads_mutate = param.annotation.as_deref().is_some_and(|ann| {
+        let head = match ann {
+            ExprType::Subscript(s) => s.value.as_ref(),
+            other => other,
+        };
+        matches!(
+            crate::ast::tree::type_ctx::collections_class_of(head, None),
+            Some(crate::CollectionsType::DefaultDict)
+        )
+    });
     scan_mutations(&func.body, &param.arg)
+        || (reads_mutate
+            && visit::any_stmt(&func.body, Descend::SkipDefs, |stmt| {
+                visit::stmt_all_exprs(stmt).into_iter().any(|e| {
+                    visit::any_expr(e, |e| {
+                        matches!(e, ExprType::Subscript(s)
+                            if root_name_of(&s.value) == Some(param.arg.as_str()))
+                    })
+                })
+            }))
 }
 
 /// Whether `body` mutates the container bound to `name`: a subscript

@@ -71,6 +71,7 @@ pub(crate) const CONTAINER_MUTATING_METHODS: &[&str] = &[
     "sort",
     "reverse",
     "rotate",
+    "move_to_end",
     "update",
     "add",
     "discard",

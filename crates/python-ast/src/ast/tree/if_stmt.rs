@@ -180,12 +180,12 @@ impl CodeGen for If {
             return Ok(quote! { #(#stmts;)* });
         }
 
-        let body_stmts: Result<Vec<_>, _> = self
-            .body
-            .into_iter()
-            .map(|stmt| stmt.to_rust(ctx.clone(), body_options.clone(), symbols.clone()))
-            .collect();
-        let body_stmts = body_stmts?;
+        let body_stmts = crate::ast::tree::expression::render_block(
+            self.body,
+            &ctx,
+            &body_options,
+            &symbols,
+        )?;
 
         if self.orelse.is_empty() {
             Ok(quote! {
@@ -194,11 +194,12 @@ impl CodeGen for If {
                 }
             })
         } else {
-            let else_stmts: Result<Vec<_>, _> = self.orelse
-                .into_iter()
-                .map(|stmt| stmt.to_rust(ctx.clone(), else_options.clone(), symbols.clone()))
-                .collect();
-            let else_stmts = else_stmts?;
+            let else_stmts = crate::ast::tree::expression::render_block(
+                self.orelse,
+                &ctx,
+                &else_options,
+                &symbols,
+            )?;
 
             Ok(quote! {
                 if #test {

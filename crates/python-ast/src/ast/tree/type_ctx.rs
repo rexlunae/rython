@@ -120,6 +120,14 @@ pub enum TypeInfo {
     /// field/coercion layers treat it like any other TypeInfo; equality
     /// is structural on the tokens (identical spellings compare equal).
     Custom(TokenStream),
+    /// A `collections` container (`deque[T]`, `defaultdict[K, V]`,
+    /// `OrderedDict[K, V]`): the runtime struct of that name, with its
+    /// type arguments (one element type for `deque`, key and value types
+    /// for the mappings — [`CollectionsType::arity`]; an unresolved
+    /// argument is `PyObject`, which renders `_` and is left to rustc).
+    /// The two mappings share the dict method surface through the runtime's
+    /// PyDictOps/PyIndex traits; see [`TypeInfo::dict_kv`].
+    Collection(crate::CollectionsType, Vec<TypeInfo>),
     PyObject,
 }
 
@@ -161,6 +169,7 @@ pub(crate) fn type_mentions_heap(t: &TypeInfo) -> bool {
         | TypeInfo::Borrowed(inner) => type_mentions_heap(inner),
         TypeInfo::Dict(k, v) => type_mentions_heap(k) || type_mentions_heap(v),
         TypeInfo::Tuple(ts) => ts.iter().any(type_mentions_heap),
+        TypeInfo::Collection(_, args) => args.iter().any(type_mentions_heap),
         _ => false,
     }
 }
@@ -180,6 +189,7 @@ pub(crate) fn type_mentions_pyobject(t: &TypeInfo) -> bool {
         | TypeInfo::Borrowed(inner) => type_mentions_pyobject(inner),
         TypeInfo::Dict(k, v) => type_mentions_pyobject(k) || type_mentions_pyobject(v),
         TypeInfo::Tuple(ts) => ts.iter().any(type_mentions_pyobject),
+        TypeInfo::Collection(_, args) => args.iter().any(type_mentions_pyobject),
         // A callable whose argument or return did not resolve renders
         // `PyCallable<(_,), _>` — an inference hole in an item signature,
         // exactly like any other unresolved element.
@@ -206,11 +216,44 @@ pub(crate) fn type_contains_pyvalue(t: &TypeInfo) -> bool {
         | TypeInfo::Borrowed(inner) => type_contains_pyvalue(inner),
         TypeInfo::Dict(k, v) => type_contains_pyvalue(k) || type_contains_pyvalue(v),
         TypeInfo::Tuple(ts) => ts.iter().any(type_contains_pyvalue),
+        TypeInfo::Collection(_, args) => args.iter().any(type_contains_pyvalue),
         _ => false,
     }
 }
 
 impl TypeInfo {
+    /// The (key, value) types of a DICT-SHAPED type: a `dict`, or one of
+    /// the `collections` mappings (`defaultdict`, `OrderedDict`), which
+    /// share the dict method surface through the runtime's PyDictOps /
+    /// PyIndex traits. The one place that answers "does this behave like a
+    /// dict" for the key-owning, view-typing and iteration lowerings.
+    pub(crate) fn dict_kv(&self) -> Option<(&TypeInfo, &TypeInfo)> {
+        match self {
+            TypeInfo::Dict(k, v) => Some((k, v)),
+            TypeInfo::Collection(kind, args) if kind.is_mapping() => match args.as_slice() {
+                [k, v] => Some((k, v)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The type a `collections` container HOLDS: a deque's element, a
+    /// mapping's VALUE (the part that can hold class instances / other
+    /// containers).
+    pub(crate) fn collection_held(&self) -> Option<&TypeInfo> {
+        match self {
+            TypeInfo::Collection(kind, args) => {
+                if kind.is_mapping() {
+                    args.get(1)
+                } else {
+                    args.first()
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Whether a value of this type can be copied implicitly by Rust.
     pub fn is_copy(&self) -> bool {
         match self {
@@ -337,6 +380,11 @@ impl TypeInfo {
                 quote!(stdpython::PyCallable<#args, #r>)
             }
             TypeInfo::Custom(t) => t.clone(),
+            TypeInfo::Collection(kind, args) => {
+                let path = kind.rust_path();
+                let args = args.iter().map(|t| t.to_rust_type());
+                quote!(#path<#(#args),*>)
+            }
             TypeInfo::PyObject => quote!(_),
         }
     }
@@ -371,6 +419,7 @@ impl TypeInfo {
                 ret.display()
             ),
             TypeInfo::Custom(_) => "custom".into(),
+            TypeInfo::Collection(kind, _) => kind.name().into(),
             TypeInfo::PyObject => "unknown".into(),
         }
     }
@@ -821,7 +870,7 @@ fn infer_type_inner(
             if let Some(kind) = options.mutable_statics.get(&n.id) {
                 match kind {
                     crate::MutableGlobalKind::Boxed
-                    | crate::MutableGlobalKind::Computed { boxed: true } => {
+                    | crate::MutableGlobalKind::Computed { boxed: true, .. } => {
                         return TypeInfo::PyValue;
                     }
                     crate::MutableGlobalKind::Str => return TypeInfo::String,
@@ -1128,6 +1177,24 @@ fn infer_type_inner(
             }
             // The builtin `open` in a text mode returns the text file.
             _ if is_text_open_call(call, symbols) => file_typeinfo(),
+            // `urlparse(url)` / `urlsplit(url)` return the runtime's
+            // ParseResult, whose attributes type below.
+            ExprType::Name(n)
+                if matches!(
+                    crate::ast::tree::call::urllib_parse_fn(&n.id, symbols, options),
+                    Some("urlparse" | "urlsplit")
+                ) =>
+            {
+                parse_result_typeinfo()
+            }
+            // `deque(...)` / `defaultdict(...)` / `OrderedDict(...)`: the
+            // runtime collections struct, element / key / value types
+            // from the arguments (unknown parts left to the uses).
+            func if let Some(kind) = crate::ast::tree::collections_lower::ctor_of(func, symbols) => {
+                crate::ast::tree::collections_lower::construction_type(
+                    kind, call, ctx, options, symbols,
+                )
+            }
             // The ITERATOR builtins carry their argument's element type
             // through (issue #222), so they are typed before the
             // name-only table below, which cannot see arguments.
@@ -1149,6 +1216,13 @@ fn infer_type_inner(
                     },
                     _ => TypeInfo::PyObject,
                 }
+            }
+            // `all(...)` / `any(...)` return a plain bool (the runtime's
+            // are infallible `-> bool`), unless the module binds its own.
+            ExprType::Name(n)
+                if matches!(n.id.as_str(), "all" | "any") && symbols.get(&n.id).is_none() =>
+            {
+                TypeInfo::Bool
             }
             ExprType::Name(n) => match builtin_call_type(&n.id) {
                 Some(t) => t,
@@ -1205,21 +1279,70 @@ fn infer_type_inner(
                     // write-back keys off). The 2-ARG get supplies a
                     // default: plain V.
                     "get" if call.args.len() == 1 => {
+                        match infer_type_inner(ctx, &attr.value, options, symbols).dict_kv() {
+                            Some((_, v)) => TypeInfo::Option(Box::new(v.clone())),
+                            None => TypeInfo::PyObject,
+                        }
+                    }
+                    "get" if call.args.len() >= 2 => {
+                        match infer_type_inner(ctx, &attr.value, options, symbols).dict_kv() {
+                            Some((_, v)) => v.clone(),
+                            None => TypeInfo::PyObject,
+                        }
+                    }
+                    // A deque's end-removals yield its element type (the
+                    // lowering raises IndexError on empty); OrderedDict's
+                    // popitem yields the (key, value) pair.
+                    "pop" | "popleft"
+                        if matches!(
+                            infer_type_inner(ctx, &attr.value, options, symbols),
+                            TypeInfo::Collection(crate::CollectionsType::Deque, _)
+                        ) =>
+                    {
                         match infer_type_inner(ctx, &attr.value, options, symbols) {
-                            TypeInfo::Dict(_, v) => {
-                                TypeInfo::Option(Box::new((*v).clone()))
+                            TypeInfo::Collection(_, args) => {
+                                args.into_iter().next().unwrap_or(TypeInfo::PyObject)
                             }
                             _ => TypeInfo::PyObject,
                         }
                     }
-                    "get" if call.args.len() >= 2 => {
-                        match infer_type_inner(ctx, &attr.value, options, symbols) {
-                            TypeInfo::Dict(_, v) => (*v).clone(),
-                            _ => TypeInfo::PyObject,
+                    // A shallow copy is the same container type.
+                    "copy"
+                        if call.args.is_empty()
+                            && matches!(
+                                infer_type_inner(ctx, &attr.value, options, symbols),
+                                TypeInfo::Collection(..)
+                            ) =>
+                    {
+                        infer_type_inner(ctx, &attr.value, options, symbols)
+                    }
+                    "popitem"
+                        if matches!(
+                            infer_type_inner(ctx, &attr.value, options, symbols),
+                            TypeInfo::Collection(crate::CollectionsType::OrderedDict, _)
+                        ) =>
+                    {
+                        match infer_type_inner(ctx, &attr.value, options, symbols).dict_kv() {
+                            Some((k, v)) => TypeInfo::Tuple(vec![k.clone(), v.clone()]),
+                            None => TypeInfo::PyObject,
                         }
                     }
                     "pop" | "setdefault" => TypeInfo::PyObject,
                     _ if on_numpy => TypeInfo::NdArray,
+                    // `seq.index(x)` / `seq.count(x)` on a list, tuple, str
+                    // or bytes receiver: a position / a tally, an int.
+                    "index" | "count"
+                        if matches!(
+                            infer_type_inner(ctx, &attr.value, options, symbols),
+                            TypeInfo::Vec(_)
+                                | TypeInfo::PyTuple(_)
+                                | TypeInfo::String
+                                | TypeInfo::StrRef
+                                | TypeInfo::Bytes
+                        ) =>
+                    {
+                        TypeInfo::Int
+                    }
                     // The str/bytes codec pair, as the lowering renders them
                     // (`decode_ascii(...)` is a String, `encode_ascii(...)`
                     // a Vec<u8>) on a STRING-SHAPED receiver — the plain
@@ -1278,21 +1401,20 @@ fn infer_type_inner(
                     // corpus's report): the receiver's Dict type is the
                     // authority (round 99).
                     "items" | "keys" | "values"
-                        if matches!(
-                            infer_type_inner(ctx, &attr.value, options, symbols),
-                            TypeInfo::Dict(_, _)
-                        ) =>
+                        if infer_type_inner(ctx, &attr.value, options, symbols)
+                            .dict_kv()
+                            .is_some() =>
                     {
-                        match infer_type_inner(ctx, &attr.value, options, symbols) {
-                            TypeInfo::Dict(k, v) => match attr.attr.as_str() {
+                        match infer_type_inner(ctx, &attr.value, options, symbols).dict_kv() {
+                            Some((k, v)) => match attr.attr.as_str() {
                                 "items" => TypeInfo::Vec(Box::new(TypeInfo::Tuple(vec![
-                                    (*k).clone(),
-                                    (*v).clone(),
+                                    k.clone(),
+                                    v.clone(),
                                 ]))),
-                                "keys" => TypeInfo::Vec(Box::new((*k).clone())),
-                                _ => TypeInfo::Vec(Box::new((*v).clone())),
+                                "keys" => TypeInfo::Vec(Box::new(k.clone())),
+                                _ => TypeInfo::Vec(Box::new(v.clone())),
                             },
-                            _ => TypeInfo::PyObject,
+                            None => TypeInfo::PyObject,
                         }
                     }
                     // A method of the ENCLOSING class (`self.subtotal(o)`):
@@ -1338,10 +1460,16 @@ fn infer_type_inner(
                             resolve_alias_typeinfo(ann, symbols, options)
                         }) {
                             Some(t) => return t,
-                            None => TypeInfo::PyObject,
+                            None => instance_method_call_typeinfo(ctx, attr, options, symbols)
+                                .unwrap_or(TypeInfo::PyObject),
                         }
                     }
-                    _ => TypeInfo::PyObject,
+                    // A method call on an INSTANCE of a known class
+                    // (`self.manager.connection_from_host(h)`, `conn.m()`
+                    // with conn a class-typed local): the method's return
+                    // on the receiver class's MRO.
+                    _ => instance_method_call_typeinfo(ctx, attr, options, symbols)
+                        .unwrap_or(TypeInfo::PyObject),
                 }
             }
             _ => TypeInfo::PyObject,
@@ -1368,13 +1496,26 @@ fn infer_type_inner(
             {
                 return t;
             }
+            let receiver_type = infer_type_inner(ctx, &attr.value, options, symbols);
             // Any attribute of a `threading.local()` object is a run-time
             // attribute: a boxed value (issue #356).
-            if matches!(
-                infer_type_inner(ctx, &attr.value, options, symbols),
-                TypeInfo::Threading(crate::ThreadingType::Local)
-            ) {
+            if matches!(receiver_type, TypeInfo::Threading(crate::ThreadingType::Local)) {
                 return TypeInfo::PyValue;
+            }
+            // A `urllib.parse` result's component or computed property.
+            if is_parse_result_typeinfo(&receiver_type)
+                && let Some(a) = ParseResultAttr::from_name(&attr.attr)
+            {
+                return a.typeinfo();
+            }
+            // `d.maxlen` of a deque is `Optional[int]` (attribute.rs).
+            if attr.attr == "maxlen"
+                && matches!(
+                    infer_type_inner(ctx, &attr.value, options, symbols),
+                    TypeInfo::Collection(crate::CollectionsType::Deque, _)
+                )
+            {
+                return TypeInfo::Option(Box::new(TypeInfo::Int));
             }
             // A class-level literal constant read through `self` or the
             // class (issue #367 — attribute.rs renders `Self::NAME` /
@@ -1396,18 +1537,24 @@ fn infer_type_inner(
                 }
             }
             // `self` needs the class context; a class-typed NAME (a local
-            // or parameter the analysis typed) resolves in any context.
-            if let ExprType::Name(recv) = attr.value.as_ref()
-                && ((recv.id == "self" && ctx.is_some())
-                    || matches!(options.name_types.get(&recv.id), Some(TypeInfo::Class(_))))
-            {
-                let class_name = if recv.id == "self" {
+            // or parameter the analysis typed) resolves in any context; a
+            // FIELD CHAIN or other receiver whose inferred type is a class
+            // (`h.reg.pools` where `h.reg` is a Reg) resolves through it.
+            let receiver_class_name = match attr.value.as_ref() {
+                ExprType::Name(recv) if recv.id == "self" => {
                     ctx.and_then(|c| c.enclosing_class_name()).map(str::to_string)
-                } else if let Some(TypeInfo::Class(cname)) = options.name_types.get(&recv.id) {
-                    Some(cname.clone())
-                } else {
-                    None
-                };
+                }
+                ExprType::Name(recv) => match options.name_types.get(&recv.id) {
+                    Some(TypeInfo::Class(cname)) => Some(cname.clone()),
+                    _ => None,
+                },
+                _ => match &receiver_type {
+                    TypeInfo::Class(cname) => Some(cname.clone()),
+                    _ => None,
+                },
+            };
+            if receiver_class_name.is_some() {
+                let class_name = receiver_class_name;
                 // Resolve through the SAME tail the codegen uses — a class
                 // name the local scope does not bind resolves across the
                 // crate's modules (`r.encoding` where `r` came from
@@ -1487,6 +1634,11 @@ fn infer_type_inner(
             match container {
             TypeInfo::Vec(inner) | TypeInfo::PyTuple(inner) => *inner,
             TypeInfo::Dict(_, v) => *v,
+            // `d[i]` of a deque is its element; `m[k]` of a collections
+            // mapping is its value.
+            t @ TypeInfo::Collection(..) => {
+                t.collection_held().cloned().unwrap_or(TypeInfo::PyObject)
+            }
             // A TUPLE indexed by a constant (`pair[0]`, `pair[-1]`) is that
             // element's type (a tuple holds its elements as a list does —
             // shared.rs; Devin review on #321).
@@ -1525,6 +1677,9 @@ fn infer_type_inner(
             // dispatch keys off this).
             TypeInfo::Option(inner) => match *inner {
                 TypeInfo::Dict(_, v) => *v,
+                ref t @ TypeInfo::Collection(..) if t.dict_kv().is_some() => {
+                    t.collection_held().cloned().unwrap_or(TypeInfo::PyObject)
+                }
                 _ => TypeInfo::PyObject,
             },
             TypeInfo::Borrowed(inner) => match *inner {
@@ -1665,6 +1820,9 @@ pub(crate) fn iterable_element_type(t: &TypeInfo) -> Option<TypeInfo> {
         TypeInfo::Tuple(members) => tuple_iteration_element(members),
         // Iterating a dict yields its keys.
         TypeInfo::Dict(k, _) => Some((**k).clone()),
+        // A deque yields its elements; the collections mappings, like
+        // dict, their keys.
+        TypeInfo::Collection(_, args) => args.first().cloned(),
         // Iterating a str yields one-character strings.
         TypeInfo::String | TypeInfo::StrRef => Some(TypeInfo::String),
         TypeInfo::Range => Some(TypeInfo::Int),
@@ -1689,6 +1847,79 @@ pub(crate) fn file_typeinfo() -> TypeInfo {
 /// Whether a TypeInfo is the runtime's text-file type ([`file_typeinfo`]).
 pub(crate) fn is_file_typeinfo(t: &TypeInfo) -> bool {
     matches!(t, TypeInfo::Custom(tokens) if tokens.to_string() == "PyFile")
+}
+
+/// The runtime's `urllib.parse` result as a TypeInfo: the
+/// `stdpython::urllib::parse::ParseResult` struct that `urlparse` and
+/// `urlsplit` return (CPython's `ParseResult` / `SplitResult`).
+pub(crate) fn parse_result_typeinfo() -> TypeInfo {
+    TypeInfo::Custom(quote!(stdpython::urllib::parse::ParseResult))
+}
+
+/// Whether a TypeInfo is the runtime's `urllib.parse` result
+/// ([`parse_result_typeinfo`]).
+pub(crate) fn is_parse_result_typeinfo(t: &TypeInfo) -> bool {
+    *t == parse_result_typeinfo()
+}
+
+/// An attribute of a `urllib.parse` result (`ParseResult` / `SplitResult`).
+/// The six components are stored fields; `hostname`, `port`, `username`
+/// and `password` are CPython properties computed from the netloc, which
+/// the runtime models as methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParseResultAttr {
+    Scheme,
+    Netloc,
+    Path,
+    Params,
+    Query,
+    Fragment,
+    Hostname,
+    Port,
+    Username,
+    Password,
+}
+
+impl ParseResultAttr {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "scheme" => Self::Scheme,
+            "netloc" => Self::Netloc,
+            "path" => Self::Path,
+            "params" => Self::Params,
+            "query" => Self::Query,
+            "fragment" => Self::Fragment,
+            "hostname" => Self::Hostname,
+            "port" => Self::Port,
+            "username" => Self::Username,
+            "password" => Self::Password,
+            _ => return None,
+        })
+    }
+
+    /// Whether the attribute is a computed property (a runtime method
+    /// call) rather than a stored component (a field read).
+    pub(crate) fn is_computed(self) -> bool {
+        matches!(self, Self::Hostname | Self::Port | Self::Username | Self::Password)
+    }
+
+    /// Whether reading the attribute can raise: CPython's `port` raises
+    /// ValueError for a non-numeric or out-of-range port.
+    pub(crate) fn is_fallible(self) -> bool {
+        self == Self::Port
+    }
+
+    pub(crate) fn typeinfo(self) -> TypeInfo {
+        match self {
+            Self::Scheme | Self::Netloc | Self::Path | Self::Params | Self::Query | Self::Fragment => {
+                TypeInfo::String
+            }
+            Self::Hostname | Self::Username | Self::Password => {
+                TypeInfo::Option(Box::new(TypeInfo::String))
+            }
+            Self::Port => TypeInfo::Option(Box::new(TypeInfo::Int)),
+        }
+    }
 }
 
 /// Whether a call is the BUILTIN `open` in a text mode — no mode, or a
@@ -1723,7 +1954,7 @@ fn named_fn_return_type(
         }
         Some(SymbolTableNode::ImportFrom(i)) => {
             let path = i.resolved_module_path(options);
-            let (f, _) = crate::module_function_def(options, &path, &n.id)?;
+            let (f, _) = crate::module_function_def(options, &path, &i.defining_name(&n.id))?;
             resolve_alias_typeinfo(
                 f.returns.as_deref()?,
                 &module_symbols(options, &path),
@@ -1871,6 +2102,7 @@ fn mentions_unknown(t: &TypeInfo) -> bool {
         | TypeInfo::Borrowed(x) => mentions_unknown(x),
         TypeInfo::Dict(k, v) => mentions_unknown(k) || mentions_unknown(v),
         TypeInfo::Tuple(xs) => xs.iter().any(mentions_unknown),
+        TypeInfo::Collection(_, args) => args.iter().any(mentions_unknown),
         _ => false,
     }
 }
@@ -1896,6 +2128,40 @@ pub fn unify(a: TypeInfo, b: TypeInfo) -> TypeInfo {
         ),
         (TypeInfo::Option(x), TypeInfo::Option(y)) => {
             TypeInfo::Option(Box::new(unify((**x).clone(), (**y).clone())))
+        }
+        // Two collections of one class unify argument-wise.
+        (TypeInfo::Collection(k1, x), TypeInfo::Collection(k2, y))
+            if k1 == k2 && x.len() == y.len() =>
+        {
+            TypeInfo::Collection(
+                *k1,
+                x.iter()
+                    .zip(y.iter())
+                    .map(|(a, b)| unify(a.clone(), b.clone()))
+                    .collect(),
+            )
+        }
+        // A pinning SUGGESTION for a collection-typed name arrives in the
+        // plain shape its use implies (`d[k] = v` suggests a dict,
+        // `d.append(x)` a list): it refines the collection's arguments and
+        // keeps the class.
+        (TypeInfo::Collection(kind, args), TypeInfo::Dict(k, v))
+        | (TypeInfo::Dict(k, v), TypeInfo::Collection(kind, args))
+            if kind.is_mapping() && args.len() == 2 =>
+        {
+            TypeInfo::Collection(
+                *kind,
+                vec![
+                    unify(args[0].clone(), (**k).clone()),
+                    unify(args[1].clone(), (**v).clone()),
+                ],
+            )
+        }
+        (TypeInfo::Collection(kind, args), TypeInfo::Vec(e))
+        | (TypeInfo::Vec(e), TypeInfo::Collection(kind, args))
+            if !kind.is_mapping() && args.len() == 1 =>
+        {
+            TypeInfo::Collection(*kind, vec![unify(args[0].clone(), (**e).clone())])
         }
         (TypeInfo::Borrowed(x), TypeInfo::Borrowed(y)) => {
             TypeInfo::Borrowed(Box::new(unify((**x).clone(), (**y).clone())))
@@ -2075,6 +2341,23 @@ pub fn render_typed(
         )
     {
         return wrapped;
+    }
+    // A `collections` constructor into a slot of that container's type
+    // (`d: deque[int] = deque()`, `return defaultdict(list)` from a
+    // `-> defaultdict[str, list[int]]` function): the slot's type
+    // arguments are spelled on the construction, which rustc could not
+    // otherwise see.
+    if let Some(TypeInfo::Collection(kind, _)) = &expected
+        && crate::ast::tree::collections_lower::construction_kind(expr, &symbols) == Some(*kind)
+        && let Some(lowered) = crate::ast::tree::collections_lower::lower_ctor_call(
+            expr,
+            expected.as_ref(),
+            &ctx,
+            &options,
+            &symbols,
+        )
+    {
+        return lowered;
     }
     // An EMPTY dict literal into a boxed slot (`tl.chal = {}` — issue
     // #356): nothing in it names an element type, so the boxed form is
@@ -2439,6 +2722,13 @@ pub fn render_reused(
     // A loop BODY moves on every turn, so one textual use is many at run
     // time: a name consumed here is reused whatever the count says.
     let in_loop = ctx.in_loop_body();
+    // A property read lowers to the getter CALL: a fresh owned value,
+    // never a move out of the receiver.
+    if let ExprType::Attribute(a) = expr
+        && crate::ast::tree::attribute::attribute_read_is_call(a, &ctx, &symbols, &options)
+    {
+        return expr.clone().to_rust(ctx, options, symbols);
+    }
     let tokens = expr
         .clone()
         .to_rust(ctx, options.clone(), symbols.clone())?;
@@ -2711,6 +3001,107 @@ pub fn call_arg_expected_type(ann: &ExprType) -> Option<TypeInfo> {
     }
 }
 
+/// The `collections` container class a name or attribute NAMES, when it
+/// really is the stdlib class: `deque` / `defaultdict` / `OrderedDict`
+/// imported from `collections` (aliases followed), the `typing` spellings
+/// (`Deque`, `DefaultDict`, `OrderedDict` from `typing`), or the
+/// module-qualified `collections.deque` / `typing.Deque`. With `symbols`,
+/// a name bound to anything else (a user class called `OrderedDict`) is
+/// NOT the stdlib class; without them (the syntax-only authority) the
+/// lexical name decides.
+pub(crate) fn collections_class_of(
+    head: &ExprType,
+    symbols: Option<&SymbolTableScopes>,
+) -> Option<crate::CollectionsType> {
+    use crate::CollectionsType;
+    match head {
+        ExprType::Name(n) => {
+            let lexical = CollectionsType::from_annotation_name(&n.id);
+            let Some(symbols) = symbols else {
+                return lexical;
+            };
+            match symbols.get(&n.id) {
+                Some(SymbolTableNode::ImportFrom(i)) => {
+                    // `from collections import deque as dq` binds only `dq`.
+                    let canonical = i.defining_name(&n.id);
+                    let canonical = canonical.as_str();
+                    let from_collections =
+                        crate::StdModule::from_name(&i.module) == Some(crate::StdModule::Collections);
+                    let from_typing = crate::is_typing(&i.module);
+                    if from_collections {
+                        CollectionsType::from_class_name(canonical)
+                    } else if from_typing {
+                        CollectionsType::from_annotation_name(canonical)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
+        ExprType::Attribute(a) => {
+            let ExprType::Name(m) = a.value.as_ref() else {
+                return None;
+            };
+            if crate::StdModule::from_name(&m.id) == Some(crate::StdModule::Collections) {
+                CollectionsType::from_class_name(&a.attr)
+            } else if crate::is_typing(&m.id) {
+                CollectionsType::from_annotation_name(&a.attr)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A `collections` container annotation (`deque[int]`,
+/// `defaultdict[str, list[int]]`, `OrderedDict[str, int]`, the typing
+/// spellings, and the BARE class name, whose arguments are the boxed
+/// value) with its type arguments resolved through `member` — the caller's
+/// own annotation authority, so the syntax-only and symbol-aware readers
+/// share this one shape reader. `None` — not a collections annotation, or
+/// an argument that does not resolve.
+pub(crate) fn collections_annotation_with(
+    ann: &ExprType,
+    symbols: Option<&SymbolTableScopes>,
+    mut member: impl FnMut(&ExprType) -> Option<TypeInfo>,
+) -> Option<TypeInfo> {
+    match ann {
+        ExprType::Subscript(sub) => {
+            let kind = collections_class_of(&sub.value, symbols)?;
+            let crate::SubscriptKind::Index(args) = &sub.kind else {
+                return None;
+            };
+            let members: Vec<&ExprType> = match args.as_ref() {
+                ExprType::Tuple(t) if kind.arity() == 2 => t.elts.iter().collect(),
+                single if kind.arity() == 1 => vec![single],
+                _ => return None,
+            };
+            if members.len() != kind.arity() {
+                return None;
+            }
+            let mut resolved = Vec::with_capacity(members.len());
+            for m in members {
+                resolved.push(member(m)?);
+            }
+            Some(TypeInfo::Collection(kind, resolved))
+        }
+        head => {
+            // The BARE class name is only decided with symbols: without
+            // them a lexical `OrderedDict` could be a user class. (A bare
+            // collections annotation is a conversion error anyway.)
+            symbols?;
+            let kind = collections_class_of(head, symbols)?;
+            Some(TypeInfo::Collection(
+                kind,
+                vec![TypeInfo::PyValue; kind.arity()],
+            ))
+        }
+    }
+}
+
+
 /// Map a Python type annotation expression to the [`TypeInfo`] of the Rust
 /// type codegen produces for it. Used to derive the expected type of a
 /// call argument from the callee's parameter annotation.
@@ -2738,6 +3129,11 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
     // by the SAME shape reader the alias-aware resolver uses; the members
     // resolve through this syntax-only mapping.
     if let Some(t) = callable_typeinfo_with(ann, annotation_type_info) {
+        return Some(t);
+    }
+    // `deque[int]` / `defaultdict[str, int]` / `OrderedDict[str, int]`
+    // (and the bare class names): the runtime's collections structs.
+    if let Some(t) = collections_annotation_with(ann, None, annotation_type_info) {
         return Some(t);
     }
     // `T | None` (and `None | T`) is Option<T>; the inner type resolves
@@ -3644,7 +4040,7 @@ fn expr_walrus_writes(expr: &ExprType, name: &str) -> bool {
     }
 }
 
-fn analysis_view(options: &PythonOptions, info: &FunctionTypeInfo) -> PythonOptions {
+pub(crate) fn analysis_view(options: &PythonOptions, info: &FunctionTypeInfo) -> PythonOptions {
     if info.name_types.is_empty() && info.optional_names.is_empty() {
         return options.clone();
     }
@@ -3856,7 +4252,13 @@ fn analyze_statement_types(
                         // resolves (the context-free path saw an untyped
                         // element and the call fell to the callable-field
                         // form).
-                        ExprType::Subscript(_) => match (options, symbols) {
+                        // An ATTRIBUTE value (`port = parsed.port` where
+                        // `parsed = urlparse(url)`) likewise: the
+                        // receiver's type decides the attribute's, which
+                        // only the context-aware inferrer sees — so an
+                        // Option-typed read makes the local an Option
+                        // binding and a later `port = 80` Some-wraps.
+                        ExprType::Subscript(_) | ExprType::Attribute(_) => match (options, symbols) {
                             (Some(options), Some(symbols)) => {
                                 // The class context: `a = self.accounts[k]`
                                 // reads a field of the enclosing class.
@@ -3928,7 +4330,7 @@ fn analyze_statement_types(
                         info.optional_names.insert(name.id.clone());
                     }
                     // Empty container: remember it to pin from later use.
-                    if is_empty_container(&assign.value) {
+                    if is_empty_container(&assign.value, symbols) {
                         info.empty_pinned.insert(name.id.clone(), t);
                     }
                 }
@@ -4202,9 +4604,13 @@ fn analyze_statement_types(
     }
 }
 
-fn is_empty_container(expr: &ExprType) -> bool {
+fn is_empty_container(expr: &ExprType, symbols: Option<&SymbolTableScopes>) -> bool {
     matches!(expr, ExprType::List(l) if l.is_empty())
         || matches!(expr, ExprType::Dict(d) if d.keys.is_empty())
+        // `deque()` / `OrderedDict()` / `defaultdict(list)`: an empty
+        // collections container, pinned from its uses like `[]` / `{}`.
+        || matches!(expr, ExprType::Call(c)
+            if crate::ast::tree::collections_lower::is_empty_construction(c, symbols))
 }
 
 /// The syntactic type of an expression, ignoring the analysis maps (used
@@ -4473,6 +4879,49 @@ fn collect_use_suggestions(
             }
         }
         StatementType::Expr(e) => {
+            // `groups[k].append(v)` / `.extend(vs)` / `.add(v)` on a
+            // collections mapping (`defaultdict(list)`): the call pins the
+            // mapping's key type (an unknown or literal key is a String)
+            // and its value container's element type.
+            if let ExprType::Call(call) = &e.value
+                && let ExprType::Attribute(attr) = call.func.as_ref()
+                && let ExprType::Subscript(sub) = attr.value.as_ref()
+                && let ExprType::Name(recv) = sub.value.as_ref()
+                && info.empty_pinned.contains_key(&recv.id)
+                && let Some(TypeInfo::Collection(kind, _)) = info.name_types.get(&recv.id)
+                && kind.is_mapping()
+                && let crate::SubscriptKind::Index(idx) = &sub.kind
+                && let Some(arg) = call.args.first()
+            {
+                let k = match resolve_type(idx, info, symbols, options) {
+                    TypeInfo::StrRef => TypeInfo::String,
+                    other => other,
+                };
+                let elem = resolve_type(arg, info, symbols, options);
+                let elem = match (attr.attr.as_str(), elem) {
+                    ("extend", TypeInfo::Vec(e)) => Some(*e),
+                    ("extend", _) => None,
+                    ("append" | "add", t) => Some(t),
+                    _ => None,
+                };
+                if let Some(elem) = elem
+                    && !matches!(elem, TypeInfo::PyObject)
+                {
+                    let elem = match elem {
+                        TypeInfo::StrRef => TypeInfo::String,
+                        other => other,
+                    };
+                    let value = if attr.attr == "add" {
+                        TypeInfo::HashSet(Box::new(elem))
+                    } else {
+                        TypeInfo::Vec(Box::new(elem))
+                    };
+                    let suggestion = TypeInfo::Dict(Box::new(k), Box::new(value));
+                    out.entry(recv.id.clone())
+                        .and_modify(|e| *e = unify(e.clone(), suggestion.clone()))
+                        .or_insert(suggestion);
+                }
+            }
             // `"; ".join(parts)` — a str join pins its ARGUMENT (the list)
             // to Vec<String>, even when the receiver is a literal.
             if let ExprType::Call(call) = &e.value
@@ -4747,6 +5196,13 @@ fn resolve_alias_typeinfo_inner(
     {
         return Some(t);
     }
+    // The `collections` containers (`deque[int]`, `OrderedDict[str, int]`,
+    // ...): decided BEFORE the arms below box an imported class generic.
+    if let Some(t) = collections_annotation_with(ann, Some(symbols), |m| {
+        resolve_alias_typeinfo(m, symbols, options)
+    }) {
+        return Some(t);
+    }
     match ann {
         // `T | None`: Option of the alias-resolved inner type
         // (`list[CharsetMatch] | None`). A boxed PyValue already contains
@@ -5000,7 +5456,10 @@ fn resolve_alias_typeinfo_inner(
                 let module = options.module_defs.get(&path)?;
                 let module: &crate::Module = module;
                 let syms = module.clone().find_symbols(SymbolTableScopes::new());
-                match syms.get(&n.id) {
+                // The DEFINING module binds the original item name
+                // (`from m import T as U` reads `T` there).
+                let defining = i.defining_name(&n.id);
+                match syms.get(&defining) {
                     Some(SymbolTableNode::Assign { value, .. }) => {
                         if is_typevar_call(value) {
                             return Some(TypeInfo::PyValue);
@@ -5026,7 +5485,7 @@ fn resolve_alias_typeinfo_inner(
                         if crate::ast::tree::module::module_def_has_runtime_item(
                             options,
                             &path,
-                            &n.id,
+                            &defining,
                         ) {
                             Some(TypeInfo::Class(n.id.clone()))
                         } else {
@@ -5038,7 +5497,7 @@ fn resolve_alias_typeinfo_inner(
                     // import ProxyConfig` — urllib3): follow the chain in
                     // the DEFINING module's scope.
                     Some(SymbolTableNode::ImportFrom(_)) | Some(SymbolTableNode::Alias(_)) => {
-                        resolve_alias_named_in(&path.join("."), &n.id, &syms, options)
+                        resolve_alias_named_in(&path.join("."), &defining, &syms, options)
                     }
                     _ => None,
                 }
@@ -5418,22 +5877,73 @@ fn self_method_return_typeinfo(
     let (class, class_symbols) =
         crate::ast::tree::call::receiver_class_tail(class_name, symbols.clone(), options)?;
     let method = class.method_on_mro(&attr.attr, &class_symbols)?;
+    method_return_typeinfo(class_name, &method, &class_symbols, options)
+}
+
+/// The type `recv.name(...)` returns when `recv` is an instance of a class
+/// the receiver resolution knows (a self field, a class-typed local or
+/// parameter, a construction, a field chain). None when the receiver's
+/// class or the method is unknown.
+fn instance_method_call_typeinfo(
+    ctx: Option<&CodeGenContext>,
+    attr: &crate::Attribute,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<TypeInfo> {
+    let module_ctx = CodeGenContext::Module(String::new());
+    let ctx = ctx.unwrap_or(&module_ctx);
+    let (class, class_symbols) =
+        crate::ast::tree::call::receiver_class(&attr.value, ctx, symbols, options)?;
+    let method = class.method_on_mro_with_options(&attr.attr, &class_symbols, options)?;
+    // A static/class method's first parameter is not the instance; its
+    // return still types the call, so no receiver-kind check is needed.
+    method_return_typeinfo(&class.name, &method, &class_symbols, options)
+}
+
+/// The type a call of `method` (found on `class_name`'s MRO) returns: its
+/// declared return, or — UNANNOTATED — the type its definition is emitted
+/// with. A primitive signature (`def subtotal(self, o): total = 0.0 ...
+/// return total` is emitted `-> f64`) maps back directly; any other
+/// inferred type counts only when it renders to exactly the emitted
+/// signature, so the caller and the definition agree by construction.
+/// Guarded against recursion through the method's own returns.
+pub(crate) fn method_return_typeinfo(
+    class_name: &str,
+    method: &crate::FunctionDef,
+    class_symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<TypeInfo> {
     if let Some(ann) = method.returns.as_deref() {
-        return resolve_alias_typeinfo(ann, &class_symbols, options);
+        return resolve_alias_typeinfo(ann, class_symbols, options);
     }
-    // An UNANNOTATED method: the return type its definition is emitted
-    // with, when that is a plain primitive (`def subtotal(self, o): total
-    // = 0.0 ... return total` is emitted `-> f64`), so a caller's
-    // `round(self.subtotal(o), 2)` is typed. Guarded against recursion
-    // through the method's own returns.
-    let tokens = self_method_resolved_return(class_name, &method, &class_symbols, options)?;
-    match tokens.to_string().as_str() {
-        "f64" => Some(TypeInfo::Float),
-        "i64" => Some(TypeInfo::Int),
-        "bool" => Some(TypeInfo::Bool),
-        "String" => Some(TypeInfo::String),
-        _ => None,
+    let tokens = self_method_resolved_return(class_name, method, class_symbols, options)?;
+    let emitted = tokens.to_string();
+    match emitted.as_str() {
+        "f64" => return Some(TypeInfo::Float),
+        "i64" => return Some(TypeInfo::Int),
+        "bool" => return Some(TypeInfo::Bool),
+        "String" => return Some(TypeInfo::String),
+        _ => {}
     }
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        ("method-return-typeinfo", class_name, &method.name).hash(&mut h);
+        h.finish() as usize
+    };
+    resolving_return(
+        key,
+        || None,
+        || {
+            [
+                method.inferred_return_typeinfo_in(class_name, class_symbols, options),
+                method.param_scoped_return_typeinfo(Some(class_name), class_symbols, options),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|t| t.to_rust_type().to_string() == emitted)
+        },
+    )
 }
 
 /// The return type `method` of `class` is emitted with (its whole
@@ -5590,6 +6100,9 @@ fn resolve_type_inner(
                 return match t {
                     TypeInfo::Vec(inner) | TypeInfo::PyTuple(inner) => (**inner).clone(),
                     TypeInfo::Dict(_, v) => (**v).clone(),
+                    t @ TypeInfo::Collection(..) => {
+                        t.collection_held().cloned().unwrap_or(TypeInfo::PyObject)
+                    }
                     other => other.clone(),
                 };
             }

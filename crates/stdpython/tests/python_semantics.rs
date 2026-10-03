@@ -3832,7 +3832,7 @@ fn urllib_parse_matches_cpython() {
     assert_eq!(p.query, "a=1&b=2");
     assert_eq!(p.fragment, "frag");
     assert_eq!(p.hostname(), Some("example.com".to_string()));
-    assert_eq!(p.port(), Some(8080));
+    assert_eq!(p.port().unwrap(), Some(8080));
     assert_eq!(p.username(), Some("user".to_string()));
     assert_eq!(p.password(), Some("pass".to_string()));
     assert_eq!(p.geturl(), "https://user:pass@example.com:8080/path/to?a=1&b=2#frag");
@@ -3873,6 +3873,27 @@ fn urllib_parse_matches_cpython() {
     let ui = urlparse("http://user@name:pass@example.com/").unwrap();
     assert_eq!(ui.username(), Some("user@name".to_string()));
     assert_eq!(ui.password(), Some("pass".to_string()));
+    // `.port` (CPython 3.11): urlparse succeeds, the read raises.
+    //   urlparse("http://h:0080/").port == 80
+    //   urlparse("http://h:/").port is None; urlparse("http://h/").port is None
+    //   urlparse("http://[::1]:8/").port == 8
+    //   urlparse("http://h:abc/").port  -> ValueError: Port could not be cast to integer value as 'abc'
+    //   urlparse("http://h:-1/").port   -> ValueError: Port could not be cast to integer value as '-1'
+    //   urlparse("http://h:70000/").port -> ValueError: Port out of range 0-65535
+    let port = |u: &str| urlparse(u).unwrap().port().map_err(|e| e.to_string());
+    assert_eq!(port("http://h:0080/"), Ok(Some(80)));
+    assert_eq!(port("http://h:/"), Ok(None));
+    assert_eq!(port("http://h/"), Ok(None));
+    assert_eq!(port("http://[::1]:8/"), Ok(Some(8)));
+    assert_eq!(
+        port("http://h:abc/"),
+        Err("ValueError: Port could not be cast to integer value as 'abc'".to_string())
+    );
+    assert_eq!(
+        port("http://h:-1/"),
+        Err("ValueError: Port could not be cast to integer value as '-1'".to_string())
+    );
+    assert_eq!(port("http://h:70000/"), Err("ValueError: Port out of range 0-65535".to_string()));
     assert_eq!(ui.hostname(), Some("example.com".to_string()));
     //   urlparse("HTTP://EXAMPLE.COM/").scheme == "http" (lowercased).
     assert_eq!(urlparse("HTTP://EXAMPLE.COM/").unwrap().scheme, "http");
@@ -5191,4 +5212,576 @@ fn py_class_name_reads_the_python_class_name_off_the_type() {
     assert_eq!(stdpython::py_class_name::<m::r#type>(), "type");
     // generics never leak into the name
     assert_eq!(stdpython::py_class_name::<m::G<m::Session>>(), "G");
+}
+
+#[test]
+fn str_of_an_optional_value_matches_cpython() {
+    use stdpython::str;
+    // Verified against python3:
+    //   str(None) == 'None'; x: int | None = 5; str(x) == '5'
+    //   str(True) == 'True'
+    assert_eq!(str(None::<i64>), "None");
+    assert_eq!(str(Some(5i64)), "5");
+    assert_eq!(str(Some(true)), "True");
+    assert_eq!(str(Some("a".to_string())), "a");
+}
+
+// ---------------------------------------------------------------------------
+// collections.deque / defaultdict / OrderedDict (issue #427). Every expected
+// value below is the output of the Python expression in the comment, run
+// under python3.12.
+// ---------------------------------------------------------------------------
+mod collections_containers {
+    use stdpython::collections::{defaultdict, deque, OrderedDict};
+    use stdpython::*;
+
+    fn items<T: Clone>(d: &deque<T>) -> Vec<T> {
+        d.to_vec()
+    }
+
+    #[test]
+    fn deque_end_operations_and_empty_pops() {
+        let mut d = deque::from_iter(vec![1i64, 2, 3], None);
+        // d = deque([1,2,3]); d.append(4); d.appendleft(0) -> deque([0, 1, 2, 3, 4])
+        d.append(4);
+        d.appendleft(0);
+        assert_eq!(items(&d), vec![0, 1, 2, 3, 4]);
+        // d.pop() -> 4; d.popleft() -> 0; d -> deque([1, 2, 3])
+        assert_eq!(d.pop().unwrap(), 4);
+        assert_eq!(d.popleft().unwrap(), 0);
+        assert_eq!(items(&d), vec![1, 2, 3]);
+        // deque().pop() / deque().popleft() -> IndexError: pop from an empty deque
+        let mut e: deque<i64> = deque::new();
+        for err in [e.pop().unwrap_err(), e.popleft().unwrap_err()] {
+            assert_eq!(err.exception_type, "IndexError");
+            assert_eq!(err.message, "pop from an empty deque");
+        }
+    }
+
+    #[test]
+    fn deque_maxlen_trims_the_opposite_end() {
+        let mut m = deque::construct(vec![1i64, 2, 3], Some(3)).unwrap();
+        // m = deque([1,2,3], maxlen=3); m.append(4) -> deque([2, 3, 4], maxlen=3)
+        m.append(4);
+        assert_eq!(items(&m), vec![2, 3, 4]);
+        // m.appendleft(0) -> deque([0, 2, 3], maxlen=3)
+        m.appendleft(0);
+        assert_eq!(items(&m), vec![0, 2, 3]);
+        // m.extend([7, 8]) -> deque([3, 7, 8], maxlen=3)
+        m.extend(vec![7, 8]);
+        assert_eq!(items(&m), vec![3, 7, 8]);
+        // m.extendleft([5, 6]) -> deque([6, 5, 3], maxlen=3)
+        m.extendleft(vec![5, 6]);
+        assert_eq!(items(&m), vec![6, 5, 3]);
+        // m.maxlen -> 3; deque([1]).maxlen -> None
+        assert_eq!(m.maxlen(), Some(3));
+        assert_eq!(deque::<i64>::new().maxlen(), None);
+        // deque([1,2,3], maxlen=0) -> deque([], maxlen=0)
+        let z = deque::construct(vec![1i64, 2, 3], Some(0)).unwrap();
+        assert_eq!(z.len(), 0);
+        // deque([1], maxlen=-1) -> ValueError: maxlen must be non-negative
+        let err = deque::construct(vec![1i64], Some(-1)).unwrap_err();
+        assert_eq!(err.exception_type, "ValueError");
+        assert_eq!(err.message, "maxlen must be non-negative");
+    }
+
+    #[test]
+    fn deque_rotate_matches_python() {
+        let mut r = deque::from_iter(vec![1i64, 2, 3, 4, 5], None);
+        // r.rotate(2) -> deque([4, 5, 1, 2, 3])
+        r.rotate(2);
+        assert_eq!(items(&r), vec![4, 5, 1, 2, 3]);
+        // r.rotate(-7) -> deque([1, 2, 3, 4, 5])
+        r.rotate(-7);
+        assert_eq!(items(&r), vec![1, 2, 3, 4, 5]);
+        // r.rotate() (default 1) -> deque([5, 1, 2, 3, 4]); r.rotate(0) leaves it
+        r.rotate(1);
+        r.rotate(0);
+        assert_eq!(items(&r), vec![5, 1, 2, 3, 4]);
+        // deque().rotate(3) -> deque([])
+        let mut e: deque<i64> = deque::new();
+        e.rotate(3);
+        assert_eq!(e.len(), 0);
+        // x = deque([1,2,3]); x.extendleft([7,8,9]) -> deque([9, 8, 7, 1, 2, 3])
+        let mut x = deque::from_iter(vec![1i64, 2, 3], None);
+        x.extendleft(vec![7, 8, 9]);
+        assert_eq!(items(&x), vec![9, 8, 7, 1, 2, 3]);
+    }
+
+    #[test]
+    fn deque_repr_matches_python() {
+        // repr(deque(['a', 'b'])) -> "deque(['a', 'b'])"
+        let s = deque::from_iter(vec!["a".to_string(), "b".to_string()], None);
+        assert_eq!(s.py_repr(), "deque(['a', 'b'])");
+        // repr(deque()) -> 'deque([])'
+        assert_eq!(deque::<i64>::new().py_repr(), "deque([])");
+        // repr(deque([1], maxlen=2)) -> 'deque([1], maxlen=2)'
+        assert_eq!(
+            deque::from_iter(vec![1i64], Some(2)).py_repr(),
+            "deque([1], maxlen=2)"
+        );
+    }
+
+    #[test]
+    fn deque_indexing_remove_and_equality() {
+        let mut y = deque::from_iter(vec![1i64, 2, 3], None);
+        // y[0], y[-1] -> 1, 3
+        assert_eq!((y.py_index(0).unwrap(), y.py_index(-1).unwrap()), (1, 3));
+        // y[3] / y[-4] -> IndexError: deque index out of range
+        for i in [3, -4] {
+            let err = y.py_index(i).unwrap_err();
+            assert_eq!(err.exception_type, "IndexError");
+            assert_eq!(err.message, "deque index out of range");
+        }
+        // y[1] = 20 -> deque([1, 20, 3]); y[9] = 1 -> IndexError: deque index out of range
+        y.py_set_index(1, 20).unwrap();
+        assert_eq!(items(&y), vec![1, 20, 3]);
+        assert_eq!(
+            y.py_set_index(9, 1).unwrap_err().message,
+            "deque index out of range"
+        );
+        // y.remove(20) -> deque([1, 3]); y.remove(99) -> ValueError: 99 is not in deque
+        y.remove(&20).unwrap();
+        assert_eq!(items(&y), vec![1, 3]);
+        let err = y.remove(&99).unwrap_err();
+        assert_eq!(err.exception_type, "ValueError");
+        assert_eq!(err.message, "99 is not in deque");
+        // deque(["a"]).remove("zz") -> ValueError: 'zz' is not in deque
+        let mut s = deque::from_iter(vec!["a".to_string()], None);
+        assert_eq!(
+            s.remove(&"zz".to_string()).unwrap_err().message,
+            "'zz' is not in deque"
+        );
+        // deque([1, 2]) == deque([1, 2]) -> True; == deque([2, 1]) -> False;
+        // deque([1], maxlen=3) == deque([1]) -> True (the bound is not compared)
+        assert!(deque::from_iter(vec![1i64, 2], None) == deque::from_iter(vec![1i64, 2], None));
+        assert!(deque::from_iter(vec![1i64, 2], None) != deque::from_iter(vec![2i64, 1], None));
+        assert!(deque::from_iter(vec![1i64], Some(3)) == deque::from_iter(vec![1i64], None));
+        // 2 in deque([1, 2]) -> True; 5 in ... -> False
+        let c = deque::from_iter(vec![1i64, 2], None);
+        assert!(c.py_contains(&2) && !c.py_contains(&5));
+    }
+
+    #[test]
+    fn deque_del_item_removes_by_index() {
+        let mut d = deque::from_iter(vec![1i64, 2, 3], None);
+        // del d[1] -> deque([1, 3]); del d[-1] -> deque([1])
+        assert_eq!(d.py_pop(1).unwrap(), 2);
+        assert_eq!(items(&d), vec![1, 3]);
+        assert_eq!(d.py_pop(-1).unwrap(), 3);
+        assert_eq!(items(&d), vec![1]);
+        // del d[5] -> IndexError: deque index out of range
+        let err = d.py_pop(5).unwrap_err();
+        assert_eq!(err.exception_type, "IndexError");
+        assert_eq!(err.message, "deque index out of range");
+    }
+
+    #[test]
+    fn defaultdict_read_inserts_and_get_does_not() {
+        let dd: defaultdict<String, i64> = defaultdict::with_class(|| 0i64, "int");
+        // dd["a"] -> 0, and the key is now present: len(dd) -> 1, list(dd) -> ['a']
+        assert_eq!(dd.py_index("a").unwrap(), 0);
+        assert_eq!(dd.len(), 1);
+        assert_eq!(dd.py_keys(), vec!["a".to_string()]);
+        // dd.get("zz") -> None and does NOT insert; "zz" in dd -> False
+        assert_eq!(dd.py_get(&"zz".to_string()), None);
+        assert!(!dd.py_contains("zz"));
+        assert_eq!(dd.len(), 1);
+    }
+
+    #[test]
+    fn defaultdict_repr_order_and_missing_keys() {
+        let mut dd: defaultdict<String, i64> = defaultdict::with_class(|| 0i64, "int");
+        // dd["a"]; dd["b"] += 2 -> defaultdict(<class 'int'>, {'a': 0, 'b': 2})
+        let _ = dd.py_index("a").unwrap();
+        *dd.py_index_mut("b").unwrap() += 2;
+        assert_eq!(dd.py_repr(), "defaultdict(<class 'int'>, {'a': 0, 'b': 2})");
+        // list(dd.keys()), list(dd.values()) -> ['a', 'b'], [0, 2]
+        assert_eq!(dd.py_values(), vec![0, 2]);
+        // dd.pop("a") -> 0; dd.pop("zz") -> KeyError: 'zz'; dd.pop("zz", -1) -> -1
+        assert_eq!(dd.py_pop("a".to_string()).unwrap(), 0);
+        assert_eq!(dd.py_pop("zz".to_string()).unwrap_err().message, "'zz'");
+        assert_eq!(dd.py_pop_default("zz".to_string(), -1), -1);
+        // defaultdict()["k"] / defaultdict(None)["k"] -> KeyError: 'k'
+        let plain: defaultdict<String, i64> = defaultdict::without_factory();
+        let err = plain.py_index("k").unwrap_err();
+        assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("KeyError", "'k'"));
+        // repr(defaultdict(list)) -> "defaultdict(<class 'list'>, {})"
+        let l: defaultdict<String, Vec<i64>> = defaultdict::with_class(|| Vec::new(), "list");
+        assert_eq!(l.py_repr(), "defaultdict(<class 'list'>, {})");
+        // dl["k"].append(1); dl["k"].append(2); dl["j"] -> {'k': [1, 2], 'j': []}
+        let mut l = l;
+        l.py_index_mut("k").unwrap().push(1);
+        l.py_index_mut("k").unwrap().push(2);
+        let _ = l.py_index("j").unwrap();
+        assert_eq!(l.py_repr(), "defaultdict(<class 'list'>, {'k': [1, 2], 'j': []})");
+        // defaultdict(float, {"x": 1.5}) -> defaultdict(<class 'float'>, {'x': 1.5})
+        let mut start = PyDict::default();
+        start.insert("x".to_string(), 1.5f64);
+        let f: defaultdict<String, f64> =
+            defaultdict::with_class(|| 0.0f64, "float").with_items(start);
+        assert_eq!(f.py_repr(), "defaultdict(<class 'float'>, {'x': 1.5})");
+    }
+
+    #[test]
+    fn defaultdict_equality_ignores_the_factory() {
+        let mut start = PyDict::default();
+        start.insert("a".to_string(), 1i64);
+        let a: defaultdict<String, i64> =
+            defaultdict::with_class(|| 0i64, "int").with_items(start.clone());
+        let b: defaultdict<String, i64> = defaultdict::new(|| 5i64).with_items(start.clone());
+        // defaultdict(int, {"a": 1}) == defaultdict(lambda: 5, {"a": 1}) -> True
+        assert!(a == b);
+        // defaultdict(int, {"a": 1}) == {"a": 1} -> True
+        assert!(a == start);
+    }
+
+    #[test]
+    fn a_factoryless_defaultdict_raises_a_genuine_keyerror() {
+        // defaultdict()["k"] / defaultdict(None)["k"] -> KeyError: 'k' — a
+        // program may catch it with `except KeyError`.
+        let d = defaultdict::<String, i64>::without_factory();
+        let err = d.py_index("k").unwrap_err();
+        assert_eq!(err.exception_type, "KeyError");
+        assert_eq!(err.message, "'k'");
+    }
+
+    #[test]
+    #[should_panic(expected = "built without its default_factory")]
+    fn a_default_built_defaultdict_panics_on_a_missing_key_read() {
+        // `Default::default()` is a class struct's placeholder, NOT a
+        // `defaultdict()`: a KeyError here would be mistaken for CPython's
+        // by `except KeyError:`, so a missing-key read panics naming the bug.
+        let d: defaultdict<String, i64> = Default::default();
+        let _ = d.py_index("k");
+    }
+
+    #[test]
+    #[should_panic(expected = "built without its default_factory")]
+    fn a_default_built_defaultdict_panics_on_a_missing_key_slot() {
+        let mut d: defaultdict<String, Vec<i64>> = Default::default();
+        let _ = d.py_index_mut("k");
+    }
+
+    #[test]
+    fn a_default_built_defaultdict_still_serves_present_keys_and_reads_that_never_insert() {
+        let mut d: defaultdict<String, i64> = Default::default();
+        d.py_set_index("a".to_string(), 1).unwrap();
+        assert_eq!(d.py_index("a").unwrap(), 1);
+        assert_eq!(d.py_get(&"zz".to_string()), None);
+        assert!(!d.py_contains("zz"));
+    }
+
+    #[test]
+    #[should_panic(expected = "memory address")]
+    fn defaultdict_repr_with_a_lambda_factory_is_loud() {
+        // repr(defaultdict(lambda: 5)) prints `<function <lambda> at 0x...>`: an
+        // address no run reproduces, so rython panics instead of printing a
+        // different string.
+        let d: defaultdict<String, i64> = defaultdict::new(|| 5);
+        let _ = d.py_repr();
+    }
+
+    #[test]
+    fn ordereddict_order_move_to_end_and_popitem() {
+        let mut od: OrderedDict<String, i64> = OrderedDict::new();
+        for (k, v) in [("b", 1), ("a", 2), ("c", 3)] {
+            od.py_set_index(k.to_string(), v).unwrap();
+        }
+        // repr(od) -> "OrderedDict({'b': 1, 'a': 2, 'c': 3})" (3.12 form); repr(OrderedDict()) -> 'OrderedDict()'
+        assert_eq!(od.py_repr(), "OrderedDict({'b': 1, 'a': 2, 'c': 3})");
+        assert_eq!(OrderedDict::<String, i64>::new().py_repr(), "OrderedDict()");
+        // od.move_to_end("b") -> ['a', 'c', 'b']
+        od.move_to_end(&"b".to_string(), true).unwrap();
+        assert_eq!(od.keys(), vec!["a", "c", "b"]);
+        // od.move_to_end("c", last=False) -> ['c', 'a', 'b']
+        od.move_to_end(&"c".to_string(), false).unwrap();
+        assert_eq!(od.keys(), vec!["c", "a", "b"]);
+        // od.popitem() -> ('b', 1); od.popitem(last=False) -> ('c', 3); list(od) -> ['a']
+        assert_eq!(od.popitem(true).unwrap(), ("b".to_string(), 1));
+        assert_eq!(od.popitem(false).unwrap(), ("c".to_string(), 3));
+        assert_eq!(od.keys(), vec!["a"]);
+        // overwriting keeps the position; delete + reinsert goes last
+        let mut o2: OrderedDict<String, i64> = OrderedDict::new();
+        for (k, v) in [("a", 1), ("b", 2), ("c", 3)] {
+            o2.insert(k.to_string(), v);
+        }
+        // o2["a"] = 10 -> [('a', 10), ('b', 2), ('c', 3)]
+        o2.py_set_index("a".to_string(), 10).unwrap();
+        assert_eq!(o2.items()[0], ("a".to_string(), 10));
+        // del o2["b"]; o2["b"] = 7 -> [('a', 10), ('c', 3), ('b', 7)]
+        o2.remove(&"b".to_string());
+        o2.py_set_index("b".to_string(), 7).unwrap();
+        assert_eq!(o2.keys(), vec!["a", "c", "b"]);
+    }
+
+    #[test]
+    fn ordereddict_errors_carry_cpythons_text() {
+        let mut od: OrderedDict<String, i64> = OrderedDict::new();
+        // OrderedDict().popitem() -> KeyError: 'dictionary is empty'
+        let err = od.popitem(true).unwrap_err();
+        assert_eq!(
+            (err.exception_type.as_str(), err.message.as_str()),
+            ("KeyError", "'dictionary is empty'")
+        );
+        // OrderedDict().move_to_end("x") / ["x"] / .pop("x") -> KeyError: 'x'
+        assert_eq!(od.move_to_end(&"x".to_string(), true).unwrap_err().message, "'x'");
+        assert_eq!(od.py_index("x").unwrap_err().message, "'x'");
+        assert_eq!(od.py_pop("x".to_string()).unwrap_err().message, "'x'");
+    }
+
+    #[test]
+    fn ordereddict_equality_is_order_sensitive_only_between_ordereddicts() {
+        let ab = OrderedDict::from_pairs(vec![("a".to_string(), 1i64), ("b".to_string(), 2)]);
+        let ba = OrderedDict::from_pairs(vec![("b".to_string(), 2i64), ("a".to_string(), 1)]);
+        // OrderedDict([("a",1),("b",2)]) == OrderedDict([("b",2),("a",1)]) -> False
+        assert!(ab != ba);
+        // OrderedDict([("a",1),("b",2)]) == {"b": 2, "a": 1} -> True
+        let mut plain = PyDict::default();
+        plain.insert("b".to_string(), 2i64);
+        plain.insert("a".to_string(), 1i64);
+        assert!(ab == plain);
+        // repr(OrderedDict([("a", 1), ("b", 2), ("a", 3)])) -> OrderedDict({'a': 3, 'b': 2})
+        let dup = OrderedDict::from_pairs(vec![
+            ("a".to_string(), 1i64),
+            ("b".to_string(), 2),
+            ("a".to_string(), 3),
+        ]);
+        assert_eq!(dup.py_repr(), "OrderedDict({'a': 3, 'b': 2})");
+        // repr(OrderedDict([(1, "x"), (2, "y")])) -> OrderedDict({1: 'x', 2: 'y'})
+        let ints = OrderedDict::from_pairs(vec![(1i64, "x".to_string()), (2, "y".to_string())]);
+        assert_eq!(ints.py_repr(), "OrderedDict({1: 'x', 2: 'y'})");
+    }
+}
+
+// A BOXED OrderedDict (`PyValue::OrderedDict` — `OrderedDict(value)` over an
+// untyped parameter, requests' `from_key_val_list`). Every expected value was
+// captured from python3.12; the Python expression is in the comment above it.
+mod boxed_ordereddict {
+    use stdpython::collections::OrderedDict;
+    use stdpython::*;
+
+    fn s(v: &str) -> PyValue {
+        PyValue::Str(v.to_string())
+    }
+
+    fn tup(items: Vec<PyValue>) -> PyValue {
+        PyValue::Tuple(std::sync::Arc::new(items))
+    }
+
+    fn pair(k: &str, v: i64) -> PyValue {
+        tup(vec![s(k), PyValue::Int(v)])
+    }
+
+    fn pairs(items: &[(&str, i64)]) -> PyValue {
+        tup(items.iter().map(|(k, v)| pair(k, *v)).collect())
+    }
+
+    fn build(v: PyValue) -> PyValue {
+        OrderedDict::from_boxed(v).unwrap()
+    }
+
+    fn err(v: PyValue) -> (String, String) {
+        let e = OrderedDict::from_boxed(v).unwrap_err();
+        (e.exception_type.clone(), e.message.clone())
+    }
+
+    fn dict(items: &[(&str, i64)]) -> PyDict<String, PyValue> {
+        let mut d = PyDict::default();
+        for (k, v) in items {
+            d.insert(k.to_string(), PyValue::Int(*v));
+        }
+        d
+    }
+
+    #[test]
+    fn repr_and_str_are_the_ordereddict_form() {
+        // repr(OrderedDict([("b", 1), ("a", 2)])) -> OrderedDict({'b': 1, 'a': 2})
+        let od = build(pairs(&[("b", 1), ("a", 2)]));
+        assert_eq!(od.py_repr(), "OrderedDict({'b': 1, 'a': 2})");
+        // str(OrderedDict([("a", "x")])) -> OrderedDict({'a': 'x'})
+        let ax = build(tup(vec![tup(vec![s("a"), s("x")])]));
+        assert_eq!(ax.py_display(), "OrderedDict({'a': 'x'})");
+        // repr(OrderedDict()) -> OrderedDict()
+        assert_eq!(build(tup(vec![])).py_repr(), "OrderedDict()");
+        // repr(OrderedDict([("a", OrderedDict([("b", None)]))]))
+        //   -> OrderedDict({'a': OrderedDict({'b': None})})
+        let inner = build(tup(vec![tup(vec![s("b"), PyValue::None_])]));
+        let outer = build(tup(vec![tup(vec![s("a"), inner])]));
+        assert_eq!(outer.py_repr(), "OrderedDict({'a': OrderedDict({'b': None})})");
+    }
+
+    #[test]
+    fn constructs_from_a_dict_and_from_pairs() {
+        // OrderedDict({"x": 1, "y": 2}) -> OrderedDict({'x': 1, 'y': 2})
+        let from_dict = build(PyValue::Dict(std::sync::Arc::new(dict(&[("x", 1), ("y", 2)]))));
+        assert_eq!(from_dict.py_repr(), "OrderedDict({'x': 1, 'y': 2})");
+        // OrderedDict([("a", 1), ("a", 2)]) -> OrderedDict({'a': 2}); a repeated key
+        // keeps its first position and takes the last value.
+        assert_eq!(build(pairs(&[("a", 1), ("a", 2)])).py_repr(), "OrderedDict({'a': 2})");
+        // OrderedDict(["ab"]) -> OrderedDict({'a': 'b'}): a 2-character str is a pair.
+        assert_eq!(build(tup(vec![s("ab")])).py_repr(), "OrderedDict({'a': 'b'})");
+        // OrderedDict(OrderedDict([("a", 1)])) -> OrderedDict({'a': 1}), a copy.
+        let first = build(pairs(&[("a", 1)]));
+        assert_eq!(build(first).py_repr(), "OrderedDict({'a': 1})");
+    }
+
+    #[test]
+    fn constructor_errors_are_cpythons() {
+        // OrderedDict(5) -> TypeError: 'int' object is not iterable
+        assert_eq!(
+            err(PyValue::Int(5)),
+            ("TypeError".to_string(), "'int' object is not iterable".to_string())
+        );
+        // OrderedDict(5.5) -> TypeError: 'float' object is not iterable
+        assert_eq!(err(PyValue::Float(5.5)).1, "'float' object is not iterable");
+        // OrderedDict(True) -> TypeError: 'bool' object is not iterable
+        assert_eq!(err(PyValue::Bool(true)).1, "'bool' object is not iterable");
+        // OrderedDict(None) -> TypeError: 'NoneType' object is not iterable
+        assert_eq!(err(PyValue::None_).1, "'NoneType' object is not iterable");
+        // OrderedDict([1]) -> TypeError: 'int' object is not iterable
+        assert_eq!(
+            err(tup(vec![PyValue::Int(1)])),
+            ("TypeError".to_string(), "'int' object is not iterable".to_string())
+        );
+        // OrderedDict([(1, 2, 3)]) -> ValueError: too many values to unpack (expected 2)
+        let three = tup(vec![tup(vec![PyValue::Int(1), PyValue::Int(2), PyValue::Int(3)])]);
+        assert_eq!(
+            err(three),
+            (
+                "ValueError".to_string(),
+                "too many values to unpack (expected 2)".to_string()
+            )
+        );
+        // OrderedDict([("a",)]) -> ValueError: need more than 1 value to unpack
+        assert_eq!(
+            err(tup(vec![tup(vec![s("a")])])),
+            (
+                "ValueError".to_string(),
+                "need more than 1 value to unpack".to_string()
+            )
+        );
+        // OrderedDict([()]) -> ValueError: need more than 0 values to unpack
+        assert_eq!(err(tup(vec![tup(vec![])])).1, "need more than 0 values to unpack");
+        // OrderedDict("ab") -> ValueError: need more than 1 value to unpack
+        assert_eq!(err(s("ab")).1, "need more than 1 value to unpack");
+        // OrderedDict([("a", 1), 5]) -> TypeError: 'int' object is not iterable
+        assert_eq!(
+            err(tup(vec![pair("a", 1), PyValue::Int(5)])).1,
+            "'int' object is not iterable"
+        );
+        // OrderedDict([({"a": 1}, 2)]) -> TypeError: unhashable type: 'dict'
+        let unhashable = tup(vec![tup(vec![
+            PyValue::Dict(std::sync::Arc::new(dict(&[("a", 1)]))),
+            PyValue::Int(2),
+        ])]);
+        assert_eq!(
+            err(unhashable),
+            ("TypeError".to_string(), "unhashable type: 'dict'".to_string())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a boxed OrderedDict holds str keys only")]
+    fn a_non_str_key_is_a_loud_panic_never_a_stringified_key() {
+        // OrderedDict([(1, 2)]) -> OrderedDict({1: 2}) in CPython; the boxed
+        // OrderedDict holds str keys only, so rython refuses loudly.
+        let _ = OrderedDict::from_boxed(tup(vec![tup(vec![PyValue::Int(1), PyValue::Int(2)])]));
+    }
+
+    #[test]
+    fn equality_is_order_sensitive_only_against_another_ordereddict() {
+        let ab = build(pairs(&[("a", 1), ("b", 2)]));
+        let ba = build(pairs(&[("b", 2), ("a", 1)]));
+        // OrderedDict([("a",1),("b",2)]) == OrderedDict([("b",2),("a",1)]) -> False
+        assert!(ab != ba);
+        // OrderedDict([("a",1),("b",2)]) == OrderedDict([("a",1),("b",2)]) -> True
+        assert!(ab == build(pairs(&[("a", 1), ("b", 2)])));
+        // OrderedDict([("a",1),("b",2)]) == {"b": 2, "a": 1} -> True, and the reverse
+        let d = dict(&[("b", 2), ("a", 1)]);
+        let plain = PyValue::Dict(std::sync::Arc::new(d.clone()));
+        assert!(ab == plain);
+        assert!(plain == ab);
+        assert!(ab == d);
+        // OrderedDict([("a",1)]) == {"a": 2} -> False
+        let other = PyValue::Dict(std::sync::Arc::new(dict(&[("a", 2)])));
+        assert!(build(pairs(&[("a", 1)])) != other);
+        // [("a", 1)] == OrderedDict([("a", 1)]) -> False; OrderedDict() == () -> False;
+        // OrderedDict() == None -> False
+        assert!(pairs(&[("a", 1)]) != build(pairs(&[("a", 1)])));
+        assert!(build(tup(vec![])) != tup(vec![]));
+        assert!(build(tup(vec![])) != PyValue::None_);
+    }
+
+    #[test]
+    fn truthiness_len_iteration_membership_and_index() {
+        let od = build(pairs(&[("b", 1), ("a", 2), ("c", 3)]));
+        // bool(OrderedDict()) -> False; bool(OrderedDict([("b", 1)])) -> True
+        assert!(!build(tup(vec![])).is_truthy());
+        assert!(od.is_truthy());
+        // len(OrderedDict([("b",1),("a",2),("c",3)])) -> 3
+        assert_eq!(od.len(), 3);
+        // list(OrderedDict([("b",1),("a",2),("c",3)])) -> ['b', 'a', 'c']
+        let keys: Vec<PyValue> = od.clone().into_iter().collect();
+        assert_eq!(keys, vec![s("b"), s("a"), s("c")]);
+        // "a" in od -> True; "q" in od -> False; 1 in od -> False
+        assert!(od.py_contains(&s("a")));
+        assert!(!od.py_contains(&s("q")));
+        assert!(!od.py_contains(&PyValue::Int(1)));
+        // od["a"] -> 2
+        assert_eq!(od.py_index("a").unwrap(), PyValue::Int(2));
+        // od["nope"] -> KeyError: 'nope' ; od[1] -> KeyError: 1
+        assert_eq!(od.py_index("nope").unwrap_err().message, "'nope'");
+        assert_eq!(od.py_index(1i64).unwrap_err().message, "1");
+        // od["b"] = 10 through a boxed index-mut keeps b's position
+        let mut od = od;
+        *od.py_index_mut("b").unwrap() = PyValue::Int(10);
+        assert_eq!(od.py_repr(), "OrderedDict({'b': 10, 'a': 2, 'c': 3})");
+    }
+
+    #[test]
+    fn type_name_and_unhashability() {
+        // type(OrderedDict()).__name__ -> 'OrderedDict'
+        assert_eq!(build(tup(vec![])).py_type_name(), "OrderedDict");
+        // hash(OrderedDict()) -> TypeError: unhashable type: 'collections.OrderedDict'
+        let od = build(tup(vec![]));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            use std::hash::Hash;
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            od.hash(&mut h);
+        }));
+        let payload = caught.unwrap_err();
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|m| m.to_string()))
+            .unwrap();
+        assert_eq!(msg, "TypeError: unhashable type: 'collections.OrderedDict'");
+    }
+
+    #[test]
+    fn typed_ordereddict_boxes_without_losing_its_type() {
+        // A typed OrderedDict flowing into a boxed slot stays an OrderedDict.
+        let typed = OrderedDict::from_pairs(vec![("b".to_string(), 1i64), ("a".to_string(), 2)]);
+        let boxed = PyValue::from(typed);
+        assert_eq!(boxed.py_repr(), "OrderedDict({'b': 1, 'a': 2})");
+        // A list of pairs boxes as a tuple of 2-tuples (the list-as-tuple form).
+        assert_eq!(PyValue::from(vec![("a", 1i64)]), pairs(&[("a", 1)]));
+    }
+
+    #[test]
+    fn json_and_urlencode_treat_it_as_a_mapping() {
+        // json.dumps(OrderedDict([("b", 1), ("a", [1, 2])])) -> {"b": 1, "a": [1, 2]}
+        let od = build(tup(vec![
+            pair("b", 1),
+            tup(vec![s("a"), tup(vec![PyValue::Int(1), PyValue::Int(2)])]),
+        ]));
+        assert_eq!(
+            stdpython::json::dumps_pyvalue(od, None).unwrap(),
+            "{\"b\": 1, \"a\": [1, 2]}"
+        );
+        // urllib.parse.urlencode(OrderedDict([("b", 1), ("a", 2)])) -> b=1&a=2
+        let q = build(pairs(&[("b", 1), ("a", 2)]));
+        assert_eq!(stdpython::urllib::parse::urlencode(&q, false).unwrap(), "b=1&a=2");
+    }
 }

@@ -2621,6 +2621,17 @@ impl PyToString for String {
     }
 }
 
+/// `str(x)` of an Option binding (`x: int | None`): CPython's `"None"` for
+/// the None, the value's own `str` otherwise.
+impl<T: PyToString> PyToString for Option<T> {
+    fn py_str(self) -> String {
+        match self {
+            Some(v) => v.py_str(),
+            None => "None".to_string(),
+        }
+    }
+}
+
 // CPython's str(exc) is the exception's args rendered as a string — for a
 // `ZeroDivisionError("division by zero")` that is just "division by zero",
 // not "Type: message" (that is Display's job for the uncaught-exception
@@ -2926,7 +2937,7 @@ impl PyDisplay for StrOrBytes {
 /// `Any`, `Literal[False] | str | None`, ... Every member keeps its concrete
 /// type; isinstance checks dispatch at runtime (`is_str()`, `as_int()`, ...)
 /// and narrow the value in the branch, mirroring StrOrBytes.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum PyValue {
     Int(i64),
     Float(f64),
@@ -2935,6 +2946,15 @@ pub enum PyValue {
     Bytes(Vec<u8>),
     Tuple(Arc<Vec<PyValue>>),
     Dict(Arc<PyDict<String, PyValue>>),
+    /// A `collections.OrderedDict` held boxed (`OrderedDict(value)` where
+    /// `value` is an untyped parameter — requests' `from_key_val_list`):
+    /// it prints as `OrderedDict({'a': 1})` (never as a plain dict), is
+    /// ORDER-sensitive against another OrderedDict and order-insensitive
+    /// against a dict, and is unhashable. Like [`PyValue::Dict`] its keys
+    /// are `String`s: building one with any other key is a loud panic
+    /// ([`collections::OrderedDict::from_boxed`]), never a silent
+    /// stringification.
+    OrderedDict(Arc<crate::collections::OrderedDict<String, PyValue>>),
     /// A Python `complex` (issue #366): a heterogeneous container or an
     /// `assertEqual` over complex operands carries it boxed.
     Complex(Complex),
@@ -2949,6 +2969,46 @@ pub enum PyValue {
     /// function object it is.
     Function(crate::PyCallable<BoxedArgs, PyValue>),
     None_,
+}
+
+/// Structural equality of boxed values. Same-variant members compare
+/// structurally (a boxed dict ignores order; two boxed OrderedDicts are
+/// ORDER-sensitive, as CPython's are); an OrderedDict equals a dict with
+/// the same items in any order (`OrderedDict(a=1, b=2) == {'b': 2, 'a': 1}`
+/// is True, both ways). Every other cross-variant pair is unequal. The
+/// match names every variant on purpose: a new member must decide its
+/// equality here.
+impl PartialEq for PyValue {
+    fn eq(&self, other: &PyValue) -> bool {
+        match (self, other) {
+            (PyValue::Int(a), PyValue::Int(b)) => a == b,
+            (PyValue::Float(a), PyValue::Float(b)) => a == b,
+            (PyValue::Bool(a), PyValue::Bool(b)) => a == b,
+            (PyValue::Str(a), PyValue::Str(b)) => a == b,
+            (PyValue::Bytes(a), PyValue::Bytes(b)) => a == b,
+            (PyValue::Tuple(a), PyValue::Tuple(b)) => a == b,
+            (PyValue::Dict(a), PyValue::Dict(b)) => a == b,
+            (PyValue::OrderedDict(a), PyValue::OrderedDict(b)) => a == b,
+            (PyValue::OrderedDict(o), PyValue::Dict(d))
+            | (PyValue::Dict(d), PyValue::OrderedDict(o)) => **o == **d,
+            (PyValue::Complex(a), PyValue::Complex(b)) => a == b,
+            (PyValue::Range(a), PyValue::Range(b)) => a == b,
+            (PyValue::Function(a), PyValue::Function(b)) => a == b,
+            (PyValue::None_, PyValue::None_) => true,
+            (PyValue::Int(_), _)
+            | (PyValue::Float(_), _)
+            | (PyValue::Bool(_), _)
+            | (PyValue::Str(_), _)
+            | (PyValue::Bytes(_), _)
+            | (PyValue::Tuple(_), _)
+            | (PyValue::Dict(_), _)
+            | (PyValue::OrderedDict(_), _)
+            | (PyValue::Complex(_), _)
+            | (PyValue::Range(_), _)
+            | (PyValue::Function(_), _)
+            | (PyValue::None_, _) => false,
+        }
+    }
 }
 
 /// The codegen hoists uninitialized locals and derives `Default` on
@@ -2980,6 +3040,8 @@ impl IntoIterator for PyValue {
             PyValue::Bytes(b) => b.iter().map(|&o| PyValue::Int(o as i64)).collect(),
             // Python iterates a dict's KEYS.
             PyValue::Dict(d) => d.keys().map(|k| PyValue::Str(k.clone())).collect(),
+            // An OrderedDict iterates its keys in insertion order.
+            PyValue::OrderedDict(d) => d.keys().into_iter().map(PyValue::Str).collect(),
             PyValue::Int(_) => panic!("TypeError: 'int' object is not iterable"),
             PyValue::Float(_) => panic!("TypeError: 'float' object is not iterable"),
             PyValue::Bool(_) => panic!("TypeError: 'bool' object is not iterable"),
@@ -3031,6 +3093,8 @@ impl PyValue {
             PyValue::Bytes(b) => b.len(),
             PyValue::Tuple(t) => t.len(),
             PyValue::Range(r) => r.py_len(),
+            PyValue::Dict(d) => d.len(),
+            PyValue::OrderedDict(d) => Len::len(d.as_ref()),
             other => panic!("len() of non-sized PyValue {other:?}"),
         }
     }
@@ -3093,6 +3157,7 @@ impl Truthy for PyValue {
             PyValue::Bytes(b) => !b.is_empty(),
             PyValue::Tuple(t) => !t.is_empty(),
             PyValue::Dict(d) => !d.is_empty(),
+            PyValue::OrderedDict(d) => d.is_truthy(),
             PyValue::Complex(z) => z.real != 0.0 || z.imag != 0.0,
             PyValue::Range(r) => r.py_len() > 0,
             PyValue::Function(_) => true,
@@ -3178,6 +3243,31 @@ pyvalue_tuple_from!(A, B, C);
 pyvalue_tuple_from!(A, B, C, D);
 pyvalue_tuple_from!(A, B, C, D, E);
 pyvalue_tuple_from!(A, B, C, D, E, F);
+
+/// A list of (key, value) PAIRS boxed (`[("b", 1), ("a", 2)]` passed to a
+/// boxed parameter — requests' `from_key_val_list`): a Tuple of 2-Tuples,
+/// the boxed model's list-as-tuple form. A pairs-specific impl, not a
+/// blanket `Vec<T>`: `Vec<u8>` is `bytes` (above), never a tuple of ints.
+impl<A: Into<PyValue>, B: Into<PyValue>> From<Vec<(A, B)>> for PyValue {
+    fn from(pairs: Vec<(A, B)>) -> Self {
+        PyValue::Tuple(Arc::new(pairs.into_iter().map(PyValue::from).collect()))
+    }
+}
+
+impl<A: Into<PyValue>, B: Into<PyValue>, C: Into<PyValue>> From<Vec<(A, B, C)>> for PyValue {
+    fn from(rows: Vec<(A, B, C)>) -> Self {
+        PyValue::Tuple(Arc::new(rows.into_iter().map(PyValue::from).collect()))
+    }
+}
+
+/// A typed dict compared with a boxed value (`boxed == {"a": 1}`):
+/// CPython's `==` — a boxed dict (or OrderedDict) with the same items, in
+/// any order, is equal; any other member is not.
+impl<V: Clone + Into<PyValue>> PartialEq<PyDict<String, V>> for PyValue {
+    fn eq(&self, other: &PyDict<String, V>) -> bool {
+        *self == PyValue::from(other.clone())
+    }
+}
 
 impl From<&str> for PyValue {
     fn from(value: &str) -> Self {
@@ -3530,6 +3620,7 @@ impl PyValue {
             PyValue::Bytes(_) => "bytes",
             PyValue::Tuple(_) => "tuple",
             PyValue::Dict(_) => "dict",
+            PyValue::OrderedDict(_) => "OrderedDict",
             PyValue::Complex(_) => "complex",
             PyValue::Range(_) => "range",
             PyValue::Function(_) => "function",
@@ -3815,6 +3906,7 @@ pub fn py_value_type_name(v: &PyValue) -> &'static str {
         PyValue::Bytes(_) => "bytes",
         PyValue::Tuple(_) => "tuple",
         PyValue::Dict(_) => "dict",
+        PyValue::OrderedDict(_) => "OrderedDict",
         PyValue::Complex(_) => "complex",
         PyValue::Range(_) => "range",
         PyValue::Function(_) => "function",
@@ -3853,6 +3945,8 @@ pub fn py_value_str(v: &PyValue) -> String {
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
+        // CPython 3.12: `OrderedDict({'a': 1})`, `OrderedDict()` empty.
+        PyValue::OrderedDict(d) => d.py_repr(),
         PyValue::None_ => "None".to_string(),
     }
 }
@@ -3909,6 +4003,11 @@ impl core::hash::Hash for PyValue {
                     core::hash::Hash::hash(k, state);
                     core::hash::Hash::hash(v, state);
                 }
+            }
+            // CPython: `hash(OrderedDict())` is a TypeError. The Hash trait
+            // has no error channel, so it is a loud panic at the use.
+            PyValue::OrderedDict(_) => {
+                panic!("TypeError: unhashable type: 'collections.OrderedDict'")
             }
             PyValue::Complex(z) => {
                 core::hash::Hash::hash(&8u8, state);
@@ -4831,9 +4930,16 @@ impl<T: PyInherits<Base>, Base> PyInherits<Base> for PyRef<T> {}
 /// instance (`PyRef` — an `Rc`, which a `static` cannot hold): the value
 /// is bound to the thread that initialized it. CPython lets every thread
 /// reach the one object; rython's single-threaded reference cells cannot,
-/// so a read from any other thread panics at that read — loud at the
+/// so an access from any other thread panics at that access — loud at the
 /// divergence (§12.2), never a data race. Reads deref to the value, so a
 /// global's `(*NAME).clone()` and method calls are unchanged.
+///
+/// A global REBOUND through `global` (the singleton pattern) or mutated in
+/// place is a `Mutex` static; its `Mutex<T>` is only `Sync` for `T: Send`,
+/// which a `PyRef` is not, so the Mutex itself sits inside the bound
+/// (`LazyLock<ThreadBound<Mutex<T>>>`) and `py_global_read` /
+/// `py_global_write` / `py_global_mutate` take `&**NAME` — the second
+/// deref is the thread check (issue #422).
 #[cfg(feature = "std")]
 pub struct ThreadBound<T> {
     owner: std::thread::ThreadId,
@@ -4856,7 +4962,7 @@ impl<T> core::ops::Deref for ThreadBound<T> {
     fn deref(&self) -> &T {
         if std::thread::current().id() != self.owner {
             panic!(
-                "RuntimeError: a module global holding a shared object is read from a \
+                "RuntimeError: a module global holding a shared object is accessed from a \
                  thread other than the one that created it; rython's shared objects are \
                  single-threaded (issue #414)"
             );
@@ -4911,6 +5017,54 @@ mod thread_bound_tests {
             .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
             .unwrap_or_default();
         assert!(msg.contains("from a thread other than the one that created it"), "{}", msg);
+    }
+
+    // Issue #422: a REBOUND / mutated-in-place global holding a shared
+    // object is `LazyLock<ThreadBound<Mutex<T>>>`; the helpers take
+    // `&**NAME` (the second deref is the thread check).
+    type Slot = std::sync::LazyLock<ThreadBound<std::sync::Mutex<Option<PyRef<i64>>>>>;
+
+    #[test]
+    fn a_thread_bound_mutex_global_reads_writes_and_mutates_on_its_own_thread() {
+        static G: Slot = std::sync::LazyLock::new(|| ThreadBound::new(std::sync::Mutex::new(None)));
+        assert!(py_global_read(&**G).is_none());
+        py_global_write(&**G, Some(PyRef::new(1)));
+        // A read is the ONE object: a write through the handle is seen by
+        // the next read.
+        let handle = py_global_read(&**G).unwrap();
+        *handle.borrow_mut() += 4;
+        assert_eq!(*py_global_read(&**G).unwrap().borrow(), 5);
+        let got = py_global_mutate(&**G, |slot| {
+            *slot.as_ref().unwrap().borrow_mut() += 1;
+            *slot.as_ref().unwrap().borrow()
+        });
+        assert_eq!(got, 6);
+        assert_eq!(*handle.borrow(), 6);
+    }
+
+    #[test]
+    fn a_thread_bound_mutex_global_touched_from_another_thread_panics() {
+        static G: Slot = std::sync::LazyLock::new(|| ThreadBound::new(std::sync::Mutex::new(None)));
+        py_global_write(&**G, Some(PyRef::new(1)));
+        for op in 0..3 {
+            let err = std::thread::spawn(move || match op {
+                0 => {
+                    py_global_read(&**G);
+                }
+                1 => py_global_write(&**G, None),
+                _ => py_global_mutate(&**G, |_| ()),
+            })
+            .join()
+            .expect_err("another thread's access must panic");
+            let msg = err
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            assert!(msg.contains("from a thread other than the one that created it"), "{}", msg);
+        }
+        // The owner is unaffected.
+        assert_eq!(*py_global_read(&**G).unwrap().borrow(), 1);
     }
 }
 
@@ -6177,6 +6331,9 @@ impl PyIndex<i64> for PyValue {
                 "TypeError",
                 "'NoneType' object is not subscriptable",
             )),
+            // A boxed dict / OrderedDict holds str keys only, so an int
+            // key is never present: CPython's `KeyError: 1`.
+            PyValue::Dict(_) | PyValue::OrderedDict(_) => Err(key_error(key.py_repr())),
             _ => Err(PyException::new(
                 "TypeError",
                 "indices must be integers or slices",
@@ -6190,6 +6347,7 @@ impl PyIndex<&str> for PyValue {
     fn py_index(&self, key: &str) -> Result<PyValue, PyException> {
         match self {
             PyValue::Dict(d) => d.py_index(key),
+            PyValue::OrderedDict(d) => d.py_index(key),
             other => Err(PyException::new(
                 "TypeError",
                 format!(
@@ -6210,6 +6368,7 @@ impl PyIndex<String> for PyValue {
     fn py_index(&self, key: String) -> Result<PyValue, PyException> {
         match self {
             PyValue::Dict(d) => d.py_index(key),
+            PyValue::OrderedDict(d) => d.py_index(key),
             other => Err(PyException::new(
                 "TypeError",
                 format!(
@@ -6226,6 +6385,7 @@ impl PyIndexMut<&str> for PyValue {
     fn py_index_mut(&mut self, key: &str) -> Result<&mut PyValue, PyException> {
         match self {
             PyValue::Dict(d) => Arc::make_mut(d).py_index_mut(key),
+            PyValue::OrderedDict(d) => Arc::make_mut(d).py_index_mut(key),
             other => Err(PyException::new(
                 "TypeError",
                 format!(
@@ -7291,6 +7451,11 @@ impl PyContains<PyValue> for PyValue {
                 // The boxed dict's keys are Strings; a non-str member is
                 // never a key (an unhashable key would be CPython's
                 // TypeError, but the boxed dict cannot hold one).
+                _ => false,
+            },
+            // The same holds for a boxed OrderedDict (String keys only).
+            PyValue::OrderedDict(d) => match item {
+                PyValue::Str(k) => d.contains_key(k),
                 _ => false,
             },
             other => panic!(
