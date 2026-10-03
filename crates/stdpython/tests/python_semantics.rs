@@ -5796,8 +5796,7 @@ mod boxed_ordereddict {
 
 mod boxed_container_ops {
     use stdpython::{
-        PyContains, PyDict, PyDictOps, PyException, PyPop, PySetIndex, PySlice, PySliceReplace,
-        PyValue,
+        PyContains, PyDict, PyDictOps, PyPop, PySetIndex, PySlice, PySliceReplace, PyValue,
     };
 
     fn boxed_dict(pairs: &[(&str, &str)]) -> PyValue {
