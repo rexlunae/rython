@@ -20680,3 +20680,187 @@ fn a_collections_module_alias_constructs_like_the_module() {
     // Verified against python3.
     assert_eq!(got, vec!["3 1"]);
 }
+
+#[test]
+fn numeric_equality_holds_inside_boxed_containers() {
+    // Issue #434: `{"n": 1, "s": "x"} == {"n": 1.0, "s": "x"}` compared the
+    // boxed members element-wise with the derived-style `PyValue == PyValue`
+    // (Int(1) != Float(1.0)) and printed False for CPython's True. The
+    // numeric tower now holds at every depth of a boxed tuple / dict /
+    // OrderedDict / list, and `in` over a boxed container.
+    let got = run_global_alias_program(
+        "boxed_numeric_equality",
+        "boxed_numeric_equality.py",
+        concat!(
+            "from collections import OrderedDict\n",
+            "from typing import Any\n",
+            "\n",
+            "\n",
+            "def same(a: Any, b: Any) -> bool:\n",
+            "    return a == b\n",
+            "\n",
+            "\n",
+            "def differ(a: Any, b: Any) -> bool:\n",
+            "    return a != b\n",
+            "\n",
+            "\n",
+            "def has(items: Any, x: Any) -> bool:\n",
+            "    return x in items\n",
+            "\n",
+            "\n",
+            "def as_ordered(value: Any) -> Any:\n",
+            "    return OrderedDict(value)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    a = {\"n\": 1, \"s\": \"x\"}\n",
+            "    b = {\"n\": 1.0, \"s\": \"x\"}\n",
+            "    print(a == b)\n",
+            "    print(a != b)\n",
+            "    print(same((1, \"x\"), (1.0, \"x\")))\n",
+            "    print(same({\"n\": 1, \"s\": \"x\"}, {\"n\": True, \"s\": \"x\"}))\n",
+            "    print(differ({\"n\": 1, \"s\": \"x\"}, {\"n\": 2.0, \"s\": \"x\"}))\n",
+            "    print(differ({\"n\": 1, \"s\": \"x\"}, {\"n\": 1.5, \"s\": \"x\"}))\n",
+            "    print(same((1, (2, \"a\")), (1.0, (2.0, \"a\"))))\n",
+            "    print(same({\"k\": {\"j\": 1}, \"t\": \"v\"}, {\"k\": {\"j\": True}, \"t\": \"v\"}))\n",
+            "    print(same(as_ordered({\"n\": 1, \"s\": \"x\"}), as_ordered({\"n\": 1.0, \"s\": \"x\"})))\n",
+            "    print(same(as_ordered({\"n\": 1, \"s\": \"x\"}), {\"s\": \"x\", \"n\": 1.0}))\n",
+            "    print(same(as_ordered({\"n\": 1, \"s\": \"x\"}), as_ordered({\"s\": \"x\", \"n\": 1})))\n",
+            "    items = [1, \"x\", 2.0, True]\n",
+            "    print(has(items, 1.0))\n",
+            "    print(has(items, 3))\n",
+            "    print(has([(2,), \"y\"], (2.0,)))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    // Verified against python3.
+    assert_eq!(
+        got,
+        vec![
+            "True", "False", "True", "True", "True", "True", "True", "True", "True", "True",
+            "False", "True", "False", "True",
+        ]
+    );
+}
+
+#[test]
+fn print_renders_after_every_argument_has_evaluated() {
+    // Issue #433: CPython evaluates all of print's arguments and only then
+    // converts each with str(), so `print(xs, xs.pop())` shows the list
+    // AFTER the pop. rython rendered each argument as it was evaluated and
+    // printed `[1, 2, 3] 3`. Snapshots (a slice, `len`) and an f-string
+    // (which formats each field as it is evaluated) keep their order.
+    // Verified against python3.
+    let got = run_global_alias_program(
+        "printorder",
+        "print_order.py",
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.n = 0\n",
+            "\n",
+            "    def bump(self) -> int:\n",
+            "        self.n += 1\n",
+            "        return self.n\n",
+            "\n",
+            "    def __str__(self) -> str:\n",
+            "        return f\"Counter({self.n})\"\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    xs = [1, 2, 3]\n",
+            "    print(xs, xs.pop())\n",
+            "    d = {\"a\": 1}\n",
+            "    print(d, d.pop(\"a\"))\n",
+            "    c = Counter()\n",
+            "    print(c, c.bump(), c.bump())\n",
+            "    ys = [7, 8, 9]\n",
+            "    print(ys, ys.pop(), sep=\" | \", end=\" <\\n\")\n",
+            "    zs = [1, 2, 3]\n",
+            "    print(zs[:2], len(zs), zs.pop(), zs)\n",
+            "    fs = [1, 2, 3]\n",
+            "    print(f\"{fs} {fs.pop()}\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    assert_eq!(
+        got,
+        [
+            "[1, 2] 3",
+            "{} 1",
+            "Counter(2) 1 2",
+            "[7, 8] | 9 <",
+            "[1, 2] 3 3 [1, 2]",
+            "[1, 2, 3] 3",
+        ]
+    );
+}
+
+#[test]
+fn print_keywords_properties_and_conversions_follow_cpythons_evaluation_order() {
+    // Devin review on #439: `flush=` and the keyword values evaluate in the
+    // order written before any deferred place renders; a chain through a
+    // property getter is a fresh value (it is read at its own position); and
+    // `str(obj)` of a user class runs its `__str__`, which pops the module
+    // list an earlier argument names.
+    let got = run_global_alias_program(
+        "printdevin",
+        "print_devin.py",
+        concat!(
+            "class Child:\n",
+            "    def __init__(self, n: int) -> None:\n",
+            "        self.items: list[int] = [n]\n",
+            "\n",
+            "\n",
+            "class Holder:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.kids = [Child(1), Child(2)]\n",
+            "        self.i = 0\n",
+            "\n",
+            "    @property\n",
+            "    def child(self) -> Child:\n",
+            "        return self.kids[self.i]\n",
+            "\n",
+            "    def advance(self) -> int:\n",
+            "        self.i = 1\n",
+            "        return 0\n",
+            "\n",
+            "\n",
+            "LOG: list[int] = [1, 2, 3]\n",
+            "\n",
+            "\n",
+            "class Loud:\n",
+            "    def __str__(self) -> str:\n",
+            "        LOG.pop()\n",
+            "        return \"done\"\n",
+            "\n",
+            "\n",
+            "def side() -> int:\n",
+            "    return 0\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    a = [1, 2]\n",
+            "    print(a, flush=bool(a.pop()))\n",
+            "    b = [1, 2, 3]\n",
+            "    print(b, end=str(b.pop()), sep=str(b.pop()))\n",
+            "    print()\n",
+            "    h = Holder()\n",
+            "    print(h.child.items, side())\n",
+            "    loud = Loud()\n",
+            "    print(LOG, str(loud))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    // Verified against python3 (3.12).
+    assert_eq!(got, vec!["[1]", "[1]3", "[1] 0", "[1, 2] done"]);
+}

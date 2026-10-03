@@ -9,6 +9,9 @@
     "boxed_constructor": {
       "status": "pass"
     },
+    "boxed_numeric_equality": {
+      "status": "pass"
+    },
     "boxed_slots": {
       "status": "pass"
     },
@@ -106,6 +109,9 @@
       "status": "pass"
     },
     "pipeline": {
+      "status": "pass"
+    },
+    "print_eval_order": {
       "status": "pass"
     },
     "records": {
