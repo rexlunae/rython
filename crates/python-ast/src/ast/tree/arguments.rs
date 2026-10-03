@@ -435,7 +435,10 @@ fn is_exception_class_member_within(
                 // hold falls to the naming convention — the documented
                 // rule for an absent external name.
                 Some(crate::SymbolTableNode::ImportFrom(imp)) => {
-                    if crate::ast::tree::raise_stmt::is_builtin_exception_name(&n.id)
+                    // Judged by the ORIGINAL item name (`from m import
+                    // Err as E` is `Err`; the local spelling is no evidence).
+                    let item = imp.defining_name(&n.id);
+                    if crate::ast::tree::raise_stmt::is_builtin_exception_name(&item)
                         || crate::ast::tree::raise_stmt::imported_exception_alias(
                             &n.id,
                             symbols,
@@ -453,7 +456,7 @@ fn is_exception_class_member_within(
                         || crate::AnnotationModule::from_name(root).is_some()
                         || crate::ast::tree::module::module_defs_key(options, &path).is_some();
                     return !known_module
-                        && crate::ast::tree::raise_stmt::is_exception_class_name(&n.id);
+                        && crate::ast::tree::raise_stmt::is_exception_class_name(&item);
                 }
                 _ => {}
             }

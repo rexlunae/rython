@@ -454,7 +454,7 @@ impl CodeGen for Module {
                 if matches!(kind, crate::MutableGlobalKind::Boxed)
                     && let Some(class) = class_stores.get(name)
                 {
-                    *kind = crate::MutableGlobalKind::Class { class: class.clone() };
+                    *kind = crate::MutableGlobalKind::Class { class: class.clone(), bound: false };
                 }
             }
         }
@@ -1088,8 +1088,24 @@ impl CodeGen for Module {
                 } else {
                     crate::MutableGlobalKind::Computed {
                         boxed: module_init_static_ty(&n.id, &a.value, &options, &symbols).is_none(),
+                        // Issue #422: a value holding a shared instance
+                        // cannot sit in a plain `Mutex` static.
+                        bound: options.name_types.get(&n.id).is_some_and(|t| {
+                            crate::ast::tree::shared::type_holds_shared(t, &symbols, &options)
+                        }),
                     }
                 };
+            }
+        }
+        // Issue #422: a class-instance global whose class holds shared
+        // objects (it IS one, or a field of it does) is thread-bound.
+        for kind in global_mutables.values_mut() {
+            if let crate::MutableGlobalKind::Class { class, bound } = kind {
+                *bound = crate::ast::tree::shared::type_holds_shared(
+                    &crate::TypeInfo::Class(class.clone()),
+                    &symbols,
+                    &options,
+                );
             }
         }
         options.mutable_statics = std::rc::Rc::new(global_mutables.clone());
@@ -1102,7 +1118,7 @@ impl CodeGen for Module {
         {
             let mut nt = (*options.name_types).clone();
             for (name, kind) in global_mutables.iter() {
-                if let crate::MutableGlobalKind::Class { class } = kind {
+                if let crate::MutableGlobalKind::Class { class, .. } = kind {
                     nt.insert(name.clone(), crate::TypeInfo::Class(class.clone()));
                 }
             }
@@ -1556,6 +1572,60 @@ impl CodeGen for Module {
             // Module-level constants become static items visible to every
             // function in the module.
             if let crate::StatementType::Assign(a) = &s.statement {
+                // A module-level `defaultdict`: a READ `d[k]` of a missing
+                // key INSERTS the default, but a module global is read
+                // through a copy — the insert would be lost (and the
+                // container is not `Sync`, so it cannot be an immutable
+                // static anyway). Loud, with the rewrite.
+                if crate::ast::tree::collections_lower::construction_kind(&a.value, &symbols)
+                    == Some(crate::CollectionsType::DefaultDict)
+                {
+                    let name = assign_name_targets(a)
+                        .map(|n| n.join(", "))
+                        .unwrap_or_else(|| "<target>".to_string());
+                    return Err(wrap_module_error(
+                        &module_filename,
+                        format!(
+                            "module-level `{name} = defaultdict(...)` is not supported yet: a \
+                             read `{name}[key]` of a missing key inserts the default, and \
+                             rython reads module globals through a copy, so the insert would \
+                             be lost; build the defaultdict inside a function (and pass it to \
+                             the functions that use it), or use a plain dict with `.get` / \
+                             `.setdefault`. rython refuses to silently ignore it"
+                        )
+                        .into(),
+                    ));
+                }
+                // A module-level `deque` / `OrderedDict` whose element /
+                // key / value types nothing pins (no annotation, no use that
+                // fixes them): a static needs a concrete Rust type, and the
+                // boxed fallback has no `PyValue` form for these containers.
+                if let Some(kind) =
+                    crate::ast::tree::collections_lower::construction_kind(&a.value, &symbols)
+                    && let [crate::ExprType::Name(target)] = a.targets.as_slice()
+                    && !options.name_types.get(&target.id).is_some_and(|t| {
+                        matches!(t, crate::TypeInfo::Collection(k, _) if *k == kind)
+                            && !crate::ast::tree::type_ctx::type_mentions_pyobject(t)
+                    })
+                {
+                    let example = match kind {
+                        crate::CollectionsType::Deque => "deque[int]",
+                        crate::CollectionsType::DefaultDict => "defaultdict[str, int]",
+                        crate::CollectionsType::OrderedDict => "OrderedDict[str, int]",
+                    };
+                    return Err(wrap_module_error(
+                        &module_filename,
+                        format!(
+                            "module-level `{name} = {class}(...)` has no inferable \
+                             element/key type, and a module global needs a concrete Rust \
+                             type: annotate it (`{name}: {example} = {class}(...)`) or give \
+                             it a use that pins the type. rython refuses to silently ignore it",
+                            name = target.id,
+                            class = kind.name(),
+                        )
+                        .into(),
+                    ));
+                }
                 // A module-level assign to a name the module ALSO imports
                 // (`SSLTransport = None` then `from .ssltransport import
                 // SSLTransport` — urllib3's ssl_.py): Python's LAST binding
@@ -1671,19 +1741,34 @@ impl CodeGen for Module {
                                     std::sync::Mutex::new(stdpython::PyValue::None_);
                             });
                         }
-                        Kind::Class { class } => {
+                        Kind::Class { class, bound } => {
                             // Issue #189: the class-instance global — the
                             // module store is the None state; the singleton
                             // construction lives in the `global`-writing
                             // function. Const None init; the Option is the
                             // representation, unwrapped at value reads
                             // (name.rs) and matched by `is None` (compare.rs).
-                            let cls = crate::safe_ident(class);
+                            //
+                            // Issue #422: a SHARED class's instance is its
+                            // `PyRef` (the one object every holder sees),
+                            // which is not `Send`: the static is then
+                            // thread-bound (`LazyLock<ThreadBound<Mutex<..>>>`).
+                            let cls = crate::TypeInfo::Class(class.clone()).to_rust_type();
                             let case_allow = crate::ast::tree::module::static_case_allow(&ident);
-                            stream.extend(quote! {
-                                #case_allow pub static #ident: std::sync::Mutex<Option<#cls>> =
-                                    std::sync::Mutex::new(None);
-                            });
+                            if *bound {
+                                stream.extend(quote! {
+                                    #case_allow pub static #ident: std::sync::LazyLock<
+                                        stdpython::ThreadBound<std::sync::Mutex<Option<#cls>>>,
+                                    > = std::sync::LazyLock::new(|| {
+                                        stdpython::ThreadBound::new(std::sync::Mutex::new(None))
+                                    });
+                                });
+                            } else {
+                                stream.extend(quote! {
+                                    #case_allow pub static #ident: std::sync::Mutex<Option<#cls>> =
+                                        std::sync::Mutex::new(None);
+                                });
+                            }
                         }
                         Kind::Scalar => {
                             let ty = const_static_type(&a.value)
@@ -1714,7 +1799,7 @@ impl CodeGen for Module {
                                     });
                             });
                         }
-                        Kind::Computed { boxed } => {
+                        Kind::Computed { boxed, bound } => {
                             // Mirrors the promoted-static machinery: a
                             // fallible initializer (rendered with a
                             // trailing `?`) unwraps inside the closure,
@@ -1750,13 +1835,28 @@ impl CodeGen for Module {
                                 (ty, value_tokens)
                             };
                             let case_allow = crate::ast::tree::module::static_case_allow(&ident);
-                            stream.extend(quote! {
-                                #case_allow pub static #ident:
-                                    std::sync::LazyLock<std::sync::Mutex<#ty>> =
-                                    std::sync::LazyLock::new(|| {
-                                        std::sync::Mutex::new(#wrapped)
+                            if *bound {
+                                // Issue #422: the value holds a shared
+                                // instance (not `Send`): the Mutex is bound
+                                // to the initializing thread, so the static
+                                // is `Sync` and any other thread's access
+                                // panics loudly instead of racing.
+                                stream.extend(quote! {
+                                    #case_allow pub static #ident: std::sync::LazyLock<
+                                        stdpython::ThreadBound<std::sync::Mutex<#ty>>,
+                                    > = std::sync::LazyLock::new(|| {
+                                        stdpython::ThreadBound::new(std::sync::Mutex::new(#wrapped))
                                     });
-                            });
+                                });
+                            } else {
+                                stream.extend(quote! {
+                                    #case_allow pub static #ident:
+                                        std::sync::LazyLock<std::sync::Mutex<#ty>> =
+                                        std::sync::LazyLock::new(|| {
+                                            std::sync::Mutex::new(#wrapped)
+                                        });
+                                });
+                            }
                             module_init_stmts.push(quote!(let _ = &*#ident;));
                             has_module_init_code = true;
                         }
@@ -4145,6 +4245,87 @@ pub(crate) fn fold_static_import_trys(
     (out, newly_live, folded_imports)
 }
 
+/// The classes whose instances a module-level value holds across scopes
+/// (issues #422, #430): the value is one more holder of the object, and
+/// every `x = current` a function binds is another, so the class takes the
+/// shared representation when it is mutated — the sharing analysis counts
+/// these classes as held, like a container slot.
+///
+/// Three shapes:
+/// - the singleton (`_instance = None`, later `_instance = Counter()`
+///   inside a function — the class-instance kind, issue #189);
+/// - a computed class-instance value a function REBINDS (`current =
+///   Counter()`, `global current; current = Counter()`, issue #422) or
+///   mutates in place (`current.n += 1`, issue #430);
+/// - a class instance bound ONCE at module level and READ by a function
+///   (a read-only `DEFAULT = Counter()` a function aliases and mutates,
+///   issue #430). Without the holder, every read of the static clones the
+///   object and a mutation through the alias never reaches the global.
+pub(crate) fn module_global_held_classes(
+    body: &[crate::Statement],
+    symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> Vec<String> {
+    let mut counts = std::collections::HashMap::new();
+    count_module_stores(body, &mut counts);
+    let mutables = module_global_mutable_names(body, &counts, symbols, options);
+    let class_stores = module_global_class_stores(body, symbols);
+    let (global_written, bound_without_global) = module_global_write_sets(body);
+    let free_reads = module_function_free_reads(body);
+    // The class a module-level `name = <value>` store constructs.
+    let stored_class = |name: &str| -> Vec<String> {
+        body.iter()
+            .filter_map(|s| match &s.statement {
+                crate::StatementType::Assign(a)
+                    if let [crate::ExprType::Name(n)] = a.targets.as_slice()
+                        && n.id == name =>
+                {
+                    match crate::infer_type(None, &a.value, options, symbols) {
+                        crate::TypeInfo::Class(c) => Some(c),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let mut out = Vec::new();
+    for (name, kind) in &mutables {
+        match kind {
+            crate::MutableGlobalKind::Boxed => {
+                if let Some(class) = class_stores.get(name) {
+                    out.push(class.clone());
+                }
+            }
+            // Rebound (`global`) or mutated in place: either way the
+            // static is a holder of the instance.
+            crate::MutableGlobalKind::Computed { .. } => out.extend(stored_class(name)),
+            _ => {}
+        }
+    }
+    // A READ-only module instance: one top-level store, never rebound,
+    // read by a function (which is what promotes it to a static the
+    // function can alias).
+    for (name, count) in &counts {
+        if *count == 1
+            && free_reads.contains(name)
+            && !mutables.contains_key(name)
+            && !global_written.contains(name)
+            && !bound_without_global.contains(name)
+            && !matches!(
+                symbols.get(name),
+                Some(crate::SymbolTableNode::ImportFrom(_))
+                    | Some(crate::SymbolTableNode::Import(_))
+                    | Some(crate::SymbolTableNode::ClassDef(_))
+                    | Some(crate::SymbolTableNode::FunctionDef(_))
+            )
+        {
+            out.extend(stored_class(name));
+        }
+    }
+    out
+}
+
 pub(crate) fn module_global_mutable_names(
     body: &[crate::Statement],
     module_assign_counts: &std::collections::HashMap<String, usize>,
@@ -4266,7 +4447,7 @@ pub(crate) fn module_global_mutable_names(
             });
             let kind = match top_level_value {
                 Some(v) if crate::is_none_expr(v) => Kind::Boxed,
-                Some(_) => Kind::Computed { boxed: true },
+                Some(_) => Kind::Computed { boxed: true, bound: false },
                 None => Kind::Boxed,
             };
             out.insert(name.clone(), kind);
@@ -4311,7 +4492,7 @@ pub(crate) fn module_global_mutable_names(
         // module-init type analysis has run, exactly as for the arm
         // above: `name_types` is empty this early, so deciding it here
         // would box every container.
-        out.insert(n.id.clone(), Kind::Computed { boxed: true });
+        out.insert(n.id.clone(), Kind::Computed { boxed: true, bound: false });
     }
 
     if global_written.is_empty() {
@@ -4370,7 +4551,7 @@ pub(crate) fn module_global_mutable_names(
             }
             // Boxedness is refined by the module generator once the
             // module-init type analysis has run (module_init_static_ty).
-            Kind::Computed { boxed: true }
+            Kind::Computed { boxed: true, bound: false }
         };
         out.insert(n.id.clone(), kind);
     }
@@ -5748,10 +5929,8 @@ fn module_init_static_ty(
         // the from-import it was bound by, so the static holds the raw
         // Regex exactly like the module-qualified spelling below.
         && let crate::ExprType::Name(cn) = c.func.as_ref()
-        && let Some(crate::SymbolTableNode::Alias(member)) = symbols.get(&cn.id)
-        && let Some(crate::SymbolTableNode::ImportFrom(i)) = symbols.get(member)
-        && i.module == "re"
-        && i.names.iter().any(|a| a.name == *member && a.name == "compile")
+        && let Some(crate::SymbolTableNode::ImportFrom(i)) = symbols.get(&cn.id)
+        && i.aliases_item(&cn.id, "re", "compile")
     {
         return Some(quote!(stdpython::stdlib::re::Regex));
     }
@@ -5802,6 +5981,7 @@ pub(crate) fn type_contains_uninferred(t: &crate::TypeInfo) -> bool {
         }
         crate::TypeInfo::Dict(k, v) => type_contains_uninferred(k) || type_contains_uninferred(v),
         crate::TypeInfo::Tuple(ts) => ts.iter().any(type_contains_uninferred),
+        crate::TypeInfo::Collection(_, args) => args.iter().any(type_contains_uninferred),
         _ => false,
     }
 }

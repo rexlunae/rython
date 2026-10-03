@@ -772,6 +772,15 @@ pub fn pyvalue_to_json(value: &crate::PyValue) -> JSONValue {
             }
             JSONValue::Object(obj)
         }
+        // An OrderedDict serializes as the JSON object of its items, in
+        // insertion order (json.dumps treats it as the dict it subclasses).
+        PyValue::OrderedDict(d) => {
+            let mut obj: crate::PyDict<String, JSONValue> = core::default::Default::default();
+            for (k, v) in d.items() {
+                obj.insert(k, pyvalue_to_json(&v));
+            }
+            JSONValue::Object(obj)
+        }
     }
 }
 

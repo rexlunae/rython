@@ -1299,7 +1299,7 @@ pub fn isinstance_narrowing(
                     let syms = module
                         .clone()
                         .find_symbols(SymbolTableScopes::new());
-                    resolve_type_name_depth(id, options, &syms, depth + 1)
+                    resolve_type_name_depth(&i.defining_name(id), options, &syms, depth + 1)
                 } else {
                     None
                 }
@@ -1530,15 +1530,37 @@ fn expr_walrus_binds(e: &crate::ExprType, name: &str) -> bool {
 pub fn update_narrowed_after_statement(
     stmt: &crate::Statement,
     narrowed: &mut std::collections::HashMap<String, crate::TypeInfo>,
+    ctx: &crate::CodeGenContext,
     options: &PythonOptions,
+    symbols: &crate::SymbolTableScopes,
 ) {
     match &stmt.statement {
         crate::StatementType::If(i) => {
+            // `if x is None: ... x = <non-None>` — the get-or-create
+            // idiom (`pool = self.pools.get(k); if pool is None: pool =
+            // Pool(k); self.pools[k] = pool`): the body's LAST write of x
+            // stores a value that is definitely not None, and the else
+            // (if any) never writes x, so x is not None after the if on
+            // either path.
+            if let Some(name) = is_none_test_name(&i.test)
+                && options.optional_names.contains(name)
+                && !narrowed.contains_key(name)
+                && body_leaves_name_non_none(&i.body, name, ctx, options, symbols)
+                && i.orelse.iter().all(|b| !stmt_writes_name(b, name))
+                && let Some(inner) = option_inner_of(options, name)
+            {
+                narrowed.insert(name.to_string(), inner);
+            }
             // The test narrows x in the body; both branches leaving x
             // non-None narrows x AFTER the if/else.
+            // Both judgements are about the NARROWED name: the body keeps
+            // the test's narrowing unless it rebinds the name (then its last
+            // store must be non-None); the else branch starts with the name
+            // possibly None, so it must store a non-None value itself.
             if let Some((name, inner)) = narrowing_from_test(&i.test, options) {
-                let body_ok = branch_ends_non_none(&i.body);
-                let else_ok = branch_ends_non_none(&i.orelse);
+                let body_ok = !i.body.iter().any(|s| stmt_writes_name(s, &name))
+                    || body_leaves_name_non_none(&i.body, &name, ctx, options, symbols);
+                let else_ok = body_leaves_name_non_none(&i.orelse, &name, ctx, options, symbols);
                 if body_ok && else_ok {
                     narrowed.insert(
                         name,
@@ -1603,8 +1625,19 @@ pub fn update_narrowed_after_statement(
         // narrowing; an assignment of a statically non-None value keeps it.
         crate::StatementType::Assign(a) => {
             if let [crate::ExprType::Name(n)] = a.targets.as_slice() {
-                if narrowed.contains_key(&n.id) && !statically_non_none(&a.value) {
+                // The KEEP test is the type-aware one: a call is not
+                // statically non-None (`x = d.get(k)` may store None), so
+                // a narrowed name revalidates on every store.
+                if narrowed.contains_key(&n.id) && !definitely_non_none(&a.value, ctx, options, symbols) {
                     narrowed.remove(&n.id);
+                } else if !narrowed.contains_key(&n.id)
+                    && options.optional_names.contains(&n.id)
+                    && definitely_non_none(&a.value, ctx, options, symbols)
+                    && let Some(inner) = option_inner_of(options, &n.id)
+                {
+                    // An Option local just bound to a value that is not
+                    // None reads unwrapped until its next write.
+                    narrowed.insert(n.id.clone(), inner);
                 }
             }
         }
@@ -1617,48 +1650,92 @@ pub fn update_narrowed_after_statement(
     }
 }
 
-/// Whether a statement list's last statement is an assignment of a
-/// statically non-None value to some name (the "branch leaves the name
-/// non-None" check for post-if narrowing). Only the LAST store matters:
-/// earlier stores are overwritten.
-fn branch_ends_non_none(body: &[crate::Statement]) -> bool {
-    for stmt in body.iter().rev() {
-        match &stmt.statement {
-            crate::StatementType::Assign(a) => {
-                return statically_non_none(&a.value);
-            }
-            crate::StatementType::Pass => continue,
-            // A nested if/else is treated conservatively: only when its own
-            // branches both assign non-None does it count as ending non-None.
-            crate::StatementType::If(i) => {
-                if i.orelse.is_empty() {
-                    return false;
-                }
-                return branch_ends_non_none(&i.body) && branch_ends_non_none(&i.orelse);
-            }
-            _ => return false,
-        }
-    }
-    false
+/// The name `x` of a single `x is None` test.
+fn is_none_test_name(test: &ExprType) -> Option<&str> {
+    let ExprType::Compare(cmp) = test else {
+        return None;
+    };
+    let ExprType::Name(n) = cmp.left.as_ref() else {
+        return None;
+    };
+    (cmp.ops.len() == 1
+        && matches!(cmp.ops[0], crate::Compares::Is)
+        && cmp.comparators.len() == 1
+        && crate::is_none_expr(&cmp.comparators[0]))
+    .then_some(n.id.as_str())
 }
 
-/// Whether an expression is statically NOT None: a literal other than None,
-/// a non-None constant, a call (functions never return the None literal
-/// here — conservative), a non-Option name, or a container literal.
-fn statically_non_none(expr: &crate::ExprType) -> bool {
-    match expr {
-        crate::ExprType::Constant(c) => c.0.is_some(),
-        crate::ExprType::Name(n) => !matches!(n.id.as_str(), "None" | "True" | "False"),
-        crate::ExprType::List(_)
-        | crate::ExprType::Dict(_)
-        | crate::ExprType::Set(_)
-        | crate::ExprType::Tuple(_)
-        | crate::ExprType::ListComp(_)
-        | crate::ExprType::DictComp(_)
-        | crate::ExprType::SetComp(_)
-        | crate::ExprType::Call(_)
-        | crate::ExprType::JoinedStr(_)
-        | crate::ExprType::FormattedValue(_) => true,
-        _ => false,
+/// The inner type of an Option binding: its recorded `Option<inner>`, or —
+/// for a name the analysis tracks as Option through `optional_names` —
+/// its recorded plain type (`pool = self.pools.get(k)` records the
+/// element class).
+fn option_inner_of(options: &PythonOptions, name: &str) -> Option<crate::TypeInfo> {
+    match options.name_types.get(name) {
+        Some(crate::TypeInfo::Option(inner)) => Some((**inner).clone()),
+        Some(crate::TypeInfo::PyObject | crate::TypeInfo::PyValue) | None => None,
+        Some(t) if options.optional_names.contains(name) => Some(t.clone()),
+        _ => None,
     }
 }
+
+/// Whether a value is DEFINITELY not None: not the None literal, and its
+/// inferred type is a concrete non-Option type. A boxed value, an
+/// unknown type or an Option-returning call (`d.get(k)`) may be None.
+fn definitely_non_none(
+    value: &ExprType,
+    ctx: &crate::CodeGenContext,
+    options: &PythonOptions,
+    symbols: &crate::SymbolTableScopes,
+) -> bool {
+    !crate::is_none_expr(value)
+        && !matches!(
+            crate::infer_type(Some(ctx), value, options, symbols),
+            crate::TypeInfo::Option(_)
+                | crate::TypeInfo::PyValue
+                | crate::TypeInfo::PyValueMember(_)
+                | crate::TypeInfo::PyObject
+        )
+}
+
+/// Whether a branch that falls through leaves `name` holding a value that
+/// is definitely not None: its last top-level write of `name` is a plain
+/// `name = <value>` store of such a value (a later exit never matters —
+/// only a fall-through reaches the following statements).
+fn body_leaves_name_non_none(
+    body: &[crate::Statement],
+    name: &str,
+    ctx: &crate::CodeGenContext,
+    options: &PythonOptions,
+    symbols: &crate::SymbolTableScopes,
+) -> bool {
+    let Some(last) = body.iter().rev().find(|s| stmt_writes_name(s, name)) else {
+        return false;
+    };
+    matches!(&last.statement, crate::StatementType::Assign(a)
+        if matches!(a.targets.as_slice(), [ExprType::Name(t)] if t.id == name)
+            && definitely_non_none(&a.value, ctx, options, symbols))
+}
+
+/// Lower a block's statements in order, threading `x is not None`
+/// narrowing from each statement to the next (the same flow the function
+/// body lowering applies): a store of a non-None value, a guard that
+/// exits, a get-or-create `if x is None:` all narrow the statements after
+/// them within the block.
+pub(crate) fn render_block(
+    stmts: Vec<crate::Statement>,
+    ctx: &crate::CodeGenContext,
+    options: &PythonOptions,
+    symbols: &crate::SymbolTableScopes,
+) -> Result<Vec<proc_macro2::TokenStream>, Box<dyn std::error::Error>> {
+    let mut narrowed = options.narrowed_names.as_ref().clone();
+    let mut out = Vec::with_capacity(stmts.len());
+    for stmt in stmts {
+        let mut stmt_options = options.clone();
+        stmt_options.narrowed_names = std::rc::Rc::new(narrowed.clone());
+        let next = stmt.clone();
+        out.push(stmt.to_rust(ctx.clone(), stmt_options, symbols.clone())?);
+        update_narrowed_after_statement(&next, &mut narrowed, ctx, options, symbols);
+    }
+    Ok(out)
+}
+

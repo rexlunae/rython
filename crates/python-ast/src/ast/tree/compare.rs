@@ -14,13 +14,11 @@ use crate::{
 /// the Option-read tokens when the operand is such a global, else None.
 fn class_global_none_check(operand: &ExprType, options: &PythonOptions) -> Option<TokenStream> {
     if let ExprType::Name(n) = operand
-        && matches!(
-            options.mutable_statics.get(&n.id),
-            Some(crate::MutableGlobalKind::Class { .. })
-        )
+        && let Some(kind @ crate::MutableGlobalKind::Class { .. }) =
+            options.mutable_statics.get(&n.id)
     {
-        let ident = crate::safe_ident(&n.id);
-        return Some(quote!(stdpython::py_global_read(&#ident)));
+        let global_ref = kind.static_ref(&crate::safe_ident(&n.id));
+        return Some(quote!(stdpython::py_global_read(#global_ref)));
     }
     None
 }

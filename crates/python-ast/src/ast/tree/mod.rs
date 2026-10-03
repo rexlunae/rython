@@ -62,10 +62,13 @@ pub mod name;
 pub use name::*;
 
 pub mod annotation_module;
+pub mod collections_lower;
+pub mod collections_types;
 pub mod datetime_types;
 pub mod math_fn_types;
 pub mod threading_types;
 pub(crate) use annotation_module::{AnnotationModule, is_typing};
+pub(crate) use collections_types::CollectionsType;
 pub(crate) use datetime_types::DatetimeType;
 pub(crate) use math_fn_types::MathFn;
 pub(crate) use threading_types::ThreadingType;

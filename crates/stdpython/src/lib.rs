@@ -1763,6 +1763,84 @@ impl PyRange {
 }
 
 impl PyRange {
+    /// CPython's `range[start:stop:step]`: a RANGE, keeping the range type
+    /// (range(6)[1:4] is range(1, 4), not a tuple or a list). Bounds resolve
+    /// through `slice.indices` semantics — negatives count from the end, and
+    /// an out-of-range bound clamps — then the new range's step is the
+    /// product of the old step and the slice step.
+    ///
+    /// CPython references, run under python3 3.14.1:
+    ///   range(6)[1:4] -> range(1, 4)      range(6)[::2] -> range(0, 6, 2)
+    ///   range(6)[::-1] -> range(5, -1, -1) range(6)[9:99] -> range(6, 6)
+    pub fn py_slice(
+        &self,
+        start: Option<i64>,
+        stop: Option<i64>,
+        step: Option<i64>,
+    ) -> PyRange {
+        let step = step.unwrap_or(1);
+        if step == 0 {
+            // CPython: xs[::0] raises ValueError: slice step cannot be zero,
+            // and it does so BEFORE any receiver check.
+            panic!("slice step cannot be zero");
+        }
+        // Every intermediate is i128: a range's length, and the products of
+        // endpoints with steps, can leave the i64 domain even when every
+        // selected value fits (range(2**63-2, 2**63-1, 2)[:]). Narrowing any
+        // of them to i64 would wrap to a DIFFERENT range instead of failing.
+        let len = self.py_len() as i128;
+        let next0 = self.next as i128;
+        let step0 = self.step as i128;
+        let step = step as i128;
+
+        // slice.indices(len, step): wrap negatives, then clamp. The exclusive
+        // end wraps into [-1, len-1] and the inclusive start into [0, len-1].
+        let wrap_start = |i: i128| -> i128 {
+            if i < 0 { (i + len).max(0) } else { i.min(len - 1) }
+        };
+        let wrap_end = |i: i128| -> i128 {
+            if i < 0 { (i + len).max(-1) } else { i.min(len - 1) }
+        };
+        let (begin, end) = if step > 0 {
+            let lo = start.map(|s| s as i128).unwrap_or(0);
+            let hi = stop.map(|s| s as i128).unwrap_or(len);
+            (lo.max(0).min(len), hi.max(0).min(len))
+        } else {
+            let hi = match stop {
+                Some(s) => wrap_end(s as i128),
+                // `xs[::-1]` / `xs[3:]` — walk back to before the start, i.e.
+                // the virtual index one before the first element.
+                None => -1,
+            };
+            (wrap_start(start.map(|s| s as i128).unwrap_or(len - 1)), hi)
+        };
+
+        // The new range is computed from the NORMALISED bounds in BOTH
+        // directions, so an empty slice keeps the start and step CPython
+        // prints: range(6)[2:4:-1] is range(2, 4, -1), not range(4, 4).
+        let new_step = step0 * step;
+        let next = next0 + begin * step0;
+        let stop_at = next0 + end * step0;
+        PyRange {
+            next: narrow(next),
+            stop: narrow(stop_at),
+            step: narrow(new_step),
+        }
+    }
+}
+
+
+/// Narrow an i128 range endpoint back into `PyRange`'s i64 fields. A value
+/// that cannot be represented is a loud refusal, never a silent wrap: a
+/// wrapped endpoint would describe a different range than CPython's.
+fn narrow(v: i128) -> i64 {
+    if v > i64::MAX as i128 || v < i64::MIN as i128 {
+        panic!("range endpoint {v} exceeds the representable range");
+    }
+    v as i64
+}
+
+impl PyRange {
     /// CPython's repr: `range(3, 6)`, `range(0, 10, 2)` — the step only
     /// when it is not 1.
     pub fn py_repr_string(&self) -> String {
@@ -2621,6 +2699,17 @@ impl PyToString for String {
     }
 }
 
+/// `str(x)` of an Option binding (`x: int | None`): CPython's `"None"` for
+/// the None, the value's own `str` otherwise.
+impl<T: PyToString> PyToString for Option<T> {
+    fn py_str(self) -> String {
+        match self {
+            Some(v) => v.py_str(),
+            None => "None".to_string(),
+        }
+    }
+}
+
 // CPython's str(exc) is the exception's args rendered as a string — for a
 // `ZeroDivisionError("division by zero")` that is just "division by zero",
 // not "Type: message" (that is Display's job for the uncaught-exception
@@ -2926,7 +3015,7 @@ impl PyDisplay for StrOrBytes {
 /// `Any`, `Literal[False] | str | None`, ... Every member keeps its concrete
 /// type; isinstance checks dispatch at runtime (`is_str()`, `as_int()`, ...)
 /// and narrow the value in the branch, mirroring StrOrBytes.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum PyValue {
     Int(i64),
     Float(f64),
@@ -2935,6 +3024,15 @@ pub enum PyValue {
     Bytes(Vec<u8>),
     Tuple(Arc<Vec<PyValue>>),
     Dict(Arc<PyDict<String, PyValue>>),
+    /// A `collections.OrderedDict` held boxed (`OrderedDict(value)` where
+    /// `value` is an untyped parameter — requests' `from_key_val_list`):
+    /// it prints as `OrderedDict({'a': 1})` (never as a plain dict), is
+    /// ORDER-sensitive against another OrderedDict and order-insensitive
+    /// against a dict, and is unhashable. Like [`PyValue::Dict`] its keys
+    /// are `String`s: building one with any other key is a loud panic
+    /// ([`collections::OrderedDict::from_boxed`]), never a silent
+    /// stringification.
+    OrderedDict(Arc<crate::collections::OrderedDict<String, PyValue>>),
     /// A Python `complex` (issue #366): a heterogeneous container or an
     /// `assertEqual` over complex operands carries it boxed.
     Complex(Complex),
@@ -2949,6 +3047,46 @@ pub enum PyValue {
     /// function object it is.
     Function(crate::PyCallable<BoxedArgs, PyValue>),
     None_,
+}
+
+/// Structural equality of boxed values. Same-variant members compare
+/// structurally (a boxed dict ignores order; two boxed OrderedDicts are
+/// ORDER-sensitive, as CPython's are); an OrderedDict equals a dict with
+/// the same items in any order (`OrderedDict(a=1, b=2) == {'b': 2, 'a': 1}`
+/// is True, both ways). Every other cross-variant pair is unequal. The
+/// match names every variant on purpose: a new member must decide its
+/// equality here.
+impl PartialEq for PyValue {
+    fn eq(&self, other: &PyValue) -> bool {
+        match (self, other) {
+            (PyValue::Int(a), PyValue::Int(b)) => a == b,
+            (PyValue::Float(a), PyValue::Float(b)) => a == b,
+            (PyValue::Bool(a), PyValue::Bool(b)) => a == b,
+            (PyValue::Str(a), PyValue::Str(b)) => a == b,
+            (PyValue::Bytes(a), PyValue::Bytes(b)) => a == b,
+            (PyValue::Tuple(a), PyValue::Tuple(b)) => a == b,
+            (PyValue::Dict(a), PyValue::Dict(b)) => a == b,
+            (PyValue::OrderedDict(a), PyValue::OrderedDict(b)) => a == b,
+            (PyValue::OrderedDict(o), PyValue::Dict(d))
+            | (PyValue::Dict(d), PyValue::OrderedDict(o)) => **o == **d,
+            (PyValue::Complex(a), PyValue::Complex(b)) => a == b,
+            (PyValue::Range(a), PyValue::Range(b)) => a == b,
+            (PyValue::Function(a), PyValue::Function(b)) => a == b,
+            (PyValue::None_, PyValue::None_) => true,
+            (PyValue::Int(_), _)
+            | (PyValue::Float(_), _)
+            | (PyValue::Bool(_), _)
+            | (PyValue::Str(_), _)
+            | (PyValue::Bytes(_), _)
+            | (PyValue::Tuple(_), _)
+            | (PyValue::Dict(_), _)
+            | (PyValue::OrderedDict(_), _)
+            | (PyValue::Complex(_), _)
+            | (PyValue::Range(_), _)
+            | (PyValue::Function(_), _)
+            | (PyValue::None_, _) => false,
+        }
+    }
 }
 
 /// The codegen hoists uninitialized locals and derives `Default` on
@@ -2980,6 +3118,8 @@ impl IntoIterator for PyValue {
             PyValue::Bytes(b) => b.iter().map(|&o| PyValue::Int(o as i64)).collect(),
             // Python iterates a dict's KEYS.
             PyValue::Dict(d) => d.keys().map(|k| PyValue::Str(k.clone())).collect(),
+            // An OrderedDict iterates its keys in insertion order.
+            PyValue::OrderedDict(d) => d.keys().into_iter().map(PyValue::Str).collect(),
             PyValue::Int(_) => panic!("TypeError: 'int' object is not iterable"),
             PyValue::Float(_) => panic!("TypeError: 'float' object is not iterable"),
             PyValue::Bool(_) => panic!("TypeError: 'bool' object is not iterable"),
@@ -3031,6 +3171,8 @@ impl PyValue {
             PyValue::Bytes(b) => b.len(),
             PyValue::Tuple(t) => t.len(),
             PyValue::Range(r) => r.py_len(),
+            PyValue::Dict(d) => d.len(),
+            PyValue::OrderedDict(d) => Len::len(d.as_ref()),
             other => panic!("len() of non-sized PyValue {other:?}"),
         }
     }
@@ -3072,6 +3214,233 @@ impl PyValue {
             _ => None,
         }
     }
+
+    // ── Container operations on a boxed value ─────────────────────────────
+    //
+    // A value inference files into a `PyValue` slot keeps its runtime type
+    // but loses its static one, so `d.get(k)`, `d.items()` and `xs[a:b]` on it
+    // had no method to call and the generated crate failed to compile (589
+    // such sites in the #137 corpus at 28efebd). `PyValue` already dispatches
+    // indexing this way (`PyIndex<&str>`); these are the same model extended
+    // to the rest of the container surface, per the member-view convention
+    // (`is_*` / `as_*` on `StrOrBytes`).
+    //
+    // CPython is the authority: a dict member gets the dict operation, a
+    // str/bytes/tuple member the sequence one (str by CHARACTER, bytes by
+    // OCTET — the line `len` already draws), and anything else raises
+    // CPython's own TypeError. A boxed value that is not a container must
+    // fail loudly, never default silently.
+
+    fn as_dict_like(&self) -> Option<&PyDict<String, PyValue>> {
+        match self {
+            PyValue::Dict(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    fn as_ordered_like(&self) -> Option<&Arc<crate::collections::OrderedDict<String, PyValue>>> {
+        match self {
+            PyValue::OrderedDict(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// CPython's refusal for a container operation on a member that is not a
+    /// container. Public so generated code (and tests) can raise the same
+    /// error the infallible trait methods panic with.
+    pub fn not_a_container(&self, op: &str) -> PyException {
+        PyException::new(
+            "TypeError",
+            format!("'{}' object does not support {}", py_value_type_name(self), op),
+        )
+    }
+
+    /// `d.items()` over a boxed dict, (String, PyValue) in insertion order.
+    /// The dict-view methods below are INFALLIBLE (their trait signatures
+    /// return plain values), so a non-dict member cannot report CPython's
+    /// error through them. They panic with CPython's refusal instead of
+    /// returning None or an empty Vec: an empty collection here would be
+    /// indistinguishable from an empty dict and would silently diverge.
+    /// The fallible `boxed_get` is the path that carries a `PyException`.
+    fn py_dict_items(&self) -> Vec<(String, PyValue)> {
+        if let Some(d) = self.as_dict_like() {
+            return d.py_items();
+        }
+        if let Some(d) = self.as_ordered_like() {
+            return PyDictOps::py_items(d.as_ref());
+        }
+        panic!("{}", self.not_a_container("items()"));
+    }
+
+    /// `d.get(k)` on a boxed dict: the member, or None when absent. The
+    /// FALLIBLE entry point — a non-dict member raises CPython's TypeError
+    /// here rather than reading as an absent key.
+    pub fn boxed_get(&self, key: &str) -> Result<Option<PyValue>, PyException> {
+        let owned = key.to_string();
+        if let Some(d) = self.as_dict_like() {
+            return Ok(d.py_get(&owned));
+        }
+        if let Some(d) = self.as_ordered_like() {
+            return Ok(PyDictOps::py_get(d.as_ref(), &owned));
+        }
+        Err(self.not_a_container("a dict lookup"))
+    }
+}
+
+// ── The container ops codegen emits on a boxed receiver ───────────────────
+//
+// The names and argument types here are fixed by what call.rs / attribute.rs
+// generate for a receiver that inference boxed to `PyValue`; the SEMANTICS are
+// CPython's, delegated to the same traits the concrete containers implement,
+// so a boxed dict and a typed dict cannot drift apart.
+
+impl PyDictOps<String, PyValue> for PyValue {
+    fn py_get(&self, key: &String) -> Option<PyValue> {
+        // `boxed_get` raises for a non-dict member. The trait returns a plain
+        // Option, so that error cannot travel through it — propagate it as a
+        // panic rather than letting `None` read as an absent key (CPython
+        // raises AttributeError for `5.get("a")`).
+        self.boxed_get(key).unwrap_or_else(|e| panic!("{}", e.message))
+    }
+    fn py_get_default(&self, key: &String, default: PyValue) -> PyValue {
+        self.boxed_get(key)
+            .unwrap_or_else(|e| panic!("{}", e.message))
+            .unwrap_or(default)
+    }
+    fn py_keys(&self) -> Vec<String> {
+        self.py_dict_items().into_iter().map(|(k, _)| k).collect()
+    }
+    fn py_values(&self) -> Vec<PyValue> {
+        self.py_dict_items().into_iter().map(|(_, v)| v).collect()
+    }
+    fn py_items(&self) -> Vec<(String, PyValue)> {
+        self.py_dict_items()
+    }
+    fn py_setdefault(&mut self, key: String, default: PyValue) -> PyValue {
+        match self {
+            PyValue::Dict(d) => PyDictOps::py_setdefault(Arc::make_mut(d), key, default),
+            PyValue::OrderedDict(d) => PyDictOps::py_setdefault(Arc::make_mut(d), key, default),
+            // The trait is infallible, so a non-dict member cannot report
+            // CPython's TypeError through it; panic with CPython's message
+            // rather than return a value Python would never produce.
+            other => panic!("{}", other.not_a_container("setdefault()")),
+        }
+    }
+    fn update(&mut self, other: PyDict<String, PyValue>) {
+        match self {
+            PyValue::Dict(d) => PyDictOps::update(Arc::make_mut(d), other),
+            PyValue::OrderedDict(d) => PyDictOps::update(Arc::make_mut(d), other),
+            // Never a silent no-op: `[].update({})` is an AttributeError in
+            // CPython, so a non-dict receiver must not "succeed".
+            other => panic!("{}", other.not_a_container("update()")),
+        }
+    }
+}
+
+impl PySetIndex<String, PyValue> for PyValue {
+    fn py_set_index(&mut self, key: String, value: PyValue) -> Result<(), PyException> {
+        match self {
+            PyValue::Dict(d) => PySetIndex::py_set_index(Arc::make_mut(d), key, value),
+            PyValue::OrderedDict(d) => PySetIndex::py_set_index(Arc::make_mut(d), key, value),
+            other => Err(other.not_a_container("item assignment")),
+        }
+    }
+}
+
+impl PySetIndex<&str, PyValue> for PyValue {
+    fn py_set_index(&mut self, key: &str, value: PyValue) -> Result<(), PyException> {
+        PySetIndex::py_set_index(self, key.to_string(), value)
+    }
+}
+
+impl PyPop<String> for PyValue {
+    type Output = PyValue;
+    /// `d.pop(k)` on a boxed dict. `PyPop` already raises CPython's KeyError
+    /// for a missing key, so the dict arm propagates it unchanged.
+    fn py_pop(&mut self, key: String) -> Result<PyValue, PyException> {
+        match self {
+            PyValue::Dict(d) => PyPop::py_pop(Arc::make_mut(d), key),
+            PyValue::OrderedDict(d) => PyPop::py_pop(Arc::make_mut(d), key),
+            other => Err(other.not_a_container("pop()")),
+        }
+    }
+}
+
+impl PyPop<&str> for PyValue {
+    type Output = PyValue;
+    fn py_pop(&mut self, key: &str) -> Result<PyValue, PyException> {
+        PyPop::py_pop(self, key.to_string())
+    }
+}
+
+impl PySlice for PyValue {
+    type Output = PyValue;
+    /// `xs[a:b:c]` on a boxed value: str by character, bytes by octet (the
+    /// same line `len` draws), and a tuple member stays a tuple.
+    fn py_slice(&self, start: Option<i64>, stop: Option<i64>, step: Option<i64>) -> PyValue {
+        match self {
+            PyValue::Str(s) => PyValue::Str(s.as_str().py_slice(start, stop, step)),
+            PyValue::Bytes(b) => PyValue::Bytes(slice(b.as_slice(), start, stop, step).to_vec()),
+            PyValue::Tuple(members) => {
+                PyValue::Tuple(Arc::new(slice(members.as_slice(), start, stop, step)))
+            }
+            // A range slices to a RANGE (range(6)[1:4] == range(1, 4)), never a
+            // tuple — it keeps the sequence type, as every other arm above
+            // keeps its own.
+            PyValue::Range(r) => PyValue::Range(r.py_slice(start, stop, step)),
+            // The str surface is infallible by construction, so there is no
+            // Result to carry CPython's TypeError through; panic with its
+            // message rather than return a wrong value.
+            other => panic!("'{}' object is not subscriptable", py_value_type_name(other)),
+        }
+    }
+}
+
+impl PySliceReplace for PyValue {
+    type Item = PyValue;
+    /// `xs[a:b] = replacement` on a boxed value (step 1 only; the
+    /// extended-slice path is separate). A boxed TUPLE is immutable in
+    /// Python — `t[0:1] = [9]` raises TypeError — so this refuses rather
+    /// than editing the tuple's contents.
+    fn py_slice_assign(
+        &mut self,
+        _start: Option<i64>,
+        _stop: Option<i64>,
+        _replacement: Vec<PyValue>,
+    ) {
+        panic!("{}", self.not_a_container("item assignment"));
+    }
+    fn py_slice_assign_step(
+        &mut self,
+        _start: Option<i64>,
+        _stop: Option<i64>,
+        step: i64,
+        _replacement: Vec<PyValue>,
+    ) -> Result<(), PyException> {
+        // CPython checks the step BEFORE the receiver: `xs[::0] = v` is a
+        // ValueError even on an immutable xs. (Verified: for a tuple, whose
+        // members are the only ones reachable here, `t[::0] = []` raises
+        // TypeError — mutability is checked first — so a boxed member still
+        // reports the assignment refusal below.)
+        if step == 0 {
+            return Err(PyException::new("ValueError", "slice step cannot be zero"));
+        }
+        Err(self.not_a_container("item assignment"))
+    }
+    fn py_slice_delete(&mut self, _start: Option<i64>, _stop: Option<i64>) {
+        panic!("{}", self.not_a_container("item deletion"));
+    }
+    fn py_slice_delete_step(
+        &mut self,
+        _start: Option<i64>,
+        _stop: Option<i64>,
+        step: i64,
+    ) -> Result<(), PyException> {
+        if step == 0 {
+            return Err(PyException::new("ValueError", "slice step cannot be zero"));
+        }
+        Err(self.not_a_container("item deletion"))
+    }
 }
 
 impl AsStrLike for PyValue {
@@ -3093,6 +3462,7 @@ impl Truthy for PyValue {
             PyValue::Bytes(b) => !b.is_empty(),
             PyValue::Tuple(t) => !t.is_empty(),
             PyValue::Dict(d) => !d.is_empty(),
+            PyValue::OrderedDict(d) => d.is_truthy(),
             PyValue::Complex(z) => z.real != 0.0 || z.imag != 0.0,
             PyValue::Range(r) => r.py_len() > 0,
             PyValue::Function(_) => true,
@@ -3178,6 +3548,31 @@ pyvalue_tuple_from!(A, B, C);
 pyvalue_tuple_from!(A, B, C, D);
 pyvalue_tuple_from!(A, B, C, D, E);
 pyvalue_tuple_from!(A, B, C, D, E, F);
+
+/// A list of (key, value) PAIRS boxed (`[("b", 1), ("a", 2)]` passed to a
+/// boxed parameter — requests' `from_key_val_list`): a Tuple of 2-Tuples,
+/// the boxed model's list-as-tuple form. A pairs-specific impl, not a
+/// blanket `Vec<T>`: `Vec<u8>` is `bytes` (above), never a tuple of ints.
+impl<A: Into<PyValue>, B: Into<PyValue>> From<Vec<(A, B)>> for PyValue {
+    fn from(pairs: Vec<(A, B)>) -> Self {
+        PyValue::Tuple(Arc::new(pairs.into_iter().map(PyValue::from).collect()))
+    }
+}
+
+impl<A: Into<PyValue>, B: Into<PyValue>, C: Into<PyValue>> From<Vec<(A, B, C)>> for PyValue {
+    fn from(rows: Vec<(A, B, C)>) -> Self {
+        PyValue::Tuple(Arc::new(rows.into_iter().map(PyValue::from).collect()))
+    }
+}
+
+/// A typed dict compared with a boxed value (`boxed == {"a": 1}`):
+/// CPython's `==` — a boxed dict (or OrderedDict) with the same items, in
+/// any order, is equal; any other member is not.
+impl<V: Clone + Into<PyValue>> PartialEq<PyDict<String, V>> for PyValue {
+    fn eq(&self, other: &PyDict<String, V>) -> bool {
+        *self == PyValue::from(other.clone())
+    }
+}
 
 impl From<&str> for PyValue {
     fn from(value: &str) -> Self {
@@ -3530,6 +3925,7 @@ impl PyValue {
             PyValue::Bytes(_) => "bytes",
             PyValue::Tuple(_) => "tuple",
             PyValue::Dict(_) => "dict",
+            PyValue::OrderedDict(_) => "OrderedDict",
             PyValue::Complex(_) => "complex",
             PyValue::Range(_) => "range",
             PyValue::Function(_) => "function",
@@ -3815,6 +4211,7 @@ pub fn py_value_type_name(v: &PyValue) -> &'static str {
         PyValue::Bytes(_) => "bytes",
         PyValue::Tuple(_) => "tuple",
         PyValue::Dict(_) => "dict",
+        PyValue::OrderedDict(_) => "OrderedDict",
         PyValue::Complex(_) => "complex",
         PyValue::Range(_) => "range",
         PyValue::Function(_) => "function",
@@ -3853,6 +4250,8 @@ pub fn py_value_str(v: &PyValue) -> String {
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
+        // CPython 3.12: `OrderedDict({'a': 1})`, `OrderedDict()` empty.
+        PyValue::OrderedDict(d) => d.py_repr(),
         PyValue::None_ => "None".to_string(),
     }
 }
@@ -3909,6 +4308,11 @@ impl core::hash::Hash for PyValue {
                     core::hash::Hash::hash(k, state);
                     core::hash::Hash::hash(v, state);
                 }
+            }
+            // CPython: `hash(OrderedDict())` is a TypeError. The Hash trait
+            // has no error channel, so it is a loud panic at the use.
+            PyValue::OrderedDict(_) => {
+                panic!("TypeError: unhashable type: 'collections.OrderedDict'")
             }
             PyValue::Complex(z) => {
                 core::hash::Hash::hash(&8u8, state);
@@ -4831,9 +5235,16 @@ impl<T: PyInherits<Base>, Base> PyInherits<Base> for PyRef<T> {}
 /// instance (`PyRef` — an `Rc`, which a `static` cannot hold): the value
 /// is bound to the thread that initialized it. CPython lets every thread
 /// reach the one object; rython's single-threaded reference cells cannot,
-/// so a read from any other thread panics at that read — loud at the
+/// so an access from any other thread panics at that access — loud at the
 /// divergence (§12.2), never a data race. Reads deref to the value, so a
 /// global's `(*NAME).clone()` and method calls are unchanged.
+///
+/// A global REBOUND through `global` (the singleton pattern) or mutated in
+/// place is a `Mutex` static; its `Mutex<T>` is only `Sync` for `T: Send`,
+/// which a `PyRef` is not, so the Mutex itself sits inside the bound
+/// (`LazyLock<ThreadBound<Mutex<T>>>`) and `py_global_read` /
+/// `py_global_write` / `py_global_mutate` take `&**NAME` — the second
+/// deref is the thread check (issue #422).
 #[cfg(feature = "std")]
 pub struct ThreadBound<T> {
     owner: std::thread::ThreadId,
@@ -4856,7 +5267,7 @@ impl<T> core::ops::Deref for ThreadBound<T> {
     fn deref(&self) -> &T {
         if std::thread::current().id() != self.owner {
             panic!(
-                "RuntimeError: a module global holding a shared object is read from a \
+                "RuntimeError: a module global holding a shared object is accessed from a \
                  thread other than the one that created it; rython's shared objects are \
                  single-threaded (issue #414)"
             );
@@ -4911,6 +5322,54 @@ mod thread_bound_tests {
             .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
             .unwrap_or_default();
         assert!(msg.contains("from a thread other than the one that created it"), "{}", msg);
+    }
+
+    // Issue #422: a REBOUND / mutated-in-place global holding a shared
+    // object is `LazyLock<ThreadBound<Mutex<T>>>`; the helpers take
+    // `&**NAME` (the second deref is the thread check).
+    type Slot = std::sync::LazyLock<ThreadBound<std::sync::Mutex<Option<PyRef<i64>>>>>;
+
+    #[test]
+    fn a_thread_bound_mutex_global_reads_writes_and_mutates_on_its_own_thread() {
+        static G: Slot = std::sync::LazyLock::new(|| ThreadBound::new(std::sync::Mutex::new(None)));
+        assert!(py_global_read(&**G).is_none());
+        py_global_write(&**G, Some(PyRef::new(1)));
+        // A read is the ONE object: a write through the handle is seen by
+        // the next read.
+        let handle = py_global_read(&**G).unwrap();
+        *handle.borrow_mut() += 4;
+        assert_eq!(*py_global_read(&**G).unwrap().borrow(), 5);
+        let got = py_global_mutate(&**G, |slot| {
+            *slot.as_ref().unwrap().borrow_mut() += 1;
+            *slot.as_ref().unwrap().borrow()
+        });
+        assert_eq!(got, 6);
+        assert_eq!(*handle.borrow(), 6);
+    }
+
+    #[test]
+    fn a_thread_bound_mutex_global_touched_from_another_thread_panics() {
+        static G: Slot = std::sync::LazyLock::new(|| ThreadBound::new(std::sync::Mutex::new(None)));
+        py_global_write(&**G, Some(PyRef::new(1)));
+        for op in 0..3 {
+            let err = std::thread::spawn(move || match op {
+                0 => {
+                    py_global_read(&**G);
+                }
+                1 => py_global_write(&**G, None),
+                _ => py_global_mutate(&**G, |_| ()),
+            })
+            .join()
+            .expect_err("another thread's access must panic");
+            let msg = err
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            assert!(msg.contains("from a thread other than the one that created it"), "{}", msg);
+        }
+        // The owner is unaffected.
+        assert_eq!(*py_global_read(&**G).unwrap().borrow(), 1);
     }
 }
 
@@ -6177,6 +6636,9 @@ impl PyIndex<i64> for PyValue {
                 "TypeError",
                 "'NoneType' object is not subscriptable",
             )),
+            // A boxed dict / OrderedDict holds str keys only, so an int
+            // key is never present: CPython's `KeyError: 1`.
+            PyValue::Dict(_) | PyValue::OrderedDict(_) => Err(key_error(key.py_repr())),
             _ => Err(PyException::new(
                 "TypeError",
                 "indices must be integers or slices",
@@ -6190,6 +6652,7 @@ impl PyIndex<&str> for PyValue {
     fn py_index(&self, key: &str) -> Result<PyValue, PyException> {
         match self {
             PyValue::Dict(d) => d.py_index(key),
+            PyValue::OrderedDict(d) => d.py_index(key),
             other => Err(PyException::new(
                 "TypeError",
                 format!(
@@ -6210,6 +6673,7 @@ impl PyIndex<String> for PyValue {
     fn py_index(&self, key: String) -> Result<PyValue, PyException> {
         match self {
             PyValue::Dict(d) => d.py_index(key),
+            PyValue::OrderedDict(d) => d.py_index(key),
             other => Err(PyException::new(
                 "TypeError",
                 format!(
@@ -6226,6 +6690,7 @@ impl PyIndexMut<&str> for PyValue {
     fn py_index_mut(&mut self, key: &str) -> Result<&mut PyValue, PyException> {
         match self {
             PyValue::Dict(d) => Arc::make_mut(d).py_index_mut(key),
+            PyValue::OrderedDict(d) => Arc::make_mut(d).py_index_mut(key),
             other => Err(PyException::new(
                 "TypeError",
                 format!(
@@ -7291,6 +7756,11 @@ impl PyContains<PyValue> for PyValue {
                 // The boxed dict's keys are Strings; a non-str member is
                 // never a key (an unhashable key would be CPython's
                 // TypeError, but the boxed dict cannot hold one).
+                _ => false,
+            },
+            // The same holds for a boxed OrderedDict (String keys only).
+            PyValue::OrderedDict(d) => match item {
+                PyValue::Str(k) => d.contains_key(k),
                 _ => false,
             },
             other => panic!(

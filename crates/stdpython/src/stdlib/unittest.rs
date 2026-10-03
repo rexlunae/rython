@@ -188,7 +188,9 @@ fn pyvalue_isinstance(v: &PyValue, t: &str) -> bool {
         "float" => matches!(v, PyValue::Float(_)),
         "str" => matches!(v, PyValue::Str(_)),
         "bytes" => matches!(v, PyValue::Bytes(_)),
-        "dict" => matches!(v, PyValue::Dict(_)),
+        // OrderedDict subclasses dict: `isinstance(OrderedDict(), dict)`.
+        "dict" => matches!(v, PyValue::Dict(_) | PyValue::OrderedDict(_)),
+        "OrderedDict" => matches!(v, PyValue::OrderedDict(_)),
         "tuple" => matches!(v, PyValue::Tuple(_)),
         "range" => matches!(v, PyValue::Range(_)),
         "list" => matches!(v, PyValue::Tuple(_)),

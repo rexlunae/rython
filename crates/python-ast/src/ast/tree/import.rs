@@ -39,7 +39,7 @@ pub(crate) fn stdpython_module_class(module: &str, name: &str) -> bool {
         StdModule::Urllib => false,
         // The alias table is a static dict, not a constructible class.
         StdModule::Encodings => false,
-        StdModule::Collections => matches!(name, "OrderedDict" | "defaultdict" | "deque"),
+        StdModule::Collections => crate::CollectionsType::from_class_name(name).is_some(),
         StdModule::Re => false,
         StdModule::Itertools => false,
         StdModule::Functools => false,
@@ -184,7 +184,7 @@ pub(crate) fn stdpython_module_item(module: &str, name: &str) -> bool {
                 | "urldefrag",
         ),
         StdModule::Collections => {
-            matches!(name, "OrderedDict" | "defaultdict" | "deque" | "namedtuple")
+            crate::CollectionsType::from_class_name(name).is_some() || name == "namedtuple"
         }
         StdModule::Re => matches!(name, "compile" | "match" | "search" | "findall" | "finditer" | "sub" | "split" | "fullmatch" | "escape" | "IGNORECASE"),
         StdModule::Itertools => matches!(
@@ -1993,11 +1993,32 @@ impl CodeGen for Import {
             // (`import h2.config` — urllib3's http2: `h2.config.
             // H2Configuration(...)`).
             if let Some(root) = alias.name.split('.').next() {
-                if !root.is_empty() && root != &alias.name {
+                let root_bound_unaliased = alias.asname.is_some()
+                    && matches!(
+                        symbols.get(root),
+                        Some(SymbolTableNode::Import(prev))
+                            if prev.names.iter().any(|p| {
+                                p.asname.is_none() && p.name.split('.').next() == Some(root)
+                            })
+                    );
+                if !root.is_empty() && root != &alias.name && !root_bound_unaliased {
                     symbols.insert(root.to_string(), SymbolTableNode::Import(self.clone()));
                 }
             }
-            symbols.insert(alias.name.clone(), SymbolTableNode::Import(self.clone()));
+            // An ALIASED `import m as a` must not replace the entry an
+            // earlier unaliased `import m` made: Python keeps that binding
+            // of `m` live (`import collections; import collections as c`
+            // still reads `collections.deque`). Issue #435 tracks binding
+            // only `a` for an aliased import.
+            let keeps_unaliased = alias.asname.is_some()
+                && matches!(
+                    symbols.get(&alias.name),
+                    Some(SymbolTableNode::Import(prev))
+                        if prev.names.iter().any(|p| p.name == alias.name && p.asname.is_none())
+                );
+            if !keeps_unaliased {
+                symbols.insert(alias.name.clone(), SymbolTableNode::Import(self.clone()));
+            }
             if let Some(a) = alias.asname.clone() {
                 symbols.insert(a, SymbolTableNode::Alias(alias.name.clone()))
             }
@@ -2296,6 +2317,31 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ImportFrom {
 }
 
 impl ImportFrom {
+    /// The name the DEFINING module binds for the local name `local` this
+    /// import introduces: `from m import X as Y` binds only `Y` here, but
+    /// `m` defines `X`, so every lookup into `m` (`module_class_def`,
+    /// `resolve_imported_class`, `module_function_def`, ...) must use `X`.
+    /// An unaliased import, or a name this import does not bind, is its own
+    /// defining name.
+    pub(crate) fn defining_name(&self, local: &str) -> String {
+        self.names
+            .iter()
+            .find(|a| a.asname.as_deref() == Some(local))
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| local.to_string())
+    }
+
+    /// Whether `local` is bound by this import as a rename of `module`'s
+    /// `item` (`from re import compile as re_compile`): the module matches
+    /// exactly and the local name is the item's `as` name.
+    pub(crate) fn aliases_item(&self, local: &str, module: &str, item: &str) -> bool {
+        self.module == module
+            && self
+                .names
+                .iter()
+                .any(|a| a.asname.as_deref() == Some(local) && a.name == item)
+    }
+
     /// The module path this import resolves to inside the generated crate:
     /// for a relative import, the current module path (cut by `level`) plus
     /// the dotted module; for an absolute import, the dotted module itself.
@@ -2330,22 +2376,22 @@ impl CodeGen for ImportFrom {
     fn find_symbols(self, symbols: Self::SymbolTable) -> Self::SymbolTable {
         let mut symbols = symbols;
         for alias in self.names.iter() {
-            symbols.insert(
-                alias.name.clone(),
-                SymbolTableNode::ImportFrom(self.clone()),
-            );
-            // `from pylev import wf as w`: the alias resolves to the
-            // canonical name so call lowering propagates exceptions and
-            // attribute access treats it as the imported value. A SELF-alias
-            // (`from ._base_connection import ProxyConfig as ProxyConfig` —
-            // urllib3's re-export) must NOT overwrite the ImportFrom symbol:
-            // resolve_imported_class follows the chain through ImportFrom,
-            // and an Alias-to-self would loop.
-            if let Some(asname) = &alias.asname {
-                if asname != &alias.name {
-                    symbols.insert(asname.clone(), SymbolTableNode::Alias(alias.name.clone()));
-                }
-            }
+            // Python binds ONLY the local name: `asname` when present, else
+            // the imported name. (Binding the original name too — `from
+            // typing import Counter as TypeCounter` also registering
+            // `Counter` — overwrote an earlier `from collections import
+            // Counter` and sent later `Counter(...)` calls to the wrong
+            // module: issue #428.) The entry is the import narrowed to the
+            // ONE alias that binds this name, so a consumer's lookup of the
+            // original item name through `names` (`a.asname == Some(local)`)
+            // is unambiguous even for `from m import a as b, b`.
+            let local = alias.asname.clone().unwrap_or_else(|| alias.name.clone());
+            let bound = ImportFrom {
+                module: self.module.clone(),
+                names: vec![alias.clone()],
+                level: self.level,
+            };
+            symbols.insert(local, SymbolTableNode::ImportFrom(bound));
         }
         symbols
     }

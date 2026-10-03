@@ -1,5 +1,8 @@
 {
   "programs": {
+    "__main__": {
+      "status": "pass"
+    },
     "bank": {
       "status": "pass"
     },
@@ -15,6 +18,15 @@
     "clauses": {
       "status": "pass"
     },
+    "collections_defaultdict": {
+      "status": "pass"
+    },
+    "collections_deque": {
+      "status": "pass"
+    },
+    "collections_ordereddict": {
+      "status": "pass"
+    },
     "comb_perm": {
       "status": "pass"
     },
@@ -24,13 +36,31 @@
     "detect": {
       "status": "pass"
     },
+    "factory_return": {
+      "status": "pass"
+    },
     "float_coercion": {
       "status": "pass"
     },
     "fsum_compensation": {
       "status": "pass"
     },
+    "global_alias_holders": {
+      "status": "pass"
+    },
+    "global_alias_mutation": {
+      "status": "pass"
+    },
+    "global_shared_singleton": {
+      "status": "pass"
+    },
+    "global_singleton_handles": {
+      "status": "pass"
+    },
     "handoff": {
+      "status": "pass"
+    },
+    "import_alias_names": {
       "status": "pass"
     },
     "inventory": {
@@ -66,7 +96,13 @@
     "mixin_fields": {
       "status": "pass"
     },
+    "narrowed_option_slots": {
+      "status": "pass"
+    },
     "nested_param_mutation": {
+      "status": "pass"
+    },
+    "ordereddict_boxed": {
       "status": "pass"
     },
     "pipeline": {
@@ -97,6 +133,12 @@
       "status": "pass"
     },
     "untyped_method_args": {
+      "status": "pass"
+    },
+    "untyped_returns": {
+      "status": "pass"
+    },
+    "url_parts": {
       "status": "pass"
     },
     "valueor": {
