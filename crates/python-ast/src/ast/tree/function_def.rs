@@ -4425,7 +4425,18 @@ fn renderable_return_typeinfo(t: &crate::TypeInfo) -> bool {
         // declares Result<PyValue, _>, and the body already emits the
         // boxed values. Only the NO-ANSWER PyObject keeps refusing.
         crate::TypeInfo::PyValue => true,
+        // `&'static str` IS a concrete Rust type and is emitted verbatim
+        // wherever the lowering does not own the string (a tuple or set
+        // element, a str local used as a dict value). It was missing here,
+        // which made every container holding one "unrenderable" and dropped
+        // the signature to `()` — `return {"a", "b"}` against a
+        // `HashSet<&'static str>` body (issue #137). Safe only because the
+        // sites that DO own the string promote `StrRef` to `String` first
+        // (`owned_str_element` in type_ctx), so a `String` slot can never
+        // be filled by a `&'static str`.
+        crate::TypeInfo::StrRef => true,
         crate::TypeInfo::Vec(e) | crate::TypeInfo::PyTuple(e) => renderable_return_typeinfo(e),
+        crate::TypeInfo::HashSet(e) => renderable_return_typeinfo(e),
         crate::TypeInfo::Dict(k, v) => {
             renderable_return_typeinfo(k) && renderable_return_typeinfo(v)
         }

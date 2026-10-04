@@ -820,24 +820,31 @@ impl Drop for NameInferenceEntry {
 /// The type a string-LITERAL element takes where the LOWERING owns the
 /// string.
 ///
-/// A dict key/value and a list element render as `("v").to_string()` — an
-/// owned `String` — while a tuple or set element stays `&'static str`.
-/// Typing the owned sites `StrRef` made the inferred type disagree with the
-/// code that was emitted for it, and `renderable_return_typeinfo` (no
-/// `StrRef` arm) then rejected the whole container: `return {"k": 1}` typed
-/// the function `()` while its body emitted `PyDict<String, i64>` and rustc
-/// rejected the pair — issue #137's requests/urllib3 `found unit type ()`
-/// sites.
+/// A dict key/value and a list element render a string LITERAL as
+/// `("v").to_string()` — an owned `String` — while a tuple or set element
+/// stays `&'static str`. Typing the owned sites `StrRef` made the inferred
+/// type disagree with the code emitted for it, and
+/// `renderable_return_typeinfo` then rejected the whole container:
+/// `return {"k": 1}` typed the function `()` while its body emitted
+/// `PyDict<String, i64>` — issue #137's requests/urllib3 `found unit type
+/// ()` sites.
 ///
-/// Promotion belongs HERE, at the point the type is derived from the same
-/// literal the code is rendered from, rather than in a normalisation pass at
-/// each consumer: a blanket StrRef→String would corrupt the tuple and set
-/// cases, whose lowering deliberately keeps `&'static str` (they are correct
-/// today and must stay correct).
-fn owned_str_element(t: TypeInfo) -> TypeInfo {
-    match t {
-        TypeInfo::StrRef => TypeInfo::String,
-        other => other,
+/// Promotion is keyed on the EXPRESSION, not on the inferred type: a
+/// string *local* (`s = "v"; return {"k": s}`) is emitted as the bare `s`,
+/// so its type must stay `StrRef`. Promoting by type alone claimed `String`
+/// for it and produced the mirror-image mismatch
+/// (`expected IndexMap<String, String>, found IndexMap<String, &str>`).
+fn owned_str_element(expr: &ExprType, t: TypeInfo) -> TypeInfo {
+    let is_literal = match expr {
+        ExprType::Constant(c) => c
+            .0
+            .as_ref()
+            .is_some_and(|l| matches!(l, litrs::Literal::String(_) | litrs::Literal::ByteString(_))),
+        _ => false,
+    };
+    match (is_literal, t) {
+        (true, TypeInfo::StrRef) => TypeInfo::String,
+        (_, other) => other,
     }
 }
 
@@ -963,7 +970,7 @@ fn infer_type_inner(
         ExprType::List(l) => {
             let known: Vec<TypeInfo> = l
                 .iter()
-                .map(|e| owned_str_element(infer_type_inner(ctx, e, options, symbols)))
+                .map(|e| owned_str_element(e, infer_type_inner(ctx, e, options, symbols)))
                 .filter(|t| !matches!(t, TypeInfo::PyObject))
                 .collect();
             let mut distinct: Vec<&TypeInfo> = Vec::new();
@@ -1000,12 +1007,14 @@ fn infer_type_inner(
             let mut saw_value = false;
             for (key, value) in d.keys.iter().zip(d.values.iter()) {
                 let kt = match key {
-                    // The key renders `.to_string()` (dict.rs), so it is an
-                    // owned String — see `owned_str_element`.
-                    Some(key) => owned_str_element(infer_type_inner(ctx, key, options, symbols)),
+                    // The key renders `.to_string()` (dict.rs), so a string
+                    // LITERAL key is an owned String — see `owned_str_element`.
+                    Some(key) => {
+                        owned_str_element(key, infer_type_inner(ctx, key, options, symbols))
+                    }
                     None => TypeInfo::PyObject, // `**d` unpacking
                 };
-                let vt = owned_str_element(infer_type_inner(ctx, value, options, symbols));
+                let vt = owned_str_element(value, infer_type_inner(ctx, value, options, symbols));
                 if !matches!(kt, TypeInfo::PyObject) {
                     k = unify(k, kt);
                 }
@@ -1048,6 +1057,33 @@ fn infer_type_inner(
                 .map(|e| infer_type_inner(ctx, e, options, symbols))
                 .collect(),
         ),
+        // A set LITERAL lowers to `HashSet::from([...])`, whose element type
+        // rustc infers from the rendered elements — and it renders them
+        // VERBATIM, so a string element stays `&'static str` (no
+        // `.to_string()`, unlike a list/dict element). Typing it with the
+        // same join the list arm uses, WITHOUT `owned_str_element`, is what
+        // makes the inferred `HashSet<&'static str>` agree with the emitted
+        // `HashSet::from(["a", "b"])`.
+        ExprType::Set(s) => {
+            let known: Vec<TypeInfo> = s
+                .elts
+                .iter()
+                .map(|e| infer_type_inner(ctx, e, options, symbols))
+                .filter(|t| !matches!(t, TypeInfo::PyObject))
+                .collect();
+            let mut distinct: Vec<&TypeInfo> = Vec::new();
+            for t in &known {
+                if !distinct.contains(&t) {
+                    distinct.push(t);
+                }
+            }
+            // A heterogeneous set has no single element type (`HashSet<T>`
+            // needs one `T: Hash + Eq`), so it stays untyped — the lowering
+            // then fails in rustc rather than guessing a type.
+            TypeInfo::HashSet(Box::new(join_known_types(
+                distinct.iter().copied(),
+            )))
+        }
         ExprType::JoinedStr(_) => TypeInfo::String,
         ExprType::FormattedValue(_) => TypeInfo::String,
         ExprType::BinOp(op) => {
