@@ -479,6 +479,86 @@ class RankCausesTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("Nothing to rank", text)
 
+    def test_summarize_shouts_when_the_two_records_are_not_comparable(self):
+        # Measured at one commit and one rustc, the counts differ by host
+        # (3006 on aarch64-apple-darwin vs 2575 on x86_64-linux, 428 of it in
+        # requests alone), so a delta across machines is not a delta. The
+        # corpus is NON-EMPTY here so the comparison actually runs, and the
+        # banner is proven to coexist with real output rather than replacing
+        # it. A same-host pair, and records missing either fact, stay silent.
+        def banner(host, target=None, total=2, config=None):
+            # `rustc` / `build_target` / `cargo_config_sha256` live at the TOP
+            # level of the record, next to `packages` — that is where
+            # run_sweep.py writes them and where summarize.py reads them.
+            rec = {"packages": {"demo": {
+                "status": "build-failed", "total": total, "uncoded_total": 0,
+                "convert_status": 0, "build_status": 101,
+                "requirement": "demo==1"}},
+                "rustc": "rustc 1.97.1\nhost: %s\n" % host}
+            if target is not None:
+                rec["build_target"] = target
+            if config is not None:
+                rec["cargo_config_sha256"] = config
+            return rec
+
+        def run(base, cand):
+            with tempfile.TemporaryDirectory() as tmp:
+                b = Path(tmp) / "b.json"
+                c = Path(tmp) / "c.json"
+                b.write_text(json.dumps(base))
+                c.write_text(json.dumps(cand))
+                out = io.StringIO()
+                with patch.object(sys, "argv", ["summarize.py", str(b), str(c)]), \
+                     contextlib.redirect_stdout(out):
+                    summarize.main()
+                return out.getvalue()
+
+        # Different hosts: banner AND the real comparison table.
+        text = run(banner("aarch64-apple-darwin", ""),
+                   banner("x86_64-unknown-linux-gnu", ""))
+        self.assertIn("NOT COMPARABLE", text)
+        self.assertIn("aarch64-apple-darwin", text)
+        self.assertIn("x86_64-unknown-linux-gnu", text)
+        self.assertIn("== demo:", text)
+
+        # Same host, DIFFERENT build target: cross-compiling keeps the host
+        # identical while building the generated crate for something else.
+        text = run(banner("x86_64-unknown-linux-gnu", ""),
+                   banner("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"))
+        self.assertIn("NOT COMPARABLE", text)
+        self.assertIn("build target", text)
+
+        # Setting CARGO_BUILD_TARGET to the run's OWN native triple builds the
+        # same thing as leaving it unset, so it must NOT be a mismatch.
+        text = run(banner("x86_64-unknown-linux-gnu", ""),
+                   banner("x86_64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"))
+        self.assertNotIn("NOT COMPARABLE", text)
+
+        # Cargo also reads the target from .cargo/config.toml, so two runs with
+        # different config files are not comparable even when the environment
+        # variable agrees on both.
+        text = run(banner("x86_64-unknown-linux-gnu", "", config="aaa"),
+                   banner("x86_64-unknown-linux-gnu", "", config="bbb"))
+        self.assertIn("NOT COMPARABLE", text)
+        self.assertIn("cargo config", text)
+        self.assertNotIn("NOT COMPARABLE",
+                         run(banner("x86_64-unknown-linux-gnu", "", config="aaa"),
+                             banner("x86_64-unknown-linux-gnu", "", config="aaa")))
+
+        # Same host, same target: silent, and still compares.
+        text = run(banner("x86_64-unknown-linux-gnu", ""),
+                   banner("x86_64-unknown-linux-gnu", ""))
+        self.assertNotIn("NOT COMPARABLE", text)
+        self.assertIn("== demo:", text)
+
+        # A record with no rustc banner, or no build_target field, is skipped
+        # rather than falsely accused.
+        self.assertNotIn("NOT COMPARABLE",
+                         run({"packages": {}}, banner("x86_64-unknown-linux-gnu", "")))
+        bare = {"packages": banner("x86_64-unknown-linux-gnu")["packages"]}
+        self.assertNotIn("NOT COMPARABLE",
+                         run(bare, banner("x86_64-unknown-linux-gnu", "")))
+
 
 if __name__ == "__main__":
     unittest.main()

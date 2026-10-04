@@ -62,6 +62,24 @@ def binary_digest(path: Path) -> str:
         return hashlib.file_digest(f, "sha256").hexdigest()
 
 
+def cargo_config_digest(root: Path = ROOT) -> str:
+    """sha256 of the repo's Cargo config, or "" when there is none.
+
+    Cargo takes its build target from `CARGO_BUILD_TARGET` **and** from
+    `build.target` in `.cargo/config.toml`, and `cargo config get` is
+    nightly-only — so the environment variable alone records "" for a run
+    that is in fact cross-compiling. Fingerprinting the config file catches
+    that without parsing it: two records whose configs differ are flagged,
+    and the flag does not claim to know which target was selected.
+    """
+    for name in ("config.toml", "config"):
+        path = root / ".cargo" / name
+        if path.is_file():
+            with path.open("rb") as f:
+                return hashlib.file_digest(f, "sha256").hexdigest()
+    return ""
+
+
 def check_binary_inputs(rypip: Path, root: Path = ROOT) -> None:
     """Use Cargo's input list, not runtime/tests that aren't linked into rypip.
 
@@ -272,6 +290,8 @@ def main() -> int:
         "rypip_path": str(rypip),
         "rypip_sha256": fingerprint,
         "rustc": rustc,
+        "build_target": os.environ.get("CARGO_BUILD_TARGET", ""),
+        "cargo_config_sha256": cargo_config_digest(),
         "python": platform.python_version(),
         "packages": results,
     }
