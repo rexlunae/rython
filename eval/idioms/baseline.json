@@ -21,6 +21,9 @@
     "clauses": {
       "status": "pass"
     },
+    "collections_counter": {
+      "status": "pass"
+    },
     "collections_defaultdict": {
       "status": "pass"
     },

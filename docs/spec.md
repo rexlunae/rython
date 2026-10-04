@@ -2152,10 +2152,14 @@ groups; backreferences/lookarounds are a loud `re.error`),
 reader/writer thread a literal `delimiter=` and a named dialect from a
 std-gated `register_dialect`/`get_dialect` registry — dialect OBJECTS,
 `DictReader`/`DictWriter`/`Sniffer`/`field_size_limit` stay unsupported),
-`collections` (`deque`, `defaultdict`, `OrderedDict` construct, but most
-of their methods fail in rustc — §12.1, issue #427; a `Counter(...)` or
-`ChainMap(...)` construction is a conversion error naming a plain-dict
-rewrite; `namedtuple` only as a dropped class base, issue #367),
+`collections` (`deque`, `defaultdict`, `OrderedDict`, `Counter` construct,
+but most of their methods fail in rustc — §12.1, issue #427; `Counter`
+counts an iterable one per element but adds a mapping's VALUES
+(`Counter({'a': 3})` is `{'a': 3}`, CPython's `__init__` dispatching on
+`has_key`), and its `get` is `dict.get`, so a missing key is `None` where
+`c[k]` alone answers 0; a `ChainMap(...)` construction is a conversion
+error naming a plain-dict rewrite; `namedtuple` only as a dropped class
+base, issue #367),
 `pathlib`, `glob`, `subprocess`, `tempfile`, `argparse`
 (conversion-time; §10.3), `string`, `io` (`StringIO`/`BytesIO`),
 `threading` (§10.5), `socket` (§10.5), `numpy` (a sizable subset with

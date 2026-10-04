@@ -20264,6 +20264,74 @@ fn collections_containers_match_python_at_runtime() {
 }
 
 #[test]
+fn counter_construction_and_reads_match_python_at_runtime() {
+    // Issue #137 frontier: `Counter(layer)` (charset_normalizer's coherence
+    // detection) had no construction lowering, and #426 made it a loud
+    // conversion refusal — which stopped charset_normalizer and requests
+    // converting AT ALL, so the sweep could not measure ~2,300 errors of
+    // frontier. This pins the construction and the two reads the corpus
+    // uses.
+    let scratch = Scratch::new("counter-construction");
+    let file = scratch.path().join("countering.py");
+    fs::write(
+        &file,
+        concat!(
+            "from collections import Counter\n",
+            "from typing import Counter as TypeCounter\n",
+            "\n",
+            "\n",
+            "def tally(words: list[str]) -> list[tuple[str, int]]:\n",
+            "    counts: TypeCounter[str] = Counter(words)\n",
+            "    return counts.most_common()\n",
+            "\n",
+            "\n",
+            "def top_only(words: list[str]) -> list[tuple[str, int]]:\n",
+            "    return Counter(words).most_common(1)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    c = Counter(\"aab\")\n",
+            "    print(c.get(\"a\"), c.get(\"z\"), c.get(\"z\", 99))\n",
+            "    print(c.most_common(), c.most_common(1))\n",
+            "    d = Counter({\"a\": 3, \"b\": 1})\n",
+            "    print(d.get(\"a\"), d.get(\"q\"))\n",
+            "    e = Counter()\n",
+            "    print(e.get(\"x\"), e.get(\"x\", 5))\n",
+            "    print(tally([\"x\", \"y\", \"x\"]))\n",
+            "    print(top_only([\"x\", \"y\", \"x\"]))\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/countering"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3. The `None`s are the point: a Counter is a
+    // dict SUBCLASS, so `c.get(missing)` is `dict.get` and answers None,
+    // while only `c[missing]` would answer 0.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "2 None 99",
+            "[('a', 2), ('b', 1)] [('a', 2)]",
+            "3 None",
+            "None 5",
+            "[('x', 2), ('y', 1)]",
+            "[('x', 2)]",
+        ],
+        "Counter construction semantics diverged from CPython"
+    );
+}
+
+#[test]
 fn collections_containers_in_classes_globals_and_closures_match_python_at_runtime() {
     // Issue #427, the shapes beyond a single function: annotated class
     // fields, module-level deque/OrderedDict (typed statics), `del d[i]`,

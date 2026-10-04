@@ -40,6 +40,23 @@ where
         counter
     }
     
+    /// Create a Counter from a MAPPING, adding each value to the count
+    /// rather than counting one per key.
+    ///
+    /// CPython's `Counter(mapping)` is `update(mapping)`, and update adds
+    /// the mapping's VALUES: `Counter({'a': 3})` is `{'a': 3}` and
+    /// `Counter(Counter({'a': 2}))` is `{'a': 2}` — a distinct rule from
+    /// `from_iter`, which counts one per element. `Counter.__init__`
+    /// dispatches on `has_key`, so a dict never goes down the counting
+    /// path; that is the difference this constructor exists to preserve.
+    pub fn from_mapping(mapping: &crate::PyDict<T, i64>) -> Self {
+        let mut counter = Self::new();
+        for (k, v) in mapping.iter() {
+            counter.update_one(&k, *v);
+        }
+        counter
+    }
+
     /// Update counts with elements from iterable
     pub fn update<I>(&mut self, iterable: I) 
     where 
@@ -57,6 +74,26 @@ where
         *self.counts.entry(element.clone()).or_insert(0) += count;
     }
     
+    /// Whether the element has been counted. `Counter.get(key, default)`
+    /// needs it: `get` answers 0 for a missing key, so a caller that
+    /// supplied its own default has to tell the two cases apart.
+    pub fn contains_key(&self, element: &T) -> bool {
+        self.counts.contains_key(element)
+    }
+
+    /// CPython's `Counter.get(key)`: `None` for a key that was never
+    /// counted.
+    ///
+    /// This is deliberately NOT [`Counter::get`]. A Counter is a dict
+    /// subclass, so `c.get(missing)` is `dict.get` and answers `None`; only
+    /// `c[missing]` runs `__missing__` and answers 0. Verified against
+    /// python3: `Counter('ab').get('z')` is `None` while `Counter('ab')['z']`
+    /// is `0`. A first revision of this lowering routed both through `get`
+    /// and would have printed `0` for the first — a silent divergence.
+    pub fn get_opt(&self, element: &T) -> Option<i64> {
+        self.counts.get(element).copied()
+    }
+
     /// Get count for element
     pub fn get(&self, element: &T) -> i64 {
         self.counts.get(element).copied().unwrap_or(0)
@@ -118,6 +155,34 @@ where
     /// Get items (element, count pairs)
     pub fn items(&self) -> Vec<(T, i64)> {
         self.counts.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+}
+
+/// `c[key]`: CPython's `Counter.__missing__`, which answers ZERO for a key
+/// that was never counted instead of raising KeyError.
+///
+/// This is the OTHER half of the pair `get_opt` covers, and the two
+/// disagreeing is CPython's rule, not an oversight: `Counter('ab')['z']` is
+/// `0` while `Counter('ab').get('z')` is `None` (verified against python3).
+/// A `Result` is still returned so the trait matches; this arm never errs,
+/// and `get` deliberately does not delegate here.
+impl<T> crate::PyIndex<T> for Counter<T>
+where
+    T: Hash + Eq + Clone + core::fmt::Debug,
+{
+    type Output = i64;
+    fn py_index(&self, key: T) -> Result<i64, PyException> {
+        Ok(self.get(&key))
+    }
+}
+
+/// A String-keyed Counter subscripted with a literal: the literal lowers as
+/// `&str`, which the T-keyed impl above cannot take (same reason
+/// `PyDict<String, V>` has its own `&str` arm).
+impl crate::PyIndex<&str> for Counter<String> {
+    type Output = i64;
+    fn py_index(&self, key: &str) -> Result<i64, PyException> {
+        Ok(self.get(&String::from(key)))
     }
 }
 

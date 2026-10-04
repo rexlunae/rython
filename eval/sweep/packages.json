@@ -19,7 +19,7 @@
     {
       "name": "charset_normalizer",
       "requirement": "charset-normalizer==3.4.1",
-      "note": "Round 66: tuple-literal for-iteration (289 -> 285). Issue #332: the dynamic issubclass in utils.py no longer blocks conversion; 121 at that round. Sweep at 28efebd (schema 2): 41 coded + 3 other diagnostics (42 at 24d1987; 47 at round 118)."
+      "note": "Round 66: tuple-literal for-iteration (289 -> 285). Issue #332: the dynamic issubclass in utils.py no longer blocks conversion; 121 at that round. Sweep at 28efebd (schema 2): 41 coded + 3 other diagnostics (42 at 24d1987; 47 at round 118). Counter(layer) in cd.py had no construction lowering, so #426's refusal stopped this package converting AT ALL; the Counter construction slice restored it at 39 coded + 3 (run-counter-137)."
     },
     {
       "name": "requests",
