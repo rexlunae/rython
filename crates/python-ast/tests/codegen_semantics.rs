@@ -27825,3 +27825,126 @@ fn print_a_nested_definition_that_assigns_the_attribute_is_still_a_loud_error() 
         "{err}"
     );
 }
+
+// ---- #137: a returned dict/list literal types what the lowering emits ----
+//
+// A string-LITERAL dict key, dict value or list element renders as
+// `("v").to_string()` — an owned String — while a tuple or set element
+// stays `&'static str`. Typing the owned sites `StrRef` made the inferred
+// return type disagree with the emitted body, and `renderable_return_typeinfo`
+// (no `StrRef` arm) then rejected the whole container, so the signature
+// collapsed to `()` while the body returned a dict:
+// `expected (), found IndexMap<String, PyValue>` in requests/urllib3
+// (issue #137's 31 `found unit type ()` sites).
+
+#[test]
+fn a_returned_dict_literal_types_the_dict_the_body_emits() {
+    let out = compile(
+        "def str_keys():\n\
+         \x20   return {\"k\": 1}\n\
+         \n\
+         \n\
+         def int_keys():\n\
+         \x20   return {1: 2}\n",
+        "dict_return.py",
+    );
+    // A literal string key is owned; an int key is not.
+    assert!(
+        out.contains("Result < PyDict < String , i64 > , PyException >"),
+        "generated: {}",
+        out
+    );
+    assert!(
+        out.contains("Result < PyDict < i64 , i64 > , PyException >"),
+        "generated: {}",
+        out
+    );
+    // The collapsed-to-unit shape must not come back.
+    assert!(
+        !out.contains("-> Result < () , PyException >"),
+        "a dict return must not type as unit: {}",
+        out
+    );
+}
+
+#[test]
+fn a_returned_dict_from_a_method_types_the_dict_too() {
+    // The corpus shape (requests' merge_environment_settings): every value is
+    // a boxed PyValue, so the signature is PyDict<String, PyValue> and agrees
+    // with the body's PyValue values.
+    let out = compile(
+        "class S:\n\
+         \x20   def merge_environment_settings(self, a, b, c):\n\
+         \x20       return {\"p\": a, \"s\": b, \"v\": c}\n",
+        "method_dict_return.py",
+    );
+    assert!(
+        out.contains("PyDict < String , stdpython :: PyValue >"),
+        "generated: {}",
+        out
+    );
+}
+
+// A dict whose VALUES disagree (`{"k": 1, "j": "v"}`) is still typed `()` —
+// the all-boxable-mix rule the LIST arm applies is NOT mirrored here, because
+// adding it changed a dict literal's declared type and suppressed dict.rs's
+// own key/value boxing, breaking issue #130's mixed-KEY literal
+// (`{"k": 1, 2: "v"}` rendered `PyDict::from([("k", ..), (2, ..)])`, which
+// cannot unify `&str` with `i64`). Left as a known limitation: the mismatch
+// is a rustc error, never a silent divergence.
+#[test]
+fn a_dict_with_heterogeneous_values_is_still_a_loud_mismatch_not_a_silent_one() {
+    let out = compile(
+        "def mixed():\n\
+         \x20   return {\"k\": 1, \"j\": \"v\"}\n",
+        "mixed_dict_return.py",
+    );
+    // The body boxes both values ...
+    assert!(
+        out.contains("PyValue :: from (1)") && out.contains("PyValue :: from (\"v\")"),
+        "generated: {}",
+        out
+    );
+    // ... while the signature is still untyped, so rustc rejects the pair
+    // rather than a wrong type being silently accepted.
+    assert!(
+        out.contains("-> Result < () , PyException >"),
+        "known limitation (see the comment above): {}",
+        out
+    );
+}
+
+#[test]
+fn a_returned_list_of_string_literals_is_owned_but_a_tuple_stays_a_str_ref() {
+    // The over-correction guard: list elements are owned (`vec![..to_string()]`),
+    // tuple elements are NOT (`("a", "b")` is `&'static str` twice). Promoting
+    // every StrRef would break the tuple, which is correct today.
+    let out = compile(
+        "def list_of_str():\n\
+         \x20   return [\"a\", \"b\"]\n\
+         \n\
+         \n\
+         def tuple_of_str():\n\
+         \x20   return (\"a\", \"b\")\n\
+         \n\
+         \n\
+         def nested():\n\
+         \x20   return {\"k\": [\"a\"]}\n",
+        "owned_str_sites.py",
+    );
+    assert!(
+        out.contains("Result < Vec < String > , PyException >"),
+        "a list of string literals is owned: {}",
+        out
+    );
+    assert!(
+        out.contains("Result < (& 'static str , & 'static str) , PyException >"),
+        "a tuple of string literals must keep &'static str: {}",
+        out
+    );
+    assert!(
+        out.contains("Result < PyDict < String , Vec < String > > , PyException >"),
+        "nested owned sites: {}",
+        out
+    );
+}
