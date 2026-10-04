@@ -6367,3 +6367,81 @@ fn numpy_array_scalar_comparisons_broadcast_and_keep_operand_order() {
     let e = numpy::equal(&numpy::array(vec![0i64, 1, 2]), &true).unwrap();
     assert_eq!(e.to_string(), "[False  True False]");
 }
+
+// Counter construction, added for issue #137's charset_normalizer frontier
+// (`Counter(layer)` in coherence detection, which the round-100 sweep could
+// not convert at all). Every expectation below was produced by running the
+// quoted Python under python3 with PYTHONHASHSEED=0.
+mod counter_construction {
+    use super::*;
+    use stdpython::collections::Counter;
+
+    fn pd(pairs: &[(&'static str, i64)]) -> PyDict<&'static str, i64> {
+        PyDict::from_iter(pairs.iter().copied())
+    }
+
+    #[test]
+    fn counting_an_iterable_is_distinct_from_a_mappings_values() {
+        // c = Counter("aab"); c.get('a'), c.get('b')
+        let c = Counter::from_iter("aab".chars());
+        assert_eq!(c.get(&'a'), 2);
+        assert_eq!(c.get(&'b'), 1);
+        // d = Counter({'a': 3, 'b': 1}); d.get('a')
+        //
+        // CPython dispatches __init__ on has_key: a MAPPING's VALUES are the
+        // counts, so this is 3, not 1 (counting the keys would give 1).
+        let d: Counter<&'static str> = Counter::from_mapping(&pd(&[("a", 3), ("b", 1)]));
+        assert_eq!(d.get(&"a"), 3);
+        // f = Counter(['x', 'y', 'x']); f.get('x')
+        let f: Counter<char> = Counter::from_iter(['x', 'y', 'x'].into_iter());
+        assert_eq!(f.get(&'x'), 2);
+        // e = Counter(); e.get('x', 5) -> 5 (an empty Counter has no keys)
+        let e: Counter<char> = Counter::new();
+        assert_eq!(e.get_opt(&'x'), None);
+        assert_eq!(e.get_opt(&'x').unwrap_or(5), 5);
+    }
+
+    #[test]
+    fn get_is_dict_get_so_a_missing_key_is_none_not_zero() {
+        // The rule this pins is the one a Counter inherits from dict, and it
+        // is NOT the __missing__ rule: only `c[k]` answers 0.
+        // c = Counter("aab"); c.get('z') -> None      but c['z'] -> 0
+        let c = Counter::from_iter("aab".chars());
+        assert_eq!(c.get_opt(&'z'), None);
+        assert_eq!(c.get(&'z'), 0);
+        // c.get('z', 99) -> 99; c.get('z', None) -> None
+        assert_eq!(c.get_opt(&'z').unwrap_or(99), 99);
+        assert_eq!(c.get_opt(&'z').unwrap_or(-1), -1);
+        // c.get('a') -> 2
+        assert_eq!(c.get_opt(&'a'), Some(2));
+    }
+
+    #[test]
+    fn subscripting_is_missing_so_a_missing_key_counts_zero() {
+        // The other half of the pair above, and the reason the two disagree:
+        // `__missing__` answers 0 where `dict.get` answers None.
+        // c = Counter('aab'); c['a'] -> 2, c['z'] -> 0
+        let c: Counter<char> = Counter::from_iter("aab".chars());
+        assert_eq!(crate::PyIndex::py_index(&c, 'a').unwrap(), 2);
+        assert_eq!(crate::PyIndex::py_index(&c, 'z').unwrap(), 0);
+        // The String-keyed arm takes a literal, which lowers as `&str`.
+        // s = Counter('aab'); s['a'] -> 2, s['z'] -> 0
+        let s: Counter<String> = Counter::from_iter("aab".chars().map(String::from));
+        assert_eq!(crate::PyIndex::py_index(&s, "a").unwrap(), 2);
+        assert_eq!(crate::PyIndex::py_index(&s, "z").unwrap(), 0);
+    }
+
+    #[test]
+    fn most_common_takes_an_optional_n_where_absent_means_all() {
+        // c = Counter("aab"); c.most_common() -> [('a', 2), ('b', 1)]
+        let c = Counter::from_iter("aab".chars());
+        assert_eq!(format!("{:?}", c.most_common(None)), "[('a', 2), ('b', 1)]");
+        // c.most_common(1) -> [('a', 2)]
+        assert_eq!(format!("{:?}", c.most_common(Some(1))), "[('a', 2)]");
+        // CPython sorts by COUNT and breaks ties by first insertion, so a
+        // stable sort on the count alone reproduces the order.
+        // g = Counter("bbaa"); g.most_common() -> [('b', 2), ('a', 2)]
+        let g = Counter::from_iter("bbaa".chars());
+        assert_eq!(format!("{:?}", g.most_common(None)), "[('b', 2), ('a', 2)]");
+    }
+}

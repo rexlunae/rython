@@ -14848,33 +14848,118 @@ fn chainmap_construction_is_rejected_at_conversion() {
 }
 
 #[test]
-fn counter_construction_is_rejected_at_conversion() {
-    // collections.Counter: the same missing construction lowering as
-    // ChainMap (a bare `Counter(...)` failed in rustc) — loud at
-    // conversion, naming the plain-dict rewrite.
-    for (src, name) in [
-        (
-            "from collections import Counter\n\
-             c = Counter(\"abca\")\n",
-            "counter_from.py",
-        ),
-        (
-            "import collections\n\
-             \n\
-             def f() -> None:\n\
-             \x20   c = collections.Counter([1, 2, 1])\n",
-            "counter_qualified.py",
-        ),
-    ] {
-        let err = compile_err(src, name);
-        assert!(
-            err.contains("`collections.Counter(...)` is not supported yet")
-                && err.contains("counts.get(x, 0) + 1"),
-            "{}: Counter construction must fail conversion with the rewrite: {}",
-            name,
-            err
-        );
-    }
+fn counter_construction_shapes_the_lowering_cannot_express_are_rejected() {
+    // `collections.Counter` now HAS a construction lowering (issue #137's
+    // charset_normalizer frontier — the #426 refusal stopped that package
+    // and requests from converting at all). The shapes CPython defines but
+    // the lowering does not must still be loud, not silently mis-rendered.
+    // Each is inside a function so the arity/keyword rules are what is
+    // under test, not the module-global type rule.
+    //
+    // CPython's Counter signature takes no keyword arguments.
+    let err = compile_err(
+        "from collections import Counter\n\
+         \n\
+         \n\
+         def f() -> None:\n\
+         \x20   c = Counter(iterable=\"ab\")\n\
+         \x20   print(c)\n",
+        "counter_kw.py",
+    );
+    assert!(
+        err.contains("keyword arguments are not supported") && err.contains("refuses to silently"),
+        "Counter(iterable=...) must fail conversion: {}",
+        err
+    );
+    // `Counter` takes at most one positional argument.
+    let err = compile_err(
+        "from collections import Counter\n\
+         \n\
+         \n\
+         def f() -> None:\n\
+         \x20   c = Counter([1, 2], 3)\n\
+         \x20   print(c)\n",
+        "counter_two_args.py",
+    );
+    assert!(
+        err.contains("Counter() takes at most 1 argument"),
+        "Counter(a, b) must fail conversion: {}",
+        err
+    );
+    // `most_common` has ONE argument, so a second must be refused rather
+    // than dropped. CPython evaluates it and then raises TypeError:
+    //   Counter('ab').most_common(1, print('called'))
+    // prints `called`, then raises. Dropping it silently would lose the
+    // argument's side effects AND answer instead of raising.
+    let err = compile_err(
+        "from collections import Counter\n\
+         \n\
+         \n\
+         def f() -> None:\n\
+         \x20   c = Counter(\"ab\")\n\
+         \x20   c.most_common(1, print(\"called\"))\n",
+        "counter_mc_two_args.py",
+    );
+    assert!(
+        err.contains("Counter.most_common()") && err.contains("at most 1 positional"),
+        "most_common(n, x) must fail conversion: {}",
+        err
+    );
+}
+
+#[test]
+fn counter_construction_lowers_to_the_runtime_constructor() {
+    // The shape the corpus needs: an iterable renders through `from_iter`,
+    // a mapping through `from_mapping` (CPython's __init__ dispatches on
+    // has_key, so a dict's VALUES are the counts), and the zero-arg form
+    // through `new`.
+    let out = compile(
+        "from collections import Counter\n\
+         \n\
+         \n\
+         def shapes() -> None:\n\
+         \x20   a: Counter[str] = Counter(\"abca\")\n\
+         \x20   b: Counter[int] = Counter([1, 2, 1])\n\
+         \x20   c: Counter[str] = Counter()\n\
+         \x20   d: Counter[str] = Counter({'x': 3})\n\
+         \x20   print(a.get(\"a\"), b.get(1), c.get(\"z\"), d.get(\"x\"))\n",
+        "counter_shapes.py",
+    );
+    assert!(out.contains("from_iter"), "generated: {}", out);
+    assert!(out.contains("from_mapping"), "generated: {}", out);
+    assert!(out.contains("Counter :: < String > :: new ()"), "generated: {}", out);
+}
+
+#[test]
+fn counter_reads_render_the_optional_argument_their_way() {
+    // `most_common()` is CPython's "all entries" (None), not an empty
+    // list; and `get` on a Counter is `dict.get` (None for a missing key),
+    // NOT the `__missing__` 0 that `c[k]` gives.
+    let out = compile(
+        "from collections import Counter\n\
+         \n\
+         \n\
+         def f(words: list[str]) -> None:\n\
+         \x20   c = Counter(words)\n\
+         \x20   c.most_common()\n\
+         \x20   c.most_common(3)\n\
+         \x20   c.get(\"a\")\n\
+         \x20   c.get(\"a\", 9)\n",
+        "counter_reads.py",
+    );
+    assert!(out.contains("most_common (None)"), "generated: {}", out);
+    assert!(out.contains("most_common (Some (3))"), "generated: {}", out);
+    assert!(out.contains("get_opt (&"), "generated: {}", out);
+    assert!(
+        out.contains("unwrap_or (9)"),
+        "get(key, default) must unwrap the Option: {}",
+        out
+    );
+    assert!(
+        !out.contains("most_common (Some ())"),
+        "an absent n must be None, not an empty Option: {}",
+        out
+    );
 }
 
 #[test]

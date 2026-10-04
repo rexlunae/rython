@@ -8757,8 +8757,20 @@ let mutating_self_field = boxed_self_ref_receiver
                             );
                         }
                     }
+                    crate::CollectionsType::Counter => {
+                        if let Some(m) =
+                            crate::ast::tree::collections_types::CounterMethod::from_name(
+                                &attr.attr,
+                            )
+                        {
+                            let elem = targs.first().cloned().unwrap_or(crate::TypeInfo::PyObject);
+                            return crate::ast::tree::collections_lower::lower_counter_method(
+                                m, &receiver, &elem, &self, &ctx, &options, &symbols,
+                            );
+                        }
+                    }
                     crate::CollectionsType::Defaultdict => {}
-                _ => {}
+                    _ => {}
                 }
             }
 

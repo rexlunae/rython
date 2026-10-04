@@ -16,7 +16,9 @@ use crate::{
     Call, CodeGenContext, CollectionsType, ExprType, PythonOptions, SymbolTableNode,
     SymbolTableScopes, TypeInfo,
 };
-use crate::ast::tree::collections_types::{DefaultFactoryClass, DequeMethod, OrderedDictMethod};
+use crate::ast::tree::collections_types::{
+    CounterMethod, DefaultFactoryClass, DequeMethod, OrderedDictMethod,
+};
 use crate::ast::tree::type_ctx::{iterable_element_type, type_mentions_pyobject};
 
 type Lowered = Result<TokenStream, Box<dyn std::error::Error>>;
@@ -194,6 +196,26 @@ pub(crate) fn construction_type(
 ) -> TypeInfo {
     let unknown = TypeInfo::PyObject;
     match kind {
+        CollectionsType::Counter => {
+            // `Counter[str]`: the COUNTED element. A mapping argument names
+            // its KEY (its values are the counts), so the same
+            // `dict_kv`-then-`iterable_element_type` pair the OrderedDict arm
+            // uses applies unchanged.
+            let elem = call
+                .args
+                .first()
+                .map(|a| {
+                    let t = crate::infer_type(ctx, a, options, symbols);
+                    match t.dict_kv() {
+                        Some((k, _)) => owned(k.clone()),
+                        None => iterable_element_type(&t)
+                            .map(owned)
+                            .unwrap_or_else(|| unknown.clone()),
+                    }
+                })
+                .unwrap_or(unknown);
+            TypeInfo::Collection(kind, vec![elem])
+        }
         CollectionsType::Deque => {
             let elem = call
                 .args
@@ -441,6 +463,43 @@ pub(crate) fn lower_construction(
 ) -> Lowered {
     let path = typed_path(path, kind, expected);
     match kind {
+        CollectionsType::Counter => {
+            // CPython's `Counter.__init__` takes at most one positional
+            // argument and no keywords (3.10+).
+            if !call.keywords.is_empty() {
+                return Err(unsupported(
+                    "Counter(key=value) keyword arguments are not supported; Counter takes \
+                     no keyword arguments. rython refuses to silently ignore it"
+                        .to_string(),
+                ));
+            }
+            if call.args.len() > 1 {
+                return Err(unsupported(
+                    "Counter() takes at most 1 argument (an iterable to count, or a mapping \
+                     whose values are the counts)"
+                        .to_string(),
+                ));
+            }
+            let Some(src) = call.args.first() else {
+                return Ok(quote!(#path::new()));
+            };
+            let ty = crate::infer_type(Some(ctx), src, options, symbols);
+            // `Counter(mapping)` SUMS the values — the `update` rule, and
+            // NOT one count per key. CPython picks between the two on
+            // `has_key`, so the branch is on the argument's own type.
+            if ty.dict_kv().is_some() {
+                let rendered =
+                    crate::render_reused(src, ctx.clone(), options.clone(), symbols.clone())?;
+                let items = if matches!(ty, TypeInfo::Dict(..)) {
+                    rendered
+                } else {
+                    quote!(stdpython::PyDict::from_iter((#rendered).py_items()))
+                };
+                return Ok(quote!(#path::from_mapping(&#items)));
+            }
+            let items = iterable_tokens(src, ctx, options, symbols)?;
+            Ok(quote!(#path::from_iter(#items)))
+        }
         CollectionsType::Deque => {
             let mut iterable: Option<&ExprType> = None;
             let mut maxlen: Option<&ExprType> = None;
@@ -987,5 +1046,90 @@ pub(crate) fn lower_ordered_dict_method(
             Ok(quote!((#recv).move_to_end(&(#k), #last)?))
         }
         _ => Ok(quote!((#recv).popitem(#last)?)),
+    }
+}
+
+/// `Counter.most_common([n])` and `Counter.get(key[, default])`.
+///
+/// Both are lowered here for CPython's optional arguments: `most_common()`
+/// means "every entry" (`None`), and `get` is `dict.get`, so a missing key
+/// is `None` — not the `0` that `c[key]` alone owes (`__missing__`).
+pub(crate) fn lower_counter_method(
+    method: CounterMethod,
+    recv: &TokenStream,
+    elem_ty: &TypeInfo,
+    call: &Call,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Lowered {
+    let what = format!("Counter.{}()", method.name());
+    let mut positional = call.args.iter();
+    let mut arg0: Option<&ExprType> = positional.next();
+    // `n` for most_common(), `default` for get().
+    let mut arg1: Option<&ExprType> = positional.next();
+    if positional.next().is_some() {
+        return Err(arity_error(&what, "at most 2 positional arguments"));
+    }
+    for kw in &call.keywords {
+        match (method, kw.arg.as_deref()) {
+            (CounterMethod::MostCommon, Some("n")) if arg0.is_none() => arg0 = Some(&kw.value),
+            (CounterMethod::Get, Some("default")) if arg1.is_none() => arg1 = Some(&kw.value),
+            _ => {
+                return Err(unsupported(format!(
+                    "{what} got an unexpected or duplicate keyword argument `{}`",
+                    kw.arg.as_deref().unwrap_or("**kwargs")
+                )));
+            }
+        }
+    }
+    match method {
+        CounterMethod::MostCommon => {
+            // Only `get` has a second argument. CPython EVALUATES it and
+            // then raises `TypeError: Counter.most_common() takes from 1 to
+            // 2 positional arguments but 3 were given` — silently dropping
+            // it (as a shared arity check would) loses the argument's side
+            // effects and answers instead of raising, so refuse instead.
+            if arg1.is_some() {
+                return Err(arity_error(&what, "at most 1 positional argument (`n`)"));
+            }
+            // `most_common()` is CPython's "every entry"; the runtime reads
+            // the absence as `None`, so a missing argument is `None` and not
+            // an empty slice.
+            let n = match arg0 {
+                None => quote!(None),
+                Some(e) => {
+                    let rendered = crate::render_typed(
+                        e,
+                        ctx.clone(),
+                        options.clone(),
+                        symbols.clone(),
+                        Some(TypeInfo::Int),
+                    )?;
+                    quote!(Some(#rendered))
+                }
+            };
+            Ok(quote!((#recv).most_common(#n)))
+        }
+        CounterMethod::Get => {
+            let Some(key) = arg0 else {
+                return Err(arity_error(&what, "a key argument"));
+            };
+            let key = key_tokens(key, elem_ty, ctx, options, symbols)?;
+            // `get_opt` is the `dict.get` rule (None for a key that was never
+            // counted); the runtime's `get` is the `__missing__` rule and
+            // must not be used here. A supplied default replaces the None.
+            let Some(default) = arg1 else {
+                return Ok(quote!((#recv).get_opt(&(#key))));
+            };
+            let default = crate::render_typed(
+                default,
+                ctx.clone(),
+                options.clone(),
+                symbols.clone(),
+                Some(TypeInfo::Int),
+            )?;
+            Ok(quote!((#recv).get_opt(&(#key)).unwrap_or(#default)))
+        }
     }
 }

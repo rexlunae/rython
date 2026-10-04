@@ -69,6 +69,7 @@ impl CollectionsType {
     /// The runtime type's path.
     pub(crate) fn rust_path(self) -> proc_macro2::TokenStream {
         match self {
+            CollectionsType::Counter => quote!(stdpython::collections::Counter),
             CollectionsType::Deque => quote!(stdpython::collections::deque),
             CollectionsType::Defaultdict => quote!(stdpython::collections::defaultdict),
             CollectionsType::OrderedDict => quote!(stdpython::collections::OrderedDict),
@@ -95,7 +96,10 @@ impl CollectionsType {
     pub(crate) fn has_construction_lowering(self) -> bool {
         matches!(
             self,
-            CollectionsType::Deque | CollectionsType::Defaultdict | CollectionsType::OrderedDict
+            CollectionsType::Counter
+                | CollectionsType::Deque
+                | CollectionsType::Defaultdict
+                | CollectionsType::OrderedDict
         )
     }
 
@@ -136,12 +140,8 @@ impl CollectionsType {
                  `ChainMap(d1, d2)` (later maps first, so earlier ones win) — \
                  when neither the chain nor its maps change afterwards",
             ),
-            CollectionsType::Counter => Some(
-                "count into a plain dict instead — `counts: dict[str, int] = {}` \
-                 and `counts[x] = counts.get(x, 0) + 1` per element, read with \
-                 `counts.get(x, 0)` (a Counter's missing key counts 0)",
-            ),
-            CollectionsType::Deque
+            CollectionsType::Counter
+            | CollectionsType::Deque
             | CollectionsType::Defaultdict
             | CollectionsType::OrderedDict
             | CollectionsType::Namedtuple => None,
@@ -242,6 +242,34 @@ impl DequeMethod {
             DequeMethod::ExtendLeft => "extendleft",
             DequeMethod::Rotate => "rotate",
             DequeMethod::Remove => "remove",
+        }
+    }
+}
+
+/// The Counter methods whose lowering the compiler owns.
+///
+/// Both are here for CPython's optional arguments: `most_common()` means
+/// "every entry" (`None`), not an empty list, and `get` on a Counter is
+/// `dict.get`, so a missing key is `None` where only `c[k]` answers 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CounterMethod {
+    MostCommon,
+    Get,
+}
+
+impl CounterMethod {
+    pub(crate) fn from_name(name: &str) -> Option<CounterMethod> {
+        match name {
+            "most_common" => Some(CounterMethod::MostCommon),
+            "get" => Some(CounterMethod::Get),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            CounterMethod::MostCommon => "most_common",
+            CounterMethod::Get => "get",
         }
     }
 }
