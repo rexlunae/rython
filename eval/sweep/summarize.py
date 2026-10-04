@@ -104,6 +104,29 @@ def summarize(base: dict, cand: dict) -> bool:
     return complete
 
 
+def rustc_host(record: dict) -> str:
+    """The `host:` line of the record's rustc banner, or '?' when absent."""
+    for line in (record.get("rustc") or "").splitlines():
+        if line.strip().startswith("host:"):
+            return line.split(":", 1)[1].strip()
+    return "?"
+
+
+def effective_target(record: dict) -> str:
+    """The target the generated crate was actually built for.
+
+    An empty `build_target` means "no CARGO_BUILD_TARGET", which builds for
+    the rustc HOST — so a run that sets the variable to its own native triple
+    and a run that leaves it unset are the SAME build and must not be
+    reported as a mismatch. Normalising empty to the host makes that true.
+    Returns "?" when neither fact is available.
+    """
+    target = record.get("build_target")
+    if target:
+        return target
+    return rustc_host(record)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("baseline")
@@ -112,6 +135,35 @@ def main() -> int:
     base, cand = load(args.baseline), load(args.candidate)
     print(f"baseline  : {args.baseline}  ({base.get('rypip_commit', '?')})")
     print(f"candidate : {args.candidate}  ({cand.get('rypip_commit', '?')})\n")
+
+    # The counts are host-dependent (see README: same commit and rustc
+    # measure 3006 on aarch64-apple-darwin and 2575 on x86_64-linux, of which
+    # requests alone is 428). A delta across two hosts is not a delta, so say
+    # so loudly rather than printing a number that invites a claim.
+    hb, hc = rustc_host(base), rustc_host(cand)
+    mismatched = []
+    if "?" not in (hb, hc) and hb != hc:
+        mismatched.append(f"host: baseline {hb}, candidate {hc}")
+    # A cross-CARGO_BUILD_TARGET pair counts too: the rustc banner reports the
+    # HOST, so cross-compiling keeps the host identical while the generated
+    # crate is built for a different target. `effective_target` normalises the
+    # unset case to the host, so only a REAL difference is flagged.
+    tb, tc = effective_target(base), effective_target(cand)
+    if "?" not in (tb, tc) and tb != tc:
+        mismatched.append(f"build target: baseline {tb}, candidate {tc}")
+    # Cargo also takes the target from .cargo/config.toml, and
+    # `cargo config get` is nightly-only, so run_sweep.py fingerprints that
+    # file instead. Different configs cannot be compared even when the
+    # environment variable agrees.
+    cb, cc = base.get("cargo_config_sha256"), cand.get("cargo_config_sha256")
+    if cb is not None and cc is not None and cb != cc:
+        mismatched.append("cargo config (.cargo/config.toml) differs between the runs")
+    if mismatched:
+        print("!! NOT COMPARABLE — these records do not measure the same build:")
+        for m in mismatched:
+            print(f"!!   {m}")
+        print("!! The counts are host-dependent; this delta does not mean")
+        print("!! anything. Re-run BOTH records on the same machine and target.\n")
     return 0 if summarize(base, cand) else 1
 
 

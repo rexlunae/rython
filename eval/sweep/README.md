@@ -51,6 +51,33 @@ hand-grep for.
   diverge on real packages; the sweep is the ground truth.
 - **Parallel conversion runs share `~/.cache/rypip` and the workdir.**
   Use separate `--workdir` values for concurrent sweeps.
+- **The counts are HOST-dependent — compare only within one machine.**
+  Measured at the same commit (`88875e2`) and the same rustc (1.97.1),
+  `aarch64-apple-darwin` reports 3006 diagnostics and
+  `x86_64-unknown-linux-gnu` reports 2575 — a 431 difference, of which
+  `requests` alone accounts for 428 (2307 vs 1879). Generated crates build
+  for the host, and the corpus is std-heavy, so the platform-gated surface
+  resolves differently. A baseline run on one machine and a candidate run on
+  another therefore produces a delta that means nothing.
+  `summarize.py` refuses to present such a pair as a delta: it prints a
+  `NOT COMPARABLE` banner when the records do not describe the same build,
+  on any of three axes.
+
+  - the rustc banner's **host triple** — cross-machine pairs;
+  - the effective **build target**: `build_target` (the requested
+    `CARGO_BUILD_TARGET`), normalised so *unset* means *the host*. That
+    normalisation matters: a run that sets the variable to its own native
+    triple and a run that leaves it unset build the same thing, so a naive
+    `"" != "x86_64-..."` comparison would wrongly call them incomparable;
+  - a sha256 of **`.cargo/config.toml`**, because Cargo also takes its target
+    from there and `cargo config get` is nightly-only — so the environment
+    variable alone records "" for a genuinely cross-compiling run. The
+    fingerprint flags differing configs without pretending to know which
+    target they select.
+
+  All three facts are in the record, so the check is free, and it stays
+  silent on any axis a record does not carry, so a legacy record is never
+  falsely accused.
 
 ## CI ratchet (recommended, not yet wired)
 
