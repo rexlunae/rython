@@ -1,0 +1,335 @@
+{
+  "converter_commit": "9fcff41",
+  "repo_head": "55d7296",
+  "rypip_path": "target/debug/rypip",
+  "oracle": "CPython 3.14.1 (pins captured under 3.11)",
+  "passed": 53,
+  "total": 54,
+  "passing": [
+    "__main__",
+    "bank",
+    "boxed_constructor",
+    "boxed_numeric_equality",
+    "boxed_slots",
+    "callback_registry",
+    "clauses",
+    "collections_counter",
+    "collections_defaultdict",
+    "collections_deque",
+    "collections_ordereddict",
+    "comb_perm",
+    "complex_components",
+    "detect",
+    "factory_return",
+    "float_coercion",
+    "fsum_compensation",
+    "global_alias_holders",
+    "global_alias_mutation",
+    "global_shared_singleton",
+    "global_singleton_handles",
+    "handoff",
+    "import_alias_names",
+    "inventory",
+    "ledger",
+    "line_tally",
+    "math_bare_imports",
+    "math_exact_int_round",
+    "math_gamma_lgamma",
+    "math_int_coercion",
+    "math_log",
+    "math_scalar_extras",
+    "matrix",
+    "mixin_fields",
+    "narrowed_option_slots",
+    "nested_param_mutation",
+    "ordereddict_boxed",
+    "pipeline",
+    "print_eval_order",
+    "records",
+    "returned_literals",
+    "rmw",
+    "shapes",
+    "sumprod_pairs",
+    "text_stats",
+    "tokenizer",
+    "tree",
+    "untyped_method_args",
+    "untyped_returns",
+    "url_parts",
+    "valueor",
+    "variadic_tuples",
+    "views"
+  ],
+  "programs": {
+    "__main__": {
+      "program": "__main__",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "bank": {
+      "program": "bank",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "boxed_constructor": {
+      "program": "boxed_constructor",
+      "warnings": 1,
+      "status": "pass"
+    },
+    "boxed_numeric_equality": {
+      "program": "boxed_numeric_equality",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "boxed_slots": {
+      "program": "boxed_slots",
+      "warnings": 2,
+      "status": "pass"
+    },
+    "callback_registry": {
+      "program": "callback_registry",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "clauses": {
+      "program": "clauses",
+      "warnings": 1,
+      "status": "pass"
+    },
+    "collections_counter": {
+      "program": "collections_counter",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "collections_defaultdict": {
+      "program": "collections_defaultdict",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "collections_deque": {
+      "program": "collections_deque",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "collections_ordereddict": {
+      "program": "collections_ordereddict",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "comb_perm": {
+      "program": "comb_perm",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "complex_components": {
+      "program": "complex_components",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "detect": {
+      "program": "detect",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "factory_return": {
+      "program": "factory_return",
+      "warnings": 1,
+      "status": "pass"
+    },
+    "float_coercion": {
+      "program": "float_coercion",
+      "warnings": 1,
+      "status": "pass"
+    },
+    "fsum_compensation": {
+      "program": "fsum_compensation",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "global_alias_holders": {
+      "program": "global_alias_holders",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "global_alias_mutation": {
+      "program": "global_alias_mutation",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "global_shared_singleton": {
+      "program": "global_shared_singleton",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "global_singleton_handles": {
+      "program": "global_singleton_handles",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "handoff": {
+      "program": "handoff",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "import_alias_names": {
+      "program": "import_alias_names",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "inventory": {
+      "program": "inventory",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "ledger": {
+      "program": "ledger",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "line_tally": {
+      "program": "line_tally",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "math_bare_imports": {
+      "program": "math_bare_imports",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "math_exact_int_round": {
+      "program": "math_exact_int_round",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "math_gamma_lgamma": {
+      "program": "math_gamma_lgamma",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "math_int_coercion": {
+      "program": "math_int_coercion",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "math_log": {
+      "program": "math_log",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "math_scalar_extras": {
+      "program": "math_scalar_extras",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "matrix": {
+      "program": "matrix",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "mixin_fields": {
+      "program": "mixin_fields",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "narrowed_option_slots": {
+      "program": "narrowed_option_slots",
+      "warnings": 2,
+      "status": "pass"
+    },
+    "nested_param_mutation": {
+      "program": "nested_param_mutation",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "ordereddict_boxed": {
+      "program": "ordereddict_boxed",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "pipeline": {
+      "program": "pipeline",
+      "warnings": 1,
+      "status": "pass"
+    },
+    "print_eval_order": {
+      "program": "print_eval_order",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "records": {
+      "program": "records",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "returned_literals": {
+      "program": "returned_literals",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "rmw": {
+      "program": "rmw",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "schedule": {
+      "program": "schedule",
+      "status": "convert-failed",
+      "detail": "t schedule.py:18:1-41:62 [location=schedule.py:18:1-41:62, message=`cal` (a container) is passed to a function that mutates it, and read again afterwards; rython copies containers at the call site, so the mutation would not be visible through `cal`. Python containers are references (issue #79); restructure the code \u2014 mutate through a single name, or pass the container and return the result, help=]"
+    },
+    "shapes": {
+      "program": "shapes",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "sumprod_pairs": {
+      "program": "sumprod_pairs",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "text_stats": {
+      "program": "text_stats",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "tokenizer": {
+      "program": "tokenizer",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "tree": {
+      "program": "tree",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "untyped_method_args": {
+      "program": "untyped_method_args",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "untyped_returns": {
+      "program": "untyped_returns",
+      "warnings": 2,
+      "status": "pass"
+    },
+    "url_parts": {
+      "program": "url_parts",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "valueor": {
+      "program": "valueor",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "variadic_tuples": {
+      "program": "variadic_tuples",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "views": {
+      "program": "views",
+      "warnings": 0,
+      "status": "pass"
+    }
+  }
+}

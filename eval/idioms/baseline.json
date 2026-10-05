@@ -120,6 +120,9 @@
     "records": {
       "status": "pass"
     },
+    "returned_literals": {
+      "status": "pass"
+    },
     "rmw": {
       "status": "pass"
     },
