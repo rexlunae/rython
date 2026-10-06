@@ -28076,3 +28076,48 @@ fn set_add_discard_remove_lower_to_python_semantics() {
         out
     );
 }
+
+#[test]
+fn a_shadowed_set_call_is_not_the_empty_set() {
+    // Devin review on #446: a parameter named `set` shadows the builtin,
+    // so `return set()` calls it (CPython returns whatever it returns) —
+    // never the typed empty set the builtin would build.
+    let out = compile(
+        "from typing import Callable\n\
+         \n\
+         \n\
+         def make(set: Callable[[], set[int]]) -> set[int]:\n\
+         \x20   return set()\n\
+         \n\
+         \n\
+         def local() -> set[int]:\n\
+         \x20   set = lambda: {4}\n\
+         \x20   out: set[int] = set()\n\
+         \x20   return out\n",
+        "shadowed_set.py",
+    );
+    assert!(
+        !out.contains("HashSet :: < i64 > :: new ()"),
+        "a shadowing `set` must be called, not replaced: {}",
+        out
+    );
+}
+
+#[test]
+fn a_keyed_min_max_sorted_over_a_set_is_not_lowered() {
+    // Devin review on #446: `key=` can tie distinct members (`min({"aa",
+    // "ab"}, key=len)` answers the first one ITERATED), and a Rust
+    // HashSet iterates in a different, randomized order (issue #444), so
+    // the keyed forms keep the loud build error instead of collecting.
+    let out = compile(
+        "def f() -> None:\n\
+         \x20   s = {\"aa\", \"ab\"}\n\
+         \x20   print(min(s, key=len), sorted(s, key=len))\n",
+        "keyed_set.py",
+    );
+    assert!(
+        !out.contains("collect :: < Vec < _ >> ()"),
+        "a keyed builtin over a set must not take its iteration order: {}",
+        out
+    );
+}

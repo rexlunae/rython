@@ -3352,12 +3352,20 @@ impl<'a> CodeGen for Call {
                     }
                     // A SET argument to an order-independent slice builtin
                     // (`sorted(s)`, `min(s)`, `max(s)`): its elements as a
-                    // Vec (a HashSet is not a slice). Only these three: the
-                    // result does not depend on iteration order, which
-                    // differs from CPython's for a Rust HashSet — the
-                    // order-dependent builtins (`list(s)`, `enumerate(s)`)
-                    // stay a loud build error.
-                    if matches!(
+                    // Vec (a HashSet is not a slice). Only these three, and
+                    // only without `key=`: distinct members never tie under
+                    // their own ordering, so the result does not depend on
+                    // iteration order, which differs from CPython's for a
+                    // Rust HashSet (issue #444). A `key=` can tie distinct
+                    // members (`min({"aa", "ab"}, key=len)` answers the
+                    // first one iterated), and the order-dependent builtins
+                    // (`list(s)`, `enumerate(s)`) — both stay a loud build
+                    // error.
+                    if !self
+                        .keywords
+                        .iter()
+                        .any(|k| k.arg.as_deref() == Some("key"))
+                        && matches!(
                         crate::ast::tree::collections_types::SliceBuiltin::from_name(bname),
                         Some(
                             crate::ast::tree::collections_types::SliceBuiltin::Sorted
@@ -10022,12 +10030,15 @@ let mutating_self_field = boxed_self_ref_receiver
                     // against the set's element type (a str literal owns
                     // itself into a HashSet<String>); each call is a unit
                     // statement, as Python's None-returning methods are.
-                    ("add" | "discard" | "remove", [_])
-                        if matches!(
-                            crate::infer_type(Some(&ctx), &attr.value, &options, &symbols),
-                            crate::TypeInfo::HashSet(_)
-                        ) =>
+                    (name, [_])
+                        if let Some(method) =
+                            crate::ast::tree::collections_types::SetMethod::from_name(name)
+                            && matches!(
+                                crate::infer_type(Some(&ctx), &attr.value, &options, &symbols),
+                                crate::TypeInfo::HashSet(_)
+                            ) =>
                     {
+                        use crate::ast::tree::collections_types::SetMethod;
                         let crate::TypeInfo::HashSet(elem) =
                             crate::infer_type(Some(&ctx), &attr.value, &options, &symbols)
                         else {
@@ -10046,10 +10057,12 @@ let mutating_self_field = boxed_self_ref_receiver
                             expected,
                         )?;
                         let runtime = crate::safe_ident(&options.stdpython);
-                        return Ok(match attr.attr.as_str() {
-                            "add" => quote!({ (#receiver).insert(#value); }),
-                            "discard" => quote!({ (#receiver).remove(&(#value)); }),
-                            _ => quote!(#runtime::py_set_remove(&mut (#receiver), &(#value))?),
+                        return Ok(match method {
+                            SetMethod::Add => quote!({ (#receiver).insert(#value); }),
+                            SetMethod::Discard => quote!({ (#receiver).remove(&(#value)); }),
+                            SetMethod::Remove => {
+                                quote!(#runtime::py_set_remove(&mut (#receiver), &(#value))?)
+                            }
                         });
                     }
                     // list.remove(x) removes by VALUE and raises ValueError;

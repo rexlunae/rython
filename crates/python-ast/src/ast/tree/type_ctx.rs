@@ -2494,7 +2494,7 @@ pub fn render_typed(
     // element type the bare call cannot, so it builds the empty typed set
     // instead of the boxed None of the empty-set divergence.
     if let Some(TypeInfo::HashSet(elem)) = &expected
-        && is_empty_set_call(expr, &symbols)
+        && is_empty_set_call(expr, &symbols, &options)
         && !type_mentions_pyobject(elem)
     {
         let ty = elem.to_rust_type();
@@ -2762,14 +2762,26 @@ pub fn render_typed(
     }
 }
 
-/// Whether `expr` is the builtin `set()` call with no arguments (the
-/// empty set, whose element type only its slot can name).
-pub(crate) fn is_empty_set_call(expr: &ExprType, symbols: &SymbolTableScopes) -> bool {
+/// Whether `expr` is the BUILTIN `set()` call with no arguments (the
+/// empty set, whose element type only its slot can name). A `set` that a
+/// module definition, a parameter or a local binds is not the builtin:
+/// its call is a real call and must run (the same shadow checks as the
+/// builtin dispatch in call.rs).
+pub(crate) fn is_empty_set_call(
+    expr: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    const NAME: &str = "set";
     matches!(expr, ExprType::Call(c)
-        if matches!(c.func.as_ref(), ExprType::Name(f) if f.id == "set")
+        if matches!(c.func.as_ref(), ExprType::Name(f) if f.id == NAME)
             && c.args.is_empty()
             && c.keywords.is_empty())
-        && symbols.get("set").is_none()
+        && symbols.get(NAME).is_none()
+        && !options.called_params.contains(NAME)
+        && !options.param_type_vars.contains_key(NAME)
+        && !options.local_types.contains_key(NAME)
+        && !options.name_types.contains_key(NAME)
 }
 
 /// Whether `expr` is a `self.<field>` read whose field type is

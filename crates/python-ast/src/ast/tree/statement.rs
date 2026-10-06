@@ -1152,7 +1152,7 @@ impl CodeGen for StatementType {
                         Some(t @ crate::TypeInfo::HashSet(_))
                             if matches!(e.value, ExprType::Set(_))
                                 || crate::ast::tree::type_ctx::is_empty_set_call(
-                                    &e.value, &symbols,
+                                    &e.value, &symbols, &options,
                                 ) =>
                         {
                             Some(t.clone())

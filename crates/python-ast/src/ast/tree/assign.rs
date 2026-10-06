@@ -424,7 +424,7 @@ impl<'a> CodeGen for Assign {
         // would record that divergence's warning for a store that has none.
         let empty_typed_set = match self.targets.as_slice() {
             [ExprType::Name(name)]
-                if crate::ast::tree::type_ctx::is_empty_set_call(&value_expr, &symbols) =>
+                if crate::ast::tree::type_ctx::is_empty_set_call(&value_expr, &symbols, &options) =>
             {
                 match options.name_types.get(&name.id) {
                     Some(bound @ crate::TypeInfo::HashSet(elem))
