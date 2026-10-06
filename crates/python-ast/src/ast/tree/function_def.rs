@@ -6732,10 +6732,19 @@ impl FunctionDef {
         if options.name_scope_owner == owner {
             return (symbols.clone(), options.clone());
         }
+        // The module binding must be THIS definition, not a nested one or
+        // one from another module that shares its name (Devin on #449):
+        // the same name and the same source span.
+        let is_self = |def: &FunctionDef| def.name == self.name && same_span(&def.body, &self.body);
         let module_symbols = options.module_scope_symbols.as_deref().filter(|module| {
-            match self_class {
-                Some(class) => matches!(module.get(class), Some(SymbolTableNode::ClassDef(_))),
-                None => matches!(module.get(&self.name), Some(SymbolTableNode::FunctionDef(_))),
+            match (self_class, module.get(self_class.unwrap_or(&self.name))) {
+                (Some(_), Some(SymbolTableNode::ClassDef(class))) => class.body.iter().any(|s| {
+                    matches!(&s.statement,
+                        StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f)
+                            if is_self(f))
+                }),
+                (None, Some(SymbolTableNode::FunctionDef(def))) => is_self(def),
+                _ => false,
             }
         });
         let enclosing_types = match (module_symbols, options.module_name_types.as_deref()) {
@@ -7220,4 +7229,16 @@ mod string_default_tests {
         assert!(matches!(python_int_of("٣"), StringDefault::Unsupported("non-ASCII digits in a string default")));
         assert!(matches!(python_int_of("99999999999999999999"), StringDefault::Unsupported("an int outside i64")));
     }
+}
+
+/// Whether two definition bodies cover the same source span (a module
+/// symbol holds a CLONE of the definition, so identity is positional).
+fn same_span(a: &[Statement], b: &[Statement]) -> bool {
+    let span = |body: &[Statement]| {
+        (
+            body.first().map(|s| (s.lineno, s.col_offset)),
+            body.last().map(|s| (s.end_lineno, s.end_col_offset)),
+        )
+    };
+    a.len() == b.len() && span(a) == span(b)
 }
