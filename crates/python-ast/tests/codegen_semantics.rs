@@ -28234,3 +28234,51 @@ fn a_callers_locals_do_not_type_a_callees_returns() {
         out
     );
 }
+
+#[test]
+fn a_callers_local_does_not_shadow_a_module_name_the_callee_reads() {
+    // Issue #448 (Devin review on #449): a function defined in the module
+    // reads module names in the MODULE's scope, so a caller's local of the
+    // same name must not type the callee's return.
+    //
+    // LIMITS = [7, 8]
+    // class L:
+    //     def first(self):
+    //         return [LIMITS[0], 1]
+    // def first():
+    //     return [LIMITS[0], 2]
+    // def main() -> None:
+    //     LIMITS = ["shadow"]
+    //     q = L().first()
+    //     q.append(5)
+    //     r = first()
+    //     r.append(6)
+    //     print(q, r, LIMITS)   # [7, 1, 5] [7, 2, 6] ['shadow']
+    let out = compile(
+        "LIMITS = [7, 8]\n\
+         \n\
+         \n\
+         class L:\n\
+         \x20   def first(self):\n\
+         \x20       return [LIMITS[0], 1]\n\
+         \n\
+         \n\
+         def first():\n\
+         \x20   return [LIMITS[0], 2]\n\
+         \n\
+         \n\
+         def main() -> None:\n\
+         \x20   LIMITS = [\"shadow\"]\n\
+         \x20   q = L().first()\n\
+         \x20   q.append(5)\n\
+         \x20   r = first()\n\
+         \x20   r.append(6)\n\
+         \x20   print(q, r, LIMITS)\n",
+        "callee_module_scope.py",
+    );
+    assert!(
+        out.contains("(q) . push (5)") && out.contains("(r) . push (6)"),
+        "the callees return Vec<i64>, whatever the caller's LIMITS is: {}",
+        out
+    );
+}

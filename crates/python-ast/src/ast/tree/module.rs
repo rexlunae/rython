@@ -1124,6 +1124,10 @@ impl CodeGen for Module {
             }
             options.name_types = std::rc::Rc::new(nt);
         }
+        // Issue #448: the module scope a callee's return inference starts
+        // from, whichever function asks.
+        options.module_scope_symbols = Some(std::rc::Rc::new(symbols.clone()));
+        options.module_name_types = Some(options.name_types.clone());
         // Module-level aliasing (`b = a` on a container, later mutated) is
         // the same divergence the function-level guard rejects (issue #79).
         crate::check_aliasing(

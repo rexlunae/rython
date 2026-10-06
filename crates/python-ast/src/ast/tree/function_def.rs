@@ -6076,7 +6076,7 @@ impl FunctionDef {
         options: &crate::PythonOptions,
         self_class: Option<&str>,
     ) -> Option<TokenStream> {
-        let (symbols, options) = &self.own_scope(symbols, options);
+        let (symbols, options) = &self.own_scope(self_class, symbols, options);
         // A bare `str` annotation is authoritative: the inferred type for a
         // literal-returning body (`&'static str`) is a Rust literal artifact,
         // not the Python type, and the mismatch breaks every call site
@@ -6240,7 +6240,7 @@ impl FunctionDef {
         };
         let instance_method =
             self_class.is_some() && !decorated("classmethod") && !decorated("staticmethod");
-        let (symbols, options) = &self.own_scope(symbols, options);
+        let (symbols, options) = &self.own_scope(self_class, symbols, options);
         let mut types = (*options.name_types).clone();
         let params = self.args.posonlyargs.iter().chain(self.args.args.iter());
         for (i, p) in params.chain(self.args.kwonlyargs.iter()).enumerate() {
@@ -6709,13 +6709,22 @@ impl FunctionDef {
     /// table. A caller's `s = {1, 2}` typed the callee's `return {s: 1}`
     /// as a set-keyed dict while the callee's own signature said
     /// `PyDict<String, i64>`. Unless the options already belong to this
-    /// body (the function generator marks them), the view keeps what the
-    /// body itself sees: of the name types, the module statics it does
-    /// not rebind (the merge its own lowering performs,
-    /// `merge_module_static_types`); in the symbol table, its own local
-    /// bindings over the enclosing ones, as its lowering registers them.
+    /// body (the function generator marks them), the view is what the
+    /// body itself sees.
+    ///
+    /// A function defined in the module being lowered (a module function,
+    /// or a method of a module class: `self_class`) starts from the
+    /// MODULE's scope, which the module generator records: its symbol
+    /// table and, of its name types, the statics the body does not rebind
+    /// (the merge its own lowering performs, `merge_module_static_types`).
+    /// A caller's local that shadows a module name is then invisible, as
+    /// in Python. Anything else (a nested closure, whose enclosing
+    /// function is the caller, or a definition from another module, whose
+    /// symbols the caller passes) starts from the incoming scope. The
+    /// body's own bindings go over either.
     fn own_scope(
         &self,
+        self_class: Option<&str>,
         symbols: &crate::SymbolTableScopes,
         options: &crate::PythonOptions,
     ) -> (crate::SymbolTableScopes, crate::PythonOptions) {
@@ -6723,9 +6732,18 @@ impl FunctionDef {
         if options.name_scope_owner == owner {
             return (symbols.clone(), options.clone());
         }
+        let module_symbols = options.module_scope_symbols.as_deref().filter(|module| {
+            match self_class {
+                Some(class) => matches!(module.get(class), Some(SymbolTableNode::ClassDef(_))),
+                None => matches!(module.get(&self.name), Some(SymbolTableNode::FunctionDef(_))),
+            }
+        });
+        let enclosing_types = match (module_symbols, options.module_name_types.as_deref()) {
+            (Some(_), Some(module_types)) => module_types,
+            _ => options.name_types.as_ref(),
+        };
         let bound = crate::ast::tree::closure::scope_binding_names(&self.args, &self.body);
-        let types: std::collections::HashMap<String, crate::TypeInfo> = options
-            .name_types
+        let types: std::collections::HashMap<String, crate::TypeInfo> = enclosing_types
             .iter()
             .filter(|(n, _)| options.mutable_statics.contains_key(*n) && !bound.contains(*n))
             .map(|(n, t)| (n.clone(), t.clone()))
@@ -6743,7 +6761,7 @@ impl FunctionDef {
         view.called_params = Default::default();
         view.empty_pinned = Default::default();
         view.name_scope_owner = owner;
-        let mut scope = symbols.clone();
+        let mut scope = module_symbols.unwrap_or(symbols).clone();
         scope.new_scope();
         for s in &self.body {
             scope = s.clone().find_symbols(scope);
@@ -6757,7 +6775,8 @@ impl FunctionDef {
         symbols: &crate::SymbolTableScopes,
         options: &crate::PythonOptions,
     ) -> Option<crate::TypeInfo> {
-        let (symbols, options) = &self.own_scope(symbols, options);
+        let class = ctx.and_then(|c| c.enclosing_class_name());
+        let (symbols, options) = &self.own_scope(class, symbols, options);
         let mut returns = Vec::new();
         crate::ast::tree::specialize::collect_return_exprs(&self.body, &mut returns);
         if returns.is_empty() {
