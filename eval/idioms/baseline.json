@@ -18,6 +18,9 @@
     "callback_registry": {
       "status": "pass"
     },
+    "callee_scope": {
+      "status": "pass"
+    },
     "clauses": {
       "status": "pass"
     },

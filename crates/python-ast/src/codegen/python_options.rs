@@ -676,6 +676,15 @@ pub struct PythonOptionsData {
     /// `clone_str_attribute_returns` by the function generator.
     pub str_literal_locals: std::rc::Rc<std::collections::HashSet<String>>,
 
+    /// The function whose body these options are lowering (its body's
+    /// buffer address; 0 outside any function), set by the function
+    /// generator. Return inference compares it with the function it types
+    /// (issue #448): the name-scoped fields here belong to THIS function,
+    /// so a different function's returns — a callee typed from a call
+    /// site — must not read them; a caller's `s = {1, 2}` is not the
+    /// callee's `s = "k"`.
+    pub name_scope_owner: usize,
+
     /// Rust modules available to `import` / `from ... import` as
     /// compile-time bindings, keyed by the Python-side import name. The
     /// frontend (rypip / rythonc) populates this from the `rython.toml`
@@ -891,6 +900,7 @@ impl Default for PythonOptionsData {
             refused_closures: std::rc::Rc::new(std::collections::HashMap::new()),
             uncallable_params: std::rc::Rc::new(std::collections::HashMap::new()),
             str_literal_locals: std::rc::Rc::new(std::collections::HashSet::new()),
+            name_scope_owner: 0,
             rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),
             module_defs: std::rc::Rc::new(std::collections::HashMap::new()),
