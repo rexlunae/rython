@@ -117,11 +117,21 @@ def run_logged(cmd, log: Path, *, cwd=None, timeout=1800, env=None):
             raise
 
 
-def write_probe(pkg_root: Path, name: str, requirement: str) -> None:
+def write_probe(pkg_root: Path, name: str, requirement: str, pins=()) -> None:
+    """Write a one-dependency project that imports the package under test.
+
+    `pins` are corpus requirements listed AHEAD of `requirement`: rypip
+    resolves each listed dependency's tree in order and the first version
+    of an import name wins, so a pin fixes the version a transitive
+    dependency resolves to. Without it, rypip picks the newest PyPI release
+    satisfying the dependent's specifier (or whichever one happens to be
+    cached), and the measurement drifts with PyPI and the cache.
+    """
     pkg_root.mkdir(parents=True, exist_ok=True)
+    deps = ", ".join(f'"{r}"' for r in [*pins, requirement])
     (pkg_root / "pyproject.toml").write_text(
         f'[project]\nname = "probe"\nversion = "0.1.0"\n'
-        f'dependencies = ["{requirement}"]\n'
+        f'dependencies = [{deps}]\n'
     )
     pkg_dir = pkg_root / name.replace("-", "_")
     pkg_dir.mkdir(exist_ok=True)
@@ -206,12 +216,28 @@ def parse_build(lines, crate: Path, build_status: int, rendered_log) -> dict:
     }
 
 
-def sweep_one(spec: dict, rypip: Path, workdir: Path, timeout=1800) -> dict:
+def dependency_pins(spec: dict, corpus: list) -> list:
+    """The corpus requirements `spec["pin_dependencies"]` names, in order.
+
+    A name outside the corpus is an error, not a silently unpinned dependency.
+    """
+    by_name = {s["name"]: s["requirement"] for s in corpus}
+    names = spec.get("pin_dependencies", [])
+    unknown = [n for n in names if n not in by_name or n == spec["name"]]
+    if unknown:
+        raise ValueError(f"{spec['name']}: pin_dependencies names {', '.join(unknown)}, "
+                         "which must be other packages in packages.json")
+    return [by_name[n] for n in names]
+
+
+def sweep_one(spec: dict, rypip: Path, workdir: Path, timeout=1800, pins=()) -> dict:
     name = spec["name"]
     crate = workdir / f"crate-{name}"
     probe = workdir / f"probe-{name}"
     result = {"package": name, "requirement": spec["requirement"], "total": None}
-    write_probe(probe, name, spec["requirement"])
+    if pins:
+        result["dependency_pins"] = list(pins)
+    write_probe(probe, name, spec["requirement"], pins)
     phase = "convert"
     try:
         convert_log = workdir / f"{name}-convert.log"
@@ -253,6 +279,10 @@ def main() -> int:
     if args.jobs < 1 or args.timeout <= 0:
         ap.error("--jobs and --timeout must be positive")
     specs = json.loads((Path(__file__).resolve().parent / "packages.json").read_text())["packages"]
+    try:
+        pins = {s["name"]: dependency_pins(s, specs) for s in specs}
+    except ValueError as exc:
+        ap.error(str(exc))
     if args.package:
         unknown = set(args.package) - {s["name"] for s in specs}
         if unknown:
@@ -276,7 +306,7 @@ def main() -> int:
     started = time.time()
     results = {}
     with ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        futures = {ex.submit(sweep_one, s, rypip, workdir, args.timeout): s for s in specs}
+        futures = {ex.submit(sweep_one, s, rypip, workdir, args.timeout, pins[s["name"]]): s for s in specs}
         for fut, spec in futures.items():
             try:
                 results[spec["name"]] = fut.result()
