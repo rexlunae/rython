@@ -3350,6 +3350,26 @@ impl<'a> CodeGen for Call {
                     {
                         tokens = quote!((#tokens).to_vec());
                     }
+                    // A SET argument to an order-independent slice builtin
+                    // (`sorted(s)`, `min(s)`, `max(s)`): its elements as a
+                    // Vec (a HashSet is not a slice). Only these three: the
+                    // result does not depend on iteration order, which
+                    // differs from CPython's for a Rust HashSet — the
+                    // order-dependent builtins (`list(s)`, `enumerate(s)`)
+                    // stay a loud build error.
+                    if matches!(
+                        crate::ast::tree::collections_types::SliceBuiltin::from_name(bname),
+                        Some(
+                            crate::ast::tree::collections_types::SliceBuiltin::Sorted
+                                | crate::ast::tree::collections_types::SliceBuiltin::Min
+                                | crate::ast::tree::collections_types::SliceBuiltin::Max
+                        )
+                    ) && matches!(
+                        crate::infer_type(Some(&ctx), arg, &options, &symbols),
+                        crate::TypeInfo::HashSet(_)
+                    ) {
+                        tokens = quote!((#tokens).iter().cloned().collect::<Vec<_>>());
+                    }
                     rendered.push(tokens);
                 }
                 let unexpected = |kw: Option<&str>| -> Box<dyn std::error::Error> {
@@ -9994,6 +10014,43 @@ let mutating_self_field = boxed_self_ref_receiver
                             return Ok(quote!((#receiver).py_setdefault(#key, #default)));
                         }
                         return Ok(quote!((#receiver).py_setdefault(#key, #default)));
+                    }
+                    // set.add(x) / set.discard(x) / set.remove(x) on a
+                    // HashSet receiver: HashSet has no add/discard, and its
+                    // inherent remove returns a bool where Python's raises
+                    // KeyError for a missing element. The element renders
+                    // against the set's element type (a str literal owns
+                    // itself into a HashSet<String>); each call is a unit
+                    // statement, as Python's None-returning methods are.
+                    ("add" | "discard" | "remove", [_])
+                        if matches!(
+                            crate::infer_type(Some(&ctx), &attr.value, &options, &symbols),
+                            crate::TypeInfo::HashSet(_)
+                        ) =>
+                    {
+                        let crate::TypeInfo::HashSet(elem) =
+                            crate::infer_type(Some(&ctx), &attr.value, &options, &symbols)
+                        else {
+                            unreachable!("guarded above");
+                        };
+                        let expected = if crate::ast::tree::type_ctx::type_mentions_pyobject(&elem) {
+                            None
+                        } else {
+                            Some(*elem)
+                        };
+                        let value = crate::render_typed_reused(
+                            &self.args[0],
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            expected,
+                        )?;
+                        let runtime = crate::safe_ident(&options.stdpython);
+                        return Ok(match attr.attr.as_str() {
+                            "add" => quote!({ (#receiver).insert(#value); }),
+                            "discard" => quote!({ (#receiver).remove(&(#value)); }),
+                            _ => quote!(#runtime::py_set_remove(&mut (#receiver), &(#value))?),
+                        });
                     }
                     // list.remove(x) removes by VALUE and raises ValueError;
                     // Vec::remove removes by index — silently different. A

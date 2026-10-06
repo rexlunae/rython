@@ -126,7 +126,13 @@
     "schedule": {
       "status": "convert-failed"
     },
+    "set_ops": {
+      "status": "pass"
+    },
     "shapes": {
+      "status": "pass"
+    },
+    "str_local_returns": {
       "status": "pass"
     },
     "sumprod_pairs": {

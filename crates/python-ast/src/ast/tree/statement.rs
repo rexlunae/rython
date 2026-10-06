@@ -1144,7 +1144,30 @@ impl CodeGen for StatementType {
                         | crate::TypeInfo::Bool)) => Some(t.clone()),
                         _ => None,
                     };
+                    // A set literal or an empty `set()` returned into a
+                    // typed SET slot (`return {"a", "b"}` from a `-> set[
+                    // str]` function): the slot types the elements (a str
+                    // literal owns itself) and the empty set.
+                    let set_return = match options.fn_return_typed.as_ref() {
+                        Some(t @ crate::TypeInfo::HashSet(_))
+                            if matches!(e.value, ExprType::Set(_))
+                                || crate::ast::tree::type_ctx::is_empty_set_call(
+                                    &e.value, &symbols,
+                                ) =>
+                        {
+                            Some(t.clone())
+                        }
+                        _ => None,
+                    };
                     let tokens = if let (ExprType::IfExp(_), Some(slot)) = (&e.value, scalar_return) {
+                        crate::render_typed(
+                            &e.value,
+                            ctx.clone(),
+                            options.clone(),
+                            symbols.clone(),
+                            Some(slot),
+                        )?
+                    } else if let Some(slot) = set_return {
                         crate::render_typed(
                             &e.value,
                             ctx.clone(),

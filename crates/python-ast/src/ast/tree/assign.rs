@@ -417,10 +417,33 @@ impl<'a> CodeGen for Assign {
                     std::rc::Rc::new(Some(((**k).clone(), (**v).clone())));
             }
         }
-        let mut value = self
-            .value
-            .clone()
-            .to_rust(ctx.clone(), value_options, symbols.clone())?;
+        // `out: set[str] = set()` — an empty `set()` bound to a name whose
+        // final type is a typed set: the binding's type names the element
+        // type the bare call cannot (otherwise the boxed None of the
+        // empty-set divergence). Decided before the plain lowering, which
+        // would record that divergence's warning for a store that has none.
+        let empty_typed_set = match self.targets.as_slice() {
+            [ExprType::Name(name)]
+                if crate::ast::tree::type_ctx::is_empty_set_call(&value_expr, &symbols) =>
+            {
+                match options.name_types.get(&name.id) {
+                    Some(bound @ crate::TypeInfo::HashSet(elem))
+                        if !crate::type_mentions_pyobject(elem) =>
+                    {
+                        Some(bound.clone())
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let mut value = if let Some(bound) = empty_typed_set {
+            crate::render_typed(&value_expr, ctx.clone(), options.clone(), symbols.clone(), Some(bound))?
+        } else {
+            self.value
+                .clone()
+                .to_rust(ctx.clone(), value_options, symbols.clone())?
+        };
 
         // `d = deque()` / `dd = defaultdict(int)` / `od = OrderedDict()`
         // bound to a name whose FINAL type is known (an annotation, or

@@ -2489,6 +2489,41 @@ pub fn render_typed(
         let ty = elem.to_rust_type();
         return Ok(quote!(stdpython::PyTuple::<#ty>(vec![#(#elts),*])));
     }
+    // An empty `set()` into a typed set slot (`out: set[str] = set()`,
+    // `return set()` from a `-> set[int]` function): the slot names the
+    // element type the bare call cannot, so it builds the empty typed set
+    // instead of the boxed None of the empty-set divergence.
+    if let Some(TypeInfo::HashSet(elem)) = &expected
+        && is_empty_set_call(expr, &symbols)
+        && !type_mentions_pyobject(elem)
+    {
+        let ty = elem.to_rust_type();
+        return Ok(quote!(std::collections::HashSet::<#ty>::new()));
+    }
+    // A non-empty set LITERAL into a typed set slot (`return {"b", "a"}`
+    // from a `-> set[str]` function): each element renders against the
+    // element type, so a str literal owns itself where the slot holds
+    // Strings (a bare literal set builds `HashSet<&str>`).
+    if let (ExprType::Set(s), Some(TypeInfo::HashSet(elem))) = (expr, &expected)
+        && !s.elts.is_empty()
+        && !matches!(elem.as_ref(), TypeInfo::PyObject)
+    {
+        let elts = s
+            .elts
+            .iter()
+            .map(|e| {
+                render_typed_reused(
+                    e,
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                    Some((**elem).clone()),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let ty = elem.to_rust_type();
+        return Ok(quote!(std::collections::HashSet::<#ty>::from([#(#elts),*])));
+    }
     // A tuple LITERAL into a fixed-shape tuple slot of its own arity
     // (`return "", 0` from a `-> tuple[str, int]` function — idna's
     // codec): each member renders against its slot, so a str literal
@@ -2642,6 +2677,21 @@ pub fn render_typed(
             Some(crate::TypeInfo::Bytes) => crate::TypeInfo::Bytes,
             Some(crate::TypeInfo::PyValueMember(inner)) => (**inner).clone(),
             Some(t) => t.clone(),
+            // A local bound only to a string literal (`s = "v"`) is
+            // recorded as `str` → String, but its emitted binding is the
+            // literal's `&'static str` (rustc infers it from `s = "v";`).
+            // Into a String slot (`return [s]` against `Vec<String>`,
+            // `{"k": s}` against `PyDict<String, String>`) the read must
+            // own, exactly as a literal does. Only when the recorded type
+            // is String: `.to_string()` is then correct whichever of the
+            // two the binding really is, and never stringifies a non-str.
+            None if options.str_literal_locals.contains(&n.id)
+                && matches!(actual, crate::TypeInfo::String)
+                && matches!(expected, crate::TypeInfo::String)
+                && !options.owned_str_literals.contains(&n.id) =>
+            {
+                crate::TypeInfo::StrRef
+            }
             None => actual,
         },
         _ => actual,
@@ -2710,6 +2760,16 @@ pub fn render_typed(
             Ok(tokens)
         }
     }
+}
+
+/// Whether `expr` is the builtin `set()` call with no arguments (the
+/// empty set, whose element type only its slot can name).
+pub(crate) fn is_empty_set_call(expr: &ExprType, symbols: &SymbolTableScopes) -> bool {
+    matches!(expr, ExprType::Call(c)
+        if matches!(c.func.as_ref(), ExprType::Name(f) if f.id == "set")
+            && c.args.is_empty()
+            && c.keywords.is_empty())
+        && symbols.get("set").is_none()
 }
 
 /// Whether `expr` is a `self.<field>` read whose field type is

@@ -27948,3 +27948,131 @@ fn a_returned_list_of_string_literals_is_owned_but_a_tuple_stays_a_str_ref() {
         out
     );
 }
+
+#[test]
+fn a_str_literal_local_owns_where_a_returned_literal_holds_strings() {
+    // `s = "v"` binds a `&'static str` (rustc infers it from the literal)
+    // while the recorded type is `str` → String: into a String slot of a
+    // returned list or dict literal the read owns, exactly as a literal
+    // does. A tuple slot keeps the `&'static str` (no ownership).
+    let out = compile(
+        "class C:\n\
+         \x20   def tags(self):\n\
+         \x20       s = \"v\"\n\
+         \x20       return [s, \"w\"]\n\
+         \n\
+         \x20   def mapping(self):\n\
+         \x20       s = \"v\"\n\
+         \x20       return {\"k\": s}\n\
+         \n\
+         \x20   def keyed(self):\n\
+         \x20       s = \"k\"\n\
+         \x20       return {s: 1}\n\
+         \n\
+         \n\
+         def top():\n\
+         \x20   s = \"x\"\n\
+         \x20   return [s]\n\
+         \n\
+         \n\
+         def pair():\n\
+         \x20   s = \"x\"\n\
+         \x20   return (s, s)\n",
+        "str_local_slots.py",
+    );
+    assert!(
+        out.contains("vec ! [(s) . to_string () , (\"w\") . to_string ()]"),
+        "list element owns the literal local: {}",
+        out
+    );
+    assert!(
+        out.contains("PyDict :: from ([((\"k\") . to_string () , (s) . to_string ())])"),
+        "dict value owns the literal local: {}",
+        out
+    );
+    assert!(
+        out.contains("PyDict :: from ([((s) . to_string () , 1)])"),
+        "dict key owns the literal local: {}",
+        out
+    );
+    assert!(out.contains("vec ! [(s) . to_string ()]"), "free function: {}", out);
+    assert!(
+        !out.contains("return Ok (((s) . to_string ()"),
+        "a tuple of literal locals keeps &'static str: {}",
+        out
+    );
+}
+
+#[test]
+fn a_typed_set_slot_types_the_empty_set_and_owns_literal_elements() {
+    // `out: set[str] = set()` and `return set()` from a `-> set[int]`
+    // function build the typed empty set (not the boxed None of the
+    // empty-set divergence); a set literal returned from `-> set[str]`
+    // owns its str literals (a bare literal set is HashSet<&str>).
+    let (out, warnings) = compile_with_warnings(
+        "def words(text: str) -> set[str]:\n\
+         \x20   out: set[str] = set()\n\
+         \x20   for w in text.split():\n\
+         \x20       out.add(w)\n\
+         \x20   return out\n\
+         \n\
+         \n\
+         def none() -> set[int]:\n\
+         \x20   return set()\n\
+         \n\
+         \n\
+         def letters() -> set[str]:\n\
+         \x20   return {\"b\", \"a\"}\n",
+        "typed_sets.py",
+    );
+    assert!(
+        out.contains("out = std :: collections :: HashSet :: < String > :: new ()"),
+        "annotated empty set: {}",
+        out
+    );
+    assert!(
+        out.contains("return Ok (std :: collections :: HashSet :: < i64 > :: new ())"),
+        "returned empty set: {}",
+        out
+    );
+    assert!(
+        out.contains(
+            "std :: collections :: HashSet :: < String > :: from ([(\"b\") . to_string () , (\"a\") . to_string ()])"
+        ),
+        "returned set literal owns its elements: {}",
+        out
+    );
+    assert!(
+        !warnings.iter().any(|w| w.contains("empty-set divergence")),
+        "a typed empty set is no divergence: {:?}",
+        warnings
+    );
+}
+
+#[test]
+fn set_add_discard_remove_lower_to_python_semantics() {
+    // HashSet has no add/discard, and its inherent remove answers a bool
+    // where Python's raises KeyError: add/discard are unit statements
+    // (Python's None) and remove routes through py_set_remove.
+    let out = compile(
+        "def f() -> None:\n\
+         \x20   s = {1, 2}\n\
+         \x20   s.add(3)\n\
+         \x20   s.discard(9)\n\
+         \x20   s.remove(1)\n\
+         \x20   print(sorted(s), min(s), max(s), len(s))\n",
+        "set_methods.py",
+    );
+    assert!(out.contains("{ (s) . insert (3) ; }"), "add: {}", out);
+    assert!(out.contains("{ (s) . remove (& (9)) ; }"), "discard: {}", out);
+    assert!(
+        out.contains("py_set_remove (& mut (s) , & (1)) ?"),
+        "remove raises KeyError: {}",
+        out
+    );
+    assert!(
+        out.contains("sorted (& ((s) . iter () . cloned () . collect :: < Vec < _ >> ()))"),
+        "sorted over a set collects its elements: {}",
+        out
+    );
+}

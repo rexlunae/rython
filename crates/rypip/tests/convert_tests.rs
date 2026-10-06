@@ -21154,3 +21154,89 @@ fn numpy_scalar_comparisons_masks_where_and_std_match_numpy_at_runtime() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn str_literal_locals_and_typed_sets_build_and_run() {
+    // The #443 follow-ups (issue #137): a string-literal local returned
+    // inside a list/dict literal owns into the String slot, and a typed
+    // set supports `set()`, add/discard/remove (KeyError), len, and
+    // sorted/min/max. Each printed line observes state after a mutation.
+    // Verified against python3.
+    let scratch = Scratch::new("str-locals-sets");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Labeler:\n",
+            "    def tags(self):\n",
+            "        s = \"v\"\n",
+            "        return [s, \"w\"]\n",
+            "\n",
+            "    def keyed(self):\n",
+            "        s = \"k\"\n",
+            "        return {s: 1}\n",
+            "\n",
+            "\n",
+            "def words(text: str) -> set[str]:\n",
+            "    out: set[str] = set()\n",
+            "    for w in text.split():\n",
+            "        out.add(w)\n",
+            "    return out\n",
+            "\n",
+            "\n",
+            "def letters() -> set[str]:\n",
+            "    return {\"b\", \"a\"}\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    lab = Labeler()\n",
+            "    t = lab.tags()\n",
+            "    t.append(\"z\")\n",
+            "    print(t)\n",
+            "    k = lab.keyed()\n",
+            "    k[\"k\"] += 4\n",
+            "    print(k)\n",
+            "    s = words(\"the cat and the hat\")\n",
+            "    s.add(\"zebra\")\n",
+            "    s.discard(\"cat\")\n",
+            "    print(len(s), sorted(s), min(s), max(s))\n",
+            "    ls = letters()\n",
+            "    ls.add(\"a\")\n",
+            "    print(len(ls), sorted(ls))\n",
+            "    try:\n",
+            "        ls.remove(\"zz\")\n",
+            "    except KeyError as e:\n",
+            "        print(\"missing\", e)\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stdout,
+        concat!(
+            "['v', 'w', 'z']\n",
+            "{'k': 5}\n",
+            "4 ['and', 'hat', 'the', 'zebra'] and zebra\n",
+            "2 ['a', 'b']\n",
+            "missing 'zz'\n",
+        ),
+        "stderr: {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0));
+}

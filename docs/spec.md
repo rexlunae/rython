@@ -2137,7 +2137,14 @@ exception message (`raise ClosedPoolError(self)` — urllib3) declares
 generated impl, so the bound is always satisfiable (round 41).
 Deliberate hole: **sets have no `repr`** — printing a set would expose
 unordered iteration, so it is a compile error rather than
-nondeterministic output.
+nondeterministic output. On a typed set, `add`/`discard` are unit
+statements (Python's None), `remove` raises CPython's `KeyError` with
+the element's repr, `len` counts members, and the order-independent
+`sorted`/`min`/`max` take the set's elements; an empty `set()` into a
+typed slot (`out: set[str] = set()`, `return set()` from `-> set[T]`)
+builds the typed empty set. Iterating a set (`for x in s`, `list(s)`)
+still runs in Rust's HashSet order — a silent divergence filed as
+issue #444.
 
 ### 10.2 Modules
 
@@ -2732,6 +2739,7 @@ accepted as permanent spec:
 | `deque.index(x)` lowers through the shared list-ops arm and raises `ValueError: deque.index(x): x not in deque` (the 3.14 wording the list arm pinned), where CPython 3.12/3.13 say `9 is not in deque` — the wording `deque.remove` and the inherent `deque::index(x, start, stop)` already use. The exception TYPE agrees | Documented version choice, pinned in `python_semantics.rs`; the list arm's wording is the project-wide pin |
 | `unicodedata` answers from the Unicode 16.0.0 database — CPython 3.14's `unidata_version` — for every CPython: an older CPython carries an older database (3.12: 15.0.0, 3.13: 15.1.0), so a code point assigned or re-classified since answers differently there (`category`, `bidirectional`, `combining`, `name`, `normalize`). Code points assigned before 15.0 agree | Model limit (issue #334); a per-CPython database would need one table set per version |
 | Unpacking's ValueError text is CPython 3.11–3.13's: `too many values to unpack (expected 2)`. CPython 3.14 appends the length for a sized sequence (`(expected 2, got 3)` for a tuple, list or dict; not for a str). `not enough values to unpack (expected 2, got 1)` and `cannot unpack non-iterable int object` agree across versions | Model limit; one message set, pinned to the 3.11 transcripts |
+| Iterating a set (`for x in s`, `list(s)`, a comprehension over one) runs in Rust's randomized `HashSet` order, not CPython's — different and nondeterministic output. Printing a set is a compile error, but iteration is not | Defect, issue #444 |
 | True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |
 | Exception message shapes: `int()`'s message carries "with base 10" and `float()`'s quotes the string as Python's repr (#339, round 10); `open` and stream errors are CPython's `[Errno N] text: 'path'` form (#339); the `KeyError` key quoting is single-quoted like CPython (round 99) | Correct (was a defect class in issue #82's family) |
 | An uncaught exception on the direct-`main` entry path prints Rust's `Debug` form instead of `Type: message` (exit code 1 either way) | Defect (cosmetic) |
