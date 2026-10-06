@@ -21242,3 +21242,107 @@ fn str_literal_locals_and_typed_sets_build_and_run() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn a_mutation_through_a_getter_reaches_the_held_object() {
+    // Issue #440: a class a method or property hands back out of a field
+    // (`return self.kid`) was a plain value, so the getter returned a
+    // clone and every mutation through it was lost (`[1, 2]` three times
+    // for CPython's `[1]` / `[1, 9]` / `[1, 9, 7]`). The returned object is
+    // the holder's, so the class is shared: the property, the method, a
+    // local bound to the property, a store through the property, and a
+    // container call through the holder's field all reach the one object.
+    let got = run_global_alias_program(
+        "gettermutation",
+        "getter_mutation.py",
+        concat!(
+            "class Child:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items: list[int] = [1, 2]\n",
+            "        self.n = 0\n",
+            "\n",
+            "\n",
+            "class Holder:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.kid = Child()\n",
+            "\n",
+            "    @property\n",
+            "    def child(self) -> Child:\n",
+            "        return self.kid\n",
+            "\n",
+            "    def get_child(self) -> Child:\n",
+            "        return self.kid\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    h = Holder()\n",
+            "    h.child.items.pop()\n",
+            "    print(h.child.items)\n",
+            "    h.get_child().items.append(9)\n",
+            "    print(h.kid.items)\n",
+            "    c = h.child\n",
+            "    c.items.append(7)\n",
+            "    print(h.kid.items)\n",
+            "    h.child.n += 4\n",
+            "    h.get_child().n = h.child.n + 1\n",
+            "    h.kid.items.append(3)\n",
+            "    print(h.kid.n, c.n, h.kid.items)\n",
+            "    print(c is h.kid, h.get_child() is h.child)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    // Verified against python3.
+    assert_eq!(
+        got,
+        vec!["[1]", "[1, 9]", "[1, 9, 7]", "5 5 [1, 9, 7, 3]", "True True"]
+    );
+}
+
+#[test]
+fn a_mutating_call_through_an_unannotated_getter_reaches_the_held_object() {
+    // Issue #440 (Devin review on #447): `def get(self): return
+    // self.counter` carries no return annotation, so `b.get().bump(2)`
+    // could not resolve `bump` and failed in rustc (on main it printed a
+    // stale `0`). The method's returned receiver field names the class.
+    let got = run_global_alias_program(
+        "unannotatedgetter",
+        "unannotated_getter.py",
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.n = 0\n",
+            "        self.log: list[str] = []\n",
+            "\n",
+            "    def bump(self, k: int) -> None:\n",
+            "        self.n += k\n",
+            "        self.log.append(f\"+{k}\")\n",
+            "\n",
+            "\n",
+            "class Box:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.counter = Counter()\n",
+            "\n",
+            "    def get(self):\n",
+            "        return self.counter\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    b = Box()\n",
+            "    b.get().bump(2)\n",
+            "    g = b.get()\n",
+            "    g.bump(5)\n",
+            "    b.get().log.append(\"x\")\n",
+            "    print(b.counter.n, b.counter.log)\n",
+            "    print(g is b.counter)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    // Verified against python3.
+    assert_eq!(got, vec!["7 ['+2', '+5', 'x']", "True"]);
+}

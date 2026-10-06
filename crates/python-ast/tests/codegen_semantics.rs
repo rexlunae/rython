@@ -28121,3 +28121,59 @@ fn a_keyed_min_max_sorted_over_a_set_is_not_lowered() {
         out
     );
 }
+
+/// Issue #440, no over-widening: a class a getter returns out of a field
+/// but that nothing mutates stays a plain value, and a mutated class a
+/// method only CONSTRUCTS (`return Fresh()`, a new object, not a second
+/// handle) stays unshared. The class a getter returns and something
+/// mutates takes the shared representation. (`Frozen`'s field is named
+/// apart: a store through an untyped receiver, `k.kid().v = 2`, counts for
+/// every class with a `v` field — the documented over-approximation.)
+#[test]
+fn a_getter_returned_class_is_shared_only_when_mutated() {
+    let out = compile(
+        concat!(
+            "class Frozen:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.w = 3\n",
+            "\n",
+            "class Fresh:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.v = 0\n",
+            "\n",
+            "class Kid:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.v = 0\n",
+            "\n",
+            "class Keeper:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.f = Frozen()\n",
+            "        self.k = Kid()\n",
+            "\n",
+            "    @property\n",
+            "    def frozen(self) -> Frozen:\n",
+            "        return self.f\n",
+            "\n",
+            "    def kid(self) -> Kid:\n",
+            "        return self.k\n",
+            "\n",
+            "    def fresh(self) -> Fresh:\n",
+            "        return Fresh()\n",
+            "\n",
+            "def run() -> int:\n",
+            "    k = Keeper()\n",
+            "    k.kid().v = 2\n",
+            "    x = k.fresh()\n",
+            "    x.v = 5\n",
+            "    return k.frozen.w + x.v\n",
+        ),
+        "no_widen_440.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        !flat.contains("PyRef<Frozen>") && !flat.contains("PyRef<Fresh>"),
+        "neither unmutated nor freshly constructed classes are shared: {}",
+        out
+    );
+    assert!(flat.contains("PyRef<Kid>"), "the mutated returned class is shared: {}", out);
+}

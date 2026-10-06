@@ -992,6 +992,17 @@ pub(crate) fn to_rust_place_expr(
                 }
                 return Ok(quote!(#value_tokens::#attr_path));
             }
+            // A PROPERTY GETTER that hands back a SHARED instance
+            // (`h.child` where `def child(self) -> Child: return
+            // self.kid`): the getter's `PyRef` is another handle to the
+            // one object, so the read IS the place a store or a mutating
+            // call borrows through (issue #440). The getter is the only
+            // way to reach it — `h.child` names no field.
+            if attribute_read_is_call(attr, ctx, symbols, options)
+                && shared_receiver(expr, ctx, symbols, options)
+            {
+                return expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone());
+            }
             // The receiver must itself be a place. `class_field_access`
             // only rewrites a receiver that is BARE `self` (its `is_self`
             // test), so a chain like `self.inner.x` resolves `x` against
@@ -1103,6 +1114,10 @@ pub(crate) fn chain_root_is_self(expr: &ExprType) -> bool {
 /// a mutation through it must render the chain as a place — the field
 /// through the mutable borrow — never through the read's clone of the
 /// field (`a.items.append(x)`, `a.center.bump()`; Devin review on #321).
+/// The shared instance may sit anywhere on the chain, not only at its
+/// root: `h.kid.items.append(x)` where `h` is a plain value holding a
+/// shared `kid`, or `h.child.items.pop()` through a property getter that
+/// hands back the held object (issue #440).
 pub(crate) fn chain_root_is_shared_instance(
     expr: &ExprType,
     ctx: &CodeGenContext,
@@ -1112,14 +1127,16 @@ pub(crate) fn chain_root_is_shared_instance(
     let ExprType::Attribute(a) = expr else {
         return false;
     };
-    let mut root = a.value.as_ref();
-    while let ExprType::Attribute(inner) = root {
-        root = inner.value.as_ref();
+    let mut recv = a.value.as_ref();
+    loop {
+        if shared_receiver(recv, ctx, symbols, options) {
+            return true;
+        }
+        match recv {
+            ExprType::Attribute(inner) => recv = inner.value.as_ref(),
+            _ => return false,
+        }
     }
-    if crate::ast::tree::visit::is_self(root) {
-        return false;
-    }
-    shared_receiver(root, ctx, symbols, options)
 }
 
 pub(crate) fn chain_root_is_narrowed_class(expr: &ExprType, options: &PythonOptions) -> bool {

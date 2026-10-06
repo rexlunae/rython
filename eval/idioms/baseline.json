@@ -51,6 +51,9 @@
     "fsum_compensation": {
       "status": "pass"
     },
+    "getter_mutation": {
+      "status": "pass"
+    },
     "global_alias_holders": {
       "status": "pass"
     },

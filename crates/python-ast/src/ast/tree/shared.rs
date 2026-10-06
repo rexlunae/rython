@@ -1,6 +1,7 @@
 //! The SHARED classes of the crate (issue #137, the aliasing
 //! representation): a class whose instances are stored in a container or
 //! held by a parameter (issue #414 — a parameter binds the caller's object)
+//! or handed back out of a field by a method or property (issue #440)
 //! anywhere in the crate AND mutated after construction anywhere in the
 //! crate holds its state behind `stdpython::PyRef<T>` (`Rc<RefCell<T>>`),
 //! so a local fetched from the container, the container slot, and every
@@ -190,6 +191,11 @@ pub fn compute_shared(
         // (the singleton pattern, issue #422): every handle the getter
         // returns is another reference to the one object.
         stored.extend(crate::ast::tree::module::module_global_held_classes(body, symbols, opts));
+        // A method or property that hands back an object out of a FIELD
+        // (`return self.kid`) gives its caller a second handle to the
+        // holder's object (issue #440): `h.child.items.pop()` mutates the
+        // `Child` that `h` holds.
+        collect_returned_field_holders(body, symbols, opts, &mut stored);
         collect_external_store_fields(body, &Env::default(), symbols, opts, &mut external_stores);
     };
     register(this_body, this_classes.to_vec(), this_symbols, options);
@@ -473,6 +479,74 @@ fn collect_parameter_holders(
                     out.insert(crate::ast::tree::hierarchy::canonical_class_name(&c, symbols));
                 }
             }
+        }
+        crate::ast::tree::visit::Flow::Continue
+    });
+}
+
+/// The classes a method (a property getter included) RETURNS OUT OF A
+/// FIELD of its receiver, anywhere in `stmts`: `return self.kid`,
+/// `return self.a.b`. The caller's handle and the holder's field are one
+/// object in CPython, so the class is held exactly as a parameter's is
+/// (issue #440). The class is the method's return annotation (bare or
+/// `| None`) or, unannotated, the inferred type of the returned field.
+/// A method that returns a FRESH object (`return Child()`) creates no
+/// second holder and adds nothing.
+fn collect_returned_field_holders(
+    stmts: &[Statement],
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+    out: &mut HashSet<String>,
+) {
+    fn class_of(t: TypeInfo) -> Option<String> {
+        match t {
+            TypeInfo::Class(c) => Some(c),
+            TypeInfo::Option(inner) => match *inner {
+                TypeInfo::Class(c) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    // `self.f`, `self.f.g`: the expression reads a field of the receiver
+    // (its first field is returned for the unannotated lookup).
+    fn self_field_path(e: &ExprType) -> Option<(&str, bool)> {
+        match e {
+            ExprType::Attribute(a) if is_self(&a.value) => Some((a.attr.as_str(), true)),
+            ExprType::Attribute(a) => self_field_path(&a.value).map(|(f, _)| (f, false)),
+            _ => None,
+        }
+    }
+    crate::ast::tree::visit::walk_stmts(stmts, crate::ast::tree::visit::Descend::All, &mut |s| {
+        let StatementType::ClassDef(c) = &s.statement else {
+            return crate::ast::tree::visit::Flow::Continue;
+        };
+        let fields = c.infer_fields(symbols, options).ok();
+        for m in all_methods(c) {
+            let annotated = m.returns.as_deref().and_then(|ann| {
+                crate::resolve_alias_typeinfo(ann, symbols, options)
+                    .or_else(|| crate::annotation_type_info(ann))
+            });
+            let annotated_class = annotated.map(|t| class_of(t));
+            crate::ast::tree::visit::walk_stmts(&m.body, crate::ast::tree::visit::Descend::SkipDefs, &mut |st| {
+                if let StatementType::Return(Some(e)) = &st.statement
+                    && let Some((field, direct)) = self_field_path(&e.value)
+                {
+                    let held = match &annotated_class {
+                        Some(class) => class.clone(),
+                        // Unannotated: only a direct field's type is known.
+                        None if direct => fields
+                            .as_ref()
+                            .and_then(|fs| fs.iter().find(|(name, _)| name == field))
+                            .and_then(|(_, t)| class_of(t.clone())),
+                        None => None,
+                    };
+                    if let Some(class) = held {
+                        out.insert(crate::ast::tree::hierarchy::canonical_class_name(&class, symbols));
+                    }
+                }
+                crate::ast::tree::visit::Flow::Continue
+            });
         }
         crate::ast::tree::visit::Flow::Continue
     });

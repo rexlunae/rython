@@ -5985,6 +5985,32 @@ impl FunctionDef {
     /// annotation when it names a type; else — for the unannotated
     /// lazy-singleton shape (issue #189) — the single class-instance
     /// module global every return reads. None when neither applies.
+    /// The receiver FIELD an unannotated method hands back: every
+    /// `return` is the same `self.<field>` (`def get(self): return
+    /// self.counter`). The caller resolves the field's class through the
+    /// owner (issue #440); any other return shape, a bare `return`, or a
+    /// possible fall-through (an implicit None) gives `None`.
+    pub fn returned_self_field(&self) -> Option<String> {
+        if self.returns.is_some() || !guarantees_return(&self.body) {
+            return None;
+        }
+        let mut returns = Vec::new();
+        collect_returns(&self.body, &mut returns);
+        let mut field: Option<String> = None;
+        for ret in &returns {
+            let ExprType::Attribute(a) = (*ret)? else {
+                return None;
+            };
+            if !crate::ast::tree::visit::is_self(&a.value)
+                || field.as_ref().is_some_and(|f| f != &a.attr)
+            {
+                return None;
+            }
+            field = Some(a.attr.clone());
+        }
+        field
+    }
+
     pub fn return_class_name(&self, options: &crate::PythonOptions) -> Option<String> {
         if let Some(ann) = self.returns.as_ref() {
             return match ann.as_ref() {
