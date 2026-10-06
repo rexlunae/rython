@@ -676,6 +676,23 @@ pub struct PythonOptionsData {
     /// `clone_str_attribute_returns` by the function generator.
     pub str_literal_locals: std::rc::Rc<std::collections::HashSet<String>>,
 
+    /// The function whose body these options are lowering (its body's
+    /// buffer address; 0 outside any function), set by the function
+    /// generator. Return inference compares it with the function it types
+    /// (issue #448): the name-scoped fields here belong to THIS function,
+    /// so a different function's returns — a callee typed from a call
+    /// site — must not read them; a caller's `s = {1, 2}` is not the
+    /// callee's `s = "k"`.
+    pub name_scope_owner: usize,
+
+    /// The module's own scope as its lowering sees it before entering any
+    /// function: its symbol table and its name types (set by the module
+    /// generator). Return inference for a function defined in the module
+    /// starts from these rather than from the calling function's, whose
+    /// locals can shadow the module names the callee reads (issue #448).
+    pub module_scope_symbols: Option<std::rc::Rc<crate::SymbolTableScopes>>,
+    pub module_name_types: Option<std::rc::Rc<std::collections::HashMap<String, TypeInfo>>>,
+
     /// Rust modules available to `import` / `from ... import` as
     /// compile-time bindings, keyed by the Python-side import name. The
     /// frontend (rypip / rythonc) populates this from the `rython.toml`
@@ -891,6 +908,9 @@ impl Default for PythonOptionsData {
             refused_closures: std::rc::Rc::new(std::collections::HashMap::new()),
             uncallable_params: std::rc::Rc::new(std::collections::HashMap::new()),
             str_literal_locals: std::rc::Rc::new(std::collections::HashSet::new()),
+            name_scope_owner: 0,
+            module_scope_symbols: None,
+            module_name_types: None,
             rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),
             module_defs: std::rc::Rc::new(std::collections::HashMap::new()),

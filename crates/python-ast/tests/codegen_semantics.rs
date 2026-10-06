@@ -28177,3 +28177,108 @@ fn a_getter_returned_class_is_shared_only_when_mutated() {
     );
     assert!(flat.contains("PyRef<Kid>"), "the mutated returned class is shared: {}", out);
 }
+
+#[test]
+fn a_callers_locals_do_not_type_a_callees_returns() {
+    // Issue #448: a callee's inferred return type was computed in the
+    // CALLER's scope, so the caller's `s = {1, 2}` (and its `n = 3`) typed
+    // the callee's `return {s: 1}` / `return [n, n]` as set-keyed / int
+    // containers while the callee's own signature said String. The caller
+    // then indexed and appended with unowned `&str`s (E0308).
+    //
+    // class L:
+    //     def keyed(self):
+    //         s = "k"
+    //         return {s: 1}
+    // def pair():
+    //     n = "x"
+    //     return [n, n]
+    // def main() -> None:
+    //     s = {1, 2}
+    //     n = 3
+    //     k = L().keyed()
+    //     k["k"] += 4
+    //     p = pair()
+    //     p.append("y")
+    //     print(k, len(s), p, n)   # {'k': 5} 2 ['x', 'x', 'y'] 3
+    let out = compile(
+        "class L:\n\
+         \x20   def keyed(self):\n\
+         \x20       s = \"k\"\n\
+         \x20       return {s: 1}\n\
+         \n\
+         \n\
+         def pair():\n\
+         \x20   n = \"x\"\n\
+         \x20   return [n, n]\n\
+         \n\
+         \n\
+         def main() -> None:\n\
+         \x20   s = {1, 2}\n\
+         \x20   n = 3\n\
+         \x20   k = L().keyed()\n\
+         \x20   k[\"k\"] += 4\n\
+         \x20   p = pair()\n\
+         \x20   p.append(\"y\")\n\
+         \x20   print(k, len(s), p, n)\n",
+        "callee_scope.py",
+    );
+    assert!(
+        out.contains("let __rython_idx = (\"k\") . to_string () ;"),
+        "the String-keyed dict the callee returns owns the index: {}",
+        out
+    );
+    assert!(
+        out.contains("(p) . push ((\"y\") . to_string ())"),
+        "the Vec<String> the callee returns owns the pushed literal: {}",
+        out
+    );
+}
+
+#[test]
+fn a_callers_local_does_not_shadow_a_module_name_the_callee_reads() {
+    // Issue #448 (Devin review on #449): a function defined in the module
+    // reads module names in the MODULE's scope, so a caller's local of the
+    // same name must not type the callee's return.
+    //
+    // LIMITS = [7, 8]
+    // class L:
+    //     def first(self):
+    //         return [LIMITS[0], 1]
+    // def first():
+    //     return [LIMITS[0], 2]
+    // def main() -> None:
+    //     LIMITS = ["shadow"]
+    //     q = L().first()
+    //     q.append(5)
+    //     r = first()
+    //     r.append(6)
+    //     print(q, r, LIMITS)   # [7, 1, 5] [7, 2, 6] ['shadow']
+    let out = compile(
+        "LIMITS = [7, 8]\n\
+         \n\
+         \n\
+         class L:\n\
+         \x20   def first(self):\n\
+         \x20       return [LIMITS[0], 1]\n\
+         \n\
+         \n\
+         def first():\n\
+         \x20   return [LIMITS[0], 2]\n\
+         \n\
+         \n\
+         def main() -> None:\n\
+         \x20   LIMITS = [\"shadow\"]\n\
+         \x20   q = L().first()\n\
+         \x20   q.append(5)\n\
+         \x20   r = first()\n\
+         \x20   r.append(6)\n\
+         \x20   print(q, r, LIMITS)\n",
+        "callee_module_scope.py",
+    );
+    assert!(
+        out.contains("(q) . push (5)") && out.contains("(r) . push (6)"),
+        "the callees return Vec<i64>, whatever the caller's LIMITS is: {}",
+        out
+    );
+}

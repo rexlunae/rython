@@ -2307,6 +2307,9 @@ impl FunctionDef {
         // Optional annotation) are visible to every assignment in the body:
         // their non-None stores wrap in Some.
         let mut options = options;
+        // Issue #448: the name-scoped fields below describe THIS body;
+        // return inference for any other function strips them.
+        options.name_scope_owner = self.body.as_ptr() as usize;
         // Issue #115: this function may write exactly the mutable statics
         // its own `global` statements declare; every other scope's
         // grant (the module's all-of-them default in particular) does not
@@ -6073,6 +6076,7 @@ impl FunctionDef {
         options: &crate::PythonOptions,
         self_class: Option<&str>,
     ) -> Option<TokenStream> {
+        let (symbols, options) = &self.own_scope(self_class, symbols, options);
         // A bare `str` annotation is authoritative: the inferred type for a
         // literal-returning body (`&'static str`) is a Rust literal artifact,
         // not the Python type, and the mismatch breaks every call site
@@ -6236,6 +6240,7 @@ impl FunctionDef {
         };
         let instance_method =
             self_class.is_some() && !decorated("classmethod") && !decorated("staticmethod");
+        let (symbols, options) = &self.own_scope(self_class, symbols, options);
         let mut types = (*options.name_types).clone();
         let params = self.args.posonlyargs.iter().chain(self.args.args.iter());
         for (i, p) in params.chain(self.args.kwonlyargs.iter()).enumerate() {
@@ -6696,12 +6701,91 @@ impl FunctionDef {
         )
     }
 
+    /// The scope this function's returns are typed in (issue #448).
+    /// Return inference is asked from wherever the function is CALLED, so
+    /// the incoming scope describes the caller's body: its name-scoped
+    /// option fields (`name_types`, `local_types`, the narrowing and
+    /// literal sets) and the locals its lowering registered in the symbol
+    /// table. A caller's `s = {1, 2}` typed the callee's `return {s: 1}`
+    /// as a set-keyed dict while the callee's own signature said
+    /// `PyDict<String, i64>`. Unless the options already belong to this
+    /// body (the function generator marks them), the view is what the
+    /// body itself sees.
+    ///
+    /// A function defined in the module being lowered (a module function,
+    /// or a method of a module class: `self_class`) starts from the
+    /// MODULE's scope, which the module generator records: its symbol
+    /// table and, of its name types, the statics the body does not rebind
+    /// (the merge its own lowering performs, `merge_module_static_types`).
+    /// A caller's local that shadows a module name is then invisible, as
+    /// in Python. Anything else (a nested closure, whose enclosing
+    /// function is the caller, or a definition from another module, whose
+    /// symbols the caller passes) starts from the incoming scope. The
+    /// body's own bindings go over either.
+    fn own_scope(
+        &self,
+        self_class: Option<&str>,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> (crate::SymbolTableScopes, crate::PythonOptions) {
+        let owner = self.body.as_ptr() as usize;
+        if options.name_scope_owner == owner {
+            return (symbols.clone(), options.clone());
+        }
+        // The module binding must be THIS definition, not a nested one or
+        // one from another module that shares its name (Devin on #449):
+        // the same name and the same source span.
+        let is_self = |def: &FunctionDef| def.name == self.name && same_span(&def.body, &self.body);
+        let module_symbols = options.module_scope_symbols.as_deref().filter(|module| {
+            match (self_class, module.get(self_class.unwrap_or(&self.name))) {
+                (Some(_), Some(SymbolTableNode::ClassDef(class))) => class.body.iter().any(|s| {
+                    matches!(&s.statement,
+                        StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f)
+                            if is_self(f))
+                }),
+                (None, Some(SymbolTableNode::FunctionDef(def))) => is_self(def),
+                _ => false,
+            }
+        });
+        let enclosing_types = match (module_symbols, options.module_name_types.as_deref()) {
+            (Some(_), Some(module_types)) => module_types,
+            _ => options.name_types.as_ref(),
+        };
+        let bound = crate::ast::tree::closure::scope_binding_names(&self.args, &self.body);
+        let types: std::collections::HashMap<String, crate::TypeInfo> = enclosing_types
+            .iter()
+            .filter(|(n, _)| options.mutable_statics.contains_key(*n) && !bound.contains(*n))
+            .map(|(n, t)| (n.clone(), t.clone()))
+            .collect();
+        let mut view = options.clone();
+        view.name_types = std::rc::Rc::new(types);
+        view.local_types = Default::default();
+        view.narrowed_names = Default::default();
+        view.narrowed_class_origin = Default::default();
+        view.optional_names = Default::default();
+        view.annotated_names = Default::default();
+        view.str_literal_locals = Default::default();
+        view.owned_str_literals = Default::default();
+        view.param_type_vars = Default::default();
+        view.called_params = Default::default();
+        view.empty_pinned = Default::default();
+        view.name_scope_owner = owner;
+        let mut scope = module_symbols.unwrap_or(symbols).clone();
+        scope.new_scope();
+        for s in &self.body {
+            scope = s.clone().find_symbols(scope);
+        }
+        (scope, view)
+    }
+
     fn inferred_return_typeinfo_inner(
         &self,
         ctx: Option<&crate::CodeGenContext>,
         symbols: &crate::SymbolTableScopes,
         options: &crate::PythonOptions,
     ) -> Option<crate::TypeInfo> {
+        let class = ctx.and_then(|c| c.enclosing_class_name());
+        let (symbols, options) = &self.own_scope(class, symbols, options);
         let mut returns = Vec::new();
         crate::ast::tree::specialize::collect_return_exprs(&self.body, &mut returns);
         if returns.is_empty() {
@@ -7145,4 +7229,16 @@ mod string_default_tests {
         assert!(matches!(python_int_of("٣"), StringDefault::Unsupported("non-ASCII digits in a string default")));
         assert!(matches!(python_int_of("99999999999999999999"), StringDefault::Unsupported("an int outside i64")));
     }
+}
+
+/// Whether two definition bodies cover the same source span (a module
+/// symbol holds a CLONE of the definition, so identity is positional).
+fn same_span(a: &[Statement], b: &[Statement]) -> bool {
+    let span = |body: &[Statement]| {
+        (
+            body.first().map(|s| (s.lineno, s.col_offset)),
+            body.last().map(|s| (s.end_lineno, s.end_col_offset)),
+        )
+    };
+    a.len() == b.len() && span(a) == span(b)
 }
