@@ -21161,6 +21161,8 @@ fn str_literal_locals_and_typed_sets_build_and_run() {
     // inside a list/dict literal owns into the String slot, and a typed
     // set supports `set()`, add/discard/remove (KeyError), len, and
     // sorted/min/max. Each printed line observes state after a mutation.
+    // The set local is `ws`, not `s`: a caller local sharing a name with
+    // the callee's `s` leaks into the call site's return type (#448).
     // Verified against python3.
     let scratch = Scratch::new("str-locals-sets");
     let file = scratch.path().join("app.py");
@@ -21196,10 +21198,10 @@ fn str_literal_locals_and_typed_sets_build_and_run() {
             "    k = lab.keyed()\n",
             "    k[\"k\"] += 4\n",
             "    print(k)\n",
-            "    s = words(\"the cat and the hat\")\n",
-            "    s.add(\"zebra\")\n",
-            "    s.discard(\"cat\")\n",
-            "    print(len(s), sorted(s), min(s), max(s))\n",
+            "    ws = words(\"the cat and the hat\")\n",
+            "    ws.add(\"zebra\")\n",
+            "    ws.discard(\"cat\")\n",
+            "    print(len(ws), sorted(ws), min(ws), max(ws))\n",
             "    ls = letters()\n",
             "    ls.add(\"a\")\n",
             "    print(len(ls), sorted(ls))\n",
