@@ -2383,9 +2383,13 @@ impl FunctionDef {
                 });
             // Locals whose only known type is a string literal (`label =
             // "fine"`): they lower to `&'static str`, which a `-> str`
-            // return must own. Reuse the literal-local inference, keyed by
-            // the same `&'static str` type it records.
-            if options.clone_str_attribute_returns {
+            // return must own, and so must a String slot of a returned
+            // literal (`return [label]` into `Vec<String>` —
+            // render_typed). Reuse the literal-local inference, keyed by
+            // the same `&'static str` type it records. Computed for every
+            // function: the return rule stays gated on
+            // `clone_str_attribute_returns` at its use site.
+            {
                 let mut locals = std::collections::HashMap::new();
                 collect_local_types(&effective_body, &mut locals);
                 options.str_literal_locals = std::rc::Rc::new(
@@ -3085,16 +3089,8 @@ impl FunctionDef {
             .is_some_and(|t| t.to_string() == "String")
             && !options.clone_str_attribute_returns
         {
+            // `str_literal_locals` is already computed for every function.
             options.clone_str_attribute_returns = true;
-            let mut locals = std::collections::HashMap::new();
-            collect_local_types(&effective_body, &mut locals);
-            options.str_literal_locals = std::rc::Rc::new(
-                locals
-                    .into_iter()
-                    .filter(|(_, ty)| matches!(ty, crate::TypeInfo::StrRef))
-                    .map(|(name, _)| name)
-                    .collect(),
-            );
         }
         options.param_method_params =
             std::rc::Rc::new(inferred_signature.method_params.clone());
@@ -3708,7 +3704,7 @@ impl FunctionDef {
                     })
             })
             // A declared CONTAINER return (`-> list[str]`, `-> dict[str,
-            // int]`, `-> tuple[...]`): the return-site Option-coercion
+            // int]`, `-> tuple[...]`, `-> set[str]`): the return-site Option-coercion
             // compares an Option-typed return value's INNER against this
             // (round 107 — an `Option<Vec<String>>` field like
             // charset_normalizer's `_unicode_ranges` returned from a
@@ -3726,6 +3722,7 @@ impl FunctionDef {
                                 | crate::TypeInfo::Dict(_, _)
                                 | crate::TypeInfo::Tuple(_)
                                 | crate::TypeInfo::PyTuple(_)
+                                | crate::TypeInfo::HashSet(_)
                         ) && !options.fn_return_is_pyvalue
                             && !options.fn_return_is_option
                     })

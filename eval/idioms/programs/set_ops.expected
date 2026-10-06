@@ -1,0 +1,10 @@
+4
+['and', 'cat', 'hat', 'the']
+4 ['and', 'hat', 'the', 'zebra']
+3 ['a', 'b', 'c']
+True False
+[1, 2, 3, 10] 4
+1 10
+missing 3
+missing 'zz'
+[1, 2, 10] 3

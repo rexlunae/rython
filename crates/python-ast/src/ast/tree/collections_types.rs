@@ -299,6 +299,28 @@ impl OrderedDictMethod {
     }
 }
 
+/// The `set` methods codegen lowers on a typed set (`HashSet`) receiver:
+/// HashSet has no `add`/`discard`, and its inherent `remove` answers a
+/// bool where Python's raises KeyError. Parsed from the attribute name
+/// once, here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetMethod {
+    Add,
+    Discard,
+    Remove,
+}
+
+impl SetMethod {
+    pub(crate) fn from_name(name: &str) -> Option<SetMethod> {
+        match name {
+            "add" => Some(SetMethod::Add),
+            "discard" => Some(SetMethod::Discard),
+            "remove" => Some(SetMethod::Remove),
+            _ => None,
+        }
+    }
+}
+
 /// The builtins whose runtime form takes its iterable as a SLICE (`&[T]`)
 /// or a `Vec<T>`, which a deque (ring-buffer storage) is not: a
 /// deque argument is converted to a `Vec` first.

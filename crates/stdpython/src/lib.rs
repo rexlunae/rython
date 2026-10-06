@@ -5075,10 +5075,25 @@ impl Len for str {
     }
 }
 
-impl Len for crate::HashSet<String> {
+impl<T, S> Len for crate::HashSet<T, S> {
     fn len(&self) -> usize {
         // Python counts members.
         crate::HashSet::len(self)
+    }
+}
+
+/// Python `set.remove(x)`: removes `x`, or raises `KeyError` with the
+/// element's repr when it is absent (`KeyError: 'cat'`). A HashSet's
+/// inherent `remove` answers a bool instead — silently different.
+pub fn py_set_remove<T, S>(set: &mut crate::HashSet<T, S>, item: &T) -> Result<(), PyException>
+where
+    T: Eq + core::hash::Hash + PyRepr,
+    S: core::hash::BuildHasher,
+{
+    if set.remove(item) {
+        Ok(())
+    } else {
+        Err(PyException::new("KeyError", item.py_repr()))
     }
 }
 
