@@ -6445,3 +6445,20 @@ mod counter_construction {
         assert_eq!(format!("{:?}", g.most_common(None)), "[('b', 2), ('a', 2)]");
     }
 }
+
+#[test]
+fn set_remove_raises_key_error_with_the_element_repr() {
+    // s = {"cat", "dog"}; s.remove("cat"); s.remove("cat")
+    //   -> KeyError: 'cat'        (str(e) == "'cat'")
+    // n = {3}; n.remove(4)        -> KeyError: 4
+    let mut s = std::collections::HashSet::from(["cat".to_string(), "dog".to_string()]);
+    py_set_remove(&mut s, &"cat".to_string()).unwrap();
+    assert_eq!(len(&s), 1);
+    let e = py_set_remove(&mut s, &"cat".to_string()).unwrap_err();
+    assert_eq!(e.exception_type, "KeyError");
+    assert_eq!(e.message, "'cat'");
+    let mut n = std::collections::HashSet::from([3i64]);
+    assert_eq!(py_set_remove(&mut n, &4).unwrap_err().message, "4");
+    // len() counts members of any set: len({3}) == 1
+    assert_eq!(len(&n), 1);
+}

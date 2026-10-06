@@ -132,6 +132,32 @@ class ProcessTests(unittest.TestCase):
             self.assertIn("warning retained", (root / "demo-convert.log").read_text())
             self.assertIn("unsupported construct", (root / "demo-build.log").read_text())
 
+    def test_dependency_pins_precede_the_requirement_in_the_probe(self):
+        # rypip's merge is first-wins by import name, so a pin only holds
+        # when it is listed ahead of the dependent that would otherwise
+        # resolve the newest release.
+        with tempfile.TemporaryDirectory() as tmp, patch.object(run_sweep, "run_logged", return_value=1):
+            result = run_sweep.sweep_one({"name": "demo", "requirement": "demo==1"}, Path("/rypip"),
+                                         Path(tmp), pins=["dep==2", "other==3"])
+            toml = (Path(tmp) / "probe-demo" / "pyproject.toml").read_text()
+            self.assertIn('dependencies = ["dep==2", "other==3", "demo==1"]', toml)
+            self.assertEqual(result["dependency_pins"], ["dep==2", "other==3"])
+
+    def test_dependency_pins_resolve_from_the_corpus_and_reject_unknown_names(self):
+        corpus = [{"name": "dep", "requirement": "dep==2"},
+                  {"name": "demo", "requirement": "demo==1", "pin_dependencies": ["dep"]}]
+        self.assertEqual(run_sweep.dependency_pins(corpus[1], corpus), ["dep==2"])
+        self.assertEqual(run_sweep.dependency_pins(corpus[0], corpus), [])
+        for names in (["missing"], ["demo"]):
+            with self.subTest(names=names), self.assertRaises(ValueError):
+                run_sweep.dependency_pins({**corpus[1], "pin_dependencies": names}, corpus)
+
+    def test_the_pinned_corpus_pins_requests_dependencies(self):
+        corpus = json.loads((Path(run_sweep.__file__).parent / "packages.json").read_text())["packages"]
+        requests = next(s for s in corpus if s["name"] == "requests")
+        self.assertEqual(sorted(run_sweep.dependency_pins(requests, corpus)),
+                         sorted(s["requirement"] for s in corpus if s["name"] != "requests"))
+
     def test_timeout_and_missing_cargo_are_unmeasured(self):
         for exc in (FileNotFoundError("cargo missing"), subprocess.TimeoutExpired("cargo", 1)):
             with self.subTest(exc=exc), tempfile.TemporaryDirectory() as tmp, patch.object(run_sweep, "run_logged", side_effect=[0, exc]):
@@ -172,6 +198,12 @@ class ComparisonTests(unittest.TestCase):
                                    {"packages": {"demo": self.record(requirement="demo==2")}})
         self.assertFalse(valid)
         self.assertIn("pin changed", text)
+
+    def test_different_dependency_pins_are_not_comparable(self):
+        valid, text = self.compare({"packages": {"demo": self.record()}},
+                                   {"packages": {"demo": self.record(dependency_pins=["dep==2"])}})
+        self.assertFalse(valid)
+        self.assertIn("dependency pins changed", text)
 
     def test_legacy_zero_error_failure_is_ambiguous(self):
         legacy = {"total": 0, "convert_status": 0, "build_status": 101}

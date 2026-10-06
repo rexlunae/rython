@@ -24,7 +24,8 @@
     {
       "name": "requests",
       "requirement": "requests==2.32.3",
-      "note": "The dependent-package frontier (imports urllib3/charset_normalizer/idna/certifi; 112 errors at the round-54 baseline). Round 55: urllib.parse + class registry (69). Round 56: builtin-class values, tuple boxing, compat imports, del reads, range annotations (29). Round 57: module tuple-unpack promotion (25). Sweep at 28efebd (schema 2): 2127 coded + 205 other diagnostics (2249 at 24d1987; 2245 at round 118)."
+      "pin_dependencies": ["urllib3", "charset_normalizer", "idna", "certifi"],
+      "note": "The dependent-package frontier (imports urllib3/charset_normalizer/idna/certifi; 112 errors at the round-54 baseline). Round 55: urllib.parse + class registry (69). Round 56: builtin-class values, tuple boxing, compat imports, del reads, range annotations (29). Round 57: module tuple-unpack promotion (25). Sweep at 28efebd (schema 2): 2127 coded + 205 other diagnostics (2249 at 24d1987; 2245 at round 118). pin_dependencies: requests' own specifiers (urllib3<3, charset_normalizer<4, ...) let rypip pick the newest PyPI release, so once urllib3 2.8.0 shipped a fresh cache measured requests against 2.8.0 (which fails conversion) instead of the corpus's 2.0.7; the probe now lists the corpus pins ahead of requests so they win."
     }
   ]
 }

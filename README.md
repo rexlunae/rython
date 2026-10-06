@@ -303,7 +303,8 @@ change:
   **kwargs)` spreads are dropped (the defaults are the excel dialect /
   empty in practice).
 - **Boxed containers** — empty lists/dicts/sets whose element type is
-  unknowable at the store (`result: list[float] = []` pins fine; a
+  unknowable at the store (`result: list[float] = []` and `out:
+  set[str] = set()` pin fine; a
   PyValue-poisoned `1 + len(archive)` field, `{**a, **b}` all-spread
   dicts, `[1, 2, 3, None, 4, True, False, "Hello World"]` demo mixes)
   lower as `Vec<PyValue>` / `PyDict<String, PyValue>`.
