@@ -582,7 +582,13 @@ through subscript/attribute stores marks the chain's base variable.
   the class of any module-level instance a function reads or mutates
   (`current = Box()` with `current.n += 1`, or a read-only `DEFAULT =
   Box()`): `x = current; x.n = 5` mutates the global's object, as
-  `x is current` is True (issue #430). Every
+  `x is current` is True (issue #430). So is a class a method or
+  property getter hands back out of a field (`def child(self) -> Child:
+  return self.kid`, the return annotation or, unannotated, the field's
+  type naming it): `h.child.items.pop()`, `h.get_child().n = 1`, and
+  `c = h.child; c.items.append(7)` all mutate the `Child` that `h`
+  holds (issue #440); a method that returns a freshly constructed
+  object adds no holder. Every
   other class stays a plain struct
   (cloning an immutable object, or one no container or parameter holds,
   is unobservable). The
