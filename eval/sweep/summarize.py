@@ -62,6 +62,8 @@ def summarize(base: dict, cand: dict) -> bool:
                     if (problem := measurement_problem(r))]
         if b.get("requirement") != c.get("requirement"):
             problems.append("package pin changed")
+        if b.get("dependency_pins") != c.get("dependency_pins"):
+            problems.append("dependency pins changed")
         if problems:
             print(f"== {name}: NOT COMPARABLE ({'; '.join(problems)})")
             complete = False
