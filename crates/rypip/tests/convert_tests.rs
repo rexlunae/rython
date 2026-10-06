@@ -21212,3 +21212,49 @@ fn a_mutation_through_a_getter_reaches_the_held_object() {
         vec!["[1]", "[1, 9]", "[1, 9, 7]", "5 5 [1, 9, 7, 3]", "True True"]
     );
 }
+
+#[test]
+fn a_mutating_call_through_an_unannotated_getter_reaches_the_held_object() {
+    // Issue #440 (Devin review on #447): `def get(self): return
+    // self.counter` carries no return annotation, so `b.get().bump(2)`
+    // could not resolve `bump` and failed in rustc (on main it printed a
+    // stale `0`). The method's returned receiver field names the class.
+    let got = run_global_alias_program(
+        "unannotatedgetter",
+        "unannotated_getter.py",
+        concat!(
+            "class Counter:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.n = 0\n",
+            "        self.log: list[str] = []\n",
+            "\n",
+            "    def bump(self, k: int) -> None:\n",
+            "        self.n += k\n",
+            "        self.log.append(f\"+{k}\")\n",
+            "\n",
+            "\n",
+            "class Box:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.counter = Counter()\n",
+            "\n",
+            "    def get(self):\n",
+            "        return self.counter\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    b = Box()\n",
+            "    b.get().bump(2)\n",
+            "    g = b.get()\n",
+            "    g.bump(5)\n",
+            "    b.get().log.append(\"x\")\n",
+            "    print(b.counter.n, b.counter.log)\n",
+            "    print(g is b.counter)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    // Verified against python3.
+    assert_eq!(got, vec!["7 ['+2', '+5', 'x']", "True"]);
+}

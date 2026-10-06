@@ -12457,9 +12457,18 @@ pub(crate) fn receiver_class(
                 // instance, or a FIELD ACCESSOR (`self.proxy()` where
                 // proxy is a ProxyConfig-typed field — urllib3): the
                 // accessor returns the field's class.
-                let class = match owner
-                    .method_on_mro_with_options(&attr.attr, &owner_symbols, options)
+                let method = owner.method_on_mro_with_options(&attr.attr, &owner_symbols, options);
+                let class = match method
+                    .as_ref()
                     .and_then(|m| m.return_class_name(options))
+                    // An UNANNOTATED method returning a receiver field
+                    // (`def get(self): return self.counter`): the field's
+                    // class, so `b.get().bump(2)` resolves `bump` on it
+                    // (issue #440).
+                    .or_else(|| {
+                        let field = method.as_ref()?.returned_self_field()?;
+                        owner.field_class(&field, &owner_symbols, options)
+                    })
                 {
                     Some(class) => class,
                     None => match owner.field_class(&attr.attr, &owner_symbols, options) {
