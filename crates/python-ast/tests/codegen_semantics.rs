@@ -26871,7 +26871,8 @@ fn defaultdict_deque_factory_resolves_through_the_import() {
          \x20   return len(d)\n",
         "dd_deque_unbound_module.py",
     );
-    assert!(err.contains("defaultdict(...) takes only a builtin class"), "{err}");
+    // Issue #435: the unbound module name itself is the refusal.
+    assert!(err.contains("`collections`") && err.contains("NameError"), "{err}");
     // Nor when the module is imported only under another name: `import
     // collections as c` binds `c`, not `collections`.
     let err = compile_err(
@@ -26883,7 +26884,8 @@ fn defaultdict_deque_factory_resolves_through_the_import() {
          \x20   return len(d)\n",
         "dd_deque_other_alias.py",
     );
-    assert!(err.contains("defaultdict(...) takes only a builtin class"), "{err}");
+    // Issue #435: the unbound module name itself is the refusal.
+    assert!(err.contains("`collections`") && err.contains("NameError"), "{err}");
     // A local class named `deque` shadows the import: not the collections
     // class, so not a supported factory.
     let err = compile_err(
@@ -28399,4 +28401,111 @@ fn order_free_set_consumers_still_convert() {
         "set_pop.py",
     );
     assert!(out.contains("py_set_pop (& mut (lengths))"), "{}", out);
+}
+
+#[test]
+fn an_unbound_runtime_module_name_is_refused() {
+    // Issue #435: `use stdpython::*` brings the runtime modules into every
+    // generated module by their Python names, so a read of a module name
+    // the program never bound ran instead of raising NameError.
+    // Verified against python3: each program prints what precedes the
+    // read, then raises `NameError: name 'math' is not defined` (`json`
+    // for the last two).
+    for (src, name) in [
+        // `import math as m` binds only `m`.
+        (
+            "import math as m\n\n\ndef main() -> None:\n    print(m.sqrt(4.0))\n    print(math.sqrt(9.0))\n",
+            "math",
+        ),
+        // No import at all.
+        ("def main() -> None:\n    print(math.sqrt(9.0))\n", "math"),
+        // Module code.
+        ("import math as m\nprint(math.pi)\n", "math"),
+        // A function's import is its own local.
+        (
+            "def f() -> None:\n    import json\n    print(json.dumps(1))\n\n\n\
+             def g() -> None:\n    print(json.dumps(2))\n",
+            "json",
+        ),
+        // A class body's names are not visible in its methods.
+        (
+            "class C:\n    import json\n\n    def m(self) -> None:\n        print(json.dumps(3))\n",
+            "json",
+        ),
+        // Devin review on #451, each verified against python3 (NameError
+        // for `math`). A runtime module's star import binds its members,
+        // not the module.
+        ("from math import *\nprint(sqrt(4.0))\nprint(math.sqrt(9.0))\n", "math"),
+        // A comprehension target binds only inside the comprehension.
+        ("values = [math for math in [1]]\nprint(values)\nprint(math.sqrt(9.0))\n", "math"),
+        // A parameter binds only inside its function.
+        ("def f(math: int) -> None:\n    pass\n\n\nprint(math.sqrt(9.0))\n", "math"),
+        // A lambda or a comprehension in a class body does not see the
+        // class body's names.
+        (
+            "class C:\n    import math\n    f = staticmethod(lambda: math.sqrt(9.0))\n",
+            "math",
+        ),
+        (
+            "class C:\n    import math\n    xs = [math.sqrt(x) for x in [4.0]]\n",
+            "math",
+        ),
+        // A `global` declaration binds nothing until the function stores
+        // the name.
+        (
+            "def setup() -> None:\n    global math\n\n\nsetup()\nprint(math.sqrt(9.0))\n",
+            "math",
+        ),
+        // A class nested in a class body does not see the outer class's
+        // names (python3: NameError at `math.pi`).
+        (
+            "class C:\n    import math\n    if True:\n        class D:\n            x = math.pi\n",
+            "math",
+        ),
+    ] {
+        let err = compile_err(src, "unbound_module.py");
+        assert!(
+            err.contains(&format!("`{}`", name)) && err.contains("NameError") && err.contains("#435"),
+            "{}: {}",
+            src,
+            err
+        );
+    }
+}
+
+#[test]
+fn a_bound_runtime_module_name_still_converts() {
+    // Issue #435: every way Python binds the name keeps converting: a
+    // plain or dotted import, the alias itself, a function-local import
+    // read in that function, a nested function reading its enclosing
+    // function's import, a `global` declaration that imports at module
+    // scope (python3 prints 4.0 for the last), and a parameter of that
+    // name.
+    for src in [
+        "import math\n\n\ndef main() -> None:\n    print(math.sqrt(9.0))\n",
+        "import os.path\n\n\ndef main() -> None:\n    print(os.path.join(\"a\", \"b\"))\n",
+        "import math as m\n\n\ndef main() -> None:\n    print(m.sqrt(4.0))\n",
+        "def f() -> None:\n    import json\n    print(json.dumps(1))\n",
+        "def f() -> None:\n    import json\n\n    def g() -> str:\n        return json.dumps(1)\n\n    print(g())\n",
+        "def setup() -> None:\n    global math\n    import math\n\n\ndef main() -> None:\n    setup()\n    print(math.sqrt(16.0))\n",
+        "def f(json: str) -> int:\n    return len(json)\n",
+        // A lambda's default reads the enclosing scope; its parameter
+        // binds the body (python3 prints 3.141592653589793).
+        "import math\n\n\ndef f() -> float:\n    g = lambda math=math: math.pi\n    return g()\n",
+        // A comprehension's own target, and a lambda's parameter.
+        "def f(xs: list[int]) -> list[int]:\n    return [json + 1 for json in xs]\n",
+        "def f() -> int:\n    g = lambda json: json + 1\n    return g(1)\n",
+        // An `except ... as` name.
+        "def f() -> str:\n    try:\n        return \"x\"\n    except ValueError as json:\n        return str(json)\n",
+    ] {
+        compile(src, "bound_module.py");
+    }
+    // A class body's `global` plus a store binds the module name (python3
+    // prints 3.141592653589793). Class-level statements do not lower yet,
+    // so the program is refused, but not as an unbound module name.
+    let err = compile_err(
+        "class C:\n    global math\n    import math\n\n\nprint(math.pi)\n",
+        "bound_module.py",
+    );
+    assert!(!err.contains("#435") && err.contains("class level"), "{}", err);
 }

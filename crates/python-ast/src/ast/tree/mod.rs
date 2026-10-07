@@ -66,6 +66,7 @@ pub mod collections_lower;
 pub mod collections_types;
 pub(crate) mod print_order;
 pub(crate) mod set_order;
+pub(crate) mod unbound_module;
 pub mod datetime_types;
 pub mod math_fn_types;
 pub mod threading_types;
