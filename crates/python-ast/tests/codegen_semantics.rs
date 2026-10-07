@@ -28456,6 +28456,12 @@ fn an_unbound_runtime_module_name_is_refused() {
             "def setup() -> None:\n    global math\n\n\nsetup()\nprint(math.sqrt(9.0))\n",
             "math",
         ),
+        // A class nested in a class body does not see the outer class's
+        // names (python3: NameError at `math.pi`).
+        (
+            "class C:\n    import math\n    if True:\n        class D:\n            x = math.pi\n",
+            "math",
+        ),
     ] {
         let err = compile_err(src, "unbound_module.py");
         assert!(
@@ -28494,4 +28500,12 @@ fn a_bound_runtime_module_name_still_converts() {
     ] {
         compile(src, "bound_module.py");
     }
+    // A class body's `global` plus a store binds the module name (python3
+    // prints 3.141592653589793). Class-level statements do not lower yet,
+    // so the program is refused, but not as an unbound module name.
+    let err = compile_err(
+        "class C:\n    global math\n    import math\n\n\nprint(math.pi)\n",
+        "bound_module.py",
+    );
+    assert!(!err.contains("#435") && err.contains("class level"), "{}", err);
 }

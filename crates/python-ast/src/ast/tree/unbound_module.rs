@@ -165,7 +165,9 @@ fn check_scope(body: &[Statement], visible: &Names, enclosing: &Names) -> Result
                     check_scope(&f.body, &inner, &inner)
                 }
                 StatementType::ClassDef(c) => {
-                    let mut class_scope = visible.clone();
+                    // From `enclosing`, not `visible`: a class nested in
+                    // a class body does not see the outer class's names.
+                    let mut class_scope = enclosing.clone();
                     class_scope.extend(scope_bindings(&c.body));
                     check_scope(&c.body, &class_scope, enclosing)
                 }
@@ -208,19 +210,22 @@ pub(crate) fn check_module(body: &[Statement]) -> Result<(), String> {
         return Ok(());
     }
     let mut module = scope_bindings(body);
-    // A function's `global` declaration binds the name at module scope
-    // when that function stores it (`global math; import math`); a bare
-    // declaration binds nothing.
+    // A function's or class body's `global` declaration binds the name at
+    // module scope when that scope stores it (`global math; import math`);
+    // a bare declaration binds nothing.
     visit::walk_stmts(body, Descend::All, &mut |s| {
-        if let StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) = &s.statement {
-            let stored = scope_bindings(&f.body);
-            visit::walk_stmts(&f.body, Descend::SkipDefs, &mut |inner| {
-                if let StatementType::Global(names) = &inner.statement {
-                    module.extend(names.iter().filter(|n| stored.contains(*n)).cloned());
-                }
-                Flow::Continue
-            });
-        }
+        let scope_body = match &s.statement {
+            StatementType::FunctionDef(f) | StatementType::AsyncFunctionDef(f) => &f.body,
+            StatementType::ClassDef(c) => &c.body,
+            _ => return Flow::Continue,
+        };
+        let stored = scope_bindings(scope_body);
+        visit::walk_stmts(scope_body, Descend::SkipDefs, &mut |inner| {
+            if let StatementType::Global(names) = &inner.statement {
+                module.extend(names.iter().filter(|n| stored.contains(*n)).cloned());
+            }
+            Flow::Continue
+        });
         Flow::Continue
     });
     check_scope(body, &module, &module)
