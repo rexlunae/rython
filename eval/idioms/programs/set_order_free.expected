@@ -1,0 +1,10 @@
+4 ['apple', 'fig', 'kiwi', 'pear']
+apple pear True False
+[3, 4, 5] 12
+True True
+['a', 'f', 'k', 'p']
+['fig', 'kiwi'] 5 ['apple', 'pear']
+APPLE
+FIG
+KIWI
+PEAR

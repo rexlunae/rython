@@ -5097,6 +5097,29 @@ where
     }
 }
 
+/// Python `set.pop()` (issue #444): CPython answers an ARBITRARY member,
+/// the first in its table order, which a Rust HashSet does not reproduce.
+/// A set of exactly one member has one answer, so it is returned (urllib3
+/// pops its validated single Content-Length); an empty set raises
+/// CPython's `KeyError: 'pop from an empty set'`; a larger set panics at
+/// the call rather than answer a different member than CPython would.
+pub fn py_set_pop<T, S>(set: &mut crate::HashSet<T, S>) -> Result<T, PyException>
+where
+    T: Eq + core::hash::Hash,
+    S: core::hash::BuildHasher,
+{
+    match set.len() {
+        0 => Err(PyException::new("KeyError", "'pop from an empty set'")),
+        1 => Ok(set.drain().next().expect("one member")),
+        n => panic!(
+            "rython: set.pop() on a set of {} members: CPython answers the first member in \
+             its own table order, which a Rust HashSet does not reproduce (issue #444); \
+             pop from sorted(s) instead",
+            n
+        ),
+    }
+}
+
 impl<T> Len for Vec<T> {
     fn len(&self) -> usize {
         self.len()

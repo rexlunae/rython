@@ -41,8 +41,10 @@ in as the oracle. The pinned surface includes:
   algorithm; `str(1e16)` is `1e+16`, not `10000000000000000`.
 - **`hash()`**: matches CPython with `PYTHONHASHSEED=0`.
 - **Dict ordering**: dicts iterate in insertion order, like CPython.
-  (Sets deliberately have no `repr` at all — printing one is a compile
-  error — so unordered set iteration is never observable output.)
+  (Sets iterate in Rust's HashSet order, so printing a set and every
+  other order-observing use — a `for` loop, `list(s)`, a list
+  comprehension — is a conversion error naming `sorted(s)`; unordered
+  set iteration is never observable output, issue #444.)
 - **Sort stability** and comparison behavior.
 - **Exception raising and messages**: exceptions are raised where
   CPython raises them, with pinned message text across the verified

@@ -274,6 +274,12 @@ line, never a silent behaviour change:
   `csv.get_dialect(name)`). Dialect OBJECTS (`dialect=Dialect()`),
   `csv.DictReader`/`csv.DictWriter`, `csv.Sniffer`, and `field_size_limit`
   are not supported yet.
+- **Set iteration order** — a set is a Rust `HashSet`, whose order is
+  not CPython's, so a `for` loop over a set, `list(s)`, `", ".join(s)`,
+  a list comprehension over one and every other order-observing use is
+  a loud conversion error naming `sorted(s)` (issue #444); `s.pop()`
+  answers a one-member set and panics on a larger one. `len`, `in`, set algebra, `any`/`all`, `sum` of ints and
+  `sorted`/`min`/`max` without `key=` over non-floats work as in CPython.
 - **`re`** is backed by the `regex` crate: backreferences and lookarounds
   are a loud `re.error`; `findall` supports up to 3 capture groups.
 - **Typed-lowering edges**: places where Python produces `None` inside a

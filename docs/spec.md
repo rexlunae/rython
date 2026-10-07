@@ -2148,9 +2148,30 @@ statements (Python's None), `remove` raises CPython's `KeyError` with
 the element's repr, `len` counts members, and the order-independent
 `sorted`/`min`/`max` take the set's elements; an empty `set()` into a
 typed slot (`out: set[str] = set()`, `return set()` from `-> set[T]`)
-builds the typed empty set. Iterating a set (`for x in s`, `list(s)`)
-still runs in Rust's HashSet order — a silent divergence filed as
-issue #444.
+builds the typed empty set. A set's iteration order is Rust's HashSet
+order, not CPython's, so every construct that observes it is a
+conversion error naming `sorted(s)` as the rewrite (issue #444): a
+`for` / `async for` loop over a set, `list`/`tuple`/`enumerate`/`zip`/
+`iter` (or any other builtin, `print` and `str` included) of a set,
+`str.join` / `list.extend` / `dict.fromkeys` over one, a list, dict or
+generator comprehension over one, star-unpacking (`f(*s)`, `[*s]`),
+tuple-unpacking assignment, `yield from s`, and the keyed
+`sorted`/`min`/`max` (a `key=` ties distinct members, and the tie keeps
+the iteration order), as are `sorted`/`min`/`max` over floats (a NaN
+compares neither way, so the result keeps whichever member came first).
+Order-independent consumers stay: `len`, `in`, set operators and
+methods, `set(s)`/`frozenset(s)`, `any`/`all`, `sorted`/`min`/`max`
+without `key=` over non-floats, `sum` over ints, a set comprehension,
+and a comprehension or `list(...)`/`tuple(...)` copy handed straight to
+one of those when no part of it (element, condition, a later
+generator's iterable) runs user code
+(`sorted(list({r for r in rs if r}))`). A comprehension's later
+generators are typed with the earlier targets bound, so
+`[y for g in groups for y in g]` over a `list[set[int]]` is refused. A set passed to a user function
+is checked in that function's body. `s.pop()` returns the member of a
+one-member set (the one answer CPython can give), raises CPython's
+`KeyError: 'pop from an empty set'` on an empty one, and panics at the
+call on a larger one, where CPython's answer is its table order.
 
 ### 10.2 Modules
 
@@ -2745,7 +2766,7 @@ accepted as permanent spec:
 | `deque.index(x)` lowers through the shared list-ops arm and raises `ValueError: deque.index(x): x not in deque` (the 3.14 wording the list arm pinned), where CPython 3.12/3.13 say `9 is not in deque` — the wording `deque.remove` and the inherent `deque::index(x, start, stop)` already use. The exception TYPE agrees | Documented version choice, pinned in `python_semantics.rs`; the list arm's wording is the project-wide pin |
 | `unicodedata` answers from the Unicode 16.0.0 database — CPython 3.14's `unidata_version` — for every CPython: an older CPython carries an older database (3.12: 15.0.0, 3.13: 15.1.0), so a code point assigned or re-classified since answers differently there (`category`, `bidirectional`, `combining`, `name`, `normalize`). Code points assigned before 15.0 agree | Model limit (issue #334); a per-CPython database would need one table set per version |
 | Unpacking's ValueError text is CPython 3.11–3.13's: `too many values to unpack (expected 2)`. CPython 3.14 appends the length for a sized sequence (`(expected 2, got 3)` for a tuple, list or dict; not for a str). `not enough values to unpack (expected 2, got 1)` and `cannot unpack non-iterable int object` agree across versions | Model limit; one message set, pinned to the 3.11 transcripts |
-| Iterating a set (`for x in s`, `list(s)`, a comprehension over one) runs in Rust's randomized `HashSet` order, not CPython's — different and nondeterministic output. Printing a set is a compile error, but iteration is not | Defect, issue #444 |
+| Iterating a set (`for x in s`, `list(s)`, a comprehension over one) would run in Rust's randomized `HashSet` order, not CPython's; every order-observing construct is now a conversion error naming `sorted(s)` (§10.1). Remaining limit: a set reached only through a comprehension's own variable (`for g in groups for x in g`) or an untyped value is not seen | Loud since issue #444; the model of CPython's set table order stays unimplemented |
 | True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |
 | Exception message shapes: `int()`'s message carries "with base 10" and `float()`'s quotes the string as Python's repr (#339, round 10); `open` and stream errors are CPython's `[Errno N] text: 'path'` form (#339); the `KeyError` key quoting is single-quoted like CPython (round 99) | Correct (was a defect class in issue #82's family) |
 | An uncaught exception on the direct-`main` entry path prints Rust's `Debug` form instead of `Type: message` (exit code 1 either way) | Defect (cosmetic) |
