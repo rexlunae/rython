@@ -2157,12 +2157,17 @@ conversion error naming `sorted(s)` as the rewrite (issue #444): a
 generator comprehension over one, star-unpacking (`f(*s)`, `[*s]`),
 tuple-unpacking assignment, `yield from s`, and the keyed
 `sorted`/`min`/`max` (a `key=` ties distinct members, and the tie keeps
-the iteration order). Order-independent consumers stay: `len`, `in`,
-set operators and methods, `set(s)`/`frozenset(s)`, `any`/`all`,
-`sorted`/`min`/`max` without `key=`, `sum` over ints, a set
-comprehension, and a comprehension or `list(...)`/`tuple(...)` copy
-handed straight to one of those when its body runs no user code
-(`sorted(list({r for r in rs if r}))`). A set passed to a user function
+the iteration order), as are `sorted`/`min`/`max` over floats (a NaN
+compares neither way, so the result keeps whichever member came first).
+Order-independent consumers stay: `len`, `in`, set operators and
+methods, `set(s)`/`frozenset(s)`, `any`/`all`, `sorted`/`min`/`max`
+without `key=` over non-floats, `sum` over ints, a set comprehension,
+and a comprehension or `list(...)`/`tuple(...)` copy handed straight to
+one of those when no part of it (element, condition, a later
+generator's iterable) runs user code
+(`sorted(list({r for r in rs if r}))`). A comprehension's later
+generators are typed with the earlier targets bound, so
+`[y for g in groups for y in g]` over a `list[set[int]]` is refused. A set passed to a user function
 is checked in that function's body. `s.pop()` returns the member of a
 one-member set (the one answer CPython can give), raises CPython's
 `KeyError: 'pop from an empty set'` on an empty one, and panics at the

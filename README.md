@@ -279,7 +279,7 @@ line, never a silent behaviour change:
   a list comprehension over one and every other order-observing use is
   a loud conversion error naming `sorted(s)` (issue #444); `s.pop()`
   answers a one-member set and panics on a larger one. `len`, `in`, set algebra, `any`/`all`, `sum` of ints and
-  `sorted`/`min`/`max` without `key=` work as in CPython.
+  `sorted`/`min`/`max` without `key=` over non-floats work as in CPython.
 - **`re`** is backed by the `regex` crate: backreferences and lookarounds
   are a loud `re.error`; `findall` supports up to 3 capture groups.
 - **Typed-lowering edges**: places where Python produces `None` inside a

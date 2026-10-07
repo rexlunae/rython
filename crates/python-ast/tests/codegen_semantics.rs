@@ -28318,6 +28318,44 @@ fn order_observable_set_iteration_is_refused() {
             err
         );
     }
+    // Devin review on #450. A later generator iterating a comprehension
+    // target that holds a set (CPython: `['pear', 'apple', 'fig']` for
+    // `[y for g in [{'pear', 'apple', 'fig'}] for y in g]`); a later
+    // generator's iterable that runs code once per set member, even under
+    // an order-free consumer (CPython prints `emit pear`, `emit apple`,
+    // `emit fig` before the sorted list); and min/max/sorted over floats,
+    // where a NaN keeps whichever member came first (CPython:
+    // `min([nan, 1.0])` is nan, `min([1.0, nan])` is 1.0).
+    for (src, what) in [
+        (
+            "def f(groups: list[set[str]]) -> None:\n    print([y for g in groups for y in g])\n",
+            "a list comprehension over a set",
+        ),
+        (
+            "def f(groups: list[set[str]]) -> None:\n    print([list(g) for g in groups])\n",
+            "`list(s)` of a set",
+        ),
+        (
+            "def emit(x: str) -> list[str]:\n    print(\"emit\", x)\n    return [x]\n\n\
+             def f() -> None:\n    s = {\"pear\", \"apple\"}\n    print(sorted([y for x in s for y in emit(x)]))\n",
+            "a list comprehension over a set",
+        ),
+        (
+            "def f() -> None:\n    s = {float(\"nan\"), 1.0}\n    print(min(s), max(s))\n",
+            "a set of floats",
+        ),
+        (
+            "def f() -> None:\n    s = {float(\"nan\"), 1.0}\n    print(sorted(s))\n",
+            "a set of floats",
+        ),
+        (
+            "def f() -> None:\n    s = {float(\"nan\"), 1.0}\n    print(min(x * 2 for x in s))\n",
+            "a generator expression over a set",
+        ),
+    ] {
+        let err = compile_err(src, "set_order_review.py");
+        assert!(err.contains(what) && err.contains("#444"), "{}: {}", src, err);
+    }
     // Module code and the `__main__` block are checked too.
     for src in [
         "s = {1, 2}\nfor x in s:\n    print(x)\n",
@@ -28334,7 +28372,8 @@ fn order_free_set_consumers_still_convert() {
     // allowed: len, in, set algebra, min/max/sorted without key=, sum of
     // ints, any/all, a read-only set comprehension, and an order-free
     // consumer of a list() copy (charset_normalizer's
-    // `sorted(list({r for r in ranges if r}))`).
+    // `sorted(list({r for r in ranges if r}))`), integer sorting, and a
+    // comprehension target that shadows an outer set with a list.
     // def f() -> None:
     //     s = {"pear", "apple", "fig"}
     //     n = {3, 1, 2}
@@ -28347,7 +28386,8 @@ fn order_free_set_consumers_still_convert() {
          \x20   print(sorted(s), min(s), max(s), len(s), sum(n), \"fig\" in s)\n\
          \x20   print(sorted(x.upper() for x in s), sum(x for x in n))\n\
          \x20   print(any(x == \"fig\" for x in s), len({x[0] for x in s}))\n\
-         \x20   print(sorted(list({x for x in s if x})), len(s | {\"kiwi\"}))\n",
+         \x20   print(sorted(list({x for x in s if x})), len(s | {\"kiwi\"}))\n\
+         \x20   print(sorted(n), min(n), [x for s in [[\"b\", \"a\"]] for x in s])\n",
         "set_order_free.py",
     );
     assert!(out.contains("fn f"), "{}", out);
