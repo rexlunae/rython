@@ -26871,7 +26871,8 @@ fn defaultdict_deque_factory_resolves_through_the_import() {
          \x20   return len(d)\n",
         "dd_deque_unbound_module.py",
     );
-    assert!(err.contains("defaultdict(...) takes only a builtin class"), "{err}");
+    // Issue #435: the unbound module name itself is the refusal.
+    assert!(err.contains("`collections`") && err.contains("NameError"), "{err}");
     // Nor when the module is imported only under another name: `import
     // collections as c` binds `c`, not `collections`.
     let err = compile_err(
@@ -26883,7 +26884,8 @@ fn defaultdict_deque_factory_resolves_through_the_import() {
          \x20   return len(d)\n",
         "dd_deque_other_alias.py",
     );
-    assert!(err.contains("defaultdict(...) takes only a builtin class"), "{err}");
+    // Issue #435: the unbound module name itself is the refusal.
+    assert!(err.contains("`collections`") && err.contains("NameError"), "{err}");
     // A local class named `deque` shadows the import: not the collections
     // class, so not a supported factory.
     let err = compile_err(
