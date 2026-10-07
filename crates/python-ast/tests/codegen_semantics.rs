@@ -28432,6 +28432,30 @@ fn an_unbound_runtime_module_name_is_refused() {
             "class C:\n    import json\n\n    def m(self) -> None:\n        print(json.dumps(3))\n",
             "json",
         ),
+        // Devin review on #451, each verified against python3 (NameError
+        // for `math`). A runtime module's star import binds its members,
+        // not the module.
+        ("from math import *\nprint(sqrt(4.0))\nprint(math.sqrt(9.0))\n", "math"),
+        // A comprehension target binds only inside the comprehension.
+        ("values = [math for math in [1]]\nprint(values)\nprint(math.sqrt(9.0))\n", "math"),
+        // A parameter binds only inside its function.
+        ("def f(math: int) -> None:\n    pass\n\n\nprint(math.sqrt(9.0))\n", "math"),
+        // A lambda or a comprehension in a class body does not see the
+        // class body's names.
+        (
+            "class C:\n    import math\n    f = staticmethod(lambda: math.sqrt(9.0))\n",
+            "math",
+        ),
+        (
+            "class C:\n    import math\n    xs = [math.sqrt(x) for x in [4.0]]\n",
+            "math",
+        ),
+        // A `global` declaration binds nothing until the function stores
+        // the name.
+        (
+            "def setup() -> None:\n    global math\n\n\nsetup()\nprint(math.sqrt(9.0))\n",
+            "math",
+        ),
     ] {
         let err = compile_err(src, "unbound_module.py");
         assert!(
@@ -28459,6 +28483,14 @@ fn a_bound_runtime_module_name_still_converts() {
         "def f() -> None:\n    import json\n\n    def g() -> str:\n        return json.dumps(1)\n\n    print(g())\n",
         "def setup() -> None:\n    global math\n    import math\n\n\ndef main() -> None:\n    setup()\n    print(math.sqrt(16.0))\n",
         "def f(json: str) -> int:\n    return len(json)\n",
+        // A lambda's default reads the enclosing scope; its parameter
+        // binds the body (python3 prints 3.141592653589793).
+        "import math\n\n\ndef f() -> float:\n    g = lambda math=math: math.pi\n    return g()\n",
+        // A comprehension's own target, and a lambda's parameter.
+        "def f(xs: list[int]) -> list[int]:\n    return [json + 1 for json in xs]\n",
+        "def f() -> int:\n    g = lambda json: json + 1\n    return g(1)\n",
+        // An `except ... as` name.
+        "def f() -> str:\n    try:\n        return \"x\"\n    except ValueError as json:\n        return str(json)\n",
     ] {
         compile(src, "bound_module.py");
     }

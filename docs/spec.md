@@ -693,8 +693,13 @@ Consequences, all enforced loudly:
   `import math as m`, or with no import at all; an import inside another
   function; a class body's import read in a method) is a conversion error
   where CPython raises NameError: the glob import would otherwise resolve
-  it to the runtime module (issue #435). A `from m import *` in the module
-  turns the check off, and annotations are not checked.
+  it to the runtime module (issue #435). Python's scoping applies: a
+  comprehension target, a lambda or function parameter binds only inside
+  it, a class body's names are invisible to the functions, lambdas and
+  comprehensions in it, and a `global` declaration counts only in a
+  function that stores the name. A `from m import *` of a module other
+  than a runtime module turns the check off, and annotations are not
+  checked.
 - `from typing import …` and `from functools import
   partial/lru_cache/cache/singledispatch` lower to nothing.
 - Importing a module that neither the runtime nor an FFI manifest
