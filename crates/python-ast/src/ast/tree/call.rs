@@ -9716,6 +9716,17 @@ let mutating_self_field = boxed_self_ref_receiver
                     // (Vec::pop returns an Option). A GENERIC receiver (an
                     // unannotated parameter with a PyPop bound, issue #109
                     // M2) has no inherent pop: route through the trait.
+                    // set.pop() (issue #444): only a one-member set has a
+                    // reproducible answer; the runtime panics on more.
+                    ("pop", [])
+                        if matches!(
+                            crate::infer_type(Some(&ctx), &attr.value, &options, &symbols),
+                            crate::TypeInfo::HashSet(_)
+                        ) =>
+                    {
+                        let runtime = crate::safe_ident(&options.stdpython);
+                        return Ok(quote!(#runtime::py_set_pop(&mut (#receiver))?));
+                    }
                     ("pop", []) => {
                         let generic = crate::ast::tree::call::root_name(&attr.value)
                             .is_some_and(|root| options.param_method_params.contains(root));

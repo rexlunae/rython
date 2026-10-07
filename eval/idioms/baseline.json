@@ -135,6 +135,10 @@
     "set_ops": {
       "status": "pass"
     },
+    "set_order_free": {
+      "status": "build-failed",
+      "errors": 5
+    },
     "shapes": {
       "status": "pass"
     },

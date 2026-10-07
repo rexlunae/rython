@@ -3499,6 +3499,9 @@ impl FunctionDef {
             )
             .into());
         }
+        // Issue #444: a set's iteration order is Rust's, not CPython's.
+        crate::ast::tree::set_order::check_body(&effective_body, &ctx, &options, &symbols)
+            .map_err(|e| format!("function `{}`: {}", self.name, e))?;
         let gen_elt = if crate::body_has_yields(&effective_body)
             // An abstract generator STUB (`def stream(...) ->
             // typing.Iterator[bytes]: raise NotImplementedError()` —

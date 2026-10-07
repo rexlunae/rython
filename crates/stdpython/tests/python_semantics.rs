@@ -6462,3 +6462,22 @@ fn set_remove_raises_key_error_with_the_element_repr() {
     // len() counts members of any set: len({3}) == 1
     assert_eq!(len(&n), 1);
 }
+
+#[test]
+fn set_pop_answers_only_a_one_member_set() {
+    // Issue #444: {42}.pop() == 42; set().pop() raises
+    //   KeyError: 'pop from an empty set'   (str(e) == "'pop from an empty set'")
+    // A larger set's pop answers CPython's first member in table order,
+    // which a HashSet does not reproduce: py_set_pop panics there.
+    let mut one = std::collections::HashSet::from([42i64]);
+    assert_eq!(py_set_pop(&mut one).unwrap(), 42);
+    assert!(one.is_empty());
+    let e = py_set_pop(&mut one).unwrap_err();
+    assert_eq!(e.exception_type, "KeyError");
+    assert_eq!(e.message, "'pop from an empty set'");
+    let many = std::panic::catch_unwind(|| {
+        let mut s = std::collections::HashSet::from([1i64, 2]);
+        py_set_pop(&mut s)
+    });
+    assert!(many.is_err());
+}

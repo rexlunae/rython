@@ -21264,11 +21264,14 @@ fn a_return_of_a_subtree_class_converts_into_the_roots_sum_type() {
 /// its receiver and propagates the Result.
 #[test]
 fn a_set_comprehension_target_is_the_sets_element() {
+    // The target's class comes from the set's element type. (A LIST
+    // comprehension over a set is refused, issue #444; a set
+    // comprehension whose body only reads is order-free.)
     let out = compile(
-        "class Shape:\n    def area(self) -> float:\n        return 1.0\n\ndef f(shapes: set[Shape]) -> list[float]:\n    return [s.area() for s in shapes]\n",
+        "class Shape:\n    def __init__(self) -> None:\n        self.kind = \"sq\"\n\ndef f(shapes: set[Shape]) -> int:\n    return len({s.kind for s in shapes})\n",
         "setcomp.py",
     );
-    assert!(out.contains(". area () ?"), "the target is the set's element: {}", out);
+    assert!(out.contains("s . kind"), "the target is the set's element: {}", out);
 }
 
 /// `map(lambda x, y: ..., xs, ys)`: one parameter per iterable, each the
@@ -28104,22 +28107,21 @@ fn a_shadowed_set_call_is_not_the_empty_set() {
 }
 
 #[test]
-fn a_keyed_min_max_sorted_over_a_set_is_not_lowered() {
+fn a_keyed_min_max_sorted_over_a_set_is_refused() {
     // Devin review on #446: `key=` can tie distinct members (`min({"aa",
     // "ab"}, key=len)` answers the first one ITERATED), and a Rust
     // HashSet iterates in a different, randomized order (issue #444), so
-    // the keyed forms keep the loud build error instead of collecting.
-    let out = compile(
-        "def f() -> None:\n\
-         \x20   s = {\"aa\", \"ab\"}\n\
-         \x20   print(min(s, key=len), sorted(s, key=len))\n",
-        "keyed_set.py",
-    );
-    assert!(
-        !out.contains("collect :: < Vec < _ >> ()"),
-        "a keyed builtin over a set must not take its iteration order: {}",
-        out
-    );
+    // the keyed forms are a conversion error naming the rewrite.
+    for call in ["min(s, key=len)", "sorted(s, key=len)", "max(s, key=len)"] {
+        let src = format!("def f() -> None:\n    s = {{\"aa\", \"ab\"}}\n    print({})\n", call);
+        let err = compile_err(&src, "keyed_set.py");
+        assert!(
+            err.contains("is not supported yet") && err.contains("sorted(s)") && err.contains("#444"),
+            "{}: {}",
+            call,
+            err
+        );
+    }
 }
 
 /// Issue #440, no over-widening: a class a getter returns out of a field
@@ -28281,4 +28283,80 @@ fn a_callers_local_does_not_shadow_a_module_name_the_callee_reads() {
         "the callees return Vec<i64>, whatever the caller's LIMITS is: {}",
         out
     );
+}
+
+#[test]
+fn order_observable_set_iteration_is_refused() {
+    // Issue #444: a set lowers to a Rust HashSet, whose iteration order is
+    // not CPython's (and changes from run to run). Every construct that
+    // observes the order is a conversion error naming `sorted(s)`.
+    // CPython (PYTHONHASHSEED=0) prints `banana fig apple pear kiwi` for
+    // `for x in {"pear", "apple", "fig", "kiwi", "banana"}: print(x)`.
+    for stmt in [
+        "for x in s:\n        print(x)",
+        "print(list(s))",
+        "print(tuple(s))",
+        "print([x for x in s])",
+        "print({x: 1 for x in s})",
+        "print(\", \".join(s))",
+        "print(list(enumerate(s)))",
+        "out.extend(s)",
+        "print(*s)",
+        "a, b = s",
+        "print(sorted(s, key=len))",
+        "print(len({out.append(x) for x in s}))",
+    ] {
+        let src = format!(
+            "def f() -> None:\n    s = {{\"aa\", \"b\"}}\n    out: list[str] = []\n    {}\n",
+            stmt
+        );
+        let err = compile_err(&src, "set_order.py");
+        assert!(
+            err.contains("is not supported yet") && err.contains("sorted(s)") && err.contains("#444"),
+            "{}: {}",
+            stmt,
+            err
+        );
+    }
+    // Module code and the `__main__` block are checked too.
+    for src in [
+        "s = {1, 2}\nfor x in s:\n    print(x)\n",
+        "if __name__ == \"__main__\":\n    print(list({1, 2}))\n",
+    ] {
+        let err = compile_err(src, "set_order_module.py");
+        assert!(err.contains("#444"), "{}: {}", src, err);
+    }
+}
+
+#[test]
+fn order_free_set_consumers_still_convert() {
+    // Issue #444: consumers whose result cannot depend on the order stay
+    // allowed: len, in, set algebra, min/max/sorted without key=, sum of
+    // ints, any/all, a read-only set comprehension, and an order-free
+    // consumer of a list() copy (charset_normalizer's
+    // `sorted(list({r for r in ranges if r}))`).
+    // def f() -> None:
+    //     s = {"pear", "apple", "fig"}
+    //     n = {3, 1, 2}
+    //     print(sorted(s), min(s), max(s), len(s), sum(n), "fig" in s)
+    //     # ['apple', 'fig', 'pear'] apple pear 3 6 True
+    let out = compile(
+        "def f() -> None:\n\
+         \x20   s = {\"pear\", \"apple\", \"fig\"}\n\
+         \x20   n = {3, 1, 2}\n\
+         \x20   print(sorted(s), min(s), max(s), len(s), sum(n), \"fig\" in s)\n\
+         \x20   print(sorted(x.upper() for x in s), sum(x for x in n))\n\
+         \x20   print(any(x == \"fig\" for x in s), len({x[0] for x in s}))\n\
+         \x20   print(sorted(list({x for x in s if x})), len(s | {\"kiwi\"}))\n",
+        "set_order_free.py",
+    );
+    assert!(out.contains("fn f"), "{}", out);
+    // `s.pop()` has a reproducible answer only on a one-member set
+    // (urllib3 pops its validated single Content-Length): the runtime
+    // checks the size (`py_set_pop`).
+    let out = compile(
+        "def f(t: str) -> int:\n    lengths = {int(v) for v in t.split(\",\")}\n    return lengths.pop()\n",
+        "set_pop.py",
+    );
+    assert!(out.contains("py_set_pop (& mut (lengths))"), "{}", out);
 }

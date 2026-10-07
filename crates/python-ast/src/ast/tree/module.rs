@@ -1139,6 +1139,8 @@ impl CodeGen for Module {
         // Issue #112: `del name` at module level lowers to a no-op; a use
         // after the del is a loud error (the module body is one scope).
         crate::check_deleted_names(&module_init_raw)?;
+        // Issue #444: module code iterates sets in Rust's order too.
+        crate::ast::tree::set_order::check_body(&module_init_raw, &ctx, &options, &symbols)?;
         // Issue #109, M5: module-level calls (including the __main__ block)
         // are checked against callee inferred bounds at conversion time.
         crate::check_call_sites(
@@ -1428,6 +1430,15 @@ impl CodeGen for Module {
                             o.in_module_init_body = true;
                             o
                         };
+                        // Issue #444: the block iterates sets in Rust's
+                        // order too.
+                        crate::ast::tree::set_order::check_body(
+                            &if_stmt.body,
+                            &ctx,
+                            &main_options,
+                            &symbols,
+                        )
+                        .map_err(|e| wrap_module_error(&module_filename, e.into()))?;
                         for body_stmt in &if_stmt.body {
                             // A `unittest.main()` call lowers to the emitted
                             // test runner (issue #334): construct the module's
