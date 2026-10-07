@@ -28400,3 +28400,64 @@ fn order_free_set_consumers_still_convert() {
     );
     assert!(out.contains("py_set_pop (& mut (lengths))"), "{}", out);
 }
+
+#[test]
+fn an_unbound_runtime_module_name_is_refused() {
+    // Issue #435: `use stdpython::*` brings the runtime modules into every
+    // generated module by their Python names, so a read of a module name
+    // the program never bound ran instead of raising NameError.
+    // Verified against python3: each program prints what precedes the
+    // read, then raises `NameError: name 'math' is not defined` (`json`
+    // for the last two).
+    for (src, name) in [
+        // `import math as m` binds only `m`.
+        (
+            "import math as m\n\n\ndef main() -> None:\n    print(m.sqrt(4.0))\n    print(math.sqrt(9.0))\n",
+            "math",
+        ),
+        // No import at all.
+        ("def main() -> None:\n    print(math.sqrt(9.0))\n", "math"),
+        // Module code.
+        ("import math as m\nprint(math.pi)\n", "math"),
+        // A function's import is its own local.
+        (
+            "def f() -> None:\n    import json\n    print(json.dumps(1))\n\n\n\
+             def g() -> None:\n    print(json.dumps(2))\n",
+            "json",
+        ),
+        // A class body's names are not visible in its methods.
+        (
+            "class C:\n    import json\n\n    def m(self) -> None:\n        print(json.dumps(3))\n",
+            "json",
+        ),
+    ] {
+        let err = compile_err(src, "unbound_module.py");
+        assert!(
+            err.contains(&format!("`{}`", name)) && err.contains("NameError") && err.contains("#435"),
+            "{}: {}",
+            src,
+            err
+        );
+    }
+}
+
+#[test]
+fn a_bound_runtime_module_name_still_converts() {
+    // Issue #435: every way Python binds the name keeps converting: a
+    // plain or dotted import, the alias itself, a function-local import
+    // read in that function, a nested function reading its enclosing
+    // function's import, a `global` declaration that imports at module
+    // scope (python3 prints 4.0 for the last), and a parameter of that
+    // name.
+    for src in [
+        "import math\n\n\ndef main() -> None:\n    print(math.sqrt(9.0))\n",
+        "import os.path\n\n\ndef main() -> None:\n    print(os.path.join(\"a\", \"b\"))\n",
+        "import math as m\n\n\ndef main() -> None:\n    print(m.sqrt(4.0))\n",
+        "def f() -> None:\n    import json\n    print(json.dumps(1))\n",
+        "def f() -> None:\n    import json\n\n    def g() -> str:\n        return json.dumps(1)\n\n    print(g())\n",
+        "def setup() -> None:\n    global math\n    import math\n\n\ndef main() -> None:\n    setup()\n    print(math.sqrt(16.0))\n",
+        "def f(json: str) -> int:\n    return len(json)\n",
+    ] {
+        compile(src, "bound_module.py");
+    }
+}

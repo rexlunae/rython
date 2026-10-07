@@ -301,6 +301,10 @@ impl CodeGen for Module {
         } = normalize_module_body(self.raw.body, &options)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         self.raw.body = body;
+        // Issue #435: a runtime module name the program never bound would
+        // resolve to the runtime module through `use stdpython::*`.
+        crate::ast::tree::unbound_module::check_module(&self.raw.body)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         let mut options = options;
         options.folded_guard_imports = std::rc::Rc::new(folded_imports);
         // Handler statements the fold made live were invisible to
