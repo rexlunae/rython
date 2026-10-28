@@ -116,7 +116,10 @@ fn module_level_main_call_in(raw: &python_ast::RawModule) -> bool {
     let python_ast::ExprType::Name(name) = call.func.as_ref() else {
         return false;
     };
-    if name.id != "main" || !call.args.is_empty() {
+    // Zero arguments, matching `Module::module_level_main_call`: a call
+    // carrying arguments cannot cross the entry boundary, and is a loud
+    // conversion error in python-ast (never an entry the converter builds).
+    if name.id != "main" || !call.args.is_empty() || !call.keywords.is_empty() {
         return false;
     }
     body.iter().any(|s| {

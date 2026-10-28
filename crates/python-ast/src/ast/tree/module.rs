@@ -791,6 +791,35 @@ impl CodeGen for Module {
             .then(|| Self::module_level_main_call(&self.raw.body))
             .flatten();
 
+        // The argument-bearing form is refused by SHAPE, in every role:
+        // whether or not the converter picked this module, a final
+        // `main(...)` with arguments cannot be the entry (see the message).
+        if let Some(call_index) = Self::module_level_main_call(&self.raw.body)
+            && let Some(crate::StatementType::Expr(e)) =
+                self.raw.body.get(call_index).map(|s| &s.statement)
+            && let crate::ExprType::Call(call) = &e.value
+            && !(call.args.is_empty() && call.keywords.is_empty())
+        {
+            let line = self.raw.body[call_index]
+                .lineno
+                .map(|l| format!(" (line {})", l))
+                .unwrap_or_default();
+            return Err(wrap_module_error(
+                &module_filename,
+                format!(
+                    "the module-level `main(...)` call{} passes arguments, and a \
+                     bare module-level call is the program's entry point — whose \
+                     boundary cannot carry them (the function becomes Rust's `fn main`, \
+                     which takes none); rython refuses to drop them or to silently \
+                     call `main()` with no arguments. Wrap the call in \
+                     `if __name__ == \"__main__\": main(...)`, which is an ordinary \
+                     statement and passes its arguments as Python does",
+                    line,
+                )
+                .into(),
+            ));
+        }
+
         // Issue #431, Devin review on #454: the same shape in a module that
         // is NOT the crate's executable entry is an ordinary module-level
         // call — Python runs it when the module is imported, and it has to
@@ -6318,9 +6347,24 @@ impl Module {
         
         let stmt = &body[0];
         match &stmt.statement {
-            // Pattern 1: main() - direct call as expression statement
+            // Pattern 1: main() - direct call as expression statement.
+            // Zero ARGUMENTS: promoting the user's `main` to the Rust entry
+            // point only works when it takes none (`fn main(x: i64)` is
+            // E0580: the entry point has a fixed, argument-less signature).
+            // A `main(...)` with arguments is NOT this pattern, so the
+            // block falls to the wrapper, which renames the function and
+            // calls it with its arguments — as Python does.
             crate::StatementType::Expr(expr) => {
-                Self::is_main_function_call(&expr.value)
+                matches!(
+                    &expr.value,
+                    crate::ExprType::Call(call)
+                        if call.args.is_empty()
+                            && call.keywords.is_empty()
+                            && matches!(
+                                call.func.as_ref(),
+                                crate::ExprType::Name(n) if n.id == "main"
+                            )
+                )
             },
             // Pattern 2: result = main() - assignment from main call
             crate::StatementType::Assign(assign) => {
@@ -6379,20 +6423,13 @@ impl Module {
         let crate::StatementType::Expr(expr) = &last.statement else {
             return None;
         };
-        // A bare `main()` — no arguments at all (positional or keyword),
-        // no return value taken. The user's `main` becomes the process
-        // entry point, so arguments could not cross the boundary: a
-        // `main(1)` would run the function with its own arity (a
-        // TypeError under Python) and a `main(x=1)` would lose the
-        // argument. Those shapes are ordinary module-level calls and stay
-        // in `__module_init__`.
         let crate::ExprType::Call(call) = &expr.value else {
             return None;
         };
         let crate::ExprType::Name(name) = call.func.as_ref() else {
             return None;
         };
-        if name.id != "main" || !call.args.is_empty() || !call.keywords.is_empty() {
+        if name.id != "main" {
             return None;
         }
         // ... of the module's OWN `def main` (a module-level `def` or

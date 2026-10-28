@@ -21415,6 +21415,77 @@ fn unguarded_main_call_runs_module_level_code_first() {
 }
 
 #[test]
+fn a_final_main_call_with_arguments_is_a_loud_conversion_error() {
+    // The Lead's check on #454: a final module-level `main(...)` call with
+    // arguments. `python3 pos.py` prints `1` and `python3 kw.py` prints
+    // `1` (captured from real runs) — they are the program body under
+    // CPython. The generated entry point cannot carry arguments (the
+    // user's `main` becomes Rust's `fn main`), so both used to convert and
+    // then fail `cargo build` with `E0428`/`E0580`. They are refused at
+    // conversion instead, naming the line and the guarded rewrite (which
+    // does pass its arguments).
+    for (name, src, prints) in [
+        (
+            "posargs",
+            "def main(x: int) -> None:\n    print(x)\n\n\nmain(1)\n",
+            "1",
+        ),
+        (
+            "kwargs",
+            "def main(x: int = 5) -> None:\n    print(x)\n\n\nmain(x=1)\n",
+            "1",
+        ),
+    ] {
+        let scratch = Scratch::new(name);
+        let file = scratch.path().join(format!("{}.py", name));
+        fs::write(&file, src).unwrap();
+        let out = scratch.path().join("crate");
+
+        let pkg = rypip::discover(&file).expect("discover");
+        let err = rypip::convert(&pkg, &out, &ConvertOptions::default())
+            .expect_err("a final main(...) call with arguments must be refused");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("passes arguments") && msg.contains("line 5"),
+            "the refusal names the construct and its line (python3 prints {}): {}",
+            prints,
+            msg
+        );
+        assert!(
+            msg.contains("__main__"),
+            "the refusal names the guarded rewrite: {}",
+            msg
+        );
+    }
+}
+
+#[test]
+fn the_guarded_main_call_passes_arguments_through() {
+    // The rewrite the refusal points at really works: `python3` prints `1`
+    // (captured from a real run).
+    let scratch = Scratch::new("argguard");
+    let file = scratch.path().join("argguard.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main(x: int) -> None:\n",
+            "    print(x)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main(1)\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "argguard"), vec!["1"]);
+}
+
+#[test]
 fn unguarded_main_call_after_other_statements_is_a_loud_conversion_error() {
     // `python3 trail.py` prints `hi` then `bye` (captured from a real run):
     // the trailing statement runs AFTER the program body. The generated
