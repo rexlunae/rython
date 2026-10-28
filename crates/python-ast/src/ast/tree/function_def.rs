@@ -2291,15 +2291,30 @@ impl FunctionDef {
         // a list of shared `PyRef`s never mutates the list). The signature
         // region asks the same question through this closure so `def f`
         // and `def f(self)` are decided from ONE analysis.
+        // Memoized: the analysis is not cheap, and the pre-name-types
+        // region asks it several times. The cache is dropped the moment
+        // `options` is retyped below (the later query passes the TYPED
+        // options and must see a fresh answer).
+        let scope_cache: std::cell::RefCell<
+            Option<(usize, std::rc::Rc<crate::ScopeBindings>)>,
+        > = std::cell::RefCell::new(None);
         let lazy_scope = |options: &crate::PythonOptions| {
-            crate::analyze_scope_typed(
+            let key = std::rc::Rc::as_ptr(&options.name_types) as usize;
+            if let Some((k, v)) = scope_cache.borrow().as_ref()
+                && *k == key
+            {
+                return std::rc::Rc::clone(v);
+            }
+            let computed = std::rc::Rc::new(crate::analyze_scope_typed(
                 &effective_body,
                 &param_names,
                 &crate::class_call_resolver(&ctx, &symbols, options),
                 &ctx,
                 &symbols,
                 options,
-            )
+            ));
+            *scope_cache.borrow_mut() = Some((key, std::rc::Rc::clone(&computed)));
+            computed
         };
         let receiver = if is_method {
             if forced_mut_self
