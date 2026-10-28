@@ -21530,6 +21530,35 @@ fn the_guarded_main_call_passes_arguments_through() {
             "\n",
             "if __name__ == \"__main__\":\n",
             "    main(1)\n",
+fn unittest_assert_raises_with_a_raise_builds_and_runs() {
+    // Issue #457: `with self.assertRaises(E): raise E(...)` -- a raise as
+    // the with-body's LAST statement -- used to convert with no warning and
+    // then FAIL TO BUILD (E0308 on the enclosing method). The existing pin
+    // asserted generated token text only, so it passed while the crate did
+    // not compile. This one converts, builds, and runs.
+    // Verified against python3 (3.14.4): both tests pass, exit 0.
+    let scratch = Scratch::new("assert-raises-tail");
+    let file = scratch.path().join("t.py");
+    fs::write(
+        &file,
+        concat!(
+            "import unittest\n",
+            "\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    def test_raises(self) -> None:\n",
+            "        with self.assertRaises(ValueError):\n",
+            "            raise ValueError(\"boom\")\n",
+            "\n",
+            "    def test_raises_after_work(self) -> None:\n",
+            "        with self.assertRaises(ZeroDivisionError):\n",
+            "            x = 1\n",
+            "            y = x // 0\n",
+            "            print(y)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
         ),
     )
     .unwrap();
@@ -21765,5 +21794,28 @@ fn an_imported_module_ending_in_a_bare_main_call_is_loud_not_silently_dropped() 
         msg.contains("__main__"),
         "the refusal names the rewrite: {}",
         msg
+
+    let status = build_generated(&krate.root);
+    assert!(
+        status.success(),
+        "the assertRaises crate must COMPILE (issue #457 built one that did not)"
+    );
+
+    let output = Command::new(krate.root.join("target/debug/t"))
+        .output()
+        .expect("running generated binary");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("not declared as mutable") && !combined.contains("error["),
+        "no compile/runtime error text expected: {combined}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "2 passing assertRaises tests exit 0 like python3: {combined}"
     );
 }

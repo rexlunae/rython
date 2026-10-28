@@ -5976,11 +5976,20 @@ pub(crate) fn annotation_display(ann: &ExprType) -> String {
 pub(crate) fn guarantees_return(body: &[Statement]) -> bool {
     match body.last().map(|stmt| &stmt.statement) {
         Some(StatementType::Return(Some(_))) => true,
-        // A `with` body's return IS the function's return (context
+        // A `with` body's RETURN is the function's return (context
         // managers only intercept exceptions, never returns — requests'
-        // api.request; issue #137).
-        Some(StatementType::With(s)) => guarantees_return(&s.body),
-        Some(StatementType::AsyncWith(s)) => guarantees_return(&s.body),
+        // api.request; issue #137) — but a `RAISE` is not the same thing
+        // for this analysis. `raise` lowers to `return Err(..)` inside the
+        // block, which does terminate the path for the code FOLLOWING the
+        // with; that is a different question from "the function needs no
+        // trailing Ok(())", and conflating them withheld the function's own
+        // tail whenever the with-body's last statement was a raise
+        // (issue #457: `with self.assertRaises(E): raise E(...)` compiled
+        // to a method whose body fell off the end, E0308 on the method).
+        // So a with/async-with propagates a genuine RETURN from its body,
+        // never a bare raise.
+        Some(StatementType::With(s)) => returns_from_body(&s.body),
+        Some(StatementType::AsyncWith(s)) => returns_from_body(&s.body),
         Some(StatementType::If(s)) => {
             !s.orelse.is_empty() && guarantees_return(&s.body) && guarantees_return(&s.orelse)
         }
@@ -5998,6 +6007,36 @@ pub(crate) fn guarantees_return(body: &[Statement]) -> bool {
             };
             let handlers = t.handlers.iter().all(|h| guarantees_return(&h.body));
             (normal_path && handlers) || guarantees_return(&t.finalbody)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `body` terminates the enclosing FUNCTION with a `return`
+/// (rather than merely raising), looking through the nesting forms whose
+/// returns propagate outward. `guarantees_return` answers "does control
+/// leave this block?"; this answers the narrower question a `with` needs:
+/// does the body RETURN from the function, so the function's trailing
+/// `Ok(())` would be unreachable? A `raise` ends the block but is not a
+/// return the function body can rely on for its own tail (issue #457).
+fn returns_from_body(body: &[Statement]) -> bool {
+    match body.last().map(|stmt| &stmt.statement) {
+        Some(StatementType::Return(Some(_))) => true,
+        Some(StatementType::With(s)) => returns_from_body(&s.body),
+        Some(StatementType::AsyncWith(s)) => returns_from_body(&s.body),
+        Some(StatementType::If(s)) => {
+            !s.orelse.is_empty()
+                && returns_from_body(&s.body)
+                && returns_from_body(&s.orelse)
+        }
+        Some(StatementType::Try(t)) => {
+            let normal_path = if t.orelse.is_empty() {
+                returns_from_body(&t.body)
+            } else {
+                returns_from_body(&t.body) || returns_from_body(&t.orelse)
+            };
+            let handlers = t.handlers.iter().all(|h| returns_from_body(&h.body));
+            (normal_path && handlers) || returns_from_body(&t.finalbody)
         }
         _ => false,
     }

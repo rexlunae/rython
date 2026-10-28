@@ -12,7 +12,7 @@ use crate::{
 /// `with self.assertRaises(Exc):` form (issue #334). None when the shape is
 /// not that CM or the exception is not a statically-known name (a tuple of
 /// exceptions, or a dynamic `self.failureException`).
-fn assert_raises_cm_name(expr: &ExprType) -> Option<String> {
+pub(crate) fn assert_raises_cm_name(expr: &ExprType) -> Option<String> {
     let ExprType::Call(c) = expr else {
         return None;
     };
@@ -228,10 +228,24 @@ impl CodeGen for With {
                 .collect();
             let body_tokens = body_tokens?;
             let exc_lit = quote!(#exc);
+            // A body that RAISES unconditionally (`raise E(...)` as its
+            // last statement) already ends in `return Err(..)`, which is
+            // the closure's exit: appending `Ok(())` after it is dead code
+            // and makes rustc see the closure return `()`, not
+            // `Result<(), PyException>` (issue #457 - the reported E0308
+            // lands on the ENCLOSING method, because `guarantees_return`
+            // unwraps a `with` into its body and so withholds the
+            // method's own tail). Only a body that can fall through needs
+            // the tail.
+            let tail = if crate::ast::tree::function_def::guarantees_return(&self.body) {
+                quote!()
+            } else {
+                quote!(Ok(()))
+            };
             return Ok(quote! {
                 unittest::assert_raises(#exc_lit, || -> Result<(), PyException> {
                     #(#body_tokens;)*
-                    Ok(())
+                    #tail
                 })?;
             });
         }

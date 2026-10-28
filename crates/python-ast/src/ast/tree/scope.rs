@@ -886,13 +886,13 @@ fn walk_stmts(body: &[Statement], a: &mut Analysis<'_>, multi: bool) {
                 for item in &s.items {
                     walk_expr(&item.context_expr, a);
                 }
-                walk_stmts(&s.body, a, multi);
+                walk_with_body(&s.items, &s.body, a, multi);
             }
             StatementType::AsyncWith(s) => {
                 for item in &s.items {
                     walk_expr(&item.context_expr, a);
                 }
-                walk_stmts(&s.body, a, multi);
+                walk_with_body(&s.items, &s.body, a, multi);
             }
             // Nested definitions are their own scopes.
             _ => {}
@@ -1000,6 +1000,41 @@ fn walk_call(call: &crate::Call, a: &mut Analysis<'_>) {
     for kw in &call.keywords {
         walk_expr(&kw.value, a);
     }
+}
+
+/// Walk a `with` body, mirroring how it RENDERS.
+///
+/// `with self.assertRaises(E):` (the unittest context-manager form) lowers
+/// its body into a generated closure (`with_stmt.rs`), so a name first
+/// assigned in that body is captured while possibly-uninitialized — exactly
+/// the try-body case above. Treating the body as a plain block gave such a
+/// name neither `closure_captured_uninit` (so a bare `let x;` was captured —
+/// E0381) nor, once the prologue was fixed, the `mut` its store-inside-a-
+/// closure needs (E0594) (issue #457). Every other `with` renders inline and
+/// keeps the plain walk.
+fn walk_with_body(
+    items: &[crate::WithItem],
+    body: &[Statement],
+    a: &mut Analysis<'_>,
+    multi: bool,
+) {
+    if items.len() == 1
+        && items[0].optional_vars.is_none()
+        && crate::ast::tree::with_stmt::assert_raises_cm_name(&items[0].context_expr).is_some()
+    {
+        let before = a.state.clone();
+        walk_stmts(body, a, multi);
+        a.record_closure_boundary(&before);
+        // The store happened INSIDE a closure, so rustc needs the binding
+        // mutable even though the analysis saw a first assignment.
+        for name in &a.seq_assigned {
+            if before.get(name).copied().unwrap_or(Init::No) != Init::Yes {
+                a.needs_mut.insert(name.clone());
+            }
+        }
+        return;
+    }
+    walk_stmts(body, a, multi);
 }
 
 fn walk_subscript_kind(kind: &crate::SubscriptKind, a: &mut Analysis<'_>) {
