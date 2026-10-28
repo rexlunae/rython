@@ -21346,3 +21346,164 @@ fn a_mutating_call_through_an_unannotated_getter_reaches_the_held_object() {
     // Verified against python3.
     assert_eq!(got, vec!["7 ['+2', '+5', 'x']", "True"]);
 }
+
+#[test]
+fn unguarded_module_level_main_call_converts_and_runs() {
+    // Issue #431: `def main()` plus a bare module-level `main()` (no
+    // `if __name__ == "__main__":` guard) is a very common script shape.
+    // CPython runs the file as `__main__`, so the call IS the program body:
+    // `python3 e2e.py` prints exactly
+    //
+    //     hi
+    //
+    // (captured from a real `python3 e2e.py` run). Previously the crate
+    // was generated library-only, with the user's `pub fn main` beside a
+    // generated `fn main` — rustc's E0428, and no binary at all.
+    let scratch = Scratch::new("unguardedmain");
+    let file = scratch.path().join("e2e.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> None:\n",
+            "    print(\"hi\")\n",
+            "\n",
+            "\n",
+            "main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    // The crate needs a BINARY: the module-level call is the program.
+    assert!(
+        krate.root.join("src/main.rs").exists(),
+        "the unguarded module-level `main()` call must produce a binary crate"
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "e2e"), vec!["hi"]);
+}
+
+#[test]
+fn unguarded_main_call_runs_module_level_code_first() {
+    // Module-level code before the call runs first, in source order:
+    // `python3 pre.py` prints `before` then `hi` (captured from a real
+    // run), which is also what the binary must print.
+    let scratch = Scratch::new("unguardedpre");
+    let file = scratch.path().join("pre.py");
+    fs::write(
+        &file,
+        concat!(
+            "print(\"before\")\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(\"hi\")\n",
+            "\n",
+            "\n",
+            "main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "pre"), vec!["before", "hi"]);
+}
+
+#[test]
+fn unguarded_main_call_after_other_statements_is_a_loud_conversion_error() {
+    // `python3 trail.py` prints `hi` then `bye` (captured from a real run):
+    // the trailing statement runs AFTER the program body. The generated
+    // module init would run it BEFORE, so the conversion refuses the shape
+    // and names the rewrite instead of emitting a silently different
+    // program.
+    let scratch = Scratch::new("unguardedtrail");
+    let file = scratch.path().join("trail.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> None:\n",
+            "    print(\"hi\")\n",
+            "\n",
+            "\n",
+            "main()\n",
+            "print(\"bye\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect_err("the shape must be refused loudly");
+    let msg = format!("{:#}", err);
+    assert!(
+        msg.contains("main()") && msg.contains("AFTER it"),
+        "the refusal names the construct and the trailing statement: {}",
+        msg
+    );
+    assert!(
+        msg.contains("move them above") && msg.contains("__main__"),
+        "the refusal names the rewrite: {}",
+        msg
+    );
+}
+
+#[test]
+fn a_module_defining_main_without_calling_it_stays_a_library_crate() {
+    // `python3 nomain.py` prints nothing — the definition alone is not a
+    // program (verified against python3). The conversion must stay a
+    // library crate.
+    let scratch = Scratch::new("maindefined");
+    let file = scratch.path().join("nomain.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> None:\n",
+            "    print(\"hi\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    assert!(
+        !krate.root.join("src/main.rs").exists(),
+        "a module that never calls `main` must stay a library crate"
+    );
+}
+
+#[test]
+fn the_guarded_main_call_still_produces_the_same_binary() {
+    // The regression pin for the guarded form: `python3 guarded.py` prints
+    // `hi` (captured from a real run) and the crate keeps its binary.
+    let scratch = Scratch::new("guardedmain");
+    let file = scratch.path().join("guarded.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> None:\n",
+            "    print(\"hi\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    assert!(
+        krate.root.join("src/main.rs").exists(),
+        "the guarded form keeps its binary"
+    );
+    // Verified against python3.
+    assert_eq!(run_package(&krate, "guarded"), vec!["hi"]);
+}

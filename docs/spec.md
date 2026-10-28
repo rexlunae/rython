@@ -2050,18 +2050,33 @@ exception escaping a lambda (§4.5).
   point runs first. Consequently, **non-constant module globals are not
   visible inside functions** — the reference fails to compile (loud,
   but with a rustc error; see §12.1).
-- The entry point is `__main__.py`, or the module containing an
-  `if __name__ == "__main__":` block. The block becomes `fn main()`.
-  When the block does more than call `main()` (or module-init code
+- The entry point is `__main__.py`, or the module that either holds an
+  `if __name__ == "__main__":` block or calls its own module-level
+  `main()` as its last top-level statement (issue #431). The second
+  spelling is what a plain `python file.py` runs — CPython executes the
+  file as `__main__`, so that call is the whole program body — and it
+  produces the same `fn main()` with the same wrapper decision. The
+  block, or that call, becomes `fn main()`.
+  When it does more than call `main()` (or module-init code
   exists), a generated wrapper runs `__module_init__` and the body,
   printing `Type: message` to stderr and exiting 1 on an uncaught
-  exception. When the block is just `main()` with no module-level
+  exception. When it is just `main()` with no module-level
   code, the user's `main` — which returns `Result` — becomes the Rust
   entry point directly, so an uncaught exception still exits 1 but
   prints the error's `Debug` form rather than `Type: message` (a
   cosmetic inconsistency, §12.3). A dedicated `__main__.py` is
   bin-only; any other entry module appears in both the library and the
   binary.
+- A bare module-level `main()` is only the entry point as the module
+  body's FINAL statement: module-level statements before it still run
+  first, and `python file.py` would run statements after it AFTER the
+  program — the generated wrapper would run them BEFORE — so that shape
+  is a conversion error naming the trailing statement and the rewrite
+  (move it above the call, delete it, or spell the guard), never a
+  silently reordered program. A module-level `main()` call beside an
+  `if __name__ == "__main__":` block is refused for the same reason
+  (one program body per crate, where CPython would run both). A module
+  that defines `main` and never calls it stays a library crate.
 - Packages without an entry point convert to library crates and cannot
   be `rypip install`ed or `rypip run` (loud error naming the fix).
 - `rypip run program.py -- args` is CPython's command-line shape over the

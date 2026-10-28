@@ -748,6 +748,71 @@ impl CodeGen for Module {
             })
             .collect();
 
+        // Issue #431: a bare module-level `main()` call as the module
+        // body's FINAL statement, in a module that itself defines `main`,
+        // is what `python prog.py` runs: CPython executes the file as
+        // `__main__`, so that call is the whole program body — the shape
+        // `if __name__ == "__main__": main()` spells explicitly (the
+        // user's `main` becomes the process entry point; rypip treats the
+        // module as the crate's entry, so the crate gets a binary).
+        //
+        // A `main()` call that is NOT the module body's final statement is
+        // refused loudly: Python runs the statements after it too, in
+        // source order, while the generated binary's `__module_init__`
+        // would run them BEFORE the call — a silent reordering of the
+        // program. The error names the statement and the rewrite.
+        if let Some(after) = Self::module_level_main_call_followed_by(&self.raw.body)
+            .map(|call_index| &self.raw.body[call_index + 1..])
+        {
+            let line = after[0].lineno.map(|l| format!(" (line {})", l)).unwrap_or_default();
+            return Err(wrap_module_error(
+                &module_filename,
+                format!(
+                    "the module-level `main()` call is the program's entry point \
+                     (`python <file>` runs the file as `__main__`, so that call is the \
+                     program body), but the module runs {} more module-level \
+                     statement{} AFTER it{}. The generated program runs those BEFORE the \
+                     call and CPython runs them after, and rython refuses to silently \
+                     reorder them; move them above `main()`, delete them, or wrap the \
+                     call in `if __name__ == \"__main__\":`",
+                    after.len(),
+                    if after.len() == 1 { "" } else { "s" },
+                    line,
+                )
+                .into(),
+            ));
+        }
+        let module_level_main_call = Self::module_level_main_call(&self.raw.body);
+        if let Some(_call_index) = module_level_main_call {
+            // `if __name__ == "__main__": main()` already selected the
+            // entry shape below; a second, bare call is the same program
+            // body spelled twice — refuse rather than emit two entries.
+            let guarded_call = self
+                .raw
+                .body
+                .iter()
+                .any(|s| matches!(&s.statement, crate::StatementType::If(i) if is_main_guard(&i.test)));
+            if guarded_call {
+                return Err(wrap_module_error(
+                    &module_filename,
+                    "the module calls `main()` at module level AND holds an \
+                     `if __name__ == \"__main__\":` block: rython emits one program entry \
+                     point per crate, and `python <file>` would run both; keep one of the two"
+                        .into(),
+                ));
+            }
+            if options.no_std {
+                return Err(wrap_module_error(
+                    &module_filename,
+                    "the module-level `main()` call is the program's entry point (as it is \
+                     for `python <file>`), which the no_std profile has no process to enter \
+                     from; drop the call (converting the module as a library) or convert \
+                     without the no_std profile"
+                        .into(),
+                ));
+            }
+        }
+
         // Pass 1: classify statements so the hoisted-name sets are known
         // before any statement renders — a `for` target on a name that
         // leaks out of the loop lowers to a store into the prologue
@@ -762,6 +827,14 @@ impl CodeGen for Module {
             if let Some(rw) = &module_argparse
                 && (rw.skip.contains(&stmt_index) || stmt_index == rw.parse_index)
             {
+                continue;
+            }
+            // Issue #431: the module-level `main()` call that is the
+            // program body (see above) — its body is the user's `main`,
+            // not module init code, exactly as for the guarded simple
+            // call, and its trailing position means no statement follows
+            // it in the init sequence.
+            if Some(stmt_index) == module_level_main_call {
                 continue;
             }
             if let crate::StatementType::If(if_stmt) = &s.statement {
@@ -1384,6 +1457,17 @@ impl CodeGen for Module {
                 has_async_functions = true;
             }
 
+            // Issue #431: a module-level `main()` call as the module
+            // body's final statement is the program body — the entry
+            // module gets a `main` (and, through rypip's entry detection,
+            // a binary). Routed through the guard's simple-main-call
+            // machinery: the user's `main` becomes the process entry
+            // point, with the same module-init wrapper decision.
+            if Some(stmt_index) == module_level_main_call {
+                has_main_code = true;
+                is_simple_main_call_pattern = true;
+                continue;
+            }
             // Check for if __name__ == "__main__" blocks at the AST level before generating code
             if let crate::StatementType::If(if_stmt) = &s.statement {
                 if is_main_guard(&if_stmt.test) {
@@ -6222,6 +6306,103 @@ impl Module {
         }
     }
     
+    /// The module body's FIRST statement, ignoring the module docstring
+    /// (a leading string constant expression, which binds nothing and is
+    /// emitted as `#![doc]` rather than a statement).
+    fn module_body_without_docstring(body: &[crate::Statement]) -> &[crate::Statement] {
+        if let Some(first) = body.first()
+            && matches!(
+                &first.statement,
+                crate::StatementType::Expr(e)
+                    if matches!(
+                        &e.value,
+                        crate::ExprType::Constant(c)
+                            if matches!(&c.0, Some(litrs::Literal::String(_)))
+                    )
+            )
+        {
+            &body[1..]
+        } else {
+            body
+        }
+    }
+
+    /// The module-level call that is Python's `__main__` body: a bare
+    /// `main()` expression statement as the module body's FINAL statement,
+    /// in a module that itself `def main`-s. `python prog.py` runs
+    /// `prog.py` as `__main__`, so its last statement is the whole of what
+    /// CPython executes as the program's body — the shape
+    /// `if __name__ == "__main__": main()` spells explicitly (issue #431).
+    ///
+    /// Only the FINAL statement qualifies: a `main()` in the middle of a
+    /// module body is an ordinary call in `__module_init__`, at its own
+    /// position, and must not turn the rest of the body into the program's
+    /// body (the emission refuses that shape loudly — see the call site).
+    /// It returns the body INDEX of that call.
+    fn module_level_main_call(raw_body: &[crate::Statement]) -> Option<usize> {
+        // `body` is the docstring-stripped slice; the returned index is in
+        // RAW coordinates (the emit loop's `stmt_index`).
+        let stripped = Self::module_body_without_docstring(raw_body).len();
+        let offset = raw_body.len() - stripped;
+        let body = &raw_body[offset..];
+        let (last_index, last) = (body.len().checked_sub(1)?, body.last()?);
+        let crate::StatementType::Expr(expr) = &last.statement else {
+            return None;
+        };
+        // A bare `main()` — no arguments, no return value taken.
+        if !Self::is_main_function_call(&expr.value) {
+            return None;
+        }
+        // ... of the module's OWN `def main` (a module-level `def` or
+        // `async def`, at any depth of the key bindings the emission
+        // accepts) — a `main` the module imports or binds some other way
+        // is not a program entry point.
+        let defines_main = body.iter().any(|s| {
+            matches!(
+                &s.statement,
+                crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f)
+                    if f.name == "main"
+            )
+        });
+        defines_main.then_some(last_index + offset)
+    }
+
+    /// The body index of a bare module-level `main()` call that is NOT the
+    /// module body's final statement (with anything after it). Such a call
+    /// still makes the file a program under CPython — `python prog.py` runs
+    /// every statement of the body, in order — but the generated binary's
+    /// `__module_init__` cannot run the statements after it AFTER the
+    /// program body, so the emission refuses it loudly (issue #431).
+    /// Returns `None` when the shape is not this one.
+    fn module_level_main_call_followed_by(raw_body: &[crate::Statement]) -> Option<usize> {
+        let stripped = Self::module_body_without_docstring(raw_body).len();
+        let offset = raw_body.len() - stripped;
+        let body = &raw_body[offset..];
+        if body.len() < 2 {
+            return None;
+        }
+        let call_index = body.len() - 1;
+        let (position, call) = body
+            .iter()
+            .enumerate()
+            .take(call_index)
+            .find(|(_, s)| {
+                matches!(
+                    &s.statement,
+                    crate::StatementType::Expr(e) if Self::is_main_function_call(&e.value)
+                )
+            })?;
+        let _ = call;
+        let defines_main = body.iter().any(|s| {
+            matches!(
+                &s.statement,
+                crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f)
+                    if f.name == "main"
+            )
+        });
+        defines_main.then_some(position + offset)
+    }
+
     /// Check if an expression is a call to a function named "main"
     fn is_main_function_call(expr: &crate::ExprType) -> bool {
         match expr {

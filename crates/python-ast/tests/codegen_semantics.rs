@@ -28575,6 +28575,57 @@ fn a_shared_element_field_store_does_not_make_the_list_binding_mutable() {
     assert!(
         flat.contains("letitems;"),
         "the binding is still hoisted, just not mutable: {}",
+#[test]
+fn unguarded_module_level_main_call_becomes_the_entry_point() {
+    // Issue #431: `def main(): ...` plus a bare module-level `main()` is
+    // what `python prog.py` runs (CPython executes the file as `__main__`),
+    // so it must produce ONE process entry point — the user's `main` —
+    // instead of a `pub fn main` beside a generated `fn main` (E0428).
+    //
+    // `python3` prints `hi` for the source below (verified by running it).
+    let out = compile(
+        "def main() -> None:\n    print(\"hi\")\n\n\nmain()\n",
+        "prog.py",
+    );
+    // The user's main is the entry point: exactly one `fn main`, no
+    // `pub fn main` beside it, and no `python_main` rename either.
+    assert_eq!(
+        out.matches(" fn main (").count(),
+        1,
+        "the unguarded call must yield ONE process entry point: {}",
+        out
+    );
+    assert!(
+        !out.contains("pub fn main ("),
+        "a `pub fn main` beside the entry point is E0428: {}",
+        out
+    );
+    assert!(
+        !out.contains("python_main"),
+        "the simple-main path must not reach the rename fallback: {}",
+        out
+    );
+    // The `#[allow(dead_code)]` convention: rypip compiles the entry module
+    // twice (bin root + lib submodule), and the lib copy never calls it.
+    assert!(
+        out.contains("#[allow(dead_code)] fn main (")
+            || out.contains("# [allow (dead_code)] fn main ("),
+        "the entry point carries the dead-code allowance: {}",
+        out
+    );
+    // The entry name stays the user's `main`: it is not renamed, so the
+    // body is the user's, with no module-init indirection required when
+    // there is no module-level code.
+    assert!(
+        out.contains("print (& (\"hi\"))"),
+        "the user's main body is the entry's body: {}",
+        out
+    );
+    // No `main()` call is left inside `__module_init__` (it would run the
+    // entry point as module init code, before the binary's own entry).
+    assert!(
+        !out.contains("main () ?"),
+        "the module-level call must not also run as module init code: {}",
         out
     );
 }
@@ -28621,6 +28672,29 @@ fn a_plain_store_through_the_element_borrows_and_keeps_the_list_binding_mutable(
         flat.contains("letmutitems"),
         "that &mut makes the list binding genuinely mutable (dropping it \
          would be E0596, not a warning): {}",
+fn unguarded_main_call_with_module_level_code_keeps_one_entry_point() {
+    // The module body runs before the program body (python3 prints
+    // `before` then `hi`), and the user's `main` is still the ONE entry
+    // point — the module-init wrapper calls it as `python_main`, so no
+    // second `fn main` collides with it.
+    let out = compile(
+        "print(\"before\")\n\n\ndef main() -> None:\n    print(\"hi\")\n\n\nmain()\n",
+        "prog_pre.py",
+    );
+    assert_eq!(
+        out.matches(" fn main (").count(),
+        1,
+        "one process entry point: {}",
+        out
+    );
+    assert!(
+        out.contains("pub fn python_main ("),
+        "with module init code the user's main is renamed for the wrapper: {}",
+        out
+    );
+    assert!(
+        out.contains("print (& (\"before\"))"),
+        "module-level code runs in __module_init__: {}",
         out
     );
 }
@@ -28674,6 +28748,27 @@ fn a_shared_collections_slot_store_keeps_the_container_binding_mutable() {
     assert!(
         flat.contains("(__rython_recv).py_set_index("),
         "the slot stores go through py_set_index on &mut of the container: {}",
+fn a_module_that_defines_main_without_calling_it_stays_a_library() {
+    // python3 defined `main` and never runs it; the conversion must stay a
+    // library (no entry point at all).
+    let out = compile(
+        "def main() -> None:\n    print(\"hi\")\n",
+        "libmod.py",
+    );
+    assert!(
+        !out.contains("fn main (") || out.matches("fn main (").count() == 1,
+        "a never-called main must not become an ENTRY point (only the \
+         definition, never a second generated one): {}",
+        out
+    );
+    assert!(
+        out.contains("pub fn main ("),
+        "the definition is still an ordinary module function: {}",
+        out
+    );
+    assert!(
+        !out.contains("#[allow(dead_code)] fn main ("),
+        "no generated entry point is emitted for a never-called main: {}",
         out
     );
 }
@@ -28723,6 +28818,22 @@ fn an_element_store_through_a_plain_objects_container_field_keeps_its_mut() {
     assert!(
         flat.contains("letmutbag"),
         "that &mut reaches the binding, so `bag` stays mutable: {}",
+fn the_guarded_main_call_is_unchanged() {
+    // The `if __name__ == "__main__": main()` shape keeps the exact
+    // behavior it had (python3 prints `hi`).
+    let out = compile(
+        "def main() -> None:\n    print(\"hi\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+        "prog_guard.py",
+    );
+    assert_eq!(
+        out.matches(" fn main (").count(),
+        1,
+        "the guard yields one entry point: {}",
+        out
+    );
+    assert!(
+        !out.contains("python_main"),
+        "a guard with no module-level code keeps the direct entry: {}",
         out
     );
 }
@@ -28788,6 +28899,63 @@ fn an_augmented_element_store_through_a_shared_parameter_drops_the_mut() {
     assert!(
         !bump.contains("letmutbag"),
         "every &mut is taken inside the borrow guard: {}",
+fn unguarded_main_call_after_the_body_is_refused_loudly() {
+    // python3 runs the trailing statement AFTER main() (`hi`, then `bye`).
+    // The generated binary's module init would run it BEFORE the program
+    // body, a silent reordering — refused, naming the statement and the
+    // rewrite (issue #431).
+    let err = compile_err(
+        "def main() -> None:\n    print(\"hi\")\n\n\nmain()\nprint(\"bye\")\n",
+        "prog_trail.py",
+    );
+    assert!(
+        err.contains("main()") && err.contains("AFTER it"),
+        "the refusal names the construct and the trailing statement: {}",
+        err
+    );
+    assert!(
+        err.contains("move them above") && err.contains("__main__"),
+        "the refusal names the rewrite: {}",
+        err
+    );
+}
+
+#[test]
+fn unguarded_main_call_beside_a_guard_is_refused_loudly() {
+    // Python would run both (`hi`, `hi`). rython emits one entry point per
+    // crate, so the shape is refused rather than silently dropping one.
+    let err = compile_err(
+        "def main() -> None:\n    print(\"hi\")\n\n\nmain()\n\n\nif __name__ == \"__main__\":\n    main()\n",
+        "prog_both.py",
+    );
+    // The `if __name__ == "__main__":` block IS a statement after the
+    // bare call, so the trailing-statement refusal fires first and names
+    // the guard as the rewrite.
+    assert!(
+        err.contains("AFTER it") && err.contains("__main__"),
+        "the refusal names the trailing guard and the rewrite: {}",
+        err
+    );
+}
+
+#[test]
+fn unguarded_main_call_renders_a_trailing_docstring_consistently() {
+    // A module docstring is not a statement of the program body: the
+    // `main()` call below it is still the final one and still the entry
+    // (python3 prints `hi`).
+    let out = compile(
+        "\"\"\"Docs.\"\"\"\n\n\ndef main() -> None:\n    print(\"hi\")\n\n\nmain()\n",
+        "prog_doc.py",
+    );
+    assert_eq!(
+        out.matches(" fn main (").count(),
+        1,
+        "one process entry point beside a docstring: {}",
+        out
+    );
+    assert!(
+        out.contains("print (& (\"hi\"))"),
+        "the user's main body is the entry: {}",
         out
     );
 }
