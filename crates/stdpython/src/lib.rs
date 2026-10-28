@@ -5133,11 +5133,16 @@ where
 /// `String` minus a literal set of `&str`) is ordinary code, and the
 /// literal's elements are `&'static str`.
 ///
-/// `A` is the receiver's member type, `B` the other operand's. `A` must
-/// convert into the canonical comparison type `C` ([`PySetKey`]) and `B`
-/// must view itself as `C` ([`PySetView`]): `String`/`&str` both
-/// canonicalise to `str`, an integer set canonicalises to itself. The
-/// result takes the RECEIVER's element type, so `seen & {"a"}` is a
+/// `A` is the receiver's member type, `B` the other operand's. Both view
+/// their members in a shared canonical form `C` ([`PySetKey`] /
+/// [`PySetView`]; `String` and `&str` both canonicalise to `str`), and the
+/// canonical form is opened into a BORROWED index set once per operand, so
+/// every membership test is an amortised O(1) hash lookup — the same
+/// complexity CPython's set operations have. A per-element scan of the
+/// other operand would be correct but quadratic (|a| × |b| comparisons on
+/// disjoint 100k-member sets; Devin review on PR #458).
+///
+/// The result takes the RECEIVER's element type, so `seen & {"a"}` is a
 /// `HashSet<String>` and an assignment target inferred from `seen`
 /// matches. Every helper is a membership select, so it cannot depend on
 /// the iteration order either operand yields its members in — the
@@ -5145,16 +5150,14 @@ where
 pub fn py_set_and<A, B, S, U>(a: &HashSet<A, S>, b: &HashSet<B, U>) -> HashSet<A, S>
 where
     A: PySetKey + Eq + Hash + Clone,
-    A::Key: PartialEq<A::Key>,
-    B: PySetView<A::Key> + Eq + Hash,
+    A::Key: Eq + Hash,
+    B: PySetView<A::Key>,
     S: core::hash::BuildHasher + Default,
     U: core::hash::BuildHasher,
 {
+    let index: crate::HashSet<&A::Key> = b.iter().map(|y| y.py_set_view()).collect();
     a.iter()
-        .filter(|x| {
-            let k = x.py_set_key();
-            b.iter().any(|y| y.py_set_view() == k)
-        })
+        .filter(|x| index.contains(x.py_set_key()))
         .cloned()
         .collect()
 }
@@ -5163,16 +5166,17 @@ where
 pub fn py_set_or<A, B, S, U>(a: &HashSet<A, S>, b: &HashSet<B, U>) -> HashSet<A, S>
 where
     A: PySetKey + Eq + Hash + Clone + FromPySetView<B>,
-    A::Key: PartialEq<A::Key>,
+    A::Key: Eq + Hash,
     B: PySetView<A::Key> + Clone,
     S: core::hash::BuildHasher + Default,
     U: core::hash::BuildHasher,
 {
     let mut out: HashSet<A, S> = a.iter().cloned().collect();
+    let index: crate::HashSet<&A::Key> = a.iter().map(|x| x.py_set_key()).collect();
     let extra: Vec<A> = b
         .iter()
-        .filter(|y| !a.iter().any(|x| y.py_set_view() == x.py_set_key()))
-        .map(|y| A::from_py_set_view(y.clone()))
+        .filter(|y| !index.contains((*y).py_set_view()))
+        .map(|y| A::from_py_set_view((*y).clone()))
         .collect();
     out.extend(extra);
     out
@@ -5182,16 +5186,14 @@ where
 pub fn py_set_sub<A, B, S, U>(a: &HashSet<A, S>, b: &HashSet<B, U>) -> HashSet<A, S>
 where
     A: PySetKey + Eq + Hash + Clone,
-    A::Key: PartialEq<A::Key>,
-    B: PySetView<A::Key> + Eq + Hash,
+    A::Key: Eq + Hash,
+    B: PySetView<A::Key>,
     S: core::hash::BuildHasher + Default,
     U: core::hash::BuildHasher,
 {
+    let index: crate::HashSet<&A::Key> = b.iter().map(|y| y.py_set_view()).collect();
     a.iter()
-        .filter(|x| {
-            let k = x.py_set_key();
-            !b.iter().any(|y| y.py_set_view() == k)
-        })
+        .filter(|x| !index.contains(x.py_set_key()))
         .cloned()
         .collect()
 }
@@ -5200,23 +5202,22 @@ where
 pub fn py_set_xor<A, B, S, U>(a: &HashSet<A, S>, b: &HashSet<B, U>) -> HashSet<A, S>
 where
     A: PySetKey + Eq + Hash + Clone + FromPySetView<B>,
-    A::Key: PartialEq<A::Key>,
+    A::Key: Eq + Hash,
     B: PySetView<A::Key> + Clone,
     S: core::hash::BuildHasher + Default,
     U: core::hash::BuildHasher,
 {
+    let a_index: crate::HashSet<&A::Key> = a.iter().map(|x| x.py_set_key()).collect();
+    let b_index: crate::HashSet<&A::Key> = b.iter().map(|y| y.py_set_view()).collect();
     let mut out: HashSet<A, S> = a
         .iter()
-        .filter(|x| {
-            let k = x.py_set_key();
-            !b.iter().any(|y| y.py_set_view() == k)
-        })
+        .filter(|x| !b_index.contains(x.py_set_key()))
         .cloned()
         .collect();
     let extra: Vec<A> = b
         .iter()
-        .filter(|y| !a.iter().any(|x| y.py_set_view() == x.py_set_key()))
-        .map(|y| A::from_py_set_view(y.clone()))
+        .filter(|y| !a_index.contains((*y).py_set_view()))
+        .map(|y| A::from_py_set_view((*y).clone()))
         .collect();
     out.extend(extra);
     out

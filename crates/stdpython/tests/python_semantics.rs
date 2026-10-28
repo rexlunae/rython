@@ -6555,6 +6555,34 @@ mod set_algebra {
     }
 
     #[test]
+    fn large_disjoint_sets_are_not_quadratic() {
+        // Devin review on PR #458: a per-element scan of the other operand
+        // is O(|a| x |b|). CPython's set operations hash, so disposable
+        // 100k-member sets must be ~O(n), not ~10^10 comparisons. This is
+        // a REGRESSION GUARD, not a benchmark: the inputs are large enough
+        // that a quadratic implementation would not finish in a test run.
+        //
+        // >>> a = {str(i).zfill(20) for i in range(100_000)}
+        // >>> b = {str(i).zfill(20) + "x" for i in range(100_000)}
+        // >>> (len(a & b), len(a - b), len(a | b), len(a ^ b))
+        // (0, 100000, 200000, 200000)
+        // Verified against python3.
+        let a: HashSet<String> = (0..100_000).map(|i| format!("{:020}", i)).collect();
+        let b: HashSet<String> = (0..100_000).map(|i| format!("{:020}x", i)).collect();
+        assert_eq!(py_set_and(&a, &b).len(), 0);
+        assert_eq!(py_set_sub(&a, &b).len(), 100_000);
+        assert_eq!(py_set_or(&a, &b).len(), 200_000);
+        assert_eq!(py_set_xor(&a, &b).len(), 200_000);
+        // With a shared half, so the select is not trivially all-or-nothing.
+        // >>> half = {str(i).zfill(20) for i in range(50_000)}
+        // >>> (len(a & half), len(a - half)) -> (50000, 50000)
+        // Verified against python3.
+        let half: HashSet<String> = (0..50_000).map(|i| format!("{:020}", i)).collect();
+        assert_eq!(py_set_and(&a, &half).len(), 50_000);
+        assert_eq!(py_set_sub(&a, &half).len(), 50_000);
+    }
+
+    #[test]
     fn integer_set_algebra_is_exact() {
         // >>> sorted({3, 1, 2} & {2, 3, 9}) -> [2, 3]
         let a: HashSet<i64> = [3, 1, 2].into_iter().collect();
