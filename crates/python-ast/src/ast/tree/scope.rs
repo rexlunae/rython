@@ -463,23 +463,41 @@ fn element_store_borrows(base: &ExprType, a: &Analysis<'_>) -> bool {
 }
 
 /// Whether a receiver expression denotes a value reached through a shared
-/// `PyRef` borrow: the shared class itself, or a container it holds.
+/// `PyRef` borrow: the shared class itself, a container it holds, or an
+/// element fetched out of one.
+///
+/// The walk goes through the ONE visitor (`visit::any_expr`) so a new
+/// expression form cannot escape the classification — a by-hand match over
+/// `Name`/`Attribute`/`Subscript` would keep compiling while quietly
+/// missing whatever was added (AGENTS.md: "Walk the tree through the one
+/// visitor").
+///
+/// A hit needs one of two facts about a subexpression, and both are answered
+/// by codegen's own placement predicates, so this cannot drift from the
+/// emitted place:
+///
+/// - it is a NAME holding a shared `PyRef` (`binding_is_shared_value` —
+///   which already excludes `self` and a narrowed binding, both of which
+///   keep `&mut`);
+/// - it is an ATTRIBUTE over a shared receiver (`attribute::shared_receiver`,
+///   the same predicate `to_rust_place_expr` consults).
+///
+/// The traversal is deliberately `any` rather than first-hop-only: a
+/// receiver chain rooted at a shared object (`h.items[i]`, `h.child.items`)
+/// reaches every later step through the borrow guard, never through the
+/// binding — the reasoning `class_call_resolver`'s `through_shared` already
+/// documents for method calls.
 fn receiver_borrows(recv: &ExprType, a: &Analysis<'_>) -> bool {
-    match recv {
-        ExprType::Name(n) => {
-            n.id != "self" && crate::ast::tree::shared::binding_is_shared_value(&n.id, a.options)
-        }
-        ExprType::Attribute(attr) => {
-            crate::ast::tree::attribute::shared_receiver(
-                attr.value.as_ref(),
-                a.ctx,
-                a.symbols,
-                a.options,
-            ) || receiver_borrows(&attr.value, a)
-        }
-        ExprType::Subscript(sub) => receiver_borrows(&sub.value, a),
+    crate::ast::tree::visit::any_expr(recv, |e| match e {
+        ExprType::Name(n) => crate::ast::tree::shared::binding_is_shared_value(&n.id, a.options),
+        ExprType::Attribute(attr) => crate::ast::tree::attribute::shared_receiver(
+            attr.value.as_ref(),
+            a.ctx,
+            a.symbols,
+            a.options,
+        ),
         _ => false,
-    }
+    })
 }
 
 /// The name at the base of a subscript/attribute chain (`grid` in
