@@ -124,6 +124,13 @@ message text, ordering, and float formatting.
   workflow
 - [`docs/context-awareness.md`](docs/context-awareness.md) — type
   inference/coercion internals
+- [`docs/frontier.md`](docs/frontier.md) — the measured corpus frontier
+  and the `PyValue` boundary (issue #335)
+- [`docs/testing-under-rython.md`](docs/testing-under-rython.md) — running
+  Python test suites under rython (issue #334)
+- [`docs/jit-eval.md`](docs/jit-eval.md) — the JIT evaluation (issue #166)
+- [`docs/cpython-suite-status.md`](docs/cpython-suite-status.md) — per-file
+  status of the 17 CPython stdlib test files under conversion
 
 ### The corpus sweep (issue #137)
 
