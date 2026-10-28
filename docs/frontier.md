@@ -105,22 +105,29 @@ result is the single most concentrated cause on the corpus:
    130  E0599 no method on PyValue
 ```
 
-and it is the majority of the codes it hides inside:
+The 409 is **E0599 + E0609 only**: `rank_causes.py:246` computes
+`boundary = sum(methods.values()) + sum(fields.values())`, and only the
+`no field`/`no method` shapes increment those counters. It is 70% of E0609
+(279 of 397).
 
-```
-E0277        301 of   469  (64%)
-E0609        279 of   397  (70%)
-```
+E0277 is a **separate** accounting: `rank_causes.py:194-197` counts a
+trait-bound error into `code_pyvalue` when the bound names `PyValue`, which
+gives the "301 of 469 (64%)" line the ranking prints under "how much of
+each code is the PyValue boundary". That 301 is **not** a subset of the
+409 — the two counts come from different arms of the same `match` and
+overlap only in cause, not in membership. Do not add them.
 
-The mechanism: a value that inference files into a `PyValue` slot keeps its
-*runtime* type but loses its *static* one. `PyValue` is a closed enum
-without an instance variant and without an attribute accessor, so
-`x.attr` / `x.method()` on such a value has nothing to resolve to, and the
-generated Rust does not compile at that line.
+The mechanism behind both: a value that inference files into a `PyValue`
+slot keeps its *runtime* type but loses its *static* one. `PyValue` is a
+closed enum without an instance variant and without an attribute accessor,
+so `x.attr` / `x.method()` on such a value has nothing to resolve to, and
+the generated Rust does not compile at that line. The adjacent E0277 family
+is the same loss seen from the trait side: a `PyValue` where a bound
+expects a concrete type.
 
 ### The variants that exist today
 
-`crates/stdpython/src/lib.rs:3019-3050` — eleven variants, none of them an
+`crates/stdpython/src/lib.rs:3019-3050` — twelve variants, none of them an
 instance:
 
 `Int`, `Float`, `Bool`, `Str`, `Bytes`, `Tuple`, `Dict`, `OrderedDict`,

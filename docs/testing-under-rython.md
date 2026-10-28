@@ -174,40 +174,79 @@ if __name__ == "__main__":
 - `cargo build` on the generated crate: **fails**, exit 101.
 
 ```
+warning: unreachable expression
+  --> src/test_cm_raise.rs:32:13
 error[E0308]: mismatched types
-  --> src/test_cm_raise.rs:51:34
-   |
-51 |     pub fn test_raises(&self) -> Result<(), PyException> {
-   |            -----------           ^^^^^^^^^^^^^^^^^^^^^^^
-   |            |                     expected `Result<(), PyException>`, found `()`
-   = note: expected enum `Result<(), PyException>`
-              found unit type `()`
+  --> src/test_cm_raise.rs:29:36
+error: could not compile `test_cm_raise` (lib) due to 1 previous error; 1 warning emitted
 ```
 
-plus a `warning: unreachable expression` on the `Ok(())` that follows.
+Note where the error lands: on `src/test_cm_raise.rs:29:36`, the method's
+signature, **not** inside the closure. The warning at `32:13` is the
+closure's dead `Ok(())` — the visible symptom, not the cause.
 
 ### Root cause
 
-`crates/python-ast/src/ast/tree/with_stmt.rs:232` lowers the context-manager
-form by wrapping the body in a closure and appending `Ok(())`:
+The error is **not** inside the closure. `return Err(...); Ok(())` type
+checks fine: the `Ok(())` is merely unreachable (a warning), and the
+closure's return type is fixed by its annotation. The E0308 is on the
+**enclosing method**, which is missing its own trailing `Ok(())`.
 
-```rust
-unittest::assert_raises(#exc_lit, || -> Result<(), PyException> {
-    #(#body_tokens;)*
-    Ok(())
-})?;
-```
+Two sites combine:
 
-When the body's last statement is an unconditional `raise`, the lowering
-emits `return Err(...);` and then the appended `Ok(())` is dead code. The
-closure therefore has two problems: unreachable code (a warning) and,
-because the `return` makes the tail expression unreachable in a way the type
-checker reports, an inferred `()` tail (the error).
+1. `crates/python-ast/src/ast/tree/with_stmt.rs:232` wraps the body in a
+   closure:
 
-The guard above that lowering, `body_escapes_a_closure`
-(`with_stmt.rs:53`), only rejects bodies containing `return`/`break`/
-`continue`. A `raise` is not in that set, so the shape is routed into the
-closure anyway.
+   ```rust
+   unittest::assert_raises(#exc_lit, || -> Result<(), PyException> {
+       #(#body_tokens;)*
+       Ok(())
+   })?;
+   ```
+
+   Its guard, `body_escapes_a_closure` (`with_stmt.rs:53`), rejects bodies
+   containing `return`/`break`/`continue` — a `raise` is not in that set,
+   so the shape is routed into the closure.
+
+2. `crates/python-ast/src/ast/tree/function_def.rs:4011` appends the
+   method's trailing `Ok(())` only when `!guarantees_return(&self.body)`.
+   `guarantees_return` (`function_def.rs:5943`) **unwraps a `with`
+   statement and recurses into its body** (`function_def.rs:5949`), where a
+   `raise` reports `true` (`function_def.rs:5955`, "`raise` lowers to
+   `return Err(...)`, which terminates the path").
+
+   For `with self.assertRaises(E): raise E(...)`, that reasoning is sound
+   for the *closure* but wrong for the *method*: the `with` statement does
+   not terminate the method, so the method falls off the end and needs its
+   tail. The generated Rust is therefore:
+
+   ```rust
+   pub fn test_cm_raise(&self) -> Result<(), PyException> {
+       unittest::assert_raises("ValueError", || -> Result<(), PyException> {
+           return Err(PyException::new("ValueError", format!("{}", "boom")));
+           Ok(())
+       })?;
+   }   // <- no Ok(()) tail: E0308 "expected Result<(), PyException>, found ()"
+   ```
+
+   Compare the working shape (a call in the body), which emits the tail
+   `Ok(())` after the `assert_raises(...)?;`:
+
+   ```rust
+   unittest::assert_raises("ValueError", || -> Result<(), PyException> {
+       might_fail(-1)?;
+       Ok(())
+   })?;
+   Ok(())
+   ```
+
+The defect is therefore in `guarantees_return`'s `With` arm — or in that
+call site's use of it — not in the closure's appended `Ok(())`. Removing
+the closure's `Ok(())` alone would leave the E0308 in place (and drop the
+`unreachable_code` warning, which is the only visible symptom at the
+closure). A correct fix makes `guarantees_return` treat a `with` whose body
+merely *raises* as not guaranteeing the enclosing return, or gives the
+assertRaises lowering its own tail accounting.
 
 ### Why the test suite does not catch it
 
@@ -287,19 +326,25 @@ prime directive.
 ### Phase 1 — fix the `raise`-in-`assertRaises` defect (small, do first)
 
 A one-shape bug with a known localization and a CPython-verified
-reproducer. Either:
+reproducer. The fix is in the **enclosing-return** accounting, not in the
+closure (see "Root cause" above):
 
-- add `raise` to the statements `body_escapes_a_closure` refuses, so the
-  shape falls through to the plain with-lowering and its existing loud
-  behaviour; or
-- better, thread the raise correctly: a `raise` inside the closure is the
-  *expected* outcome for `assertRaises`, and `assert_raises` already
-  handles `Err(e) if e.matches(expected)`. The lowering needs the closure to
-  *not* append `Ok(())` when the body cannot fall through.
+- teach `guarantees_return` (`function_def.rs:5943`) that a `with` whose
+  body only *raises* does not terminate the enclosing function — the
+  `With` arm at `function_def.rs:5949` currently inherits the body's
+  answer, which is right for `return` and wrong for `raise`; or
+- special-case the assertRaises lowering so the method still gets its
+  trailing `Ok(())`.
 
-The second is correct and keeps the shape supported; the first is loud but
-loses a legal program. Either way, the pin must be **end-to-end** (convert,
-build, run, diff exit status against `python3`), not a token check.
+Removing the closure's appended `Ok(())` does **not** fix it — the E0308 is
+on the method, not the closure. Forcing the shape through
+`body_escapes_a_closure` (a loud refusal) would also work and is the
+cheapest option if the accounting fix is judged too risky, but it loses a
+legal program that CPython runs.
+
+The pin must be **end-to-end** (convert, build, run, diff exit status
+against `python3`), not a token check — the existing token pin
+(`codegen_semantics.rs:6275`) is exactly why this shipped.
 
 ### Phase 2 — make `pytest` loud, and decide whether to support it
 
