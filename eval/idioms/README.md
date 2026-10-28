@@ -100,3 +100,4 @@ as an improvement over any recorded error count.
 | `collections_deque` | a `deque` work queue and a `maxlen` sliding window: `append`/`appendleft`/`pop`/`popleft`/`extend`/`rotate`, `maxlen`, indexing, `IndexError` on an empty pop, `repr` |
 | `collections_defaultdict` | `defaultdict(int)` counting and `defaultdict(list)` grouping: the missing-key insert on a READ, `get`/`in` not inserting, views, `repr` |
 | `collections_ordereddict` | `OrderedDict` insertion order, `move_to_end`, `popitem(last=...)`, `KeyError` text, `repr` (the 3.12 form) |
+| `shared_slot_mutation` | a list of shared objects mutated through an index (`slots[0].n += 5`, `slots[1].n = 40`, `slots[2].n *= 2`) beside plain `list[int]`/`dict[str, int]` slot stores — the two need different `mut` decisions, and both are printed after the mutation |

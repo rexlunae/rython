@@ -2275,15 +2275,6 @@ impl FunctionDef {
             // mutations select `&mut self` above instead.
             param_names.push("self".to_string());
         }
-        // The resolver makes class knowledge authoritative for method
-        // calls: `c.bump()` marks `c` mutable when bump takes &mut self,
-        // and a read-only user method shadowing a builtin mutator name
-        // (`pop`, `update`, ...) does NOT force a spurious `mut`.
-        let scope = crate::analyze_scope_with(
-            &effective_body,
-            &param_names,
-            &crate::class_call_resolver(&ctx, &symbols, &options),
-        );
         if is_method {
             param_names.pop();
         }
@@ -2294,8 +2285,42 @@ impl FunctionDef {
                 ..
             }
         );
+        // The scope analysis is resolved LATE (below, once the body's name
+        // types are known): it needs them to tell a store through a borrow
+        // from a store into the binding (issue #432 — `items[0].n += 1` on
+        // a list of shared `PyRef`s never mutates the list). The signature
+        // region asks the same question through this closure so `def f`
+        // and `def f(self)` are decided from ONE analysis.
+        // Memoized: the analysis is not cheap, and the pre-name-types
+        // region asks it several times. The cache is dropped the moment
+        // `options` is retyped below (the later query passes the TYPED
+        // options and must see a fresh answer).
+        let scope_cache: std::cell::RefCell<
+            Option<(usize, std::rc::Rc<crate::ScopeBindings>)>,
+        > = std::cell::RefCell::new(None);
+        let lazy_scope = |options: &crate::PythonOptions| {
+            let key = std::rc::Rc::as_ptr(&options.name_types) as usize;
+            if let Some((k, v)) = scope_cache.borrow().as_ref()
+                && *k == key
+            {
+                return std::rc::Rc::clone(v);
+            }
+            let computed = std::rc::Rc::new(crate::analyze_scope_typed(
+                &effective_body,
+                &param_names,
+                &crate::class_call_resolver(&ctx, &symbols, options),
+                &ctx,
+                &symbols,
+                options,
+            ));
+            *scope_cache.borrow_mut() = Some((key, std::rc::Rc::clone(&computed)));
+            computed
+        };
         let receiver = if is_method {
-            if forced_mut_self || method_mutates_self || scope.needs_mut.contains("self") {
+            if forced_mut_self
+                || method_mutates_self
+                || lazy_scope(&options).needs_mut.contains("self")
+            {
                 quote!(&mut self,)
             } else {
                 quote!(&self,)
@@ -2321,10 +2346,10 @@ impl FunctionDef {
         // fresh binding (issue #80). A `global`-declared mutable static is
         // NOT a local — its binding is the module static (issue #115).
         options.hoisted_names = std::rc::Rc::new(
-            scope
+            lazy_scope(&options)
                 .assigned
                 .iter()
-                .chain(scope.needs_mut.iter())
+                .chain(lazy_scope(&options).needs_mut.iter())
                 .filter(|n| !fn_mutable_globals.contains(*n))
                 .cloned()
                 .collect(),
@@ -2332,9 +2357,10 @@ impl FunctionDef {
         // Only the targets whose value is observed after the loop store
         // into the hoisted binding; the rest keep fresh per-loop bindings
         // (issue #80).
-        options.leaked_loop_targets = std::rc::Rc::new(scope.leaked_loop_targets.clone());
+        options.leaked_loop_targets =
+            std::rc::Rc::new(lazy_scope(&options).leaked_loop_targets.clone());
         {
-            let mut optional = scope.optional.clone();
+            let mut optional = lazy_scope(&options).optional.clone();
             for p in self
                 .args
                 .posonlyargs
@@ -2896,6 +2922,13 @@ impl FunctionDef {
             ));
             options.empty_pinned = std::rc::Rc::new(info.empty_pinned);
         }
+        // The SCOPE analysis (which declarations need `mut`, which names
+        // hoist, which loop targets leak). It runs HERE, not beside the
+        // signature, because it needs the body's name types: a store
+        // through a BORROW (`items[0].n += 1` on a list of shared
+        // `PyRef`s — issue #432) leaves the binding untouched, and telling
+        // the two apart means typing the receiver.
+        let scope = lazy_scope(&options);
         // Issue #79's cheap guard: reject aliasing shapes rython cannot
         // model (`b = a` on a container that is later mutated, and passing
         // a container to a function that mutates it) at conversion time

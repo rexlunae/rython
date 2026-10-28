@@ -6026,7 +6026,7 @@ fn hoisted_name_set(
         symbols = s.clone().find_symbols(symbols);
     }
     let scope =
-        crate::analyze_scope_with(body, &[], &crate::class_call_resolver(ctx, &symbols, options));
+        crate::analyze_scope_typed(body, &[], &crate::class_call_resolver(ctx, &symbols, options), ctx, &symbols, options);
     let hoisted = scope
         .assigned
         .iter()
@@ -6064,7 +6064,7 @@ fn hoisted_declarations(
         symbols = s.clone().find_symbols(symbols);
     }
     let scope =
-        crate::analyze_scope_with(body, &[], &crate::class_call_resolver(ctx, &symbols, options));
+        crate::analyze_scope_typed(body, &[], &crate::class_call_resolver(ctx, &symbols, options), ctx, &symbols, options);
     let mut out = TokenStream::new();
     // A name every store of which binds a CLASS reference (`R = Root`,
     // `R = Exception` — a module-level alias, straight-line or under a

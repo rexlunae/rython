@@ -533,6 +533,24 @@ generated code carries neither `unused_mut` warnings nor missing-`mut`
 errors; mutation through methods (`append`, `pop`, file writes, …) and
 through subscript/attribute stores marks the chain's base variable.
 
+The analysis follows the **place the renderer emits**, not the store's
+syntactic shape, which matters for a store that goes through a *borrow*
+(issue #432). A read of a SHARED class yields a `PyRef` handle, so:
+
+- `items[0].n += 1` on a `list[Box]` whose `Box` is shared lowers to
+  `(items).py_index(0)?.borrow_mut().n = …` — the list is only ever
+  *read*, so `items` stays immutable and no `unused_mut` is emitted;
+- `items[0].n = 1` on the same list lowers to
+  `((items).py_index_mut(0)?).borrow_mut().n = …`, which takes `&mut` of
+  the list — so `items` **does** stay `mut`;
+- slot stores into plain containers (`xs[i] = v`, `d[k] = v`,
+  `xs[i] += v`) always take `&mut` of the container and keep `mut`,
+  whichever element type it holds.
+
+Dropping `mut` where the emitted place needs it would be an E0596
+compile error, so an unresolved receiver keeps `mut` (the conservative
+answer).
+
 - **Chained assignment** `a = b = <container literal>` is a loud error:
   CPython binds both names to one object, and the value-semantics
   lowering cannot preserve that aliasing (issue #104).
