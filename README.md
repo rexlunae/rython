@@ -68,6 +68,15 @@ and [`rypip install`](examples/05-rypip-install) turning a
   alike (see also [`AGENTS.md`](AGENTS.md))
 - [Context-aware codegen](docs/context-awareness.md) — type inference
   and coercion internals
+- [The frontier](docs/frontier.md) — the measured rustc-error frontier on
+  the pinned package corpus, the boxed-`PyValue` boundary that dominates
+  it, and the candidate designs (issue #335)
+- [Testing under rython](docs/testing-under-rython.md) — what works today
+  for running a Python library's test suite, the exact code sites, and a
+  phased plan toward pytest/unittest (issue #334)
+- [Evaluating a JIT](docs/jit-eval.md) — how a JIT measures against the
+  prime directive and the non-goals, and what a first milestone must prove
+  (issue #166)
 
 ## Crates
 
