@@ -29075,6 +29075,7 @@ fn a_final_main_call_with_arguments_is_refused_loudly() {
     );
 }
 
+#[test]
 fn an_imported_modules_final_main_call_is_refused_not_dropped() {
     // Devin review on #454: the same shape in a module the converter did
     // NOT select as the crate entry is an ordinary module-level call that
