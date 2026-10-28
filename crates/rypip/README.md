@@ -60,8 +60,16 @@ flat and `src/` layouts are recognized. Projects without any packaging
 metadata fall back to the historical layout heuristics.
 
 A module containing an `if __name__ == "__main__":` block (or a
-`__main__.py`) becomes the binary entry point; packages without one convert
-to library crates and cannot be `install`ed.
+`__main__.py`) becomes the binary entry point. So does a module that
+defines `main` and calls it as its last top-level statement with no
+arguments — that is what `python file.py` runs, since CPython executes the
+file as `__main__` (issue #431) — but only when exactly one module of the
+package has that shape (a library may contain several such modules; none
+is the entry). A bare `main()` call that is not the module body's final
+statement is a conversion error, not a reordering: Python runs the
+statements after it after the program body, and the generated entry runs
+them before. Packages without an entry module convert to library crates
+and cannot be `install`ed.
 
 ## Unannotated parameters (parameter type inference)
 

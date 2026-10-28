@@ -761,9 +761,13 @@ impl CodeGen for Module {
         // source order, while the generated binary's `__module_init__`
         // would run them BEFORE the call — a silent reordering of the
         // program. The error names the statement and the rewrite.
-        if let Some(after) = Self::module_level_main_call_followed_by(&self.raw.body)
-            .map(|call_index| &self.raw.body[call_index + 1..])
-        {
+        // The shape is diagnosed by SHAPE, not by which role the module
+        // got: a bare `main()` call with module-level statements after it
+        // is a program under CPython either way, and the generated entry
+        // would run those statements BEFORE the call. Refused in both
+        // roles, with the same message.
+        if let Some(call_index) = Self::module_level_main_call_followed_by(&self.raw.body) {
+            let after = &self.raw.body[call_index + 1..];
             let line = after[0].lineno.map(|l| format!(" (line {})", l)).unwrap_or_default();
             return Err(wrap_module_error(
                 &module_filename,
@@ -782,7 +786,33 @@ impl CodeGen for Module {
                 .into(),
             ));
         }
-        let module_level_main_call = Self::module_level_main_call(&self.raw.body);
+        let module_level_main_call = options
+            .is_executable_entry
+            .then(|| Self::module_level_main_call(&self.raw.body))
+            .flatten();
+
+        // Issue #431, Devin review on #454: the same shape in a module that
+        // is NOT the crate's executable entry is an ordinary module-level
+        // call — Python runs it when the module is imported, and it has to
+        // stay in `__module_init__`. It cannot: the user's `main` and the
+        // generated `fn main` would collide in the lib copy (rustc E0428),
+        // which is a §12.1-class failure the converter should name itself.
+        // Refuse loudly rather than drop the call (silently skipping the
+        // import's side effect) or emit a crate rustc cannot build.
+        if !options.is_executable_entry && Self::module_level_main_call(&self.raw.body).is_some()
+        {
+            return Err(wrap_module_error(
+                &module_filename,
+                "this module defines `main` and calls it as its last top-level \
+                 statement, which is a program entry point (`python <file>` runs the \
+                 file as `__main__`), but the converter did not select this module as \
+                 the crate's entry — so the call is an ordinary module-level statement \
+                 that must run when the module is imported, and the generated crate \
+                 would define `main` twice; move the call into an \
+                 `if __name__ == \"__main__\":` block, or delete it from this module"
+                    .into(),
+            ));
+        }
         if let Some(_call_index) = module_level_main_call {
             // `if __name__ == "__main__": main()` already selected the
             // entry shape below; a second, bare call is the same program
@@ -6349,8 +6379,20 @@ impl Module {
         let crate::StatementType::Expr(expr) = &last.statement else {
             return None;
         };
-        // A bare `main()` — no arguments, no return value taken.
-        if !Self::is_main_function_call(&expr.value) {
+        // A bare `main()` — no arguments at all (positional or keyword),
+        // no return value taken. The user's `main` becomes the process
+        // entry point, so arguments could not cross the boundary: a
+        // `main(1)` would run the function with its own arity (a
+        // TypeError under Python) and a `main(x=1)` would lose the
+        // argument. Those shapes are ordinary module-level calls and stay
+        // in `__module_init__`.
+        let crate::ExprType::Call(call) = &expr.value else {
+            return None;
+        };
+        let crate::ExprType::Name(name) = call.func.as_ref() else {
+            return None;
+        };
+        if name.id != "main" || !call.args.is_empty() || !call.keywords.is_empty() {
             return None;
         }
         // ... of the module's OWN `def main` (a module-level `def` or
@@ -6387,9 +6429,16 @@ impl Module {
             .enumerate()
             .take(call_index)
             .find(|(_, s)| {
+                let crate::StatementType::Expr(e) = &s.statement else {
+                    return false;
+                };
                 matches!(
-                    &s.statement,
-                    crate::StatementType::Expr(e) if Self::is_main_function_call(&e.value)
+                    &e.value,
+                    crate::ExprType::Call(c) if matches!(
+                        c.func.as_ref(),
+                        crate::ExprType::Name(n)
+                            if n.id == "main" && c.args.is_empty() && c.keywords.is_empty()
+                    )
                 )
             })?;
         let _ = call;

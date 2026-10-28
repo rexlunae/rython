@@ -21507,3 +21507,136 @@ fn the_guarded_main_call_still_produces_the_same_binary() {
     // Verified against python3.
     assert_eq!(run_package(&krate, "guarded"), vec!["hi"]);
 }
+
+#[test]
+fn an_imported_modules_bare_main_call_is_refused_not_silently_dropped() {
+    // Devin review on #454: the bare-call shape in a module the converter
+    // did NOT select as the crate entry is an ordinary module-level call
+    // that runs when the module is IMPORTED. `python3 -m pkg` on this
+    // package prints
+    //
+    //     helper
+    //     entry
+    //
+    // (captured from a real run) — the helper's call runs during the
+    // import. It cannot stay in `__module_init__` without the user's
+    // `pub fn main` colliding with the generated `fn main` (rustc E0428),
+    // so the conversion refuses it loudly rather than dropping the call
+    // and printing only `entry`.
+    let scratch = Scratch::new("importedmain");
+    let pkg_dir = scratch.path().join("impkg");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    fs::write(pkg_dir.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg_dir.join("helper.py"),
+        concat!(
+            "def main() -> None:\n",
+            "    print(\"helper\")\n",
+            "\n",
+            "\n",
+            "main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg_dir.join("__main__.py"),
+        concat!(
+            "from . import helper\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(\"entry\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&pkg_dir).expect("discover");
+    let err = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect_err("an imported module's bare main() call must be refused");
+    let msg = format!("{:#}", err);
+    assert!(
+        msg.contains("did not select this module as the crate's entry"),
+        "the refusal says why the call cannot stay: {}",
+        msg
+    );
+    assert!(
+        msg.contains("__main__"),
+        "the refusal names the rewrite: {}",
+        msg
+    );
+}
+
+#[test]
+fn an_imported_module_ending_in_a_bare_main_call_is_loud_not_silently_dropped() {
+    // Lead-confirmed reproducer on PR #454 (Devin thread 1). A PACKAGE
+    // whose entry is `__main__.py` and whose imported helper module ends
+    // with a bare `main()` call:
+    //
+    //     helper_pkg/__init__.py   (empty)
+    //     helper_pkg/util.py       def main(): print("util-main-ran")
+    //                              main()
+    //     helper_pkg/__main__.py   from . import util
+    //                              print("pkg-main")
+    //
+    // `python3 -m helper_pkg` prints `util-main-ran` then `pkg-main`
+    // (captured from a real run): the helper's call runs when the module
+    // is IMPORTED.
+    //
+    // The helper is not the crate's entry, so it cannot use the call as
+    // the program body — the call has to stay in its `__module_init__`,
+    // where the user's `pub fn main` collides with the generated `fn main`
+    // (rustc E0428, which is what `main` did: loud). Consuming the call
+    // instead would build fine and silently print only `pkg-main`, losing
+    // `util-main-ran`. The conversion refuses it loudly.
+    //
+    // NOTE: this must be a real PACKAGE layout. Single-file conversion of
+    // a file that imports a sibling is a separate pre-existing limitation
+    // (`E0432: unresolved import crate::helper`), not what this pins.
+    let scratch = Scratch::new("importedbaremain");
+    let pkg_dir = scratch.path().join("helper_pkg");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    fs::write(pkg_dir.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg_dir.join("util.py"),
+        concat!(
+            "def main() -> None:\n",
+            "    print(\"util-main-ran\")\n",
+            "\n",
+            "\n",
+            "main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg_dir.join("__main__.py"),
+        concat!(
+            "from . import util\n",
+            "\n",
+            "print(\"pkg-main\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&pkg_dir).expect("discover");
+    let err = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect_err(
+        "an imported module's bare main() call must be a loud error, never a \
+         silently dropped call",
+    );
+    let msg = format!("{:#}", err);
+    assert!(
+        msg.contains("did not select this module as the crate's entry"),
+        "the refusal says why the call cannot be consumed: {}",
+        msg
+    );
+    assert!(
+        msg.contains("__main__"),
+        "the refusal names the rewrite: {}",
+        msg
+    );
+}
