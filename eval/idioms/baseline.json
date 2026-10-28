@@ -145,6 +145,9 @@
     "shapes": {
       "status": "pass"
     },
+    "shared_slot_mutation": {
+      "status": "pass"
+    },
     "str_local_returns": {
       "status": "pass"
     },

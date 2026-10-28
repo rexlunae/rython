@@ -122,6 +122,12 @@ struct Analysis<'r> {
     /// name may be read-only); None means unknown, falling back to the
     /// syntactic MUTATING_METHODS list.
     resolve: &'r dyn Fn(Access<'_>) -> Option<bool>,
+    /// The scope's codegen context and symbol table: the store-shape
+    /// question ([`is_interior_store`]) needs them to type a receiver, the
+    /// same way the class resolver types an attribute's receiver.
+    ctx: &'r crate::CodeGenContext,
+    symbols: &'r crate::SymbolTableScopes,
+    options: &'r crate::PythonOptions,
 }
 
 impl Analysis<'_> {
@@ -261,6 +267,32 @@ pub(crate) fn analyze_scope_with(
     initialized: &[String],
     resolve: &dyn Fn(Access<'_>) -> Option<bool>,
 ) -> ScopeBindings {
+    // No context to type receivers with: the store-shape question keeps
+    // its conservative answer (every store through a subscript mutates the
+    // chain's base binding). Production callers that render code use
+    // [`analyze_scope_typed`].
+    analyze_scope_typed(
+        body,
+        initialized,
+        resolve,
+        &crate::CodeGenContext::Module(String::new()),
+        &crate::SymbolTableScopes::new(),
+        &crate::PythonOptions::default(),
+    )
+}
+
+/// [`analyze_scope_with`] for a caller that renders the scope: the context,
+/// symbol table and options let the analysis TYPE a store's receiver, so a
+/// store that goes through a borrow (issue #432: `items[0].n += 1` on a
+/// list of shared `PyRef`s) is not recorded as a mutation of the binding.
+pub(crate) fn analyze_scope_typed(
+    body: &[Statement],
+    initialized: &[String],
+    resolve: &dyn Fn(Access<'_>) -> Option<bool>,
+    ctx: &crate::CodeGenContext,
+    symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> ScopeBindings {
     // First pass: collect every name the body assigns, so the closure
     // boundaries in the analysis pass know the full name set (a name first
     // assigned *inside* a try body is not yet in `assigned` when the
@@ -277,6 +309,9 @@ pub(crate) fn analyze_scope_with(
         leaked_loop_targets: HashSet::new(),
         state: HashMap::new(),
         resolve: &noop_resolve,
+        ctx,
+        symbols,
+        options,
     };
     walk_stmts(body, &mut collector, false);
 
@@ -292,6 +327,9 @@ pub(crate) fn analyze_scope_with(
             .map(|n| (n.clone(), Init::Yes))
             .collect(),
         resolve,
+        ctx,
+        symbols,
+        options,
     };
     walk_stmts(body, &mut a, false);
     // Parameters are tracked for needs_mut but are not hoisted declarations.
@@ -324,21 +362,123 @@ fn record_target(target: &ExprType, a: &mut Analysis<'_>, multi: bool) {
             }
         }
         // Stores through the base name: `x[i] = v`, `x.f = v`, and nested
-        // chains like `grid[i][j] = v` all mutate the chain's base binding.
+        // chains like `grid[i][j] = v` all mutate the chain's base binding
+        // — UNLESS the store is interior (`is_interior_store`: it goes
+        // through a borrow, leaving the binding itself untouched).
         ExprType::Subscript(sub) => {
-            if let Some(name) = chain_base_name(&sub.value) {
-                a.record_mutation(name);
+            if !is_interior_store(&ExprType::Subscript(sub.clone()), false, a) {
+                if let Some(name) = chain_base_name(&sub.value) {
+                    a.record_mutation(name);
+                }
             }
             walk_subscript_kind(&sub.kind, a);
         }
         ExprType::Attribute(attr) => {
+            // A store whose place goes THROUGH a borrow (a shared PyRef, or
+            // a container reached through a shared value's borrow) leaves
+            // the base binding untouched: `x.borrow_mut().f = v` takes
+            // `&x`, so `x` never needs `mut`. The resolver's interior arms
+            // answer first (a `threading.local` field, a shared receiver);
+            // `is_interior_store` covers the SUBSCRIPT-derived shape the
+            // resolver does not model.
             if (a.resolve)(Access::Store(attr)) != Some(false)
+                && !is_interior_store(&ExprType::Attribute(attr.clone()), false, a)
                 && let Some(name) = chain_base_name(&attr.value)
             {
                 a.record_mutation(name);
             }
         }
         _ => {}
+    }
+}
+
+/// Whether a STORE target mutates only through a borrow, leaving the base
+/// BINDING untouched (issue #432).
+///
+/// A source read of a SHARED class yields a `PyRef` clone — a handle, not
+/// the value — and every mutation through it borrows. So a store into a
+/// shared object, or into a container reached through one, takes `&recv`
+/// and never `&mut recv`. Recording the chain's base name as mutated
+/// anyway made rustc answer `unused_mut` on the binding (AGENTS.md:
+/// generated code must be warning-clean, so the analysis answers, not an
+/// `#[allow]`).
+///
+/// This asks the question the RENDERER answers, per target shape. The
+/// placement rules are subscript.rs's `subscript_receiver_place` and
+/// attribute.rs's `to_rust_place_expr`:
+///
+/// - `xs[i] = v` puts the value into the container's own slot through
+///   `py_set_index`, which takes `&mut` of the container — so it is
+///   interior only when the container is itself reached through a borrow
+///   (`h.items[i] = v` with `h` shared).
+/// - `base.f += v` binds the current value first and stores through
+///   `base`'s OWN borrow (`(recv).borrow_mut().f = ..`). That borrow is
+///   on the object `base` denotes, so the CONTAINER binding is only read
+///   exactly when `base` is an element of a container of shared handles
+///   (`Vec<PyRef<T>>`) — `element_store_borrows`.
+/// - `base.f = v` is never interior: its place takes `&mut` of `base`
+///   (`((items).py_index_mut(0)?).borrow_mut().f = ..`), and dropping
+///   `mut` there is E0596, an error rather than a warning.
+///
+/// Everything else keeps `mut`, which is the conservative side of the
+/// trade: an unused `mut` is the bug being fixed, a missing one is a
+/// compile error. A store into `Vec<i64>` / `PyDict<K, V>` replaces the
+/// container's contents and keeps `mut`; a receiver whose type does not
+/// resolve keeps `mut` too.
+fn is_interior_store(target: &ExprType, augmented: bool, a: &Analysis<'_>) -> bool {
+    match target {
+        // `items[0].n += v`: the read-modify-write binds the current value
+        // first and stores through the ELEMENT's own borrow
+        // (`(items).py_index(0)?.borrow_mut().n = ..`), so the container
+        // binding is only ever READ.
+        ExprType::Attribute(attr) if augmented => element_store_borrows(&attr.value, a),
+        // `items[0].n = v` is NOT interior even when the element is a
+        // shared `PyRef`: its place renders `((items).py_index_mut(0)?)
+        // .borrow_mut().n = v`, which takes `&mut` of the CONTAINER. That
+        // asymmetry belongs to the renderer (assign.rs's attribute place),
+        // and this analysis follows the emitted place rather than the
+        // target's syntactic shape — a missing `mut` here is E0596.
+        ExprType::Attribute(_) => false,
+        // `xs[i] = v` / `xs[i] += v`: a write into the container's slot.
+        // Interior exactly when the container itself is reached through a
+        // borrow (`h.items[i] = v` — `(&mut place).py_set_index`).
+        ExprType::Subscript(sub) => receiver_borrows(&sub.value, a),
+        _ => false,
+    }
+}
+
+/// Whether an AUGMENTED store whose place is `base` (`items[0]` in
+/// `items[0].n += v`) borrows the element rather than taking `&mut` of the
+/// container.
+fn element_store_borrows(base: &ExprType, a: &Analysis<'_>) -> bool {
+    let ExprType::Subscript(sub) = base else {
+        return false;
+    };
+    if receiver_borrows(&sub.value, a) {
+        return true;
+    }
+    crate::infer_type(None, &sub.value, a.options, a.symbols)
+        .vec_element()
+        .is_some_and(|element| element.writes_through_a_handle())
+}
+
+/// Whether a receiver expression denotes a value reached through a shared
+/// `PyRef` borrow: the shared class itself, or a container it holds.
+fn receiver_borrows(recv: &ExprType, a: &Analysis<'_>) -> bool {
+    match recv {
+        ExprType::Name(n) => {
+            n.id != "self" && crate::ast::tree::shared::binding_is_shared_value(&n.id, a.options)
+        }
+        ExprType::Attribute(attr) => {
+            crate::ast::tree::attribute::shared_receiver(
+                attr.value.as_ref(),
+                a.ctx,
+                a.symbols,
+                a.options,
+            ) || receiver_borrows(&attr.value, a)
+        }
+        ExprType::Subscript(sub) => receiver_borrows(&sub.value, a),
+        _ => false,
     }
 }
 
@@ -615,6 +755,20 @@ fn walk_stmts(body: &[Statement], a: &mut Analysis<'_>, multi: bool) {
                     // Reads and writes an existing value: always mutable.
                     a.record_store(&name.id, multi);
                     a.record_mutation(&name.id);
+                } else if matches!(&aug.target, ExprType::Subscript(_) | ExprType::Attribute(_))
+                    && is_interior_store(&aug.target, true, a)
+                {
+                    // A read-modify-write that goes through a borrow (issue
+                    // #432: `items[0].n += 1` on a list of shared `PyRef`s —
+                    // the load is `(recv).borrow().n` and the store is
+                    // `(recv).borrow_mut().n = ..`) leaves the chain's base
+                    // binding untouched, so it must not be recorded as a
+                    // mutation.
+                    match &aug.target {
+                        ExprType::Subscript(sub) => walk_subscript_kind(&sub.kind, a),
+                        ExprType::Attribute(attr) => walk_expr(&attr.value, a),
+                        _ => {}
+                    }
                 } else {
                     record_target(&aug.target, a, multi);
                 }

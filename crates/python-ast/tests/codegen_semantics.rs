@@ -28509,3 +28509,285 @@ fn a_bound_runtime_module_name_still_converts() {
     );
     assert!(!err.contains("#435") && err.contains("class level"), "{}", err);
 }
+
+// ---------------------------------------------------------------------
+// Issue #432: a store that goes THROUGH A BORROW does not mutate the
+// binding, so the binding must not be declared `mut`.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_shared_element_field_store_does_not_make_the_list_binding_mutable() {
+    // The issue's reproducer. `Box` is stored in a list and mutated after
+    // construction, so it is SHARED (shared.rs): `items` is
+    // `Vec<PyRef<Box>>`, the index read clones the handle, and
+    // `items[0].n += 1` borrows the one object
+    // (`(recv).borrow_mut().n = ..`) — it never mutates the `Vec`.
+    // `let mut items;` was therefore `unused_mut` under the default lints,
+    // which AGENTS.md forbids: the analysis answers, not an `#[allow]`.
+    //
+    // python3 prints `2 2` (the element store and `bump()` are one object;
+    // neither `run` nor `bump` rebinds `items`).
+    let out = compile(
+        concat!(
+            "class Box:\n",
+            "    def __init__(self):\n",
+            "        self.n = 0\n",
+            "\n",
+            "\n",
+            "current = Box()\n",
+            "\n",
+            "\n",
+            "def bump() -> None:\n",
+            "    current.n += 1\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    items = [current]\n",
+            "    items[0].n += 1\n",
+            "    bump()\n",
+            "    print(current.n, items[0].n)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+        "shared_element.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    // The element really is the shared handle, and the store really goes
+    // through its borrow — this is what makes dropping `mut` sound.
+    assert!(
+        flat.contains("vec![Clone::clone(&(stdpython::py_global_read"),
+        "the list holds a PyRef handle, not a copy: {}",
+        out
+    );
+    assert!(
+        flat.contains(").borrow_mut().n="),
+        "the element store borrows the one object: {}",
+        out
+    );
+    assert!(
+        !flat.contains("letmutitems"),
+        "the list binding is never mutated, so it must not be `mut` \
+         (unused_mut): {}",
+        out
+    );
+    assert!(
+        flat.contains("letitems;"),
+        "the binding is still hoisted, just not mutable: {}",
+        out
+    );
+}
+
+#[test]
+fn a_plain_store_through_the_element_borrows_and_keeps_the_list_binding_mutable() {
+    // The `=` sibling of the `+=` shape above, where the answer DIFFERS.
+    // `items[0].n = 7` renders its place through `py_index_mut(0)` — the
+    // receiver is `&mut Vec` — so the list binding really is mutated and
+    // MUST stay `mut`. The analysis keys on the emitted PLACE, not on the
+    // target's syntactic shape, which is why this pin exists next to the
+    // `+=` one: a blanket "an element store never mutates the list" would
+    // make this program fail to compile (E0596), and an unused `mut` is a
+    // warning while a missing one is an error.
+    //
+    // python3 prints `Item(n=7)`.
+    let out = compile(
+        concat!(
+            "class Item:\n",
+            "    def __init__(self, n: int) -> None:\n",
+            "        self.n = n\n",
+            "    def __repr__(self) -> str:\n",
+            "        return f\"Item(n={self.n})\"\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    items = [Item(1)]\n",
+            "    items[0].n = 7\n",
+            "    print(items[0])\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+        "shared_element_store.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("((items).py_index_mut(0)?).borrow_mut().n=7"),
+        "the place takes &mut of the list, then borrows the element: {}",
+        out
+    );
+    assert!(
+        flat.contains("letmutitems"),
+        "that &mut makes the list binding genuinely mutable (dropping it \
+         would be E0596, not a warning): {}",
+        out
+    );
+}
+
+#[test]
+fn a_shared_collections_slot_store_keeps_the_container_binding_mutable() {
+    // The OTHER direction, which would break the build if the analysis got
+    // it wrong: a store into the CONTAINER's own slot needs `&mut` on the
+    // container (`py_set_index`). `xs[1] = 42` and `d["b"] = 7` therefore
+    // keep `mut`; only the element-field store (`pts[0].n += 100`) drops
+    // it. All four shapes live in ONE function, which is where a
+    // too-eager "interior" verdict would show up as a missing-`mut`
+    // compile error rather than a warning.
+    //
+    // python3 prints `11 42 6 7 101 2`.
+    let out = compile(
+        concat!(
+            "class Pt:\n",
+            "    def __init__(self, n: int):\n",
+            "        self.n = n\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    xs: list[int] = [1, 2, 3]\n",
+            "    xs[0] += 10\n",
+            "    xs[1] = 42\n",
+            "    d: dict[str, int] = {\"a\": 1}\n",
+            "    d[\"a\"] += 5\n",
+            "    d[\"b\"] = 7\n",
+            "    pts = [Pt(1), Pt(2)]\n",
+            "    pts[0].n += 100\n",
+            "    print(xs[0], xs[1], d[\"a\"], d[\"b\"], pts[0].n, pts[1].n)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+        "containers.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("letmutxs") && flat.contains("letmutd"),
+        "a store into the container's own slot needs `mut`: {}",
+        out
+    );
+    assert!(
+        !flat.contains("letmutpts"),
+        "the element-field store leaves the list binding alone: {}",
+        out
+    );
+    assert!(
+        flat.contains("(__rython_recv).py_set_index("),
+        "the slot stores go through py_set_index on &mut of the container: {}",
+        out
+    );
+}
+
+#[test]
+fn an_element_store_through_a_plain_objects_container_field_keeps_its_mut() {
+    // The composition case the interior verdict must NOT swallow: `bag` is
+    // a plain (unshared) value holding `items: list[Cell]` of shared
+    // `Cells`. `bag.items[0].n = 9` renders `(bag.items).py_index_mut(0)`,
+    // which borrows `bag` MUTABLY — so `bag` keeps `mut` even though the
+    // CELL is a shared handle. The `+=` form on the same place goes through
+    // the element's borrow instead, and that case is pinned by the first
+    // test; both are needed: the analysis must answer per SHAPE, not per
+    // receiver class.
+    //
+    // python3 prints `9`.
+    let out = compile(
+        concat!(
+            "class Cell:\n",
+            "    def __init__(self, n: int) -> None:\n",
+            "        self.n = n\n",
+            "\n",
+            "\n",
+            "class Bag:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items: list[Cell] = []\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    bag = Bag()\n",
+            "    bag.items.append(Cell(4))\n",
+            "    bag.items[0].n = 9\n",
+            "    print(bag.items[0].n)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+        "plain_field_container.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    assert!(
+        flat.contains("((bag.items).py_index_mut(0)?).borrow_mut().n=9"),
+        "the place takes py_index_mut on the field: {}",
+        out
+    );
+    assert!(
+        flat.contains("letmutbag"),
+        "that &mut reaches the binding, so `bag` stays mutable: {}",
+        out
+    );
+}
+
+#[test]
+fn an_augmented_element_store_through_a_shared_parameter_drops_the_mut() {
+    // The `+=` twin of the test above on a receiver that IS shared: `Bag`
+    // is handed to a function, so it is a `PyRef` (shared.rs) and the
+    // augmented store's place renders
+    // `((bag).borrow().items.clone()).py_index(0)?.borrow_mut().n = ..` —
+    // every `&mut` is taken inside the borrow guard, so the binding is
+    // never mutated and must not be `mut`.
+    //
+    // python3 prints `10`.
+    let out = compile(
+        concat!(
+            "class Cell:\n",
+            "    def __init__(self, n: int) -> None:\n",
+            "        self.n = n\n",
+            "\n",
+            "\n",
+            "class Bag:\n",
+            "    def __init__(self) -> None:\n",
+            "        self.items: list[Cell] = []\n",
+            "\n",
+            "\n",
+            "def make() -> Bag:\n",
+            "    bag = Bag()\n",
+            "    bag.items.append(Cell(4))\n",
+            "    return bag\n",
+            "\n",
+            "\n",
+            "def bump_first(bag: Bag) -> None:\n",
+            "    bag.items[0].n += 6\n",
+            "\n",
+            "\n",
+            "def run() -> None:\n",
+            "    bag = make()\n",
+            "    bump_first(bag)\n",
+            "    print(bag.items[0].n)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    run()\n",
+        ),
+        "plain_field_container_aug.py",
+    );
+    let flat: String = out.split_whitespace().collect();
+    let bump = &flat[flat
+        .find("fnbump_first")
+        .expect("the augmented store must be emitted")..];
+    let bump = &bump[..bump.find("fnrun").unwrap_or(bump.len())];
+    assert!(
+        bump.contains("fnbump_first(bag:stdpython::PyRef<Bag>)"),
+        "the parameter arrives as the shared handle: {}",
+        out
+    );
+    assert!(
+        bump.contains(").py_index(0)?") && bump.contains(").borrow_mut().n="),
+        "the augmented store borrows the element: {}",
+        out
+    );
+    assert!(
+        !bump.contains("letmutbag"),
+        "every &mut is taken inside the borrow guard: {}",
+        out
+    );
+}

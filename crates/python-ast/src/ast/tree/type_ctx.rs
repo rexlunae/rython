@@ -174,6 +174,48 @@ pub(crate) fn type_mentions_heap(t: &TypeInfo) -> bool {
     }
 }
 
+impl TypeInfo {
+    /// The element type when this is a `Vec<T>`-shaped container whose
+    /// element a store writes IN PLACE (`Vec<T>`, an `Option<Vec<T>>`
+    /// narrowed by a guard, a borrowed slice). None for a mapping (whose
+    /// slot type is not an element), for a scalar, and for an unresolved
+    /// type.
+    pub(crate) fn vec_element(&self) -> Option<&TypeInfo> {
+        match self {
+            TypeInfo::Vec(inner) => Some(inner.as_ref()),
+            TypeInfo::Option(inner) | TypeInfo::Borrowed(inner) => inner.vec_element(),
+            _ => None,
+        }
+    }
+
+    /// Whether a store into a container of THIS element type reaches the
+    /// object through a HANDLE rather than the container's own slot
+    /// (issue #432). A SHARED class is the `PyRef` case: reading the
+    /// element clones the handle, and the store borrows the object, so
+    /// `items[0].n += 1` needs no `mut` on `items`. A shared ROOT's sum
+    /// type works the same way for its MUTABLE NARROWING VIEW only —
+    /// `isinstance`-narrowed names take `&mut self` — so it deliberately
+    /// does NOT qualify (it renders as a plain enum value in the slot).
+    ///
+    /// An unshared (value) element type is copied into the expression and
+    /// written back into the container's slot, so it keeps `mut`: the
+    /// value-copy family of #414/#430.
+    pub(crate) fn writes_through_a_handle(&self) -> bool {
+        match self {
+            TypeInfo::Class(name) => {
+                crate::ast::tree::shared::is_shared(name)
+                    && !crate::ast::tree::hierarchy::is_polymorphic_root(name)
+            }
+            // A nested container of handles (`list[list[PyRef[T]]]`): the
+            // outer slot write is still a `py_index_mut` on the OUTER
+            // container, so this does not qualify — the double-subscript
+            // place goes through `py_index_mut` one level in, which needs
+            // `mut` at the outer binding.
+            _ => false,
+        }
+    }
+}
+
 /// Whether a type mentions an UNKNOWN (`PyObject`) element anywhere inside
 /// (`Dict(PyObject, PyObject)` — an empty-container literal typed without
 /// an anchor). Such a type renders `PyDict<_, _>` / `Vec<_>`, which is
