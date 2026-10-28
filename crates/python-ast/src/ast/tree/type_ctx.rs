@@ -1143,6 +1143,21 @@ fn infer_type_inner(
                     r
                 }
                 crate::BinOps::Div => TypeInfo::Float, // Python true division
+                // PYTHON SET ALGEBRA (issue #137): `a & b`, `a | b`,
+                // `a ^ b`, `a - b` over sets answer a SET. The result takes
+                // the LEFT operand's element type (bin_ops lowers through
+                // py_set_* helpers that build in the receiver's spelling),
+                // so the name assigned from it keeps its set type and
+                // `sorted(x)`/`len(x)`/`for` over it still dispatch as set
+                // operations. `-` between non-sets stays numeric below.
+                crate::BinOps::BitAnd | crate::BinOps::BitOr | crate::BinOps::BitXor
+                    if matches!((&l, &r), (TypeInfo::HashSet(_), TypeInfo::HashSet(_))) =>
+                {
+                    l
+                }
+                crate::BinOps::Sub if matches!((&l, &r), (TypeInfo::HashSet(_), TypeInfo::HashSet(_))) => {
+                    l
+                }
                 crate::BinOps::Sub | crate::BinOps::Mult | crate::BinOps::Pow => {
                     if is_numeric(&l) && is_numeric(&r) {
                         numeric_join(&l, &r)

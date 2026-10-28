@@ -6481,3 +6481,105 @@ fn set_pop_answers_only_a_one_member_set() {
     });
     assert!(many.is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Set algebra on std HashSets (issue #137)
+//
+// Python's `&`, `|`, `-`, `^` over sets work across element spellings: a
+// `set[str]` local is `HashSet<String>` while a literal `{"a"}` is
+// `HashSet<&str>`. Rust's HashSet only implements the three bitwise ops
+// between two sets with the SAME element type and has no subtraction at
+// all, so codegen lowers all four through the runtime helpers below.
+//
+// Every expectation is the CPython 3.14 answer for the same expression:
+//
+//   >>> sorted({"a", "b", "c"} & {"b", "c", "z"})   -> ['b', 'c']
+//   >>> sorted({"a", "b"} | {"b", "z"})             -> ['a', 'b', 'z']
+//   >>> sorted({"a", "b", "c"} - {"b"})             -> ['a', 'c']
+//   >>> sorted({"a", "b"} ^ {"b", "z"})             -> ['a', 'z']
+mod set_algebra {
+    use std::collections::HashSet;
+    use stdpython::{py_set_and, py_set_or, py_set_sub, py_set_xor};
+
+    fn owned(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn sorted(set: &HashSet<String>) -> Vec<&str> {
+        let mut out: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn intersection_across_element_spellings() {
+        // `seen & {"b", "c", "z"}` where seen is set[str].
+        let a = owned(&["a", "b", "c"]);
+        let b: HashSet<&str> = ["b", "c", "z"].into_iter().collect();
+        assert_eq!(sorted(&py_set_and(&a, &b)), vec!["b", "c"]);
+        // Same spelling, same answer.
+        assert_eq!(sorted(&py_set_and(&a, &owned(&["c", "z"]))), vec!["c"]);
+        // Empty intersection is empty, not a panic.
+        assert!(py_set_and(&a, &owned(&["q"])).is_empty());
+        // Literal on the LEFT, owned on the right (`{"b"} & seen`): the
+        // result keeps the literal receiver's element type.
+        let lit: HashSet<&str> = ["b", "c"].into_iter().collect();
+        let mut l: Vec<&str> = py_set_and(&lit, &a).into_iter().collect();
+        l.sort();
+        assert_eq!(l, vec!["b", "c"]);
+    }
+
+    #[test]
+    fn union_dedupes_like_python() {
+        // `sorted({"a", "b"} | {"b", "z"})` -> ['a', 'b', 'z']
+        let a = owned(&["a", "b"]);
+        let b: HashSet<&str> = ["b", "z"].into_iter().collect();
+        assert_eq!(sorted(&py_set_or(&a, &b)), vec!["a", "b", "z"]);
+    }
+
+    #[test]
+    fn difference_removes_only_the_shared_members() {
+        // `sorted({"a", "b", "c"} - {"b"})` -> ['a', 'c']
+        let a = owned(&["a", "b", "c"]);
+        let b: HashSet<&str> = ["b"].into_iter().collect();
+        assert_eq!(sorted(&py_set_sub(&a, &b)), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn symmetric_difference_keeps_only_the_exclusive_members() {
+        // `sorted({"a", "b"} ^ {"b", "z"})` -> ['a', 'z']
+        // "b" is in both, so it is in NEITHER side of the result.
+        let a = owned(&["a", "b"]);
+        let b: HashSet<&str> = ["b", "z"].into_iter().collect();
+        assert_eq!(sorted(&py_set_xor(&a, &b)), vec!["a", "z"]);
+    }
+
+    #[test]
+    fn integer_set_algebra_is_exact() {
+        // >>> sorted({3, 1, 2} & {2, 3, 9}) -> [2, 3]
+        let a: HashSet<i64> = [3, 1, 2].into_iter().collect();
+        let b: HashSet<i64> = [2, 3, 9].into_iter().collect();
+        let mut got: Vec<i64> = py_set_and(&a, &b).into_iter().collect();
+        got.sort();
+        assert_eq!(got, vec![2, 3]);
+        // >>> sorted({3, 1, 2} ^ {2, 3, 9}) -> [1, 9]
+        let mut got: Vec<i64> = py_set_xor(&a, &b).into_iter().collect();
+        got.sort();
+        assert_eq!(got, vec![1, 9]);
+    }
+}
+
+mod set_sum {
+    use std::collections::HashSet;
+    use stdpython::sum;
+
+    #[test]
+    fn sum_of_an_integer_set_is_exact_in_any_order() {
+        // >>> sum({3, 1, 2}) -> 6 (integer addition is order-free, and
+        // #444 refuses a float set, so the set's own order is exact).
+        let s: HashSet<i64> = [3, 1, 2].into_iter().collect();
+        assert_eq!(sum(s), 6);
+        let empty: HashSet<i64> = HashSet::new();
+        assert_eq!(sum(empty), 0);
+    }
+}
