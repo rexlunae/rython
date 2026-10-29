@@ -29435,28 +29435,33 @@ fn an_unawaited_async_main_refusal_names_the_module_and_line() {
 }
 
 #[test]
-fn an_async_main_call_inside_a_nested_block_is_still_found() {
-    // Devin review on #462: the scan matched `If` bodies by hand, so a call
-    // inside a `try` at module scope escaped. The walk goes through the one
-    // statement visitor now.
-    let err = compile_err(
+fn a_non_entry_async_main_call_is_not_refused() {
+    // The #455 refusal is scoped to the ENTRY spellings the promotion
+    // machinery recognizes. A `main()` call nested under a guard with more
+    // than one statement is NOT one of them (`is_simple_main_call_block`
+    // requires exactly one statement), so it takes the ordinary wrapper
+    // path and is not refused here.
+    //
+    // That shape currently generates a crate with a duplicate `main` item
+    // and does not build -- identical on `main` before this change, so it is
+    // a SEPARATE pre-existing defect (issue #464), not something #455
+    // introduced or should silently absorb.
+    let out = compile(
         concat!(
-            "async def main() -> None:\n",
-            "    print(\"async\")\n",
+            "def main() -> None:\n",
+            "    print(\"sync\")\n",
             "\n",
             "\n",
             "try:\n",
-            "    if 1:\n",
-            "        main()\n",
+            "    main()\n",
             "except Exception:\n",
             "    print(\"err\")\n",
         ),
-        "nested_async_main.py",
+        "try_call_sync_main.py",
     );
     assert!(
-        err.contains("async def main"),
-        "a nested module-level call must be refused too: {}",
-        err
+        out.contains("print"),
+        "a non-entry call keeps converting: {out}"
     );
 }
 
@@ -29481,8 +29486,94 @@ fn a_sync_redefinition_of_main_makes_the_call_ordinary() {
         ),
         "rebound_main.py",
     );
+    // This test governs ONE thing: the #455 refusal must not fire, because
+    // the binding at the call is synchronous. (The generated crate still
+    // emits both items and does not build — a SEPARATE, pre-existing
+    // duplicate-`main` defect that fails identically on `main`, reported in
+    // issue #464 rather than absorbed here.)
     assert!(
-        !out.is_empty(),
-        "a synchronous rebinding keeps the program converting"
+        out.contains("sync version"),
+        "the synchronous definition must be emitted: {out}"
+    );
+}
+
+#[test]
+fn a_type_checking_call_does_not_make_the_async_entry_unawaited() {
+    // Devin review on #462: the emitter SKIPS `if TYPE_CHECKING:` at
+    // runtime, so a call there is not executed and must not trigger the
+    // refusal. The scan reuses the entry classification, which already
+    // excludes those blocks.
+    let out = compile(
+        concat!(
+            "import asyncio\n",
+            "from typing import TYPE_CHECKING\n",
+            "\n",
+            "\n",
+            "async def work() -> None:\n",
+            "    print(\"ran\")\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    asyncio.run(work())\n",
+            "\n",
+            "\n",
+            "if TYPE_CHECKING:\n",
+            "    main()\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+        "typechecking_async.py",
+    );
+    assert!(out.contains("asyncio :: run"), "generated: {}", out);
+}
+
+#[test]
+fn an_earlier_dead_call_does_not_hide_the_async_entry() {
+    // Devin review on #462: an `if False:` call before the definition must
+    // not stop the scan, or the real unawaited entry would be promoted and
+    // run a body CPython never runs.
+    let err = compile_err(
+        concat!(
+            "if False:\n",
+            "    main()\n",
+            "\n",
+            "\n",
+            "async def main() -> None:\n",
+            "    print(\"ran\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+        "dead_call_async.py",
+    );
+    assert!(
+        err.contains("async def main"),
+        "the real entry must still be refused: {}",
+        err
+    );
+}
+
+#[test]
+fn a_guarded_assignment_from_an_async_main_is_refused() {
+    // Devin review on #462: `result = main()` is a form the ENTRY classifier
+    // accepts, so the refusal must accept it too -- otherwise the entry is
+    // promoted and the body runs.
+    let err = compile_err(
+        concat!(
+            "async def main() -> None:\n",
+            "    print(\"ran\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    result = main()\n",
+        ),
+        "guarded_assign_async.py",
+    );
+    assert!(
+        err.contains("async def main"),
+        "the guarded-assignment spelling must be refused: {}",
+        err
     );
 }

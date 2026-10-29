@@ -700,46 +700,30 @@ impl CodeGen for Module {
             )
         });
 
-        // Issue #455: an `async def main` that is CALLED as a bare or
-        // guarded statement creates a coroutine in CPython and never awaits
-        // it, so the program body does NOT run (Python prints nothing and
-        // warns `coroutine 'main' was never awaited`). rython's entry
-        // machinery would install it as the process entry (`#[tokio::main]`)
-        // and RUN the body -- output CPython never prints, a silent
-        // divergence.
-        //
-        // Two things make this a real analysis rather than a presence test
-        // (Devin review on #462):
-        //
-        //  - the CALL is found through the one statement visitor
-        //    (`visit::any_stmt`, `Descend::SkipDefs` — a nested def's call
-        //    is not module-init code), not a hand-written `If` match, so a
-        //    call inside a `try`/`with`/`for` at module scope is found too;
-        //  - the refusal requires the binding ACTIVE AT THE CALL to be
-        //    async. A later `def main` replaces the `async def`, and then
-        //    the call is an ordinary synchronous one.
-        //
-        // Modelling a never-awaited coroutine (the discarded object and the
-        // RuntimeWarning) is not implemented, so this refuses at conversion
-        // time, with the call's own source location.
-        if let Some((stmt, async_at_call)) = module_level_async_main_call(&self.raw.body) {
-            if async_at_call {
-                let location = crate::SourceLocation::with_position(
-                    module_filename.clone(),
-                    stmt.lineno,
-                    stmt.col_offset.map(|c| c + 1),
-                );
-                return Err(Box::from(crate::codegen_error(
-                    location,
-                    "`async def main()` is called without `await`, so CPython only \
-                     creates the coroutine and the body never runs (it prints \n\
-                     nothing and warns `coroutine 'main' was never awaited`). rython \
-                     cannot reproduce a never-awaited coroutine yet, and would \
-                     otherwise RUN the body instead",
-                    "rewrite the call as `asyncio.run(main())` to run it, or make \
-                     `main` a plain `def`",
-                )));
-            }
+        // Issue #455: an `async def main` that the ENTRY MACHINERY would
+        // promote to the process entry creates a coroutine in CPython and
+        // never awaits it, so the body does NOT run (Python prints nothing
+        // and warns `coroutine 'main' was never awaited`). Promoting it
+        // would RUN the body -- output CPython never prints, a silent
+        // divergence. Modelling a never-awaited coroutine is not
+        // implemented, so the conversion refuses at the entry's own
+        // location, naming the construct and the rewrite.
+        if let Some(stmt) = unawaited_async_main_entry(&self.raw.body, user_main_returns_value) {
+            let location = crate::SourceLocation::with_position(
+                module_filename.clone(),
+                stmt.lineno,
+                stmt.col_offset.map(|c| c + 1),
+            );
+            return Err(Box::from(crate::codegen_error(
+                location,
+                "`async def main()` is the program entry but is called without `await`, \
+                 so CPython only creates the coroutine and the body never runs (it \
+                 prints nothing and warns `coroutine 'main' was never awaited`). rython \
+                 cannot reproduce a never-awaited coroutine yet, and would otherwise RUN \
+                 the body instead",
+                "rewrite the call as `asyncio.run(main())` to run it, or make `main` a \
+                 plain `def`",
+            )));
         }
 
         // A boxed mutable static with NO top-level store (a module value
@@ -6336,24 +6320,28 @@ fn hoisted_declarations(
 /// their location; this substitutes the actual filename and preserves the
 /// structured fields (message, help) so downstream consumers — the proc
 /// macro in particular — can render precise diagnostics.
-/// Find a module-level call to the module's own `main`, and whether the
-/// binding active AT THAT CALL is an `async def` (issue #455).
+/// The module-level statement that makes the user's `async def main` the
+/// program entry, if this module has one (issue #455).
 ///
-/// The walk goes through the one statement visitor so every module-level
-/// body form is covered; `Descend::SkipDefs` because a nested definition's
-/// call is not module-init code. The call is any `Expr` statement whose
-/// value calls the name `main`, at module level or inside a guard
-/// (`if __name__ == "__main__":`).
-fn module_level_async_main_call(
+/// This deliberately does NOT re-derive entry classification: it asks the
+/// SAME predicates the entry machinery uses (`is_simple_main_call_block`
+/// for the `__name__` guard, and the bare-final-call rule), so the refusal
+/// and the promotion can never disagree about which spellings count. A
+/// spelling the entry path would promote is exactly the spelling that runs
+/// a body CPython never runs.
+///
+/// `<`TYPE_CHECKING`>` blocks are excluded: the emitter skips them at
+/// runtime, so a call there is not executed.
+fn unawaited_async_main_entry(
     body: &[crate::Statement],
-) -> Option<(&crate::Statement, bool)> {
-    use crate::ast::tree::visit::{any_stmt, Descend};
-    // Is `main` an `async def` at the point this statement runs? The module
-    // body is a straight line modulo control flow, so the LAST definition
-    // before the call wins; a definition AFTER the call has not run yet.
-    fn async_at(body: &[crate::Statement], call_index: usize) -> bool {
+    user_main_returns_value: bool,
+) -> Option<&crate::Statement> {
+    // Last definition of `main` before the given index decides the binding
+    // (`def` and `async def` both count); module scope is a straight line
+    // modulo control flow.
+    fn main_is_async_at(body: &[crate::Statement], index: usize) -> bool {
         let mut answer = false;
-        for s in body.iter().take(call_index + 1) {
+        for s in body.iter().take(index + 1) {
             match &s.statement {
                 crate::StatementType::AsyncFunctionDef(f) if f.name == "main" => answer = true,
                 crate::StatementType::FunctionDef(f) if f.name == "main" => answer = false,
@@ -6362,21 +6350,26 @@ fn module_level_async_main_call(
         }
         answer
     }
+    let last_index = body.len().checked_sub(1)?;
     for (index, s) in body.iter().enumerate() {
-        let mut found = false;
-        any_stmt(std::slice::from_ref(s), Descend::SkipDefs, |inner| {
-            let calls_main = match &inner.statement {
-                crate::StatementType::Expr(e) => Module::is_main_function_call(&e.value),
-                _ => false,
-            };
-            if calls_main {
-                found = true;
-                return true;
+        let promotes = match &s.statement {
+            crate::StatementType::If(i) => {
+                is_main_guard(&i.test)
+                    && !Module::is_type_checking_test(&i.test)
+                    && Module::is_simple_main_call_block(&i.body)
+                    && !user_main_returns_value
             }
-            false
-        });
-        if found {
-            return Some((s, async_at(body, index)));
+            // The bare final-call spelling (issue #431).
+            _ if index == last_index => {
+                matches!(
+                    &s.statement,
+                    crate::StatementType::Expr(e) if Module::is_main_function_call(&e.value)
+                )
+            }
+            _ => false,
+        };
+        if promotes && main_is_async_at(body, index) {
+            return Some(s);
         }
     }
     None
