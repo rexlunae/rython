@@ -21880,32 +21880,9 @@ fn a_pytest_import_is_a_warning_not_a_broken_crate() {
     );
 }
 
-#[test]
-fn a_python_module_macro_import_of_a_sibling_is_still_a_crate_path() {
-    // Devin review on #460: the `python_module!` macros convert ONE module
-    // with no index of its siblings, so fixing #456 must not make them
-    // treat a real sibling import as external -- that would drop the
-    // sibling's initializer and its binding. `unindexed_crate_modules`
-    // is what keeps the old (correct) answer for this caller only.
-    use python_ast::CodeGen as _;
-    let module = python_ast::parse(
-        "import helper\n\n\ndef use_it() -> None:\n    helper.greet()\n",
-        "app.py",
-    )
-    .expect("parse");
-    let symbols = module.clone().find_symbols(python_ast::SymbolTableScopes::new());
-    let mut options = python_ast::PythonOptions::default();
-    options.unindexed_crate_modules = true;
-    let out = module
-        .to_rust(
-            python_ast::CodeGenContext::Module("app".to_string()),
-            options,
-            symbols,
-        )
-        .expect("codegen")
-        .to_string();
-    assert!(
-        out.contains("use crate :: helper") || out.contains("use crate::helper"),
-        "a standalone macro module's sibling import stays a crate path: {out}"
-    );
-}
+// NOTE: the `python_module!` sibling-import case is covered by a REAL
+// compiled fixture rather than a codegen-text assertion:
+// `crates/python-mod/tests/sibling_import.rs` invokes the macro on an
+// importer and its sibling and asserts the call returns the sibling's
+// value. A token-text pin here would not have caught the inverted
+// guard polarity that made the call a boxed None (Devin review on #460).

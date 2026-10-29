@@ -334,14 +334,15 @@ pub(crate) fn resolves_to_external_import(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> bool {
-    // Only meaningful when the whole crate is known. A rypip conversion
-    // enumerates every module, so an unresolved import is external — the
-    // same rule the import lowering applies, kept in sync deliberately so a
-    // dropped import's USES are classified consistently with the drop
-    // (issue #456, Devin review on #460). The `python_module!` macros have
-    // no index of their siblings (`unindexed_crate_modules`) and keep the
-    // old answer.
-    if options.module_defs.len() <= 1 && !options.unindexed_crate_modules {
+    // Only meaningful when the whole crate is known. A single-module
+    // conversion (`len() == 1`) and the `python_module!` macros
+    // (`unindexed_crate_modules`) do NOT know it, so a name they cannot
+    // resolve may still be a sibling and must not be called external. A
+    // rypip conversion enumerates every module, so an unresolved import
+    // there IS external — the same rule the import lowering applies, kept in
+    // sync deliberately so a dropped import's uses are classified
+    // consistently with the drop (issue #456, Devin review on #460).
+    if options.module_defs.len() <= 1 || options.unindexed_crate_modules {
         return false;
     }
     let mut current = name.to_string();
