@@ -6596,26 +6596,45 @@ fn class_body_statement_is_observable(s: &crate::Statement) -> bool {
             definition_effect_reason(s, "").is_some()
         }
         crate::StatementType::ClassDef(_) => definition_effect_reason(s, "").is_some(),
-        // A field store is inert only when its value contains no call and no
-        // name read — a literal (of any nesting) cannot run code.
-        crate::StatementType::Assign(a) => !value_is_literal_only(&a.value),
+        // A field store is inert only when it is a plain NAME target and its
+        // value cannot run code or FAIL to construct. A subscript or
+        // attribute target (`a[0] = 1`, `obj.x = 1`) mutates an object
+        // outside the discarded class, which is observable; an unpacking
+        // target can run the iterator protocol (Devin review on #467).
+        crate::StatementType::Assign(a) => {
+            let plain_target = a.targets.iter().all(|t| matches!(t, crate::ExprType::Name(_)));
+            !plain_target || !value_is_literal_only(&a.value)
+        }
         _ => true,
     }
 }
 
-/// Whether a value expression is built only from literals (so evaluating it
-/// cannot run any code).
+/// Whether a value expression is built only from literals AND constructing
+/// it cannot raise, so evaluating it has no observable effect.
+///
+/// The construction itself matters: `-"bad"` raises TypeError under CPython,
+/// and a set or dict literal requires hashable elements/keys, so those are
+/// not inert even though every leaf is a literal (Devin review on #467).
+/// Tuples and lists are always constructible (no hashing, no operator), so
+/// they recurse; a set/dict of constants is dict/set-constructible but a
+/// nested mutable container is not hashable — conservative, treat any
+/// non-constant element/key as observable.
 fn value_is_literal_only(e: &crate::ExprType) -> bool {
     match e {
         crate::ExprType::Constant(_) => true,
         crate::ExprType::Tuple(t) => t.elts.iter().all(value_is_literal_only),
         crate::ExprType::List(l) => l.iter().all(value_is_literal_only),
-        crate::ExprType::Set(s) => s.elts.iter().all(value_is_literal_only),
+        // Hashing a nested container raises TypeError; only flat constants
+        // are certainly constructible.
+        crate::ExprType::Set(s) => s
+            .elts
+            .iter()
+            .all(|x| matches!(x, crate::ExprType::Constant(_))),
         crate::ExprType::Dict(d) => {
-            d.keys.iter().flatten().all(value_is_literal_only)
-                && d.values.iter().all(value_is_literal_only)
+            d.keys.iter().flatten().all(|k| matches!(k, crate::ExprType::Constant(_)))
+                && d.values.iter().all(|v| matches!(v, crate::ExprType::Constant(_)))
         }
-        crate::ExprType::UnaryOp(u) => value_is_literal_only(&u.operand),
+        // A unary op can reject its operand (`-"bad"` is TypeError).
         _ => false,
     }
 }

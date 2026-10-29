@@ -22550,3 +22550,84 @@ fn a_dead_branch_nested_in_a_dead_else_does_not_make_the_async_entry_unawaited()
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.trim(), "done", "stdout: {}", stdout);
 }
+
+#[test]
+fn a_shadowed_class_mutating_an_external_object_is_refused() {
+    // Devin review on #467: a class body's SUBSCRIPT or attribute store
+    // mutates an object outside the discarded class, which is observable.
+    // Verified against python3:
+    //
+    //   $ python3 shadow_class_external_target.py
+    //   1
+    //
+    // Dropping the first class would leave `a[0]` at 0.
+    let scratch = Scratch::new("dup-class-external");
+    let file = scratch.path().join("shadow_class_external_target.py");
+    fs::write(
+        &file,
+        concat!(
+            "a = [0]\n",
+            "\n",
+            "\n",
+            "class Foo:\n",
+            "    a[0] = 1\n",
+            "\n",
+            "\n",
+            "class Foo:\n",
+            "    x = 2\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(a[0])\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect_err("a store to an external target must not be dropped");
+    assert!(
+        err.to_string().contains("class body"),
+        "unexpected message: {}",
+        err
+    );
+}
+
+#[test]
+fn a_shadowed_class_whose_literal_cannot_be_constructed_is_refused() {
+    // Devin review on #467: literal operands do not guarantee construction
+    // succeeds. Verified against python3:
+    //
+    //   $ python3 shadow_class_failing_literal.py
+    //   TypeError: bad operand type for unary -: 'str'
+    //
+    // Dropping the class would let the program continue where CPython
+    // raises at class creation.
+    let scratch = Scratch::new("dup-class-failing-literal");
+    let file = scratch.path().join("shadow_class_failing_literal.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Foo:\n",
+            "    x = -\"bad\"\n",
+            "\n",
+            "\n",
+            "class Foo:\n",
+            "    x = 2\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect_err("a failing literal construction must not be dropped");
+    assert!(
+        err.to_string().contains("class body"),
+        "unexpected message: {}",
+        err
+    );
+}
