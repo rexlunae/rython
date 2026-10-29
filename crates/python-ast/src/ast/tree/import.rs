@@ -334,9 +334,14 @@ pub(crate) fn resolves_to_external_import(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> bool {
-    // Only meaningful when the whole crate is known (multi-module
-    // conversion): a single-module conversion may import any sibling.
-    if options.module_defs.len() <= 1 {
+    // Only meaningful when the whole crate is known. A rypip conversion
+    // enumerates every module, so an unresolved import is external — the
+    // same rule the import lowering applies, kept in sync deliberately so a
+    // dropped import's USES are classified consistently with the drop
+    // (issue #456, Devin review on #460). The `python_module!` macros have
+    // no index of their siblings (`unindexed_crate_modules`) and keep the
+    // old answer.
+    if options.module_defs.len() <= 1 && !options.unindexed_crate_modules {
         return false;
     }
     let mut current = name.to_string();
@@ -2240,7 +2245,15 @@ impl CodeGen for Import {
                     let is_sibling = crate::module_defs_contains(&options, &path)
                         || options.python_modules.contains(
                             &path.first().cloned().unwrap_or_default(),
-                        );
+                        )
+                        // The `python_module!` macros convert ONE module
+                        // with no index of its siblings: for them an
+                        // unresolvable import may still be a module of the
+                        // same crate (`use crate::helper`). A rypip
+                        // conversion enumerates the whole crate, so an
+                        // unresolved import there is genuinely external and
+                        // is dropped with a warning instead (issue #456).
+                        || options.unindexed_crate_modules;
                     if !is_sibling {
                         options.definition_warnings.borrow_mut().push(format!(
                             "import `{}` is dropped: the module is not part of the \

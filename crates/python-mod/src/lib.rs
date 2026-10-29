@@ -146,7 +146,13 @@ fn module_options(input: TokenStream, options: PythonOptions) -> TokenStream {
 #[proc_macro]
 #[proc_macro_error]
 pub fn python_module(input: TokenStream) -> TokenStream {
-    let options = PythonOptions::default();
+    let mut options = PythonOptions::default();
+    // One module at a time, with no module index: its siblings live in the
+    // same generated crate but are not enumerated here, so an unresolvable
+    // import may still be a sibling (`use crate::helper`). Only this
+    // standalone-macro path may assume that; a rypip conversion knows its
+    // whole module set (issue #456 / Devin review on #460).
+    options.unindexed_crate_modules = true;
     module_options(input, options)
 }
 
@@ -156,5 +162,6 @@ pub fn python_module(input: TokenStream) -> TokenStream {
 pub fn python_module_nostd(input: TokenStream) -> TokenStream {
     let mut options = PythonOptions::default();
     options.with_std_python = false;
+    options.unindexed_crate_modules = true;
     module_options(input, options)
 }
