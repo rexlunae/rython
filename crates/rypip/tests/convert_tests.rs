@@ -21886,3 +21886,248 @@ fn a_pytest_import_is_a_warning_not_a_broken_crate() {
 // importer and its sibling and asserts the call returns the sibling's
 // value. A token-text pin here would not have caught the inverted
 // guard polarity that made the call a boxed None (Devin review on #460).
+
+
+#[test]
+fn a_shadowed_sync_main_definition_builds_and_prints_the_last_binding() {
+    // Issue #464. Python's module scope is a namespace, not a set of items:
+    // the second `def main` REBINDS the name, so `python3` runs the sync one
+    // and prints `sync version`. Emitting both as Rust items is E0428 at a
+    // generated line that never names the Python source, so the converter
+    // must emit ONLY the last binding.
+    //
+    // Verified against python3:
+    //   $ python3 rebind_main.py
+    //   sync version
+    //   $ echo $?
+    //   0
+    let scratch = Scratch::new("dup-main-sync-last");
+    let file = scratch.path().join("rebind_main.py");
+    fs::write(
+        &file,
+        concat!(
+            "async def main() -> None:\n",
+            "    print(\"async version\")\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(\"sync version\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    // A codegen-text assertion cannot see the duplicate — the crate has to
+    // build (issue #464 shipped because the pin was text-only).
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "shadowed-main crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/rebind_main"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "sync version", "stdout: {}", stdout);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn a_multi_statement_main_guard_uses_the_last_binding_and_runs() {
+    // Issue #464, second spelling: a `__name__` guard with MORE than one
+    // statement takes the WRAPPER path (it is not the "simple main call"
+    // shape), which renamed the user's `main` by string replacement — the
+    // rename hit BOTH definitions (`python_main` twice, E0428) and, for the
+    // async definition, dropped the `.await` (E0277). Only the last binding
+    // is observable, so only it may be emitted.
+    //
+    // Verified against python3:
+    //   $ python3 nested_guard_main.py
+    //   guard start
+    //   sync
+    //   $ echo $?
+    //   0
+    let scratch = Scratch::new("dup-main-guard-wrapper");
+    let file = scratch.path().join("nested_guard_main.py");
+    fs::write(
+        &file,
+        concat!(
+            "async def main() -> None:\n",
+            "    print(\"async\")\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(\"sync\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    print(\"guard start\")\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "multi-statement guard crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/nested_guard_main"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "guard start\nsync",
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn a_shadowed_class_definition_keeps_the_last_binding() {
+    // Issue #464, same root cause on a class: two top-level `class Foo`
+    // definitions emitted two structs and two sets of trait impls (E0428
+    // plus E0119 "conflicting implementations"). Python rebinds the name, so
+    // the later body is what runs.
+    //
+    // Verified against python3:
+    //   $ python3 shadow_class.py
+    //   2
+    let scratch = Scratch::new("dup-class-last");
+    let file = scratch.path().join("shadow_class.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Foo:\n",
+            "    x = 1\n",
+            "\n",
+            "\n",
+            "class Foo:\n",
+            "    x = 2\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(Foo.x)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "shadowed-class crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/shadow_class"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "2", "stdout: {}", stdout);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn a_shadowed_helper_function_prints_the_last_binding() {
+    // Issue #464's root cause on an ordinary name: two top-level `def
+    // helper` emitted two fns (E0428). The last binding is what CPython
+    // calls.
+    //
+    // Verified against python3:
+    //   $ python3 shadow_helper.py
+    //   v2
+    let scratch = Scratch::new("dup-helper-last");
+    let file = scratch.path().join("shadow_helper.py");
+    fs::write(
+        &file,
+        concat!(
+            "def helper() -> None:\n",
+            "    print(\"v1\")\n",
+            "\n",
+            "\n",
+            "def helper() -> None:\n",
+            "    print(\"v2\")\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    helper()\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "shadowed-helper crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/shadow_helper"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "v2", "stdout: {}", stdout);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn an_unawaited_async_main_under_a_multi_statement_guard_is_refused() {
+    // Issue #464, criterion 3: the third spelling. A single `async def main`
+    // whose `main()` call sits inside a MULTI-statement guard is not the
+    // "simple main call" shape, so it reaches the wrapper path — which calls
+    // an `async fn` without `.await` (E0277) and would RUN a body CPython
+    // never runs. CPython:
+    //
+    //   $ python3 nested_async.py
+    //   (no output)
+    //   $ echo $?
+    //   0
+    //   # plus: RuntimeWarning: coroutine 'main' was never awaited
+    //
+    // Modelling a never-awaited coroutine is issue #455's open gap, so the
+    // converter refuses LOUDLY instead of emitting a crate that runs the
+    // body. That is the prime directive's "or loud" arm.
+    let scratch = Scratch::new("dup-main-unawaited-guard");
+    let file = scratch.path().join("nested_async.py");
+    fs::write(
+        &file,
+        concat!(
+            "async def main() -> None:\n",
+            "    print(\"async\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    if 1:\n",
+            "        main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect_err("the never-awaited async entry must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("async def main") && msg.contains("never"),
+        "the refusal names the construct: {}",
+        msg
+    );
+    assert!(
+        msg.contains("asyncio.run"),
+        "the refusal names the rewrite: {}",
+        msg
+    );
+}

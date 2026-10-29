@@ -386,6 +386,25 @@ impl CodeGen for Module {
             });
         }
         
+        // Issue #464: a top-level `def`/`class` REBINDS its name in Python;
+        // only the last binding is observable, so only the last item may be
+        // emitted (two items under one name is E0428 in the generated
+        // crate). Drop the shadowed definitions from the body the emission
+        // walks — the entry machinery reads the same `self.raw.body`, so
+        // fixing it here keeps the entry decision and the item emission in
+        // agreement (see `shadowed_top_level_definitions`).
+        let shadowed = Self::shadowed_top_level_definitions(&self.raw.body);
+        if !shadowed.is_empty() {
+            let kept: Vec<crate::Statement> = self
+                .raw
+                .body
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !shadowed.contains(index))
+                .map(|(_, s)| s.clone())
+                .collect();
+            self.raw.body = kept;
+        }
         // Add async runtime dependency if async functions are detected.
         // We'll check this early so we can add the import at the top. The
         // import is only emitted for generated BINARY crates
@@ -6315,6 +6334,60 @@ fn hoisted_declarations(
     out
 }
 
+/// Whether a `__name__ == "__main__"` guard body contains a `main()`
+/// call that is NOT awaited, in a module whose binding of `main` at the
+/// guard is an `async def` (issue #464).
+///
+/// CPython creates a coroutine and never awaits it: the body does not
+/// run and CPython warns. The wrapper emission in `to_rust` renames the
+/// user's `main` and CALLS it from the generated entry — running a body
+/// CPython never runs — and, for the async definition, emits a call
+/// missing `.await` that rustc rejects (E0277). Refusing is the loud
+/// form of the #455 rule.
+///
+/// Descends through control flow (`Descend::Control` — an `if` in the
+/// guard, a `for`, a `try`) but not into nested scopes: a `main()` call
+/// inside a nested `def` is that function's body, not the guard's. The
+/// walk uses the shared visitor, never a local match over statement
+/// forms (AGENTS.md).
+fn guard_body_calls_main_unawaited(
+    guard_body: &[crate::Statement],
+    module_body: &[crate::Statement],
+) -> bool {
+    use crate::ast::tree::visit::{stmt_exprs, walk_stmts, Descend, Flow};
+    // The binding of `main` the guard sees: the last `def`/`async def`
+    // above it decides (Python's last-write-wins module scope). The
+    // guard is the last statement that calls it in this shape, so the
+    // module's LAST definition is the one that runs.
+    let mut main_is_async = false;
+    for s in module_body {
+        match &s.statement {
+            crate::StatementType::AsyncFunctionDef(f) if f.name == "main" => {
+                main_is_async = true
+            }
+            crate::StatementType::FunctionDef(f) if f.name == "main" => main_is_async = false,
+            _ => {}
+        }
+    }
+    if !main_is_async {
+        return false;
+    }
+    let mut calls = false;
+    walk_stmts(guard_body, Descend::SkipDefs, &mut |s| {
+        for e in stmt_exprs(s) {
+            if Module::is_main_function_call(e) {
+                calls = true;
+            }
+        }
+        if calls {
+            Flow::Stop
+        } else {
+            Flow::Continue
+        }
+    });
+    calls
+}
+
 /// Rebuild a statement-level codegen error so it points at the module's real
 /// source file. Statement errors carry a `<module>` placeholder filename in
 /// their location; this substitutes the actual filename and preserves the
@@ -6356,8 +6429,18 @@ fn unawaited_async_main_entry(
             crate::StatementType::If(i) => {
                 is_main_guard(&i.test)
                     && !Module::is_type_checking_test(&i.test)
-                    && Module::is_simple_main_call_block(&i.body)
                     && !user_main_returns_value
+                    && (Module::is_simple_main_call_block(&i.body)
+                        // Issue #464: a guard with MORE than one statement
+                        // takes the WRAPPER path, which renames the user's
+                        // `main` to `python_main` and calls it from the
+                        // generated entry. For an `async def main` that call
+                        // is a never-awaited coroutine too, so CPython runs
+                        // nothing while the wrapper would run the body — the
+                        // same #455 divergence, reached by the other
+                        // emission path. Cover both spellings here so the
+                        // refusal and the entry machinery agree.
+                        || guard_body_calls_main_unawaited(&i.body, body))
             }
             // The bare final-call spelling (issue #431).
             _ if index == last_index => {
@@ -6461,6 +6544,62 @@ impl Module {
         }
     }
     
+    /// The body INDEX of each top-level definition that is SHADOWED by a
+    /// later definition of the same name (issue #464).
+    ///
+    /// Python's module scope is a namespace, not a set of items: a second
+    /// `def f` or `class C` at top level REBINDS the name, and only the last
+    /// binding is observable afterwards (verified against python3: a module
+    /// with two `def helper` runs the second, and `helper.__code__` is the
+    /// second one's). Rust has one item per name, so emitting both is
+    /// E0428 — a failure at a generated line that never names the Python
+    /// source. This computes the set the emission must DROP so it emits
+    /// exactly one item per name, last binding wins.
+    ///
+    /// Only a definition can shadow a definition: a plain store of the name
+    /// (`f = 1` above the `def f`) is already refused by the emit loop's
+    /// `stored_above` rule, and an import that rebinds a definition by
+    /// `defined_above`. This is the third case in the same family, and it is
+    /// the one Python resolves without ambiguity.
+    ///
+    /// A definition under module-level CONTROL FLOW (`if cond: def f`) is
+    /// NOT top level: whether it binds depends on the branch, and the
+    /// straight-line rule above would be wrong. Those are skipped here (the
+    /// emitter lowers them by its own rules), so this only answers for the
+    /// unconditional top-level definitions the loop in `to_rust` sees.
+    fn shadowed_top_level_definitions(
+        body: &[crate::Statement],
+    ) -> std::collections::HashSet<usize> {
+        // The LAST index that binds each name.
+        let mut last_binding: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (index, s) in body.iter().enumerate() {
+            match &s.statement {
+                crate::StatementType::FunctionDef(f)
+                | crate::StatementType::AsyncFunctionDef(f) => {
+                    last_binding.insert(f.name.as_str(), index);
+                }
+                crate::StatementType::ClassDef(c) => {
+                    last_binding.insert(c.name.as_str(), index);
+                }
+                _ => {}
+            }
+        }
+        body.iter()
+            .enumerate()
+            .filter(|(index, s)| {
+                let name = match &s.statement {
+                    crate::StatementType::FunctionDef(f)
+                    | crate::StatementType::AsyncFunctionDef(f) => f.name.as_str(),
+                    crate::StatementType::ClassDef(c) => c.name.as_str(),
+                    _ => return false,
+                };
+                last_binding.get(name).is_some_and(|last| last != index)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     /// The module body's FIRST statement, ignoring the module docstring
     /// (a leading string constant expression, which binds nothing and is
     /// emitted as `#![doc]` rather than a statement).
