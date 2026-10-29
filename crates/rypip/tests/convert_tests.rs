@@ -22415,3 +22415,138 @@ fn asyncio_run_in_a_sync_function_blocks_and_runs_the_coroutine() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+fn a_class_redefined_with_literal_fields_keeps_the_last_binding() {
+    // Devin review on #465: a class body of literal field stores builds an
+    // object the rebind then DISCARDS, which nobody can observe — so this
+    // shape must keep converting (regression: an earlier version of the
+    // observability check rejected it).
+    //
+    // Verified against python3:
+    //   $ python3 shadow_class_fields.py
+    //   2
+    let scratch = Scratch::new("dup-class-fields");
+    let file = scratch.path().join("shadow_class_fields.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Foo:\n",
+            "    x = 1\n",
+            "\n",
+            "\n",
+            "class Foo:\n",
+            "    x = 2\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(Foo.x)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "literal-field class crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/shadow_class_fields"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "2", "stdout: {}", stdout);
+}
+
+#[test]
+fn a_class_decorator_on_a_shadowed_class_is_refused() {
+    // Devin review on #465: decorators run when the class is created, so a
+    // decorated shadowed class is observable even when its body is inert.
+    //
+    // Verified against python3:
+    //   $ python3 shadow_class_decorated.py
+    //   decorated
+    //   2
+    let scratch = Scratch::new("dup-class-decorated");
+    let file = scratch.path().join("shadow_class_decorated.py");
+    fs::write(
+        &file,
+        concat!(
+            "def deco(c: int) -> int:\n",
+            "    print(\"decorated\")\n",
+            "    return c\n",
+            "\n",
+            "\n",
+            "@deco\n",
+            "class Foo:\n",
+            "    x = 1\n",
+            "\n",
+            "\n",
+            "class Foo:\n",
+            "    x = 2\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(Foo.x)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect_err("a class decorator must not be dropped");
+    assert!(
+        err.to_string().contains("class decorator"),
+        "the refusal names the creation effect: {}",
+        err
+    );
+}
+
+#[test]
+fn a_dead_branch_nested_in_a_dead_else_does_not_make_the_async_entry_unawaited() {
+    // Devin review on #465: the statically-false exclusion applies at EVERY
+    // depth, so a `main()` under a dead `if` inside a dead `else` is still
+    // not an unawaited call. Verified against python3:
+    //
+    //   $ python3 nested_dead_guard.py
+    //   done
+    let scratch = Scratch::new("dup-nested-dead-guard");
+    let file = scratch.path().join("nested_dead_guard.py");
+    fs::write(
+        &file,
+        concat!(
+            "async def main() -> None:\n",
+            "    print(\"async\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    if False:\n",
+            "        pass\n",
+            "    else:\n",
+            "        if False:\n",
+            "            main()\n",
+            "    print(\"done\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect("a nested dead branch holds no unawaited call");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "nested-dead-branch crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/nested_dead_guard"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "done", "stdout: {}", stdout);
+}
