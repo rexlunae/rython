@@ -2929,6 +2929,15 @@ impl FunctionDef {
         // `PyRef`s — issue #432) leaves the binding untouched, and telling
         // the two apart means typing the receiver.
         let scope = lazy_scope(&options);
+        // A name first assigned inside `with self.assertRaises(E):` renders
+        // as a closure capture, and the context manager CATCHES the expected
+        // exception, so after the block the name may still be unbound —
+        // CPython raises UnboundLocalError. The declaration must be
+        // default-initialized for the capture to be legal (E0381), which
+        // would hand a post-block read a fabricated default instead. Refuse
+        // that read at conversion time (issue #457 review): loud, not
+        // silently a different value.
+        refuse_reads_of_assert_raises_locals(&effective_body, &scope)?;
         // Issue #79's cheap guard: reject aliasing shapes rython cannot
         // model (`b = a` on a container that is later mutated, and passing
         // a container to a function that mutates it) at conversion time
@@ -5976,11 +5985,20 @@ pub(crate) fn annotation_display(ann: &ExprType) -> String {
 pub(crate) fn guarantees_return(body: &[Statement]) -> bool {
     match body.last().map(|stmt| &stmt.statement) {
         Some(StatementType::Return(Some(_))) => true,
-        // A `with` body's return IS the function's return (context
+        // A `with` body's RETURN is the function's return (context
         // managers only intercept exceptions, never returns — requests'
-        // api.request; issue #137).
-        Some(StatementType::With(s)) => guarantees_return(&s.body),
-        Some(StatementType::AsyncWith(s)) => guarantees_return(&s.body),
+        // api.request; issue #137) — but a `RAISE` is not the same thing
+        // for this analysis. `raise` lowers to `return Err(..)` inside the
+        // block, which does terminate the path for the code FOLLOWING the
+        // with; that is a different question from "the function needs no
+        // trailing Ok(())", and conflating them withheld the function's own
+        // tail whenever the with-body's last statement was a raise
+        // (issue #457: `with self.assertRaises(E): raise E(...)` compiled
+        // to a method whose body fell off the end, E0308 on the method).
+        // So a with/async-with propagates a genuine RETURN from its body,
+        // never a bare raise.
+        Some(StatementType::With(s)) => returns_from_body(&s.body),
+        Some(StatementType::AsyncWith(s)) => returns_from_body(&s.body),
         Some(StatementType::If(s)) => {
             !s.orelse.is_empty() && guarantees_return(&s.body) && guarantees_return(&s.orelse)
         }
@@ -6000,6 +6018,72 @@ pub(crate) fn guarantees_return(body: &[Statement]) -> bool {
             (normal_path && handlers) || guarantees_return(&t.finalbody)
         }
         _ => false,
+    }
+}
+
+/// Whether `body` terminates the enclosing FUNCTION with a `return`
+/// (rather than merely raising), looking through the nesting forms whose
+/// returns propagate outward. `guarantees_return` answers "does control
+/// leave this block?"; this answers the narrower question a `with` needs:
+/// does the body RETURN from the function, so the function's trailing
+/// `Ok(())` would be unreachable? A `raise` ends the block but is not a
+/// return the function body can rely on for its own tail (issue #457).
+///
+/// The descent goes through the ONE visitor (`visit::stmt_bodies_for`, the
+/// same enumeration `walk_stmts` uses) rather than its own `match` over
+/// `If`/`Try`/`With`: a new body-carrying statement form must not be able
+/// to escape this predicate. A nested `def`/`class` body is NOT this
+/// function's return (`Descend::SkipDefs`), and a `lambda` body cannot
+/// return at all.
+fn returns_from_body(body: &[Statement]) -> bool {
+    let Some(last) = body.last() else {
+        return false;
+    };
+    match &last.statement {
+        StatementType::Return(Some(_)) => true,
+        // A `raise` never counts here, even as the last statement.
+        StatementType::Raise(_) => false,
+        // An `if` guarantees a return only when it has an `else` and BOTH
+        // arms return.
+        StatementType::If(i) => {
+            !i.orelse.is_empty()
+                && returns_from_body(&i.body)
+                && returns_from_body(&i.orelse)
+        }
+        // A loop NEVER guarantees a return: `break` skips the body's
+        // remaining statements, and `for` may run zero iterations (so the
+        // `else` may or may not run either). The old explicit arms did not
+        // claim otherwise, and the generic walk below must not either
+        // (Devin review on #459).
+        StatementType::For(_) | StatementType::AsyncFor(_) | StatementType::While(_) => false,
+        // `with` / `async with`: the body's return is the function's return
+        // (a context manager cannot swallow it), so ONE body decides.
+        StatementType::With(w) => returns_from_body(&w.body),
+        StatementType::AsyncWith(w) => returns_from_body(&w.body),
+        // `try`: every path that can leave the statement must return — the
+        // body (or the `else` it falls into) and every handler. An EMPTY
+        // `orelse`/`finalbody` is the normal case and must not be read as a
+        // body that fails to return; a `finally` that returns unconditionally
+        // overrides the rest.
+        StatementType::Try(t) => {
+            let normal = if t.orelse.is_empty() {
+                returns_from_body(&t.body)
+            } else {
+                returns_from_body(&t.body) || returns_from_body(&t.orelse)
+            };
+            let handlers = t.handlers.iter().all(|h| returns_from_body(&h.body));
+            (normal && handlers) || returns_from_body(&t.finalbody)
+        }
+        // Any OTHER body-carrying form: use the ONE visitor's enumeration so
+        // a form added there is covered, requiring every body to return.
+        // Non-empty is required so an unknown form is not vacuously true.
+        _ => {
+            let bodies = crate::ast::tree::visit::stmt_bodies_for(
+                last,
+                crate::ast::tree::visit::Descend::SkipDefs,
+            );
+            !bodies.is_empty() && bodies.iter().all(|b| returns_from_body(b))
+        }
     }
 }
 
@@ -7278,3 +7362,154 @@ fn same_span(a: &[Statement], b: &[Statement]) -> bool {
     };
     a.len() == b.len() && span(a) == span(b)
 }
+
+/// Reject a READ of a name first assigned inside an `assertRaises` body when
+/// that read can still see the name unbound.
+///
+/// See `ScopeBindings::assert_raises_body_names`: the name's declaration is
+/// default-initialized so the closure can capture it, so a read that may
+/// happen before any later assignment would silently yield the default where
+/// CPython raises UnboundLocalError.
+///
+/// The check walks the statements AFTER the block in order and tracks which
+/// of those names a definitely-executed assignment has bound by then:
+///
+/// - a bare `name = ...` at this level (or an unconditional `if`/`else` pair
+///   that assigns it on both arms) makes later reads safe;
+/// - anything that may skip the assignment — a loop, a `try`, a conditional
+///   without an `else` — leaves the name still possibly-unbound;
+/// - a read is counted only where it is a LOAD: a walrus target, an
+///   assignment target, `del`, or a `global`/`nonlocal` declaration is not
+///   a read of the old value, and a nested `def`/`class`/`lambda` body is
+///   its own scope (`Descend::SkipDefs`).
+fn refuse_reads_of_assert_raises_locals(
+    body: &[Statement],
+    scope: &crate::ScopeBindings,
+) -> Result<(), String> {
+    if scope.assert_raises_body_names.is_empty() {
+        return Ok(());
+    }
+    let mut after: Vec<&Statement> = Vec::new();
+    let mut seen = false;
+    for stmt in body {
+        if seen {
+            after.push(stmt);
+        }
+        if let StatementType::With(w) = &stmt.statement
+            && w.items.len() == 1
+            && w.items[0].optional_vars.is_none()
+            && crate::ast::tree::with_stmt::assert_raises_cm_name(&w.items[0].context_expr).is_some()
+        {
+            seen = true;
+        }
+    }
+    // Names that a definite assignment has bound since the block.
+    let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in after {
+        if let Some(name) = read_before_bound(stmt, &scope.assert_raises_body_names, &bound) {
+            return Err(format!(
+                "`{name}` is assigned inside a `with assertRaises(...)` body and read after the \
+                 block before any later assignment; the body runs in a closure that CATCHES the \
+                 expected exception, so `{name}` may never have been bound, and CPython would \
+                 raise UnboundLocalError at that read. rython refuses to hand back a fabricated \
+                 default; assign `{name}` before the `with` block, or read it inside"
+            ));
+        }
+        record_definite_bindings(stmt, &mut bound);
+    }
+    Ok(())
+}
+
+/// The first watched name this statement READS before any later assignment
+/// has bound it, if any.
+fn read_before_bound(
+    stmt: &Statement,
+    watched: &std::collections::HashSet<String>,
+    bound: &std::collections::HashSet<String>,
+) -> Option<String> {
+    // Targets/stores are not reads of the old value.
+    let mut stores: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for target in crate::ast::tree::visit::stmt_targets(stmt) {
+        for n in crate::ast::tree::visit::target_names(target) {
+            stores.insert(n.to_string());
+        }
+    }
+    // A walrus binds its name; it is a store, not a read of the old value.
+    let mut walrus: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in crate::ast::tree::visit::stmt_exprs(stmt) {
+        crate::ast::tree::visit::any_expr_for(
+            e,
+            crate::ast::tree::visit::Descend::SkipDefs,
+            |sub| {
+                if let crate::ExprType::NamedExpr(ne) = sub
+                    && let crate::ExprType::Name(n) = ne.left.as_ref()
+                {
+                    walrus.insert(n.id.clone());
+                }
+                false
+            },
+        );
+    }
+    let mut hit: Option<String> = None;
+    for e in crate::ast::tree::visit::stmt_exprs(stmt) {
+        crate::ast::tree::visit::any_expr_for(
+            e,
+            crate::ast::tree::visit::Descend::SkipDefs,
+            |sub| {
+                if let crate::ExprType::Name(n) = sub
+                    && watched.contains(&n.id)
+                    && !bound.contains(&n.id)
+                    && !stores.contains(&n.id)
+                    && !walrus.contains(&n.id)
+                {
+                    hit = Some(n.id.clone());
+                    return true;
+                }
+                false
+            },
+        );
+        if hit.is_some() {
+            break;
+        }
+    }
+    hit
+}
+
+/// Bindings this statement definitely performs when it runs to completion in
+/// this flow. Only the forms that ALWAYS execute their assignment count; a
+/// loop body may not run, and a `try` body may not complete.
+fn record_definite_bindings(
+    stmt: &Statement,
+    bound: &mut std::collections::HashSet<String>,
+) {
+    match &stmt.statement {
+        StatementType::Assign(a) => {
+            for target in &a.targets {
+                for n in crate::ast::tree::visit::target_names(target) {
+                    bound.insert(n.to_string());
+                }
+            }
+        }
+        StatementType::AugAssign(a) => {
+            for n in crate::ast::tree::visit::target_names(&a.target) {
+                bound.insert(n.to_string());
+            }
+        }
+        // Both arms bind it => it is bound afterwards.
+        StatementType::If(i) if !i.orelse.is_empty() => {
+            let mut then_b: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut else_b: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for s in &i.body {
+                record_definite_bindings(s, &mut then_b);
+            }
+            for s in &i.orelse {
+                record_definite_bindings(s, &mut else_b);
+            }
+            for n in then_b.intersection(&else_b) {
+                bound.insert(n.clone());
+            }
+        }
+        _ => {}
+    }
+}
+

@@ -29198,3 +29198,146 @@ fn an_imported_modules_final_main_call_is_refused_not_dropped() {
         msg
     );
 }
+
+#[test]
+fn unittest_assert_raises_with_a_raising_body_needs_no_closure_tail() {
+    // Issue #457: `raise E(...)` as the with-body's LAST statement lowers
+    // to `return Err(..)`, which already exits the generated closure.
+    // Appending `Ok(())` after it made rustc see the closure return `()`;
+    // and because `guarantees_return` unwrapped the `with` into its body,
+    // the ENCLOSING method lost its own `Ok(())` tail too, so the reported
+    // E0308 landed on the method. Both tails must be absent/absent-correct.
+    let out = compile(
+        concat!(
+            "import unittest
+",
+            "class T(unittest.TestCase):
+",
+            "    def t(self) -> None:
+",
+            "        with self.assertRaises(ValueError):
+",
+            "            raise ValueError(\"boom\")\n",
+        ),
+        "assert_raises_raise.py",
+    );
+    assert!(
+        out.contains("assert_raises (\"ValueError\""),
+        "the with-form must still lower with the exception name: {}",
+        out
+    );
+    // The closure body ends at the `return Err`; no `Ok(())` may follow it
+    // inside the closure (that is the E0308).
+    let closure_body = out
+        .split("assert_raises (\"ValueError\"")
+        .nth(1)
+        .expect("assert_raises call present");
+    // The closure's own body: everything up to its closing `})?`.
+    let head = closure_body
+        .split("}) ?")
+        .next()
+        .expect("closure ends with })?");
+    assert!(
+        head.contains("return Err"),
+        "the raise must lower to return Err inside the closure: {}",
+        head
+    );
+    assert!(
+        !head.contains("Ok (())"),
+        "a raising with-body must NOT get an `Ok(())` tail (issue #457 E0308): {}",
+        head
+    );
+    // ... and the METHOD must keep its own tail, because a `with` body that
+    // raises is not a `return` from the method.
+    let method = out
+        .split("pub fn t (")
+        .nth(1)
+        .expect("the method is generated");
+    assert!(
+        method.contains("Ok (())"),
+        "the enclosing method must keep its `Ok(())` tail: {}",
+        method
+    );
+}
+
+#[test]
+fn unittest_assert_raises_with_locals_in_the_body_declares_them_mutable() {
+    // Issue #457 (second defect): a name first assigned INSIDE the
+    // assertRaises body is stored inside the generated closure, so its
+    // hoisted declaration needs `mut` — otherwise E0594. It also holds a
+    // possibly-uninitialized capture, so the declaration must be
+    // Default-initialized (the try-body rule).
+    let out = compile(
+        concat!(
+            "import unittest
+",
+            "class T(unittest.TestCase):
+",
+            "    def t(self) -> None:
+",
+            "        with self.assertRaises(ZeroDivisionError):\n",
+            "            x = 1\n",
+            "            y = x // 0\n",
+            "            print(y)\n",
+        ),
+        "assert_raises_locals.py",
+    );
+    for name in ["x", "y"] {
+        assert!(
+            out.contains(&format!("let mut {name} = Default :: default ()"))
+                || out.contains(&format!("let mut {name} = Default::default()")),
+            "`{name}` is assigned inside the closure and must be a mutable, \
+             default-initialized binding: {}",
+            out
+        );
+    }
+}
+
+#[test]
+fn a_post_block_read_of_an_assert_raises_local_is_refused() {
+    // Issue #457 review: the assertRaises body renders as a closure whose
+    // exception is CAUGHT, so a name assigned inside it may never have been
+    // assigned. Its declaration is default-initialized (the capture must be
+    // E0381-legal), which would hand a post-block read a fabricated value.
+    // CPython raises UnboundLocalError; rython must refuse, not invent.
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(ValueError):\n",
+            "            raise ValueError(\"early\")\n",
+            "            y = 99\n",
+            "        print(\"y is\", y)\n",
+        ),
+        "assert_raises_post_read.py",
+    );
+    assert!(
+        err.contains("UnboundLocalError") && err.contains("assertRaises"),
+        "the post-block read must be a loud refusal naming the cause: {}",
+        err
+    );
+}
+
+#[test]
+fn an_assert_raises_body_that_only_assigns_locally_still_converts() {
+    // No read after the block: the closure's locals are fine, and the crate
+    // must still convert (the refusal above is narrowly about the read).
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(ZeroDivisionError):\n",
+            "            x = 1\n",
+            "            y = x // 0\n",
+            "            print(y)\n",
+        ),
+        "assert_raises_local_only.py",
+    );
+    assert!(
+        out.contains("assert_raises (\"ZeroDivisionError\""),
+        "the body must still lower: {}",
+        out
+    );
+}
