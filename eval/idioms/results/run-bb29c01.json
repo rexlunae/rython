@@ -1,6 +1,6 @@
 {
-  "converter_commit": "a055a18",
-  "repo_head": "a055a18",
+  "converter_commit": "bb29c01",
+  "repo_head": "bb29c01",
   "rypip_path": "target/debug/rypip",
   "oracle": "CPython 3.14.4 (pins captured under 3.11)",
   "passed": 58,
@@ -21,6 +21,7 @@
     "comb_perm",
     "complex_components",
     "detect",
+    "entry_no_guard",
     "factory_return",
     "float_coercion",
     "fsum_compensation",
@@ -52,7 +53,6 @@
     "set_ops",
     "set_order_sorted",
     "shapes",
-    "shared_slot_mutation",
     "str_local_returns",
     "sumprod_pairs",
     "text_stats",
@@ -138,6 +138,11 @@
     },
     "detect": {
       "program": "detect",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "entry_no_guard": {
+      "program": "entry_no_guard",
       "warnings": 0,
       "status": "pass"
     },
@@ -309,11 +314,6 @@
     },
     "shapes": {
       "program": "shapes",
-      "warnings": 0,
-      "status": "pass"
-    },
-    "shared_slot_mutation": {
-      "program": "shared_slot_mutation",
       "warnings": 0,
       "status": "pass"
     },

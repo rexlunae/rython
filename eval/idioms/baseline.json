@@ -45,6 +45,9 @@
     "detect": {
       "status": "pass"
     },
+    "entry_no_guard": {
+      "status": "pass"
+    },
     "factory_return": {
       "status": "pass"
     },

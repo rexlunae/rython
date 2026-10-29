@@ -2050,18 +2050,33 @@ exception escaping a lambda (§4.5).
   point runs first. Consequently, **non-constant module globals are not
   visible inside functions** — the reference fails to compile (loud,
   but with a rustc error; see §12.1).
-- The entry point is `__main__.py`, or the module containing an
-  `if __name__ == "__main__":` block. The block becomes `fn main()`.
-  When the block does more than call `main()` (or module-init code
+- The entry point is `__main__.py`, or the module that either holds an
+  `if __name__ == "__main__":` block or calls its own module-level
+  `main()` as its last top-level statement (issue #431). The second
+  spelling is what a plain `python file.py` runs — CPython executes the
+  file as `__main__`, so that call is the whole program body — and it
+  produces the same `fn main()` with the same wrapper decision. The
+  block, or that call, becomes `fn main()`.
+  When it does more than call `main()` (or module-init code
   exists), a generated wrapper runs `__module_init__` and the body,
   printing `Type: message` to stderr and exiting 1 on an uncaught
-  exception. When the block is just `main()` with no module-level
+  exception. When it is just `main()` with no module-level
   code, the user's `main` — which returns `Result` — becomes the Rust
   entry point directly, so an uncaught exception still exits 1 but
   prints the error's `Debug` form rather than `Type: message` (a
   cosmetic inconsistency, §12.3). A dedicated `__main__.py` is
   bin-only; any other entry module appears in both the library and the
   binary.
+- A bare module-level `main()` is only the entry point as the module
+  body's FINAL statement: module-level statements before it still run
+  first, and `python file.py` would run statements after it AFTER the
+  program — the generated wrapper would run them BEFORE — so that shape
+  is a conversion error naming the trailing statement and the rewrite
+  (move it above the call, delete it, or spell the guard), never a
+  silently reordered program. A module-level `main()` call beside an
+  `if __name__ == "__main__":` block is refused for the same reason
+  (one program body per crate, where CPython would run both). A module
+  that defines `main` and never calls it stays a library crate.
 - Packages without an entry point convert to library crates and cannot
   be `rypip install`ed or `rypip run` (loud error naming the fix).
 - `rypip run program.py -- args` is CPython's command-line shape over the
@@ -2814,6 +2829,7 @@ accepted as permanent spec:
 | True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |
 | Exception message shapes: `int()`'s message carries "with base 10" and `float()`'s quotes the string as Python's repr (#339, round 10); `open` and stream errors are CPython's `[Errno N] text: 'path'` form (#339); the `KeyError` key quoting is single-quoted like CPython (round 99) | Correct (was a defect class in issue #82's family) |
 | An uncaught exception on the direct-`main` entry path prints Rust's `Debug` form instead of `Type: message` (exit code 1 either way) | Defect (cosmetic) |
+| An `async def main()` used as the program entry RUNS the coroutine. CPython's `main()` call on an `async def` returns a coroutine object and never awaits it: `python prog.py` executes none of the body and emits `RuntimeWarning: coroutine 'main' was never awaited`, while the generated binary awaits it and the body runs (so its output appears). Both entry spellings share this (`if __name__ == "__main__": main()` with an `async def main`, and issue #431's bare module-level `main()` call); the body should either be refused at conversion, or the call left as an ordinary coroutine-producing statement (Python's behavior), rather than silently awaited | Defect (silent divergence; found in the #431 work, pre-existing on the guarded path) |
 | The kernel device-manifest sub-mode skips the module-wide floating-point scan | Defect, issue #108 |
 | Generator expressions are materialized eagerly (side-effect timing differs from lazy CPython) | Model limit until generator lowering lands |
 | `with` does not call `__enter__`/`__exit__` (Drop approximates cleanup) | Model limit; correct for the supported file objects |

@@ -874,6 +874,45 @@ fn cross_module_mut_reentrant_guard_does_not_recompute() {
         "the in-progress scan state must be left untouched"
     );
 }
+/// Compile as the crate's EXECUTABLE ENTRY (the role rypip gives the
+/// `__main__.py`, the module holding the `__name__` guard, or the module
+/// whose body ends with a bare `main()` call). Only in that role does a
+/// final `main()` call become the program body — see issue #431.
+fn compile_as_entry(src: &str, name: &str) -> String {
+    let module = parse(src, name).unwrap_or_else(|e| panic!("parse failed for {:?}: {}", src, e));
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let options = PythonOptions::from(PythonOptionsData {
+        is_executable_entry: true,
+        ..Default::default()
+    });
+    module
+        .to_rust(
+            CodeGenContext::Module(name.replace(".py", "")),
+            options,
+            symbols,
+        )
+        .unwrap_or_else(|e| panic!("codegen failed for {:?}: {}", src, e))
+        .to_string()
+}
+
+/// The `compile_err` counterpart for the executable-entry role.
+fn compile_err_as_entry(src: &str, name: &str) -> String {
+    let module = parse(src, name).unwrap_or_else(|e| panic!("parse failed: {}", e));
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let options = PythonOptions::from(PythonOptionsData {
+        is_executable_entry: true,
+        ..Default::default()
+    });
+    let err = module
+        .to_rust(
+            CodeGenContext::Module(name.replace(".py", "")),
+            options,
+            symbols,
+        )
+        .expect_err("conversion must fail loudly");
+    format!("{}", err)
+}
+
 fn compile(src: &str, name: &str) -> String {
     let module = parse(src, name).unwrap_or_else(|e| panic!("parse failed for {:?}: {}", src, e));
     let symbols = module.clone().find_symbols(SymbolTableScopes::new());
@@ -28878,5 +28917,284 @@ fn an_augmented_element_store_through_a_shared_parameter_drops_the_mut() {
         !bump.contains("letmutbag"),
         "every &mut is taken inside the borrow guard: {}",
         out
+    );
+}
+
+#[test]
+fn unguarded_module_level_main_call_becomes_the_entry_point() {
+    // Issue #431: `def main(): ...` plus a bare module-level `main()` is
+    // what `python prog.py` runs (CPython executes the file as `__main__`),
+    // so it must produce ONE process entry point — the user's `main` —
+    // instead of a `pub fn main` beside a generated `fn main` (E0428).
+    //
+    // `python3` prints `hi` for the source below (verified by running it).
+    let out = compile_as_entry(
+        "def main() -> None:\n    print(\"hi\")\n\n\nmain()\n",
+        "prog.py",
+    );
+    // The user's main is the entry point: exactly one `fn main`, no
+    // `pub fn main` beside it, and no `python_main` rename either.
+    assert_eq!(
+        out.matches(" fn main (").count(),
+        1,
+        "the unguarded call must yield ONE process entry point: {}",
+        out
+    );
+    assert!(
+        !out.contains("pub fn main ("),
+        "a `pub fn main` beside the entry point is E0428: {}",
+        out
+    );
+    assert!(
+        !out.contains("python_main"),
+        "the simple-main path must not reach the rename fallback: {}",
+        out
+    );
+    // The `#[allow(dead_code)]` convention: rypip compiles the entry module
+    // twice (bin root + lib submodule), and the lib copy never calls it.
+    assert!(
+        out.contains("#[allow(dead_code)] fn main (")
+            || out.contains("# [allow (dead_code)] fn main ("),
+        "the entry point carries the dead-code allowance: {}",
+        out
+    );
+    // The entry name stays the user's `main`: it is not renamed, so the
+    // body is the user's, with no module-init indirection required when
+    // there is no module-level code.
+    assert!(
+        out.contains("print (& (\"hi\"))"),
+        "the user's main body is the entry's body: {}",
+        out
+    );
+    // No `main()` call is left inside `__module_init__` (it would run the
+    // entry point as module init code, before the binary's own entry).
+    assert!(
+        !out.contains("main () ?"),
+        "the module-level call must not also run as module init code: {}",
+        out
+    );
+}
+
+#[test]
+fn unguarded_main_call_with_module_level_code_keeps_one_entry_point() {
+    // The module body runs before the program body (python3 prints
+    // `before` then `hi`), and the user's `main` is still the ONE entry
+    // point — the module-init wrapper calls it as `python_main`, so no
+    // second `fn main` collides with it.
+    let out = compile_as_entry(
+        "print(\"before\")\n\n\ndef main() -> None:\n    print(\"hi\")\n\n\nmain()\n",
+        "prog_pre.py",
+    );
+    assert_eq!(
+        out.matches(" fn main (").count(),
+        1,
+        "one process entry point: {}",
+        out
+    );
+    assert!(
+        out.contains("pub fn python_main ("),
+        "with module init code the user's main is renamed for the wrapper: {}",
+        out
+    );
+    assert!(
+        out.contains("print (& (\"before\"))"),
+        "module-level code runs in __module_init__: {}",
+        out
+    );
+}
+
+#[test]
+fn a_module_that_defines_main_without_calling_it_stays_a_library() {
+    // python3 defined `main` and never runs it; the conversion must stay a
+    // library (no entry point at all).
+    let out = compile_as_entry(
+        "def main() -> None:\n    print(\"hi\")\n",
+        "libmod.py",
+    );
+    assert!(
+        !out.contains("fn main (") || out.matches("fn main (").count() == 1,
+        "a never-called main must not become an ENTRY point (only the \
+         definition, never a second generated one): {}",
+        out
+    );
+    assert!(
+        out.contains("pub fn main ("),
+        "the definition is still an ordinary module function: {}",
+        out
+    );
+    assert!(
+        !out.contains("#[allow(dead_code)] fn main ("),
+        "no generated entry point is emitted for a never-called main: {}",
+        out
+    );
+}
+
+#[test]
+fn the_guarded_main_call_is_unchanged() {
+    // The `if __name__ == "__main__": main()` shape keeps the exact
+    // behavior it had (python3 prints `hi`).
+    let out = compile_as_entry(
+        "def main() -> None:\n    print(\"hi\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+        "prog_guard.py",
+    );
+    assert_eq!(
+        out.matches(" fn main (").count(),
+        1,
+        "the guard yields one entry point: {}",
+        out
+    );
+    assert!(
+        !out.contains("python_main"),
+        "a guard with no module-level code keeps the direct entry: {}",
+        out
+    );
+}
+
+#[test]
+fn unguarded_main_call_after_the_body_is_refused_loudly() {
+    // python3 runs the trailing statement AFTER main() (`hi`, then `bye`).
+    // The generated binary's module init would run it BEFORE the program
+    // body, a silent reordering — refused, naming the statement and the
+    // rewrite (issue #431).
+    let err = compile_err_as_entry(
+        "def main() -> None:\n    print(\"hi\")\n\n\nmain()\nprint(\"bye\")\n",
+        "prog_trail.py",
+    );
+    assert!(
+        err.contains("main()") && err.contains("AFTER it"),
+        "the refusal names the construct and the trailing statement: {}",
+        err
+    );
+    assert!(
+        err.contains("move them above") && err.contains("__main__"),
+        "the refusal names the rewrite: {}",
+        err
+    );
+}
+
+#[test]
+fn unguarded_main_call_beside_a_guard_is_refused_loudly() {
+    // Python would run both (`hi`, `hi`). rython emits one entry point per
+    // crate, so the shape is refused rather than silently dropping one.
+    let err = compile_err_as_entry(
+        "def main() -> None:\n    print(\"hi\")\n\n\nmain()\n\n\nif __name__ == \"__main__\":\n    main()\n",
+        "prog_both.py",
+    );
+    // The `if __name__ == "__main__":` block IS a statement after the
+    // bare call, so the trailing-statement refusal fires first and names
+    // the guard as the rewrite.
+    assert!(
+        err.contains("AFTER it") && err.contains("__main__"),
+        "the refusal names the trailing guard and the rewrite: {}",
+        err
+    );
+}
+
+#[test]
+fn unguarded_main_call_renders_a_trailing_docstring_consistently() {
+    // A module docstring is not a statement of the program body: the
+    // `main()` call below it is still the final one and still the entry
+    // (python3 prints `hi`).
+    let out = compile_as_entry(
+        "\"\"\"Docs.\"\"\"\n\n\ndef main() -> None:\n    print(\"hi\")\n\n\nmain()\n",
+        "prog_doc.py",
+    );
+    assert_eq!(
+        out.matches(" fn main (").count(),
+        1,
+        "one process entry point beside a docstring: {}",
+        out
+    );
+    assert!(
+        out.contains("print (& (\"hi\"))"),
+        "the user's main body is the entry: {}",
+        out
+    );
+}
+
+#[test]
+fn a_final_main_call_with_arguments_is_refused_loudly() {
+    // Devin review on #454 / the Lead's check: a final module-level
+    // `main(...)` call CARRYING arguments is the program body under
+    // CPython too (`python3 pos.py` prints `1`), but the entry boundary
+    // cannot pass them — the user's `main` becomes Rust's `fn main`, which
+    // takes none. Silently calling it with no arguments would drop them,
+    // and leaving the statement alone defines `main` twice (E0428). So
+    // both the positional and the keyword form are refused, naming the
+    // line and the rewrite that already works.
+    for (call, src) in [
+        (
+            "main(1)",
+            "def main(x: int) -> None:\n    print(x)\n\n\nmain(1)\n",
+        ),
+        (
+            "main(x=1)",
+            "def main(x: int = 5) -> None:\n    print(x)\n\n\nmain(x=1)\n",
+        ),
+    ] {
+        let err = compile_err_as_entry(src, "argmain.py");
+        assert!(
+            err.contains("passes arguments"),
+            "`{}` must be refused for its arguments: {}",
+            call,
+            err
+        );
+        assert!(
+            err.contains("line 5"),
+            "`{}`'s refusal names the line: {}",
+            call,
+            err
+        );
+        assert!(
+            err.contains("__main__"),
+            "`{}`'s refusal names the rewrite: {}",
+            call,
+            err
+        );
+    }
+    // The guarded spelling carries arguments correctly and is untouched.
+    let out = compile_as_entry(
+        "def main(x: int) -> None:\n    print(x)\n\n\nif __name__ == \"__main__\":\n    main(1)\n",
+        "argguard.py",
+    );
+    assert!(
+        out.contains("fn main ("),
+        "the guarded form still produces an entry point: {}",
+        out
+    );
+}
+
+#[test]
+fn an_imported_modules_final_main_call_is_refused_not_dropped() {
+    // Devin review on #454: the same shape in a module the converter did
+    // NOT select as the crate entry is an ordinary module-level call that
+    // runs on IMPORT (Python prints the helper's output during the
+    // import). It cannot stay in `__module_init__` — the user's `pub fn
+    // main` would collide with the generated `fn main` (rustc E0428) — so
+    // the converter refuses it instead of silently dropping the call's
+    // side effect.
+    let module = parse(
+        "def main() -> None:\n    print(\"helper\")\n\n\nmain()\n",
+        "helper.py",
+    )
+    .unwrap();
+    let symbols = module.clone().find_symbols(SymbolTableScopes::new());
+    let err = module
+        .to_rust(
+            CodeGenContext::Module("helper".to_string()),
+            PythonOptions::default(),
+            symbols,
+        )
+        .expect_err("a non-entry module's final main() call must be refused");
+    let msg = format!("{}", err);
+    assert!(
+        msg.contains("did not select this module as the crate's entry"),
+        "the refusal says why the call cannot stay: {}",
+        msg
+    );
+    assert!(
+        msg.contains("__main__"),
+        "the refusal names the rewrite: {}",
+        msg
     );
 }

@@ -768,6 +768,16 @@ pub struct PythonOptionsData {
     /// before `cli` (Devin review on #338).
     pub root_init_module: Option<String>,
 
+    /// Set by the converter on the module it selected as the crate's
+    /// executable ENTRY (the `__main__.py`, the module holding an
+    /// `if __name__ == "__main__":` block, or — issue #431 — the module
+    /// whose body ends with a bare zero-argument call to its own `main`).
+    /// Only that module's final `main()` call IS the program body; the
+    /// same shape in an IMPORTED module is an ordinary module-level call
+    /// that runs when Python imports it, and must stay in
+    /// `__module_init__` (Devin review on #454).
+    pub is_executable_entry: bool,
+
     /// Set by the converter on the BIN copy of the entry module: that code
     /// is the bin crate root, which already declares every root-level
     /// module of the crate (`pub mod data;`). A relative import resolving
@@ -922,6 +932,7 @@ impl Default for PythonOptionsData {
             )),
             folded_guard_imports: std::rc::Rc::new(std::collections::HashMap::new()),
             root_init_module: None,
+            is_executable_entry: false,
             bin_crate_root: false,
             cross_module_mut_self: std::rc::Rc::new(std::cell::RefCell::new(
                 CrossModuleMutSelf::Uncomputed,

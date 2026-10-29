@@ -2087,6 +2087,14 @@ fn convert_on_this_thread(
     {
         entry_options.root_init_module = Some(ROOT_BIN_MODULE.to_string());
     }
+    // Issue #431: only the module the converter selected as the entry may
+    // consume its final `main()` call as the program body. The same shape
+    // in an IMPORTED module is an ordinary module-level call that runs on
+    // import, and must stay in that module's `__module_init__` (Devin
+    // review on #454).
+    if entry_file.is_some() {
+        entry_options.is_executable_entry = true;
+    }
     // The bin's copy of the entry is the bin crate ROOT, where the sibling
     // modules are declared (`pub mod data;`): a `from . import data` there
     // must not also `pub use crate::data;` (E0255), while the lib's copy

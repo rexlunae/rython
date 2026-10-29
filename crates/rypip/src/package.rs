@@ -50,7 +50,85 @@ impl PyPackage {
                     .iter()
                     .find(|m| m.source.contains("__name__") && m.source.contains("__main__"))
             })
+            .or_else(|| {
+                // Issue #431: a module that `def main`-s and calls it as its
+                // FINAL top-level statement is the program, without a
+                // `__name__` guard — `python prog.py` runs the file as
+                // `__main__`, so that call is the program body. The whole
+                // package is a program only when exactly one module has the
+                // shape; in a library several might, and no single one is
+                // the entry.
+                let entries: Vec<&PyModule> = self
+                    .modules
+                    .iter()
+                    .filter(|m| module_level_main_call_is_entry(&m.source))
+                    .collect();
+                (entries.len() == 1).then(|| entries[0])
+            })
     }
+}
+
+/// Whether a module's source ends with a bare module-level `main()` call as
+/// its final statement, in a module that itself `def main`-s — Python's
+/// program body without the `if __name__ == "__main__":` guard (issue #431).
+///
+/// The source is parsed rather than pattern-matched, so comments, blank
+/// lines, a docstring and an indented (nested) `main()` are all classified
+/// as CPython classifies them. A parse failure is `false`: the conversion
+/// itself reports it with its own message.
+fn module_level_main_call_is_entry(source: &str) -> bool {
+    let Ok(module) = python_ast::parse(source, "entry_probe.py") else {
+        return false;
+    };
+    module_level_main_call_in(&module.raw)
+}
+
+/// The AST predicate behind [`module_level_main_call_is_entry`].
+fn module_level_main_call_in(raw: &python_ast::RawModule) -> bool {
+    let body = {
+        let mut body = raw.body.as_slice();
+        // A leading string constant is the module docstring: it binds
+        // nothing and is not a statement of the program body.
+        if let Some(first) = body.first()
+            && matches!(
+                &first.statement,
+                python_ast::StatementType::Expr(e)
+                    if matches!(
+                        &e.value,
+                        python_ast::ExprType::Constant(c)
+                            if matches!(&c.0, Some(litrs::Literal::String(_)))
+                    )
+            )
+        {
+            body = &body[1..];
+        }
+        body
+    };
+    let Some(last) = body.last() else {
+        return false;
+    };
+    let python_ast::StatementType::Expr(expr) = &last.statement else {
+        return false;
+    };
+    let python_ast::ExprType::Call(call) = &expr.value else {
+        return false;
+    };
+    let python_ast::ExprType::Name(name) = call.func.as_ref() else {
+        return false;
+    };
+    // Zero arguments, matching `Module::module_level_main_call`: a call
+    // carrying arguments cannot cross the entry boundary, and is a loud
+    // conversion error in python-ast (never an entry the converter builds).
+    if name.id != "main" || !call.args.is_empty() || !call.keywords.is_empty() {
+        return false;
+    }
+    body.iter().any(|s| {
+        matches!(
+            &s.statement,
+            python_ast::StatementType::FunctionDef(f) | python_ast::StatementType::AsyncFunctionDef(f)
+                if f.name == "main"
+        )
+    })
 }
 
 /// Sanitize a package name into a valid Rust identifier.

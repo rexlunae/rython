@@ -12,7 +12,9 @@ installation at runtime.
 **1. Translating Python into Rust to migrate projects.**
 `rypip convert` turns a Python file, package, or `pyproject.toml` project
 into a standalone Rust crate you own from then on: each module becomes a
-Rust module, the `__main__` block becomes `fn main`, and the generated code
+Rust module, the `__main__` block — or, in a file that defines `main` and
+calls it as its last top-level statement, that call (what `python
+file.py` runs) — becomes `fn main`, and the generated code
 depends only on the `stdpython` runtime. The output is a starting point for
 a permanent port — readable Rust you can refactor, not an opaque bundle.
 `rypip run program.py -- args` is the same pipeline behind CPython's

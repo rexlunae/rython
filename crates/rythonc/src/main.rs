@@ -98,6 +98,12 @@ fn main() -> Result<()> {
             with_std_python: !args.nostd,
             numpy_backend: args.numpy_backend.clone(),
             rust_modules: std::rc::Rc::new(rust_modules),
+            // Issue #431: this compiler's input file IS the executable
+            // program — `python input.py` runs it as `__main__` — so a
+            // final bare `main()` call is that program's body. Without
+            // this the same source that rypip converts would be refused
+            // here as a non-entry module (Devin review on #454).
+            is_executable_entry: true,
             ..Default::default()
         });
 
