@@ -63,9 +63,52 @@ impl PyPackage {
                     .iter()
                     .filter(|m| module_level_main_call_is_entry(&m.source))
                     .collect();
-                (entries.len() == 1).then(|| entries[0])
+                if entries.len() == 1 {
+                    return Some(entries[0]);
+                }
+                // Issue #464: a module whose body RUNS something is
+                // `python file.py`'s program -- CPython executes every
+                // top-level statement as `__main__`, a statically dead `if`
+                // included. A module of pure definitions binds nothing at
+                // runtime and stays a library (the documented library
+                // conversion, pinned by
+                // `a_module_defining_main_without_calling_it_stays_a_library_crate`).
+                // Read through the AST, not the text: a definitional module
+                // is exactly one whose top level is only defs, classes,
+                // imports and a docstring.
+                (self.modules.len() == 1 && module_runs_top_level_code(&self.modules[0].source))
+                    .then(|| &self.modules[0])
             })
     }
+}
+
+/// Whether a module's body RUNS anything at import time: a call, a store, a
+/// loop, a `with`, a `try`, or a guard block (an `if`, even a statically
+/// dead one -- the entry choice is a shape decision, not an execution one).
+///
+/// Pure definitions -- `def`, `class`, `import`, `from`, a docstring, a
+/// standalone `pass` -- bind names and do nothing, so such a module stays a
+/// library (issue #464).
+fn module_runs_top_level_code(source: &str) -> bool {
+    let Ok(ast) = python_ast::parse_enhanced(source, "<module>") else {
+        // Unparseable source is not this decision's to make.
+        return false;
+    };
+    use python_ast::tree::StatementType;
+    ast.raw.body.iter().any(|s| {
+        !matches!(
+            s.statement,
+            StatementType::FunctionDef(_)
+                | StatementType::AsyncFunctionDef(_)
+                | StatementType::ClassDef(_)
+                | StatementType::Import(_)
+                | StatementType::ImportFrom(_)
+                | StatementType::Pass
+                | StatementType::Global(_)
+                | StatementType::Nonlocal(_)
+                | StatementType::AnnotatedName { .. }
+        )
+    })
 }
 
 /// Whether a module's source ends with a bare module-level `main()` call as
