@@ -262,17 +262,55 @@ impl<'a> CodeGen for Attribute {
         // `p.NAME` where `p` is a LOCAL holding an instance whose class
         // defines NAME as a class-level literal constant (issue #468).
         // Python's instance lookup falls back to the type, so this reads
-        // the same value `Point.NAME` does. rython emits a class-attribute-
-        // only class as a struct with NO field for NAME (the value lives in
-        // an associated const), so without this the read compiles to
-        // `p.NAME` and rustc reports `no field NAME`.
+        // the same value `Point.NAME` does. rython emits a
+        // class-attribute-only class as a struct with NO field for NAME (the
+        // value lives in an associated const), so without this the read
+        // compiles to `p.NAME` and rustc reports `no field NAME`.
         //
-        // The receiver's class is resolved from the local's inferred type
-        // (the same `receiver_class` authority the field path uses), then
-        // the constant is looked up the MRO exactly as the class-qualified
-        // spelling does — so an inherited constant resolves to its definer.
-        if let Some((class, class_symbols)) =
-            crate::receiver_class(&self.value, &ctx, &symbols, &options)
+        // The narrowing matters, and each clause below rejects a shape that
+        // would be WRONG if the shortcut ran (Devin review on #472):
+        //
+        //  - the receiver must be a bare NAME bound to a plain instance. A
+        //    CALL receiver (`Point().x`) must still EVALUATE, since the
+        //    constructor can run code or raise — rewriting it to
+        //    `Point::x` would silently drop that;
+        //  - an `Option<Class>` receiver is `None`-able, and Python raises
+        //    AttributeError on a None receiver; the ordinary path handles
+        //    that (receiver_option_inner), so this must not pre-empt it;
+        //  - the class must not define a PROPERTY of that name, and no
+        //    derived class may override the constant — the receiver's
+        //    static type is all we know, so a `Base`-typed name could hold
+        //    a `Sub` at run time and Python would read the override.
+        // The Option test must use the SAME evidence the ordinary read
+        // path does (`receiver_option_inner`): a name is None-able when its
+        // inferred type is `Option<..>` OR it is in `optional_names` (a
+        // None-initialized local, `conn = None` then `conn = ...`) — the
+        // second is easy to miss and would let a None receiver reach this
+        // shortcut (Devin review on #473).
+        //
+        // A NARROWED name (`if p is not None:` — the `None` case has been
+        // eliminated) IS a plain instance at this point, so narrowing wins
+        // over the Option markers: without this, a guarded read rejected the
+        // shortcut and then fell through to a field access on a struct that
+        // has no such field, so a valid program stopped compiling (Devin
+        // review on #473).
+        let receiver_is_plain_local = match self.value.as_ref() {
+            ExprType::Name(n) => {
+                let narrowed_to_class = matches!(
+                    options.narrowed_names.get(&n.id),
+                    Some(t) if !matches!(t, crate::TypeInfo::Option(_))
+                );
+                narrowed_to_class
+                    || (!matches!(options.name_types.get(&n.id), Some(crate::TypeInfo::Option(_)))
+                        && !options.optional_names.contains(&n.id))
+            }
+            _ => false,
+        };
+        if receiver_is_plain_local
+            && let Some((class, class_symbols)) =
+                crate::receiver_class(&self.value, &ctx, &symbols, &options)
+            && !class.has_property_getter(&self.attr, &class_symbols, &options)
+            && !crate::ast::tree::hierarchy::is_polymorphic_root(&class.name)
             && let Some((definer, _)) =
                 class.literal_constant_on_mro(&self.attr, &class_symbols, &options)
             // A real FIELD of the same name wins: an instance attribute
