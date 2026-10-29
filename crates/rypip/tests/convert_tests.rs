@@ -21830,3 +21830,59 @@ fn unittest_assert_raises_with_a_raise_builds_and_runs() {
         "2 passing assertRaises tests exit 0 like python3: {combined}"
     );
 }
+
+#[test]
+fn a_pytest_import_is_a_warning_not_a_broken_crate() {
+    // Issue #456: `import pytest` used to convert with NO warning and emit
+    // `use crate::pytest;` for a module the crate does not contain, so the
+    // crate died with E0432 at a generated line unrelated to the source.
+    // pytest has no runtime here; the import must be dropped through the
+    // external-module channel and the crate must BUILD.
+    let scratch = Scratch::new("pytest-import");
+    let file = scratch.path().join("t.py");
+    fs::write(
+        &file,
+        concat!(
+            "import pytest\n",
+            "\n",
+            "\n",
+            "def test_add() -> None:\n",
+            "    assert 1 + 1 == 2\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let src = fs::read_to_string(krate.root.join("src/t.rs")).expect("generated module");
+    assert!(
+        !src.contains("use crate::pytest"),
+        "an absent module must not be emitted as a crate path: {src}"
+    );
+    // The drop must be REPORTED, not just done: the warning is the user's
+    // only signal that the framework's runtime is absent, so pin it here
+    // (Devin review on #460 -- build success alone would let the diagnostic
+    // regress silently).
+    assert!(
+        krate
+            .warnings
+            .iter()
+            .any(|w| w.contains("pytest") && w.contains("external-module divergence")),
+        "the dropped import must warn through the definition channel: {:?}",
+        krate.warnings
+    );
+    let status = build_generated(&krate.root);
+    assert!(
+        status.success(),
+        "the crate must build once the external import is dropped"
+    );
+}
+
+// NOTE: the `python_module!` sibling-import case is covered by a REAL
+// compiled fixture rather than a codegen-text assertion:
+// `crates/python-mod/tests/sibling_import.rs` invokes the macro on an
+// importer and its sibling and asserts the call returns the sibling's
+// value. A token-text pin here would not have caught the inverted
+// guard polarity that made the call a boxed None (Devin review on #460).

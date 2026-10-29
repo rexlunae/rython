@@ -705,6 +705,20 @@ pub struct PythonOptionsData {
     /// sibling module of the generated crate, not an external dependency.
     pub python_modules: std::rc::Rc<std::collections::HashSet<String>>,
 
+    /// The module being converted is part of a crate whose OTHER modules
+    /// are present in the same generated crate but not enumerated here —
+    /// the `python_module!` / `python_module_nostd!` macros, which build one
+    /// module at a time with default options and no module index.
+    ///
+    /// Only these callers may treat an otherwise-unresolvable import as a
+    /// crate sibling (`use crate::helper`). A rypip conversion KNOWS its
+    /// whole module set, so an unresolved import there is genuinely
+    /// external and must be dropped with a warning rather than emitted as
+    /// a path the crate cannot resolve (issue #456). Without this
+    /// distinction, fixing #456 silently broke `python_module!(app)`
+    /// importing `helper.py` beside it (Devin review on #460).
+    pub unindexed_crate_modules: bool,
+
     /// Cross-module class knowledge: parsed ASTs of the sibling modules of
     /// the generated crate (vendored `[python-modules]` deps and the
     /// package's own modules), keyed by module path. ImportFrom lowering
@@ -922,6 +936,7 @@ impl Default for PythonOptionsData {
             module_scope_symbols: None,
             module_name_types: None,
             rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
+            unindexed_crate_modules: false,
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),
             module_defs: std::rc::Rc::new(std::collections::HashMap::new()),
             in_module_init_body: false,

@@ -1659,10 +1659,19 @@ pub(crate) fn external_module_root(
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<String> {
-    // Only meaningful when the whole crate is known (multi-module
-    // conversion); a single-module conversion (len == 1) only knows the
-    // module itself, so any import may be a sibling.
-    if options.module_defs.len() <= 1 {
+    // Only meaningful when the whole crate is known. Two callers do NOT
+    // know it, and both must keep the "may be a sibling" answer:
+    //   - a single-module conversion (`len() == 1`), which knows only the
+    //     module itself;
+    //   - the `python_module!` macros, which convert one module with no
+    //     index at all (`unindexed_crate_modules`) even though it may have
+    //     siblings in the same generated crate.
+    // A rypip conversion enumerates every module, so an unresolved import
+    // there IS external and its attribute uses are classified as such --
+    // the same rule the import lowering applies (issue #456, Devin review
+    // on #460). Getting this backwards classified `helper.greet()` in a
+    // macro conversion as external and replaced the call with boxed None.
+    if options.module_defs.len() <= 1 || options.unindexed_crate_modules {
         return None;
     }
     let root = match expr {
