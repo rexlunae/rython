@@ -21991,24 +21991,86 @@ fn a_multi_statement_main_guard_uses_the_last_binding_and_runs() {
 }
 
 #[test]
-fn a_shadowed_class_definition_keeps_the_last_binding() {
-    // Issue #464, same root cause on a class: two top-level `class Foo`
-    // definitions emitted two structs and two sets of trait impls (E0428
-    // plus E0119 "conflicting implementations"). Python rebinds the name, so
-    // the later body is what runs.
+fn a_shadowed_class_whose_body_does_work_is_refused_loudly() {
+    // Issue #464 (Devin review on #465). A class body RUNS where the
+    // statement stands, so CPython prints both bodies:
     //
     // Verified against python3:
-    //   $ python3 shadow_class.py
-    //   2
-    let scratch = Scratch::new("dup-class-last");
-    let file = scratch.path().join("shadow_class.py");
+    //   $ python3 shadow_class_effects.py
+    //   class body runs
+    //   second body
+    //
+    // Dropping the earlier definition to avoid E0428 would lose the first
+    // body's output, which is a silent divergence. The converter refuses
+    // instead, naming both lines.
+    let scratch = Scratch::new("dup-class-effects");
+    let file = scratch.path().join("shadow_class_effects.py");
     fs::write(
         &file,
         concat!(
-            "class Foo:\n",
-            "    x = 1\n",
-            "\n",
-            "\n",
+            "class Foo:
+",
+            "    print(\"class body runs\")
+",
+            "
+",
+            "
+",
+            "class Foo:
+",
+            "    print(\"second body\")
+",
+            "
+",
+            "
+",
+            "def main() -> None:
+",
+            "    pass
+",
+            "
+",
+            "
+",
+            "if __name__ == \"__main__\":
+",
+            "    main()
+",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect_err("a class body that runs must not be dropped silently");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("`Foo` is defined twice") && msg.contains("class body"),
+        "the refusal names the construct: {}",
+        msg
+    );
+    assert!(
+        msg.contains("line 1") && msg.contains("line 5"),
+        "the refusal names both lines: {}",
+        msg
+    );
+}
+
+#[test]
+fn a_class_redefined_with_an_inert_body_keeps_the_last_binding() {
+    // The SAFE half of the same shape: a class body that is only a field
+    // with a literal value performs no call and prints nothing, so dropping
+    // the earlier definition is indistinguishable. Python's later binding
+    // wins, and `Foo().x` is 2.
+    //
+    // Verified against python3:
+    //   $ python3 shadow_class_inert.py
+    //   2
+    let scratch = Scratch::new("dup-class-inert");
+    let file = scratch.path().join("shadow_class_inert.py");
+    fs::write(
+        &file,
+        concat!(
             "class Foo:\n",
             "    x = 2\n",
             "\n",
@@ -22027,9 +22089,9 @@ fn a_shadowed_class_definition_keeps_the_last_binding() {
     let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
 
     let status = build_generated(&krate.root);
-    assert!(status.success(), "shadowed-class crate failed to compile");
+    assert!(status.success(), "inert-class crate failed to compile");
 
-    let output = Command::new(krate.root.join("target/debug/shadow_class"))
+    let output = Command::new(krate.root.join("target/debug/shadow_class_inert"))
         .output()
         .expect("running generated binary");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -22130,4 +22192,166 @@ fn an_unawaited_async_main_under_a_multi_statement_guard_is_refused() {
         "the refusal names the rewrite: {}",
         msg
     );
+}
+
+#[test]
+fn a_call_between_two_definitions_is_refused_not_silently_rebound() {
+    // Devin review on #465. CPython runs each top-level definition where it
+    // stands and resolves a use to the binding in force AT THAT POINT, so a
+    // call between the two definitions reaches the FIRST one:
+    //
+    // Verified against python3:
+    //   $ python3 call_between_defs.py
+    //   first
+    //   second
+    //
+    // The generated crate holds one item per name, so the call would reach
+    // the second definition and print "second" twice — a silent divergence.
+    // Refused instead.
+    let scratch = Scratch::new("dup-call-between");
+    let file = scratch.path().join("call_between_defs.py");
+    fs::write(
+        &file,
+        concat!(
+            "def f() -> None:\n",
+            "    print(\"first\")\n",
+            "\n",
+            "\n",
+            "f()\n",
+            "\n",
+            "\n",
+            "def f() -> None:\n",
+            "    print(\"second\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    f()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect_err("a use between two definitions must not be silently rebound");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("reads `f` between its two definitions"),
+        "the refusal names the intermediate use: {}",
+        msg
+    );
+}
+
+#[test]
+fn a_shadowed_definition_with_a_default_expression_is_refused() {
+    // Devin review on #465: CPython EVALUATES a default expression when the
+    // `def` statement executes. Verified against python3:
+    //
+    //   $ python3 default_effect.py
+    //   first-default
+    //
+    // Dropping the earlier definition would lose that output.
+    let scratch = Scratch::new("dup-default-effect");
+    let file = scratch.path().join("default_effect.py");
+    fs::write(
+        &file,
+        concat!(
+            "def f(x = print(\"first-default\")) -> None:\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def f() -> None:\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect_err("a default expression's effect must not be dropped");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("default expression"),
+        "the refusal names the creation effect: {}",
+        msg
+    );
+}
+
+#[test]
+fn a_shadowed_decorated_definition_is_refused() {
+    // Devin review on #465: a decorator is a CALL CPython makes when the
+    // `def` statement executes, so the earlier definition is observable
+    // even if nothing reads its name.
+    let scratch = Scratch::new("dup-decorated");
+    let file = scratch.path().join("decorated.py");
+    fs::write(
+        &file,
+        concat!(
+            "def deco(f: int) -> int:\n",
+            "    print(\"decorated\")\n",
+            "    return f\n",
+            "\n",
+            "\n",
+            "@deco\n",
+            "def g() -> None:\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def g() -> None:\n",
+            "    pass\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let err = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect_err("a decorator's call must not be dropped");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("decorator"),
+        "the refusal names the creation effect: {}",
+        msg
+    );
+}
+
+#[test]
+fn a_dead_guard_branch_does_not_make_the_async_entry_unawaited() {
+    // Devin review on #465: a `main()` call inside a statically DEAD branch
+    // never runs, so it is not a never-awaited coroutine and must not trip
+    // the #455 refusal. CPython prints `done`:
+    //
+    // Verified against python3:
+    //   $ python3 dead_guard.py
+    //   done
+    //   $ echo $?
+    //   0
+    let scratch = Scratch::new("dup-dead-guard");
+    let file = scratch.path().join("dead_guard.py");
+    fs::write(
+        &file,
+        concat!(
+            "async def main() -> None:\n",
+            "    print(\"async\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    if False:\n",
+            "        main()\n",
+            "    print(\"done\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect("a dead branch holds no unawaited call");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "dead-branch crate failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/dead_guard"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "done", "stdout: {}", stdout);
+    assert_eq!(output.status.code(), Some(0));
 }

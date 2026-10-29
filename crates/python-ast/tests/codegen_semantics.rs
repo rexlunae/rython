@@ -29626,15 +29626,53 @@ fn a_shadowed_top_level_main_definition_emits_only_the_last_binding() {
 }
 
 #[test]
-fn a_shadowed_class_definition_emits_one_struct() {
-    // Issue #464's root cause on a class: two structs of one name are E0428,
-    // and their trait impls are E0119. Only the last binding runs in Python.
-    let out = compile(
+fn a_shadowed_class_body_that_does_work_is_refused() {
+    // Issue #464 (Devin review on #465). A class body RUNS where the
+    // statement stands; CPython prints both bodies:
+    //
+    // Verified against python3:
+    //   $ python3 shadowed_class_effects.py
+    //   class body runs
+    //   second body
+    //
+    // The generated crate holds one item per name, so dropping the earlier
+    // definition would lose the first body's output. Refused loudly instead
+    // of silently different.
+    let err = compile_err(
         concat!(
             "class Foo:\n",
-            "    x = 1\n",
+            "    print(\"class body runs\")\n",
             "\n",
             "\n",
+            "class Foo:\n",
+            "    print(\"second body\")\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+        "shadowed_class_effects.py",
+    );
+    assert!(
+        err.contains("`Foo` is defined twice") && err.contains("class body"),
+        "the refusal names the construct: {err}"
+    );
+    assert!(
+        err.contains("line 1") && err.contains("line 5"),
+        "the refusal names both lines: {err}"
+    );
+}
+
+#[test]
+fn a_shadowed_class_with_an_inert_body_emits_one_struct() {
+    // The SAFE half: a body of literal field stores performs no call, so the
+    // earlier definition is indistinguishable from never having run.
+    let out = compile(
+        concat!(
             "class Foo:\n",
             "    x = 2\n",
             "\n",
@@ -29646,7 +29684,7 @@ fn a_shadowed_class_definition_emits_one_struct() {
             "if __name__ == \"__main__\":\n",
             "    main()\n",
         ),
-        "shadowed_class.py",
+        "shadowed_class_inert.py",
     );
     assert_eq!(
         out.matches("struct Foo").count(),
