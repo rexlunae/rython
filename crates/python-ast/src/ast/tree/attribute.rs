@@ -287,10 +287,22 @@ impl<'a> CodeGen for Attribute {
         // None-initialized local, `conn = None` then `conn = ...`) — the
         // second is easy to miss and would let a None receiver reach this
         // shortcut (Devin review on #473).
+        //
+        // A NARROWED name (`if p is not None:` — the `None` case has been
+        // eliminated) IS a plain instance at this point, so narrowing wins
+        // over the Option markers: without this, a guarded read rejected the
+        // shortcut and then fell through to a field access on a struct that
+        // has no such field, so a valid program stopped compiling (Devin
+        // review on #473).
         let receiver_is_plain_local = match self.value.as_ref() {
             ExprType::Name(n) => {
-                !matches!(options.name_types.get(&n.id), Some(crate::TypeInfo::Option(_)))
-                    && !options.optional_names.contains(&n.id)
+                let narrowed_to_class = matches!(
+                    options.narrowed_names.get(&n.id),
+                    Some(t) if !matches!(t, crate::TypeInfo::Option(_))
+                );
+                narrowed_to_class
+                    || (!matches!(options.name_types.get(&n.id), Some(crate::TypeInfo::Option(_)))
+                        && !options.optional_names.contains(&n.id))
             }
             _ => false,
         };

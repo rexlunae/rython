@@ -22951,3 +22951,52 @@ fn a_property_override_beats_the_inherited_class_constant() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn a_none_narrowed_optional_reads_its_class_constant() {
+    // Review on #473. A local typed `Point | None` is narrowed to `Point`
+    // inside `if p is not None:`, but stays in `optional_names`. The
+    // constant shortcut must honour the NARROWING over the Option markers —
+    // otherwise the read falls through to a field access on a struct that
+    // has no such field and a valid program stops compiling.
+    // Verified against python3: prints 1.
+    let scratch = Scratch::new("class-const-narrowed");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Point:\n",
+            "    x = 1\n",
+            "\n",
+            "\n",
+            "def show(p: Point | None) -> None:\n",
+            "    if p is not None:\n",
+            "        print(p.x)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    show(Point())\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(
+        status.success(),
+        "a None-narrowed read of a class constant must compile"
+    );
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3, byte-exact.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "1\n",
+        "the narrowing makes the receiver a plain instance"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
