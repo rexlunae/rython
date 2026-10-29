@@ -2929,6 +2929,15 @@ impl FunctionDef {
         // `PyRef`s — issue #432) leaves the binding untouched, and telling
         // the two apart means typing the receiver.
         let scope = lazy_scope(&options);
+        // A name first assigned inside `with self.assertRaises(E):` renders
+        // as a closure capture, and the context manager CATCHES the expected
+        // exception, so after the block the name may still be unbound —
+        // CPython raises UnboundLocalError. The declaration must be
+        // default-initialized for the capture to be legal (E0381), which
+        // would hand a post-block read a fabricated default instead. Refuse
+        // that read at conversion time (issue #457 review): loud, not
+        // silently a different value.
+        refuse_reads_of_assert_raises_locals(&effective_body, &scope)?;
         // Issue #79's cheap guard: reject aliasing shapes rython cannot
         // model (`b = a` on a container that is later mutated, and passing
         // a container to a function that mutates it) at conversion time
@@ -6019,27 +6028,39 @@ pub(crate) fn guarantees_return(body: &[Statement]) -> bool {
 /// does the body RETURN from the function, so the function's trailing
 /// `Ok(())` would be unreachable? A `raise` ends the block but is not a
 /// return the function body can rely on for its own tail (issue #457).
+///
+/// The descent goes through the ONE visitor (`visit::stmt_bodies_for`, the
+/// same enumeration `walk_stmts` uses) rather than its own `match` over
+/// `If`/`Try`/`With`: a new body-carrying statement form must not be able
+/// to escape this predicate. A nested `def`/`class` body is NOT this
+/// function's return (`Descend::SkipDefs`), and a `lambda` body cannot
+/// return at all.
 fn returns_from_body(body: &[Statement]) -> bool {
-    match body.last().map(|stmt| &stmt.statement) {
-        Some(StatementType::Return(Some(_))) => true,
-        Some(StatementType::With(s)) => returns_from_body(&s.body),
-        Some(StatementType::AsyncWith(s)) => returns_from_body(&s.body),
-        Some(StatementType::If(s)) => {
-            !s.orelse.is_empty()
-                && returns_from_body(&s.body)
-                && returns_from_body(&s.orelse)
+    let Some(last) = body.last() else {
+        return false;
+    };
+    match &last.statement {
+        StatementType::Return(Some(_)) => return true,
+        // A `raise` never counts here, even as the last statement.
+        StatementType::Raise(_) => return false,
+        // An `if` only guarantees a return when it has an `else` and BOTH
+        // arms return; every other branchless form falls through.
+        StatementType::If(i) => {
+            return !i.orelse.is_empty()
+                && returns_from_body(&i.body)
+                && returns_from_body(&i.orelse);
         }
-        Some(StatementType::Try(t)) => {
-            let normal_path = if t.orelse.is_empty() {
-                returns_from_body(&t.body)
-            } else {
-                returns_from_body(&t.body) || returns_from_body(&t.orelse)
-            };
-            let handlers = t.handlers.iter().all(|h| returns_from_body(&h.body));
-            (normal_path && handlers) || returns_from_body(&t.finalbody)
-        }
-        _ => false,
+        _ => {}
     }
+    // Any other body-carrying form guarantees a return when EVERY one of
+    // its bodies does (a `with`/`async with` has one; a `try` has its body,
+    // handlers, `else` and `finally`). `stmt_bodies_for` with SkipDefs is
+    // that enumeration, so a form added to the visitor is covered here.
+    let bodies = crate::ast::tree::visit::stmt_bodies_for(
+        last,
+        crate::ast::tree::visit::Descend::SkipDefs,
+    );
+    !bodies.is_empty() && bodies.iter().all(|b| returns_from_body(b))
 }
 
 impl FunctionDef {
@@ -7316,4 +7337,60 @@ fn same_span(a: &[Statement], b: &[Statement]) -> bool {
         )
     };
     a.len() == b.len() && span(a) == span(b)
+}
+
+/// Reject a READ of a name first assigned inside an `assertRaises` body when
+/// that read happens in a statement AFTER the block.
+///
+/// See `ScopeBindings::assert_raises_body_names`: the name's declaration is
+/// default-initialized so the closure can capture it, so a post-block read
+/// would silently yield the default where CPython raises UnboundLocalError.
+fn refuse_reads_of_assert_raises_locals(
+    body: &[Statement],
+    scope: &crate::ScopeBindings,
+) -> Result<(), String> {
+    if scope.assert_raises_body_names.is_empty() {
+        return Ok(());
+    }
+    let mut after: Vec<&Statement> = Vec::new();
+    let mut seen = false;
+    for stmt in body {
+        if seen {
+            after.push(stmt);
+        }
+        if let StatementType::With(w) = &stmt.statement
+            && w.items.len() == 1
+            && w.items[0].optional_vars.is_none()
+            && crate::ast::tree::with_stmt::assert_raises_cm_name(&w.items[0].context_expr).is_some()
+        {
+            seen = true;
+        }
+    }
+    let mut offending: Option<String> = None;
+    for stmt in &after {
+        for e in crate::ast::tree::visit::stmt_exprs(stmt) {
+            crate::ast::tree::visit::any_expr(e, |sub| {
+                if let crate::ExprType::Name(n) = sub
+                    && scope.assert_raises_body_names.contains(&n.id)
+                {
+                    offending = Some(n.id.clone());
+                    return true;
+                }
+                false
+            });
+        }
+        if offending.is_some() {
+            break;
+        }
+    }
+    match offending {
+        Some(name) => Err(format!(
+            "`{name}` is assigned inside a `with assertRaises(...)` body and read after the \
+             block; the body runs in a closure that CATCHES the expected exception, so \
+             `{name}` may never have been assigned, and CPython would raise \
+             UnboundLocalError at that read. rython refuses to hand back a fabricated \
+             default; assign `{name}` before the `with` block, or read it inside"
+        )),
+        None => Ok(()),
+    }
 }

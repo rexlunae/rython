@@ -30,6 +30,16 @@ pub struct ScopeBindings {
     /// Names assigned `None` on some path: they hold an Option, and every
     /// non-None store into them wraps in `Some`.
     pub optional: HashSet<String>,
+    /// Names first assigned INSIDE a `with self.assertRaises(E):` body.
+    /// That body renders as a closure, and the context manager CATCHES the
+    /// expected exception and lets execution continue — so after the block
+    /// such a name may still be unbound, and CPython answers a read with
+    /// UnboundLocalError. The declaration must still be default-initialized
+    /// (rustc rejects capturing an uninitialized binding, E0381), which
+    /// means a post-block read would silently return the default. The
+    /// function lowering therefore REFUSES that read at conversion time
+    /// instead (issue #457 review).
+    pub assert_raises_body_names: HashSet<String>,
     /// Names that are possibly-uninitialized where a generated closure is
     /// created (try-body, and finally-guarded handler/else bodies). rustc
     /// rejects capturing a possibly-uninitialized variable (E0381), so the
@@ -114,6 +124,9 @@ struct Analysis<'r> {
     needs_mut: HashSet<String>,
     optional: HashSet<String>,
     closure_captured_uninit: HashSet<String>,
+    /// Names assigned inside a `with self.assertRaises(E):` body (see
+    /// `ScopeBindings::assert_raises_body_names`).
+    assert_raises_body_names: HashSet<String>,
     leaked_loop_targets: HashSet<String>,
     state: HashMap<String, Init>,
     /// Classifies a method call's effect on its receiver when the
@@ -306,6 +319,7 @@ pub(crate) fn analyze_scope_typed(
         needs_mut: HashSet::new(),
         optional: HashSet::new(),
         closure_captured_uninit: HashSet::new(),
+        assert_raises_body_names: HashSet::new(),
         leaked_loop_targets: HashSet::new(),
         state: HashMap::new(),
         resolve: &noop_resolve,
@@ -321,6 +335,7 @@ pub(crate) fn analyze_scope_typed(
         needs_mut: HashSet::new(),
         optional: HashSet::new(),
         closure_captured_uninit: HashSet::new(),
+        assert_raises_body_names: HashSet::new(),
         leaked_loop_targets: HashSet::new(),
         state: initialized
             .iter()
@@ -343,6 +358,7 @@ pub(crate) fn analyze_scope_typed(
         needs_mut: a.needs_mut,
         optional: a.optional,
         closure_captured_uninit: a.closure_captured_uninit,
+        assert_raises_body_names: a.assert_raises_body_names,
         leaked_loop_targets: a.leaked_loop_targets,
     }
 }
@@ -892,7 +908,12 @@ fn walk_stmts(body: &[Statement], a: &mut Analysis<'_>, multi: bool) {
                 for item in &s.items {
                     walk_expr(&item.context_expr, a);
                 }
-                walk_with_body(&s.items, &s.body, a, multi);
+                // NOT `walk_with_body`: `async with` has its own lowering
+                // that renders the body INLINE (async_with.rs), so there is
+                // no generated closure to account for. Its context manager
+                // protocol is not modeled, so it cannot be the
+                // assertRaises closure either (Devin review on #459).
+                walk_stmts(&s.body, a, multi);
             }
             // Nested definitions are their own scopes.
             _ => {}
@@ -1026,12 +1047,17 @@ fn walk_with_body(
         walk_stmts(body, a, multi);
         a.record_closure_boundary(&before);
         // The store happened INSIDE a closure, so rustc needs the binding
-        // mutable even though the analysis saw a first assignment.
+        // mutable even though the analysis saw a first assignment; and
+        // because this context manager CATCHES the expected exception, a
+        // name it never reached is still unbound afterwards. Record both.
+        let mut assigned_here: Vec<String> = Vec::new();
         for name in &a.seq_assigned {
             if before.get(name).copied().unwrap_or(Init::No) != Init::Yes {
                 a.needs_mut.insert(name.clone());
+                assigned_here.push(name.clone());
             }
         }
+        a.assert_raises_body_names.extend(assigned_here);
         return;
     }
     walk_stmts(body, a, multi);

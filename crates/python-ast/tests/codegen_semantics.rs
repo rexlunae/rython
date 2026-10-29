@@ -29255,6 +29255,28 @@ fn a_final_main_call_with_arguments_is_refused_loudly() {
         out.contains("fn main ("),
         "the guarded form still produces an entry point: {}",
         out
+fn a_post_block_read_of_an_assert_raises_local_is_refused() {
+    // Issue #457 review: the assertRaises body renders as a closure whose
+    // exception is CAUGHT, so a name assigned inside it may never have been
+    // assigned. Its declaration is default-initialized (the capture must be
+    // E0381-legal), which would hand a post-block read a fabricated value.
+    // CPython raises UnboundLocalError; rython must refuse, not invent.
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(ValueError):\n",
+            "            raise ValueError(\"early\")\n",
+            "            y = 99\n",
+            "        print(\"y is\", y)\n",
+        ),
+        "assert_raises_post_read.py",
+    );
+    assert!(
+        err.contains("UnboundLocalError") && err.contains("assertRaises"),
+        "the post-block read must be a loud refusal naming the cause: {}",
+        err
     );
 }
 
@@ -29290,5 +29312,24 @@ fn an_imported_modules_final_main_call_is_refused_not_dropped() {
         msg.contains("__main__"),
         "the refusal names the rewrite: {}",
         msg
+fn an_assert_raises_body_that_only_assigns_locally_still_converts() {
+    // No read after the block: the closure's locals are fine, and the crate
+    // must still convert (the refusal above is narrowly about the read).
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(ZeroDivisionError):\n",
+            "            x = 1\n",
+            "            y = x // 0\n",
+            "            print(y)\n",
+        ),
+        "assert_raises_local_only.py",
+    );
+    assert!(
+        out.contains("assert_raises (\"ZeroDivisionError\""),
+        "the body must still lower: {}",
+        out
     );
 }
