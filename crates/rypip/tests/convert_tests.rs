@@ -22774,3 +22774,64 @@ fn renaming_main_leaves_string_literals_alone() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn a_class_attribute_read_through_an_instance_builds_and_runs() {
+    // Issue #468: a class whose values are declared as CLASS attributes
+    // (`x = 1` in the body, no `self.x`) lowers to a struct with no field
+    // for them — the value lives in an associated const — so `p.x` compiled
+    // to a field read and rustc reported `no field x`. Python's instance
+    // lookup falls back to the type, so `p.x` must give the class value.
+    // Verified against python3: prints both lines, exit 0.
+    let scratch = Scratch::new("class-attr-via-instance");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Point:\n",
+            "    x = 1\n",
+            "    label = \"pt\"\n",
+            "\n",
+            "\n",
+            "class Base:\n",
+            "    kind = \"base\"\n",
+            "\n",
+            "\n",
+            "class Sub(Base):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    p = Point()\n",
+            "    print(p.x, p.label, Point.x)\n",
+            "    s = Sub()\n",
+            "    print(s.kind, Sub.kind, Base.kind)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(
+        status.success(),
+        "an instance read of a class attribute must compile (issue #468 was E0609)"
+    );
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3, byte-exact.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "1 pt 1\nbase base base\n",
+        "an instance read falls back to the class attribute, as Python does"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}

@@ -259,6 +259,31 @@ impl<'a> CodeGen for Attribute {
             let attr = crate::safe_ident(&self.attr);
             return Ok(quote!(Self::#attr));
         }
+        // `p.NAME` where `p` is a LOCAL holding an instance whose class
+        // defines NAME as a class-level literal constant (issue #468).
+        // Python's instance lookup falls back to the type, so this reads
+        // the same value `Point.NAME` does. rython emits a class-attribute-
+        // only class as a struct with NO field for NAME (the value lives in
+        // an associated const), so without this the read compiles to
+        // `p.NAME` and rustc reports `no field NAME`.
+        //
+        // The receiver's class is resolved from the local's inferred type
+        // (the same `receiver_class` authority the field path uses), then
+        // the constant is looked up the MRO exactly as the class-qualified
+        // spelling does — so an inherited constant resolves to its definer.
+        if let Some((class, class_symbols)) =
+            crate::receiver_class(&self.value, &ctx, &symbols, &options)
+            && let Some((definer, _)) =
+                class.literal_constant_on_mro(&self.attr, &class_symbols, &options)
+            // A real FIELD of the same name wins: an instance attribute
+            // shadows the class attribute in Python, and rython models it
+            // as a struct field.
+            && !class.family_owns_field(&self.attr, &class_symbols, &options)
+        {
+            let class_ident = crate::safe_ident(&definer.name);
+            let attr = crate::safe_ident(&self.attr);
+            return Ok(quote!(#class_ident::#attr));
+        }
         // A class-level COMPUTED constant read
         // (`self._encode_url_methods`, `cls.X`, `RequestMethods.X` —
         // urllib3's RequestMethods): the LazyLock static lives at MODULE
