@@ -22,6 +22,51 @@ pub async fn run<F: Future>(coro: F) -> <F as Future>::Output {
     coro.await
 }
 
+/// asyncio.run(coro) called from SYNCHRONOUS code: CPython creates a fresh
+/// event loop and blocks until the coroutine finishes (issue #463).
+///
+/// rython's async programs already run under the tokio runtime, and a
+/// blocking wait INSIDE a running runtime panics, so this picks the right
+/// strategy at run time:
+///
+/// - on a runtime thread, it hands the future to a throwaway blocking
+///   worker thread with its own current-thread runtime, and joins it (the
+///   caller blocks, the nested runtime is never entered from inside an
+///   async context, and no `Handle::block_on` panic can occur);
+/// - off any runtime, it builds a runtime and blocks on the future
+///   directly, which is what CPython does with a fresh loop.
+///
+/// The future must be `Send + 'static` because it crosses the thread
+/// boundary; generated calls satisfy that (they move owned arguments).
+pub fn run_blocking<F>(coro: F) -> <F as Future>::Output
+where
+    F: Future + Send + 'static,
+    <F as Future>::Output: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        // Already inside a runtime: build the future on a worker thread
+        // that owns its own runtime, then join.
+        Ok(_) => std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("asyncio.run: building a blocking runtime")
+                        .block_on(coro)
+                })
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        }),
+        // No runtime: this IS the thread that should block.
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("asyncio.run: building a runtime")
+            .block_on(coro),
+    }
+}
+
 /// asyncio.sleep(secs): suspend the current task for `secs` seconds
 /// (float, like Python).
 pub async fn sleep(secs: f64) {

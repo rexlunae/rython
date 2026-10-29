@@ -11386,6 +11386,14 @@ let mutating_self_field = boxed_self_ref_receiver
         // Check if this function returns a Result that should be unwrapped
         let name_str = format!("{}", name);
 
+        // Whether this call sits in an ASYNC body: `.await` is legal only
+        // there, and `asyncio.run` picks its lowering on that basis (issue
+        // #463). `CodeGenContext::Async` is the marker the function lowering
+        // installs around an `async def` body; a `Loop`/`Try` context nests
+        // it, so the check walks the parent chain through the one authority
+        // (`exists_in_async`).
+        let in_async_body = options.in_async_def;
+
         // os.setenv(name, value) with an OPTIONAL value (requests'
         // set_environ — `os.environ[name] = value` where the value is a
         // narrowed Option<String>): route through setenv_opt, which
@@ -11483,19 +11491,33 @@ let mutating_self_field = boxed_self_ref_receiver
                 quote!(#name)
             }
         } else if name_str == "asyncio :: run" {
-            // asyncio.run(coro): drive the coroutine on the CURRENT runtime
-            // (rython's entry point already runs under tokio), so the call
-            // lowers to awaiting the future and unwrapping its Result. The
-            // coroutine argument renders with a trailing `?` (calls to user
-            // async functions propagate exceptions), which must apply to
-            // the awaited Result, not the future — strip it like the Await
-            // node does. In a synchronous context rustc rejects the `.await`
-            // loudly.
+            // asyncio.run(coro) drives the coroutine to completion.
+            //
+            // In ASYNC code the enclosing body already runs under tokio, so
+            // the call awaits the future directly (Python's "create a fresh
+            // loop" collapses to "run on the current loop"). The coroutine
+            // argument renders with a trailing `?` (calls to user async
+            // functions propagate exceptions), which must apply to the
+            // awaited Result, not the future — strip it like the Await node
+            // does.
+            //
+            // In SYNC code there is nothing to await from, and `.await`
+            // there is E0728 (issue #463) — `asyncio.run(main())` inside a
+            // plain `def main` is the idiomatic way to start an async
+            // program, so it must work. It lowers to the runtime's blocking
+            // driver instead, which blocks the caller like CPython's fresh
+            // event loop (and picks a nested-runtime-safe strategy).
             if let Some((first, rest)) = all_args.split_first() {
                 let inner = strip_trailing_question(first);
-                quote!(asyncio::run(#inner, #(#rest),*).await?)
-            } else {
+                if in_async_body {
+                    quote!(asyncio::run(#inner, #(#rest),*).await?)
+                } else {
+                    quote!(asyncio::run_blocking(#inner, #(#rest),*)?)
+                }
+            } else if in_async_body {
                 quote!(#call_expr.await?)
+            } else {
+                quote!(#call_expr?)
             }
         } else if name_str == "asyncio :: sleep" {
             // asyncio.sleep(secs): suspend on tokio's timer. The argument

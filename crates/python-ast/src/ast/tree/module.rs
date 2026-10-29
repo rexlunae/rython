@@ -445,13 +445,19 @@ impl CodeGen for Module {
         // below).
         let needs_async_runtime = module_contains_async(&self.raw.body);
 
-        if needs_async_runtime && options.async_runtime_dep {
-            let runtime_import = format_ident!("{}", options.async_runtime.import());
-            stream.extend(quote! {
-                #[cfg(feature = #ASYNC_RUNTIME_FEATURE)]
-                use #runtime_import;
-            });
-        }
+        // The bare `use tokio;` exists to make the ENTRY ATTRIBUTE's path
+        // resolve (`#[tokio::main]`). When no entry wrapper is generated
+        // but the module still calls `asyncio.run` from sync code (issue
+        // #463), nothing references it and rustc reports `unused_imports`
+        // — which AGENTS.md forbids in generated code. The runtime helpers
+        // (`asyncio::run_blocking`, `sleep`) are reached through the
+        // `stdpython` re-export, so the import is only needed alongside an
+        // entry attribute. `will_emit_entry_wrapper` is decided below; this
+        // is a cheap pre-check of the same condition (an async entry), and
+        // the final emission is filtered by it.
+        // (emitted after the entry decision below -- see the // ENTRY-IMPORT
+        // marker -- because whether an attribute is generated is not known
+        // until `has_main_code` is.)
         
         let mut main_body_stmts = Vec::new();
         let mut has_main_code = false;
@@ -1637,6 +1643,14 @@ impl CodeGen for Module {
                         }
                         let main_options = {
                             let mut o = options.clone();
+                            // The entry wrapper is an `async` block whenever
+                            // the program needs the runtime, so `.await` is
+                            // legal in the statements it carries and
+                            // `asyncio.run` must await rather than block
+                            // (issue #463). This is a synthetic async body,
+                            // not an `async def`, so the flag is set here
+                            // explicitly rather than inferred.
+                            o.in_async_def = needs_async_runtime || has_async_functions;
                             o.hoisted_names = std::rc::Rc::new(main_hoisted.clone());
                             o.leaked_loop_targets = std::rc::Rc::new(main_leaked.clone());
                             o.use_counts = std::rc::Rc::new(main_info.use_counts.clone());
@@ -3206,6 +3220,20 @@ impl CodeGen for Module {
                     }
                 }
                 
+                // ENTRY-IMPORT: the wrapper below carries
+                // `#[runtime::main]`, whose path needs the bare runtime
+                // import. Emitted here (not at the top) because a module
+                // that calls `asyncio.run` from SYNC code has no wrapper
+                // and would otherwise get an unused import (issue #463).
+                if options.async_runtime_dep && module_has_async_entry(&module_raw_body, has_main_code)
+                {
+                    let runtime_import = format_ident!("{}", options.async_runtime.import());
+                    stream.extend(quote! {
+                        #[cfg(feature = #ASYNC_RUNTIME_FEATURE)]
+                        use #runtime_import;
+                    });
+                }
+
                 // Generate the Rust entry point as main() - async if needed
                 if needs_async_runtime || has_async_functions {
                     // Parse the runtime attribute string into tokens
@@ -3308,7 +3336,19 @@ pub fn module_contains_async(body: &[crate::Statement]) -> bool {
     })
 }
 
-/// Whether a module body imports a module with the given ROOT name (plain
+/// Whether this module will emit an ENTRY WRAPPER carrying the
+/// `#[runtime::main]` attribute — the only thing that needs the bare
+/// runtime `use` (issue #463).
+///
+/// The wrapper is emitted when the module has main code AND the program
+/// needs the async runtime (`needs_async_runtime || has_async_functions`,
+/// see the emission below), EXCEPT for the simple-sync-main-call shape,
+/// whose entry is the user's own function.
+fn module_has_async_entry(body: &[crate::Statement], has_main_code: bool) -> bool {
+    has_main_code && module_contains_async(body)
+}
+
+/// Whether a module body imports a module with the given ROOT name (plain/// Whether a module body imports a module with the given ROOT name (plain
 /// or from-import, aliased or not, anywhere in the statement tree). Drives
 /// the feature-gated stdpython surfaces: `asyncio` needs `async-tokio`,
 /// `urllib` (urllib.request) needs `http-ureq`.

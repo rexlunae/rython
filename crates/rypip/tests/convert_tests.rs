@@ -22355,3 +22355,63 @@ fn a_dead_guard_branch_does_not_make_the_async_entry_unawaited() {
     assert_eq!(stdout.trim(), "done", "stdout: {}", stdout);
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn asyncio_run_in_a_sync_function_blocks_and_runs_the_coroutine() {
+    // Issue #463: `asyncio.run(main())` inside a plain `def main` is THE
+    // idiomatic way to start an async program, and it is the rewrite the
+    // #455 refusal tells users to perform. It used to lower to
+    // `asyncio::run(...).await`, which is E0728 outside an `async fn`, so
+    // the crate converted clean and then failed to build.
+    // Verified against python3: prints each line below, exit 0.
+    let scratch = Scratch::new("asyncio-run-sync");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "import asyncio\n",
+            "\n",
+            "\n",
+            "async def work(n: int) -> None:\n",
+            "    print(\"work\", n)\n",
+            "\n",
+            "\n",
+            "async def once() -> None:\n",
+            "    print(\"once\")\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    asyncio.run(once())\n",
+            "    for i in range(3):\n",
+            "        asyncio.run(work(i))\n",
+            "    print(\"done\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(
+        status.success(),
+        "asyncio.run in a sync fn must compile (issue #463 was E0728)"
+    );
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Verified against python3.
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["once", "work 0", "work 1", "work 2", "done"],
+        "stdout: {stdout}"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
