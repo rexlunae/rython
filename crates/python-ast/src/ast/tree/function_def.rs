@@ -6040,27 +6040,51 @@ fn returns_from_body(body: &[Statement]) -> bool {
         return false;
     };
     match &last.statement {
-        StatementType::Return(Some(_)) => return true,
+        StatementType::Return(Some(_)) => true,
         // A `raise` never counts here, even as the last statement.
-        StatementType::Raise(_) => return false,
-        // An `if` only guarantees a return when it has an `else` and BOTH
-        // arms return; every other branchless form falls through.
+        StatementType::Raise(_) => false,
+        // An `if` guarantees a return only when it has an `else` and BOTH
+        // arms return.
         StatementType::If(i) => {
-            return !i.orelse.is_empty()
+            !i.orelse.is_empty()
                 && returns_from_body(&i.body)
-                && returns_from_body(&i.orelse);
+                && returns_from_body(&i.orelse)
         }
-        _ => {}
+        // A loop NEVER guarantees a return: `break` skips the body's
+        // remaining statements, and `for` may run zero iterations (so the
+        // `else` may or may not run either). The old explicit arms did not
+        // claim otherwise, and the generic walk below must not either
+        // (Devin review on #459).
+        StatementType::For(_) | StatementType::AsyncFor(_) | StatementType::While(_) => false,
+        // `with` / `async with`: the body's return is the function's return
+        // (a context manager cannot swallow it), so ONE body decides.
+        StatementType::With(w) => returns_from_body(&w.body),
+        StatementType::AsyncWith(w) => returns_from_body(&w.body),
+        // `try`: every path that can leave the statement must return — the
+        // body (or the `else` it falls into) and every handler. An EMPTY
+        // `orelse`/`finalbody` is the normal case and must not be read as a
+        // body that fails to return; a `finally` that returns unconditionally
+        // overrides the rest.
+        StatementType::Try(t) => {
+            let normal = if t.orelse.is_empty() {
+                returns_from_body(&t.body)
+            } else {
+                returns_from_body(&t.body) || returns_from_body(&t.orelse)
+            };
+            let handlers = t.handlers.iter().all(|h| returns_from_body(&h.body));
+            (normal && handlers) || returns_from_body(&t.finalbody)
+        }
+        // Any OTHER body-carrying form: use the ONE visitor's enumeration so
+        // a form added there is covered, requiring every body to return.
+        // Non-empty is required so an unknown form is not vacuously true.
+        _ => {
+            let bodies = crate::ast::tree::visit::stmt_bodies_for(
+                last,
+                crate::ast::tree::visit::Descend::SkipDefs,
+            );
+            !bodies.is_empty() && bodies.iter().all(|b| returns_from_body(b))
+        }
     }
-    // Any other body-carrying form guarantees a return when EVERY one of
-    // its bodies does (a `with`/`async with` has one; a `try` has its body,
-    // handlers, `else` and `finally`). `stmt_bodies_for` with SkipDefs is
-    // that enumeration, so a form added to the visitor is covered here.
-    let bodies = crate::ast::tree::visit::stmt_bodies_for(
-        last,
-        crate::ast::tree::visit::Descend::SkipDefs,
-    );
-    !bodies.is_empty() && bodies.iter().all(|b| returns_from_body(b))
 }
 
 impl FunctionDef {
@@ -7340,11 +7364,24 @@ fn same_span(a: &[Statement], b: &[Statement]) -> bool {
 }
 
 /// Reject a READ of a name first assigned inside an `assertRaises` body when
-/// that read happens in a statement AFTER the block.
+/// that read can still see the name unbound.
 ///
 /// See `ScopeBindings::assert_raises_body_names`: the name's declaration is
-/// default-initialized so the closure can capture it, so a post-block read
-/// would silently yield the default where CPython raises UnboundLocalError.
+/// default-initialized so the closure can capture it, so a read that may
+/// happen before any later assignment would silently yield the default where
+/// CPython raises UnboundLocalError.
+///
+/// The check walks the statements AFTER the block in order and tracks which
+/// of those names a definitely-executed assignment has bound by then:
+///
+/// - a bare `name = ...` at this level (or an unconditional `if`/`else` pair
+///   that assigns it on both arms) makes later reads safe;
+/// - anything that may skip the assignment — a loop, a `try`, a conditional
+///   without an `else` — leaves the name still possibly-unbound;
+/// - a read is counted only where it is a LOAD: a walrus target, an
+///   assignment target, `del`, or a `global`/`nonlocal` declaration is not
+///   a read of the old value, and a nested `def`/`class`/`lambda` body is
+///   its own scope (`Descend::SkipDefs`).
 fn refuse_reads_of_assert_raises_locals(
     body: &[Statement],
     scope: &crate::ScopeBindings,
@@ -7366,31 +7403,113 @@ fn refuse_reads_of_assert_raises_locals(
             seen = true;
         }
     }
-    let mut offending: Option<String> = None;
-    for stmt in &after {
-        for e in crate::ast::tree::visit::stmt_exprs(stmt) {
-            crate::ast::tree::visit::any_expr(e, |sub| {
-                if let crate::ExprType::Name(n) = sub
-                    && scope.assert_raises_body_names.contains(&n.id)
+    // Names that a definite assignment has bound since the block.
+    let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in after {
+        if let Some(name) = read_before_bound(stmt, &scope.assert_raises_body_names, &bound) {
+            return Err(format!(
+                "`{name}` is assigned inside a `with assertRaises(...)` body and read after the \
+                 block before any later assignment; the body runs in a closure that CATCHES the \
+                 expected exception, so `{name}` may never have been bound, and CPython would \
+                 raise UnboundLocalError at that read. rython refuses to hand back a fabricated \
+                 default; assign `{name}` before the `with` block, or read it inside"
+            ));
+        }
+        record_definite_bindings(stmt, &mut bound);
+    }
+    Ok(())
+}
+
+/// The first watched name this statement READS before any later assignment
+/// has bound it, if any.
+fn read_before_bound(
+    stmt: &Statement,
+    watched: &std::collections::HashSet<String>,
+    bound: &std::collections::HashSet<String>,
+) -> Option<String> {
+    // Targets/stores are not reads of the old value.
+    let mut stores: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for target in crate::ast::tree::visit::stmt_targets(stmt) {
+        for n in crate::ast::tree::visit::target_names(target) {
+            stores.insert(n.to_string());
+        }
+    }
+    // A walrus binds its name; it is a store, not a read of the old value.
+    let mut walrus: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in crate::ast::tree::visit::stmt_exprs(stmt) {
+        crate::ast::tree::visit::any_expr_for(
+            e,
+            crate::ast::tree::visit::Descend::SkipDefs,
+            |sub| {
+                if let crate::ExprType::NamedExpr(ne) = sub
+                    && let crate::ExprType::Name(n) = ne.left.as_ref()
                 {
-                    offending = Some(n.id.clone());
+                    walrus.insert(n.id.clone());
+                }
+                false
+            },
+        );
+    }
+    let mut hit: Option<String> = None;
+    for e in crate::ast::tree::visit::stmt_exprs(stmt) {
+        crate::ast::tree::visit::any_expr_for(
+            e,
+            crate::ast::tree::visit::Descend::SkipDefs,
+            |sub| {
+                if let crate::ExprType::Name(n) = sub
+                    && watched.contains(&n.id)
+                    && !bound.contains(&n.id)
+                    && !stores.contains(&n.id)
+                    && !walrus.contains(&n.id)
+                {
+                    hit = Some(n.id.clone());
                     return true;
                 }
                 false
-            });
-        }
-        if offending.is_some() {
+            },
+        );
+        if hit.is_some() {
             break;
         }
     }
-    match offending {
-        Some(name) => Err(format!(
-            "`{name}` is assigned inside a `with assertRaises(...)` body and read after the \
-             block; the body runs in a closure that CATCHES the expected exception, so \
-             `{name}` may never have been assigned, and CPython would raise \
-             UnboundLocalError at that read. rython refuses to hand back a fabricated \
-             default; assign `{name}` before the `with` block, or read it inside"
-        )),
-        None => Ok(()),
+    hit
+}
+
+/// Bindings this statement definitely performs when it runs to completion in
+/// this flow. Only the forms that ALWAYS execute their assignment count; a
+/// loop body may not run, and a `try` body may not complete.
+fn record_definite_bindings(
+    stmt: &Statement,
+    bound: &mut std::collections::HashSet<String>,
+) {
+    match &stmt.statement {
+        StatementType::Assign(a) => {
+            for target in &a.targets {
+                for n in crate::ast::tree::visit::target_names(target) {
+                    bound.insert(n.to_string());
+                }
+            }
+        }
+        StatementType::AugAssign(a) => {
+            for n in crate::ast::tree::visit::target_names(&a.target) {
+                bound.insert(n.to_string());
+            }
+        }
+        // Both arms bind it => it is bound afterwards.
+        StatementType::If(i) if !i.orelse.is_empty() => {
+            let mut then_b: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut else_b: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for s in &i.body {
+                record_definite_bindings(s, &mut then_b);
+            }
+            for s in &i.orelse {
+                record_definite_bindings(s, &mut else_b);
+            }
+            for n in then_b.intersection(&else_b) {
+                bound.insert(n.clone());
+            }
+        }
+        _ => {}
     }
 }
+
