@@ -1434,6 +1434,17 @@ impl CodeGen for Module {
         let binding_marks = crate::ast::tree::import::BindingMarks::of(&self.raw.body);
         let mut options = options;
         options.init_binding_marks = std::rc::Rc::new(binding_marks.by_pos.clone());
+        // Whether this module defines its own `main`. Computed BEFORE the
+        // emit loop below consumes the body; the entry machinery needs it
+        // afterwards (issue #464).
+        let defines_main_definition = self.raw.body.iter().any(|s| {
+            matches!(
+                &s.statement,
+                crate::StatementType::FunctionDef(f)
+                    | crate::StatementType::AsyncFunctionDef(f)
+                    if f.name == "main"
+            )
+        });
         let mut top_level_binds: Vec<(Option<TokenStream>, usize)> = Vec::new();
         for (stmt_index, s) in self.raw.body.into_iter().enumerate() {
             // The names the statement binds after its init code (a loop or
@@ -3289,6 +3300,18 @@ impl CodeGen for Module {
         } else if needs_init_wrapper {
             // No main block, but module initialization code (this module's
             // or a sibling's): a main that runs just the startup sequence.
+            //
+            // A module that DEFINES `main` and has no `__main__` block still
+            // emits that definition as an item, and this wrapper's `fn main`
+            // would collide with it (rustc E0428) — the #464 class reached
+            // through module-level code rather than a guard or a bare call.
+            // The wrapper's entry is the one the module body needs, so the
+            // USER's definition moves aside to `python_main`, exactly as the
+            // guarded wrapper path does (issue #464).
+            if defines_main_definition {
+                let renamed = Self::rename_main_function_and_references(&stream.to_string());
+                stream = renamed.parse::<proc_macro2::TokenStream>().unwrap_or(stream);
+            }
             stream.extend(quote! {
                 #[allow(dead_code)]
                 fn main() {
