@@ -95,20 +95,39 @@ fn module_runs_top_level_code(source: &str) -> bool {
         return false;
     };
     use python_ast::tree::StatementType;
-    ast.raw.body.iter().any(|s| {
-        !matches!(
-            s.statement,
-            StatementType::FunctionDef(_)
-                | StatementType::AsyncFunctionDef(_)
-                | StatementType::ClassDef(_)
-                | StatementType::Import(_)
-                | StatementType::ImportFrom(_)
-                | StatementType::Pass
-                | StatementType::Global(_)
-                | StatementType::Nonlocal(_)
-                | StatementType::AnnotatedName { .. }
+    // A bare string constant is a DOCSTRING (or a no-op string statement):
+    // CPython evaluates it and discards it, printing nothing. A module of
+    // definitions plus a docstring is therefore still a library, not a
+    // program (Devin review on #471) — treating it as one would turn every
+    // documented library module into a binary.
+    fn is_inert_string(stmt: &StatementType) -> bool {
+        matches!(
+            stmt,
+            StatementType::Expr(e)
+                if matches!(
+                    &e.value,
+                    python_ast::ExprType::Constant(c)
+                        if matches!(&c.0, Some(litrs::Literal::String(_)))
+                )
         )
-    })
+    }
+    ast.raw
+        .body
+        .iter()
+        .any(|s| {
+            !matches!(
+                s.statement,
+                StatementType::FunctionDef(_)
+                    | StatementType::AsyncFunctionDef(_)
+                    | StatementType::ClassDef(_)
+                    | StatementType::Import(_)
+                    | StatementType::ImportFrom(_)
+                    | StatementType::Pass
+                    | StatementType::Global(_)
+                    | StatementType::Nonlocal(_)
+                    | StatementType::AnnotatedName { .. }
+            ) && !is_inert_string(&s.statement)
+        })
 }
 
 /// Whether a module's source ends with a bare module-level `main()` call as

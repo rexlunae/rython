@@ -22352,7 +22352,12 @@ fn a_dead_guard_branch_does_not_make_the_async_entry_unawaited() {
         .output()
         .expect("running generated binary");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(stdout.trim(), "done", "stdout: {}", stdout);
+    assert_eq!(stdout, "done\n", "stdout must be byte-exact");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "",
+        "the program must write nothing to stderr"
+    );
     assert_eq!(output.status.code(), Some(0));
 }
 
@@ -22671,7 +22676,12 @@ fn a_module_defining_main_beside_module_code_builds_and_runs() {
         .output()
         .expect("running generated binary");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(stdout.trim(), "module code", "stdout: {}", stdout);
+    assert_eq!(stdout, "module code\n", "stdout must be byte-exact");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "",
+        "the program must write nothing to stderr"
+    );
     assert_eq!(output.status.code(), Some(0));
 }
 
@@ -22720,5 +22730,47 @@ fn an_async_main_called_only_from_dead_branches_builds_and_runs() {
         .expect("running generated binary");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.trim(), "done", "stdout: {}", stdout);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn renaming_main_leaves_string_literals_alone() {
+    // Devin review on #471: `rename_main_function_and_references` regexed
+    // the whole generated token stream as TEXT, so a string literal
+    // containing `main(` was rewritten too — `print("main( is a
+    // substring")` came out as `python_main( is a substring`. Silent wrong
+    // output, which no build check can see.
+    // Verified against python3: prints the literal, then the function's line.
+    let scratch = Scratch::new("rename-main-literal");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> None:\n",
+            "    print(\"in main\")\n",
+            "\n",
+            "\n",
+            "print(\"main( is a substring\")\n",
+            "main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "the crate must compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3, byte-exact.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "main( is a substring\nin main\n",
+        "a string literal mentioning `main(` must not be rewritten"
+    );
     assert_eq!(output.status.code(), Some(0));
 }

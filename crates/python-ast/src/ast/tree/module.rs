@@ -7104,17 +7104,45 @@ fn shadowed_top_level_definitions(
     
     /// Rename the main function definition and update all references to it throughout the code
     fn rename_main_function_and_references(code: &str) -> String {
-        // First, rename the function definitions
-        let code = code
-            .replace("pub async fn main (", "pub async fn python_main (")
-            .replace("pub fn main (", "pub fn python_main (");
-        
-        // Then update all references using the comprehensive reference updater
-        Self::update_main_references(&code)
+        // Token-aware, not text-regex (Devin review on #471): the previous
+        // implementation regexed the WHOLE generated token stream as text,
+        // so a STRING LITERAL containing `main(` was rewritten too —
+        // `print("main( is a substring")` became `python_main( is a
+        // substring`, silently changing the program's output.
+        //
+        // This walks the token stream and renames only IDENTIFIERS whose
+        // text is exactly `main`. Literals, `#[...]` attributes' strings,
+        // and doc comments are untouched; every other token passes through
+        // byte-for-byte.
+        let parsed: proc_macro2::TokenStream = match code.parse() {
+            Ok(ts) => ts,
+            // Unparseable input: leave it alone rather than guess. The
+            // caller falls back to the unrenamed stream, which rustc will
+            // reject loudly rather than emit a silently altered program.
+            Err(_) => return code.to_string(),
+        };
+        fn rename_ident(t: proc_macro2::TokenTree) -> proc_macro2::TokenTree {
+            use proc_macro2::{Group, TokenTree};
+            match t {
+                TokenTree::Ident(i) if i == "main" => {
+                    TokenTree::Ident(proc_macro2::Ident::new(
+                        "python_main",
+                        i.span(),
+                    ))
+                }
+                TokenTree::Group(g) => {
+                    let inner: proc_macro2::TokenStream =
+                        g.stream().into_iter().map(rename_ident).collect();
+                    let mut new = Group::new(g.delimiter(), inner);
+                    new.set_span(g.span());
+                    TokenTree::Group(new)
+                }
+                other => other,
+            }
+        }
+        parsed.into_iter().map(rename_ident).collect::<proc_macro2::TokenStream>().to_string()
     }
     
-    /// Convert a Python main function to be suitable as a Rust entry point
-    /// This handles return value conversion and signature requirements
     fn convert_python_main_to_rust_entry_point(code: &str) -> String {
         use regex::Regex;
         
