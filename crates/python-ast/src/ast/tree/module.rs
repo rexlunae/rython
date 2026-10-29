@@ -700,6 +700,48 @@ impl CodeGen for Module {
             )
         });
 
+        // Issue #455: an `async def main` that is CALLED as a bare or
+        // guarded statement creates a coroutine in CPython and never awaits
+        // it, so the program body does NOT run (Python prints nothing and
+        // warns `coroutine 'main' was never awaited`). rython's entry
+        // machinery would install it as the process entry (`#[tokio::main]`)
+        // and RUN the body — output CPython never prints, a silent
+        // divergence. Reproducing "never awaited" faithfully needs a
+        // coroutine VALUE model, so this refuses at conversion time instead
+        // of silently running different code.
+        {
+            let async_main_called = self.raw.body.iter().any(|s| {
+                match &s.statement {
+                    crate::StatementType::Expr(e) => {
+                        Self::is_main_function_call(&e.value)
+                    }
+                    crate::StatementType::If(f) => {
+                        is_main_guard(&f.test)
+                            && Self::is_simple_main_call_block(&f.body)
+                    }
+                    _ => false,
+                }
+            });
+            let has_async_main = self.raw.body.iter().any(|s| {
+                matches!(
+                    &s.statement,
+                    crate::StatementType::AsyncFunctionDef(f) if f.name == "main"
+                )
+            });
+            if async_main_called && has_async_main {
+                return Err(
+                    "`async def main()` is called without `await`, so CPython only \
+                     creates the coroutine and the body never runs (it prints nothing \
+                     and warns `coroutine 'main' was never awaited`). rython cannot \
+                     reproduce a never-awaited coroutine yet, and would otherwise RUN \
+                     the body instead; rewrite the call as `asyncio.run(main())` to run \
+                     it, or make `main` a plain `def`"
+                        .to_string()
+                        .into(),
+                );
+            }
+        }
+
         // A boxed mutable static with NO top-level store (a module value
         // stored only under module-level control flow, read by functions —
         // requests' `_preloaded_ssl_context`; issue #333): no statement's

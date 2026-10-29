@@ -29341,3 +29341,68 @@ fn an_assert_raises_body_that_only_assigns_locally_still_converts() {
         out
     );
 }
+
+#[test]
+fn an_unawaited_async_main_call_is_refused() {
+    // Issue #455: CPython's bare `main()` on an `async def` only CREATES the
+    // coroutine -- the body never runs and Python warns "coroutine 'main'
+    // was never awaited". rython's entry machinery would install it as the
+    // process entry and RUN the body, printing output CPython never prints.
+    // A never-awaited coroutine cannot be modelled yet, so the conversion
+    // refuses loudly instead of silently running different code.
+    let err = compile_err(
+        "async def main() -> None:\n    print(\"body\")\n\n\nmain()\n",
+        "async_main_bare.py",
+    );
+    assert!(
+        err.contains("async def main") && err.contains("asyncio.run"),
+        "the refusal must name the construct and the rewrite: {}",
+        err
+    );
+    // The guarded spelling is the same program body in CPython.
+    let err = compile_err(
+        concat!(
+            "async def main() -> None:\n",
+            "    print(\"body\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+        "async_main_guarded.py",
+    );
+    assert!(
+        err.contains("asyncio.run"),
+        "the guarded spelling refuses the same way: {}",
+        err
+    );
+}
+
+#[test]
+fn a_sync_main_calling_asyncio_run_is_not_refused() {
+    // The refusal is narrow: `asyncio.run(main())` is the spelling that
+    // actually runs the coroutine, so it must keep converting.
+    let out = compile(
+        concat!(
+            "import asyncio\n",
+            "\n",
+            "\n",
+            "async def work() -> None:\n",
+            "    print(\"work\")\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    asyncio.run(work())\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+        "async_run_ok.py",
+    );
+    assert!(
+        out.contains("asyncio :: run"),
+        "asyncio.run must still lower: {}",
+        out
+    );
+}
