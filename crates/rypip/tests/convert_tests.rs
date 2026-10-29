@@ -22352,7 +22352,12 @@ fn a_dead_guard_branch_does_not_make_the_async_entry_unawaited() {
         .output()
         .expect("running generated binary");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(stdout.trim(), "done", "stdout: {}", stdout);
+    assert_eq!(stdout, "done\n", "stdout must be byte-exact");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "",
+        "the program must write nothing to stderr"
+    );
     assert_eq!(output.status.code(), Some(0));
 }
 
@@ -22631,4 +22636,141 @@ fn a_shadowed_class_whose_literal_cannot_be_constructed_is_refused() {
         "unexpected message: {}",
         err
     );
+}
+
+#[test]
+fn a_module_defining_main_beside_module_code_builds_and_runs() {
+    // Issue #464, the shape reached through module-level code: a module that
+    // DEFINES `main` and has no `__main__` guard still has to be the
+    // program — `python file.py` runs every top-level statement as
+    // `__main__`. It used to emit BOTH the user's `main` item and the
+    // wrapper's `fn main` (rustc E0428); the user's definition now moves
+    // aside to `python_main`.
+    //
+    // Verified against python3:
+    //   $ python3 main_beside_module_code.py
+    //   module code
+    //   $ echo $?
+    //   0
+    let scratch = Scratch::new("dup-main-module-code");
+    let file = scratch.path().join("main_beside_module_code.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> None:\n",
+            "    print(\"hi from main\")\n",
+            "\n",
+            "\n",
+            "print(\"module code\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "main-beside-module-code failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/main_beside_module_code"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout, "module code\n", "stdout must be byte-exact");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "",
+        "the program must write nothing to stderr"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn an_async_main_called_only_from_dead_branches_builds_and_runs() {
+    // Issue #464 (Lead review on #467). Every `main()` call site here is
+    // statically dead, so CPython creates no coroutine and just runs the
+    // module body. The crate used to be emitted with a duplicate `main`
+    // (E0428) and, after a partial fix, as a lib-only crate that printed
+    // nothing. It must run and print `done`.
+    //
+    // Verified against python3:
+    //   $ python3 async_main_dead_branches.py
+    //   done
+    //   $ echo $?
+    //   0
+    let scratch = Scratch::new("dup-async-main-dead");
+    let file = scratch.path().join("async_main_dead_branches.py");
+    fs::write(
+        &file,
+        concat!(
+            "async def main() -> None:\n",
+            "    print(\"never\")\n",
+            "\n",
+            "\n",
+            "if False:\n",
+            "    pass\n",
+            "else:\n",
+            "    if False:\n",
+            "        main()\n",
+            "\n",
+            "\n",
+            "print(\"done\")\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "dead-branch async-main failed to compile");
+
+    let output = Command::new(krate.root.join("target/debug/async_main_dead_branches"))
+        .output()
+        .expect("running generated binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "done", "stdout: {}", stdout);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn renaming_main_leaves_string_literals_alone() {
+    // Devin review on #471: `rename_main_function_and_references` regexed
+    // the whole generated token stream as TEXT, so a string literal
+    // containing `main(` was rewritten too — `print("main( is a
+    // substring")` came out as `python_main( is a substring`. Silent wrong
+    // output, which no build check can see.
+    // Verified against python3: prints the literal, then the function's line.
+    let scratch = Scratch::new("rename-main-literal");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "def main() -> None:\n",
+            "    print(\"in main\")\n",
+            "\n",
+            "\n",
+            "print(\"main( is a substring\")\n",
+            "main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "the crate must compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3, byte-exact.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "main( is a substring\nin main\n",
+        "a string literal mentioning `main(` must not be rewritten"
+    );
+    assert_eq!(output.status.code(), Some(0));
 }
