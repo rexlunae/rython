@@ -134,13 +134,30 @@ mod tests {
 
     #[test]
     fn run_blocking_runs_the_coroutine_exactly_once() {
-        // The worker-thread branch must not double-poll or drop the body:
-        // an observable side effect fires once per call.
+        // BOTH branches must run the body exactly once (no double-poll, no
+        // drop). Each branch is exercised in its own condition, because the
+        // branch is chosen at run time from `Handle::try_current()` (Devin
+        // review on #466).
         use std::sync::atomic::{AtomicUsize, Ordering};
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
+        static OFF_RUNTIME: AtomicUsize = AtomicUsize::new(0);
+        static ON_RUNTIME: AtomicUsize = AtomicUsize::new(0);
+
+        // (a) off any runtime -> the direct branch.
         let _ = run_blocking(async {
-            COUNT.fetch_add(1, Ordering::SeqCst);
+            OFF_RUNTIME.fetch_add(1, Ordering::SeqCst);
         });
-        assert_eq!(COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(OFF_RUNTIME.load(Ordering::SeqCst), 1, "direct branch");
+
+        // (b) ON a runtime -> the worker-thread branch.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let _ = run_blocking(async {
+                ON_RUNTIME.fetch_add(1, Ordering::SeqCst);
+            });
+        });
+        assert_eq!(ON_RUNTIME.load(Ordering::SeqCst), 1, "worker-thread branch");
     }
 }
