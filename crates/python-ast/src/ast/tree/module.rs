@@ -6385,7 +6385,6 @@ fn guard_body_calls_main_unawaited(
     guard_body: &[crate::Statement],
     module_body: &[crate::Statement],
 ) -> bool {
-    use crate::ast::tree::visit::{walk_stmts, Descend, Flow};
     // The binding of `main` the guard sees: the last `def`/`async def`
     // above it decides (Python's last-write-wins module scope). The
     // guard is the last statement that calls it in this shape, so the
@@ -6403,46 +6402,42 @@ fn guard_body_calls_main_unawaited(
     if !main_is_async {
         return false;
     }
+    // A statically FALSE branch never runs, so a call there is not a
+    // never-awaited coroutine: `if False: main()` is dead code, and the
+    // refusal would reject a program CPython runs (Devin review on #465).
+    // The scan honours that rule at every depth.
+    //
+    // `if TYPE_CHECKING:` is deliberately NOT excluded: the wrapper emission
+    // still lowers such a body (a separate, pre-existing emitter defect), so
+    // excluding it would convert a program whose crate does not build.
+    // Refusing stays the loud answer until the emitter skip lands.
     let mut calls = false;
-    walk_stmts(guard_body, Descend::SkipDefs, &mut |s| {
-        // A statically FALSE branch never runs, so a call there is not a
-        // never-awaited coroutine: `if False: main()` is dead code, and the
-        // refusal would reject a program CPython runs (Devin review on
-        // #465). Only the `else` arm is live.
-        //
-        // `if TYPE_CHECKING:` is deliberately NOT excluded here: the
-        // wrapper emission still lowers such a body (a separate, pre-existing
-        // emitter defect), so excluding it would convert a program whose
-        // crate does not build. Refusing stays the loud answer until the
-        // emitter skip lands.
+    scan_guard_body(guard_body, &mut calls);
+    calls
+}
+
+/// Record a `main()` call reachable in `body`, honouring statically false
+/// branches at every depth (a nested `if False: main()` never runs).
+fn scan_guard_body(body: &[crate::Statement], calls: &mut bool) {
+    use crate::ast::tree::visit::{stmt_exprs, walk_stmts, Descend, Flow};
+    walk_stmts(body, Descend::SkipDefs, &mut |s| {
         if let crate::StatementType::If(i) = &s.statement
             && is_literal_false(&i.test)
         {
-            // Visit the `else` arm only — the taken path when the branch is
-            // statically false.
-            walk_stmts(&i.orelse, Descend::SkipDefs, &mut |inner| {
-                scan_guard_stmt(inner, &mut calls);
-                Flow::Continue
-            });
+            scan_guard_body(&i.orelse, calls);
             return Flow::Skip;
         }
-        scan_guard_stmt(s, &mut calls);
-        if calls {
+        for e in stmt_exprs(s) {
+            if Module::is_main_function_call(e) {
+                *calls = true;
+            }
+        }
+        if *calls {
             Flow::Stop
         } else {
             Flow::Continue
         }
     });
-    calls
-}
-
-/// Record a `main()` call in `s` itself (not a nested statement).
-fn scan_guard_stmt(s: &crate::Statement, calls: &mut bool) {
-    for e in crate::ast::tree::visit::stmt_exprs(s) {
-        if Module::is_main_function_call(e) {
-            *calls = true;
-        }
-    }
 }
 
 /// Whether a test is the literal `False` (a statically dead branch).
@@ -6514,25 +6509,26 @@ fn definition_effect_reason(s: &crate::Statement, name: &str) -> Option<String> 
             None
         }
         crate::StatementType::ClassDef(c) => {
-            // A class body runs. A body that is only a docstring / `pass` /
-            // annotations with no runtime statement is inert; anything else
-            // may do work, and so may a base or keyword expression.
+            // A class body runs, and so do its decorators. Only the work that
+            // can be SEEN is observable: a decorator is a call (any supported
+            // class decorator may have an effect, so treat it as observable),
+            // and any body statement that is not a literal field store or a
+            // plain `pass` may do work. A class body of literals builds an
+            // object the rebind then discards, which nobody can observe
+            // (Devin review on #465).
+            if !c.decorator_list.is_empty() {
+                return Some(format!(
+                    "`{name}` carries a class decorator, which CPython RUNS when the \
+                     definition statement executes"
+                ));
+            }
             if !c.bases.is_empty() || !c.keywords.is_empty() {
                 return Some(format!(
                     "the class body of `{name}` names a base or a keyword, whose expression \
                      CPython EVALUATES when the statement executes"
                 ));
             }
-            let effects = c.body.iter().any(|bs| {
-                !matches!(
-                    bs.statement,
-                    crate::StatementType::Pass
-                        | crate::StatementType::AnnotatedName { .. }
-                        | crate::StatementType::FunctionDef(_)
-                        | crate::StatementType::AsyncFunctionDef(_)
-                        | crate::StatementType::ClassDef(_)
-                )
-            });
+            let effects = c.body.iter().any(class_body_statement_is_observable);
             effects.then(|| {
                 format!(
                     "the class body of `{name}` runs statements CPython EXECUTES when the \
@@ -6541,6 +6537,46 @@ fn definition_effect_reason(s: &crate::Statement, name: &str) -> Option<String> 
             })
         }
         _ => None,
+    }
+}
+
+/// Whether a statement in a class BODY can be observed when the class it
+/// builds is discarded by a rebind.
+///
+/// A literal field store (`x = 1`), a plain `pass`, and a nested definition
+/// whose own creation is inert are all invisible: the object they build is
+/// dropped. Anything else (a call, a print, a comprehension, a `for`) may do
+/// work, so it is treated as observable (Devin review on #465).
+fn class_body_statement_is_observable(s: &crate::Statement) -> bool {
+    match &s.statement {
+        crate::StatementType::Pass | crate::StatementType::AnnotatedName { .. } => false,
+        // A nested definition runs nothing at creation unless its decorators
+        // or defaults evaluate — those DO run, so recurse on the same rule.
+        crate::StatementType::FunctionDef(_) | crate::StatementType::AsyncFunctionDef(_) => {
+            definition_effect_reason(s, "").is_some()
+        }
+        crate::StatementType::ClassDef(_) => definition_effect_reason(s, "").is_some(),
+        // A field store is inert only when its value contains no call and no
+        // name read — a literal (of any nesting) cannot run code.
+        crate::StatementType::Assign(a) => !value_is_literal_only(&a.value),
+        _ => true,
+    }
+}
+
+/// Whether a value expression is built only from literals (so evaluating it
+/// cannot run any code).
+fn value_is_literal_only(e: &crate::ExprType) -> bool {
+    match e {
+        crate::ExprType::Constant(_) => true,
+        crate::ExprType::Tuple(t) => t.elts.iter().all(value_is_literal_only),
+        crate::ExprType::List(l) => l.iter().all(value_is_literal_only),
+        crate::ExprType::Set(s) => s.elts.iter().all(value_is_literal_only),
+        crate::ExprType::Dict(d) => {
+            d.keys.iter().flatten().all(value_is_literal_only)
+                && d.values.iter().all(value_is_literal_only)
+        }
+        crate::ExprType::UnaryOp(u) => value_is_literal_only(&u.operand),
+        _ => false,
     }
 }
 
