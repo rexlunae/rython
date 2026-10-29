@@ -281,12 +281,16 @@ impl<'a> CodeGen for Attribute {
         //    derived class may override the constant — the receiver's
         //    static type is all we know, so a `Base`-typed name could hold
         //    a `Sub` at run time and Python would read the override.
+        // The Option test must use the SAME evidence the ordinary read
+        // path does (`receiver_option_inner`): a name is None-able when its
+        // inferred type is `Option<..>` OR it is in `optional_names` (a
+        // None-initialized local, `conn = None` then `conn = ...`) — the
+        // second is easy to miss and would let a None receiver reach this
+        // shortcut (Devin review on #473).
         let receiver_is_plain_local = match self.value.as_ref() {
             ExprType::Name(n) => {
-                !matches!(
-                    options.name_types.get(&n.id),
-                    Some(crate::TypeInfo::Option(_))
-                )
+                !matches!(options.name_types.get(&n.id), Some(crate::TypeInfo::Option(_)))
+                    && !options.optional_names.contains(&n.id)
             }
             _ => false,
         };

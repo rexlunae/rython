@@ -22835,3 +22835,119 @@ fn a_class_attribute_read_through_an_instance_builds_and_runs() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn a_constant_read_through_a_class_typed_local_does_not_fabricate_a_value() {
+    // Review on #472/#473. The class-constant shortcut may only fire for a
+    // bare, non-Option local whose static class has no property override and
+    // is not a polymorphic root. Every OTHER receiver keeps the pre-existing
+    // LOUD failure rather than returning a plausible wrong constant:
+    //
+    //   - `Point().x` would drop the constructor's side effects;
+    //   - a `Base`-typed parameter holding `Sub()` would return Base's value;
+    //   - an Option local that is None would return a value where Python
+    //     raises AttributeError.
+    //
+    // Verified against python3 for the first two: `python3` prints
+    // "ctor ran" / "1", and "2" (Sub's override) respectively.
+    let scratch = Scratch::new("class-const-no-fabrication");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Point:\n",
+            "    x = 1\n",
+            "\n",
+            "    def __init__(self) -> None:\n",
+            "        print(\"ctor ran\")\n",
+            "\n",
+            "\n",
+            "class Base:\n",
+            "    x = 1\n",
+            "\n",
+            "\n",
+            "class Sub(Base):\n",
+            "    x = 2\n",
+            "\n",
+            "\n",
+            "def show(b: Base) -> None:\n",
+            "    print(b.x)\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(Point().x)\n",
+            "    show(Sub())\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let src = fs::read_to_string(krate.root.join("src/app.rs")).expect("generated module");
+
+    // The shortcut must NOT have fired: neither read may render as a
+    // class-qualified constant.
+    assert!(
+        !src.contains("Point :: x") && !src.contains("Point::x"),
+        "a CALL receiver must not become a constant read (its constructor \
+         side effects would vanish): {src}"
+    );
+    assert!(
+        !src.contains("Base :: x") && !src.contains("Base::x"),
+        "a Base-typed parameter must not become a class-qualified constant \
+         (a Sub instance would lose its override): {src}"
+    );
+}
+
+#[test]
+fn a_property_override_beats_the_inherited_class_constant() {
+    // `Sub` defines property `x` over `Base.x`: Python reads the PROPERTY.
+    // Verified against python3: prints 99.
+    let scratch = Scratch::new("class-const-property");
+    let file = scratch.path().join("app.py");
+    fs::write(
+        &file,
+        concat!(
+            "class Base:\n",
+            "    x = 1\n",
+            "\n",
+            "\n",
+            "class Sub(Base):\n",
+            "    @property\n",
+            "    def x(self) -> int:\n",
+            "        return 99\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    s = Sub()\n",
+            "    print(s.x)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "the property read must compile");
+
+    let output = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3, byte-exact.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "99\n",
+        "a property must beat the inherited class constant"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
