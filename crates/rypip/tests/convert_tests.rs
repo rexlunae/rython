@@ -22416,6 +22416,7 @@ fn asyncio_run_in_a_sync_function_blocks_and_runs_the_coroutine() {
     assert_eq!(output.status.code(), Some(0));
 }
 
+#[test]
 fn a_class_redefined_with_literal_fields_keeps_the_last_binding() {
     // Devin review on #465: a class body of literal field stores builds an
     // object the rebind then DISCARDS, which nobody can observe — so this
