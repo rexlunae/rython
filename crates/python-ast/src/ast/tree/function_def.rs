@@ -7495,18 +7495,36 @@ fn record_definite_bindings(
                 bound.insert(n.to_string());
             }
         }
-        // Both arms bind it => it is bound afterwards.
+        // Both arms bind it => it is bound afterwards. The two arms are the
+        // `If`'s bodies as the ONE visitor enumerates them
+        // (`stmt_bodies_for`, SkipDefs), not a private `match`: a form whose
+        // nesting the visitor gains must not drift from this analysis
+        // (Devin review on #459). `If` is the only form with a DEFINITE
+        // two-way exit, so it is the only one whose arms are intersected;
+        // every other body-carrying form may not run at all and is handled
+        // by the `_ => {}` arm (its bindings are not definite here).
         StatementType::If(i) if !i.orelse.is_empty() => {
-            let mut then_b: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut else_b: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for s in &i.body {
-                record_definite_bindings(s, &mut then_b);
+            let bodies = crate::ast::tree::visit::stmt_bodies_for(
+                stmt,
+                crate::ast::tree::visit::Descend::SkipDefs,
+            );
+            debug_assert_eq!(bodies.len(), 2, "an If has exactly its two arms");
+            let mut arm_sets: Vec<std::collections::HashSet<String>> = Vec::new();
+            for arm in &bodies {
+                let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for s in *arm {
+                    record_definite_bindings(s, &mut set);
+                }
+                arm_sets.push(set);
             }
-            for s in &i.orelse {
-                record_definite_bindings(s, &mut else_b);
-            }
-            for n in then_b.intersection(&else_b) {
-                bound.insert(n.clone());
+            if let Some((first, rest)) = arm_sets.split_first() {
+                let mut common = first.clone();
+                for other in rest {
+                    common = common.intersection(other).cloned().collect();
+                }
+                for n in common {
+                    bound.insert(n);
+                }
             }
         }
         _ => {}
