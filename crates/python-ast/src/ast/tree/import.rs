@@ -2227,16 +2227,20 @@ impl CodeGen for Import {
                             Some(key) => key.to_vec(),
                             None => path.clone(),
                         };
+                    // A sibling is a module of the crate, or a submodule of
+                    // one of its packages — resolved through the ONE
+                    // authority, never assumed. `module_defs.len() <= 1`
+                    // used to make every unknown import a sibling for a
+                    // single-file conversion, which emitted
+                    // `use crate::<name>` for a module the crate does not
+                    // contain: `import pytest` converted with no warning and
+                    // then failed to build with E0432 (issue #456). An
+                    // unresolved module is EXTERNAL and takes the loud
+                    // definition-warning path below instead.
                     let is_sibling = crate::module_defs_contains(&options, &path)
                         || options.python_modules.contains(
                             &path.first().cloned().unwrap_or_default(),
-                        )
-                        // Single-module conversions only know the module
-                        // itself (module_defs.len() == 1): assume any other
-                        // non-stdpython import is a crate sibling (the
-                        // module_defs check is authoritative only when the
-                        // whole crate is known).
-                        || options.module_defs.len() <= 1;
+                        );
                     if !is_sibling {
                         options.definition_warnings.borrow_mut().push(format!(
                             "import `{}` is dropped: the module is not part of the \

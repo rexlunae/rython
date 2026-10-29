@@ -21830,3 +21830,82 @@ fn unittest_assert_raises_with_a_raise_builds_and_runs() {
         "2 passing assertRaises tests exit 0 like python3: {combined}"
     );
 }
+
+#[test]
+fn a_pytest_import_is_a_warning_not_a_broken_crate() {
+    // Issue #456: `import pytest` used to convert with NO warning and emit
+    // `use crate::pytest;` for a module the crate does not contain, so the
+    // crate died with E0432 at a generated line unrelated to the source.
+    // pytest has no runtime here; the import must be dropped through the
+    // external-module channel and the crate must BUILD.
+    let scratch = Scratch::new("pytest-import");
+    let file = scratch.path().join("t.py");
+    fs::write(
+        &file,
+        concat!(
+            "import pytest\n",
+            "\n",
+            "\n",
+            "def test_add() -> None:\n",
+            "    assert 1 + 1 == 2\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let src = fs::read_to_string(krate.root.join("src/t.rs")).expect("generated module");
+    assert!(
+        !src.contains("use crate::pytest"),
+        "an absent module must not be emitted as a crate path: {src}"
+    );
+    // The drop must be REPORTED, not just done: the warning is the user's
+    // only signal that the framework's runtime is absent, so pin it here
+    // (Devin review on #460 -- build success alone would let the diagnostic
+    // regress silently).
+    assert!(
+        krate
+            .warnings
+            .iter()
+            .any(|w| w.contains("pytest") && w.contains("external-module divergence")),
+        "the dropped import must warn through the definition channel: {:?}",
+        krate.warnings
+    );
+    let status = build_generated(&krate.root);
+    assert!(
+        status.success(),
+        "the crate must build once the external import is dropped"
+    );
+}
+
+#[test]
+fn a_python_module_macro_import_of_a_sibling_is_still_a_crate_path() {
+    // Devin review on #460: the `python_module!` macros convert ONE module
+    // with no index of its siblings, so fixing #456 must not make them
+    // treat a real sibling import as external -- that would drop the
+    // sibling's initializer and its binding. `unindexed_crate_modules`
+    // is what keeps the old (correct) answer for this caller only.
+    use python_ast::CodeGen as _;
+    let module = python_ast::parse(
+        "import helper\n\n\ndef use_it() -> None:\n    helper.greet()\n",
+        "app.py",
+    )
+    .expect("parse");
+    let symbols = module.clone().find_symbols(python_ast::SymbolTableScopes::new());
+    let mut options = python_ast::PythonOptions::default();
+    options.unindexed_crate_modules = true;
+    let out = module
+        .to_rust(
+            python_ast::CodeGenContext::Module("app".to_string()),
+            options,
+            symbols,
+        )
+        .expect("codegen")
+        .to_string();
+    assert!(
+        out.contains("use crate :: helper") || out.contains("use crate::helper"),
+        "a standalone macro module's sibling import stays a crate path: {out}"
+    );
+}

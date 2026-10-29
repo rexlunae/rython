@@ -231,21 +231,38 @@ fn rust_module_stub_wins_and_unknown_fns_fail_loudly() {
 }
 
 #[test]
-fn rust_module_import_unknown_module_falls_through() {
+fn rust_module_import_unknown_module_is_a_dropped_external_import() {
     // `import nosuchmod` with no manifest entry is not a rust-module error:
-    // it falls through to the normal import path and fails as a resolution
-    // error in the generated crate (same as any other unknown import).
+    // it falls through to the normal import path, where an unresolvable
+    // module is EXTERNAL — the import lowers to nothing and is reported
+    // through the definition-warning channel (the external-module
+    // divergence).
+    //
+    // This test used to assert the opposite — that conversion succeeds and
+    // the generated crate then fails to compile. That pinned a bug: the
+    // single-file path treated EVERY unknown import as a crate sibling and
+    // emitted `use crate::nosuchmod;`, so `import pytest` converted with no
+    // warning and died with E0432 in the generated crate (issue #456).
     let scratch = Scratch::new("fallthrough");
     write_manifest(scratch.path(), "");
     fs::write(scratch.path().join("a.py"), "import nosuchmod\n").unwrap();
     let pkg = rypip::discover(&scratch.path().join("a.py")).expect("discover");
-    // Conversion itself succeeds; the generated crate fails to resolve.
     let krate = rypip::convert(
         &pkg,
         &scratch.path().join("crate"),
         &ConvertOptions::default(),
     )
     .expect("unknown import is not a conversion error");
+    // The import must NOT become a `use crate::...` path for a module the
+    // crate does not contain.
+    let src = fs::read_to_string(krate.root.join("src/a.rs")).expect("generated module");
+    assert!(
+        !src.contains("use crate::nosuchmod"),
+        "an unresolvable module must not be emitted as a crate path: {src}"
+    );
     let status = build_generated(&krate.root);
-    assert!(!status.success(), "generated crate must fail to compile");
+    assert!(
+        status.success(),
+        "the dropped external import must leave a crate that BUILDS (issue #456)"
+    );
 }
