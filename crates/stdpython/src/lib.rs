@@ -1375,6 +1375,34 @@ where
     }
 }
 
+// `sum(s)` over a SET (issue #137's idiom, #444's order-free consumer):
+// codegen collects the set into a `Vec` first (`sum(seen.iter().cloned()
+// .collect::<Vec<_>>())`) where the element type is known, and a direct
+// `sum(set)` arrives with the set still a `HashSet`. Integer addition is
+// exact in any order, and #444 refuses a float set, so summing in the
+// set's own iteration order is exactly Python's result.
+impl<T, S> PySum for crate::HashSet<T, S>
+where
+    T: core::iter::Sum<T> + Clone,
+    S: core::hash::BuildHasher,
+{
+    type Output = T;
+    fn py_sum(self) -> T {
+        self.iter().cloned().sum()
+    }
+}
+
+impl<'a, T, S> PySum for &'a crate::HashSet<T, S>
+where
+    T: core::iter::Sum<T> + Clone,
+    S: core::hash::BuildHasher,
+{
+    type Output = T;
+    fn py_sum(self) -> T {
+        self.iter().cloned().sum()
+    }
+}
+
 /// Python all() function - returns True if all elements are truthy
 pub fn all<T: Truthy, I: IntoIterator<Item = T>>(iterable: I) -> bool {
     iterable.into_iter().all(|x| x.is_truthy())
@@ -5097,6 +5125,104 @@ where
     }
 }
 
+/// Python set algebra (issue #137): `a & b`, `a | b`, `a - b`, `a ^ b`.
+///
+/// Rust's `HashSet` implements `BitAnd`/`BitOr`/`BitXor` only between two
+/// sets with the SAME element type, and has no subtraction operator at
+/// all. Python has no such restriction: `set[str] - {"a"}` (a set of
+/// `String` minus a literal set of `&str`) is ordinary code, and the
+/// literal's elements are `&'static str`.
+///
+/// `A` is the receiver's member type, `B` the other operand's. Both view
+/// their members in a shared canonical form `C` ([`PySetKey`] /
+/// [`PySetView`]; `String` and `&str` both canonicalise to `str`), and the
+/// canonical form is opened into a BORROWED index set once per operand, so
+/// every membership test is an amortised O(1) hash lookup — the same
+/// complexity CPython's set operations have. A per-element scan of the
+/// other operand would be correct but quadratic (|a| × |b| comparisons on
+/// disjoint 100k-member sets; Devin review on PR #458).
+///
+/// The result takes the RECEIVER's element type, so `seen & {"a"}` is a
+/// `HashSet<String>` and an assignment target inferred from `seen`
+/// matches. Every helper is a membership select, so it cannot depend on
+/// the iteration order either operand yields its members in — the
+/// property issue #444 requires of a set consumer.
+pub fn py_set_and<A, B, S, U>(a: &HashSet<A, S>, b: &HashSet<B, U>) -> HashSet<A, S>
+where
+    A: PySetKey + Eq + Hash + Clone,
+    A::Key: Eq + Hash,
+    B: PySetView<A::Key>,
+    S: core::hash::BuildHasher + Default,
+    U: core::hash::BuildHasher,
+{
+    let index: crate::HashSet<&A::Key> = b.iter().map(|y| y.py_set_view()).collect();
+    a.iter()
+        .filter(|x| index.contains(x.py_set_key()))
+        .cloned()
+        .collect()
+}
+
+/// Python `a | b` (see [`py_set_and`]): every member of either operand.
+pub fn py_set_or<A, B, S, U>(a: &HashSet<A, S>, b: &HashSet<B, U>) -> HashSet<A, S>
+where
+    A: PySetKey + Eq + Hash + Clone + FromPySetView<B>,
+    A::Key: Eq + Hash,
+    B: PySetView<A::Key> + Clone,
+    S: core::hash::BuildHasher + Default,
+    U: core::hash::BuildHasher,
+{
+    let mut out: HashSet<A, S> = a.iter().cloned().collect();
+    let index: crate::HashSet<&A::Key> = a.iter().map(|x| x.py_set_key()).collect();
+    let extra: Vec<A> = b
+        .iter()
+        .filter(|y| !index.contains((*y).py_set_view()))
+        .map(|y| A::from_py_set_view((*y).clone()))
+        .collect();
+    out.extend(extra);
+    out
+}
+
+/// Python `a - b` (see [`py_set_and`]): the members of `a` absent from `b`.
+pub fn py_set_sub<A, B, S, U>(a: &HashSet<A, S>, b: &HashSet<B, U>) -> HashSet<A, S>
+where
+    A: PySetKey + Eq + Hash + Clone,
+    A::Key: Eq + Hash,
+    B: PySetView<A::Key>,
+    S: core::hash::BuildHasher + Default,
+    U: core::hash::BuildHasher,
+{
+    let index: crate::HashSet<&A::Key> = b.iter().map(|y| y.py_set_view()).collect();
+    a.iter()
+        .filter(|x| !index.contains(x.py_set_key()))
+        .cloned()
+        .collect()
+}
+
+/// Python `a ^ b` (see [`py_set_and`]): the symmetric difference.
+pub fn py_set_xor<A, B, S, U>(a: &HashSet<A, S>, b: &HashSet<B, U>) -> HashSet<A, S>
+where
+    A: PySetKey + Eq + Hash + Clone + FromPySetView<B>,
+    A::Key: Eq + Hash,
+    B: PySetView<A::Key> + Clone,
+    S: core::hash::BuildHasher + Default,
+    U: core::hash::BuildHasher,
+{
+    let a_index: crate::HashSet<&A::Key> = a.iter().map(|x| x.py_set_key()).collect();
+    let b_index: crate::HashSet<&A::Key> = b.iter().map(|y| y.py_set_view()).collect();
+    let mut out: HashSet<A, S> = a
+        .iter()
+        .filter(|x| !b_index.contains(x.py_set_key()))
+        .cloned()
+        .collect();
+    let extra: Vec<A> = b
+        .iter()
+        .filter(|y| !a_index.contains((*y).py_set_view()))
+        .map(|y| A::from_py_set_view((*y).clone()))
+        .collect();
+    out.extend(extra);
+    out
+}
+
 /// Python `set.pop()` (issue #444): CPython answers an ARBITRARY member,
 /// the first in its table order, which a Rust HashSet does not reproduce.
 /// A set of exactly one member has one answer, so it is returned (urllib3
@@ -7816,6 +7942,79 @@ impl<T: Eq + Hash> PyContains<T> for PySet<T> {
 }
 
 // Set literals lower to a std HashSet, so `x in {1, 2, 3}` needs this.
+
+/// The canonical COMPARISON form of a set member type, for Python's SET
+/// ALGEBRA (issue #137).
+///
+/// Python compares set members by VALUE regardless of how a side spells
+/// them: `{"a"} & {"a"}` is `{"a"}` whether a side holds owned `String`s
+/// or string literals. `String` and `&str` therefore share one canonical
+/// form, `str`; every other member type canonicalises to itself.
+pub trait PySetKey {
+    type Key: ?Sized;
+    fn py_set_key(&self) -> &Self::Key;
+}
+
+impl PySetKey for String {
+    type Key = str;
+    fn py_set_key(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PySetKey for &str {
+    type Key = str;
+    fn py_set_key(&self) -> &str {
+        self
+    }
+}
+
+macro_rules! py_set_key_identity {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl PySetKey for $t {
+                type Key = $t;
+                fn py_set_key(&self) -> &$t {
+                    self
+                }
+            }
+        )*
+    };
+}
+py_set_key_identity!(i64, f64, bool, u8);
+
+/// Viewing one operand's member in the OTHER operand's canonical form,
+/// for Python's SET ALGEBRA (issue #137) — the mirror of [`PySetKey`].
+pub trait PySetView<K: ?Sized> {
+    fn py_set_view(&self) -> &K;
+}
+
+/// Every member type views itself in its own canonical form.
+impl<T: PySetKey> PySetView<T::Key> for T {
+    fn py_set_view(&self) -> &T::Key {
+        self.py_set_key()
+    }
+}
+
+/// Building the right operand's member in the LEFT operand's element type,
+/// for `|`/`^` (which must place the right operand's exclusive members into
+/// a result of the receiver's type).
+pub trait FromPySetView<E> {
+    fn from_py_set_view(other: E) -> Self;
+}
+
+impl<T> FromPySetView<T> for T {
+    fn from_py_set_view(other: T) -> T {
+        other
+    }
+}
+
+impl FromPySetView<&str> for String {
+    fn from_py_set_view(other: &str) -> String {
+        other.to_string()
+    }
+}
+
 impl<T: Eq + Hash> PyContains<T> for HashSet<T> {
     fn py_contains(&self, item: &T) -> bool {
         self.contains(item)

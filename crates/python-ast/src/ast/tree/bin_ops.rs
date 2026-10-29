@@ -246,6 +246,39 @@ impl CodeGen for BinOp {
             return Ok(quote!((#left).py_add(&(#right))));
         }
 
+        // PYTHON SET ALGEBRA (issue #137): `a & b`, `a | b`, `a - b`,
+        // `a ^ b` are set operations when both operands are sets, and the
+        // result depends only on membership -- never on the order either
+        // operand yields its members in (the property #444 requires of a
+        // set consumer). Rust's HashSet supports only the same-type
+        // `BitOr`/`BitAnd`/`BitXor` and has no `-` at all, so
+        // `seen & {"a"}` (a set of String and a literal set of &str)
+        // emitted `BitAnd` and was an E0369/E0599. The runtime helpers
+        // test membership instead, so each side may spell its element
+        // type differently (String vs &str, i64 vs {integer}).
+        if matches!(
+            self.op,
+            BinOps::BitAnd | BinOps::BitOr | BinOps::BitXor | BinOps::Sub
+        ) && is_set_expr(&self.left, &ctx, &options, &symbols)
+            && is_set_expr(&self.right, &ctx, &options, &symbols)
+        {
+            // Each side is rendered in the OTHER side's element type when
+            // that type is known, so an integer LITERAL set is not left to
+            // rustc's `{integer}` -> i32 fallback: Python has one integer
+            // type, so `{3, 1, 2} & {2, 3, 9}` is a set of ints, and an
+            // `i32` element fails `i32: PySetKey` with E0277. When neither
+            // side names an element type, the literal still means ints, so
+            // it defaults to `HashSet<i64>` — the runtime's integer type.
+            let left = render_set_operand(&self.left, &self.right, &ctx, &options, &symbols)?;
+            let right = render_set_operand(&self.right, &self.left, &ctx, &options, &symbols)?;
+            return Ok(match self.op {
+                BinOps::BitAnd => quote!(py_set_and(&(#left), &(#right))),
+                BinOps::BitOr => quote!(py_set_or(&(#left), &(#right))),
+                BinOps::BitXor => quote!(py_set_xor(&(#left), &(#right))),
+                _ => quote!(py_set_sub(&(#left), &(#right))),
+            });
+        }
+
         // `-` mirrors `+`: PySub borrows its operands (numeric promotion
         // for scalars, elementwise for NdArray), so `x - y` never moves
         // the variables.
@@ -443,4 +476,109 @@ mod tests {
         assert_eq!(BinOps::from_python_string("Unknown"), None);
         assert_eq!(BinOps::parse_or_unknown("Invalid"), BinOps::Unknown);
     }
+}
+
+/// Whether `e` is a statically-known set (`set` or `frozenset` value),
+/// looking through borrows and Options. Set ALGEBRA (issue #137) routes
+/// `&`/`|`/`^`/`-` through membership-based runtime helpers only when both
+/// operands are sets; anything else keeps its existing lowering (integer
+/// bitwise ops, numeric subtraction).
+fn is_set_expr(
+    e: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    matches!(
+        peel_set_type(crate::infer_type(Some(ctx), e, options, symbols)),
+        crate::TypeInfo::HashSet(_)
+    )
+}
+
+/// Strip the borrow/Option wrappers a set value can carry, so its
+/// `HashMap`/`HashSet` shape is visible.
+fn peel_set_type(mut t: crate::TypeInfo) -> crate::TypeInfo {
+    loop {
+        t = match t {
+            crate::TypeInfo::Borrowed(inner) | crate::TypeInfo::Option(inner) => *inner,
+            other => return other,
+        };
+    }
+}
+
+/// Render one operand of set algebra, in the OTHER operand's element type
+/// when that type is known, else in a Python-int default for an integer
+/// set literal.
+///
+/// `HashSet::from([3, 1, 2])` leaves the element type to rustc's
+/// `{integer}` -> i32 fallback, which the set-algebra helpers reject
+/// (`i32: PySetKey` is E0277) and which nothing else in rython uses
+/// (integers are `i64`). Pinning here is semantic, not cosmetic: Python
+/// has ONE integer type, so a bare `{3, 1, 2}` and an annotated
+/// `set[int]` are the same kind of set and must mix.
+fn render_set_operand(
+    operand: &ExprType,
+    other: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    // 1. The OTHER operand names a concrete element type: render in it.
+    let other_ty = peel_set_type(crate::infer_type(Some(ctx), other, options, symbols));
+    if let Some(tok) = render_set_in_slot(operand, other_ty, ctx, options, symbols) {
+        return Ok(tok);
+    }
+    // 2. This operand's own type is already concrete: leave it alone.
+    let own = peel_set_type(crate::infer_type(Some(ctx), operand, options, symbols));
+    if let crate::TypeInfo::HashSet(elem) = &own
+        && !matches!(**elem, crate::TypeInfo::PyObject | crate::TypeInfo::Int)
+    {
+        return operand
+            .clone()
+            .to_rust(ctx.clone(), options.clone(), symbols.clone());
+    }
+    // 3. A non-empty literal set of integers with nothing else to go on:
+    //    Python's single int type.
+    if let Some(tok) = render_set_in_slot(
+        operand,
+        crate::TypeInfo::HashSet(Box::new(crate::TypeInfo::Int)),
+        ctx,
+        options,
+        symbols,
+    ) {
+        return Ok(tok);
+    }
+    operand
+        .clone()
+        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+}
+
+/// Render `operand` as a non-empty set literal spelled in `slot`'s element
+/// type, when the slot names a concrete Rust element type. `None` keeps the
+/// plain rendering (an unsupported spelling stays a loud rustc error rather
+/// than a guessed type).
+fn render_set_in_slot(
+    operand: &ExprType,
+    slot: crate::TypeInfo,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<TokenStream> {
+    if !matches!(operand, ExprType::Set(s) if !s.elts.is_empty()) {
+        return None;
+    }
+    let crate::TypeInfo::HashSet(elem) = slot else {
+        return None;
+    };
+    if matches!(*elem, crate::TypeInfo::PyObject | crate::TypeInfo::PyValue) {
+        return None;
+    }
+    crate::render_typed(
+        operand,
+        ctx.clone(),
+        options.clone(),
+        symbols.clone(),
+        Some(crate::TypeInfo::HashSet(elem)),
+    )
+    .ok()
 }

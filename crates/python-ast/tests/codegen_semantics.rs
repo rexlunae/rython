@@ -28055,6 +28055,95 @@ fn a_typed_set_slot_types_the_empty_set_and_owns_literal_elements() {
 }
 
 #[test]
+fn set_algebra_lowers_to_the_membership_helpers() {
+    // Rust's HashSet implements BitAnd/BitOr/BitXor only between two sets
+    // with the SAME element type and has no subtraction at all, so Python's
+    // `&`, `|`, `-`, `^` over sets cannot be the native operators: a
+    // `set[str]` local against a literal `{"a"}` (HashSet<String> vs
+    // HashSet<&str>) was an E0369, and `a - b` an E0599. All four lower
+    // through the runtime's membership-based selectors, whose result keeps
+    // the RECEIVER's element type.
+    //
+    // Every expectation below is CPython 3.14's answer for the same
+    // expression (sorted, so set order does not enter):
+    //   >>> sorted({"a","b","c"} & {"b","z"})  -> ['b']
+    //   >>> sorted({"a","b"} | {"b","z"})      -> ['a','b','z']
+    //   >>> sorted({"a","b","c"} - {"b"})      -> ['a','c']
+    //   >>> sorted({"a","b"} ^ {"b","z"})      -> ['a','z']
+    // Verified against python3.
+    let out = compile(
+        "def f() -> None:\n\
+         \x20   seen: set[str] = {\"a\", \"b\"}\n\
+         \x20   print(sorted(seen & {\"b\", \"z\"}))\n\
+         \x20   print(sorted(seen | {\"z\"}))\n\
+         \x20   print(sorted(seen - {\"b\"}))\n\
+         \x20   print(sorted(seen ^ {\"b\", \"z\"}))\n",
+        "set_algebra.py",
+    );
+    assert!(out.contains("py_set_and"), "intersection: {}", out);
+    assert!(out.contains("py_set_or"), "union: {}", out);
+    assert!(out.contains("py_set_sub"), "difference: {}", out);
+    assert!(out.contains("py_set_xor"), "symmetric difference: {}", out);
+    // The native operators must NOT be emitted for sets: `&` between two
+    // HashSets with different element spellings does not compile.
+    let assignments: Vec<&str> = out
+        .lines()
+        .filter(|l| l.contains("py_set_"))
+        .collect();
+    assert!(
+        !assignments.iter().any(|l| l.contains("(seen) & (")),
+        "no native BitAnd over sets: {}",
+        out
+    );
+}
+
+#[test]
+fn integer_set_algebra_pins_the_literal_to_the_receivers_element_type() {
+    // Python has one integer type, so `{3, 1, 2} & {2, 3, 9}` is a set of
+    // ints. Rust leaves a bare integer literal set to `{integer}` and
+    // rustc's i32 fallback then contradicts an i64 receiver (E0277: i32 is
+    // not a set member type), so the literal is rendered in the other
+    // operand's element type.
+    //   >>> sorted({3, 1, 2} & {2, 3, 9}) -> [2, 3]
+    // Verified against python3.
+    let out = compile(
+        "def f() -> None:\n\
+         \x20   nums: set[int] = {3, 1, 2}\n\
+         \x20   print(sorted(nums & {2, 3, 9}))\n",
+        "set_algebra_int.py",
+    );
+    assert!(out.contains("py_set_and"), "intersection: {}", out);
+    assert!(
+        !out.contains("HashSet :: from ([2 , 3 , 9])"),
+        "the literal set is pinned, not left to i32 inference: {}",
+        out
+    );
+}
+
+#[test]
+fn set_algebra_answers_a_set_not_an_unknown() {
+    // `both = seen & {"b"}` then `len(both)` / `sorted(both)` must keep the
+    // set type: an untyped result would render `sorted` over a HashValue
+    // and fail. CPython:
+    //   >>> both = {"a","b"} & {"b","z"}; (len(both), sorted(both)) -> (1, ['b'])
+    // Verified against python3.
+    let out = compile(
+        "def f() -> None:\n\
+         \x20   seen: set[str] = {\"a\", \"b\"}\n\
+         \x20   both = seen & {\"b\", \"z\"}\n\
+         \x20   print(len(both), sorted(both))\n",
+        "set_algebra_name.py",
+    );
+    assert!(out.contains("py_set_and"), "intersection: {}", out);
+    assert!(out.contains("len (& (both))"), "len over the result: {}", out);
+    assert!(
+        out.contains("both") && out.contains("sorted"),
+        "sorted over the result: {}",
+        out
+    );
+}
+
+#[test]
 fn set_add_discard_remove_lower_to_python_semantics() {
     // HashSet has no add/discard, and its inherent remove answers a bool
     // where Python's raises KeyError: add/discard are unit statements

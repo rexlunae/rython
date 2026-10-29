@@ -2201,6 +2201,22 @@ one-member set (the one answer CPython can give), raises CPython's
 `KeyError: 'pop from an empty set'` on an empty one, and panics at the
 call on a larger one, where CPython's answer is its table order.
 
+Set algebra (`&`, `|`, `-`, `^`) lowers to membership selects
+(`py_set_and`/`py_set_or`/`py_set_sub`/`py_set_xor`), never to Rust's
+`BitAnd`/`BitOr`/`BitXor`: those are implemented only between two sets
+with the SAME element type, and Rust's `HashSet` has no subtraction at
+all. Because the helpers test membership rather than operate on a
+same-typed operand, the two sides may spell their element type
+differently — a `set[str]` local is `HashSet<String>` while a literal
+`{"a"}` is `HashSet<&str>`, and Python compares members by value across
+that difference. The result always takes the RECEIVER's element type
+(`seen & {"a"}` is a `HashSet<String>`), and every helper is a membership
+select, so the result cannot depend on iteration order. An element
+pairing outside the string family keeps its old behaviour: a loud rustc
+error, never a guessed type. An all-integer-literal set renders as
+`HashSet<i64>` — Python has one integer type, and rustc's `{integer}`
+fallback to `i32` is a type no rython construct uses.
+
 ### 10.2 Modules
 
 Implemented (std tier): `math`, `random` (seeded output bit-identical

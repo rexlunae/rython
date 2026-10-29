@@ -21302,6 +21302,62 @@ fn a_mutation_through_a_getter_reaches_the_held_object() {
 }
 
 #[test]
+fn set_algebra_over_a_literal_operand_matches_cpython() {
+    // Issue #137, #444: a `set[str]` local is `HashSet<String>`, a literal
+    // `{"fig"}` is `HashSet<&str>`. Rust implements `&`/`|`/`^` only
+    // between sets with the SAME element type and has no `-` at all, so
+    // every one of these lines was an E0369/E0599 build failure before the
+    // membership-based helpers. `sorted(...)` keeps the assertion
+    // order-free (#444's canonical consumer).
+    let got = run_global_alias_program(
+        "setalgebra",
+        "set_algebra.py",
+        concat!(
+            "def tally(words: list[str]) -> set[str]:\n",
+            "    seen: set[str] = set()\n",
+            "    for w in words:\n",
+            "        seen.add(w.lower())\n",
+            "    return seen\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    seen = tally([\"Pear\", \"apple\", \"fig\", \"APPLE\", \"kiwi\", \"pear\"])\n",
+            "    both = seen & {\"fig\", \"plum\", \"kiwi\"}\n",
+            "    union = seen | {\"plum\"}\n",
+            "    diff = seen - both\n",
+            "    sym = seen ^ {\"fig\", \"mango\"}\n",
+            "    print(sorted(both))\n",
+            "    print(sorted(union), len(union))\n",
+            "    print(sorted(diff))\n",
+            "    print(sorted(sym))\n",
+            "    nums = {3, 1, 2}\n",
+            "    print(sorted(nums), len(nums), min(nums), max(nums), sum(nums))\n",
+            "    print(sorted(nums & {2, 3, 9}))\n",
+            "    initial = sorted(list({w[0] for w in seen if w}))\n",
+            "    print(initial)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    // Verified against python3 (3.14.4): captured from a real run, not
+    // written by hand.
+    assert_eq!(
+        got,
+        vec![
+            "['fig', 'kiwi']",
+            "['apple', 'fig', 'kiwi', 'pear', 'plum'] 5",
+            "['apple', 'pear']",
+            "['apple', 'kiwi', 'mango', 'pear']",
+            "[1, 2, 3] 3 1 3 6",
+            "[2, 3]",
+            "['a', 'f', 'k', 'p']",
+        ]
+    );
+}
+
+#[test]
 fn a_mutating_call_through_an_unannotated_getter_reaches_the_held_object() {
     // Issue #440 (Devin review on #447): `def get(self): return
     // self.counter` carries no return annotation, so `b.get().bump(2)`

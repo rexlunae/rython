@@ -136,8 +136,7 @@
       "status": "pass"
     },
     "set_order_free": {
-      "status": "build-failed",
-      "errors": 5
+      "status": "pass"
     },
     "set_order_sorted": {
       "status": "pass"
