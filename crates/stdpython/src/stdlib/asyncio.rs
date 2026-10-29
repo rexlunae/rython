@@ -93,4 +93,54 @@ mod tests {
     async fn sleep_suspends() {
         sleep(0.001).await;
     }
+
+    // `run_blocking` has TWO branches, and the nested one is the tricky
+    // one: a plain `block_on` inside a running runtime panics, which is why
+    // the runtime-thread case hands the future to a worker thread with its
+    // own current-thread runtime. Both branches need a pin (Devin review on
+    // #466).
+    #[test]
+    fn run_blocking_off_any_runtime_builds_one() {
+        // No runtime on this thread: the direct branch.
+        let out = run_blocking(async { 7i64 });
+        assert_eq!(out, 7);
+    }
+
+    #[test]
+    fn run_blocking_inside_a_runtime_uses_the_worker_thread() {
+        // On a runtime thread: the worker-thread branch. Reaching this
+        // without a panic IS the assertion — a `block_on` in the running
+        // context would panic with "Cannot start a runtime from within a
+        // runtime".
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let got = rt.block_on(async { run_blocking(async { 21i64 * 2 }) });
+        assert_eq!(got, 42);
+    }
+
+    #[test]
+    fn run_blocking_propagates_the_coroutine_result() {
+        // The coroutine's own Output crosses the boundary unchanged --
+        // including a Result, which is what generated `asyncio.run(...)?`
+        // sites rely on.
+        let ok: Result<i64, crate::PyException> = run_blocking(async { Ok(5i64) });
+        assert_eq!(ok.expect("no error"), 5);
+        let err: Result<i64, crate::PyException> =
+            run_blocking(async { Err(crate::runtime_error("boom")) });
+        assert!(err.is_err(), "the error must propagate, not be swallowed");
+    }
+
+    #[test]
+    fn run_blocking_runs_the_coroutine_exactly_once() {
+        // The worker-thread branch must not double-poll or drop the body:
+        // an observable side effect fires once per call.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+        let _ = run_blocking(async {
+            COUNT.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(COUNT.load(Ordering::SeqCst), 1);
+    }
 }
