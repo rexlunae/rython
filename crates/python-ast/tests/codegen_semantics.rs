@@ -29406,3 +29406,83 @@ fn a_sync_main_calling_asyncio_run_is_not_refused() {
         out
     );
 }
+
+#[test]
+fn an_unawaited_async_main_refusal_names_the_module_and_line() {
+    // Devin review on #462: a plain string error loses the location, so a
+    // multi-module conversion cannot tell which module's call was rejected.
+    let err = compile_err(
+        concat!(
+            "async def main() -> None:\n",
+            "    print(\"body\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+        "located.py",
+    );
+    assert!(
+        err.contains("located.py") && err.contains(":5"),
+        "the refusal must carry the call's module and line: {}",
+        err
+    );
+    assert!(
+        err.contains("asyncio.run"),
+        "the rewrite rides the help channel: {}",
+        err
+    );
+}
+
+#[test]
+fn an_async_main_call_inside_a_nested_block_is_still_found() {
+    // Devin review on #462: the scan matched `If` bodies by hand, so a call
+    // inside a `try` at module scope escaped. The walk goes through the one
+    // statement visitor now.
+    let err = compile_err(
+        concat!(
+            "async def main() -> None:\n",
+            "    print(\"async\")\n",
+            "\n",
+            "\n",
+            "try:\n",
+            "    if 1:\n",
+            "        main()\n",
+            "except Exception:\n",
+            "    print(\"err\")\n",
+        ),
+        "nested_async_main.py",
+    );
+    assert!(
+        err.contains("async def main"),
+        "a nested module-level call must be refused too: {}",
+        err
+    );
+}
+
+#[test]
+fn a_sync_redefinition_of_main_makes_the_call_ordinary() {
+    // Devin review on #462: the refusal checked that an `async def main`
+    // EXISTS, not that the binding at the CALL is async. A later
+    // `def main` replaces it, and the call is then synchronous -- exactly as
+    // CPython runs it.
+    let out = compile(
+        concat!(
+            "async def main() -> None:\n",
+            "    print(\"async version\")\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(\"sync version\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+        "rebound_main.py",
+    );
+    assert!(
+        !out.is_empty(),
+        "a synchronous rebinding keeps the program converting"
+    );
+}

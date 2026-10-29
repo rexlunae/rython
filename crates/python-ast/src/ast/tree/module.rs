@@ -705,40 +705,40 @@ impl CodeGen for Module {
         // it, so the program body does NOT run (Python prints nothing and
         // warns `coroutine 'main' was never awaited`). rython's entry
         // machinery would install it as the process entry (`#[tokio::main]`)
-        // and RUN the body — output CPython never prints, a silent
-        // divergence. Reproducing "never awaited" faithfully needs a
-        // coroutine VALUE model, so this refuses at conversion time instead
-        // of silently running different code.
-        {
-            let async_main_called = self.raw.body.iter().any(|s| {
-                match &s.statement {
-                    crate::StatementType::Expr(e) => {
-                        Self::is_main_function_call(&e.value)
-                    }
-                    crate::StatementType::If(f) => {
-                        is_main_guard(&f.test)
-                            && Self::is_simple_main_call_block(&f.body)
-                    }
-                    _ => false,
-                }
-            });
-            let has_async_main = self.raw.body.iter().any(|s| {
-                matches!(
-                    &s.statement,
-                    crate::StatementType::AsyncFunctionDef(f) if f.name == "main"
-                )
-            });
-            if async_main_called && has_async_main {
-                return Err(
-                    "`async def main()` is called without `await`, so CPython only \
-                     creates the coroutine and the body never runs (it prints nothing \
-                     and warns `coroutine 'main' was never awaited`). rython cannot \
-                     reproduce a never-awaited coroutine yet, and would otherwise RUN \
-                     the body instead; rewrite the call as `asyncio.run(main())` to run \
-                     it, or make `main` a plain `def`"
-                        .to_string()
-                        .into(),
+        // and RUN the body -- output CPython never prints, a silent
+        // divergence.
+        //
+        // Two things make this a real analysis rather than a presence test
+        // (Devin review on #462):
+        //
+        //  - the CALL is found through the one statement visitor
+        //    (`visit::any_stmt`, `Descend::SkipDefs` — a nested def's call
+        //    is not module-init code), not a hand-written `If` match, so a
+        //    call inside a `try`/`with`/`for` at module scope is found too;
+        //  - the refusal requires the binding ACTIVE AT THE CALL to be
+        //    async. A later `def main` replaces the `async def`, and then
+        //    the call is an ordinary synchronous one.
+        //
+        // Modelling a never-awaited coroutine (the discarded object and the
+        // RuntimeWarning) is not implemented, so this refuses at conversion
+        // time, with the call's own source location.
+        if let Some((stmt, async_at_call)) = module_level_async_main_call(&self.raw.body) {
+            if async_at_call {
+                let location = crate::SourceLocation::with_position(
+                    module_filename.clone(),
+                    stmt.lineno,
+                    stmt.col_offset.map(|c| c + 1),
                 );
+                return Err(Box::from(crate::codegen_error(
+                    location,
+                    "`async def main()` is called without `await`, so CPython only \
+                     creates the coroutine and the body never runs (it prints \n\
+                     nothing and warns `coroutine 'main' was never awaited`). rython \
+                     cannot reproduce a never-awaited coroutine yet, and would \
+                     otherwise RUN the body instead",
+                    "rewrite the call as `asyncio.run(main())` to run it, or make \
+                     `main` a plain `def`",
+                )));
             }
         }
 
@@ -6336,6 +6336,52 @@ fn hoisted_declarations(
 /// their location; this substitutes the actual filename and preserves the
 /// structured fields (message, help) so downstream consumers — the proc
 /// macro in particular — can render precise diagnostics.
+/// Find a module-level call to the module's own `main`, and whether the
+/// binding active AT THAT CALL is an `async def` (issue #455).
+///
+/// The walk goes through the one statement visitor so every module-level
+/// body form is covered; `Descend::SkipDefs` because a nested definition's
+/// call is not module-init code. The call is any `Expr` statement whose
+/// value calls the name `main`, at module level or inside a guard
+/// (`if __name__ == "__main__":`).
+fn module_level_async_main_call(
+    body: &[crate::Statement],
+) -> Option<(&crate::Statement, bool)> {
+    use crate::ast::tree::visit::{any_stmt, Descend};
+    // Is `main` an `async def` at the point this statement runs? The module
+    // body is a straight line modulo control flow, so the LAST definition
+    // before the call wins; a definition AFTER the call has not run yet.
+    fn async_at(body: &[crate::Statement], call_index: usize) -> bool {
+        let mut answer = false;
+        for s in body.iter().take(call_index + 1) {
+            match &s.statement {
+                crate::StatementType::AsyncFunctionDef(f) if f.name == "main" => answer = true,
+                crate::StatementType::FunctionDef(f) if f.name == "main" => answer = false,
+                _ => {}
+            }
+        }
+        answer
+    }
+    for (index, s) in body.iter().enumerate() {
+        let mut found = false;
+        any_stmt(std::slice::from_ref(s), Descend::SkipDefs, |inner| {
+            let calls_main = match &inner.statement {
+                crate::StatementType::Expr(e) => Module::is_main_function_call(&e.value),
+                _ => false,
+            };
+            if calls_main {
+                found = true;
+                return true;
+            }
+            false
+        });
+        if found {
+            return Some((s, async_at(body, index)));
+        }
+    }
+    None
+}
+
 fn wrap_module_error(
     filename: &str,
     e: Box<dyn std::error::Error>,
