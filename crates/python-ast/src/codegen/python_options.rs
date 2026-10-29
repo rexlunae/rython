@@ -719,6 +719,13 @@ pub struct PythonOptionsData {
     /// importing `helper.py` beside it (Devin review on #460).
     pub unindexed_crate_modules: bool,
 
+    /// Whether the body being rendered is an `async def` body, where
+    /// `.await` is legal. An explicit option rather than a context test:
+    /// the call lowering needs the answer for `asyncio.run` (issue #463 —
+    /// in async code it awaits, in sync code it blocks), and the def is the
+    /// only thing that knows.
+    pub in_async_def: bool,
+
     /// Cross-module class knowledge: parsed ASTs of the sibling modules of
     /// the generated crate (vendored `[python-modules]` deps and the
     /// package's own modules), keyed by module path. ImportFrom lowering
@@ -937,6 +944,7 @@ impl Default for PythonOptionsData {
             module_name_types: None,
             rust_modules: std::rc::Rc::new(std::collections::HashMap::new()),
             unindexed_crate_modules: false,
+            in_async_def: false,
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),
             module_defs: std::rc::Rc::new(std::collections::HashMap::new()),
             in_module_init_body: false,

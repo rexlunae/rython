@@ -2335,6 +2335,10 @@ impl FunctionDef {
         // Issue #448: the name-scoped fields below describe THIS body;
         // return inference for any other function strips them.
         options.name_scope_owner = self.body.as_ptr() as usize;
+        // Whether `.await` is legal in this body (issue #463): an `async
+        // def`, identified by the context the caller installed (the
+        // AsyncFunctionDef dispatch wraps it in `CodeGenContext::Async`).
+        options.in_async_def = ctx.exists_in_async();
         // Issue #115: this function may write exactly the mutable statics
         // its own `global` statements declare; every other scope's
         // grant (the module's all-of-them default in particular) does not

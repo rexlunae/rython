@@ -63,6 +63,20 @@ pub enum CodeGenContext {
 impl CodeGenContext {
     /// Whether code generated here runs inside a try-block closure, so a
     /// raised exception can `return Err(...)` to be caught by its handlers.
+    /// Whether this context is inside an `async def` body — where `.await`
+    /// is legal. `Loop`/`Try`/handler contexts NEST the parent, so the
+    /// answer walks the chain rather than testing one variant: a call
+    /// inside `async def f(): for ...: asyncio.run(g())` is still async.
+    pub fn exists_in_async(&self) -> bool {
+        match self {
+            CodeGenContext::Async(_) => true,
+            CodeGenContext::Loop { parent, .. }
+            | CodeGenContext::TryBlock { parent, .. }
+            | CodeGenContext::ExceptHandler { parent } => parent.exists_in_async(),
+            _ => false,
+        }
+    }
+
     pub fn in_try_block(&self) -> bool {
         match self {
             CodeGenContext::TryBlock { .. } => true,
