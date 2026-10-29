@@ -29442,10 +29442,11 @@ fn a_non_entry_async_main_call_is_not_refused() {
     // module body's final statement -- takes the ordinary path and is not
     // refused, even though `main` IS an `async def`.
     //
-    // (That shape currently generates a crate that does not build, for an
-    // unrelated pre-existing reason: issue #464's duplicate-`main`. This
-    // test pins only the boundary the #455 change owns -- that the
-    // conversion is not refused.)
+    // This test pins only the boundary the #455 change owns -- that the
+    // conversion is not refused. (The duplicate-`main` item this shape used
+    // to emit is fixed by issue #464; the crate it produces still omits the
+    // `.await` the wrapper needs, which is the separate never-awaited
+    // coroutine gap tracked in #455.)
     let out = compile(
         concat!(
             "async def main() -> None:\n",
@@ -29487,10 +29488,11 @@ fn a_sync_redefinition_of_main_makes_the_call_ordinary() {
         "rebound_main.py",
     );
     // This test governs ONE thing: the #455 refusal must not fire, because
-    // the binding at the call is synchronous. (The generated crate still
-    // emits both items and does not build — a SEPARATE, pre-existing
-    // duplicate-`main` defect that fails identically on `main`, reported in
-    // issue #464 rather than absorbed here.)
+    // the binding at the call is synchronous. (The duplicate `main` item
+    // this shape used to emit — so the crate did not build — is fixed by
+    // issue #464: only the last binding is emitted, and
+    // `a_shadowed_top_level_main_definition_emits_only_the_last_binding`
+    // pins that shape.)
     assert!(
         out.contains("sync version"),
         "the synchronous definition must be emitted: {out}"
@@ -29575,5 +29577,150 @@ fn a_guarded_assignment_from_an_async_main_is_refused() {
         err.contains("async def main"),
         "the guarded-assignment spelling must be refused: {}",
         err
+    );
+}
+
+#[test]
+fn a_shadowed_top_level_main_definition_emits_only_the_last_binding() {
+    // Issue #464: Python's module scope REBINDS a name; only the last binding
+    // is observable, so only one Rust item may be emitted (two is E0428).
+    // This pins the SHAPE; the end-to-end pin that builds and runs lives in
+    // crates/rypip/tests/convert_tests.rs (a codegen-text assertion cannot
+    // see a duplicate item, which is how the defect shipped).
+    let out = compile(
+        concat!(
+            "async def main() -> None:\n",
+            "    print(\"async version\")\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(\"sync version\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+        "shadowed_main.py",
+    );
+    // The shadowed definition must be GONE, not merely unreferenced.
+    assert!(
+        !out.contains("async version"),
+        "the shadowed `async def main` must not be emitted: {out}"
+    );
+    assert!(
+        out.contains("sync version"),
+        "the last binding must be emitted: {out}"
+    );
+    // Exactly one `main` item: the entry, and no `python_main` rename of a
+    // definition that no longer exists.
+    // Token streams render with a space before the paren.
+    assert_eq!(
+        out.matches("fn main (").count(),
+        1,
+        "exactly one `main` item may be emitted: {out}"
+    );
+    assert!(
+        !out.contains("fn python_main ("),
+        "no shadowed definition may be renamed into existence: {out}"
+    );
+}
+
+#[test]
+fn a_shadowed_class_body_that_does_work_is_refused() {
+    // Issue #464 (Devin review on #465). A class body RUNS where the
+    // statement stands; CPython prints both bodies:
+    //
+    // Verified against python3:
+    //   $ python3 shadowed_class_effects.py
+    //   class body runs
+    //   second body
+    //
+    // The generated crate holds one item per name, so dropping the earlier
+    // definition would lose the first body's output. Refused loudly instead
+    // of silently different.
+    let err = compile_err(
+        concat!(
+            "class Foo:\n",
+            "    print(\"class body runs\")\n",
+            "\n",
+            "\n",
+            "class Foo:\n",
+            "    print(\"second body\")\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+        "shadowed_class_effects.py",
+    );
+    assert!(
+        err.contains("`Foo` is defined twice") && err.contains("class body"),
+        "the refusal names the construct: {err}"
+    );
+    assert!(
+        err.contains("line 1") && err.contains("line 5"),
+        "the refusal names both lines: {err}"
+    );
+}
+
+#[test]
+fn a_shadowed_class_with_an_inert_body_emits_one_struct() {
+    // The SAFE half: a body of literal field stores performs no call, so the
+    // earlier definition is indistinguishable from never having run.
+    let out = compile(
+        concat!(
+            "class Foo:\n",
+            "    x = 2\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(Foo.x)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+        "shadowed_class_inert.py",
+    );
+    assert_eq!(
+        out.matches("struct Foo").count(),
+        1,
+        "exactly one `struct Foo` may be emitted: {out}"
+    );
+}
+
+#[test]
+fn a_shadowed_definition_under_module_control_flow_is_not_deduped() {
+    // The last-write-wins rule is for UNCONDITIONAL top-level definitions.
+    // A `def` under `if cond:` binds only when the branch runs, so the
+    // emission must leave both in place rather than assume the later one
+    // wins — Python raises NameError on the untaken path, and silently
+    // dropping one would be that divergence.
+    //
+    // Verified against python3:
+    //   $ python3 conditional_def.py
+    //   v1
+    let out = compile(
+        concat!(
+            "def helper() -> None:\n",
+            "    print(\"v1\")\n",
+            "\n",
+            "\n",
+            "if False:\n",
+            "    def helper() -> None:\n",
+            "        print(\"v2\")\n",
+            "\n",
+            "\n",
+            "helper()\n",
+        ),
+        "conditional_def.py",
+    );
+    assert!(
+        out.contains("v1"),
+        "the unconditional definition stays: {out}"
     );
 }

@@ -386,6 +386,55 @@ impl CodeGen for Module {
             });
         }
         
+        // Issue #464: a top-level `def`/`class` REBINDS its name in Python;
+        // only the last binding is observable AFTER the rebinding, so only
+        // the last item may be emitted (two items under one name is E0428 in
+        // the generated crate). Drop the shadowed definitions from the body
+        // the emission walks — the entry machinery reads the same
+        // `self.raw.body`, so fixing it here keeps the entry decision and the
+        // item emission in agreement (see `shadowed_top_level_definitions`).
+        //
+        // Only the SAFE case is deduped. A definition CPython observably runs
+        // (a decorator, a default, a class body that does work) or one whose
+        // name the module reads before the rebind is refused loudly: pruning
+        // it would silently change which body runs or lose its creation
+        // effect (Devin review on #465).
+        match Self::shadowed_top_level_definitions(&self.raw.body) {
+            Ok(shadowed) if !shadowed.is_empty() => {
+                let kept: Vec<crate::Statement> = self
+                    .raw
+                    .body
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| !shadowed.contains(index))
+                    .map(|(_, s)| s.clone())
+                    .collect();
+                self.raw.body = kept;
+            }
+            Ok(_) => {}
+            Err(conflict) => {
+                let at = |line: Option<usize>| {
+                    line.map(|l| format!("line {l}")).unwrap_or_else(|| "an unnamed line".to_string())
+                };
+                let first = at(conflict.first_line);
+                let second = at(conflict.second_line);
+                return Err(wrap_module_error(
+                    &module_filename,
+                    format!(
+                        "`{}` is defined twice at module level ({first} and {second}), and \
+                         {}; rython emits one item per module name (the last binding, as \
+                         Python leaves it), so dropping the earlier definition would lose \
+                         what CPython does when it runs that statement — and CPython \
+                         behaviour is what the program must reproduce; rename one of the two \
+                         definitions, or delete the earlier one if nothing between them \
+                         needs it",
+                        conflict.name,
+                        conflict.reason,
+                    )
+                    .into(),
+                ));
+            }
+        }
         // Add async runtime dependency if async functions are detected.
         // We'll check this early so we can add the import at the top. The
         // import is only emitted for generated BINARY crates
@@ -4272,7 +4321,8 @@ pub(crate) fn normalized_body_of(
     ctx.statically_none_names = std::rc::Rc::default();
     ctx.statically_false_names = std::rc::Rc::default();
     ctx.statically_module_names = std::rc::Rc::default();
-    let body = std::rc::Rc::new(normalize_module_body(module.raw.body.clone(), &ctx).ok()?.body);
+    let body = normalize_module_body(module.raw.body.clone(), &ctx).ok()?.body;
+    let body = std::rc::Rc::new(body);
     options
         .normalized_bodies
         .borrow_mut()
@@ -6315,6 +6365,219 @@ fn hoisted_declarations(
     out
 }
 
+/// Whether a `__name__ == "__main__"` guard body contains a `main()`
+/// call that is NOT awaited, in a module whose binding of `main` at the
+/// guard is an `async def` (issue #464).
+///
+/// CPython creates a coroutine and never awaits it: the body does not
+/// run and CPython warns. The wrapper emission in `to_rust` renames the
+/// user's `main` and CALLS it from the generated entry — running a body
+/// CPython never runs — and, for the async definition, emits a call
+/// missing `.await` that rustc rejects (E0277). Refusing is the loud
+/// form of the #455 rule.
+///
+/// Descends through control flow (`Descend::Control` — an `if` in the
+/// guard, a `for`, a `try`) but not into nested scopes: a `main()` call
+/// inside a nested `def` is that function's body, not the guard's. The
+/// walk uses the shared visitor, never a local match over statement
+/// forms (AGENTS.md).
+fn guard_body_calls_main_unawaited(
+    guard_body: &[crate::Statement],
+    module_body: &[crate::Statement],
+) -> bool {
+    use crate::ast::tree::visit::{walk_stmts, Descend, Flow};
+    // The binding of `main` the guard sees: the last `def`/`async def`
+    // above it decides (Python's last-write-wins module scope). The
+    // guard is the last statement that calls it in this shape, so the
+    // module's LAST definition is the one that runs.
+    let mut main_is_async = false;
+    for s in module_body {
+        match &s.statement {
+            crate::StatementType::AsyncFunctionDef(f) if f.name == "main" => {
+                main_is_async = true
+            }
+            crate::StatementType::FunctionDef(f) if f.name == "main" => main_is_async = false,
+            _ => {}
+        }
+    }
+    if !main_is_async {
+        return false;
+    }
+    let mut calls = false;
+    walk_stmts(guard_body, Descend::SkipDefs, &mut |s| {
+        // A statically FALSE branch never runs, so a call there is not a
+        // never-awaited coroutine: `if False: main()` is dead code, and the
+        // refusal would reject a program CPython runs (Devin review on
+        // #465). Only the `else` arm is live.
+        //
+        // `if TYPE_CHECKING:` is deliberately NOT excluded here: the
+        // wrapper emission still lowers such a body (a separate, pre-existing
+        // emitter defect), so excluding it would convert a program whose
+        // crate does not build. Refusing stays the loud answer until the
+        // emitter skip lands.
+        if let crate::StatementType::If(i) = &s.statement
+            && is_literal_false(&i.test)
+        {
+            // Visit the `else` arm only — the taken path when the branch is
+            // statically false.
+            walk_stmts(&i.orelse, Descend::SkipDefs, &mut |inner| {
+                scan_guard_stmt(inner, &mut calls);
+                Flow::Continue
+            });
+            return Flow::Skip;
+        }
+        scan_guard_stmt(s, &mut calls);
+        if calls {
+            Flow::Stop
+        } else {
+            Flow::Continue
+        }
+    });
+    calls
+}
+
+/// Record a `main()` call in `s` itself (not a nested statement).
+fn scan_guard_stmt(s: &crate::Statement, calls: &mut bool) {
+    for e in crate::ast::tree::visit::stmt_exprs(s) {
+        if Module::is_main_function_call(e) {
+            *calls = true;
+        }
+    }
+}
+
+/// Whether a test is the literal `False` (a statically dead branch).
+fn is_literal_false(test: &crate::ExprType) -> bool {
+    matches!(
+        test,
+        crate::ExprType::Constant(c)
+            if matches!(&c.0, Some(litrs::Literal::Bool(b)) if !b.value())
+    )
+}
+
+/// Why a shadowed top-level definition cannot be dropped (issue #464,
+/// Devin review on #465).
+///
+/// Python EXECUTES a `def`/`class` statement where it stands: the decorators
+/// run, the defaults evaluate, the class body runs. A later definition
+/// rebinds the name, but everything the earlier one DID has already
+/// happened, and a call between the two runs the earlier binding. Dropping
+/// the statement is only correct when neither effect is observable —
+/// otherwise the emission must refuse rather than silently change what the
+/// program prints.
+pub(crate) struct ShadowedDefinitionConflict {
+    /// The shadowed definition's name.
+    pub name: String,
+    /// The shadowed definition's line.
+    pub first_line: Option<usize>,
+    /// The rebinding definition's line.
+    pub second_line: Option<usize>,
+    /// What makes dropping observable: a creation effect, or an
+    /// intermediate use.
+    pub reason: String,
+}
+
+/// The name a top-level `def`/`async def`/`class` statement binds.
+fn top_level_definition_name(s: &crate::Statement) -> Option<&str> {
+    match &s.statement {
+        crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
+            Some(f.name.as_str())
+        }
+        crate::StatementType::ClassDef(c) => Some(c.name.as_str()),
+        _ => None,
+    }
+}
+
+/// Why the DEFINITION STATEMENT itself is observable, so dropping it would
+/// lose an effect CPython performs (`None` when it is inert).
+///
+/// A `def`/`class` runs where it stands. Its observable work is the
+/// decorators (a call each), the default expressions (evaluated in the
+/// enclosing scope), and a class body's own statements. A plain
+/// `def f(): ...` with no decorators and no defaults does nothing
+/// observable, so dropping it is indistinguishable.
+fn definition_effect_reason(s: &crate::Statement, name: &str) -> Option<String> {
+    match &s.statement {
+        crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
+            if !f.decorator_list.is_empty() {
+                return Some(format!(
+                    "the definition of `{name}` carries a decorator, which CPython RUNS when \
+                     the statement executes"
+                ));
+            }
+            let a = &f.args;
+            if !a.defaults.is_empty() || a.kw_defaults.iter().any(|d| d.is_some()) {
+                return Some(format!(
+                    "the definition of `{name}` has a default expression, which CPython \
+                     EVALUATES when the statement executes"
+                ));
+            }
+            None
+        }
+        crate::StatementType::ClassDef(c) => {
+            // A class body runs. A body that is only a docstring / `pass` /
+            // annotations with no runtime statement is inert; anything else
+            // may do work, and so may a base or keyword expression.
+            if !c.bases.is_empty() || !c.keywords.is_empty() {
+                return Some(format!(
+                    "the class body of `{name}` names a base or a keyword, whose expression \
+                     CPython EVALUATES when the statement executes"
+                ));
+            }
+            let effects = c.body.iter().any(|bs| {
+                !matches!(
+                    bs.statement,
+                    crate::StatementType::Pass
+                        | crate::StatementType::AnnotatedName { .. }
+                        | crate::StatementType::FunctionDef(_)
+                        | crate::StatementType::AsyncFunctionDef(_)
+                        | crate::StatementType::ClassDef(_)
+                )
+            });
+            effects.then(|| {
+                format!(
+                    "the class body of `{name}` runs statements CPython EXECUTES when the \
+                     definition statement executes"
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Why a USE of `name` sits BETWEEN the shadowed definition and its rebind
+/// (`None` when nothing reads the name there).
+///
+/// An intermediate use sees the EARLIER binding. The generated crate has one
+/// item, so the call would reach the LATER definition — a silent divergence.
+fn intermediate_use_reason(
+    body: &[crate::Statement],
+    name: &str,
+    from: usize,
+    to: usize,
+) -> Option<String> {
+    use crate::ast::tree::visit::{any_expr, any_stmt, stmt_exprs, Descend};
+    let between = &body[from + 1..to];
+    if between.is_empty() {
+        return None;
+    }
+    // A reference anywhere in the statements BETWEEN the two bindings. Nested
+    // scopes count: a function defined there but CALLED after the rebind
+    // still reads the name at call time, which cannot be ordered statically,
+    // so the scan is conservative.
+    let reads = any_stmt(between, Descend::All, |s| {
+        stmt_exprs(s)
+            .into_iter()
+            .any(|e| any_expr(e, |x| matches!(x, crate::ExprType::Name(n) if n.id == name)))
+    });
+    reads.then(|| {
+        format!(
+            "the module reads `{name}` between its two definitions; CPython resolves that \
+             use to the FIRST definition, and the generated crate holds one item per name"
+        )
+    })
+}
+
+
 /// Rebuild a statement-level codegen error so it points at the module's real
 /// source file. Statement errors carry a `<module>` placeholder filename in
 /// their location; this substitutes the actual filename and preserves the
@@ -6356,8 +6619,18 @@ fn unawaited_async_main_entry(
             crate::StatementType::If(i) => {
                 is_main_guard(&i.test)
                     && !Module::is_type_checking_test(&i.test)
-                    && Module::is_simple_main_call_block(&i.body)
                     && !user_main_returns_value
+                    && (Module::is_simple_main_call_block(&i.body)
+                        // Issue #464: a guard with MORE than one statement
+                        // takes the WRAPPER path, which renames the user's
+                        // `main` to `python_main` and calls it from the
+                        // generated entry. For an `async def main` that call
+                        // is a never-awaited coroutine too, so CPython runs
+                        // nothing while the wrapper would run the body — the
+                        // same #455 divergence, reached by the other
+                        // emission path. Cover both spellings here so the
+                        // refusal and the entry machinery agree.
+                        || guard_body_calls_main_unawaited(&i.body, body))
             }
             // The bare final-call spelling (issue #431).
             _ if index == last_index => {
@@ -6461,6 +6734,89 @@ impl Module {
         }
     }
     
+/// The body INDEX of each top-level definition that is SHADOWED by a later
+/// definition of the same name (issue #464).
+///
+/// Python's module scope is a namespace, not a set of items: a second
+/// `def f` or `class C` at top level REBINDS the name, and only the last
+/// binding is observable AFTERWARDS (verified against python3: a module with
+/// two `def helper` runs the second, and `helper.__code__` is the second
+/// one's). Rust has one item per name, so emitting both is E0428 — a failure
+/// at a generated line that never names the Python source. This computes the
+/// set the emission must DROP so it emits exactly one item per name, last
+/// binding wins.
+///
+/// Only a definition can shadow a definition: a plain store of the name
+/// (`f = 1` above the `def f`) is already refused by the emit loop's
+/// `stored_above` rule, and an import that rebinds a definition by
+/// `defined_above`. This is the third case in the same family.
+///
+/// A definition under module-level CONTROL FLOW (`if cond: def f`) is not
+/// top level: whether it binds depends on the branch, and the straight-line
+/// rule above would be wrong. Those are skipped here (the emitter lowers
+/// them by its own rules), so this only answers for the unconditional
+/// top-level definitions the loop in `to_rust` sees.
+///
+/// Dropping is refused (`Err`) when the earlier definition is OBSERVABLE.
+/// CPython runs a `def` where it stands (decorators, defaults, a class body)
+/// and a call between the two bindings reaches the FIRST one:
+/// `def f(): print("a")` / `f()` / `def f(): ...` prints "a", and pruning
+/// alone would silently print the second. The safe cases — the overwhelmingly
+/// common ones, a plain redefinition nothing reads before the rebind — are
+/// deduped; the observable ones are refused loudly, naming both lines.
+fn shadowed_top_level_definitions(
+    body: &[crate::Statement],
+) -> Result<std::collections::HashSet<usize>, ShadowedDefinitionConflict> {
+    // Every index that binds each name, in source order.
+    let mut bindings: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, s) in body.iter().enumerate() {
+        if let Some(name) = top_level_definition_name(s) {
+            bindings.entry(name).or_default().push(index);
+        }
+    }
+    // A class whose base is its own name AFTER an earlier definition of it
+    // is the SELF-REFERENCE shape: CPython resolves the base against the
+    // earlier binding, so the result is a cycle. The dedicated
+    // cyclic-inheritance refusal names that precisely; a generic
+    // redefinition message would be the worse diagnostic for the same
+    // program, so leave the body alone and let that check report.
+    let self_referential = body.iter().any(|s| {
+        let crate::StatementType::ClassDef(c) = &s.statement else {
+            return false;
+        };
+        c.bases
+            .iter()
+            .any(|b| matches!(b, crate::ExprType::Name(n) if n.id == c.name))
+    });
+    if self_referential {
+        return Ok(std::collections::HashSet::new());
+    }
+
+    let mut drop = std::collections::HashSet::new();
+    for (name, indices) in bindings.iter() {
+        if indices.len() < 2 {
+            continue;
+        }
+        let last = *indices.last().expect("non-empty");
+        for &index in indices.iter().filter(|i| **i != last) {
+            let conflict = definition_effect_reason(&body[index], name)
+                .or_else(|| intermediate_use_reason(body, name, index, last))
+                .map(|reason| ShadowedDefinitionConflict {
+                    name: (*name).to_string(),
+                    first_line: body[index].lineno,
+                    second_line: body[last].lineno,
+                    reason,
+                });
+            if let Some(conflict) = conflict {
+                return Err(conflict);
+            }
+            drop.insert(index);
+        }
+    }
+    Ok(drop)
+}
+
     /// The module body's FIRST statement, ignoring the module docstring
     /// (a leading string constant expression, which binds nothing and is
     /// emitted as `#![doc]` rather than a statement).
