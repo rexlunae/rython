@@ -48,9 +48,9 @@ in as the oracle. The pinned surface includes:
 - **Sort stability** and comparison behavior.
 - **Exception raising and messages**: exceptions are raised where
   CPython raises them, with pinned message text across the verified
-  surface. (Handler *matching* is exact-name plus
-  `Exception`/`BaseException` catch-alls — the hierarchy in between is
-  not modeled; see the ledger, [spec §12.3](spec.md).)
+  surface. Handler matching follows the built-in exception hierarchy
+  and modeled user-class ancestry; see [spec §8.1 and §12.3](spec.md)
+  for the supported cases and limitations.
 - **Stdlib output shapes**: `argparse` help/error text, `csv` quoting,
   `datetime.strptime`, `random` with a given seed (MT19937,
   operation-for-operation), `heapq`'s exact list layout, and so on.
@@ -127,9 +127,10 @@ values). Python's aliasing is **not modeled**.
 
 ### Exceptions: same surface, different plumbing
 
-Python semantics — `try`/`except`/`else`/`finally`, typed handlers
-matched by exception name (`Exception` catches everything; the
-hierarchy in between is not yet modeled) — are reproduced, including
+Python semantics — `try`/`except`/`else`/`finally` and typed handlers
+matched through exception ancestry — are reproduced for the supported
+cases. `Exception` does not catch `SystemExit`, `KeyboardInterrupt`, or
+`GeneratorExit`. These cases include
 `ZeroDivisionError` raised from `//` and `%` at the exact point CPython
 raises it (true division `/` does not raise yet — issue #107).
 Underneath,
@@ -161,14 +162,15 @@ f-string and `str.format` templates that are literals.
   decorator-heavy metaprogramming must be restructured (usually into
   explicit dispatch) before porting.
 
-### Concurrency: no GIL, but also no `threading` yet
+### Concurrency
 
 CPython's GIL caps Python-level parallelism; Rython's output has no GIL
 and no interpreter, so nothing structural prevents real parallelism.
-However, Python's `threading`/`multiprocessing`/`asyncio` surfaces are
-not currently part of the supported subset — today, concurrency is
-something you add *in Rust* after converting (the generated crate is
-yours to extend), not something you port from Python source.
+The std tier supports a subset of `threading`, including threads, locks,
+events, semaphores, and thread-local storage; see [spec §10.5](spec.md)
+for the supported forms and restrictions. Some `asyncio` forms are also
+supported with the `async-tokio` feature. Other concurrency APIs and
+unsupported forms may require refactoring or Rust integration.
 
 ### Performance profile
 
