@@ -646,7 +646,7 @@ impl TextTestResult {
     fn add_exception(&mut self, description: &str, e: &PyException) {
         let traceback = alloc::format!(
             "Traceback (most recent call last):\n{}\n",
-            exception_only(e)
+            e.format_exception_only()
         );
         if e.matches_builtin(crate::builtin_exceptions::BuiltinException::AssertionError) {
             self.failures.push((description.into(), traceback));
@@ -742,16 +742,6 @@ fn status_char(c: char) {
     let mut err = std::io::stderr();
     let _ = write!(err, "{c}");
     let _ = err.flush();
-}
-
-/// `traceback.format_exception_only`'s line: the type, then `: message`
-/// when the message is not empty (`raise ValueError()` prints `ValueError`).
-fn exception_only(e: &PyException) -> alloc::string::String {
-    if e.message.is_empty() {
-        e.type_name()
-    } else {
-        alloc::format!("{}: {}", e.type_name(), e.message)
-    }
 }
 
 pub fn main() -> Result<(), PyException> {

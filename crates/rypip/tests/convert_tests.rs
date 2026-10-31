@@ -12959,6 +12959,93 @@ fn unittest_main_exits_after_a_tests_worker_thread_finishes() {
     assert_eq!(code, 0);
 }
 
+/// Convert, build and run a single-file program: (stdout, stderr, exit).
+fn run_single_file(name: &str, source: &str) -> (String, String, i32) {
+    let scratch = Scratch::new(name);
+    let file = scratch.path().join(format!("{name}.py"));
+    fs::write(&file, source).unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    assert!(build_generated(&krate.root).success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join(format!("target/debug/{name}")))
+        .output()
+        .expect("running generated binary");
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
+#[test]
+fn an_uncaught_exception_prints_cpythons_final_line() {
+    // Issue #479: a guarded `main()` with no module-level code made the
+    // user's `fn main() -> Result<..>` the Rust entry, so Rust printed
+    // `Error: PyException { message: "boom", ... }`. Every entry now reports
+    // as CPython does: the traceback header and final line (rython has no
+    // frames — docs/spec.md §12.3), exit 1, stdout flushed first.
+    //
+    // Verified against python3 (3.14.4); the traceback's frame lines are
+    // elided from the expectation.
+    let (stdout, stderr, code) = run_single_file(
+        "uncaught_plain",
+        concat!(
+            "def main() -> None:\n",
+            "    print(\"before\")\n",
+            "    raise ValueError(\"boom\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    assert_eq!(stdout, "before\n");
+    assert_eq!(stderr, "Traceback (most recent call last):\nValueError: boom\n");
+    assert_eq!(code, 1);
+
+    // An empty message is the bare type (`ValueError`, not `ValueError: `),
+    // and output without a newline is flushed before the report.
+    let (stdout, stderr, code) = run_single_file(
+        "uncaught_empty",
+        concat!(
+            "def main() -> None:\n",
+            "    print(\"no newline\", end=\"\")\n",
+            "    raise ValueError()\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    assert_eq!(stdout, "no newline");
+    assert_eq!(stderr, "Traceback (most recent call last):\nValueError\n");
+    assert_eq!(code, 1);
+
+    // The wrapped entry (module-level code runs first) reports the same way.
+    let (stdout, stderr, code) = run_single_file(
+        "uncaught_init",
+        concat!(
+            "LIMIT = [1, 2]\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(len(LIMIT))\n",
+            "    raise IndexError(\"list index out of range\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    );
+    assert_eq!(stdout, "2\n");
+    assert_eq!(
+        stderr,
+        "Traceback (most recent call last):\nIndexError: list index out of range\n"
+    );
+    assert_eq!(code, 1);
+}
+
 #[test]
 fn a_one_argument_key_error_prints_its_argument_repr() {
     // Issue #475: `KeyError.__str__` is `repr(arg)` for one argument, so a

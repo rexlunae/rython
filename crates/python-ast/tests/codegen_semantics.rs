@@ -28932,8 +28932,9 @@ fn unguarded_module_level_main_call_becomes_the_entry_point() {
         "def main() -> None:\n    print(\"hi\")\n\n\nmain()\n",
         "prog.py",
     );
-    // The user's main is the entry point: exactly one `fn main`, no
-    // `pub fn main` beside it, and no `python_main` rename either.
+    // ONE process entry point — the generated wrapper, which reports an
+    // uncaught exception as CPython does (issue #479) — calling the user's
+    // main, renamed `python_main`; no `pub fn main` beside it.
     assert_eq!(
         out.matches(" fn main (").count(),
         1,
@@ -28945,9 +28946,15 @@ fn unguarded_module_level_main_call_becomes_the_entry_point() {
         "a `pub fn main` beside the entry point is E0428: {}",
         out
     );
+    assert_eq!(
+        out.matches("fn python_main (").count(),
+        1,
+        "the user's main runs under the entry as `python_main`: {}",
+        out
+    );
     assert!(
-        !out.contains("python_main"),
-        "the simple-main path must not reach the rename fallback: {}",
+        out.contains("stdpython :: exit_uncaught (& e)"),
+        "the entry reports an uncaught exception as CPython does: {}",
         out
     );
     // The `#[allow(dead_code)]` convention: rypip compiles the entry module
@@ -28958,19 +28965,24 @@ fn unguarded_module_level_main_call_becomes_the_entry_point() {
         "the entry point carries the dead-code allowance: {}",
         out
     );
-    // The entry name stays the user's `main`: it is not renamed, so the
-    // body is the user's, with no module-init indirection required when
-    // there is no module-level code.
+    // The user's body is emitted (under `python_main`).
     assert!(
         out.contains("print (& (\"hi\"))"),
-        "the user's main body is the entry's body: {}",
+        "the user's main body is emitted: {}",
         out
     );
-    // No `main()` call is left inside `__module_init__` (it would run the
-    // entry point as module init code, before the binary's own entry).
+    // The one call is the entry's `python_main()?`; no `main()` call is left
+    // inside `__module_init__` (it would run the program body as module init
+    // code, before the binary's own entry).
+    assert_eq!(
+        out.matches("main () ?").count(),
+        1,
+        "only the entry calls the user's main: {}",
+        out
+    );
     assert!(
-        !out.contains("main () ?"),
-        "the module-level call must not also run as module init code: {}",
+        out.contains("python_main () ?"),
+        "only the entry calls the user's main: {}",
         out
     );
 }
@@ -29043,9 +29055,15 @@ fn the_guarded_main_call_is_unchanged() {
         "the guard yields one entry point: {}",
         out
     );
+    assert_eq!(
+        out.matches("fn python_main (").count(),
+        1,
+        "the user's main runs under the generated entry (issue #479): {}",
+        out
+    );
     assert!(
-        !out.contains("python_main"),
-        "a guard with no module-level code keeps the direct entry: {}",
+        out.contains("stdpython :: exit_uncaught (& e)"),
+        "the entry reports an uncaught exception as CPython does: {}",
         out
     );
 }
@@ -29611,17 +29629,19 @@ fn a_shadowed_top_level_main_definition_emits_only_the_last_binding() {
         out.contains("sync version"),
         "the last binding must be emitted: {out}"
     );
-    // Exactly one `main` item: the entry, and no `python_main` rename of a
-    // definition that no longer exists.
+    // Exactly one entry and exactly one user `main` (renamed `python_main`
+    // under the generated entry, issue #479): the shadowed definition is not
+    // renamed into existence beside it.
     // Token streams render with a space before the paren.
     assert_eq!(
-        out.matches("fn main (").count(),
+        out.matches(" fn main (").count(),
         1,
-        "exactly one `main` item may be emitted: {out}"
+        "exactly one entry point may be emitted: {out}"
     );
-    assert!(
-        !out.contains("fn python_main ("),
-        "no shadowed definition may be renamed into existence: {out}"
+    assert_eq!(
+        out.matches("fn python_main (").count(),
+        1,
+        "exactly one user `main` may be emitted: {out}"
     );
 }
 

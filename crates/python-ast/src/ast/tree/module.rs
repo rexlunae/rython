@@ -3071,61 +3071,41 @@ impl CodeGen for Module {
         // Python, so it must not surface as a build warning.
         if has_main_code {
             if is_simple_main_call_pattern {
-                // Simple main() call pattern - use user's main function directly as Rust entry point
-                // Don't rename the user's main function, just add module init call if needed
+                // Simple main() call pattern: the user's main, renamed
+                // `python_main`, under a generated entry.
                 let stream_str = stream.to_string();
                 
                 // Check if the user's main function is async
                 let user_main_is_async = stream_str.contains("pub async fn main (");
                 
                 if user_main_is_async {
-                    // User's async main becomes the Rust entry point. The
+                    // The user's async main runs under a generated entry
+                    // (issue #479): renamed `python_main`, awaited by an
+                    // `async fn main` that runs the startup sequence and
+                    // reports an uncaught exception as CPython does. The
                     // runtime attribute is gated on the generated crate's
                     // `async-tokio` feature (rypip declares it default-on
-                    // for async binaries); without it a compile_error names
-                    // the fix instead of a bare "no main function".
+                    // for async binaries).
                     let runtime_attr = options.async_runtime.main_attribute();
                     let attr_tokens: proc_macro2::TokenStream = runtime_attr.parse()
                         .unwrap_or_else(|_| quote!(tokio::main)); // fallback to tokio::main
-                    
-                    // Replace the user's function signature and add the
-                    // feature-gated attribute.
-                    let new_stream_str = stream_str
-                        .replace(
-                            "pub async fn main (",
-                            &format!(
-                                "#[allow(dead_code)] #[cfg_attr(feature = \"{}\", {})] async fn main(",
-                                ASYNC_RUNTIME_FEATURE,
-                                runtime_attr
-                            ),
-                        );
-                    stream = new_stream_str.parse::<proc_macro2::TokenStream>()
+                    let renamed_stream_str = Self::rename_main_function_and_references(&stream_str);
+                    stream = renamed_stream_str.parse::<proc_macro2::TokenStream>()
                         .unwrap_or_else(|_| stream);
-                        
-                    // If we have module init code, we need to modify the user's main to call it first
-                    if needs_init_wrapper {
-                        // This is more complex - we'd need to modify the user's main function body
-                        // For now, let's fall back to the rename approach for async functions with module init
-                        let renamed_stream_str = Self::rename_main_function_and_references(&stream_str);
-                        stream = renamed_stream_str.parse::<proc_macro2::TokenStream>()
-                            .unwrap_or_else(|_| stream);
-
-                        stream.extend(quote! {
-                            #[allow(dead_code)]
-                            #[cfg_attr(feature = #ASYNC_RUNTIME_FEATURE, #attr_tokens)]
-                            async fn main() {
-                                let __rython_result: Result<(), PyException> = async {
-                                    #startup_init
-                                    python_main().await?;
-                                    Ok(())
-                                }.await;
-                                if let Err(e) = __rython_result {
-                                    eprintln!("{}", e);
-                                    std::process::exit(1);
-                                }
+                    stream.extend(quote! {
+                        #[allow(dead_code)]
+                        #[cfg_attr(feature = #ASYNC_RUNTIME_FEATURE, #attr_tokens)]
+                        async fn main() {
+                            let __rython_result: Result<(), PyException> = async {
+                                #startup_init
+                                python_main().await?;
+                                Ok(())
+                            }.await;
+                            if let Err(e) = __rython_result {
+                                stdpython::exit_uncaught(&e);
                             }
-                        });
-                    }
+                        }
+                    });
                     // A compile_error! applies to the whole crate wherever it
                     // sits, so emit it once for the feature-off build.
                     stream.extend(quote! {
@@ -3137,34 +3117,28 @@ impl CodeGen for Module {
                         );
                     });
                 } else {
-                    // User's sync main becomes the Rust entry point
-                    // Need to modify the function to match Rust main signature requirements
-                    let new_stream_str = Self::convert_python_main_to_rust_entry_point(&stream_str);
-                    stream = new_stream_str.parse::<proc_macro2::TokenStream>()
+                    // The user's sync main runs under a generated entry
+                    // (issue #479): renamed `python_main`, called by a `fn
+                    // main` that runs the startup sequence and reports an
+                    // uncaught exception as CPython does. Making the user's
+                    // `fn main() -> Result<..>` the Rust entry itself let
+                    // Rust print the error's `Debug` dump.
+                    let renamed_stream_str = Self::rename_main_function_and_references(&stream_str);
+                    stream = renamed_stream_str.parse::<proc_macro2::TokenStream>()
                         .unwrap_or_else(|_| stream);
-                    
-                    // If we have module init code, we need to modify the user's main to call it first
-                    if needs_init_wrapper {
-                        // For simplicity, we'll use the rename approach when module init is needed
-                        let renamed_stream_str = Self::rename_main_function_and_references(&stream_str);
-                        stream = renamed_stream_str.parse::<proc_macro2::TokenStream>()
-                            .unwrap_or_else(|_| stream);
-
-                        stream.extend(quote! {
-                            #[allow(dead_code)]
-                            fn main() {
-                                let __rython_result = (|| -> Result<(), PyException> {
-                                    #startup_init
-                                    python_main()?;
-                                    Ok(())
-                                })();
-                                if let Err(e) = __rython_result {
-                                    eprintln!("{}", e);
-                                    std::process::exit(1);
-                                }
+                    stream.extend(quote! {
+                        #[allow(dead_code)]
+                        fn main() {
+                            let __rython_result = (|| -> Result<(), PyException> {
+                                #startup_init
+                                python_main()?;
+                                Ok(())
+                            })();
+                            if let Err(e) = __rython_result {
+                                stdpython::exit_uncaught(&e);
                             }
-                        });
-                    }
+                        }
+                    });
                 }
             } else {
                 // Complex main block - use existing behavior (rename user's main)
@@ -3232,8 +3206,7 @@ impl CodeGen for Module {
                                 Ok(())
                             }.await;
                             if let Err(e) = __rython_result {
-                                eprintln!("{}", e);
-                                std::process::exit(1);
+                                stdpython::exit_uncaught(&e);
                             }
                         }
                     });
@@ -3248,8 +3221,7 @@ impl CodeGen for Module {
                                 Ok(())
                             })();
                             if let Err(e) = __rython_result {
-                                eprintln!("{}", e);
-                                std::process::exit(1);
+                                stdpython::exit_uncaught(&e);
                             }
                         }
                     });
@@ -3278,8 +3250,7 @@ impl CodeGen for Module {
                         Ok(())
                     })();
                     if let Err(e) = __rython_result {
-                        eprintln!("{}", e);
-                        std::process::exit(1);
+                        stdpython::exit_uncaught(&e);
                     }
                 }
             });
@@ -7189,36 +7160,6 @@ fn shadowed_top_level_definitions(
             }
         }
         parsed.into_iter().map(rename_ident).collect::<proc_macro2::TokenStream>().to_string()
-    }
-    
-    fn convert_python_main_to_rust_entry_point(code: &str) -> String {
-        use regex::Regex;
-        
-        // Replace "pub fn main (" with "fn main(". The entry point allows
-        // dead_code: the lib copy of the entry module never calls it (see
-        // the consolidated-main comment in to_rust).
-        let code = code.replace("pub fn main (", "#[allow(dead_code)] fn main(");
-        
-        // Handle return statements in the main function
-        // We need to wrap the function body to ignore return values
-        let main_fn_pattern = Regex::new(r"fn main\(\s*\)\s*\{([^}]*)\}").unwrap();
-        
-        if let Some(captures) = main_fn_pattern.captures(&code) {
-            let body = captures.get(1).map_or("", |m| m.as_str());
-            
-            // Check if the body contains return statements
-            if body.contains("return ") {
-                // Wrap the original function as python_main and create new main that ignores return
-                let new_code = code.replace("fn main(", "fn python_main(");
-                format!("{}\n\n#[allow(dead_code)]\nfn main() {{\n    let _ = python_main();\n}}", new_code)
-            } else {
-                // No return statements, use the function as-is
-                code
-            }
-        } else {
-            // Couldn't parse the function, fall back to original
-            code
-        }
     }
     
     /// Update all references to main() function calls with python_main() calls

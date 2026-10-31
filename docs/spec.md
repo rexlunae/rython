@@ -1990,9 +1990,9 @@ is not allowed") exactly when CPython evaluates the clause. (A bare
 parser — which rython uses — so the not-last case never reaches
 conversion.) `except E as e` binds a copy of the exception; `str(e)` is
 the message, `repr(e)` is `Type('message')`. An uncaught exception exits
-with status 1, printing `Type: message` to stderr on the wrapped entry
-paths — §9 notes one entry path that currently prints Rust's `Debug`
-form instead.
+with status 1, printing CPython's `Traceback (most recent call last):`
+header and final line (`Type: message`, or just `Type` for an empty
+message) to stderr on every entry path — without the frames (§12.3).
 
 ### 8.2 Raising
 
@@ -2055,14 +2055,11 @@ exception escaping a lambda (§4.5).
   file as `__main__`, so that call is the whole program body — and it
   produces the same `fn main()` with the same wrapper decision. The
   block, or that call, becomes `fn main()`.
-  When it does more than call `main()` (or module-init code
-  exists), a generated wrapper runs `__module_init__` and the body,
-  printing `Type: message` to stderr and exiting 1 on an uncaught
-  exception. When it is just `main()` with no module-level
-  code, the user's `main` — which returns `Result` — becomes the Rust
-  entry point directly, so an uncaught exception still exits 1 but
-  prints the error's `Debug` form rather than `Type: message` (a
-  cosmetic inconsistency, §12.3). A dedicated `__main__.py` is
+  A generated `fn main` runs `__module_init__` (when there is
+  module-level code) and the body — the user's `main`, renamed
+  `python_main`, when the block is just `main()` — and reports an
+  uncaught exception as CPython does (the traceback header and final
+  line, no frames), exiting 1 (issue #479). A dedicated `__main__.py` is
   bin-only; any other entry module appears in both the library and the
   binary.
 - A bare module-level `main()` is only the entry point as the module
@@ -2826,7 +2823,7 @@ accepted as permanent spec:
 | Iterating a set (`for x in s`, `list(s)`, a comprehension over one) would run in Rust's randomized `HashSet` order, not CPython's; every order-observing construct is now a conversion error naming `sorted(s)` (§10.1). Remaining limit: a set reached only through a comprehension's own variable (`for g in groups for x in g`) or an untyped value is not seen | Loud since issue #444; the model of CPython's set table order stays unimplemented |
 | True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |
 | Exception message shapes: `int()`'s message carries "with base 10" and `float()`'s quotes the string as Python's repr (#339, round 10); `open` and stream errors are CPython's `[Errno N] text: 'path'` form (#339); the `KeyError` key quoting is single-quoted like CPython (round 99) | Correct (was a defect class in issue #82's family) |
-| An uncaught exception on the direct-`main` entry path prints Rust's `Debug` form instead of `Type: message` (exit code 1 either way) | Defect (cosmetic) |
+| An uncaught exception prints CPython's traceback header and final line but no traceback frames | Model limit (no frames) — the thread-exception entry's family (issue #479) |
 | An `async def main()` CALLED without `await` (both entry spellings: `if __name__ == "__main__": main()` and issue #431's bare module-level `main()`) is now a LOUD conversion error naming the construct and the rewrite (`asyncio.run(main())`, or make `main` a plain `def`). CPython only CREATES the coroutine there and never awaits it, so the body does not run; rython's entry machinery would have installed it as the process entry and RUN the body, printing output CPython never prints. Modelling a never-awaited coroutine (the `RuntimeWarning` and the discarded object) is not implemented, so the conversion refuses rather than silently running different code. `asyncio.run(main())` — the spelling that does run it — keeps converting (issue #455) | Correct-or-loud (was a silent divergence; found in the #431 work) |
 | The kernel device-manifest sub-mode skips the module-wide floating-point scan | Defect, issue #108 |
 | Generator expressions are materialized eagerly (side-effect timing differs from lazy CPython) | Model limit until generator lowering lands |
