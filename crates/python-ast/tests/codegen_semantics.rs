@@ -29711,6 +29711,34 @@ fn a_call_into_the_program_between_two_definitions_is_refused() {
         "builtin_between.py",
     );
     assert!(!out.contains("v1"), "the shadowed definition is pruned: {out}");
+    // Code that never runs between the two is not an observer (Devin review
+    // on #474): an import under `if TYPE_CHECKING:` (the emitter skips the
+    // block), and a call inside a lambda that is only created.
+    let out = compile(
+        concat!(
+            "from typing import TYPE_CHECKING\n",
+            "\n",
+            "\n",
+            "def helper() -> str:\n",
+            "    return \"v1\"\n",
+            "\n",
+            "\n",
+            "def setup() -> None:\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "if TYPE_CHECKING:\n",
+            "    import math\n",
+            "\n",
+            "later = lambda: setup()\n",
+            "\n",
+            "\n",
+            "def helper() -> str:\n",
+            "    return \"v2\"\n",
+        ),
+        "dead_between.py",
+    );
+    assert!(!out.contains("v1"), "the shadowed definition is pruned: {out}");
 }
 
 #[test]
