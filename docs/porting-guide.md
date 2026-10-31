@@ -73,7 +73,7 @@ will need refactoring. Grep for these; each maps to a rewrite in §2.
 | Metaclasses, `__init_subclass__`, class decorators | No dynamic class machinery |
 | Monkey-patching (assigning to modules/classes at runtime) | Nothing to patch at runtime |
 | Arbitrary-precision integer reliance (values beyond ±2⁶³) | `int` is `i64`; overflow panics in debug builds and may silently wrap in release builds — treat it as out of contract (an opt-in bigint tier is planned, spec §14) |
-| `threading`, `multiprocessing`, `asyncio` as APIs | Not in the subset; add concurrency in Rust after porting |
+| Concurrency APIs outside the supported subset | Some `threading` and `asyncio` forms are supported; see spec §10.5 and the async feature documentation for restrictions. Other forms may need refactoring or Rust integration. |
 
 **Refactorable (mechanical or semi-mechanical rewrites, §2):**
 
