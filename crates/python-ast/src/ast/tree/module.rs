@@ -386,55 +386,9 @@ impl CodeGen for Module {
             });
         }
         
-        // Issue #464: a top-level `def`/`class` REBINDS its name in Python;
-        // only the last binding is observable AFTER the rebinding, so only
-        // the last item may be emitted (two items under one name is E0428 in
-        // the generated crate). Drop the shadowed definitions from the body
-        // the emission walks — the entry machinery reads the same
-        // `self.raw.body`, so fixing it here keeps the entry decision and the
-        // item emission in agreement (see `shadowed_top_level_definitions`).
-        //
-        // Only the SAFE case is deduped. A definition CPython observably runs
-        // (a decorator, a default, a class body that does work) or one whose
-        // name the module reads before the rebind is refused loudly: pruning
-        // it would silently change which body runs or lose its creation
-        // effect (Devin review on #465).
-        match Self::shadowed_top_level_definitions(&self.raw.body) {
-            Ok(shadowed) if !shadowed.is_empty() => {
-                let kept: Vec<crate::Statement> = self
-                    .raw
-                    .body
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| !shadowed.contains(index))
-                    .map(|(_, s)| s.clone())
-                    .collect();
-                self.raw.body = kept;
-            }
-            Ok(_) => {}
-            Err(conflict) => {
-                let at = |line: Option<usize>| {
-                    line.map(|l| format!("line {l}")).unwrap_or_else(|| "an unnamed line".to_string())
-                };
-                let first = at(conflict.first_line);
-                let second = at(conflict.second_line);
-                return Err(wrap_module_error(
-                    &module_filename,
-                    format!(
-                        "`{}` is defined twice at module level ({first} and {second}), and \
-                         {}; rython emits one item per module name (the last binding, as \
-                         Python leaves it), so dropping the earlier definition would lose \
-                         what CPython does when it runs that statement — and CPython \
-                         behaviour is what the program must reproduce; rename one of the two \
-                         definitions, or delete the earlier one if nothing between them \
-                         needs it",
-                        conflict.name,
-                        conflict.reason,
-                    )
-                    .into(),
-                ));
-            }
-        }
+        // Issue #464: shadowed top-level definitions were pruned (or refused)
+        // by `normalize_module_body` above, so the entry machinery, the item
+        // emission and the binding marks all read the one pruned body.
         // Add async runtime dependency if async functions are detected.
         // We'll check this early so we can add the import at the top. The
         // import is only emitted for generated BINARY crates
@@ -4337,6 +4291,45 @@ pub enum FoldedGuard {
     Bare,
 }
 
+/// Issue #464: a top-level `def`/`class` REBINDS its name in Python; only
+/// the last binding is observable AFTER the rebinding, so only the last item
+/// may be emitted (two items under one name is E0428 in the generated
+/// crate). Drop the shadowed definitions, or refuse when dropping one would
+/// be observable (see `Module::shadowed_top_level_definitions`).
+///
+/// This runs inside `normalize_module_body`, so the module's own emission
+/// (its `BindingMarks`) and a cyclic importer's bound check
+/// (`import::module_binding`, through `normalized_body_of`) number the SAME
+/// pruned sequence (issue #470: the importer numbered the unpruned body and
+/// checked bits the emitter never set).
+fn prune_shadowed_definitions(body: Vec<crate::Statement>) -> Result<Vec<crate::Statement>, String> {
+    match Module::shadowed_top_level_definitions(&body) {
+        Ok(shadowed) if shadowed.is_empty() => Ok(body),
+        Ok(shadowed) => Ok(body
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| !shadowed.contains(index))
+            .map(|(_, s)| s)
+            .collect()),
+        Err(conflict) => {
+            let at = |line: Option<usize>| {
+                line.map(|l| format!("line {l}")).unwrap_or_else(|| "an unnamed line".to_string())
+            };
+            let first = at(conflict.first_line);
+            let second = at(conflict.second_line);
+            Err(format!(
+                "`{}` is defined twice at module level ({first} and {second}), and {}; rython \
+                 emits one item per module name (the last binding, as Python leaves it), so \
+                 dropping the earlier definition would lose what CPython does when it runs \
+                 that statement — and CPython behaviour is what the program must reproduce; \
+                 rename one of the two definitions, or delete the earlier one if nothing \
+                 between them needs it",
+                conflict.name, conflict.reason,
+            ))
+        }
+    }
+}
+
 pub(crate) fn normalize_module_body(
     body: Vec<crate::Statement>,
     options: &PythonOptions,
@@ -4360,6 +4353,7 @@ pub(crate) fn normalize_module_body(
     // __module_init__ (which rustc rejects and the module re-exports
     // cannot see).
     let body = splice_gated_branches(body, options);
+    let body = prune_shadowed_definitions(body)?;
     Ok(NormalizedBody {
         body,
         newly_live,
@@ -6673,7 +6667,9 @@ fn intermediate_use_reason(
     from: usize,
     to: usize,
 ) -> Option<String> {
-    use crate::ast::tree::visit::{any_expr, any_stmt, stmt_exprs, Descend};
+    use crate::ast::tree::visit::{
+        any_expr, any_stmt, stmt_exprs, walk_stmts, Descend, Flow,
+    };
     let between = &body[from + 1..to];
     if between.is_empty() {
         return None;
@@ -6687,10 +6683,58 @@ fn intermediate_use_reason(
             .into_iter()
             .any(|e| any_expr(e, |x| matches!(x, crate::ExprType::Name(n) if n.id == name)))
     });
-    reads.then(|| {
-        format!(
+    if reads {
+        return Some(format!(
             "the module reads `{name}` between its two definitions; CPython resolves that \
              use to the FIRST definition, and the generated crate holds one item per name"
+        ));
+    }
+    // Code that runs between the two bindings can read the name from
+    // OUTSIDE this module: an import (a cycle back here — `from .a import
+    // f` in the imported module binds the first `f`; issue #470), or a call
+    // into code the module bound (a function or class of its own, an
+    // imported one, a method) that may itself import or read
+    // `module.name`. A call to a name the module never binds is a builtin.
+    let top_level: std::collections::HashSet<String> = body
+        .iter()
+        .flat_map(|s| {
+            crate::ast::tree::visit::stmt_bound_names(s, crate::ast::tree::visit::Bindings::Scope)
+        })
+        .collect();
+    // A `TYPE_CHECKING` block never runs (the emitter skips it). A lambda's
+    // body IS scanned: a builtin can call it eagerly (`list(map(lambda x:
+    // setup(), xs))`), so an uncalled lambda's call is refused too — loud,
+    // never silently the wrong definition (Devin review on #474).
+    let mut observes = false;
+    walk_stmts(between, Descend::SkipDefs, &mut |s| {
+        if let crate::StatementType::If(i) = &s.statement
+            && Module::is_type_checking_test(&i.test)
+        {
+            return Flow::Skip;
+        }
+        let runs_code = matches!(
+            &s.statement,
+            crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
+        ) || stmt_exprs(s).into_iter().any(|e| {
+            any_expr(e, |x| match x {
+                crate::ExprType::Call(c) => match c.func.as_ref() {
+                    crate::ExprType::Name(n) => top_level.contains(&n.id),
+                    _ => true,
+                },
+                _ => false,
+            })
+        });
+        if runs_code {
+            observes = true;
+            return Flow::Stop;
+        }
+        Flow::Continue
+    });
+    observes.then(|| {
+        format!(
+            "code between its two definitions (an import, or a call into the program) can \
+             reach `{name}` from another module — a cyclic `from ... import {name}` binds \
+             the FIRST definition in CPython — and the generated crate holds one item per name"
         )
     })
 }
