@@ -163,7 +163,9 @@ feature that `rypip` enables automatically), and more.
 Known gaps:
 
 - **Numbers**: `int` is `i64` — arbitrary-precision integers are not
-  supported; overflow panics rather than growing.
+  supported; out-of-range literal operands are rejected during conversion
+  (including the positive operand of `-9223372036854775808`), and arithmetic
+  overflow does not grow the integer.
 - **Dynamic typing**: variables keep one type; heterogeneous lists and
   reassigning a name to a different type don't convert.
 - **Language features**: generators/`yield`, `async`/`await`,
