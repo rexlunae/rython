@@ -29759,6 +29759,33 @@ fn a_call_into_the_program_between_two_definitions_is_refused() {
 }
 
 #[test]
+fn unittest_main_with_an_unsupported_argument_is_refused() {
+    // Devin review on #476: the emitted runner reproduces `unittest.main()`
+    // and `unittest.main(exit=False)`; any other argument (`verbosity=2`
+    // prints a line per test in CPython) used to be ignored silently.
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    def test_a(self) -> None:\n",
+            "        pass\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main(verbosity=2)\n",
+        ),
+        "verbose_main.py",
+    );
+    assert!(
+        err.contains("`unittest.main(verbosity=...)` is not supported yet")
+            && err.contains("refuses to silently ignore"),
+        "the refusal names the argument and the fix: {err}"
+    );
+}
+
+#[test]
 fn a_shadowed_class_with_an_inert_body_emits_one_struct() {
     // The SAFE half: a body of literal field stores performs no call, so the
     // earlier definition is indistinguishable from never having run.

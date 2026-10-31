@@ -663,8 +663,18 @@ impl TextTestResult {
 
     /// Print the report and exit as `unittest.main()` does: 1 when the run
     /// was not successful, 5 when no test ran (and none was skipped), 0
-    /// otherwise.
+    /// otherwise. Every test case has dropped by now (the emitted runner
+    /// scopes each), so a non-daemon thread one held has been joined.
     pub fn exit(self) -> ! {
+        let code = self.report();
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
+
+    /// Print the report — `unittest.main(exit=False)`, which returns to the
+    /// caller — and the exit status `unittest.main()` would use.
+    pub fn report(&self) -> i32 {
         let elapsed = self.start.elapsed().as_secs_f64();
         // printErrors: the status line's newline, the errors, the
         // failures, then the unexpected successes.
@@ -716,16 +726,13 @@ impl TextTestResult {
         } else {
             eprintln!("{status} ({})", infos.join(", "));
         }
-        let code = if !self.was_successful() {
+        if !self.was_successful() {
             1
         } else if self.tests_run == 0 && self.skipped == 0 {
             5
         } else {
             0
-        };
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        std::process::exit(code);
+        }
     }
 }
 

@@ -134,7 +134,11 @@ runtime half is `stdpython::unittest::TextTestResult`: status characters
 the test as `TestCase.run` reports them; an `AssertionError` is a FAIL and
 anything else an ERROR; a test's docstring's first line under its name;
 the exit status 1 for an unsuccessful run, 5 when no test ran, 0
-otherwise. A clean run now reports `Ran N tests` and `OK`, so zero tests
+otherwise. `unittest.main(exit=False)` prints the report and returns to
+the caller; any other argument (`verbosity=`, `argv=`, ...) is refused at
+conversion rather than ignored. Each test's case drops before the next test
+and before the exit, so a non-daemon thread it holds is joined, never cut
+off. A clean run now reports `Ran N tests` and `OK`, so zero tests
 and two passing tests are no longer indistinguishable. Pinned end to end
 by `unittest_main_prints_cpythons_report` (convert_tests).
 

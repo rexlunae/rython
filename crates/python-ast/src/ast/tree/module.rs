@@ -1645,9 +1645,13 @@ impl CodeGen for Module {
                             // test runner (issue #334): construct the module's
                             // TestCase classes and run their test_* methods,
                             // instead of the runtime's loud stub.
-                            if matched_unittest_main(body_stmt) {
+                            if let Some(call) = matched_unittest_main(body_stmt) {
+                                let exits = unittest_main_exits(call).map_err(|e| {
+                                    wrap_module_error(&module_filename, e.into())
+                                })?;
                                 if let Some(runner) = emit_test_runner(
                                     &module_raw_body,
+                                    exits,
                                     ctx.clone(),
                                     options.clone(),
                                     symbols.clone(),
@@ -7524,26 +7528,54 @@ pub(crate) fn is_testcase_base(base: &crate::ExprType) -> bool {
     }
 }
 
-/// Whether a statement is a direct `unittest.main()` call — the site the
-/// generated test runner replaces (issue #334).
-fn matched_unittest_main(stmt: &crate::Statement) -> bool {
+/// The call when a statement is a direct `unittest.main()` call — the site
+/// the generated test runner replaces (issue #334).
+fn matched_unittest_main(stmt: &crate::Statement) -> Option<&crate::Call> {
+    let crate::StatementType::Expr(e) = &stmt.statement else {
+        return None;
+    };
+    let crate::ExprType::Call(c) = &e.value else {
+        return None;
+    };
     matches!(
-        &stmt.statement,
-        crate::StatementType::Expr(e)
-            if matches!(
-                &e.value,
-                crate::ExprType::Call(c)
-                    if matches!(
-                        c.func.as_ref(),
-                        crate::ExprType::Attribute(a)
-                            if a.attr == "main"
-                                && matches!(
-                                    a.value.as_ref(),
-                                    crate::ExprType::Name(n) if n.id == "unittest"
-                                )
-                    )
-            )
+        c.func.as_ref(),
+        crate::ExprType::Attribute(a)
+            if a.attr == "main"
+                && matches!(a.value.as_ref(), crate::ExprType::Name(n) if n.id == "unittest")
     )
+    .then_some(c)
+}
+
+/// Whether a `unittest.main(...)` call exits the program after its report:
+/// true by default, as written with `exit=False` returns to the caller.
+/// Every other argument (`verbosity=`, `argv=`, a positional module, a
+/// non-literal `exit=`) changes what CPython runs or prints in a way the
+/// emitted runner does not reproduce, so it is refused rather than ignored.
+fn unittest_main_exits(call: &crate::Call) -> Result<bool, String> {
+    let refuse = |what: &str| {
+        Err(format!(
+            "`unittest.main({what})` is not supported yet: the emitted test runner \
+             reproduces `unittest.main()` and `unittest.main(exit=False)` only; \
+             rython refuses to silently ignore the argument — call \
+             `unittest.main()` with no arguments"
+        ))
+    };
+    if !call.args.is_empty() {
+        return refuse("<positional argument>");
+    }
+    let mut exits = true;
+    for k in &call.keywords {
+        match (k.arg.as_deref(), &k.value) {
+            (Some("exit"), crate::ExprType::Constant(c))
+                if matches!(&c.0, Some(litrs::Literal::Bool(_))) =>
+            {
+                exits = matches!(&c.0, Some(litrs::Literal::Bool(b)) if b.value());
+            }
+            (Some(name), _) => return refuse(&format!("{name}=...")),
+            (None, _) => return refuse("**kwargs"),
+        }
+    }
+    Ok(exits)
 }
 
 /// The `test_*` method names directly defined on a class, in the sorted
@@ -7604,6 +7636,7 @@ fn run_gates(decorators: &[crate::ExprType]) -> Vec<RunGate> {
 
 fn emit_test_runner(
     module_stmts: &[crate::Statement],
+    exits: bool,
     ctx: crate::CodeGenContext,
     options: crate::PythonOptions,
     symbols: crate::SymbolTableScopes,
@@ -7723,15 +7756,19 @@ fn emit_test_runner(
             // `getDescription` adds it, the docstring's first line.
             let mut description = format!("{m} (__main__.{}.{m})", c.name);
             if let Some(doc) = test_def.as_ref().and_then(|f| docstring_value(&f.body))
-                && let Some(first) = doc.trim().lines().next()
+                && let Some(first) = doc.trim().lines().next().map(str::trim)
+                && !first.is_empty()
             {
                 description.push('\n');
-                description.push_str(first.trim());
+                description.push_str(first);
             }
             // `@expectedFailure`: a failure is the expected outcome; a pass
             // is an "unexpected success", which fails the run (CPython's
             // wasSuccessful() is False for it since 3.4).
-            let run = quote! {
+            // Each test's case lives in its own block, so it drops (joining
+            // any non-daemon thread it holds) before the next test and before
+            // the report — never cut off by the exit.
+            let run = quote! {{
                 let mut __rython_tc = #cname::new()?;
                 __rython_result.run_test(
                     #description,
@@ -7741,7 +7778,7 @@ fn emit_test_runner(
                     |__rython_tc: &mut #cname| __rython_tc.#mident(#(#default_args),*).map(|_| ()),
                     #teardown,
                 );
-            };
+            }};
             if skip_terms.is_empty() {
                 stmts.extend(run);
             } else {
@@ -7755,11 +7792,17 @@ fn emit_test_runner(
             }
         }
     }
-    // `unittest.main()` prints the report and exits with the run's status.
+    // `unittest.main()` prints the report and exits with the run's status;
+    // `unittest.main(exit=False)` prints it and returns to the caller.
+    let finish = if exits {
+        quote!(__rython_result.exit();)
+    } else {
+        quote!(__rython_result.report();)
+    };
     Some(quote! {
         let mut __rython_result = stdpython::unittest::TextTestResult::new();
         #stmts
-        __rython_result.exit();
+        #finish
     })
 }
 

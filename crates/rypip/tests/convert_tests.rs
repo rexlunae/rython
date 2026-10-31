@@ -12701,6 +12701,12 @@ fn run_package_status(
 /// Convert, build and run a single-file program; its stderr with the
 /// `Ran N tests in T.TTTs` time normalized to `T`, and its exit code.
 fn unittest_report(name: &str, source: &str) -> (String, i32) {
+    let (_, stderr, code) = unittest_run(name, source);
+    (stderr, code)
+}
+
+/// [`unittest_report`] with the program's stdout too.
+fn unittest_run(name: &str, source: &str) -> (String, String, i32) {
     let scratch = Scratch::new(name);
     let file = scratch.path().join(format!("{name}.py"));
     fs::write(&file, source).unwrap();
@@ -12719,7 +12725,8 @@ fn unittest_report(name: &str, source: &str) -> (String, i32) {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    (stderr, output.status.code().unwrap_or(-1))
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    (stdout, stderr, output.status.code().unwrap_or(-1))
 }
 
 #[test]
@@ -12867,6 +12874,89 @@ fn unittest_main_prints_cpythons_report() {
         )
     );
     assert_eq!(code, 5);
+}
+
+#[test]
+fn unittest_main_exit_false_returns_and_a_blank_docstring_adds_no_line() {
+    // Devin review on #476. `unittest.main(exit=False)` prints the report
+    // and RETURNS, so the statement after it runs; a whitespace-only
+    // docstring is no description (`shortDescription()` is empty), so the
+    // FAIL header has no second line.
+    //
+    // Verified against python3 (3.14.4): stdout `finished`, exit 0, and
+    // stderr as below (the time shown as `T`, the traceback's three frame
+    // lines elided — docs/spec.md §12.3).
+    let (stdout, stderr, code) = unittest_run(
+        "ut_noexit",
+        concat!(
+            "import unittest\n",
+            "\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    def test_a(self) -> None:\n",
+            "        \"\"\"   \"\"\"\n",
+            "        self.assertEqual(1, 2)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main(exit=False)\n",
+            "    print(\"finished\")\n",
+        ),
+    );
+    assert_eq!(stdout, "finished\n");
+    assert_eq!(
+        stderr,
+        concat!(
+            "F\n",
+            "======================================================================\n",
+            "FAIL: test_a (__main__.T.test_a)\n",
+            "----------------------------------------------------------------------\n",
+            "Traceback (most recent call last):\n",
+            "AssertionError: 1 != 2\n",
+            "\n",
+            "----------------------------------------------------------------------\n",
+            "Ran 1 test in T\n",
+            "\n",
+            "FAILED (failures=1)",
+        )
+    );
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn unittest_main_exits_after_a_tests_worker_thread_finishes() {
+    // Devin review on #476: the report's exit must not cut off a non-daemon
+    // worker a test started. Each test's case and locals drop before the
+    // report, joining the worker, as CPython waits for it at shutdown.
+    //
+    // Verified against python3 (3.14.4): stdout below, exit 0.
+    let (stdout, stderr, code) = unittest_run(
+        "ut_worker",
+        concat!(
+            "import threading\n",
+            "import time\n",
+            "import unittest\n",
+            "\n",
+            "\n",
+            "def work() -> None:\n",
+            "    time.sleep(0.2)\n",
+            "    print(\"worker done\")\n",
+            "\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    def test_a(self) -> None:\n",
+            "        worker = threading.Thread(target=work)\n",
+            "        worker.start()\n",
+            "        print(\"test returns\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+    );
+    assert_eq!(stdout, "test returns\nworker done\n");
+    assert!(stderr.ends_with("Ran 1 test in T\n\nOK"), "stderr: {stderr}");
+    assert_eq!(code, 0);
 }
 
 #[test]
