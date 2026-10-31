@@ -1645,9 +1645,13 @@ impl CodeGen for Module {
                             // test runner (issue #334): construct the module's
                             // TestCase classes and run their test_* methods,
                             // instead of the runtime's loud stub.
-                            if matched_unittest_main(body_stmt) {
+                            if let Some(call) = matched_unittest_main(body_stmt) {
+                                let exits = unittest_main_exits(call).map_err(|e| {
+                                    wrap_module_error(&module_filename, e.into())
+                                })?;
                                 if let Some(runner) = emit_test_runner(
                                     &module_raw_body,
+                                    exits,
                                     ctx.clone(),
                                     options.clone(),
                                     symbols.clone(),
@@ -7524,26 +7528,54 @@ pub(crate) fn is_testcase_base(base: &crate::ExprType) -> bool {
     }
 }
 
-/// Whether a statement is a direct `unittest.main()` call — the site the
-/// generated test runner replaces (issue #334).
-fn matched_unittest_main(stmt: &crate::Statement) -> bool {
+/// The call when a statement is a direct `unittest.main()` call — the site
+/// the generated test runner replaces (issue #334).
+fn matched_unittest_main(stmt: &crate::Statement) -> Option<&crate::Call> {
+    let crate::StatementType::Expr(e) = &stmt.statement else {
+        return None;
+    };
+    let crate::ExprType::Call(c) = &e.value else {
+        return None;
+    };
     matches!(
-        &stmt.statement,
-        crate::StatementType::Expr(e)
-            if matches!(
-                &e.value,
-                crate::ExprType::Call(c)
-                    if matches!(
-                        c.func.as_ref(),
-                        crate::ExprType::Attribute(a)
-                            if a.attr == "main"
-                                && matches!(
-                                    a.value.as_ref(),
-                                    crate::ExprType::Name(n) if n.id == "unittest"
-                                )
-                    )
-            )
+        c.func.as_ref(),
+        crate::ExprType::Attribute(a)
+            if a.attr == "main"
+                && matches!(a.value.as_ref(), crate::ExprType::Name(n) if n.id == "unittest")
     )
+    .then_some(c)
+}
+
+/// Whether a `unittest.main(...)` call exits the program after its report:
+/// true by default, as written with `exit=False` returns to the caller.
+/// Every other argument (`verbosity=`, `argv=`, a positional module, a
+/// non-literal `exit=`) changes what CPython runs or prints in a way the
+/// emitted runner does not reproduce, so it is refused rather than ignored.
+fn unittest_main_exits(call: &crate::Call) -> Result<bool, String> {
+    let refuse = |what: &str| {
+        Err(format!(
+            "`unittest.main({what})` is not supported yet: the emitted test runner \
+             reproduces `unittest.main()` and `unittest.main(exit=False)` only; \
+             rython refuses to silently ignore the argument — call \
+             `unittest.main()` with no arguments"
+        ))
+    };
+    if !call.args.is_empty() {
+        return refuse("<positional argument>");
+    }
+    let mut exits = true;
+    for k in &call.keywords {
+        match (k.arg.as_deref(), &k.value) {
+            (Some("exit"), crate::ExprType::Constant(c))
+                if matches!(&c.0, Some(litrs::Literal::Bool(_))) =>
+            {
+                exits = matches!(&c.0, Some(litrs::Literal::Bool(b)) if b.value());
+            }
+            (Some(name), _) => return refuse(&format!("{name}=...")),
+            (None, _) => return refuse("**kwargs"),
+        }
+    }
+    Ok(exits)
 }
 
 /// The `test_*` method names directly defined on a class, in the sorted
@@ -7604,6 +7636,7 @@ fn run_gates(decorators: &[crate::ExprType]) -> Vec<RunGate> {
 
 fn emit_test_runner(
     module_stmts: &[crate::Statement],
+    exits: bool,
     ctx: crate::CodeGenContext,
     options: crate::PythonOptions,
     symbols: crate::SymbolTableScopes,
@@ -7625,18 +7658,17 @@ fn emit_test_runner(
     for c in test_classes {
         let cname = quote::format_ident!("{}", c.name);
         // `setUp`/`tearDown` are per-test fixtures (CPython runs setUp before
-        // and tearDown after every test method). Emit them only when the
-        // class defines them; a fixture error is threaded with `?` — loud,
-        // never silently skipped.
+        // and tearDown after every test method); an exception in either is
+        // reported against the test, as `TestCase.run` reports it.
         let setup = if class_defines_method(c, "setUp") {
-            quote!(__rython_tc.setUp()?;)
+            quote!(|__rython_tc: &mut #cname| __rython_tc.setUp().map(|_| ()))
         } else {
-            quote!()
+            quote!(|_: &mut #cname| Ok(()))
         };
         let teardown = if class_defines_method(c, "tearDown") {
-            quote!(__rython_tc.tearDown()?;)
+            quote!(|__rython_tc: &mut #cname| __rython_tc.tearDown().map(|_| ()))
         } else {
-            quote!()
+            quote!(|_: &mut #cname| Ok(()))
         };
         for m in test_method_names(c) {
             let mident = quote::format_ident!("{}", m);
@@ -7646,8 +7678,7 @@ fn emit_test_runner(
             // rendered against the parameter's slot (an unannotated one is
             // the boxed value). A parameter without a default is CPython's
             // TypeError at the call — left to rustc's arity error, loudly.
-            let mut default_args: Vec<TokenStream> = Vec::new();
-            if let Some(def) = c.body.iter().find_map(|s| match &s.statement {
+            let test_def = c.body.iter().find_map(|s| match &s.statement {
                 crate::StatementType::FunctionDef(f)
                 | crate::StatementType::AsyncFunctionDef(f)
                     if f.name == m =>
@@ -7655,7 +7686,9 @@ fn emit_test_runner(
                     Some(f.clone())
                 }
                 _ => None,
-            }) {
+            });
+            let mut default_args: Vec<TokenStream> = Vec::new();
+            if let Some(def) = &test_def {
                 let params: Vec<&crate::Parameter> =
                     def.args.posonlyargs.iter().chain(def.args.args.iter()).skip(1).collect();
                 let defaults = &def.args.defaults;
@@ -7685,18 +7718,9 @@ fn emit_test_runner(
             // runner reaches the test; CPython evaluates it when the
             // decorator runs at import, which differs only for a condition
             // the module rebinds after defining the class.
-            let method_decorators = c
-                .body
-                .iter()
-                .find_map(|s| match &s.statement {
-                    crate::StatementType::FunctionDef(f)
-                    | crate::StatementType::AsyncFunctionDef(f)
-                        if f.name == m =>
-                    {
-                        Some(f.decorator_list.clone())
-                    }
-                    _ => None,
-                })
+            let method_decorators = test_def
+                .as_ref()
+                .map(|f| f.decorator_list.clone())
                 .unwrap_or_default();
             let mut gates = run_gates(&c.decorator_list);
             gates.extend(run_gates(&method_decorators));
@@ -7727,42 +7751,40 @@ fn emit_test_runner(
                     RunGate::ExpectedFailure => expected_failure = true,
                 }
             }
-            let outcome = if expected_failure {
-                // `@expectedFailure`: a failure is the expected outcome; a
-                // pass is an "unexpected success", which fails the run
-                // (CPython's wasSuccessful() is False for it since 3.4).
-                quote! {
-                    match __rython_tc.#mident(#(#default_args),*) {
-                        Ok(_) => {
-                            eprintln!("UNEXPECTED SUCCESS: {}", #m);
-                            __rython_ntest_failures += 1;
-                        }
-                        Err(_) => {}
-                    };
-                }
-            } else {
-                quote! {
-                    match __rython_tc.#mident(#(#default_args),*) {
-                        Ok(__rython_v) => __rython_v,
-                        Err(__rython_e) => {
-                            eprintln!("FAIL: {}", __rython_e);
-                            __rython_ntest_failures += 1;
-                        }
-                    };
-                }
-            };
-            let run = quote! {
+            // `str(test)` — `test_a (__main__.T.test_a)`; the emitted runner
+            // is in the program's `__main__` module — plus, as
+            // `getDescription` adds it, the docstring's first line.
+            let mut description = format!("{m} (__main__.{}.{m})", c.name);
+            if let Some(doc) = test_def.as_ref().and_then(|f| docstring_value(&f.body))
+                && let Some(first) = doc.trim().lines().next().map(str::trim)
+                && !first.is_empty()
+            {
+                description.push('\n');
+                description.push_str(first);
+            }
+            // `@expectedFailure`: a failure is the expected outcome; a pass
+            // is an "unexpected success", which fails the run (CPython's
+            // wasSuccessful() is False for it since 3.4).
+            // Each test's case lives in its own block, so it drops (joining
+            // any non-daemon thread it holds) before the next test and before
+            // the report — never cut off by the exit.
+            let run = quote! {{
                 let mut __rython_tc = #cname::new()?;
-                #setup
-                #outcome
-                #teardown
-            };
+                __rython_result.run_test(
+                    #description,
+                    #expected_failure,
+                    &mut __rython_tc,
+                    #setup,
+                    |__rython_tc: &mut #cname| __rython_tc.#mident(#(#default_args),*).map(|_| ()),
+                    #teardown,
+                );
+            }};
             if skip_terms.is_empty() {
                 stmts.extend(run);
             } else {
                 stmts.extend(quote! {
                     if #(#skip_terms)||* {
-                        __rython_ntest_skipped += 1;
+                        __rython_result.add_skip();
                     } else {
                         #run
                     }
@@ -7770,18 +7792,32 @@ fn emit_test_runner(
             }
         }
     }
+    // `unittest.main()` prints the report and exits with the run's status;
+    // `unittest.main(exit=False)` prints it and returns to the caller.
+    let finish = if exits {
+        quote!(__rython_result.exit();)
+    } else {
+        quote!(__rython_result.report();)
+    };
     Some(quote! {
-        let mut __rython_ntest_failures: usize = 0usize;
-        #[allow(unused_mut, unused_variables)]
-        let mut __rython_ntest_skipped: usize = 0usize;
+        let mut __rython_result = stdpython::unittest::TextTestResult::new();
         #stmts
-        if __rython_ntest_failures != 0usize {
-            return Err(PyException::new(
-                "AssertionError",
-                format!("{__rython_ntest_failures} test(s) failed"),
-            ));
-        }
+        #finish
     })
+}
+
+/// A body's docstring as Python's `__doc__` holds it: the string literal's
+/// VALUE (escapes decoded), when the first statement is one.
+fn docstring_value(body: &[crate::Statement]) -> Option<String> {
+    match &body.first()?.statement {
+        crate::StatementType::Expr(e) => match &e.value {
+            crate::ExprType::Constant(crate::Constant(Some(litrs::Literal::String(s)))) => {
+                Some(s.value().to_string())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Whether the class defines a method with this exact name in its own body

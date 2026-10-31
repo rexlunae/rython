@@ -49,10 +49,11 @@ runner — never a silent pass.
 **Runner landed (`a225dfd`):** a `unittest.main()` in the module's
 `if __name__ == "__main__"` now emits a runner that discovers the module's
 direct `*TestCase` subclasses, constructs each, and runs its `test_*`
-methods, counting failures; any erroring test prints `FAIL: …` and the
-runner raises `AssertionError: <n> test(s) failed` (exit 1). Verified:
-a minimal test module with a *raising* or erroring test fails loudly and
-exits 1; a passing one exits 0.
+methods. Since issue #334's Phase 3 it reports as CPython's
+`TextTestRunner` does at the default verbosity (status characters, the
+ERROR/FAIL blocks, `Ran N tests`, the `OK`/`FAILED (...)`/`NO TESTS RAN`
+summary, exit 0/1/5); a block's traceback keeps CPython's header and final
+exception line but has no frames (`docs/spec.md` §12.3).
 
 **Assertions landed (`b4a3849`, `e7a61dd`, `f3253b1`, `fea6a8c`, `6cff5f1`,
 `dfa40d1`):**

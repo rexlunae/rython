@@ -103,53 +103,44 @@ Verified against CPython (3.14) and rython `rypip` built from `a055a18`:
 | `@expectedFailure` | yes | yes | yes | yes |
 | pytest-style module | "yes" | **no** | — | **no support** |
 
-### The runner's output is not CPython's
+### The runner's output (Phase 3, done)
 
-This is an observable divergence that no test pins, and it should be
-recorded rather than glossed.
-
-CPython, all tests passing:
-
-```
-..
-----------------------------------------------------------------------
-Ran 2 tests in 0.001s
-
-OK
-```
-
-rython, same program: **prints nothing**, exit 0.
-
-CPython, one failure:
+`unittest.main()` prints CPython's report on stderr, byte-for-byte except
+for two things: the elapsed time (which varies in CPython too), and the
+traceback frames. CPython, one passing and one failing test:
 
 ```
-...F
+F.
 ======================================================================
-FAIL: test_fail (__main__.MoreTests.test_fail)
-...
-Ran 4 tests in 0.002s
+FAIL: test_a (__main__.T.test_a)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/ut/f.py", line 6, in test_a
+    self.assertEqual(1 + 1, 3)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^
+AssertionError: 2 != 3
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.000s
 
 FAILED (failures=1)
 ```
 
-rython, same program:
-
-```
-FAIL: AssertionError: 1 != 2
-AssertionError: 1 test(s) failed
-```
-
-The **pass/fail outcome and exit status agree**, which is the property that
-matters for CI gating. The *report format* does not: no per-test dots, no
-`Ran N tests` line, no `FAILED (failures=1)` summary, and notably **no
-output at all on a clean run** — a suite that ran zero tests and a suite
-that ran two passing tests are indistinguishable from the outside.
-
-`docs/cpython-suite-status.md` describes the runner as "counting failures
-and … raising `AssertionError: <n> test(s) failed`" — accurate. It does not
-claim CPython's format, and this document makes that gap explicit. It is
-**not** currently on the §12 ledger; it should be, since a program whose
-*output* is part of its contract (goal 2, `P2`) diverges here.
+rython prints the same, without the three frame lines: it has no frames,
+so a block keeps the header and the final exception line (the model limit
+a thread's unhandled exception already has; `docs/spec.md` §12.3). The
+runtime half is `stdpython::unittest::TextTestResult`: status characters
+`.` `F` `E` `s` `x` `u`; `setUp`/`tearDown` exceptions reported against
+the test as `TestCase.run` reports them; an `AssertionError` is a FAIL and
+anything else an ERROR; a test's docstring's first line under its name;
+the exit status 1 for an unsuccessful run, 5 when no test ran, 0
+otherwise. `unittest.main(exit=False)` prints the report and returns to
+the caller; any other argument (`verbosity=`, `argv=`, ...) is refused at
+conversion rather than ignored. Each test's case drops before the next test
+and before the exit, so a non-daemon thread it holds is joined, never cut
+off. A clean run now reports `Ran N tests` and `OK`, so zero tests
+and two passing tests are no longer indistinguishable. Pinned end to end
+by `unittest_main_prints_cpythons_report` (convert_tests).
 
 ## The defect: `raise` as the last statement of `assertRaises`
 
@@ -360,15 +351,10 @@ language to enhance — but it does need fixtures and collection. Whether that
 is in scope is a product decision, not an implementation one; this document
 does not recommend it.
 
-### Phase 3 — match CPython's runner output
+### Phase 3 — match CPython's runner output (done)
 
-Emit the per-test status characters (`.`/`F`/`E`/`s`), the
-`Ran N tests in T.TTTs` line, the `OK`/`FAILED (...)` summary, and — most
-importantly — *something* on a clean run. This makes suite output
-comparable byte-for-byte, which is what P2 asks for, and removes the
-"zero tests ran" ambiguity.
-
-Record the current divergence on the §12 ledger until this lands.
+Landed: see "The runner's output" above. The one remaining difference is
+the traceback frames, recorded on the §12 ledger.
 
 ### Phase 4 — the vector-file path (framework-free coverage)
 
@@ -395,7 +381,8 @@ different, narrower list:
 
 1. the `raise`-in-`assertRaises` defect (Phase 1);
 2. pytest converting silently into a non-building crate (Phase 2);
-3. the runner's non-CPython output format (Phase 3);
+3. ~~the runner's non-CPython output format (Phase 3)~~ — done, apart from
+   traceback frames (§12.3);
 4. the general `TestCase` surface beyond twelve hardcoded assertions.
 
 It cannot be closed today, but it should be **rewritten**: the callable-value

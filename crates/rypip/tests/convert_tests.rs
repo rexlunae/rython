@@ -12698,6 +12698,267 @@ fn run_package_status(
     )
 }
 
+/// Convert, build and run a single-file program; its stderr with the
+/// `Ran N tests in T.TTTs` time normalized to `T`, and its exit code.
+fn unittest_report(name: &str, source: &str) -> (String, i32) {
+    let (_, stderr, code) = unittest_run(name, source);
+    (stderr, code)
+}
+
+/// [`unittest_report`] with the program's stdout too.
+fn unittest_run(name: &str, source: &str) -> (String, String, i32) {
+    let scratch = Scratch::new(name);
+    let file = scratch.path().join(format!("{name}.py"));
+    fs::write(&file, source).unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    assert!(build_generated(&krate.root).success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join(format!("target/debug/{name}")))
+        .output()
+        .expect("running generated binary");
+    let stderr = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .map(|line| match line.strip_prefix("Ran ").and_then(|r| r.rsplit_once(" in ")) {
+            Some((count, _)) => format!("Ran {count} in T"),
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    (stdout, stderr, output.status.code().unwrap_or(-1))
+}
+
+#[test]
+fn unittest_main_prints_cpythons_report() {
+    // Issue #334, Phase 3: `unittest.main()` prints CPython's report on
+    // stderr: a status character per test, the ERROR and FAIL blocks, the
+    // UNEXPECTED SUCCESS list, `Ran N tests`, and the summary. It used to
+    // print NOTHING on a clean run, so zero tests and two passing tests were
+    // indistinguishable.
+    //
+    // Verified against python3 (3.14.4), stderr, the time shown as `T`. The
+    // traceback FRAME lines (`  File "...", line N, in test_x` and the
+    // source line under it) are elided from the expectation: rython has no
+    // frames, so a block keeps CPython's header and final exception line
+    // (docs/spec.md §12, the same model limit as a thread's exception).
+    let (stderr, code) = unittest_report(
+        "ut_all",
+        concat!(
+            "import unittest\n",
+            "\n",
+            "\n",
+            "class B(unittest.TestCase):\n",
+            "    def test_pass(self) -> None:\n",
+            "        self.assertEqual(1, 1)\n",
+            "\n",
+            "    def test_fail(self) -> None:\n",
+            "        \"\"\"Adds numbers.\n",
+            "\n",
+            "        More text.\n",
+            "        \"\"\"\n",
+            "        self.assertEqual(1 + 1, 3)\n",
+            "\n",
+            "    def test_error(self) -> None:\n",
+            "        raise ValueError()\n",
+            "\n",
+            "    @unittest.skip(\"nope\")\n",
+            "    def test_skip(self) -> None:\n",
+            "        pass\n",
+            "\n",
+            "    @unittest.expectedFailure\n",
+            "    def test_xfail(self) -> None:\n",
+            "        self.assertEqual(1, 2)\n",
+            "\n",
+            "    @unittest.expectedFailure\n",
+            "    def test_xpass(self) -> None:\n",
+            "        self.assertEqual(1, 1)\n",
+            "\n",
+            "\n",
+            "class A(unittest.TestCase):\n",
+            "    def setUp(self) -> None:\n",
+            "        raise RuntimeError(\"setup broke\")\n",
+            "\n",
+            "    def test_one(self) -> None:\n",
+            "        pass\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+    );
+    assert_eq!(
+        stderr,
+        concat!(
+            "EEF.sxu\n",
+            "======================================================================\n",
+            "ERROR: test_one (__main__.A.test_one)\n",
+            "----------------------------------------------------------------------\n",
+            "Traceback (most recent call last):\n",
+            "RuntimeError: setup broke\n",
+            "\n",
+            "======================================================================\n",
+            "ERROR: test_error (__main__.B.test_error)\n",
+            "----------------------------------------------------------------------\n",
+            "Traceback (most recent call last):\n",
+            "ValueError\n",
+            "\n",
+            "======================================================================\n",
+            "FAIL: test_fail (__main__.B.test_fail)\n",
+            "Adds numbers.\n",
+            "----------------------------------------------------------------------\n",
+            "Traceback (most recent call last):\n",
+            "AssertionError: 2 != 3\n",
+            "\n",
+            "======================================================================\n",
+            "UNEXPECTED SUCCESS: test_xpass (__main__.B.test_xpass)\n",
+            "----------------------------------------------------------------------\n",
+            "Ran 7 tests in T\n",
+            "\n",
+            "FAILED (failures=1, errors=2, skipped=1, expected failures=1, unexpected successes=1)",
+        )
+    );
+    assert_eq!(code, 1);
+
+    // Verified against python3 (3.14.4): a clean run still reports.
+    let (stderr, code) = unittest_report(
+        "ut_ok",
+        concat!(
+            "import unittest\n",
+            "\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    def test_a(self) -> None:\n",
+            "        pass\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+    );
+    assert_eq!(
+        stderr,
+        concat!(
+            ".\n",
+            "----------------------------------------------------------------------\n",
+            "Ran 1 test in T\n",
+            "\n",
+            "OK",
+        )
+    );
+    assert_eq!(code, 0);
+
+    // Verified against python3 (3.14.4): no test ran is exit status 5.
+    let (stderr, code) = unittest_report(
+        "ut_none",
+        concat!(
+            "import unittest\n",
+            "\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+    );
+    assert_eq!(
+        stderr,
+        concat!(
+            "\n",
+            "----------------------------------------------------------------------\n",
+            "Ran 0 tests in T\n",
+            "\n",
+            "NO TESTS RAN",
+        )
+    );
+    assert_eq!(code, 5);
+}
+
+#[test]
+fn unittest_main_exit_false_returns_and_a_blank_docstring_adds_no_line() {
+    // Devin review on #476. `unittest.main(exit=False)` prints the report
+    // and RETURNS, so the statement after it runs; a whitespace-only
+    // docstring is no description (`shortDescription()` is empty), so the
+    // FAIL header has no second line.
+    //
+    // Verified against python3 (3.14.4): stdout `finished`, exit 0, and
+    // stderr as below (the time shown as `T`, the traceback's three frame
+    // lines elided — docs/spec.md §12.3).
+    let (stdout, stderr, code) = unittest_run(
+        "ut_noexit",
+        concat!(
+            "import unittest\n",
+            "\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    def test_a(self) -> None:\n",
+            "        \"\"\"   \"\"\"\n",
+            "        self.assertEqual(1, 2)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main(exit=False)\n",
+            "    print(\"finished\")\n",
+        ),
+    );
+    assert_eq!(stdout, "finished\n");
+    assert_eq!(
+        stderr,
+        concat!(
+            "F\n",
+            "======================================================================\n",
+            "FAIL: test_a (__main__.T.test_a)\n",
+            "----------------------------------------------------------------------\n",
+            "Traceback (most recent call last):\n",
+            "AssertionError: 1 != 2\n",
+            "\n",
+            "----------------------------------------------------------------------\n",
+            "Ran 1 test in T\n",
+            "\n",
+            "FAILED (failures=1)",
+        )
+    );
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn unittest_main_exits_after_a_tests_worker_thread_finishes() {
+    // Devin review on #476: the report's exit must not cut off a non-daemon
+    // worker a test started. Each test's case and locals drop before the
+    // report, joining the worker, as CPython waits for it at shutdown.
+    //
+    // Verified against python3 (3.14.4): stdout below, exit 0.
+    let (stdout, stderr, code) = unittest_run(
+        "ut_worker",
+        concat!(
+            "import threading\n",
+            "import time\n",
+            "import unittest\n",
+            "\n",
+            "\n",
+            "def work() -> None:\n",
+            "    time.sleep(0.2)\n",
+            "    print(\"worker done\")\n",
+            "\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    def test_a(self) -> None:\n",
+            "        worker = threading.Thread(target=work)\n",
+            "        worker.start()\n",
+            "        print(\"test returns\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+    );
+    assert_eq!(stdout, "test returns\nworker done\n");
+    assert!(stderr.ends_with("Ran 1 test in T\n\nOK"), "stderr: {stderr}");
+    assert_eq!(code, 0);
+}
+
 #[test]
 fn unittest_skip_and_expected_failure_gates_match_cpython() {
     // issue #371: skip/skipIf/skipUnless (on a method or a class) keep a

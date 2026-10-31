@@ -6095,8 +6095,8 @@ fn unittest_main_emits_a_test_runner() {
         out
     );
     assert!(
-        out.contains("__rython_ntest_failures"),
-        "the runner must count failures: {}",
+        out.contains("TextTestResult :: new ()") && out.contains("__rython_result . exit ()"),
+        "the runner must report through CPython's TextTestResult and exit: {}",
         out
     );
     assert!(
@@ -7163,7 +7163,7 @@ fn the_unittest_runner_honors_skip_gates_in_sorted_order() {
         ),
         "gate_runner.py",
     );
-    assert!(out.contains("__rython_ntest_skipped += 1"), "the skip must be guarded: {}", out);
+    assert!(out.contains("__rython_result . add_skip ()"), "the skip must be guarded: {}", out);
     let a = out.find(". test_a ()").expect("test_a is run");
     let b = out.find(". test_b ()").expect("test_b is run");
     assert!(a < b, "tests run in sorted order: {}", out);
@@ -29755,6 +29755,33 @@ fn a_call_into_the_program_between_two_definitions_is_refused() {
     assert!(
         err.contains("`helper` is defined twice") && err.contains("an import, or a call"),
         "the refusal names the construct: {err}"
+    );
+}
+
+#[test]
+fn unittest_main_with_an_unsupported_argument_is_refused() {
+    // Devin review on #476: the emitted runner reproduces `unittest.main()`
+    // and `unittest.main(exit=False)`; any other argument (`verbosity=2`
+    // prints a line per test in CPython) used to be ignored silently.
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    def test_a(self) -> None:\n",
+            "        pass\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main(verbosity=2)\n",
+        ),
+        "verbose_main.py",
+    );
+    assert!(
+        err.contains("`unittest.main(verbosity=...)` is not supported yet")
+            && err.contains("refuses to silently ignore"),
+        "the refusal names the argument and the fix: {err}"
     );
 }
 
