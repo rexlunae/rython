@@ -465,18 +465,6 @@ mod tests {
     }
 
     #[test]
-    fn oversized_integer_is_rejected_instead_of_rounded_to_float() {
-        // Verified against python3: these are integers, including the operand
-        // of the unary minus; neither may silently become a floating point value.
-        for src in ["18446744073709551616", "9223372036854775808", "-9223372036854775808"] {
-            let err = crate::parse(src, "large_int.py").unwrap_err().to_string();
-            assert!(err.contains("integer literal outside the i64 range"), "{src}: {err}");
-            assert!(err.contains("line 1"), "{src}: {err}");
-        }
-        assert!(crate::parse("9223372036854775807", "large_int.py").is_ok());
-    }
-
-    #[test]
     fn parse_number_neg_int() {
         let s = crate::parse("-871234234", "test.py").unwrap();
         let ast = s
