@@ -71,7 +71,7 @@ pub fn try_bytes(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
 }
 
 pub fn try_int(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
-    let v: isize = value.extract()?;
+    let v: i64 = value.extract()?;
     let l = Literal::parse(format!("{}", v)).expect("[4] Parsing the literal");
 
     Ok(Some(l))
@@ -327,8 +327,11 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Constant {
             l
         // Ints must be tried before floats: extracting f64 from a Python int
         // succeeds, and would silently lose precision above 2^53.
-        } else if let Ok(l) = try_int(&value) {
-            l
+        } else if value.is_instance_of::<pyo3::types::PyInt>() {
+            try_int(&value).map_err(|_| crate::extraction_failure(
+                "integer literal", &ob,
+                "integer literal outside the i64 range is not supported yet; rewrite it using in-range operands (for i64::MIN, use -9223372036854775807 - 1); rython refuses to silently convert it to a float",
+            ))?
         } else if let Ok(l) = try_float(&value) {
             l
         } else if let Ok(l) = try_complex(&value) {

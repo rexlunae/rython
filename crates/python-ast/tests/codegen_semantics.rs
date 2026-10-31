@@ -4694,7 +4694,10 @@ fn dropped_defaults_emit_call_site_warning() {
 // ---- Struct-based classes ----
 
 fn compile_err(src: &str, name: &str) -> String {
-    let module = parse(src, name).unwrap_or_else(|e| panic!("parse failed: {}", e));
+    let module = match parse(src, name) {
+        Ok(module) => module,
+        Err(err) => return err.to_string(),
+    };
     let symbols = module.clone().find_symbols(SymbolTableScopes::new());
     let err = module
         .to_rust(
@@ -4704,6 +4707,19 @@ fn compile_err(src: &str, name: &str) -> String {
         )
         .expect_err("conversion must fail loudly");
     format!("{}", err)
+}
+
+#[test]
+fn oversized_integer_literals_fail_loudly() {
+    // Verified against python3: each value is an integer, not a float.
+    for literal in ["18446744073709551616", "9223372036854775808", "-9223372036854775808"] {
+        let src = format!("x = {literal}\n");
+        let err = compile_err(&src, "large_int.py");
+        assert!(err.contains("integer literal outside the i64 range"), "{literal}: {err}");
+        assert!(err.contains("line 1"), "{literal}: {err}");
+        assert!(err.contains("rewrite it using in-range operands"), "{literal}: {err}");
+    }
+    assert!(parse("x = 9223372036854775807\n", "large_int.py").is_ok());
 }
 
 const COUNTER: &str = concat!(
