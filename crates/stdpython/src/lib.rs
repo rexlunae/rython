@@ -8444,6 +8444,33 @@ impl From<PyException> for pyo3::PyErr {
     }
 }
 
+impl PyException {
+    /// `traceback.format_exception_only`'s line: the type, then
+    /// `: message` when the message is not empty (`raise ValueError()`
+    /// prints `ValueError`).
+    pub fn format_exception_only(&self) -> alloc::string::String {
+        if self.message.is_empty() {
+            self.type_name()
+        } else {
+            alloc::format!("{}: {}", self.type_name(), self.message)
+        }
+    }
+}
+
+/// An exception that escaped the program's entry: CPython prints the
+/// traceback and exits 1. rython has no frames, so the traceback is its
+/// header and final line — the model limit a thread's unhandled exception
+/// and a unittest block share (docs/spec.md §12.3; issue #479). Standard
+/// output is flushed first, as interpreter shutdown flushes it.
+#[cfg(feature = "std")]
+pub fn exit_uncaught(e: &PyException) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    eprintln!("Traceback (most recent call last):");
+    eprintln!("{}", e.format_exception_only());
+    std::process::exit(1);
+}
+
 impl Display for PyException {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}: {}", self.exception_type, self.message)
