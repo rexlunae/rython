@@ -541,6 +541,212 @@ pub fn assert_less_equal(
     assert_ord(a, b, "assertLessEqual", ctx)
 }
 
+/// `unittest.TestResult.separator1` / `separator2`.
+const SEPARATOR1: &str =
+    "======================================================================";
+const SEPARATOR2: &str =
+    "----------------------------------------------------------------------";
+
+/// CPython's `TextTestResult` and `TextTestRunner.run` at the default
+/// verbosity (issue #334, Phase 3): a status character per test as it
+/// finishes (`.` `F` `E` `s` `x` `u`), then the error and failure blocks,
+/// the `Ran N tests in T.TTTs` line and the `OK` / `FAILED (...)` /
+/// `NO TESTS RAN` summary — all on stderr, as `unittest.main()` writes
+/// them. The emitted runner (python-ast's `emit_test_runner`) reports
+/// each test here and ends with [`TextTestResult::exit`].
+///
+/// rython has no traceback frames, so a block's traceback is CPython's
+/// header and final exception line (the same model limit as a thread's
+/// unhandled exception; docs/spec.md §12).
+pub struct TextTestResult {
+    start: std::time::Instant,
+    tests_run: usize,
+    errors: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>,
+    failures: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>,
+    skipped: usize,
+    expected_failures: usize,
+    unexpected_successes: alloc::vec::Vec<alloc::string::String>,
+}
+
+impl Default for TextTestResult {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TextTestResult {
+    pub fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            tests_run: 0,
+            errors: alloc::vec::Vec::new(),
+            failures: alloc::vec::Vec::new(),
+            skipped: 0,
+            expected_failures: 0,
+            unexpected_successes: alloc::vec::Vec::new(),
+        }
+    }
+
+    /// A skipped test: counted as run, never constructed or set up.
+    pub fn add_skip(&mut self) {
+        self.tests_run += 1;
+        self.skipped += 1;
+        status_char('s');
+    }
+
+    /// Run one test the way `TestCase.run` does: `setUp`, then the test
+    /// (only when `setUp` succeeded), then `tearDown` (likewise). Every
+    /// part's exception is reported as it happens — a failure when it is
+    /// an `AssertionError` (`failureException`), an error otherwise —
+    /// except the test part's under `@expectedFailure`, which is the
+    /// expected outcome. The test counts as a success (or, expecting
+    /// failure, an unexpected success) only when no part raised.
+    pub fn run_test<T>(
+        &mut self,
+        description: &str,
+        expecting_failure: bool,
+        case: &mut T,
+        set_up: impl FnOnce(&mut T) -> Result<(), PyException>,
+        test: impl FnOnce(&mut T) -> Result<(), PyException>,
+        tear_down: impl FnOnce(&mut T) -> Result<(), PyException>,
+    ) {
+        self.tests_run += 1;
+        if let Err(e) = set_up(case) {
+            self.add_exception(description, &e);
+            return;
+        }
+        let mut success = true;
+        let mut expected_failure = false;
+        if let Err(e) = test(case) {
+            if expecting_failure {
+                expected_failure = true;
+            } else {
+                success = false;
+                self.add_exception(description, &e);
+            }
+        }
+        if let Err(e) = tear_down(case) {
+            success = false;
+            self.add_exception(description, &e);
+        }
+        if !success {
+            return;
+        }
+        if !expecting_failure {
+            status_char('.');
+        } else if expected_failure {
+            self.expected_failures += 1;
+            status_char('x');
+        } else {
+            self.unexpected_successes.push(description.into());
+            status_char('u');
+        }
+    }
+
+    fn add_exception(&mut self, description: &str, e: &PyException) {
+        let traceback = alloc::format!(
+            "Traceback (most recent call last):\n{}\n",
+            exception_only(e)
+        );
+        if e.matches_builtin(crate::builtin_exceptions::BuiltinException::AssertionError) {
+            self.failures.push((description.into(), traceback));
+            status_char('F');
+        } else {
+            self.errors.push((description.into(), traceback));
+            status_char('E');
+        }
+    }
+
+    fn was_successful(&self) -> bool {
+        self.failures.is_empty() && self.errors.is_empty() && self.unexpected_successes.is_empty()
+    }
+
+    /// Print the report and exit as `unittest.main()` does: 1 when the run
+    /// was not successful, 5 when no test ran (and none was skipped), 0
+    /// otherwise.
+    pub fn exit(self) -> ! {
+        let elapsed = self.start.elapsed().as_secs_f64();
+        // printErrors: the status line's newline, the errors, the
+        // failures, then the unexpected successes.
+        eprintln!();
+        for (flavour, list) in [("ERROR", &self.errors), ("FAIL", &self.failures)] {
+            for (description, traceback) in list {
+                eprintln!("{SEPARATOR1}");
+                eprintln!("{flavour}: {description}");
+                eprintln!("{SEPARATOR2}");
+                eprintln!("{traceback}");
+            }
+        }
+        for description in &self.unexpected_successes {
+            eprintln!("{SEPARATOR1}");
+            eprintln!("UNEXPECTED SUCCESS: {description}");
+        }
+        eprintln!("{SEPARATOR2}");
+        let plural = if self.tests_run == 1 { "" } else { "s" };
+        eprintln!("Ran {} test{plural} in {elapsed:.3}s", self.tests_run);
+        eprintln!();
+        let mut infos: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        let status = if !self.was_successful() {
+            if !self.failures.is_empty() {
+                infos.push(alloc::format!("failures={}", self.failures.len()));
+            }
+            if !self.errors.is_empty() {
+                infos.push(alloc::format!("errors={}", self.errors.len()));
+            }
+            "FAILED"
+        } else if self.tests_run == 0 && self.skipped == 0 {
+            "NO TESTS RAN"
+        } else {
+            "OK"
+        };
+        if self.skipped != 0 {
+            infos.push(alloc::format!("skipped={}", self.skipped));
+        }
+        if self.expected_failures != 0 {
+            infos.push(alloc::format!("expected failures={}", self.expected_failures));
+        }
+        if !self.unexpected_successes.is_empty() {
+            infos.push(alloc::format!(
+                "unexpected successes={}",
+                self.unexpected_successes.len()
+            ));
+        }
+        if infos.is_empty() {
+            eprintln!("{status}");
+        } else {
+            eprintln!("{status} ({})", infos.join(", "));
+        }
+        let code = if !self.was_successful() {
+            1
+        } else if self.tests_run == 0 && self.skipped == 0 {
+            5
+        } else {
+            0
+        };
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
+}
+
+/// A status character, flushed as CPython's `TextTestResult` flushes it.
+fn status_char(c: char) {
+    use std::io::Write;
+    let mut err = std::io::stderr();
+    let _ = write!(err, "{c}");
+    let _ = err.flush();
+}
+
+/// `traceback.format_exception_only`'s line: the type, then `: message`
+/// when the message is not empty (`raise ValueError()` prints `ValueError`).
+fn exception_only(e: &PyException) -> alloc::string::String {
+    if e.message.is_empty() {
+        e.type_name()
+    } else {
+        alloc::format!("{}: {}", e.type_name(), e.message)
+    }
+}
+
 pub fn main() -> Result<(), PyException> {
     Err(PyException::new(
         "NotImplementedError",

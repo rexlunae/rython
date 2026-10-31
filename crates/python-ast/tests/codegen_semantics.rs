@@ -6095,8 +6095,8 @@ fn unittest_main_emits_a_test_runner() {
         out
     );
     assert!(
-        out.contains("__rython_ntest_failures"),
-        "the runner must count failures: {}",
+        out.contains("TextTestResult :: new ()") && out.contains("__rython_result . exit ()"),
+        "the runner must report through CPython's TextTestResult and exit: {}",
         out
     );
     assert!(
@@ -7163,7 +7163,7 @@ fn the_unittest_runner_honors_skip_gates_in_sorted_order() {
         ),
         "gate_runner.py",
     );
-    assert!(out.contains("__rython_ntest_skipped += 1"), "the skip must be guarded: {}", out);
+    assert!(out.contains("__rython_result . add_skip ()"), "the skip must be guarded: {}", out);
     let a = out.find(". test_a ()").expect("test_a is run");
     let b = out.find(". test_b ()").expect("test_b is run");
     assert!(a < b, "tests run in sorted order: {}", out);
