@@ -6668,7 +6668,7 @@ fn intermediate_use_reason(
     to: usize,
 ) -> Option<String> {
     use crate::ast::tree::visit::{
-        any_expr, any_expr_for, any_stmt, stmt_exprs, walk_stmts, Descend, Flow,
+        any_expr, any_stmt, stmt_exprs, walk_stmts, Descend, Flow,
     };
     let between = &body[from + 1..to];
     if between.is_empty() {
@@ -6701,10 +6701,10 @@ fn intermediate_use_reason(
             crate::ast::tree::visit::stmt_bound_names(s, crate::ast::tree::visit::Bindings::Scope)
         })
         .collect();
-    // A `TYPE_CHECKING` block never runs (the emitter skips it), and a
-    // lambda body runs only when the lambda is called — a call of it is
-    // itself a call into the program (its callee is not a name), so the
-    // lambda's own body stays out (Devin review on #474).
+    // A `TYPE_CHECKING` block never runs (the emitter skips it). A lambda's
+    // body IS scanned: a builtin can call it eagerly (`list(map(lambda x:
+    // setup(), xs))`), so an uncalled lambda's call is refused too — loud,
+    // never silently the wrong definition (Devin review on #474).
     let mut observes = false;
     walk_stmts(between, Descend::SkipDefs, &mut |s| {
         if let crate::StatementType::If(i) = &s.statement
@@ -6716,7 +6716,7 @@ fn intermediate_use_reason(
             &s.statement,
             crate::StatementType::Import(_) | crate::StatementType::ImportFrom(_)
         ) || stmt_exprs(s).into_iter().any(|e| {
-            any_expr_for(e, Descend::OwnScope, |x| match x {
+            any_expr(e, |x| match x {
                 crate::ExprType::Call(c) => match c.func.as_ref() {
                     crate::ExprType::Name(n) => top_level.contains(&n.id),
                     _ => true,

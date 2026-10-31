@@ -29711,9 +29711,8 @@ fn a_call_into_the_program_between_two_definitions_is_refused() {
         "builtin_between.py",
     );
     assert!(!out.contains("v1"), "the shadowed definition is pruned: {out}");
-    // Code that never runs between the two is not an observer (Devin review
-    // on #474): an import under `if TYPE_CHECKING:` (the emitter skips the
-    // block), and a call inside a lambda that is only created.
+    // An import under `if TYPE_CHECKING:` never runs (the emitter skips the
+    // block), so it is not an observer (Devin review on #474).
     let out = compile(
         concat!(
             "from typing import TYPE_CHECKING\n",
@@ -29723,14 +29722,8 @@ fn a_call_into_the_program_between_two_definitions_is_refused() {
             "    return \"v1\"\n",
             "\n",
             "\n",
-            "def setup() -> None:\n",
-            "    pass\n",
-            "\n",
-            "\n",
             "if TYPE_CHECKING:\n",
             "    import math\n",
-            "\n",
-            "later = lambda: setup()\n",
             "\n",
             "\n",
             "def helper() -> str:\n",
@@ -29739,6 +29732,30 @@ fn a_call_into_the_program_between_two_definitions_is_refused() {
         "dead_between.py",
     );
     assert!(!out.contains("v1"), "the shadowed definition is pruned: {out}");
+    // A lambda handed to a builtin runs eagerly (`map` through `list`): its
+    // call into the program is an observer too (Devin review on #474).
+    let err = compile_err(
+        concat!(
+            "def helper() -> str:\n",
+            "    return \"v1\"\n",
+            "\n",
+            "\n",
+            "def setup() -> None:\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "list(map(lambda x: setup(), [1]))\n",
+            "\n",
+            "\n",
+            "def helper() -> str:\n",
+            "    return \"v2\"\n",
+        ),
+        "lambda_between.py",
+    );
+    assert!(
+        err.contains("`helper` is defined twice") && err.contains("an import, or a call"),
+        "the refusal names the construct: {err}"
+    );
 }
 
 #[test]
