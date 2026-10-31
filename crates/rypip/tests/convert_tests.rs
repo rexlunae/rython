@@ -12960,6 +12960,69 @@ fn unittest_main_exits_after_a_tests_worker_thread_finishes() {
 }
 
 #[test]
+fn a_one_argument_key_error_prints_its_argument_repr() {
+    // Issue #475: `KeyError.__str__` is `repr(arg)` for one argument, so a
+    // user's `raise KeyError("td")` prints `'td'`, as an indexing KeyError
+    // already did. A class deriving from KeyError inherits the rule; zero
+    // arguments is the empty string, and other exceptions keep `str(arg)`.
+    //
+    // Verified against python3 (3.14.4).
+    let scratch = Scratch::new("keyerror-str");
+    let file = scratch.path().join("ke.py");
+    fs::write(
+        &file,
+        concat!(
+            "class MissingKey(KeyError):\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    try:\n",
+            "        raise KeyError(\"td\")\n",
+            "    except KeyError as e:\n",
+            "        print(str(e))\n",
+            "    try:\n",
+            "        raise KeyError(5)\n",
+            "    except KeyError as e:\n",
+            "        print(e)\n",
+            "    try:\n",
+            "        raise KeyError()\n",
+            "    except KeyError as e:\n",
+            "        print(\"[\" + str(e) + \"]\")\n",
+            "    try:\n",
+            "        raise MissingKey(\"k\")\n",
+            "    except KeyError as e:\n",
+            "        print(str(e))\n",
+            "    try:\n",
+            "        raise ValueError(\"plain\")\n",
+            "    except ValueError as e:\n",
+            "        print(str(e))\n",
+            "    d = {\"a\": 1}\n",
+            "    try:\n",
+            "        print(d[\"zz\"])\n",
+            "    except KeyError as e:\n",
+            "        print(str(e))\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+    assert!(build_generated(&krate.root).success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/ke"))
+        .output()
+        .expect("running generated binary");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "'td'\n5\n[]\n'k'\nplain\n'zz'\n"
+    );
+}
+
+#[test]
 fn unittest_skip_and_expected_failure_gates_match_cpython() {
     // issue #371: skip/skipIf/skipUnless (on a method or a class) keep a
     // test from running at all — it is not constructed, set up, or run —
