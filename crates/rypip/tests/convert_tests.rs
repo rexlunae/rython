@@ -13713,6 +13713,131 @@ fn a_cyclic_import_of_a_name_bound_later_raises_import_error_like_python() {
 }
 
 #[test]
+fn a_cyclic_import_after_a_rebound_definition_checks_the_emitted_marks() {
+    // Issue #470: `a` defines `f` twice, then binds `X` and imports `b`,
+    // which does `from .a import f, X` while `a` is still running. The
+    // emission prunes the shadowed `def f` (issue #464), so the importer's
+    // bound check has to number the same pruned body: it used to number the
+    // unpruned one and check `X`'s bit at a position the emitter never set,
+    // raising ImportError where CPython resolves the cycle.
+    //
+    // Verified against python3 (3.14.4):
+    //   $ python3 -m rebind.cli
+    //   a sees second7
+    //   second
+    let scratch = Scratch::new("rebind");
+    let krate = package_crate(
+        &scratch,
+        "rebind",
+        &[
+            (
+                "a.py",
+                concat!(
+                    "def f() -> str:\n",
+                    "    return \"first\"\n",
+                    "\n",
+                    "\n",
+                    "def f() -> str:\n",
+                    "    return \"second\"\n",
+                    "\n",
+                    "\n",
+                    "X = 7\n",
+                    "\n",
+                    "from . import b\n",
+                    "\n",
+                    "print(\"a sees\", b.g())\n",
+                ),
+            ),
+            (
+                "b.py",
+                "from .a import f, X\n\n\ndef g() -> str:\n    return f() + str(X)\n",
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from .a import f\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(f())\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    assert_eq!(run_package(&krate, "rebind"), vec!["a sees second7", "second"]);
+}
+
+#[test]
+fn a_cycle_between_two_definitions_of_a_name_is_refused() {
+    // Issue #470's reproducer: `a` defines `f`, imports `b` (which does
+    // `from .a import f` while `a` is still running), then redefines `f`.
+    // CPython hands `b` the FIRST `f`; the generated crate holds one item per
+    // name (the last), so it could only hand out the second — refused loudly.
+    //
+    // Verified against python3 (3.14.4):
+    //   $ python3 -m early.cli
+    //   a sees first
+    //   second
+    let scratch = Scratch::new("early");
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"early\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let pkg = scratch.path().join("early");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    fs::write(
+        pkg.join("a.py"),
+        concat!(
+            "def f() -> str:\n",
+            "    return \"first\"\n",
+            "\n",
+            "\n",
+            "from . import b\n",
+            "\n",
+            "print(\"a sees\", b.g())\n",
+            "\n",
+            "\n",
+            "def f() -> str:\n",
+            "    return \"second\"\n",
+        ),
+    )
+    .unwrap();
+    fs::write(pkg.join("b.py"), "from .a import f\n\n\ndef g() -> str:\n    return f()\n").unwrap();
+    fs::write(
+        pkg.join("cli.py"),
+        concat!(
+            "from .a import f\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    print(f())\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let err = rypip::convert(&pkg, &out, &ConvertOptions::default())
+        .expect_err("a cycle between two definitions must be refused");
+    let msg = format!("{:#}", err);
+    assert!(
+        msg.contains("`f` is defined twice at module level (line 1 and line 10)")
+            && msg.contains("cyclic `from ... import f` binds the FIRST definition"),
+        "the refusal names the construct and why: {}",
+        msg
+    );
+}
+
+#[test]
 fn a_root_cycle_of_a_name_bound_later_raises_import_error_like_python() {
     // pkg/__init__.py imports helper before binding NAME; helper does
     // `from . import NAME` while the root's body is still running: CPython
