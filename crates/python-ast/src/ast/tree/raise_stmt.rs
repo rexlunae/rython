@@ -36,6 +36,26 @@ pub(crate) fn message_arg(
     }
 }
 
+/// The message of an exception constructed with exactly ONE argument —
+/// `str(e)` as CPython computes it: `str(arg)`, except for a `KeyError`
+/// (or a class deriving from it), whose `__str__` is `repr(arg)`, so
+/// `str(KeyError("td"))` is `'td'` (issue #475). `is_key_error` is whether
+/// the constructed class is `KeyError` or has it as an ancestor.
+pub(crate) fn single_arg_message(
+    is_key_error: bool,
+    arg: &crate::ExprType,
+    ctx: crate::CodeGenContext,
+    options: crate::PythonOptions,
+    symbols: crate::SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    if is_key_error {
+        let rendered = arg.clone().to_rust(ctx, options, symbols)?;
+        return Ok(quote!(stdpython::PyRepr::py_repr(&(#rendered))));
+    }
+    let arg = message_arg(arg, ctx, options, symbols)?;
+    Ok(quote!(format!("{}", #arg)))
+}
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -543,12 +563,10 @@ fn exception_value(
                     // (CPython's exact text) and carry the field stores as
                     // attrs. Falls back to the positional message when the
                     // class is not resolvable in this module.
+                    let is_key_error = kind == "KeyError";
                     let msg = match call.args.len() {
                         0 => quote!(String::new()),
-                        1 => {
-                            let arg = message_arg(&call.args[0], ctx, options, symbols)?;
-                            quote!(format!("{}", #arg))
-                        }
+                        1 => single_arg_message(is_key_error, &call.args[0], ctx, options, symbols)?,
                         _ => {
                             let args: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = call
                                 .args
@@ -2025,6 +2043,33 @@ fn model_variadic_level(
     model_init_level(st, cls, rest, forwarded, next_keywords, attrs_in, level + 1, Some(&owner.name))
 }
 
+/// Whether `str(e)` of the in-crate exception class `cls` with one argument
+/// is `KeyError.__str__` — the argument's repr (issue #475): the first class
+/// in its MRO that defines `__str__` decides, and `KeyError` is the builtin
+/// that does (an in-crate class's own `__str__` before it wins).
+fn str_is_key_error_repr(
+    cls: &crate::ClassDef,
+    class_symbols: &SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    for (name, def) in exception_mro(cls, class_symbols, options)? {
+        if let Some((def, _)) = def {
+            let defines_str = def.body.iter().any(|s| {
+                matches!(
+                    &s.statement,
+                    crate::StatementType::FunctionDef(f) if f.name == "__str__"
+                )
+            });
+            if defines_str {
+                return Ok(false);
+            }
+        } else if name == "KeyError" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The construction's tokens from what `BaseException.__init__` receives
 /// and the stored attrs: each message part evaluated once (a temporary
 /// unless it is a constant or a name — a bare name captured when a later
@@ -2054,13 +2099,16 @@ fn finish_construction(
     }
     let msg = match parts.as_slice() {
         [] => quote::quote!(String::new()),
-        [one] => {
-            // The display wrapping the message builder applies (a class
-            // instance, an Option, a boxed value — a temporary's type is
-            // recorded in the options).
-            let m = message_arg(one, st.ctx.clone(), st.options.clone(), st.symbols.clone())?;
-            quote::quote!(format!("{}", #m))
-        }
+        // The display wrapping the message builder applies (a class
+        // instance, an Option, a boxed value — a temporary's type is
+        // recorded in the options); a KeyError's `str()` is the repr.
+        [one] => single_arg_message(
+            str_is_key_error_repr(cls, class_symbols, &st.options)?,
+            one,
+            st.ctx.clone(),
+            st.options.clone(),
+            st.symbols.clone(),
+        )?,
         many => {
             let fmt = format!("({})", vec!["{}"; many.len()].join(", "));
             quote::quote!(format!(#fmt, #(stdpython::PyRepr::py_repr(&(#part_tokens))),*))

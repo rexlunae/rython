@@ -29786,6 +29786,37 @@ fn unittest_main_with_an_unsupported_argument_is_refused() {
 }
 
 #[test]
+fn a_key_error_subclass_with_its_own_str_keeps_the_plain_message() {
+    // Issue #475: the repr rule is `KeyError.__str__`; a class that defines
+    // `__str__` before KeyError in its MRO does not inherit it, so its
+    // message stays `str(arg)` (no `py_repr`).
+    let out = compile(
+        concat!(
+            "class Plain(KeyError):\n",
+            "    def __str__(self) -> str:\n",
+            "        return \"custom\"\n",
+            "\n",
+            "\n",
+            "def main() -> None:\n",
+            "    raise Plain(\"k\")\n",
+        ),
+        "plain_key_error.py",
+    );
+    assert!(
+        out.contains("\"Plain\" , format ! (\"{}\" , \"k\")"),
+        "no repr for an own __str__: {out}"
+    );
+    let out = compile(
+        concat!(
+            "def main() -> None:\n",
+            "    raise KeyError(\"k\")\n",
+        ),
+        "builtin_key_error.py",
+    );
+    assert!(out.contains("PyRepr :: py_repr"), "a builtin KeyError takes the repr: {out}");
+}
+
+#[test]
 fn a_shadowed_class_with_an_inert_body_emits_one_struct() {
     // The SAFE half: a body of literal field stores performs no call, so the
     // earlier definition is indistinguishable from never having run.
