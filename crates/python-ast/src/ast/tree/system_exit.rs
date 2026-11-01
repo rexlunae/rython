@@ -6,8 +6,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 
 use crate::{
-    CodeGen, CodeGenContext, ExprType, PythonOptions, StdModule, SymbolTableNode,
-    SymbolTableScopes, TypeInfo,
+    CodeGen, CodeGenContext, ExprType, PythonOptions, SymbolTableNode, SymbolTableScopes, TypeInfo,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -16,21 +15,9 @@ pub(crate) enum ExitCall {
     Constructor,
 }
 
-#[derive(Clone, Copy)]
-enum Module {
-    Sys,
-    Builtins,
-}
+use crate::ast::tree::interpreter_state::{InterpreterModule, module_of_expr};
 
-impl Module {
-    fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "builtins" => Some(Self::Builtins),
-            _ if StdModule::from_name(name) == Some(StdModule::Sys) => Some(Self::Sys),
-            _ => None,
-        }
-    }
-
+impl InterpreterModule {
     fn member(self, name: &str) -> Option<ExitCall> {
         match self {
             Self::Sys if name == "exit" => Some(ExitCall::Function),
@@ -42,7 +29,8 @@ impl Module {
 
 impl ExitCall {
     pub(crate) fn runtime_function(module: &str, member: &str) -> bool {
-        Module::from_name(module).and_then(|module| module.member(member)) == Some(Self::Function)
+        InterpreterModule::from_name(module).and_then(|module| module.member(member))
+            == Some(Self::Function)
     }
 
     pub(crate) fn builtin(name: &str) -> Option<Self> {
@@ -84,7 +72,7 @@ impl ExitCall {
                             resolve(value, options, symbols, seen)
                         }
                         Some(SymbolTableNode::ImportFrom(import)) if import.level == 0 => {
-                            Module::from_name(&import.module)?
+                            InterpreterModule::from_name(&import.module)?
                                 .member(&import.defining_name(&name.id))
                         }
                         None => ExitCall::builtin(&name.id),
@@ -92,42 +80,13 @@ impl ExitCall {
                     }
                 }
                 ExprType::Attribute(attr) => {
-                    module_of(&attr.value, options, symbols)?.member(&attr.attr)
+                    module_of_expr(&attr.value, options, symbols)?.member(&attr.attr)
                 }
                 _ => None,
             }
         }
         resolve(expr, options, symbols, &mut HashSet::new())
     }
-}
-
-fn module_of(
-    expr: &ExprType,
-    options: &PythonOptions,
-    symbols: &SymbolTableScopes,
-) -> Option<Module> {
-    let ExprType::Name(name) = expr else {
-        return None;
-    };
-    if options.name_types.contains_key(&name.id) || options.local_types.contains_key(&name.id) {
-        return None;
-    }
-    let mut current = name.id.as_str();
-    let mut seen = HashSet::new();
-    while let Some(SymbolTableNode::Alias(canonical)) = symbols.get(current) {
-        if !seen.insert(current) {
-            return None;
-        }
-        current = canonical;
-    }
-    let Some(SymbolTableNode::Import(import)) = symbols.get(current) else {
-        return None;
-    };
-    import
-        .names
-        .iter()
-        .find(|alias| alias.name == current || alias.asname.as_deref() == Some(current))
-        .and_then(|alias| Module::from_name(&alias.name))
 }
 
 /// A bare runtime function value would bypass call-site arity and propagation.

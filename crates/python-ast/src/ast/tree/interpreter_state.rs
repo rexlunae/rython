@@ -13,13 +13,13 @@ pub(crate) enum InterpreterNamespace {
 }
 
 #[derive(Clone, Copy)]
-enum NamespaceModule {
+pub(crate) enum InterpreterModule {
     Sys,
     Builtins,
 }
 
-impl NamespaceModule {
-    fn from_name(name: &str) -> Option<Self> {
+impl InterpreterModule {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
         match name {
             "builtins" => Some(Self::Builtins),
             _ if StdModule::from_name(name) == Some(StdModule::Sys) => Some(Self::Sys),
@@ -37,9 +37,9 @@ impl InterpreterNamespace {
     }
 
     pub(crate) fn from_import(module: &str, member: &str) -> Option<Self> {
-        match NamespaceModule::from_name(module)? {
-            NamespaceModule::Sys => Self::from_sys_member(member),
-            NamespaceModule::Builtins => Self::from_builtin(member),
+        match InterpreterModule::from_name(module)? {
+            InterpreterModule::Sys => Self::from_sys_member(member),
+            InterpreterModule::Builtins => Self::from_builtin(member),
         }
     }
 
@@ -94,8 +94,8 @@ impl InterpreterNamespace {
         symbols: &SymbolTableScopes,
     ) -> Option<Self> {
         match module_of_expr(value, options, symbols)? {
-            NamespaceModule::Sys => Self::from_sys_member(member),
-            NamespaceModule::Builtins => Self::from_builtin(member),
+            InterpreterModule::Sys => Self::from_sys_member(member),
+            InterpreterModule::Builtins => Self::from_builtin(member),
         }
     }
 
@@ -126,11 +126,11 @@ impl InterpreterNamespace {
     }
 }
 
-fn module_of_expr(
+pub(crate) fn module_of_expr(
     expr: &ExprType,
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
-) -> Option<NamespaceModule> {
+) -> Option<InterpreterModule> {
     let ExprType::Name(name) = expr else {
         return None;
     };
@@ -150,7 +150,7 @@ fn module_of_expr(
             .names
             .iter()
             .find(|alias| alias.name == current || alias.asname.as_deref() == Some(current))
-            .and_then(|alias| NamespaceModule::from_name(&alias.name)),
+            .and_then(|alias| InterpreterModule::from_name(&alias.name)),
         _ => None,
     }
 }
