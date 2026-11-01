@@ -223,14 +223,31 @@ rypip jit --clear-cache
 
 `rypip jit run` is the whole-program path. In `cdylib` mode the converter
 emits a second shim, `ry_entry(argc, argv) -> status`, that runs what the
-binary's `main` runs (module initialization, then the `__main__` body), with
-`sys.argv` set from the arguments. It differs from the binary's `main` in
-one respect: it must not call `process::exit`, which would end the host. An
+binary's `main` runs (module initialization, then the `__main__` body). It
+differs from the binary's `main` in two respects.
+
+*It must not call `process::exit`*, which would end the host. An
 uncaught exception prints the same traceback header and final line the
 binary prints and returns status 1, and a `SystemExit` returns its code, so
-the host reports both exactly as the binary's exit would. `rypip run` stays
-as it is: the exec-based, whole-program path that runs the program in its
-own process.
+the host reports both exactly as the binary's exit would.
+
+*Its arguments cannot come from its parameters alone.* `sys.argv` is a
+`LazyLock` over the real process arguments (`stdlib/sys.rs`), and
+`argv_at` reads them independently, so inside a host process both would
+report the host's arguments. M1 therefore adds a runtime seam in
+`stdpython`: one function that yields the program's arguments, consulted by
+both `argv` and `argv_at` (and by the argparse default `prog`, which goes
+through `argv_at`), with an override that `ry_entry` installs, in the
+library's own copy of `stdpython`, before the program runs. `argv[0]` is the
+program path as the user typed it, as `rypip run` already does. Because
+`argv` initializes once, a loaded library's entry can run **once** per
+process; a second `ry_entry` call on the same library returns
+`JitError::EntryAlreadyRun` instead of running with stale arguments. A
+resettable `argv` is a later change, since generated code reads the static
+directly.
+
+`rypip run` stays as it is: the exec-based, whole-program path that runs the
+program in its own process.
 
 **`eval`/`exec`** (M3). There is no ambient namespace to reach into: the
 converter has none, and it rejects fabricated interpreter namespaces. So
@@ -249,7 +266,7 @@ Each is independently mergeable, gated by tests that diff against
   `jit-eval.md` marked superseded. Docs only.
 - **M1, compile, cache, load, call, run.** `rython-jit` with scalar and
   `str` arguments and results, exception mapping, the content-hash cache,
-  the artifact-discovery refactor, the `ry_entry` shim, and `rypip jit call`
+  the artifact-discovery refactor, the `ry_entry` shim and the `sys.argv` seam in `stdpython`, and `rypip jit call`
   and `rypip jit run`. *Useful on its own:* a Rust program can call a Python
   function it loads at runtime, and the CLI gives repeated runs of an
   unchanged file a cache hit. Gate: transcript tests against `python3` for
