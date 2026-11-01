@@ -13,11 +13,8 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(tag: &str) -> Self {
-        // The CLI derives the module name from the file path and rejects
-        // anything that is not a Python identifier, so the scratch path
-        // holds no hyphens (a `rythonc_test_<tag>_<pid>` segment).
         let dir = std::env::temp_dir().join(format!(
-            "rythonc_test_{}_{}",
+            "rythonc-test-{}-{}",
             tag,
             std::process::id()
         ));
@@ -29,6 +26,51 @@ impl Scratch {
     fn path(&self) -> &PathBuf {
         &self.0
     }
+}
+
+#[test]
+fn parent_path_punctuation_is_not_part_of_the_module_name() {
+    let scratch = Scratch::new("source paths");
+    let nested = scratch.path().join("package.name").join("has spaces-and-hyphens");
+    fs::create_dir_all(&nested).unwrap();
+    let input = nested.join("single.py");
+    // Verified against python3: the program prints "path okay\n".
+    fs::write(&input, "def main() -> None:\n    print('path okay')\n\nmain()\n").unwrap();
+    for relative in [false, true] {
+        for mode in [None, Some("--ast-only"), Some("--symbols-only")] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_rythonc"));
+            if relative {
+                command.current_dir(scratch.path()).arg(input.strip_prefix(scratch.path()).unwrap());
+            } else {
+                command.arg(&input);
+            }
+            if let Some(mode) = mode { command.arg(mode); }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{relative}/{mode:?}: {}", String::from_utf8_lossy(&output.stderr));
+            let emitted = String::from_utf8_lossy(&output.stdout);
+            assert!(emitted.contains("path okay"), "{emitted}");
+        }
+    }
+}
+
+#[test]
+fn filename_validation_and_diagnostics_keep_the_original_source_path() {
+    let scratch = Scratch::new("diagnostic paths");
+    let invalid_name = scratch.path().join("bad-name.py");
+    fs::write(&invalid_name, "print('hello')\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rythonc")).arg(&invalid_name).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("Invalid module name derived from filename"), "{stderr}");
+    assert!(stderr.contains(invalid_name.to_str().unwrap()), "{stderr}");
+
+    let syntax_error = scratch.path().join("broken.py");
+    fs::write(&syntax_error, "def broken(:\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rythonc")).arg(&syntax_error).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("SyntaxError"), "{stderr}");
+    assert!(stderr.contains(syntax_error.to_str().unwrap()), "{stderr}");
 }
 
 impl Drop for Scratch {

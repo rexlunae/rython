@@ -23,6 +23,10 @@ conversion errors. Ordinary integer arithmetic still uses `i64`. See the
 [integer migration plan](../../docs/automatic-integers.md) for the supported
 slice and the remaining work.
 
+Interpreter-owned namespace access (`sys.modules` and builtin `locals()`)
+is refused during conversion, including mutation and aliased `sys` imports.
+Use explicit imports and application-owned dictionaries instead.
+
 ### Prerequisites
 
 - **Rust**: 1.82+ (2024 edition)

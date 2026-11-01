@@ -2528,6 +2528,11 @@ impl<'a> CodeGen for Call {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        use crate::ast::tree::interpreter_state::InterpreterNamespace;
+        if let Some(namespace) = InterpreterNamespace::from_call(&self, &options, &symbols) {
+            return Err(namespace.refusal().into());
+        }
+        crate::ast::tree::interpreter_state::check_target(&self.func, &options, &symbols)?;
         if crate::ast::tree::big_integer::is_integer_limit_call(&self, &options, &symbols) {
             return Err("sys integer decimal-conversion limit APIs are not supported yet; use the default 4300-digit limit; rython refuses to silently ignore a limit change or invent its value".into());
         }
@@ -5083,6 +5088,7 @@ impl<'a> CodeGen for Call {
                         });
                     }
                     "getattr" => {
+                        InterpreterNamespace::check_attribute_call(&self, &options, &symbols)?;
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
@@ -5132,6 +5138,7 @@ impl<'a> CodeGen for Call {
                         });
                     }
                     "hasattr" => {
+                        InterpreterNamespace::check_attribute_call(&self, &options, &symbols)?;
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
@@ -5149,6 +5156,7 @@ impl<'a> CodeGen for Call {
                         return Ok(quote!(false));
                     }
                     "setattr" => {
+                        InterpreterNamespace::check_attribute_call(&self, &options, &symbols)?;
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }

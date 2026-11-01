@@ -47,6 +47,8 @@ pub use function_def::*;
 pub mod import;
 pub use import::*;
 
+pub(crate) mod interpreter_state;
+
 pub mod keyword;
 pub use keyword::*;
 

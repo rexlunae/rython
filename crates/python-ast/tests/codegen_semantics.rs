@@ -4710,6 +4710,65 @@ fn compile_err(src: &str, name: &str) -> String {
 }
 
 #[test]
+fn interpreter_namespaces_are_refused_instead_of_fabricated_or_ignored() {
+    // Verified against python3: deleting sys.modules or builtins.locals
+    // removes the attribute (hasattr returns False), so dropping del is wrong.
+    for statement in [
+        "print(sys.modules)",
+        "print(len(sys.modules))",
+        "print('foo' in sys.modules)",
+        "print(sys.modules.get('foo'))",
+        "print(getattr(sys, 'modules', {}))",
+        "print(hasattr(sys, 'modules'))",
+        "setattr(sys, 'modules', {})",
+        "sys.modules.update({})",
+        "sys.modules['foo'] = sys",
+        "sys.modules = {}",
+        "sys.modules['foo'] += 1",
+        "del sys.modules",
+        "del sys.modules['foo']",
+        "registry = sys.modules",
+    ] {
+        let source = format!("import sys\n\ndef f():\n    {statement}\n");
+        let err = compile_err(&source, "registry.py");
+        assert!(err.contains("sys.modules access is not supported yet"), "{statement}: {err}");
+        assert!(err.contains("<module>:4:"), "{err}");
+        assert!(err.contains("explicit imports") && err.contains("refuses"), "{err}");
+    }
+    for source in [
+        "import sys as system\nprint(system.modules)\n",
+        "import os, sys as system\nsystem.modules['foo'] = 1\n",
+        "from sys import modules as registry\nprint(registry)\n",
+        "import sys as system\ndel system.modules\n",
+    ] {
+        let err = compile_err(source, "registry_alias.py");
+        assert!(err.contains("sys.modules access is not supported yet"), "{err}");
+    }
+    for statement in ["print(locals())", "locals()['foo'] = 1", "locals().update({})"] {
+        let err = compile_err(&format!("def f():\n    {statement}\n"), "frame.py");
+        assert!(err.contains("locals() namespace access is not supported yet"), "{err}");
+        assert!(err.contains("explicit dictionary") && err.contains("refuses"), "{err}");
+    }
+    for source in [
+        "import builtins as b\nprint(b.locals())\n",
+        "from builtins import locals as scope\nprint(scope())\n",
+        "import builtins\ndel builtins.locals\n",
+        "import builtins as b\ndel b.locals\n",
+    ] {
+        let err = compile_err(source, "frame_alias.py");
+        assert!(err.contains("locals() namespace access is not supported yet"), "{err}");
+    }
+}
+
+#[test]
+fn interpreter_namespace_guards_preserve_shadowing_and_inactive_branches() {
+    let source = "import sys\nclass Registry:\n    def __init__(self) -> None:\n        self.modules = 3\ndef read(sys: Registry) -> int:\n    return sys.modules\ndef locals() -> int:\n    return 7\nprint(locals())\nif False:\n    print(sys.modules)\n";
+    let out = compile(source, "shadowed_namespaces.py");
+    assert!(out.contains("fn read"), "{out}");
+    assert!(out.contains("fn locals"), "{out}");
+}
+
+#[test]
 fn oversized_integer_literals_keep_exact_decimal_values() {
     // Verified against python3: these are int values, including hex and
     // the positive AST operand of -9223372036854775808.

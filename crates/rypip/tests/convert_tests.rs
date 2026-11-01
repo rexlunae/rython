@@ -24,6 +24,46 @@ fn build_generated(root: &Path) -> std::process::ExitStatus {
 }
 
 #[test]
+fn interpreter_namespace_access_is_rejected_before_building() {
+    let scratch = Scratch::new("interpreter-namespaces");
+    // Verified against python3: the issue #488 source prints True twice.
+    // There is no static-runtime registry that could preserve those reads.
+    // Both namespace-deletion programs below print "deleted\n" under python3;
+    // conversion must refuse the deletion itself, without a guarded read later.
+    for (name, source, construct) in [
+        ("registry", "import sys\ndef main() -> None:\n    sys.modules['foo'] = sys\n    print('foo' in sys.modules)\n    print(len(sys.modules) > 0)\nif __name__ == '__main__':\n    main()\n", "sys.modules access"),
+        ("registry_read", "import sys as system\nprint(len(system.modules))\n", "sys.modules access"),
+        ("registry_delete", "import sys\ndel sys.modules\nprint('deleted')\n", "sys.modules access"),
+        ("locals_delete", "import builtins\ndel builtins.locals\nprint('deleted')\n", "locals() namespace access"),
+        ("local_store", "def f() -> None:\n    locals()['foo'] = 3\nf()\n", "locals() namespace access"),
+    ] {
+        let file = scratch.path().join(format!("{name}.py"));
+        fs::write(&file, source).unwrap();
+        let package = rypip::discover(&file).unwrap();
+        let error = rypip::convert(&package, &scratch.path().join(name), &ConvertOptions::default()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(construct), "{message}");
+        assert!(message.contains("refuses"), "{message}");
+        assert!(message.contains(&format!("{name}.py")), "{message}");
+    }
+}
+
+#[test]
+fn interpreter_namespace_guards_preserve_ordinary_names() {
+    let scratch = Scratch::new("namespace-shadowing");
+    let file = scratch.path().join("app.py");
+    fs::write(&file, "import sys\nclass Registry:\n    def __init__(self) -> None:\n        self.modules = 3\ndef read(sys: Registry) -> int:\n    return sys.modules\ndef locals() -> int:\n    return 7\ndef main() -> None:\n    print(read(Registry()))\n    print(locals())\n    if False:\n        print(sys.modules)\nif __name__ == '__main__':\n    main()\n").unwrap();
+    let package = rypip::discover(&file).unwrap();
+    let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/app")).output().unwrap();
+    // Verified against python3.
+    assert_eq!(output.stdout, b"3\n7\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn oversized_integer_scalar_program_matches_cpython() {
     let scratch = Scratch::new("big-integer-scalar");
     let file = scratch.path().join("app.py");

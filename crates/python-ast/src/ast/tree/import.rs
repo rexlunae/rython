@@ -2425,6 +2425,13 @@ impl CodeGen for ImportFrom {
         mut symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         debug!("ctx: {:?}", ctx);
+        if self.level == 0 {
+            for alias in &self.names {
+                if let Some(namespace) = crate::ast::tree::interpreter_state::InterpreterNamespace::from_import(&self.module, &alias.name) {
+                    return Err(namespace.refusal().into());
+                }
+            }
+        }
         // annotations map to Rust types directly, so the import itself
         // lowers to nothing.
         if crate::AnnotationModule::from_name(self.module.split('.').next().unwrap_or(""))
