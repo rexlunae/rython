@@ -17,18 +17,19 @@ pub(crate) fn message_arg(
     // The type check borrows ctx BEFORE the render move (infer_type now
     // takes the CodeGenContext — Directive 2). A GENERIC parameter keeps
     // the raw format arg (its concrete type is bound elsewhere); a
-    // concrete class instance/Option/boxed value needs py_display.
+    // concrete values whose Rust Display differs (including bool and
+    // float), class instances, optional and boxed values use py_display.
+    let ty = crate::infer_type(Some(&ctx), expr, &options, &symbols);
     let needs_display = !matches!(expr, crate::ExprType::Name(n)
         if options.param_type_vars.contains_key(&n.id))
-        && matches!(
-            crate::infer_type(Some(&ctx), expr, &options, &symbols),
-            crate::TypeInfo::Class(_)
-                | crate::TypeInfo::Option(_)
-                | crate::TypeInfo::PyValue
-                | crate::TypeInfo::PyValueMember(_)
-                | crate::TypeInfo::PyObject
-        );
-    let rendered = expr.clone().to_rust(ctx, options.clone(), symbols.clone())?;
+        && (crate::ast::tree::arguments::is_exception_typeinfo(&ty)
+            || matches!(ty, crate::TypeInfo::Bool | crate::TypeInfo::Float | crate::TypeInfo::Bytes
+                | crate::TypeInfo::Class(_) | crate::TypeInfo::Option(_) | crate::TypeInfo::PyValue
+                | crate::TypeInfo::PyValueMember(_) | crate::TypeInfo::PyObject
+                | crate::TypeInfo::Tuple(_) | crate::TypeInfo::PyTuple(_))
+            || matches!(&ty, crate::TypeInfo::Custom(tokens) if tokens.to_string() == "()")
+            || crate::is_none_expr(expr));
+    let rendered = message_value_tokens(expr, ctx, options, symbols)?;
     if needs_display {
         Ok(quote!(py_display(&(#rendered))))
     } else {
@@ -49,11 +50,24 @@ pub(crate) fn single_arg_message(
     symbols: crate::SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
     if is_key_error {
-        let rendered = arg.clone().to_rust(ctx, options, symbols)?;
+        let rendered = message_value_tokens(arg, ctx, options, symbols)?;
         return Ok(quote!(stdpython::PyRepr::py_repr(&(#rendered))));
     }
     let arg = message_arg(arg, ctx, options, symbols)?;
     Ok(quote!(format!("{}", #arg)))
+}
+
+fn message_value_tokens(
+    expr: &crate::ExprType,
+    ctx: crate::CodeGenContext,
+    options: crate::PythonOptions,
+    symbols: crate::SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    if crate::is_none_expr(expr) {
+        Ok(quote!(stdpython::PyValue::None_))
+    } else {
+        expr.clone().to_rust(ctx, options, symbols)
+    }
 }
 
 use serde::{Deserialize, Serialize};
@@ -417,6 +431,167 @@ pub fn is_exception_class_name(name: &str) -> bool {
         || name.ends_with("Warning")
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Callee {
+    Raise,
+    Value,
+}
+
+enum ExceptionClass {
+    Crate(crate::ClassDef, SymbolTableScopes),
+    Builtin(String),
+    Unseen(String),
+}
+
+/// Builtin display rules, parsed once at the name boundary. Descendants
+/// inherit the first rule on the interpreter's actual MRO.
+#[derive(Clone, Copy)]
+enum ExceptionStr {
+    Key,
+    Os,
+    Ssl,
+    Syntax,
+    Unicode,
+    Group,
+}
+
+impl ExceptionStr {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "KeyError" => Some(Self::Key),
+            "OSError" => Some(Self::Os),
+            "SSLError" => Some(Self::Ssl),
+            "SyntaxError" => Some(Self::Syntax),
+            "UnicodeEncodeError" | "UnicodeDecodeError" | "UnicodeTranslateError" => Some(Self::Unicode),
+            "BaseExceptionGroup" => Some(Self::Group),
+            _ => None,
+        }
+    }
+
+    fn of_builtin(name: &str) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        Ok(builtin_exception_mro(name)?.and_then(|mro| mro.iter().find_map(|name| Self::from_name(name))))
+    }
+}
+
+fn exception_call_class(
+    call: &crate::Call,
+    position: Callee,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<ExceptionClass> {
+    use crate::ast::tree::interpreter_state::{module_of_expr, InterpreterModule};
+    match call.func.as_ref() {
+        ExprType::Attribute(attr) => {
+            if matches!(module_of_expr(&attr.value, options, symbols), Some(InterpreterModule::Builtins))
+                && is_builtin_exception_name(&attr.attr)
+            {
+                return Some(ExceptionClass::Builtin(attr.attr.clone()));
+            }
+            let ExprType::Name(module) = attr.value.as_ref() else { return None };
+            if options.name_types.contains_key(&module.id) || options.local_types.contains_key(&module.id) {
+                return None;
+            }
+            let Some(SymbolTableNode::Import(import)) = symbols.get(&module.id) else { return None };
+            let module = import.names.iter().find(|alias|
+                alias.asname.as_deref().unwrap_or(&alias.name) == module.id
+            )?;
+            stdlib_exception_canonical(&module.name, &attr.attr)
+                .map(|kind| ExceptionClass::Builtin(kind.to_string()))
+        }
+        ExprType::Name(name) => {
+            if options.name_types.contains_key(&name.id) || options.local_types.contains_key(&name.id) {
+                return None;
+            }
+            if let Some((class, class_symbols)) = crate::ast::tree::call::resolve_construction_class(&name.id, symbols, options)
+                && crate::is_exception_class(&class)
+            {
+                return Some(ExceptionClass::Crate(class, class_symbols));
+            }
+            let mut bound = name.id.clone();
+            let mut followed = std::collections::HashSet::new();
+            while followed.insert(bound.clone()) {
+                match symbols.get(&bound) {
+                    Some(SymbolTableNode::Alias(target)) => bound = target.clone(),
+                    Some(SymbolTableNode::Assign { value: ExprType::Name(target), .. }) => bound = target.id.clone(),
+                    _ => break,
+                }
+            }
+            if let Some(SymbolTableNode::ImportFrom(import)) = symbols.get(&bound)
+                && import.level == 0
+                && matches!(InterpreterModule::from_name(&import.module), Some(InterpreterModule::Builtins))
+            {
+                let item = import.defining_name(&bound);
+                return is_builtin_exception_name(&item).then(|| ExceptionClass::Builtin(item));
+            }
+            if let Some(kind) = imported_exception_alias(&name.id, symbols, Some(options)) {
+                return Some(ExceptionClass::Builtin(kind.to_string()));
+            }
+            let member = crate::ast::tree::arguments::is_exception_class_member(call.func.as_ref(), symbols, options);
+            if position == Callee::Value && !member { return None; }
+            if position == Callee::Raise
+                && !member && !crate::ast::tree::import::resolves_to_external_import(&name.id, options, symbols)
+            {
+                return None;
+            }
+            let kind = canonical_exception_class(&name.id, symbols, options)
+                .map(|(name, _)| name).unwrap_or_else(|| name.id.clone());
+            if crate::ast::tree::import::resolves_to_external_import(&name.id, options, symbols) {
+                return Some(ExceptionClass::Unseen(kind));
+            }
+            Some(if is_builtin_exception_name(&kind) {
+                ExceptionClass::Builtin(kind)
+            } else {
+                ExceptionClass::Unseen(kind)
+            })
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn constructs_exception(call: &crate::Call, symbols: &SymbolTableScopes, options: &PythonOptions) -> bool {
+    exception_call_class(call, Callee::Value, symbols, options).is_some()
+}
+
+/// One call classification and construction for raises, stored values,
+/// returns, and arguments. Unseen classes keep the legacy raise posture
+/// for zero/one argument; new value positions cannot assume their methods.
+pub(crate) fn exception_call_construction(
+    call: &crate::Call,
+    position: Callee,
+    ctx: CodeGenContext,
+    options: PythonOptions,
+    symbols: SymbolTableScopes,
+) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
+    if let ExprType::Name(name) = call.func.as_ref()
+        && let Some(message) = ambiguous_alias_refusal(&name.id, &options)
+    {
+        return Err(message.into());
+    }
+    let class = exception_call_class(call, position, &symbols, &options);
+    if class.is_some() && call.args.iter().chain(call.keywords.iter().map(|keyword| &keyword.value)).any(|arg|
+        crate::ast::tree::type_ctx::type_mentions_bigint(&crate::infer_type(Some(&ctx), arg, &options, &symbols)))
+    {
+        return Err("arbitrary-precision integer exception arguments are not supported yet; convert the argument with str(value) first; rython refuses to change exception construction timing".into());
+    }
+    match class {
+        None => Ok(None),
+        Some(ExceptionClass::Crate(class, class_symbols)) => {
+            exception_construction(&class, &class_symbols, call, ctx, options, symbols).map(Some)
+        }
+        Some(ExceptionClass::Builtin(kind)) => {
+            let kind = builtin_exception_mro(&kind)?.and_then(|mro| mro.first().cloned()).unwrap_or(kind);
+            let rule = ExceptionStr::of_builtin(&kind)?;
+            named_exception_construction(&kind, rule, call, ctx, options, symbols).map(Some)
+        }
+        Some(ExceptionClass::Unseen(kind)) => {
+            if position == Callee::Value || call.args.len() > 1 {
+                return Err(format!("exception construction `{kind}(...)` has an unseen class definition or MRO; convert its defining module with the package, or use a supported builtin exception with explicit immutable arguments; rython refuses to invent its argument or display behavior").into());
+            }
+            named_exception_construction(&kind, None, call, ctx, options, symbols).map(Some)
+        }
+    }
+}
+
 /// Lower the raised expression to a PyException value: `Name(...)` and bare
 /// `Name` forms that look like exception classes construct one carrying the
 /// class name (so handlers can match on it); any other expression is
@@ -453,177 +628,21 @@ fn exception_value(
     }
     match exc {
         ExprType::Call(call) => {
-            if call.args.iter().chain(call.keywords.iter().map(|keyword| &keyword.value)).any(|arg|
-                crate::ast::tree::type_ctx::type_mentions_bigint(&crate::infer_type(Some(&ctx), arg, &options, &symbols)))
-            {
-                return Err("arbitrary-precision integer exception arguments are not supported yet; convert the argument with str(value) first; rython refuses to change exception construction timing".into());
+            if let Some(tokens) = exception_call_construction(
+                call, Callee::Raise, ctx.clone(), options.clone(), symbols.clone(),
+            )? {
+                return Ok(tokens);
             }
-            // An IN-CRATE exception class with a modeled __init__: render
-            // the class's own message and carry its field stores as attrs
-            // (bank's InsufficientFunds — round 99). Runs FIRST (before
-            // the message builders move ctx/options/symbols below).
-            // The class resolves locally or through its import (`from
-            // .errors import MyError`): the defining module's ClassDef
-            // and symbols drive the model and the ancestor chain.
-            if let ExprType::Name(name) = call.func.as_ref()
-                && let Some((cls, class_symbols)) =
-                    crate::ast::tree::call::resolve_construction_class(&name.id, &symbols, &options)
-                && crate::is_exception_class(&cls)
-            {
-                return exception_construction(
-                    &cls,
-                    &class_symbols,
-                    call,
-                    ctx,
-                    options,
-                    symbols,
-                );
-            }
-            // `raise ssl.SSLError(...)` — the dotted stdlib exception
-            // spelling (urllib3's pyopenssl): canonicalize like the bare
-            // name, constructing the tagged PyException (the runtime
-            // module has no SSLError item to call).
-            if let ExprType::Attribute(attr) = call.func.as_ref()
-                && let ExprType::Name(m) = attr.value.as_ref()
-                && let Some(kind) = stdlib_exception_canonical(&m.id, &attr.attr)
-            {
-                let msg = match call.args.len() {
-                    0 => quote!(String::new()),
-                    _ => {
-                        let arg = message_arg(&call.args[0], ctx, options, symbols)?;
-                        quote!(format!("{}", #arg))
-                    }
-                };
-                return Ok(quote!(PyException::new(#kind, #msg)));
-            }
-            if let ExprType::Name(name) = call.func.as_ref() {
-                if let Some(kind) = imported_exception_alias(&name.id, &symbols, Some(&options)) {
-                    // `raise timeout(...)` under `from socket import
-                    // timeout`: the canonical builtin (TimeoutError).
-                    let msg = match call.args.len() {
-                        0 => quote!(String::new()),
-                        _ => {
-                            let arg = message_arg(&call.args[0], ctx, options, symbols)?;
-                            quote!(format!("{}", #arg))
-                        }
-                    };
-                    return Ok(quote!(PyException::new(#kind, #msg)));
-                }
-                // Round 82: a raise of a name imported from an EXTERNAL
-                // module (`raise ResponseNotReady()` — http.client, which
-                // urllib3 imports; `raise RemoteDisconnected()`) that is
-                // NOT resolvable as an in-crate class: the exception model
-                // is string-tagged, so the class NAME is the exception's
-                // runtime value — construct the tagged PyException. The
-                // previous fall-through dropped the raise to the boxed
-                // None (the call into an external module), silently
-                // replacing a raised exception with a returned value
-                // (E0308 `PyException | PyValue` on every handler).
-                if crate::ast::tree::import::resolves_to_external_import(
-                    &name.id,
-                    &options,
-                    &symbols,
-                ) {
-                    let kind = &name.id;
-                    let msg = match call.args.len() {
-                        0 => quote!(String::new()),
-                        1 => {
-                            let arg = message_arg(&call.args[0], ctx, options, symbols)?;
-                            quote!(format!("{}", #arg))
-                        }
-                        _ => {
-                            let args: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = call
-                                .args
-                                .iter()
-                                .map(|a| {
-                                    message_arg(
-                                        a,
-                                        ctx.clone(),
-                                        options.clone(),
-                                        symbols.clone(),
-                                    )
-                                })
-                                .collect();
-                            let args = args?;
-                            let fmt = vec!["{}"; args.len()].join(", ");
-                            quote!(format!(#fmt, #(#args),*))
-                        }
-                    };
-                    return Ok(quote!(PyException::new(#kind, #msg)));
-                }
-                if is_exception_class_name(&name.id)
-                    || resolved_is_exception_class(&name.id, &options, &symbols)
-                {
-                    // The kind is the class's canonical name: `raise
-                    // R(...)` under `R = Root` raises a Root (Devin
-                    // review on #330).
-                    let kind = canonical_exception_class(&name.id, &symbols, &options)
-                        .map(|(n, _)| n)
-                        .unwrap_or_else(|| name.id.clone());
-                    // An in-crate class's ancestor chain is class
-                    // metadata: attached whether or not its __init__ is
-                    // modeled (`class MyError(ValueError): pass` is
-                    // caught by `except ValueError:`).
-                    let ancestors = crate::ast::tree::call::resolve_construction_class(
-                        &name.id, &symbols, &options,
-                    )
-                    .map(|(cls, class_symbols)| {
-                        exception_ancestor_tokens(&cls, &class_symbols, &options)
-                    })
-                    .transpose()?;
-                    // An IN-CRATE exception class with a modeled __init__
-                    // (`class InsufficientFunds(BankError)` whose __init__
-                    // calls super().__init__(f"need {needed}, have
-                    // {available}") and stores self.needed/self.available
-                    // — bank, round 99): render the __init__'s own message
-                    // (CPython's exact text) and carry the field stores as
-                    // attrs. Falls back to the positional message when the
-                    // class is not resolvable in this module.
-                    let is_key_error = kind == "KeyError";
-                    let msg = match call.args.len() {
-                        0 => quote!(String::new()),
-                        1 => single_arg_message(is_key_error, &call.args[0], ctx, options, symbols)?,
-                        _ => {
-                            let args: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = call
-                                .args
-                                .iter()
-                                .map(|a| {
-                                    message_arg(
-                                        a,
-                                        ctx.clone(),
-                                        options.clone(),
-                                        symbols.clone(),
-                                    )
-                                })
-                                .collect();
-                            let args = args?;
-                            let fmt = vec!["{}"; args.len()].join(", ");
-                            quote!(format!(#fmt, #(#args),*))
-                        }
-                    };
-                    let construct = |message: TokenStream| match &ancestors {
-                        Some(ancestors) => quote!(PyException::new_with_attrs_and_ancestors(
-                            #kind, #message, vec![], vec![#(#ancestors),*]
-                        )),
-                        None => quote!(PyException::new(#kind, #message)),
-                    };
-                    if is_key_error && call.args.len() == 1 {
-                        // KeyError's one-argument display is already the
-                        // argument's repr. Retain that same rendering for
-                        // repr(error), instead of quoting the display as
-                        // another string argument (issue #500). Evaluate
-                        // the original argument and its repr only once.
-                        let exception = construct(quote!(&__rython_key_arg_repr));
-                        return Ok(quote!({
-                            let __rython_key_arg_repr = #msg;
-                            #exception.with_args_repr(vec![__rython_key_arg_repr])
-                        }));
-                    }
-                    return Ok(construct(msg));
-                }
-            }
-            let tokens = exc.clone().to_rust(ctx, options, symbols)?;
-            Ok(quote!(#tokens))
+            exc.clone().to_rust(ctx, options, symbols)
+        }
+        ExprType::Name(_) if crate::ast::tree::arguments::is_exception_typeinfo(
+            &crate::infer_type(Some(&ctx), exc, &options, &symbols),
+        ) => {
+            // Raising does not consume the Python binding. A clone also
+            // keeps generated try closures from moving a hoisted default
+            // into their capture when the first real store is inside.
+            let value = exc.clone().to_rust(ctx, options, symbols)?;
+            Ok(quote!((#value).clone()))
         }
         ExprType::Name(name)
             if imported_exception_alias(&name.id, &symbols, Some(&options)).is_some() =>
@@ -870,8 +889,8 @@ pub(crate) fn classify_exception_init<'a>(
 /// (`err = MyError("x")`, `str(MyError("x"))`): the modeled `__init__`
 /// (`exception_class_raise`) when the class has one to model, else the
 /// generic construction — the kind is the class's own name, the message
-/// the one positional argument or empty (two or more would be the args
-/// tuple's repr: refused), the ancestor chain attached (Devin review on
+/// follows the builtin ancestor's rule, and the ancestor chain attaches
+/// (Devin review on
 /// #330: the value position built `PyException::new(<ident>, ...)`,
 /// which never compiled).
 pub(crate) fn exception_construction(
@@ -1449,6 +1468,96 @@ impl Construction {
             && !matches!(e, crate::ExprType::Name(n) if n.id == "self")
             && ((chain_after && self.runs_code) || exprs[k + 1..].iter().any(|e| self.may_run_code(e)))
     }
+}
+
+fn immutable_exception_argument(expr: &ExprType, st: &Construction) -> bool {
+    fn immutable(ty: &crate::TypeInfo) -> bool {
+        use crate::TypeInfo;
+        match ty {
+            TypeInfo::Int | TypeInfo::Bool | TypeInfo::Float | TypeInfo::String | TypeInfo::StrRef => true,
+            TypeInfo::Option(inner) | TypeInfo::Borrowed(inner) | TypeInfo::PyValueMember(inner) => immutable(inner),
+            TypeInfo::Tuple(parts) => !parts.is_empty() && parts.len() <= 8 && parts.iter().all(immutable),
+            TypeInfo::Custom(tokens) => tokens.to_string() == "()" || crate::ast::tree::arguments::is_exception_typeinfo(ty),
+            _ => false,
+        }
+    }
+    if crate::is_none_expr(expr) { return true; }
+    immutable(&crate::infer_type(Some(&st.ctx), expr, &st.options, &st.symbols))
+}
+
+fn bind_message_parts(st: &mut Construction, exprs: &[ExprType]) -> Result<Vec<ExprType>, Box<dyn std::error::Error>> {
+    exprs.iter().enumerate().map(|(i, expr)| {
+        let captured = st.captures(exprs, i, false);
+        if !captured && !st.may_run_code(expr) {
+            Ok(expr.clone())
+        } else {
+            st.bind_temp(exc_temp(0, "m", i), expr, captured)
+        }
+    }).collect()
+}
+
+fn args_message(
+    kind: &str,
+    rule: Option<ExceptionStr>,
+    st: &Construction,
+    parts: &[ExprType],
+    tokens: &[TokenStream],
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    let unsupported = match (rule, parts.len()) {
+        (Some(ExceptionStr::Unicode), _) => Some("Unicode codec exceptions require their codec-specific arguments and display"),
+        (Some(ExceptionStr::Group), _) => Some("exception groups require a message and a list of exceptions"),
+        (Some(ExceptionStr::Os), 2..=5) => Some("OSError-style errno/filename arguments require subclass selection and a specialized display"),
+        (Some(ExceptionStr::Ssl), 2..) => Some("SSLError's multi-argument display depends on the second argument's runtime type"),
+        (Some(ExceptionStr::Syntax), 2..) => Some("SyntaxError's location arguments require a specialized display"),
+        _ => None,
+    };
+    if let Some(reason) = unsupported {
+        return Err(format!("exception construction `{kind}(...)` with {} argument(s) is not supported yet: {reason}; use a supported exception with an explicitly formatted immutable message; rython refuses to invent its construction or display behavior", parts.len()).into());
+    }
+    Ok(match (rule, parts) {
+        (Some(ExceptionStr::Syntax), []) => quote!(String::from("None")),
+        (Some(ExceptionStr::Ssl), []) => quote!(String::from("()")),
+        (_, []) => quote!(String::new()),
+        (Some(ExceptionStr::Ssl), [_]) => {
+            let arg = &tokens[0];
+            quote!(format!("({},)", stdpython::PyRepr::py_repr(&(#arg))))
+        }
+        (Some(ExceptionStr::Key), [_]) => {
+            let arg = &tokens[0];
+            quote!(stdpython::PyRepr::py_repr(&(#arg)))
+        }
+        (_, [one]) => single_arg_message(false, one, st.ctx.clone(), st.options.clone(), st.symbols.clone())?,
+        (_, many) => {
+            let fmt = format!("({})", vec!["{}"; many.len()].join(", "));
+            quote!(format!(#fmt, #(stdpython::PyRepr::py_repr(&(#tokens))),*))
+        }
+    })
+}
+
+fn named_exception_construction(
+    kind: &str,
+    rule: Option<ExceptionStr>,
+    call: &crate::Call,
+    ctx: CodeGenContext,
+    options: PythonOptions,
+    symbols: SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    if !call.keywords.is_empty() || call.args.iter().any(|arg| matches!(arg, ExprType::Starred(_))) {
+        return Err(format!("exception construction `{kind}(...)` with keywords or starred arguments is not supported yet; pass explicit positional immutable arguments; rython refuses to drop or misbind an argument").into());
+    }
+    let mut st = Construction { ctx, options, symbols, prelude: Vec::new(), call_positional: call.args.clone(), runs_code: false };
+    for (i, arg) in call.args.iter().enumerate() {
+        if !immutable_exception_argument(arg, &st) {
+            return Err(format!("exception construction `{kind}(...)` argument {} is mutable or has an unsupported/unknown representation; pass str(value), repr(value), or explicit supported immutable scalar/tuple data instead; rython refuses to snapshot or misrepresent an exception argument", i + 1).into());
+        }
+    }
+    let parts = bind_message_parts(&mut st, &call.args)?;
+    let tokens = parts.iter().map(|part| message_value_tokens(part, st.ctx.clone(), st.options.clone(), st.symbols.clone())).collect::<Result<Vec<_>, _>>()?;
+    let message = args_message(kind, rule, &st, &parts, &tokens)?;
+    let construct = quote!(PyException::new(#kind, #message)
+        .with_args_repr(vec![#(stdpython::PyRepr::py_repr(&(#tokens))),*]));
+    let prelude = st.prelude;
+    Ok(if prelude.is_empty() { construct } else { quote!({ #(#prelude)* #construct }) })
 }
 
 /// Whether a `super().__init__` argument of any initializer up the chain
@@ -2072,31 +2181,16 @@ fn model_variadic_level(
     model_init_level(st, cls, rest, forwarded, next_keywords, attrs_in, level + 1, Some(&owner.name))
 }
 
-/// Whether `str(e)` of the in-crate exception class `cls` with one argument
-/// is `KeyError.__str__` — the argument's repr (issue #475): the first class
-/// in its MRO that defines `__str__` decides, and `KeyError` is the builtin
-/// that does (an in-crate class's own `__str__` before it wins).
-fn str_is_key_error_repr(
+fn class_str_rule(
     cls: &crate::ClassDef,
-    class_symbols: &SymbolTableScopes,
-    options: &crate::PythonOptions,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    for (name, def) in exception_mro(cls, class_symbols, options)? {
-        if let Some((def, _)) = def {
-            let defines_str = def.body.iter().any(|s| {
-                matches!(
-                    &s.statement,
-                    crate::StatementType::FunctionDef(f) if f.name == "__str__"
-                )
-            });
-            if defines_str {
-                return Ok(false);
-            }
-        } else if name == "KeyError" {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Result<Option<ExceptionStr>, Box<dyn std::error::Error>> {
+    // Custom overrides are refused at the class definition. The builtin
+    // ancestor's rule still matters, even behind several user classes.
+    Ok(exception_mro(cls, symbols, options)?.into_iter().find_map(|(name, definition)| {
+        definition.is_none().then(|| ExceptionStr::from_name(&name)).flatten()
+    }))
 }
 
 /// The construction's tokens from what `BaseException.__init__` receives
@@ -2112,37 +2206,11 @@ fn finish_construction(
     msg_exprs: Vec<crate::ExprType>,
     attrs: Vec<Attr>,
 ) -> Result<proc_macro2::TokenStream, Box<dyn std::error::Error>> {
-    use crate::ExprType;
-    let mut parts: Vec<ExprType> = Vec::new();
-    for (i, m) in msg_exprs.iter().enumerate() {
-        let captured = st.captures(&msg_exprs, i, false);
-        if !captured && !st.may_run_code(m) {
-            parts.push(m.clone());
-        } else {
-            parts.push(st.bind_temp(exc_temp(0, "m", i), m, captured)?);
-        }
-    }
-    let mut part_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
-    for p in &parts {
-        part_tokens.push(p.clone().to_rust(st.ctx.clone(), st.options.clone(), st.symbols.clone())?);
-    }
-    let msg = match parts.as_slice() {
-        [] => quote::quote!(String::new()),
-        // The display wrapping the message builder applies (a class
-        // instance, an Option, a boxed value — a temporary's type is
-        // recorded in the options); a KeyError's `str()` is the repr.
-        [one] => single_arg_message(
-            str_is_key_error_repr(cls, class_symbols, &st.options)?,
-            one,
-            st.ctx.clone(),
-            st.options.clone(),
-            st.symbols.clone(),
-        )?,
-        many => {
-            let fmt = format!("({})", vec!["{}"; many.len()].join(", "));
-            quote::quote!(format!(#fmt, #(stdpython::PyRepr::py_repr(&(#part_tokens))),*))
-        }
-    };
+    let parts = bind_message_parts(&mut st, &msg_exprs)?;
+    let part_tokens = parts.iter().map(|part| message_value_tokens(
+        part, st.ctx.clone(), st.options.clone(), st.symbols.clone(),
+    )).collect::<Result<Vec<_>, _>>()?;
+    let msg = args_message(&cls.name, class_str_rule(cls, class_symbols, &st.options)?, &st, &parts, &part_tokens)?;
     let args_repr = quote::quote!(vec![#(stdpython::PyRepr::py_repr(&(#part_tokens))),*]);
     let kind = &cls.name;
     let mut attr_pairs: Vec<proc_macro2::TokenStream> = Vec::new();

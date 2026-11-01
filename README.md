@@ -172,6 +172,11 @@ bindings are refused during conversion; format application data explicitly
 at its display sites instead.
 For a one-argument builtin `KeyError`, `str(error)` quotes the key and
 `repr(error)` preserves its original representation (`KeyError('k')`).
+Builtin exceptions can also be stored, passed, returned, and raised later.
+Their positional scalar/tuple arguments retain Python's `str` and `repr`
+forms, including the args tuple for multi-argument messages. Mutable or
+unknown arguments and unsupported specialized constructors are conversion
+errors; see [the exception specification](docs/spec.md#8-exceptions).
 
 Known gaps:
 

@@ -41,6 +41,15 @@ side effects cannot be replaced by a message computed at construction;
 format explicit application data at each display site instead.
 One-argument builtin `KeyError` construction retains the key's repr for
 both its quoted display and its exception repr, evaluating the key once.
+Builtin exception calls share their lowering and type across raise and
+value positions, including aliases and `builtins`-qualified names. Arguments
+are evaluated once in order before display/repr conversion; messages with
+multiple arguments use the args tuple's repr. The supported stored values
+are str/int/float/bool/None, nonempty fixed tuples of up to eight supported
+elements, and modeled exceptions. Tuple elements require known types.
+Mutable/unknown values (including the shared bytes/bytearray type), keywords,
+splats, and unmodeled specialized constructor forms are refused. An exception
+local that may be unbound is refused before a generated default can be read.
 
 ### Prerequisites
 

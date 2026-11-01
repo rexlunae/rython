@@ -2039,6 +2039,39 @@ is `KeyError('k')`, rather than quoting the display again (issue #500).
 
 ### 8.2 Raising
 
+Builtin exception constructors use one lowering in both value and raise
+positions (issues #477/#478): `error = ValueError("v")`, passing/returning
+that value, and `raise error` carry a `PyException`. Builtin class aliases,
+imports from `builtins`, and `builtins.ValueError(...)` use that same path.
+Exception-only annotations, including a bare `BaseException`, name the
+runtime exception type. Raising a stored value leaves its binding readable.
+
+Arguments are evaluated once, left to right, before their display/repr
+conversion. Earlier scalar reads are captured before later argument calls
+can rebind them. Zero arguments produce an empty message; one produces the
+argument's Python string (`True`, `1.0`, `None` included); two or more produce
+the args tuple's repr, such as `('a', 'b')`. `repr(error)` records each
+original argument's repr separately, so `ValueError('')`, `ValueError(3)`,
+and nested exceptions retain their structure. `KeyError` keeps its
+one-key repr rule. Modeled user-class initializer chains use the same
+message rule and preserve their existing stored-field behavior.
+
+Stored builtin arguments are str/int/float/bool/None, nonempty fixed tuples
+of up to eight supported elements, and modeled exception values. Optional
+tuple elements need a statically known inner type; an untyped `None` tuple
+element and empty tuples are refused. Mutable objects, the
+undistinguished bytes/bytearray representation, and unknown argument types
+are refused; evaluate void-returning calls first and pass explicit `None`.
+Keywords/splats, codec errors and exception groups, and unmodeled specialized
+constructor forms are refused rather than rendered as a generic args tuple.
+These include OSError-style errno/filename arguments (2–5 arguments),
+SyntaxError location arguments, and multi-argument SSLError. SyntaxError's
+zero-argument `None` display and SSLError's zero/one-argument tuple display
+are modeled. Unseen external-class value construction and multi-argument
+raises require the defining module to be converted with the package.
+An exception local that may be read before assignment is a conversion
+error; generated storage defaults must not become Python values.
+
 `raise E("msg")` lowers to `return Err(PyException::new("E", …))`;
 whether a name is an exception class is decided by a known-name list
 plus the `*Error`/`*Exception`/`*Warning` suffixes; other values are
@@ -2870,6 +2903,7 @@ accepted as permanent spec:
 | Exception attribute writes are conversion errors: assigning an auxiliary Python `error.message` cannot overwrite the Rust display payload. Direct reads of Rust implementation fields on exception values are refused; modeled caught-class field reads remain supported | Loud (issue #498); the old message store silently changed str(error) |
 | Exception classes defining or inheriting custom `__str__` / `__repr__` bindings are refused at conversion, naming the defining class, binding and line. The old marker lowering discarded these methods and silently displayed the raise argument instead | Loud (issue #483); format explicit application data at its display sites |
 | A one-argument builtin `KeyError` records the original key's repr separately from its quoted display message. `repr(error)` preserves the original key type and quoting, and the key expression is evaluated once | Correct (issue #500); the old repr fallback quoted the display as another string |
+| Builtin exception calls share their construction/type in value and raise positions. Argument evaluation is once and ordered; str/repr preserve Python scalar spelling and original argument structure, including multi-argument tuple messages. Unsupported mutable/unknown representations and specialized forms, and potentially-unbound exception locals, are refused (§8.2) | Correct-or-loud (issues #477, #478, #502) |
 | True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |
 | Exception message shapes: `int()`'s message carries "with base 10" and `float()`'s quotes the string as Python's repr (#339, round 10); `open` and stream errors are CPython's `[Errno N] text: 'path'` form (#339); the `KeyError` key quoting is single-quoted like CPython (round 99) | Correct (was a defect class in issue #82's family) |
 | An uncaught exception prints CPython's traceback header and final line but no traceback frames | Model limit (no frames) — the thread-exception entry's family (issue #479) |
@@ -2911,7 +2945,7 @@ accepted as permanent spec:
 | An out-of-range CONSTANT index on a statically-known HETEROGENEOUS Rust tuple is a loud conversion error (the runtime cannot express the failing access); on a homogeneous tuple it keeps the runtime's catchable `IndexError`; a non-constant index on a heterogeneous tuple is a loud conversion error naming the location and a rewrite | Correct-or-loud (the review's tuple-index round) |
 | The exception-attribute model binds every raise argument other than a bare name or a constant to a typed temporary once, in source order (a property read or a call runs once); the message and each attr read the temporary | Correct; CPython's single evaluation (the evaluation on issue #137; Devin review on #330) |
 | An exception __init__ with a statement beyond the `self.<field> = <param>` stores, the `super().__init__(<message>)` call, a docstring, or `pass` is a loud rustc error at the raise site (`compile_error!` naming the class and line — the statement would not run there); a keyword-only parameter with a default is modeled as its default when the raise passes no keywords, and a message reading a stored field (`super().__init__(self.message)`) means the parameter it stores | Correct-or-loud (the evaluation on issue #137) |
-| The message is `str(e)` as CPython sets it: the `super().__init__(<message>)` argument; the empty string for `super().__init__()` (the fields are kept); with no super call at all, the one positional argument of the raise, or empty for none (`BaseException.__new__` records the call's arguments). A one-argument `KeyError` — the builtin, or an in-crate class deriving from it — is the argument's REPR, as `KeyError.__str__` makes it (`str(KeyError("td"))` is `'td'`; issue #475). A custom display override is refused at the class definition (issue #483). A super call with two or more arguments is the args tuple's repr; no super call with two or more positional arguments, and a message holding a lambda or a comprehension (bindings of its own the raise-site rewrite cannot model), are loud rustc errors at the raise site | Correct-or-loud (Devin review on #330) |
+| The message is `str(e)` as CPython sets it: the `super().__init__(<message>)` argument; the empty string for `super().__init__()` (the fields are kept); with no super call at all, the one positional argument of the raise, or empty for none (`BaseException.__new__` records the call's arguments). A one-argument `KeyError` — the builtin, or an in-crate class deriving from it — is the argument's REPR, as `KeyError.__str__` makes it (`str(KeyError("td"))` is `'td'`; issue #475). A custom display override is refused at the class definition (issue #483). Two or more arguments use the args tuple's repr in builtin and modeled user-class construction, in raise and value positions. Unknown/mutable builtin argument representations, keywords/splats and unmodeled specialized constructor forms are conversion errors (§8.2); messages holding unsupported bindings remain loud | Correct-or-loud (Devin review on #330) |
 | A zero-parameter `__init__(self)` is modeled like any other (a fixed message; an argument at the raise is the arity error); a variadic `__init__(self, *args, **kwargs)` is modeled when its body only forwards to `super().__init__(*args)` (idna's IDNAError), the message being the raise's one positional argument or empty; named parameters before `*args` (`__init__(self, prefix, *args)`) take the first arguments, evaluated once and dropped, and the forwarded slice is the rest — a body doing more, a field store of a named parameter, a keyword-only parameter, a starred call that is not its own `*args`/`**kwargs`, or a keyword are loud. Every argument of a raise is evaluated once in source order, a bare name bound to a parameter the model ignores included (`raise E(undefined_name)` is loud in rustc as CPython's NameError is). The last `self.<field> = <param>` store of a field wins for the attrs, as in Python, while a `self.<field>` read in the message means the store as it stood AT the `super().__init__` call; a name the message reads at the raise site (a module global, a builtin) must be bound there exactly as the `__init__` sees it — a caller local or another module's same-named global is a loud rustc error at the site; a stored field whose argument is a class instance (`raise EmptyPoolError(self, ...)` — urllib3) is a loud rustc error at the site too, since the boxed attrs cannot hold one; a second `super().__init__` call (which would replace the args) is loud. A bare-name argument is captured, in source order, before a LATER argument that runs code (`E(counter, bump())` reads counter before bump rebinds it) | Correct-or-loud (Devin review on #330) |
 | The exception closure is keyed by bare class name (the hierarchy index's rule): a name two modules both define is ambiguous and stays out of it as a class and as a base — each definition is judged by its own name and direct bases, so an ordinary `Node` is never erased by an exception `Node(Root)` elsewhere — with a definition warning when the exclusion loses a transitive exception | Loud limit (Devin review on #330) |
 | An exception class's ancestors are its Python MRO (C3 linearization over every base, left to right: `class Both(A, B)` is caught by `except B:` and by B's builtin ancestors, and `issubclass` sees both branches); the `__init__` a construction runs and the field a handler reads resolve along the same order. A builtin base takes its full interpreter MRO into the merge, so `class C(Exception, ValueError)` is refused as CPython refuses it while `class D(ValueError, Exception)` records `ValueError, Exception`; a base the model cannot place (an ordinary class, an unresolved import, an ambiguous alias, an unknown dotted name) is loud, never dropped. A hierarchy with no consistent MRO (`C(A, B)` with `B(A)` — CPython's TypeError at class creation) is a conversion error at the definition, and so is a cyclic chain (`class B(A)` then `A = B`, where the name-keyed resolution turns back on itself) | Correct-or-loud (Devin review on #330) |

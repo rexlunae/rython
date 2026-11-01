@@ -8524,6 +8524,14 @@ impl PyDisplay for PyException {
     }
 }
 
+/// Generated storage can be initialized before Python's first store.
+/// Local read-before-assignment checks still apply to this storage.
+impl Default for PyException {
+    fn default() -> Self {
+        Self::new("Exception", "")
+    }
+}
+
 /// Python's `repr(exception)` is `ValueError('boom')`.
 impl PyRepr for PyException {
     /// CPython's `BaseException.__repr__`: the class name and the args

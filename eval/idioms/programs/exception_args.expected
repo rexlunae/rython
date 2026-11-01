@@ -1,0 +1,14 @@
+('a', 'b')
+('a', 'b')
+ValueError('a', 'b')
+True
+ValueError(True)
+1.0
+ValueError(1.0)
+(1, 2, True)
+TypeError(1, 2, True)
+counter 2
+('a', 3, False)
+KeyError('a', 3, False)
+('a', 3, 1.0)
+AppError('a', 3, 1.0)

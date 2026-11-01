@@ -1368,6 +1368,9 @@ fn infer_type_inner(
             {
                 TypeInfo::Bool
             }
+            _ if crate::ast::tree::raise_stmt::constructs_exception(call, symbols, options) => {
+                crate::ast::tree::arguments::exception_typeinfo(false)
+            }
             ExprType::Name(n) => match builtin_call_type(&n.id) {
                 Some(t) => t,
                 None => match symbols.get(&n.id) {
@@ -3700,12 +3703,16 @@ pub fn annotation_type_info(ann: &ExprType) -> Option<TypeInfo> {
 /// the stdlib `socket.timeout` spelling) is PyException,
 /// Option<PyException> with a None member; anything else is None.
 fn builtin_exception_union(ann: &ExprType) -> Option<TypeInfo> {
-    let (members, has_none) = crate::ast::tree::arguments::union_annotation_members(ann)?;
     let is_builtin = |m: &ExprType| match m {
         ExprType::Name(n) => crate::ast::tree::raise_stmt::is_builtin_exception_name(&n.id),
         ExprType::Attribute(a) => matches!(a.value.as_ref(), ExprType::Name(m)
             if crate::ast::tree::raise_stmt::stdlib_exception_canonical(&m.id, &a.attr).is_some()),
         _ => false,
+    };
+    let (members, has_none) = match crate::ast::tree::arguments::union_annotation_members(ann) {
+        Some(union) => union,
+        None if is_builtin(ann) => (vec![ann], false),
+        None => return None,
     };
     if members.is_empty() || !members.iter().all(|m| is_builtin(m)) {
         return None;
@@ -5975,6 +5982,11 @@ pub fn call_return_typeinfo(
     symbols: Option<&SymbolTableScopes>,
     options: Option<&PythonOptions>,
 ) -> Option<TypeInfo> {
+    if let (Some(symbols), Some(options)) = (symbols, options)
+        && crate::ast::tree::raise_stmt::constructs_exception(call, symbols, options)
+    {
+        return Some(crate::ast::tree::arguments::exception_typeinfo(false));
+    }
     if let (ExprType::Name(n), Some(symbols), Some(options)) = (call.func.as_ref(), symbols, options)
         && symbols.get(&n.id).is_none()
         && call.args.len() == 1
