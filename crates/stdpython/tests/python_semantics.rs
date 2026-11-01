@@ -5,6 +5,73 @@ mod common;
 use stdpython::*;
 
 #[test]
+fn py_integer_promotes_and_uses_python_floor_division() {
+    // Python: a = 2**63 - 1; (a+1, -a-2, a*a, (-2**70)//3, (-2**70)%3)
+    let a = PyInteger::from(i64::MAX);
+    assert_eq!(a.py_add(&PyInteger::from(1)).to_string(), "9223372036854775808");
+    assert_eq!(PyInteger::from(i64::MIN).py_sub(&PyInteger::from(1)).to_string(), "-9223372036854775809");
+    assert_eq!(a.py_mul(&a).to_string(), "85070591730234615847396907784232501249");
+    let n = PyInteger::from_decimal("-1180591620717411303424").unwrap();
+    assert_eq!(n.py_floordiv(&PyInteger::from(3)).unwrap().to_string(), "-393530540239137101142");
+    assert_eq!(n.py_mod(&PyInteger::from(3)).unwrap().to_string(), "2");
+    assert!(n < PyInteger::from(0));
+    assert!(PyInteger::from(0) < a.py_add(&PyInteger::from(1)));
+    assert_eq!(a.py_add(&PyInteger::from(1)).py_sub(&PyInteger::from(1)), a);
+    assert_eq!(PyInteger::from(i64::MIN).py_floordiv(&PyInteger::from(-1)).unwrap().to_string(), "9223372036854775808");
+    assert_eq!(n.py_mod(&PyInteger::from(0)).unwrap_err().message, "integer modulo by zero");
+}
+
+#[test]
+fn py_integer_comparisons_and_hashes_are_exact() {
+    // Verified against python3. Python: a = 2**64; b = a + 1;
+    // (a == float(a), b == float(a), b > float(a), float(a) < b).
+    let a = PyInteger::from_decimal("18446744073709551616").unwrap();
+    let b = a.py_add(&1i64);
+    let f = (&a).py_float().unwrap();
+    assert_eq!((a == f, b == f, b > f, f < b), (true, false, true, true));
+    assert!(a < f64::INFINITY);
+    assert!(a > f64::NEG_INFINITY);
+    assert_eq!(a.partial_cmp(&f64::NAN), None);
+    assert_ne!(a, f64::NAN);
+    assert_eq!(a.py_hash(), 8);
+    assert_eq!((-&a).py_hash(), -8);
+    // Python: hash(2**200 + 1) == 131073; hash(-1) == -2.
+    let huge = PyInteger::from_decimal("1606938044258990275541962092341162602522202993782792835301377").unwrap();
+    assert_eq!(huge.py_hash(), 131073);
+    assert_eq!((-huge).py_hash(), -131073);
+    assert_eq!(PyInteger::from(-1).py_hash(), -2);
+    // Python: int(2**64) is still the same integer; decimal display is exact.
+    assert_eq!(a.py_repr(), "18446744073709551616");
+    assert_eq!((&a).py_str(), "18446744073709551616");
+    assert!(a.is_truthy());
+    assert!(!a.py_sub(&a).is_truthy());
+    assert!(PyInteger::from(-1) < -0.5);
+    assert!(PyInteger::from(0) > -0.5);
+    assert!(PyInteger::from(0) < 0.5);
+    // Python: float(2**64 + 2048) rounds to 2**64 (ties to even);
+    // float(2**64 + 6144) rounds up to 2**64 + 8192.
+    assert_eq!((&a.py_add(&2048i64)).py_float().unwrap(), f);
+    assert_eq!((&a.py_add(&6144i64)).py_float().unwrap().to_bits(), f.to_bits() + 2);
+    // Python: float(10**600) raises OverflowError with this message.
+    let enormous = PyInteger::from_decimal(&format!("1{}", "0".repeat(600))).unwrap();
+    let error = (&enormous).py_float().unwrap_err();
+    assert_eq!(error.exception_type, "OverflowError");
+    assert_eq!(error.message, "int too large to convert to float");
+}
+
+#[test]
+fn py_integer_decimal_limit_applies_at_conversion() {
+    // Verified against python3: a = 10**3000; str(a*a) raises ValueError,
+    // while arithmetic itself and str(a) succeed under the default limit.
+    let a = PyInteger::from_decimal(&format!("1{}", "0".repeat(3000))).unwrap();
+    assert_eq!(a.checked_decimal().unwrap().len(), 3001);
+    let product = a.py_mul(&a);
+    let error = product.checked_decimal().unwrap_err();
+    assert_eq!(error.exception_type, "ValueError");
+    assert_eq!(error.message, "Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit");
+}
+
+#[test]
 fn slice_negative_indices() {
     let items = vec![1, 2, 3, 4, 5];
     // items[-2:] == [4, 5]

@@ -4710,16 +4710,65 @@ fn compile_err(src: &str, name: &str) -> String {
 }
 
 #[test]
-fn oversized_integer_literals_fail_loudly() {
-    // Verified against python3: each value is an integer, not a float.
-    for literal in ["18446744073709551616", "9223372036854775808", "-9223372036854775808"] {
-        let src = format!("x = {literal}\n");
-        let err = compile_err(&src, "large_int.py");
-        assert!(err.contains("integer literal outside the i64 range"), "{literal}: {err}");
-        assert!(err.contains("line 1"), "{literal}: {err}");
-        assert!(err.contains("rewrite it using in-range operands"), "{literal}: {err}");
+fn oversized_integer_literals_keep_exact_decimal_values() {
+    // Verified against python3: these are int values, including hex and
+    // the positive AST operand of -9223372036854775808.
+    for (literal, decimal) in [
+        ("18446744073709551616", "18446744073709551616"),
+        ("0x10000000000000000", "18446744073709551616"),
+        ("-9223372036854775808", "9223372036854775808"),
+    ] {
+        let out = compile(&format!("def f():\n    x = {literal}\n    print(x + 1)\n"), "large_int.py");
+        assert!(out.contains("PyInteger :: from_decimal"), "{out}");
+        assert!(out.contains(decimal), "{out}");
+        assert!(!out.contains("as f64"), "{out}");
     }
-    assert!(parse("x = 9223372036854775807\n", "large_int.py").is_ok());
+}
+
+#[test]
+fn unsupported_big_integer_boundaries_fail_at_conversion() {
+    for (body, needle) in [
+        ("x = 18446744073709551616 / 3", "integer operator Div"),
+        ("x = 18446744073709551616 << 2", "integer operator LShift"),
+        ("x = 18446744073709551616 + 0.5", "non-integer operand"),
+        ("x: int = 18446744073709551616", "annotated binding"),
+        ("x = [18446744073709551616]", "in containers"),
+        ("x = [18446744073709551616, 'text']", "in containers"),
+        ("x = {18446744073709551616: 'text'}", "in containers"),
+        ("x = ['text', [18446744073709551616]]", "in containers"),
+        ("x = [1][18446744073709551616]", "in a subscript"),
+        ("for value in 18446744073709551616: pass", "use in this statement"),
+        ("x = hex(18446744073709551616)", "through this call"),
+        ("x = 18446744073709551616 .bit_length()", "integer methods"),
+        ("x = 1 < 18446744073709551616 < 3", "single numeric comparison"),
+        ("x = 18446744073709551616 or 3", "boolean operand selection"),
+        ("x = 18446744073709551616 if True else 3", "conditional expression"),
+        ("x = 18446744073709551616 .real", "integer attributes"),
+        ("x = f'{18446744073709551616:x}'", "format specifications"),
+        ("x = lambda: 18446744073709551616", "from a lambda"),
+        ("print(18446744073709551616, sep=':')", "print keywords"),
+        ("raise ValueError(18446744073709551616)", "integer exception arguments"),
+        ("assert False, 18446744073709551616", "assertion message"),
+    ] {
+        let err = compile_err(&format!("def f():\n    {body}\n"), "big_boundary.py");
+        assert!(err.contains(needle), "{body}: {err}");
+        assert!(err.contains("<module>:2:") || err.contains("(line 2)"), "{body}: {err}");
+        assert!(err.contains("refuses"), "{body}: {err}");
+    }
+    let err = compile_err("def f() -> int:\n    return 18446744073709551616\n", "big_return.py");
+    assert!(err.contains("instead of narrowing or boxing"), "{err}");
+    for source in [
+        "import sys\nsys.set_int_max_str_digits(0)\n",
+        "import sys as system\nsystem.get_int_max_str_digits()\n",
+        "from sys import set_int_max_str_digits as change\nchange(0)\n",
+    ] {
+        let err = compile_err(source, "integer_limit.py");
+        assert!(err.contains("decimal-conversion limit APIs"), "{err}");
+    }
+    let err = compile_err("class C:\n    BIG = 18446744073709551616\n", "big_class.py");
+    assert!(err.contains("integer class storage"), "{err}");
+    let err = compile_with_options("BIG = 18446744073709551616\n", "big_global.py", PythonOptions::from(PythonOptionsData { no_std: true, ..Default::default() })).unwrap_err();
+    assert!(err.contains("alloc-only profile"), "{err}");
 }
 
 const COUNTER: &str = concat!(

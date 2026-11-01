@@ -20,7 +20,7 @@ categories = ["development-tools", "no-std"]
 [features]
 default = ["std", "ssl-rustls", "re-regex", "unicodedata-ucd", "pyo3-interop"]
 std = ["alloc", "dep:libc", "dep:getrandom", "indexmap/std"]
-alloc = ["dep:hashbrown", "dep:libm", "dep:md-5", "dep:sha1", "dep:sha2"]
+alloc = ["dep:hashbrown", "dep:libm", "dep:md-5", "dep:sha1", "dep:sha2", "dep:num-bigint", "dep:num-traits"]
 
 # numpy backends: "numpy" (or none) = always-on sequential engine;
 # numpy-rayon / numpy-simd / numpy-cuda / numpy-vulkan enable the
@@ -87,6 +87,8 @@ ssl-rustls = ["std", "dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
 ssl-openssl = ["std", "dep:openssl", "dep:openssl-sys"]
 
 [dependencies]
+num-bigint = { version = "0.4", default-features = false, optional = true }
+num-traits = { version = "0.2", default-features = false, optional = true }
 pyo3 = {version = "0.29", features=["auto-initialize"], optional = true}
 paste = "1.0"
 rayon = { version = "1.10", optional = true }

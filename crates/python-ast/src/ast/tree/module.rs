@@ -261,6 +261,11 @@ impl CodeGen for Module {
         mut symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let mut stream = TokenStream::new();
+        if options.no_std
+            && let Some(line) = crate::ast::tree::constant::first_big_integer_literal_line_in(&self.raw.body, Descend::OwnScope)
+        {
+            return Err(format!("module-level arbitrary-precision integer initialization (line {line}) is not supported by the alloc-only profile yet; construct it in a function local or use the std target; rython refuses to emit a std-only static").into());
+        }
 
         // A name under the conversion's own temporary prefix is refused
         // at the module: the generated `__rython_*` bindings would shadow
@@ -6128,7 +6133,13 @@ pub(crate) fn const_static_type(value: &crate::ExprType) -> Option<TokenStream> 
             // not a Rust const literal — not const-hoistable to a static
             // (issue #372); a module-init value typed Float.
             Some(l0) if crate::ast::tree::constant::is_nonfinite_literal(&l0) => None,
-            Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
+            Some(l @ litrs::Literal::Integer(_)) => {
+                if crate::ast::tree::constant::integer_type(l) == Some(crate::TypeInfo::BigInt) {
+                    None
+                } else {
+                    Some(quote!(i64))
+                }
+            },
             Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
             Some(litrs::Literal::Bool(_)) => Some(quote!(bool)),
             Some(litrs::Literal::String(_)) => Some(quote!(&'static str)),

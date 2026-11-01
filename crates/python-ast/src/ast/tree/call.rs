@@ -2528,6 +2528,42 @@ impl<'a> CodeGen for Call {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        if crate::ast::tree::big_integer::is_integer_limit_call(&self, &options, &symbols) {
+            return Err("sys integer decimal-conversion limit APIs are not supported yet; use the default 4300-digit limit; rython refuses to silently ignore a limit change or invent its value".into());
+        }
+        let has_big_integer = self.args.iter().chain(self.keywords.iter().map(|k| &k.value))
+            .any(|arg| crate::ast::tree::type_ctx::type_mentions_bigint(
+                &crate::infer_type(Some(&ctx), arg, &options, &symbols)));
+        if let ExprType::Attribute(attr) = self.func.as_ref()
+            && crate::infer_type(Some(&ctx), &attr.value, &options, &symbols) == crate::TypeInfo::BigInt
+        {
+            return Err("arbitrary-precision integer methods are not supported yet; use scalar arithmetic or the supported integer builtins; rython refuses to silently narrow the integer".into());
+        }
+        if has_big_integer {
+            use crate::ast::tree::big_integer::IntegerBuiltin;
+            let builtin = match self.func.as_ref() {
+                ExprType::Name(n) if symbols.get(&n.id).is_none() && !options.name_types.contains_key(&n.id) => IntegerBuiltin::from_name(&n.id),
+                _ => None,
+            };
+            match builtin {
+                Some(IntegerBuiltin::Print) => return crate::ast::tree::big_integer::render_print(&self, ctx, options, symbols),
+                Some(builtin) if self.args.len() == 1 && self.keywords.is_empty()
+                    && crate::infer_type(Some(&ctx), &self.args[0], &options, &symbols) == crate::TypeInfo::BigInt =>
+                {
+                    let value = self.args[0].clone().to_rust(ctx, options, symbols)?;
+                    return Ok(match builtin {
+                        IntegerBuiltin::Bool => quote!((#value).is_truthy()),
+                        IntegerBuiltin::Int => quote!((#value).clone()),
+                        IntegerBuiltin::Str | IntegerBuiltin::Repr => quote!((#value).checked_decimal()?),
+                        IntegerBuiltin::Hash => quote!(hash(&(#value))),
+                        IntegerBuiltin::Abs => quote!((#value).py_abs()),
+                        IntegerBuiltin::Float => quote!((#value).py_float()?),
+                        IntegerBuiltin::Print => unreachable!(),
+                    });
+                }
+                _ => return Err("passing an arbitrary-precision integer through this call is not supported yet; keep the value in scalar arithmetic or use print/bool/int/str/repr/hash/abs/float; rython refuses to silently narrow it".into()),
+            }
+        }
         // typing-module calls are compile-time-only: TypeVar, Protocol,
         // TypeAlias, runtime_checkable, Literal, ... exist only for
         // the type system (annotations are strings under `from __future__

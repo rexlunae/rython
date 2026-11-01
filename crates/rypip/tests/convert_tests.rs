@@ -23,6 +23,123 @@ fn build_generated(root: &Path) -> std::process::ExitStatus {
         .expect("running cargo build")
 }
 
+#[test]
+fn oversized_integer_scalar_program_matches_cpython() {
+    let scratch = Scratch::new("big-integer-scalar");
+    let file = scratch.path().join("app.py");
+    fs::write(&file, include_str!("../../../eval/idioms/programs/big_integer_scalar.py")).unwrap();
+    let package = rypip::discover(&file).unwrap();
+    let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/app")).output().unwrap();
+    // Verified against python3.
+    assert_eq!(output.stdout, b"18446744073709551616\n36893488147419103239\n18446744073709551613\n-18446744073709551613\n55340232221128654848\n-18446744073709551616\n-6148914691236517206\n-2\nTrue\nFalse\n8\nTrue True\n9223372036854775808\n18446744073709551616\n0\n18446744073709551616 18446744073709551616\n18446744073709551616 18446744073709551616 18446744073709551616 18446744073709551616\nexact=18446744073709551616 repr=18446744073709551616\n-18446744073709551617 18446744073709551616\nTrue False True True\nFalse True True True False\nzero //\nzero %\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn converted_big_integer_results_cross_storage_boundaries() {
+    let scratch = Scratch::new("big-integer-converted-values");
+    let file = scratch.path().join("app.py");
+    fs::write(&file, include_str!("../../../eval/idioms/programs/big_integer_converted_values.py")).unwrap();
+    let package = rypip::discover(&file).unwrap();
+    let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/app")).output().unwrap();
+    // Verified against python3.
+    assert_eq!(output.stdout, b"['18446744073709551616', '18446744073709551617']\n('18446744073709551616',)\n18446744073709551617\n18446744073709551618\n1\n18446744073709551616\n18446744073709551616\n['18446744073709551616', '18446744073709551617']\n['18446744073709551616', '18446744073709551617']\n18446744073709551616\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn unbounded_integer_literals_are_loud_on_targets_without_the_runtime() {
+    let scratch = Scratch::new("big-integer-targets");
+    let file = scratch.path().join("app.py");
+    fs::write(&file, "def module_init() -> int:\n    x = 18446744073709551616\n    return 0\n").unwrap();
+    let package = rypip::discover(&file).unwrap();
+    for (name, options) in [
+        ("kernel", ConvertOptions { kernel_module: true, ..Default::default() }),
+        ("pyo3", ConvertOptions { pyo3: true, ..Default::default() }),
+        ("driver", ConvertOptions { driver: true, ..Default::default() }),
+    ] {
+        let err = rypip::convert(&package, &scratch.path().join(name), &options).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("arbitrary-precision integer literal"), "{name}: {message}");
+        assert!(message.contains("line 2") || message.contains("<module>:2:"), "{name}: {message}");
+        assert!(message.contains("refuses to silently narrow"), "{name}: {message}");
+    }
+}
+
+#[test]
+fn bigint_target_policy_only_checks_emitted_literals() {
+    let scratch = Scratch::new("big-integer-inactive-target");
+    // Verified against python3: each source leaves answer() returning 42;
+    // the large integer is in a shadowed definition or an inactive branch.
+    for (case, source) in [
+        ("shadowed", "def answer() -> int:\n    unused = 18446744073709551616\n    return 0\ndef answer() -> int:\n    return 42\n"),
+        ("type_checking", "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    UNUSED = 18446744073709551616\ndef answer() -> int:\n    return 42\n"),
+        ("version_gate", "import sys\nif sys.version_info < (3, 0):\n    UNUSED = 18446744073709551616\ndef answer() -> int:\n    return 42\n"),
+        ("constant_false", "if False:\n    UNUSED = 18446744073709551616\ndef answer() -> int:\n    return 42\n"),
+    ] {
+        let file = scratch.path().join(format!("{case}.py"));
+        fs::write(&file, source).unwrap();
+        let package = rypip::discover(&file).unwrap();
+        for (target, options) in [
+            ("pyo3", ConvertOptions { pyo3: true, ..Default::default() }),
+            ("driver", ConvertOptions { driver: true, ..Default::default() }),
+        ] {
+            let output = scratch.path().join(format!("{case}-{target}"));
+            let krate = rypip::convert(&package, &output, &options)
+                .unwrap_or_else(|error| panic!("{case}/{target}: {error:#}"));
+            let code = fs::read_to_string(krate.root.join("src/lib.rs")).unwrap();
+            assert!(!code.contains("PyInteger"), "{case}/{target}: {code}");
+        }
+    }
+}
+
+#[test]
+fn bigint_conversion_rejects_a_nondefault_decimal_limit() {
+    let scratch = Scratch::new("big-integer-config");
+    let file = scratch.path().join("app.py");
+    fs::write(&file, "print(18446744073709551616)\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rypip"))
+        .env("PYTHONINTMAXSTRDIGITS", "0")
+        .arg("convert").arg(&file).arg("--out").arg(scratch.path().join("crate"))
+        .output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("default 4300-digit conversion limit"), "{:?}", output);
+}
+
+#[test]
+fn no_std_big_integer_scalar_function_builds() {
+    let scratch = Scratch::new("big-integer-alloc");
+    let file = scratch.path().join("bigtext.py");
+    fs::write(&file, "def big_text() -> str:\n    value = 18446744073709551616\n    return str(value + 1)\n").unwrap();
+    let package = rypip::discover(&file).unwrap();
+    let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions { no_std: true, ..Default::default() }).unwrap();
+    assert!(build_generated(&krate.root).success());
+}
+
+#[test]
+fn big_integer_decimal_failure_preserves_print_order() {
+    let scratch = Scratch::new("big-integer-limit");
+    let file = scratch.path().join("app.py");
+    let source = format!(
+        "def later() -> int:\n    print('later')\n    return 1\n\ndef main() -> None:\n    a = 1{}\n    try:\n        print('prefix', a * a, later())\n    except ValueError as e:\n        print('caught', str(e))\n    try:\n        str(a * a)\n    except ValueError:\n        print('str')\n    try:\n        repr(a * a)\n    except ValueError:\n        print('repr')\n    try:\n        text = f'{{a * a}}'\n    except ValueError:\n        print('fstring')\n    print('alive')\n\nif __name__ == '__main__':\n    main()\n", "0".repeat(3000));
+    fs::write(&file, source).unwrap();
+    let package = rypip::discover(&file).unwrap();
+    let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/app")).output().unwrap();
+    // Verified against python3: all arguments run first, and the prefix
+    // and separator are written before conversion of the second fails.
+    assert_eq!(output.stdout, b"later\nprefix caught Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit\nstr\nrepr\nfstring\nalive\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
 /// Lay out a small Python project: pyproject.toml plus a package with an
 /// __init__.py, a library module, and a __main__-style entry module.
 fn write_sample_package(root: &Path) {

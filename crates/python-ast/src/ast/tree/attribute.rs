@@ -85,6 +85,9 @@ impl<'a> CodeGen for Attribute {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        if crate::infer_type(Some(&ctx), &self.value, &options, &symbols) == crate::TypeInfo::BigInt {
+            return Err("arbitrary-precision integer attributes are not supported yet; keep the value in scalar arithmetic; rython refuses to silently replace or narrow it".into());
+        }
         // A READ of a `threading.local()` object's attribute (issue #356):
         // this thread's value, boxed, or CPython's AttributeError.
         if let Some(recv) = threading_local_receiver(&self.value, &ctx, &options, &symbols)? {

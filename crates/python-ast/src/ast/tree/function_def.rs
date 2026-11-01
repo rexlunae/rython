@@ -4588,7 +4588,7 @@ pub(crate) fn simple_expr_typeinfo(expr: &ExprType) -> Option<crate::TypeInfo> {
                 Some(l0) if crate::ast::tree::constant::is_nonfinite_literal(&l0) => {
                     Some(crate::TypeInfo::Float)
                 }
-                Some(litrs::Literal::Integer(_)) => Some(crate::TypeInfo::Int),
+                Some(l @ litrs::Literal::Integer(_)) => crate::ast::tree::constant::integer_type(l),
                 Some(litrs::Literal::Float(_)) => Some(crate::TypeInfo::Float),
                 Some(litrs::Literal::Bool(_)) => Some(crate::TypeInfo::Bool),
                 // A string constant lowers to a &'static str literal (the
@@ -4628,7 +4628,7 @@ pub(crate) fn simple_expr_type(expr: &ExprType) -> Option<TokenStream> {    matc
             Some(l0) if crate::ast::tree::constant::is_nonfinite_literal(&l0) => {
                 Some(quote!(f64))
             }
-            Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
+            Some(l @ litrs::Literal::Integer(_)) => crate::ast::tree::constant::integer_type(l).map(|t| t.to_rust_type()),
             Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
             Some(litrs::Literal::Bool(_)) => Some(quote!(bool)),
             // A string constant lowers to a &'static str literal.

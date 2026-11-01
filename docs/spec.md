@@ -118,7 +118,7 @@ declaration — loud, but at the wrong layer (§12.1).
 
 | Python type | Rust type | Notes |
 |---|---|---|
-| `int` | `i64` | No arbitrary precision; overflow is not detected as a Python-level error (§12.2). Integer literal operands outside the `i64` range are rejected during conversion, including the positive operand of `-9223372036854775808`. |
+| `int` | `i64`, or `stdpython::PyInteger` for oversized scalar literals | Oversized literals are preserved exactly and their scalar `+`, `-`, `*`, `//`, `%` arithmetic grows automatically. Ordinary `i64`-only arithmetic remains bounded (§12.2). The initial unbounded scalar slice and its loud boundaries are specified in [automatic-integers.md](automatic-integers.md). |
 | `float` | `f64` | |
 | `complex` | `stdpython::Complex` | An `f64` real/imaginary pair with CPython's repr, arithmetic, `abs`, `conjugate`, and `==` against `int`/`float` (a zero imaginary part and an equal real part). A mixed container boxes it as `PyValue::Complex` (issue #366); an order comparison (`1j < 2j`) raises CPython's TypeError, with its message, when it runs |
 | `bool` | `bool` | |
@@ -2746,8 +2746,8 @@ catchable `PyException`:
 
 - `i64` overflow (CPython would grow the int). Note: in release builds
   unchecked arithmetic may wrap rather than panic — treat any
-  overflow-adjacent arithmetic as out of contract until the opt-in
-  bigint tier exists.
+  overflow-adjacent arithmetic as out of contract until automatic bigint
+  promotion is implemented.
 - Sorting a `NaN`; `hash(nan)`.
 - Reading, writing or mutating a module global (or class attribute) that
   holds a shared object from a thread other than the one that initialized it
@@ -2820,6 +2820,7 @@ accepted as permanent spec:
 | `deque.index(x)` lowers through the shared list-ops arm and raises `ValueError: deque.index(x): x not in deque` (the 3.14 wording the list arm pinned), where CPython 3.12/3.13 say `9 is not in deque` — the wording `deque.remove` and the inherent `deque::index(x, start, stop)` already use. The exception TYPE agrees | Documented version choice, pinned in `python_semantics.rs`; the list arm's wording is the project-wide pin |
 | `unicodedata` answers from the Unicode 16.0.0 database — CPython 3.14's `unidata_version` — for every CPython: an older CPython carries an older database (3.12: 15.0.0, 3.13: 15.1.0), so a code point assigned or re-classified since answers differently there (`category`, `bidirectional`, `combining`, `name`, `normalize`). Code points assigned before 15.0 agree | Model limit (issue #334); a per-CPython database would need one table set per version |
 | Unpacking's ValueError text is CPython 3.11–3.13's: `too many values to unpack (expected 2)`. CPython 3.14 appends the length for a sized sequence (`(expected 2, got 3)` for a tuple, list or dict; not for a str). `not enough values to unpack (expected 2, got 1)` and `cannot unpack non-iterable int object` agree across versions | Model limit; one message set, pinned to the 3.11 transcripts |
+| Integer division/modulo by zero use the existing CPython 3.11 message pins: `integer division or modulo by zero` for `//`, `integer modulo by zero` for `%`. CPython 3.14.4 uses `division by zero` for both. The fixed-width and unbounded integer paths use the same choice | Documented version choice; issue #492 |
 | Iterating a set (`for x in s`, `list(s)`, a comprehension over one) would run in Rust's randomized `HashSet` order, not CPython's; every order-observing construct is now a conversion error naming `sorted(s)` (§10.1). Remaining limit: a set reached only through a comprehension's own variable (`for g in groups for x in g`) or an untyped value is not seen | Loud since issue #444; the model of CPython's set table order stays unimplemented |
 | True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |
 | Exception message shapes: `int()`'s message carries "with base 10" and `float()`'s quotes the string as Python's repr (#339, round 10); `open` and stream errors are CPython's `[Errno N] text: 'path'` form (#339); the `KeyError` key quoting is single-quoted like CPython (round 99) | Correct (was a defect class in issue #82's family) |
@@ -2933,9 +2934,9 @@ this spec read as current edges rather than permanent walls. Rationale
 and ordering live in [`goals-and-design.md`](goals-and-design.md);
 everything here lands under §1.2's rules when it lands.
 
-- **Opt-in bigint tier**: a feature flag backing `int` with an
-  arbitrary-precision crate. Retires the overflow panic (§12.2);
-  default stays `i64`.
+- **Automatic bigint promotion**: replace the current bounded integer
+  model with a representation that grows to match Python integers. See
+  [automatic-integers.md](automatic-integers.md) for the integration plan.
 - **Opt-in dynamic typing at the edges**: a boxed value type, behind a
   flag or explicit annotation, for heterogeneous collections and
   similar compatibility wins. Static typing stays the default.

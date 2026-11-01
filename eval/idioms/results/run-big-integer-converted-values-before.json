@@ -1,0 +1,16 @@
+{
+  "converter_commit": "bf71dd8",
+  "repo_head": "bf71dd8",
+  "rypip_path": "target/debug/rypip",
+  "oracle": "CPython 3.14.4 (pins captured under 3.11)",
+  "passed": 0,
+  "total": 1,
+  "passing": [],
+  "programs": {
+    "big_integer_converted_values": {
+      "program": "big_integer_converted_values",
+      "status": "convert-failed",
+      "detail": "s/big_integer_converted_values.py: code generation error at big_integer_converted_values.py:1:1-21:25 [location=big_integer_converted_values.py:1:1-21:25, message=code generation error at <module>:3:5-38 [location=<module>:3:5-38, message=arbitrary-precision integers in containers are not supported yet; keep the value in an integer local; rython refuses to silently narrow or box it, help=], help=]"
+    }
+  }
+}

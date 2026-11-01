@@ -6,6 +6,12 @@
     "bank": {
       "status": "pass"
     },
+    "big_integer_converted_values": {
+      "status": "pass"
+    },
+    "big_integer_scalar": {
+      "status": "pass"
+    },
     "boxed_constructor": {
       "status": "pass"
     },

@@ -75,6 +75,20 @@ impl CodeGen for AugAssign {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        let target_type = crate::infer_type(Some(&ctx), &self.target, &options, &symbols);
+        let value_type = crate::infer_type(Some(&ctx), &self.value, &options, &symbols);
+        if matches!(target_type, crate::TypeInfo::BigInt) || matches!(value_type, crate::TypeInfo::BigInt) {
+            if !matches!(target_type, crate::TypeInfo::BigInt) || !matches!(self.target, ExprType::Name(_)) {
+                return Err("arbitrary-precision integer augmented assignment requires an unbounded integer local; initialize the local with the large value before updating it; rython refuses to silently narrow the integer".into());
+            }
+            let value = crate::BinOp {
+                op: self.op,
+                left: Box::new(self.target.clone()),
+                right: Box::new(self.value),
+            }.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let target = self.target.to_rust(ctx, options, symbols)?;
+            return Ok(quote!(#target = #value;));
+        }
         // Issue #115: a compound assignment to a `global`-declared name
         // whose module binding is a MUTABLE static is a read-modify-write
         // through the static's helpers: load the global, evaluate the

@@ -2455,7 +2455,7 @@ fn collect_expr_branches<'e>(expr: &'e ExprType, out: &mut Vec<&'e ExprType>) {
 /// Python-facing type names for error messages.
 fn type_display(ty: &TypeInfo) -> String {
     match ty {
-        TypeInfo::Int => "int".to_string(),
+        TypeInfo::Int | TypeInfo::BigInt => "int".to_string(),
         TypeInfo::Float => "float".to_string(),
         TypeInfo::Bool => "bool".to_string(),
         TypeInfo::StrRef | TypeInfo::String => "str".to_string(),

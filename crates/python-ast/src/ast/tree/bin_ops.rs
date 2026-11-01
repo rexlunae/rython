@@ -143,6 +143,27 @@ impl CodeGen for BinOp {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
+        let lt = crate::infer_type(Some(&ctx), &self.left, &options, &symbols);
+        let rt = crate::infer_type(Some(&ctx), &self.right, &options, &symbols);
+        if matches!(lt, crate::TypeInfo::BigInt) || matches!(rt, crate::TypeInfo::BigInt) {
+            if !matches!(lt, crate::TypeInfo::Int | crate::TypeInfo::BigInt)
+                || !matches!(rt, crate::TypeInfo::Int | crate::TypeInfo::BigInt)
+            {
+                return Err("arbitrary-precision integer arithmetic with a non-integer operand is not supported yet; use integer operands; rython refuses to silently narrow the integer".into());
+            }
+            let left = self.left.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let right = self.right.clone().to_rust(ctx, options, symbols)?;
+            let left = anchor_numeric_literal(&self.left, left);
+            let right = anchor_numeric_literal(&self.right, right);
+            return match self.op {
+                BinOps::Add => Ok(quote!((#left).py_add(&(#right)))),
+                BinOps::Sub => Ok(quote!((#left).py_sub(&(#right)))),
+                BinOps::Mult => Ok(quote!((#left).py_mul(&(#right)))),
+                BinOps::FloorDiv => Ok(quote!((#left).py_floordiv(&(#right))?)),
+                BinOps::Mod => Ok(quote!((#left).py_mod(&(#right))?)),
+                _ => Err(format!("arbitrary-precision integer operator {:?} is not supported yet; rewrite using +, -, *, // or %; rython refuses to silently narrow the integer", self.op).into()),
+            };
+        }
         // Python's ** promotes based on operand types; route through the
         // stdpython py_pow helper, which implements those semantics.
         if matches!(self.op, BinOps::Pow) {
@@ -368,7 +389,8 @@ fn anchor_numeric_literal(expr: &ExprType, tokens: TokenStream) -> TokenStream {
     fn literal_type(expr: &ExprType) -> Option<TokenStream> {
         match expr {
             ExprType::Constant(c) => match &c.0 {
-                Some(litrs::Literal::Integer(_)) => Some(quote!(i64)),
+                Some(l @ litrs::Literal::Integer(_))
+                    if crate::ast::tree::constant::integer_type(l) == Some(crate::TypeInfo::Int) => Some(quote!(i64)),
                 Some(litrs::Literal::Float(_)) => Some(quote!(f64)),
                 _ => None,
             },

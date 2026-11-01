@@ -68,27 +68,29 @@ Each of these is a tradeoff taken knowingly. The pattern to notice: in
 every case, the failure mode is *loud* — a conversion error, a typed
 exception, or a panic — never a silently different answer.
 
-### Integers: `i64`, not arbitrary precision
+### Integers: bounded ordinary arithmetic, unbounded oversized literals
 
-CPython's `int` grows without bound; Rython's `int` is a 64-bit signed
-integer that does not grow. Overflow **panics in debug builds**; in
+CPython's `int` grows without bound; Rython's ordinary integer arithmetic
+still uses 64-bit signed integers that do not grow. Overflow **panics in debug builds**; in
 release builds (which `rypip build`/`install` produce) Rust's unchecked
 arithmetic currently wraps silently — a ledgered gap
 ([spec §12.2](spec.md)), and part of why overflow-adjacent arithmetic
-is out of contract until the bigint tier lands.
+is out of contract until the bigint migration is complete. Oversized scalar
+literals now use `PyInteger` automatically, and their arithmetic grows without
+overflow; unsupported boundaries are conversion errors. See
+[automatic-integers.md](automatic-integers.md) for the supported slice.
 
-- **Bought**: machine-speed arithmetic, `Copy` semantics, no allocation
-  for numbers, viability in `no_std` and kernel contexts.
-- **Cost**: programs that rely on bignums (cryptography, combinatorics,
-  hashes rolled by hand) don't port today. The planned fix is an
-  **opt-in feature flag** backing `int` with an arbitrary-precision
-  crate — which also removes the overflow panic, since bigints don't
-  overflow. A *silent*, magnitude-triggered fallback remains a non-goal.
-- **Edge**: the debug-build panic is the loud boundary, and the
-  release-mode wrap is the known exception to it. Checking-and-growing
-  would have been a semantic and performance fork from the declared
-  model; the bigint flag is the sanctioned way to buy the Python
-  behavior.
+- **Bought**: the existing bounded path keeps machine-speed arithmetic
+  and `Copy` semantics. `PyInteger` keeps small results in `i64` storage
+  and allocates through `num-bigint` when they grow; it works in the alloc
+  tier as well as std. The kernel shim does not support that representation.
+- **Cost**: programs that need unbounded integers beyond the supported
+  literal/scalar slice still require migration work. The plan is automatic
+  promotion throughout integer storage and arithmetic, including function
+  boundaries and containers.
+- **Edge**: unsupported bigint boundaries are conversion errors. Ordinary
+  `i64` overflow still panics in debug and can wrap in release; that gap
+  remains on the ledger until every integer path uses automatic promotion.
 
 ### Static types: one name, one type
 
@@ -144,7 +146,7 @@ return `Result<T, PyException>` and `?` propagates to the nearest handler.
   `None`, an exception escaping a lambda) — documented boundaries, not
   exceptions you can catch. The direction is to shrink this list into
   the `Result` model wherever CPython defines an exception for the
-  case, and the planned bigint tier removes the overflow panic
+  case, and completing automatic bigint promotion removes the overflow panic
   altogether ([spec §14](spec.md)).
 
 ### No runtime dynamism
@@ -216,7 +218,8 @@ the runtime it uses:
 
 ## Choosing between them
 
-Use **CPython** when the program leans on what Rython excludes: bignums,
+Use **CPython** when the program needs integers beyond the current scalar
+bigint slice or leans on what Rython excludes:
 runtime dynamism, heavy aliasing, async, the long tail of PyPI, or when
 the edit-run loop matters more than the shipped artifact.
 

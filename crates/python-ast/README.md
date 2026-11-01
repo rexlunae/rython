@@ -16,6 +16,13 @@ A Rust library for parsing Python code into Abstract Syntax Trees (AST) and expe
 
 ## 🚀 Quick Start
 
+Oversized scalar integer literals lower exactly to `stdpython::PyInteger`
+without passing through a float. Scalar arithmetic and supported builtins
+retain the integer's value; unsupported unbounded-integer boundaries are
+conversion errors. Ordinary integer arithmetic still uses `i64`. See the
+[integer migration plan](../../docs/automatic-integers.md) for the supported
+slice and the remaining work.
+
 ### Prerequisites
 
 - **Rust**: 1.82+ (2024 edition)

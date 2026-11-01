@@ -3,7 +3,7 @@ use std::fmt::*;
 use litrs::Literal;
 use tracing::debug;
 use proc_macro2::*;
-use pyo3::{Borrowed, Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods};
+use pyo3::{Borrowed, Bound, FromPyObject, PyAny, PyResult, prelude::PyAnyMethods, types::PyStringMethods};
 use quote::quote;
 
 use crate::{CodeGen, CodeGenContext, PythonOptions, SymbolTableScopes};
@@ -71,10 +71,50 @@ pub fn try_bytes(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
 }
 
 pub fn try_int(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
-    let v: i64 = value.extract()?;
-    let l = Literal::parse(format!("{}", v)).expect("[4] Parsing the literal");
+    // PyLong's decimal spelling is exact at every magnitude. Extracting an
+    // i64 first would reject large literals; falling through to f64 would
+    // silently round them. Keep the integer token and choose its runtime
+    // representation during typing/rendering.
+    let text = value.str()?.to_str()?.to_owned();
+    let l = Literal::parse(text).expect("Python integer literal");
 
     Ok(Some(l))
+}
+
+/// The integer type for one exact literal token. This is the single range
+/// boundary shared by the inference passes and the renderer.
+pub fn integer_type(literal: &Literal<String>) -> Option<crate::TypeInfo> {
+    match literal {
+        Literal::Integer(value) => Some(if value.value::<i64>().is_some() {
+            crate::TypeInfo::Int
+        } else {
+            crate::TypeInfo::BigInt
+        }),
+        _ => None,
+    }
+}
+
+/// First oversized literal in a module, for targets whose runtime has no
+/// unbounded integer representation. Uses the shared AST enumeration.
+pub fn first_big_integer_literal_line(body: &[crate::Statement]) -> Option<usize> {
+    first_big_integer_literal_line_in(body, crate::ast::tree::visit::Descend::All)
+}
+
+pub(crate) fn first_big_integer_literal_line_in(body: &[crate::Statement], descend: crate::ast::tree::visit::Descend) -> Option<usize> {
+    use crate::ast::tree::visit::{self, Flow};
+    let mut line = None;
+    visit::walk_stmts(body, descend, &mut |stmt| {
+        if visit::stmt_all_exprs(stmt).into_iter().any(|expr| visit::any_expr_for(expr, descend, |expr|
+            matches!(expr, crate::ExprType::Constant(c) if c.0.as_ref().is_some_and(|literal|
+                integer_type(literal) == Some(crate::TypeInfo::BigInt)))))
+        {
+            line = Some(stmt.lineno.unwrap_or(0));
+            Flow::Stop
+        } else {
+            Flow::Continue
+        }
+    });
+    line
 }
 
 pub fn try_float(value: &Bound<PyAny>) -> PyResult<Option<Literal<String>>> {
@@ -328,10 +368,17 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Constant {
         // Ints must be tried before floats: extracting f64 from a Python int
         // succeeds, and would silently lose precision above 2^53.
         } else if value.is_instance_of::<pyo3::types::PyInt>() {
-            try_int(&value).map_err(|_| crate::extraction_failure(
-                "integer literal", &ob,
-                "integer literal outside the i64 range is not supported yet; rewrite it using in-range operands (for i64::MIN, use -9223372036854775807 - 1); rython refuses to silently convert it to a float",
-            ))?
+            let literal = try_int(&value).map_err(|e| crate::extraction_failure("integer literal", &ob, e))?;
+            if literal.as_ref().and_then(integer_type) == Some(crate::TypeInfo::BigInt) {
+                let limit = ob.py().import("sys")?.getattr("get_int_max_str_digits")
+                    .and_then(|function| function.call0())
+                    .and_then(|value| value.extract::<usize>());
+                if !matches!(limit, Ok(4300)) {
+                    return Err(crate::extraction_failure("arbitrary-precision integer literal", &ob,
+                        "this scalar slice requires CPython's default 4300-digit conversion limit; use a CPython 3.11+ interpreter with that limit while converting; rython refuses to change decimal-conversion behavior silently"));
+                }
+            }
+            literal
         } else if let Ok(l) = try_float(&value) {
             l
         } else if let Ok(l) = try_complex(&value) {
@@ -360,10 +407,18 @@ impl CodeGen for Constant {
     fn to_rust(
         self,
         _ctx: Self::Context,
-        _options: Self::Options,
+        options: Self::Options,
         _symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
         match self.0 {
+            Some(c) if integer_type(&c) == Some(crate::TypeInfo::BigInt) => {
+                if let Some(target) = options.big_integer_target.unsupported_name() {
+                    return Err(format!("arbitrary-precision integer literal is not supported by the {target} target yet; use in-range operands or ordinary alloc/std conversion; rython refuses to silently narrow it").into());
+                }
+                let decimal = c.to_string();
+                Ok(quote!(stdpython::PyInteger::from_decimal(#decimal)
+                    .expect("validated Python integer literal")))
+            }
             Some(c) if is_nonfinite_literal(&c) => {
                 // `1e1000` → f64::INFINITY etc.: the f64 EXPRESSION, not a
                 // literal (safe then, is_finite true for typical constants).

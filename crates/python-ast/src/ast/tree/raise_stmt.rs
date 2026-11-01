@@ -442,6 +442,11 @@ fn exception_value(
     }
     match exc {
         ExprType::Call(call) => {
+            if call.args.iter().chain(call.keywords.iter().map(|keyword| &keyword.value)).any(|arg|
+                crate::ast::tree::type_ctx::type_mentions_bigint(&crate::infer_type(Some(&ctx), arg, &options, &symbols)))
+            {
+                return Err("arbitrary-precision integer exception arguments are not supported yet; convert the argument with str(value) first; rython refuses to change exception construction timing".into());
+            }
             // An IN-CRATE exception class with a modeled __init__: render
             // the class's own message and carry its field stores as attrs
             // (bank's InsufficientFunds — round 99). Runs FIRST (before

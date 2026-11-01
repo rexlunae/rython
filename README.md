@@ -162,10 +162,12 @@ feature that `rypip` enables automatically), and more.
 
 Known gaps:
 
-- **Numbers**: `int` is `i64` — arbitrary-precision integers are not
-  supported; out-of-range literal operands are rejected during conversion
-  (including the positive operand of `-9223372036854775808`), and arithmetic
-  overflow does not grow the integer.
+- **Numbers**: ordinary integers use `i64`. Oversized scalar literals
+  automatically use `PyInteger`, backed by `num-bigint`; their `+`, `-`,
+  `*`, `//` and `%` arithmetic grows without overflow. This first slice
+  rejects unsupported container and function boundaries during conversion.
+  Arithmetic involving only ordinary `i64` operands remains bounded; see
+  [the integer migration plan](docs/automatic-integers.md).
 - **Dynamic typing**: variables keep one type; heterogeneous lists and
   reassigning a name to a different type don't convert.
 - **Language features**: generators/`yield`, `async`/`await`,
@@ -411,8 +413,8 @@ is complete. What's ahead:
 - Generators and `yield` (likely as iterator-struct lowering)
 - Richer class model: inheritance (single, then multiple), common
   dunder protocols
-- An arbitrary-precision integer strategy: an opt-in feature flag
-  backed by a bigint crate, which also retires the overflow panic
+- Automatic arbitrary-precision integer promotion, which will retire the
+  current integer overflow limitation
 - An opt-in dynamic-typing escape hatch (boxed values) for multi-type
   collections and similar compatibility wins
 - Moving remaining panic cases into catchable Python exceptions via the
