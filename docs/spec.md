@@ -2002,6 +2002,8 @@ Stdout is flushed first. `sys.exit()` records no args, while
 `sys.exit(None)` records one None argument. The builtin `SystemExit(...)`
 constructor and bare `raise SystemExit` use the same representation, and
 PyO3 preserves the original code and args.
+An uncaught `SystemExit` in a `threading.Thread` ends only that thread and
+is ignored by its default exception reporter, as in CPython.
 
 Statuses are immutable scalars (`int` within i64, bool, float, str, bytes,
 None), optional scalars, or tuples of them. Mutable/unknown/unbounded

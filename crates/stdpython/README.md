@@ -139,6 +139,8 @@ end the process. The entry handler `exit_uncaught` flushes stdout and applies
 CPython's process-status rules for an uncaught `SystemExit`, without a
 traceback. Catching it keeps the process alive and runs normal cleanup.
 `PyException::system_exit` also preserves code and args through PyO3.
+The default thread exception reporter ignores `SystemExit`, ending only
+the exiting thread after its cleanup runs.
 
 ✅ **Complete built-in exception tree**: every CPython built-in exception
 name is modeled, and `except` matching walks the real hierarchy —

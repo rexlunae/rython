@@ -170,6 +170,10 @@ impl Drop for ThreadInner {
 /// CPython prints "Exception in thread NAME:" plus a traceback; rython has
 /// no frames, so the header and the final exception line are kept.
 pub fn report_thread_exception(e: &PyException) {
+    // CPython's default threading.excepthook silently ignores SystemExit.
+    if e.matches_builtin(crate::builtin_exceptions::BuiltinException::SystemExit) {
+        return;
+    }
     eprintln!("Exception in thread {}:", current_thread().name);
     eprintln!("{}", e);
 }

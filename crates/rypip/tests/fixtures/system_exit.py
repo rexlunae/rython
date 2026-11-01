@@ -1,4 +1,5 @@
 import sys
+import threading
 import sys as system
 from sys import exit as stop
 quit = sys.exit
@@ -27,6 +28,13 @@ def optional_status(present: bool) -> int | None:
     if present:
         return 4
     return None
+
+
+def worker() -> None:
+    try:
+        sys.exit(5)
+    finally:
+        print("worker cleanup")
 
 
 def main() -> int:
@@ -103,6 +111,12 @@ def main() -> int:
         sys.exit(optional_status(True))
     if kind == "alias":
         quit(6)
+    if kind == "thread":
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+        print("joined")
+        return 0
     return 3
 
 

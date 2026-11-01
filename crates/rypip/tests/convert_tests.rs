@@ -62,6 +62,7 @@ fn system_exit_preserves_status_handlers_and_cleanup() {
         ("option_none", 0, "kind option_none\n", ""),
         ("option_some", 4, "kind option_some\n", ""),
         ("alias", 6, "kind alias\n", ""),
+        ("thread", 0, "kind thread\nworker cleanup\njoined\n", ""),
     ] {
         let output = Command::new(krate.root.join("target/debug/app")).arg(kind).output().unwrap();
         assert_eq!(output.status.code(), Some(status), "{kind}");
