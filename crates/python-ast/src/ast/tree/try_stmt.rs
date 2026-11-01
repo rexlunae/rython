@@ -216,6 +216,9 @@ impl CodeGen for Try {
             }
         }
         let body_for_guarantee = self.body.clone();
+        let normal_path_terminates = crate::guarantees_return(&self.body)
+            || crate::guarantees_return(&self.orelse);
+        let handlers_terminate = self.handlers.iter().all(|handler| crate::guarantees_return(&handler.body));
         let body_has_import = try_body_contains_import(&self.body);
         let body_ctx = CodeGenContext::TryBlock {
             parent: Box::new(ctx.clone()),
@@ -240,6 +243,7 @@ impl CodeGen for Try {
         };
 
         let has_finally = !self.finalbody.is_empty();
+        let finally_terminates = crate::guarantees_return(&self.finalbody);
         let finally_tokens = if has_finally {
             let finally_body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
                 .finalbody
@@ -251,6 +255,12 @@ impl CodeGen for Try {
             quote! { #(#finally_body_tokens;)* }
         } else {
             quote!()
+        };
+        let propagate_unhandled = after_finally(&finally_tokens, finally_terminates, quote!(return Err(__rython_exc);));
+        let normal_finally = if normal_path_terminates && handlers_terminate {
+            quote!()
+        } else {
+            finally_tokens.clone()
         };
 
         // Handler bodies run outside the try closure (their exceptions are
@@ -340,6 +350,7 @@ impl CodeGen for Try {
                 &options,
                 &handler_symbols,
                 has_finally,
+                finally_terminates,
                 &finally_tokens,
                 &break_return,
                 "handler body terminates on every path",
@@ -362,7 +373,7 @@ impl CodeGen for Try {
         // CPython raises it. Match-arm guards cannot thread `?`, hence
         // the switch.
         if any_dynamic {
-            let mut chain = quote!(#finally_tokens return Err(__rython_exc););
+            let mut chain = propagate_unhandled.clone();
             for (guard, dynamic, bind, body) in entries.into_iter().rev() {
                 match (guard, dynamic) {
                     (_, Some(value)) => {
@@ -414,6 +425,7 @@ impl CodeGen for Try {
                 &options,
                 &symbols,
                 has_finally,
+                finally_terminates,
                 &finally_tokens,
                 &break_return,
                 "else clause terminates on every path",
@@ -439,7 +451,7 @@ impl CodeGen for Try {
         // else, so nothing is added here for it.)
         if !has_catch_all && !any_dynamic {
             arms.push(quote! {
-                Err(__rython_exc) => { #finally_tokens return Err(__rython_exc); }
+                Err(__rython_exc) => { #propagate_unhandled }
             });
         }
 
@@ -453,10 +465,10 @@ impl CodeGen for Try {
                 quote!(PyFlow<()>)
             };
             let return_arm = if has_return {
+                let replay = after_finally(&finally_tokens, finally_terminates, break_return.clone());
                 quote! {
                     Ok(PyFlow::Return(__rython_ret)) => {
-                        #finally_tokens
-                        #break_return
+                        #replay
                     }
                 }
             } else {
@@ -479,9 +491,11 @@ impl CodeGen for Try {
                 } else {
                     quote!(continue;)
                 };
+                let replay_break = after_finally(&finally_tokens, finally_terminates, replay_break);
+                let replay_continue = after_finally(&finally_tokens, finally_terminates, replay_continue);
                 (
-                    quote! { Ok(PyFlow::Break) => { #finally_tokens #replay_break } },
-                    quote! { Ok(PyFlow::Continue) => { #finally_tokens #replay_continue } },
+                    quote! { Ok(PyFlow::Break) => { #replay_break } },
+                    quote! { Ok(PyFlow::Continue) => { #replay_continue } },
                 )
             } else {
                 (
@@ -506,7 +520,7 @@ impl CodeGen for Try {
                         Ok(PyFlow::Normal) => { #ok_arm_body }
                         #(#arms)*
                     }
-                    #finally_tokens
+                    #normal_finally
                 }
             })
         } else {
@@ -521,11 +535,16 @@ impl CodeGen for Try {
                         Ok(()) => { #ok_arm_body }
                         #(#arms)*
                     }
-                    #finally_tokens
+                    #normal_finally
                 }
             })
         }
     }
+}
+
+/// A terminating finally overrides the earlier signal; do not emit a dead replay.
+fn after_finally(finally: &TokenStream, terminates: bool, replay: TokenStream) -> TokenStream {
+    if terminates { finally.clone() } else { quote!(#finally #replay) }
 }
 
 /// Lower an except-handler or else-clause body. Without a finally clause
@@ -540,6 +559,7 @@ fn lower_finally_guarded_body(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
     has_finally: bool,
+    finally_terminates: bool,
     finally_tokens: &TokenStream,
     break_return: &TokenStream,
     unreachable_note: &str,
@@ -569,6 +589,8 @@ fn lower_finally_guarded_body(
     } else {
         quote!()
     };
+    let replay_return = after_finally(finally_tokens, finally_terminates, break_return.clone());
+    let replay_error = after_finally(finally_tokens, finally_terminates, quote!(return Err(__rython_reraise);));
 
     if has_ret {
         Ok(quote! {
@@ -582,8 +604,7 @@ fn lower_finally_guarded_body(
             })();
             match __rython_inner {
                 Ok(PyFlow::Return(__rython_ret)) => {
-                    #finally_tokens
-                    #break_return
+                    #replay_return
                 }
                 // A break/continue in a closure-wrapped handler or else
                 // clause is rejected at conversion time, so these are
@@ -592,8 +613,7 @@ fn lower_finally_guarded_body(
                 Ok(PyFlow::Continue) => unreachable!("handler body has no continue"),
                 Ok(PyFlow::Normal) => { #completed_arm }
                 Err(__rython_reraise) => {
-                    #finally_tokens
-                    return Err(__rython_reraise);
+                    #replay_error
                 }
             }
         })
@@ -607,8 +627,7 @@ fn lower_finally_guarded_body(
             match __rython_inner {
                 Ok(()) => { #completed_arm }
                 Err(__rython_reraise) => {
-                    #finally_tokens
-                    return Err(__rython_reraise);
+                    #replay_error
                 }
             }
         })

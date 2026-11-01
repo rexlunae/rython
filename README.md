@@ -160,6 +160,14 @@ over std::net with the CPython OSError hierarchy), `urllib.request`
 (`urlopen` for http/https, behind stdpython's opt-in `http-ureq`
 feature that `rypip` enables automatically), and more.
 
+`sys.exit(status)` raises a catchable `SystemExit`: `finally` runs before
+an uncaught exit ends the process. Integer return codes, `None`, booleans,
+strings, floats, bytes, and immutable scalar tuples are supported. The
+exception's `code` can be read; mutation, reflection, mutable or unbounded
+statuses, and `SystemExit` subclasses are conversion errors.
+Exception attribute writes are refused; Python attributes cannot overwrite
+Rust's internal exception message or type.
+
 Known gaps:
 
 - **Numbers**: ordinary integers use `i64`. Oversized scalar literals

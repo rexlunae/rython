@@ -27,6 +27,15 @@ Interpreter-owned namespace access (`sys.modules` and builtin `locals()`)
 is refused during conversion, including mutation and aliased `sys` imports.
 Use explicit imports and application-owned dictionaries instead.
 
+`sys.exit()` and `sys.exit(status)` propagate `SystemExit` through ordinary
+handlers and cleanup. The builtin `SystemExit(...)` constructor records its
+original code and argument reprs. Statuses are immutable scalars or tuples;
+unsupported statuses, code mutation/reflection, and subclasses are refused
+during conversion. Static import aliases work; passing `sys.exit` as a
+function value is refused.
+Exception attribute writes and direct reads of Rust payload fields are
+refused. Modeled caught-class fields keep their typed accessors.
+
 ### Prerequisites
 
 - **Rust**: 1.82+ (2024 edition)

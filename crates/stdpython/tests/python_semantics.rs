@@ -6678,3 +6678,63 @@ mod set_sum {
         assert_eq!(sum(empty), 0);
     }
 }
+#[test]
+fn system_exit_records_python_arguments_and_code() {
+    // Verified against python3: str(e), repr(e), repr(e.code), and the
+    // POSIX status/stderr of an uncaught SystemExit constructed with these args.
+    use stdpython::{PyDisplay, PyException, PyRepr, PyValue};
+    for (args, message, repr, code_repr, status, stderr) in [
+        (vec![], "", "SystemExit()", "None", 0, None),
+        (vec![PyValue::None_], "None", "SystemExit(None)", "None", 0, None),
+        (vec![PyValue::Int(3)], "3", "SystemExit(3)", "3", 3, None),
+        (vec![PyValue::Bool(true)], "True", "SystemExit(True)", "True", 1, None),
+        (vec![PyValue::Str("bad".into())], "bad", "SystemExit('bad')", "'bad'", 1, Some("bad")),
+        (vec![PyValue::Float(1.25)], "1.25", "SystemExit(1.25)", "1.25", 1, Some("1.25")),
+        (vec![PyValue::Str("a".into()), PyValue::Int(2)], "('a', 2)", "SystemExit('a', 2)", "('a', 2)", 1, Some("('a', 2)")),
+    ] {
+        let error = PyException::system_exit(args);
+        assert_eq!(error.py_display(), message);
+        assert_eq!(error.py_repr(), repr);
+        assert_eq!(error.attr_value("code").unwrap().py_repr(), code_repr);
+        let (code, line) = error.system_exit_status().unwrap().unwrap();
+        assert_eq!(code, status);
+        assert_eq!(line.as_deref(), stderr);
+        assert!(error.matches("BaseException"));
+        assert!(!error.matches("Exception"));
+    }
+}
+
+#[test]
+#[cfg(feature = "std")]
+fn sys_exit_returns_a_catchable_exception_without_ending_the_process() {
+    // python3: catching SystemExit from sys.exit(256) keeps e.code == 256;
+    // sys.exit() has args (), while sys.exit(None) has args (None,).
+    use stdpython::{PyRepr, sys};
+    let error = sys::exit(256i64).unwrap_err();
+    assert_eq!(error.attr_i64("code").unwrap(), 256);
+    assert_eq!(error.py_repr(), "SystemExit(256)");
+    assert_eq!(sys::exit_none().unwrap_err().py_repr(), "SystemExit()");
+    assert_eq!(sys::exit(()).unwrap_err().py_repr(), "SystemExit(None)");
+}
+
+#[test]
+#[cfg(feature = "pyo3-interop")]
+fn system_exit_keeps_its_code_and_args_in_pyo3() {
+    // Verified against python3 in system_exit_records_python_arguments_and_code.
+    use pyo3::prelude::*;
+    for args in [vec![], vec![PyValue::None_], vec![PyValue::Int(3)],
+        vec![PyValue::Bool(true)], vec![PyValue::Str("bad".into())],
+        vec![PyValue::Float(1.25)], vec![PyValue::Bytes(b"bye".to_vec())],
+        vec![PyValue::Tuple(vec![PyValue::Str("bad".into()), PyValue::Int(3), PyValue::None_].into())],
+        vec![PyValue::Str("a".into()), PyValue::Int(2)]] {
+        let original = PyException::system_exit(args);
+        let repr = original.py_repr();
+        let code = original.attr_value("code").unwrap().py_repr();
+        let error: pyo3::PyErr = original.into();
+        Python::attach(|py| {
+            assert!(error.is_instance_of::<pyo3::exceptions::PySystemExit>(py));
+            assert_eq!(error.value(py).repr().unwrap().to_str().unwrap(), repr);
+            assert_eq!(error.value(py).getattr("code").unwrap().repr().unwrap().to_str().unwrap(), code);
+        });
+    }
+}

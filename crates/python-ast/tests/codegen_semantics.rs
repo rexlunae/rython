@@ -4710,6 +4710,73 @@ fn compile_err(src: &str, name: &str) -> String {
 }
 
 #[test]
+fn system_exit_calls_propagate_the_original_code() {
+    let source = "import sys as system\nfrom sys import exit as stop\ndef f() -> None:\n    system.exit()\ndef g() -> None:\n    stop(None)\ndef make() -> SystemExit:\n    return SystemExit(3)\n";
+    let out = compile(source, "exit_calls.py");
+    assert!(out.contains("ExitCode :: Missing) ?"), "{out}");
+    assert!(out.contains("stop (stdpython :: PyValue :: None_) ?"), "{out}");
+    assert!(out.contains("PyException :: system_exit"), "{out}");
+}
+
+#[test]
+fn unsupported_system_exit_edges_are_conversion_errors() {
+    for source in [
+        "import sys\nsys.exit(status=3)\n",
+        "import sys\nsys.exit(1, 2)\n",
+        "import sys\nsys.exit(*[1])\n",
+        "import sys\nsys.exit([1, 2])\n",
+        "import sys\nsys.exit(18446744073709551616)\n",
+        "import sys\nprint(sys.exit)\n",
+        "from sys import exit\nprint(exit)\n",
+        "import sys\nfrom functools import partial\ncallback = partial(sys.exit, 3)\n",
+        "SystemExit(code=3)\n",
+        "SystemExit({'code': 3})\n",
+        "class Quit(SystemExit):\n    pass\n",
+    ] {
+        let error = compile_err(source, "unsupported_exit.py");
+        assert!(error.contains("sys.exit") || error.contains("SystemExit"), "{source}: {error}");
+        assert!(error.contains("refuses"), "{source}: {error}");
+    }
+}
+
+#[test]
+fn exit_recognition_preserves_ordinary_methods_and_shadowed_names() {
+    let source = "class Shell:\n    def exit(self, status: int) -> int:\n        return status + 1\ndef SystemExit(status: int) -> int:\n    return status + 2\ndef read(sys: Shell) -> int:\n    return sys.exit(3)\nprint(read(Shell()))\nprint(SystemExit(3))\n";
+    let out = compile(source, "shadowed_exit.py");
+    assert!(!out.contains("stdpython :: sys :: exit"), "{out}");
+    assert!(!out.contains("PyException :: system_exit"), "{out}");
+}
+
+#[test]
+fn system_exit_code_mutation_and_reflection_are_loud() {
+    for statement in ["error.code = 0", "error.code += 1", "del error.code", "error.code.append(1)", "print(getattr(error, 'code'))", "print(hasattr(error, 'code'))", "setattr(error, 'code', 0)"] {
+        let source = format!("error = SystemExit(3)\n{statement}\n");
+        let error = compile_err(&source, "exit_code.py");
+        assert!(error.contains("SystemExit.code") && error.contains("refuses"), "{statement}: {error}");
+    }
+}
+
+#[test]
+fn python_exception_attributes_do_not_expose_rust_payload_fields() {
+    // Verified against python3: assigning ValueError.message creates an
+    // auxiliary attribute; str(error) must still be "original" (#498).
+    for statement in ["error.message = 'changed'", "error.exception_type = 'Other'", "error.message += 'x'", "del error.message"] {
+        let source = format!("def f():\n    try:\n        raise ValueError('original')\n    except ValueError as error:\n        {statement}\n");
+        let error = compile_err(&source, "exception_payload.py");
+        assert!(error.contains("exception attribute") && error.contains("refuses"), "{statement}: {error}");
+    }
+    for field in ["message", "exception_type", "attrs", "args_repr", "discriminant", "user_ancestors"] {
+        let source = format!("def f():\n    error = SystemExit(3)\n    print(error.{field})\n");
+        let error = compile_err(&source, "exception_payload.py");
+        assert!(error.contains("exception attribute") && error.contains("refuses"), "{field}: {error}");
+    }
+    let ordinary = compile("class Payload:\n    def __init__(self):\n        self.message = 'original'\ndef read(value: Payload) -> str:\n    value.message = 'changed'\n    return value.message\n", "ordinary_payload.py");
+    assert!(ordinary.contains("fn read"));
+    let error = compile_err("def f():\n    try:\n        raise ValueError('x')\n    except ValueError as error:\n        error = SystemExit(3)\n", "exception_rebind.py");
+    assert!(error.contains("exception binding") && error.contains("fresh local name"), "{error}");
+}
+
+#[test]
 fn interpreter_namespaces_are_refused_instead_of_fabricated_or_ignored() {
     // Verified against python3: deleting sys.modules or builtins.locals
     // removes the attribute (hasattr returns False), so dropping del is wrong.
@@ -18198,8 +18265,8 @@ fn an_option_callee_result_into_a_boxed_union_param_coerces() {
         "optunionarg.py",
     );
     assert!(
-        out.contains("match (resolve_default_timeout (timeout) ?) {")
-            || out.contains("match(resolve_default_timeout(timeout)?){"),
+        out.contains("match resolve_default_timeout (timeout) ? {")
+            || out.contains("match resolve_default_timeout(timeout)?{"),
         "the Option-typed callee result must coerce into the boxed param: {}",
         out
     );
@@ -18265,8 +18332,8 @@ fn a_property_read_local_on_a_factory_local_coerces_into_a_boxed_union_param() {
         out
     );
     assert!(
-        out.contains("match (read_timeout) { Some (__rython_v) => PyValue :: from (__rython_v) , None => stdpython :: PyValue :: None_ , }")
-            || out.contains("match(read_timeout){Some(__rython_v)=>PyValue::from((__rython_v)),None=>stdpython::PyValue::None_,}"),
+        out.contains("match read_timeout { Some (__rython_v) => PyValue :: from (__rython_v) , None => stdpython :: PyValue :: None_ , }")
+            || out.contains("match read_timeout{Some(__rython_v)=>PyValue::from((__rython_v)),None=>stdpython::PyValue::None_,}"),
         "the Option<f64> local must coerce into the boxed param: {}",
         out
     );

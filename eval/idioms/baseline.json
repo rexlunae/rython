@@ -162,6 +162,9 @@
     "sumprod_pairs": {
       "status": "pass"
     },
+    "system_exit_cleanup": {
+      "status": "pass"
+    },
     "text_stats": {
       "status": "pass"
     },

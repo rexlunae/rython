@@ -1993,6 +1993,37 @@ the message, `repr(e)` is `Type('message')`. An uncaught exception exits
 with status 1, printing CPython's `Traceback (most recent call last):`
 header and final line (`Type: message`, or just `Type` for an empty
 message) to stderr on every entry path — without the frames (§12.3).
+`SystemExit` is the exception to that reporting rule: it propagates through
+handlers and `finally`, then an uncaught exit at program entry uses its
+original `code`. `None` exits 0; an integer (including bool) supplies the C
+integer status, with the OS applying its process-status width; any other
+supported status prints its string and a newline to stderr and exits 1.
+Stdout is flushed first. `sys.exit()` records no args, while
+`sys.exit(None)` records one None argument. The builtin `SystemExit(...)`
+constructor and bare `raise SystemExit` use the same representation, and
+PyO3 preserves the original code and args.
+An uncaught `SystemExit` in a `threading.Thread` ends only that thread and
+is ignored by its default exception reporter, as in CPython.
+
+Statuses are immutable scalars (ordinary i64 int, bool, float, str, bytes,
+None), optional scalars, or tuples of them. Mutable/unknown/unbounded
+statuses are refused at conversion. `error.code` is readable; code mutation,
+method calls through it, and reflection are refused with a rewrite to an
+explicit typed status and a fresh `SystemExit(status)`. Subclasses are
+refused until their inherited code can be modeled. Static module/from-import
+aliases work; using `sys.exit` as a function value is refused.
+
+Exception attribute writes are conversion errors: a Python auxiliary
+attribute such as `error.message` must not overwrite the Rust runtime's
+stored display message or exception type. Modeled caught-class fields keep
+their typed read accessors. Other exception values cannot expose Rust's
+payload fields through Python attribute syntax; use `str(error)`,
+`repr(error)`, the supported `code` read, or explicit application data.
+Exception-attribute reflection and direct method calls on exception objects
+are also refused (issue #498). Methods on modeled scalar fields keep their
+ordinary lowering. An assignment such as `error = ...` inside its
+`except ... as error` handler is refused; use a fresh local name so the
+original caught class's field types are not reused.
 
 ### 8.2 Raising
 
@@ -2823,6 +2854,8 @@ accepted as permanent spec:
 | Integer division/modulo by zero use the existing CPython 3.11 message pins: `integer division or modulo by zero` for `//`, `integer modulo by zero` for `%`. CPython 3.14.4 uses `division by zero` for both. The fixed-width and unbounded integer paths use the same choice | Documented version choice; issue #492 |
 | `sys.modules` access (reads, imports, mutation) and builtin `locals()` access are conversion errors: the static runtime has no CPython import registry or frame dictionary. Explicit imports and application-owned dictionaries are the rewrite. An ordinary object field named `modules` and a user function named `locals` keep their ordinary behavior | Loud (issue #488); the fabricated empty registry and dropped namespace stores were silent defects |
 | Iterating a set (`for x in s`, `list(s)`, a comprehension over one) would run in Rust's randomized `HashSet` order, not CPython's; every order-observing construct is now a conversion error naming `sorted(s)` (§10.1). Remaining limit: a set reached only through a comprehension's own variable (`for g in groups for x in g`) or an untyped value is not seen | Loud since issue #444; the model of CPython's set table order stays unimplemented |
+| `sys.exit(status)` raises a catchable `SystemExit`, preserving cleanup and its original code. Only an uncaught exit at program entry ends the process, with no traceback. Immutable scalar/tuple codes, ordinary integer return values, the builtin constructor, and PyO3 code/args are pinned. Mutable or unbounded statuses, code mutation/reflection, first-class exit function values, and subclasses are conversion errors (§8.1) | Correct-or-loud (issues #484, #497) |
+| Exception attribute writes are conversion errors: assigning an auxiliary Python `error.message` cannot overwrite the Rust display payload. Direct reads of Rust implementation fields on exception values are refused; modeled caught-class field reads remain supported | Loud (issue #498); the old message store silently changed str(error) |
 | True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |
 | Exception message shapes: `int()`'s message carries "with base 10" and `float()`'s quotes the string as Python's repr (#339, round 10); `open` and stream errors are CPython's `[Errno N] text: 'path'` form (#339); the `KeyError` key quoting is single-quoted like CPython (round 99) | Correct (was a defect class in issue #82's family) |
 | An uncaught exception prints CPython's traceback header and final line but no traceback frames | Model limit (no frames) — the thread-exception entry's family (issue #479) |

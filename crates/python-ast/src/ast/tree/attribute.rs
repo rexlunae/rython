@@ -90,6 +90,12 @@ impl<'a> CodeGen for Attribute {
         ) {
             return Err(namespace.refusal().into());
         }
+        crate::ast::tree::system_exit::reject_function_value(&ExprType::Attribute(self.clone()), &options, &symbols)?;
+        if crate::ast::tree::system_exit::code_attribute(&self, Some(&ctx), &options, &symbols) {
+            let receiver = self.value.to_rust(ctx, options, symbols)?;
+            return Ok(quote!((#receiver).attr_value("code")?));
+        }
+        crate::ast::tree::system_exit::check_read(&self, &ctx, &options, &symbols)?;
         if crate::infer_type(Some(&ctx), &self.value, &options, &symbols) == crate::TypeInfo::BigInt {
             return Err("arbitrary-precision integer attributes are not supported yet; keep the value in scalar arithmetic; rython refuses to silently replace or narrow it".into());
         }
@@ -522,7 +528,7 @@ impl<'a> CodeGen for Attribute {
         // before `self.value`/`symbols` are moved below.
         let except_binding_receiver: Option<(String, Option<String>)> = match self.value.as_ref() {
             ExprType::Name(receiver) => match symbols.get(&receiver.id) {
-                Some(crate::SymbolTableNode::ExceptBinding(cls)) => {
+                Some(crate::SymbolTableNode::ExceptBinding(cls)) if ctx.in_except_handler() => {
                     Some((receiver.id.clone(), cls.clone()))
                 }
                 _ => None,

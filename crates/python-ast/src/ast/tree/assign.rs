@@ -193,8 +193,16 @@ impl<'a> CodeGen for Assign {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        crate::ast::tree::system_exit::reject_function_value(&self.value, &options, &symbols)?;
         for target in &self.targets {
+            if ctx.in_except_handler()
+                && crate::ast::tree::visit::target_names(target).into_iter().any(|name|
+                    matches!(symbols.get(name), Some(SymbolTableNode::ExceptBinding(_))))
+            {
+                return Err("reassigning an exception binding inside its handler is not supported yet; use a fresh local name; rython refuses to reuse the original caught class's field types for a different exception value".into());
+            }
             crate::ast::tree::interpreter_state::check_target(target, &options, &symbols)?;
+            crate::ast::tree::system_exit::check_mutation(target, &options, &symbols)?;
         }
         let value_type = crate::infer_type(Some(&ctx), &self.value, &options, &symbols);
         if self.targets.iter().filter(|t| !matches!(t, ExprType::Name(_))).any(|target| {

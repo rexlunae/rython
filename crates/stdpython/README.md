@@ -133,6 +133,17 @@ instance route through its `__str__`/`__repr__`, else the default
 object repr.
 
 ### Exception System
+
+`sys::exit` returns `Err(SystemExit)` with the original `code`; it does not
+end the process. The entry handler `exit_uncaught` flushes stdout and applies
+CPython's process-status rules for an uncaught `SystemExit`, without a
+traceback. Catching it keeps the process alive and runs normal cleanup.
+`PyException::system_exit` also preserves code and args through PyO3.
+The default thread exception reporter ignores `SystemExit`, ending only
+the exiting thread after its cleanup runs.
+The converter refuses Python attribute writes and direct reads of Rust's
+exception payload fields; modeled caught-class attributes stay readable.
+
 ✅ **Complete built-in exception tree**: every CPython built-in exception
 name is modeled, and `except` matching walks the real hierarchy —
 `except LookupError:` catches `IndexError`/`KeyError`, `except OSError:`

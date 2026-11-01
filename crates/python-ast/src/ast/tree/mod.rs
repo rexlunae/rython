@@ -80,6 +80,7 @@ pub(crate) use math_fn_types::MathFn;
 pub(crate) use threading_types::ThreadingType;
 
 pub mod std_module;
+pub(crate) mod system_exit;
 pub(crate) use std_module::{StdModule, is_numpy_alias};
 
 pub mod named_expression;

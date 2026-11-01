@@ -3423,7 +3423,11 @@ impl CodeGen for ClassDef {
             // The class exists only with a consistent MRO (CPython's
             // TypeError at class creation otherwise): loud here, at the
             // definition (Devin review on #330).
-            crate::ast::tree::raise_stmt::exception_mro(&self, &symbols, &options)?;
+            let mro = crate::ast::tree::raise_stmt::exception_mro(&self, &symbols, &options)?;
+            if mro.iter().skip(1).any(|(name, definition)| definition.is_none()
+                && crate::ast::tree::system_exit::ExitCall::builtin(name).is_some()) {
+                return Err("SystemExit subclasses are not supported yet; use builtin SystemExit or sys.exit(status) and catch SystemExit explicitly; rython refuses to lose an inherited exit code".into());
+            }
             // A real doc ATTRIBUTE: interpolating a String into quote!
             // yields a string-literal token — `""` in item position, a
             // parse error in the generated crate.

@@ -1,0 +1,5 @@
+before
+cleanup
+caught 3
+code 3
+after

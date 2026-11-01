@@ -84,6 +84,7 @@ impl CodeGen for Name {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        crate::ast::tree::system_exit::reject_function_value(&crate::ExprType::Name(self.clone()), &options, &symbols)?;
         // Handle dotted names (like "os.path") by converting them to Rust module paths
         if self.id.contains('.') {
             let parts: Vec<&str> = self.id.split('.').collect();
