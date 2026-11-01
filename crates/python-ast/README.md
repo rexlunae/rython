@@ -62,11 +62,14 @@ while gaierror/herror remain distinct subclasses for construction and matching.
 
 Immediate `list(value for ...)` consumption reuses list-comprehension
 lowering, including filters, nested loops, typed results, and exception
-propagation. Comprehensions reject borrowed mutable container output
-places (names, fields, and indexed values), including nested stored values
-and mutable walrus results, where copying would lose sharing. Immutable
-outputs and fresh container literals keep their ordinary lowering. The
-shared bytes/bytearray type is also refused at this borrowing boundary.
+propagation. Comprehensions reject borrowed mutable container outputs,
+including nested stored values, mutable walrus results, and identity calls
+such as `typing.cast`, where copying would lose sharing. Unresolved or
+boxed outputs and calls returning mutable values require an ownership
+proof; add immutable type annotations or construct fresh containers with
+safe members. Immutable outputs and fresh container literals keep their
+ordinary lowering. The shared bytes/bytearray type is also refused at
+this borrowing boundary.
 
 ### Prerequisites
 

@@ -132,7 +132,8 @@ a + b` works for ints, floats, strings, and lists; `for x in p` infers
 infer or fail loudly at conversion time),
 classes (struct-based), control flow including `try`/`except`/`finally` and
 loop `else`, comprehensions (including immediate `list(... for ...)`
-consumption), f-strings and `str.format` on literal
+consumption, with conversion errors for mutable or unresolved outputs
+whose sharing cannot be preserved), f-strings and `str.format` on literal
 templates, keyword arguments and defaults for user functions (plus
 keyword `replace()` on the datetime family), the core builtins (`print`,
 `len`, `range`, `open`, `sorted`, `min`/`max`, `enumerate`,

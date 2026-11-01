@@ -1747,7 +1747,7 @@ fn with_without_target_still_evaluates() {
 
 #[test]
 fn comprehension_binds_target() {
-    let out = compile("doubled = [x * 2 for x in items]", "comp.py");
+    let out = compile("items = [1, 2, 3]\ndoubled = [x * 2 for x in items]", "comp.py");
     assert!(out.contains("for x in"), "generated: {}", out);
     assert!(!out.contains("_item"), "generated: {}", out);
     assert!(out.contains("push"), "generated: {}", out);
@@ -1755,13 +1755,13 @@ fn comprehension_binds_target() {
 
 #[test]
 fn comprehension_condition_uses_continue() {
-    let out = compile("evens = [x for x in items if x % 2 == 0]", "comp2.py");
+    let out = compile("items = [1, 2, 3]\nevens = [x for x in items if x % 2 == 0]", "comp2.py");
     assert!(out.contains("continue"), "generated: {}", out);
 }
 
 #[test]
 fn multi_generator_comprehension_nests_loops() {
-    let out = compile("pairs = [x + y for x in a for y in b]", "comp3.py");
+    let out = compile("a = [1, 2]\nb = [3, 4]\npairs = [x + y for x in a for y in b]", "comp3.py");
     let for_count = out.matches("for ").count();
     assert!(for_count >= 2, "expected nested loops, generated: {}", out);
     assert!(!out.contains("vec ! []"), "generated: {}", out);
@@ -1769,7 +1769,7 @@ fn multi_generator_comprehension_nests_loops() {
 
 #[test]
 fn dict_comprehension_inserts_pairs() {
-    let out = compile("m = {k: v for k in keys}", "comp4.py");
+    let out = compile("keys = [\"a\"]\nv = 1\nm = {k: v for k in keys}", "comp4.py");
     assert!(out.contains("insert"), "generated: {}", out);
     assert!(out.contains("PyDict"), "generated: {}", out);
 }
@@ -2974,7 +2974,7 @@ fn nested_def_bare_name_default_converts() {
     // expression default still stays loud — see
     // omitted_defaults_must_be_constant.)
     let module = crate::parse(
-        "sep = \"-\"\ndef join(words):\n    def glue(a=x, b=sep):\n        return a + b\n    return [glue() for _ in words]\n",
+        "x = \"prefix\"\nsep = \"-\"\ndef join(words):\n    def glue(a=x, b=sep) -> str:\n        return a + b\n    return [glue() for _ in words]\n",
         "nestednamedefault.py",
     )
     .unwrap();
@@ -30145,6 +30145,67 @@ fn unbound_exception_reads_follow_every_shared_visitor_body() {
         "def f(flag: bool) -> None:\n    if flag:\n        error = ValueError('outer')\n    def inner(error: BaseException) -> None:\n        print(str(error))\n",
         "exception_nested_scope.py",
     );
+}
+
+#[test]
+fn cast_wrapped_and_returned_mutable_outputs_are_loud() {
+    // Verified against python3: casts and identity-returning helpers keep
+    // the inner list shared; source[0].append(2) updates result[0].
+    for (header, output) in [
+        ("from typing import cast\n", "cast(list[int], item)"),
+        ("from typing import cast as checked\n", "checked(list[int], item)"),
+        ("import typing\n", "typing.cast(list[int], item)"),
+        ("import typing as types\n", "types.cast(list[int], item)"),
+        ("from typing import cast\n", "cast(str, item)"),
+        ("from typing import cast\n", "cast(tuple[list[int], int], (item, 0))"),
+        ("def identity(value: list[int]) -> list[int]:\n    return value\n", "identity(item)"),
+        ("def str(value: list[int]) -> list[int]:\n    return value\n", "str(item)"),
+        ("def list(value: list[int]) -> list[int]:\n    return value\n", "list(item)"),
+    ] {
+        let source = format!("{header}def f() -> None:\n    source = [[1]]\n    result = [{output} for item in source]\n    source[0].append(2)\n    print(source, result)\n");
+        let error = compile_err(&source, "borrowed_call_output.py");
+        assert!(error.contains("comprehension output") && error.contains("refuses to lose sharing"), "{error}");
+    }
+}
+
+#[test]
+fn typing_cast_requires_two_positional_arguments() {
+    // Verified against python3: the keyword form returns 1; the invalid
+    // arities raise TypeError. Refuse forms the identity lowering cannot
+    // bind instead of discarding an argument or the whole call.
+    for expression in ["cast(int)", "cast(int, 1, 2)", "cast(typ=int, val=1)"] {
+        let source = format!("from typing import cast\ndef f() -> None:\n    print({expression})\n");
+        let error = compile_err(&source, "cast_arguments.py");
+        assert!(error.contains("typing.cast(...) requires two positional arguments")
+            && error.contains("refuses to drop or misbind"), "{error}");
+    }
+}
+
+#[test]
+fn unresolved_comprehension_output_requires_ownership_proof() {
+    // Verified against python3: the untyped and Any-typed forms can
+    // receive inner lists and must preserve their sharing too.
+    for source in [
+        "def collect(values):\n    return [item for item in values]\n",
+        "def collect(values):\n    return [item[0] for item in values]\n",
+        "from typing import Any\ndef collect(values: list[Any]) -> list[Any]:\n    return [item for item in values]\n",
+        "from typing import Any\ndef collect(values: list[Any]) -> list[Any]:\n    return [(item, 0) for item in values]\n",
+        "def collect(values):\n    return [item + [] for item in values]\n",
+        "from typing import Callable\ndef collect(values: list[list[int]], f: Callable[[list[int]], list[int]]) -> list[list[int]]:\n    return [f(item) for item in values]\n",
+    ] {
+        let error = compile_err(source, "unknown_output.py");
+        assert!(error.contains("unresolved") && error.contains("annotate immutable output types")
+            && error.contains("refuses to lose sharing"), "{error}");
+    }
+    // An explicit scalar annotation proves the pass-through is safe.
+    compile("def collect(values: list[int]) -> list[int]:\n    return [item for item in values]\n", "typed_output.py");
+    // List concatenation creates a new outer list, retaining the shared
+    // inner lists; mutating values[0][0] must still update the output.
+    let error = compile_err(
+        "def collect(values: list[list[list[int]]]) -> list[list[list[int]]]:\n    return [item + [] for item in values]\n",
+        "nested_concat_output.py",
+    );
+    assert!(error.contains("comprehension output") && error.contains("refuses to lose sharing"), "{error}");
 }
 
 #[test]

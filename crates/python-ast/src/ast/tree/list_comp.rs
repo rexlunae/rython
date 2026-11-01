@@ -18,40 +18,127 @@ pub(crate) fn refuse_borrowed_mutable_output(
     symbols: &SymbolTableScopes,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::ast::tree::visit;
-    fn mutable(t: &crate::TypeInfo) -> bool {
+    fn needs_ownership_proof(t: &crate::TypeInfo) -> bool {
         use crate::TypeInfo as T;
         match t {
             T::Vec(_) | T::Dict(..) | T::HashSet(_) | T::Collection(..)
-            | T::Bytes | T::NdArray => true,
-            T::Tuple(parts) => parts.iter().any(mutable),
+            | T::Bytes | T::NdArray | T::PyObject | T::PyValue | T::StrOrBytes => true,
+            T::Tuple(parts) => parts.iter().any(needs_ownership_proof),
             T::Option(inner) | T::Borrowed(inner) | T::PyValueMember(inner)
-            | T::PyTuple(inner) => mutable(inner),
+            | T::PyTuple(inner) => needs_ownership_proof(inner),
             _ => false,
         }
     }
-    fn borrowed(e: &ExprType, ctx: &CodeGenContext, scope: &PythonOptions, symbols: &SymbolTableScopes) -> bool {
+    fn immutable(t: &crate::TypeInfo) -> bool {
+        use crate::TypeInfo as T;
+        match t {
+            T::Int | T::BigInt | T::Float | T::Bool | T::String | T::StrRef
+            | T::Complex | T::Range => true,
+            T::Tuple(parts) => parts.iter().all(immutable),
+            T::Option(inner) | T::Borrowed(inner) | T::PyValueMember(inner)
+            | T::PyTuple(inner) => immutable(inner),
+            _ => false,
+        }
+    }
+    fn fresh_call(call: &crate::Call, ty: &crate::TypeInfo, ctx: &CodeGenContext, scope: &PythonOptions, symbols: &SymbolTableScopes) -> bool {
+        use crate::TypeInfo as T;
+        use crate::ast::tree::collections_types::DefaultFactoryClass as Factory;
+        if let ExprType::Attribute(attr) = call.func.as_ref() {
+            let receiver = crate::infer_type(Some(ctx), &attr.value, scope, symbols);
+            if matches!(receiver, T::PyObject | T::PyValue)
+                && crate::ast::tree::type_ctx::StrMethod::from_name(&attr.attr).is_some()
+            {
+                // An unresolved string receiver lowers through PyStrOps;
+                // its typed method table guarantees owned scalar/string
+                // results (or a new Vec<String>), not a borrowed container.
+                return true;
+            }
+            // An immutable builtin receiver cannot own a mutable result
+            // which a method could return by reference.
+            if immutable(&receiver) { return true; }
+        }
+        let ExprType::Name(name) = call.func.as_ref() else { return false; };
+        if !crate::ast::tree::type_ctx::is_unshadowed_builtin(&name.id, scope, symbols) { return false; }
+        let Some(factory) = Factory::from_builtin_name(&name.id) else { return false; };
+        match factory {
+            Factory::List | Factory::Set | Factory::Dict => {
+                // These copy their outer container. Nested members must
+                // already preserve identity; an unknown member is no proof.
+                call.args.is_empty() && call.keywords.is_empty() || match ty {
+                    T::Vec(item) | T::HashSet(item) => !needs_ownership_proof(item),
+                    T::Dict(key, value) => !needs_ownership_proof(key) && !needs_ownership_proof(value),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+    fn borrowed(e: &ExprType, ctx: &CodeGenContext, scope: &PythonOptions, symbols: &SymbolTableScopes, safe_names: &std::collections::HashSet<String>) -> bool {
         match e {
+            ExprType::Constant(_) => false,
+            ExprType::Name(name) if safe_names.contains(&name.id) => false,
             ExprType::Name(_) | ExprType::Attribute(_) | ExprType::Subscript(_)
-                if mutable(&crate::infer_type(Some(ctx), e, scope, symbols)) => true,
+                if needs_ownership_proof(&crate::infer_type(Some(ctx), e, scope, symbols)) => true,
+            ExprType::Call(call) => {
+                if let Some(value) = crate::ast::tree::annotation_module::cast_value(call, scope, symbols) {
+                    return borrowed(value, ctx, scope, symbols, safe_names);
+                }
+                let ty = crate::infer_type(Some(ctx), e, scope, symbols);
+                needs_ownership_proof(&ty) && !fresh_call(call, &ty, ctx, scope, symbols)
+            }
             // Even a fresh mutable RHS is shared with the walrus target.
             ExprType::NamedExpr(_) => visit::subexprs_for(e, visit::Descend::OwnScope)
                 .into_iter().skip(1).any(|v|
-                    mutable(&crate::infer_type(Some(ctx), v, scope, symbols))
-                        || borrowed(v, ctx, scope, symbols)),
+                    needs_ownership_proof(&crate::infer_type(Some(ctx), v, scope, symbols))
+                        || borrowed(v, ctx, scope, symbols, safe_names)),
             // Follow only stored/selected values, never intermediate
             // operands such as the mutable input of str(row).
             ExprType::List(_) | ExprType::Tuple(_) | ExprType::Dict(_) | ExprType::Set(_) =>
-                visit::container_values(e).into_iter().any(|v| borrowed(v, ctx, scope, symbols)),
+                visit::container_values(e).into_iter().any(|v| borrowed(v, ctx, scope, symbols, safe_names)),
             ExprType::IfExp(_) => visit::subexprs_for(e, visit::Descend::OwnScope)
-                .into_iter().skip(1).any(|v| borrowed(v, ctx, scope, symbols)),
+                .into_iter().skip(1).any(|v| borrowed(v, ctx, scope, symbols, safe_names)),
             ExprType::BoolOp(_) => visit::subexprs_for(e, visit::Descend::OwnScope)
-                .into_iter().any(|v| borrowed(v, ctx, scope, symbols)),
-            _ => false,
+                .into_iter().any(|v| borrowed(v, ctx, scope, symbols, safe_names)),
+            // Builtin sequence/set operators produce a fresh outer
+            // container, but their members can still alias the operands.
+            ExprType::BinOp(op) => {
+                use crate::{BinOps as B, TypeInfo as T};
+                let ty = crate::infer_type(Some(ctx), e, scope, symbols);
+                let fresh = match (&ty, &op.op) {
+                    (T::Vec(item), B::Add | B::Mult)
+                    | (T::HashSet(item), B::Sub | B::BitAnd | B::BitOr | B::BitXor) =>
+                        !needs_ownership_proof(item),
+                    (T::Bytes, B::Add) => true,
+                    _ => false,
+                };
+                needs_ownership_proof(&ty) && !fresh
+            }
+            // Nested comprehensions enforce their own output boundary
+            // when lowered; each evaluation constructs a fresh result.
+            ExprType::ListComp(_) | ExprType::SetComp(_) | ExprType::DictComp(_)
+            | ExprType::GeneratorExp(_) => false,
+            _ => needs_ownership_proof(&crate::infer_type(Some(ctx), e, scope, symbols)),
         }
     }
     if let Some((values, generators)) = visit::comprehension_parts(expr) {
-        let scope = crate::comprehension_scope(generators, Some(ctx), options, symbols);
-        if values.into_iter().any(|value| borrowed(value, ctx, &scope, symbols)) {
+        let prefixes = crate::ast::tree::type_ctx::comprehension_prefix_scopes(generators, Some(ctx), options, symbols);
+        let mut safe_names = std::collections::HashSet::new();
+        for (generator, prefix) in generators.iter().zip(&prefixes) {
+            let names = visit::target_names(&generator.target);
+            for name in &names { safe_names.remove(*name); }
+            // A heterogeneous tuple may not have one inferable element
+            // type, but every possible element can still be proven safe.
+            if let crate::TypeInfo::Tuple(parts) = crate::infer_type(Some(ctx), &generator.iter, prefix, symbols)
+                && !parts.is_empty() && parts.iter().all(|t| !needs_ownership_proof(t))
+            {
+                safe_names.extend(names.into_iter().map(str::to_owned));
+            }
+        }
+        let mut scope = crate::comprehension_scope(generators, Some(ctx), options, symbols);
+        for (name, inner) in comprehension_filter_narrowings(generators, &scope) {
+            apply_comprehension_narrowing(&mut scope, &name, inner);
+        }
+        if values.into_iter().any(|value| borrowed(value, ctx, &scope, symbols, &safe_names)) {
             // Position metadata only; the shared visitor above owns the
             // enumeration of result expressions and nested generators.
             let line = match expr {
@@ -62,8 +149,8 @@ pub(crate) fn refuse_borrowed_mutable_output(
                 _ => None,
             };
             return Err(format!(
-                "comprehension output borrowing a mutable or undistinguished container (line {}) is not supported yet; \
-                 produce immutable values or explicit fresh container values instead; \
+                "comprehension output borrowing a mutable, unresolved, or undistinguished value (line {}) is not supported yet; \
+                 annotate immutable output types or produce explicit fresh container values instead; \
                  rython refuses to lose sharing between the result and its source",
                 line.unwrap_or(0),
             ).into());

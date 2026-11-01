@@ -54,6 +54,68 @@ pub(crate) fn is_typing(name: &str) -> bool {
     )
 }
 
+/// Runtime operations in typing; all consumers use this boundary rather
+/// than separately recognizing identity calls in lowering and analyses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TypingCall { Cast }
+
+impl TypingCall {
+    fn from_name(name: &str) -> Option<Self> {
+        match name { "cast" => Some(Self::Cast), _ => None }
+    }
+
+    pub(crate) fn of_callee(
+        func: &crate::ExprType,
+        options: &crate::PythonOptions,
+        symbols: &crate::SymbolTableScopes,
+    ) -> Option<Self> {
+        use crate::{ExprType, SymbolTableNode};
+        let canonical = |name: &str| -> Option<String> {
+            let mut current = name.to_owned();
+            let mut seen = std::collections::HashSet::new();
+            while let Some(SymbolTableNode::Alias(next)) = symbols.get(&current) {
+                if !seen.insert(current) { return None; }
+                current = next.clone();
+            }
+            Some(current)
+        };
+        match func {
+            ExprType::Name(name) if !options.local_types.contains_key(&name.id)
+                && !options.name_types.contains_key(&name.id)
+                && !options.called_params.contains(&name.id) => {
+                let name = canonical(&name.id)?;
+                let SymbolTableNode::ImportFrom(import) = symbols.get(&name)? else { return None; };
+                if !is_typing(&import.module) { return None; }
+                let alias = import.names.iter().find(|a|
+                    a.asname.as_deref().unwrap_or(&a.name) == name)?;
+                Self::from_name(&alias.name)
+            }
+            ExprType::Attribute(attr) => {
+                let ExprType::Name(name) = attr.value.as_ref() else { return None; };
+                if options.local_types.contains_key(&name.id) || options.name_types.contains_key(&name.id)
+                    || options.called_params.contains(&name.id) {
+                    return None;
+                }
+                let name = canonical(&name.id)?;
+                let SymbolTableNode::Import(import) = symbols.get(&name)? else { return None; };
+                let module = import.names.iter().find(|a|
+                    a.asname.as_deref().unwrap_or(&a.name) == name || a.name == name)?;
+                is_typing(&module.name).then(|| Self::from_name(&attr.attr)).flatten()
+            }
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn cast_value<'a>(
+    call: &'a crate::Call,
+    options: &crate::PythonOptions,
+    symbols: &crate::SymbolTableScopes,
+) -> Option<&'a crate::ExprType> {
+    (TypingCall::of_callee(&call.func, options, symbols) == Some(TypingCall::Cast)
+        && call.args.len() == 2 && call.keywords.is_empty()).then(|| &call.args[1])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -87,7 +87,7 @@ fn comprehension_fresh_and_immutable_outputs_match_cpython() {
     assert!(build_generated(&krate.root).success());
     let output = Command::new(krate.root.join("target/debug/app")).output().unwrap();
     // Verified against python3.
-    assert_eq!(output.stdout, b"[[0, 9], [1], [2]]\n[[0], [1], [2]]\n[(0, '0'), (1, '1'), (2, '2')]\n['[1]', '[2]']\n");
+    assert_eq!(output.stdout, b"[[0, 9], [1], [2]]\n[[0], [1], [2]]\n[(0, '0'), (1, '1'), (2, '2')]\n['[1]', '[2]']\n[0, 1, 2]\n[[0], [1], [2]]\n['[1]', '[2]']\n['0', '1', '2']\n");
     assert!(output.stderr.is_empty(), "{:?}", output.stderr);
     assert_eq!(output.status.code(), Some(0));
 }
