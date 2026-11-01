@@ -18,6 +18,11 @@ pub(crate) fn refuse_borrowed_mutable_output(
     symbols: &SymbolTableScopes,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::ast::tree::visit;
+    if let ExprType::ListComp(comp) = expr
+        && subclass_registry_base(comp, options, symbols).is_some()
+    {
+        return Ok(());
+    }
     fn needs_ownership_proof(t: &crate::TypeInfo) -> bool {
         use crate::TypeInfo as T;
         match t {
@@ -84,7 +89,14 @@ pub(crate) fn refuse_borrowed_mutable_output(
                     return borrowed(value, ctx, scope, symbols, safe_names);
                 }
                 let ty = crate::infer_type(Some(ctx), e, scope, symbols);
-                needs_ownership_proof(&ty) && !fresh_call(call, &ty, ctx, scope, symbols)
+                // Imported scalar returns can be known even when the
+                // general inferrer keeps the call opaque (it avoids
+                // naming another module's concrete class in this one).
+                let scalar_return = matches!(ty, crate::TypeInfo::PyObject)
+                    && crate::call_return_typeinfo(call, Some(symbols), Some(scope))
+                        .is_some_and(|result| immutable(&result));
+                needs_ownership_proof(&ty) && !scalar_return
+                    && !fresh_call(call, &ty, ctx, scope, symbols)
             }
             // Even a fresh mutable RHS is shared with the walrus target.
             ExprType::NamedExpr(_) => visit::subexprs_for(e, visit::Descend::OwnScope)
@@ -342,6 +354,31 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Comprehension {
             ifs,
             is_async,
         })
+    }
+}
+
+/// The existing static registry lowering constructs each known subclass
+/// afresh. Keep its exact, side-effect-free shape as the ownership proof.
+fn subclass_registry_base(
+    comp: &ListComp,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<String> {
+    let [generator] = comp.generators.as_slice() else { return None; };
+    if generator.is_async || !generator.ifs.is_empty() { return None; }
+    let ExprType::Call(iter) = &generator.iter else { return None; };
+    if !iter.args.is_empty() || !iter.keywords.is_empty() { return None; }
+    let ExprType::Attribute(attr) = iter.func.as_ref() else { return None; };
+    if attr.attr != "__subclasses__" { return None; }
+    let ExprType::Name(base) = attr.value.as_ref() else { return None; };
+    if !matches!(symbols.get(&base.id), Some(crate::SymbolTableNode::ClassDef(_)))
+        || options.local_types.contains_key(&base.id) || options.name_types.contains_key(&base.id)
+        || options.called_params.contains(&base.id) { return None; }
+    let ExprType::Call(element) = comp.elt.as_ref() else { return None; };
+    if !element.args.is_empty() || !element.keywords.is_empty() { return None; }
+    match (element.func.as_ref(), &generator.target) {
+        (ExprType::Name(callee), ExprType::Name(target)) if callee.id == target.id => Some(base.id.clone()),
+        _ => None,
     }
 }
 
@@ -603,45 +640,7 @@ impl CodeGen for ListComp {
         // modules are invisible (a divergence on the ledger), and a
         // non-construction element stays on the general path below.
         {
-            let registry_shape = self.generators.len() == 1
-                && {
-                    let iter_is_subclasses = match &self.generators[0].iter {
-                        ExprType::Call(c) => matches!(
-                            c.func.as_ref(),
-                            ExprType::Attribute(a)
-                                if a.attr == "__subclasses__"
-                                    && matches!(
-                                        a.value.as_ref(),
-                                        ExprType::Name(b)
-                                            if matches!(
-                                                symbols.get(&b.id),
-                                                Some(crate::SymbolTableNode::ClassDef(_))
-                                            )
-                                    )
-                        ),
-                        _ => false,
-                    };
-                    iter_is_subclasses
-                }
-                && match self.elt.as_ref() {
-                    ExprType::Call(c) => matches!(c.func.as_ref(), ExprType::Name(t)
-                        if match &self.generators[0].target {
-                            ExprType::Name(tn) => tn.id == t.id,
-                            _ => false,
-                        }),
-                    _ => false,
-                };
-            if registry_shape {
-                let base_name = match &self.generators[0].iter {
-                    ExprType::Call(c) => match c.func.as_ref() {
-                        ExprType::Attribute(a) => match a.value.as_ref() {
-                            ExprType::Name(b) => b.id.clone(),
-                            _ => unreachable!("checked above"),
-                        },
-                        _ => unreachable!("checked above"),
-                    },
-                    _ => unreachable!("checked above"),
-                };
+            if let Some(base_name) = subclass_registry_base(&self, &options, &symbols) {
                 let members: Vec<String> =
                     crate::ast::tree::hierarchy::subtree(&options, &base_name)
                         .map(|v| {

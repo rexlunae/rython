@@ -93,6 +93,43 @@ fn comprehension_fresh_and_immutable_outputs_match_cpython() {
 }
 
 #[test]
+fn comprehension_imported_scalars_and_counter_items_match_cpython() {
+    let scratch = Scratch::new("comprehension-imported-scalar");
+    let root = scratch.path().join("app");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap();
+    fs::write(root.join("helper.py"),
+        "def label(value: int) -> str:\n    return f'n{value}'\ndef identity(value: list[int]) -> list[int]:\n    return value\n").unwrap();
+    fs::write(root.join("__init__.py"), concat!(
+        "from collections import Counter\n",
+        "from typing import Counter as TypeCounter\n",
+        "from .helper import label\n",
+        "def main() -> None:\n",
+        "    print([label(value) for value in [1, 2]])\n",
+        "    counter: TypeCounter[str] = Counter('aba')\n",
+        "    pairs = counter.most_common()\n",
+        "    print([name for name, _count in pairs])\n",
+        "if __name__ == '__main__':\n    main()\n",
+    )).unwrap();
+    let package = rypip::discover(scratch.path()).unwrap();
+    let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/app")).output().unwrap();
+    // Verified against python3.
+    assert_eq!(output.stdout, b"['n1', 'n2']\n['a', 'b']\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+
+    // The imported return authority must not approve a mutable identity.
+    fs::write(root.join("__init__.py"),
+        "from .helper import identity\ndef main() -> None:\n    source = [[1]]\n    result = [identity(value) for value in source]\n    source[0].append(2)\n    print(source, result)\nif __name__ == '__main__':\n    main()\n").unwrap();
+    let package = rypip::discover(scratch.path()).unwrap();
+    let error = rypip::convert(&package, &scratch.path().join("refused"), &ConvertOptions::default()).unwrap_err();
+    assert!(format!("{error:#}").contains("refuses to lose sharing"), "{error:#}");
+}
+
+#[test]
 fn immediate_list_generator_consumption_matches_cpython() {
     let scratch = Scratch::new("list-generator");
     let file = scratch.path().join("app.py");

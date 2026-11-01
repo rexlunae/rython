@@ -1418,6 +1418,14 @@ fn infer_type_inner(
                 },
             },
             ExprType::Attribute(attr) => {
+                if let TypeInfo::Collection(crate::CollectionsType::Counter, args) =
+                    infer_type_inner(ctx, &attr.value, options, symbols)
+                    && crate::ast::tree::collections_types::CounterMethod::from_name(&attr.attr)
+                        == Some(crate::ast::tree::collections_types::CounterMethod::MostCommon)
+                {
+                    let key = args.first().cloned().unwrap_or(TypeInfo::PyObject);
+                    return TypeInfo::Vec(Box::new(TypeInfo::Tuple(vec![key, TypeInfo::Int])));
+                }
                 // numpy functions produce arrays (`np.sum`, `numpy.mean`).
                 let on_numpy = matches!(
                     attr.value.as_ref(),

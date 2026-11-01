@@ -30169,6 +30169,22 @@ fn cast_wrapped_and_returned_mutable_outputs_are_loud() {
 }
 
 #[test]
+fn subclass_registry_ownership_proof_never_drops_filters_or_arguments() {
+    // Verified against python3: the False filter produces an empty list;
+    // passing 3 constructs a Child whose value is 3, not its default 1.
+    for result in [
+        "[kind() for kind in Base.__subclasses__() if False]",
+        "[kind(3) for kind in Base.__subclasses__()]",
+    ] {
+        let source = format!(
+            "class Base:\n    pass\nclass Child(Base):\n    def __init__(self, value: int = 1):\n        self.value = value\ndef main() -> None:\n    result: list[Base] = {result}\n    print(len(result))\n"
+        );
+        let error = compile_err(&source, "subclass_registry_output.py");
+        assert!(error.contains("comprehension output") && error.contains("refuses to lose sharing"), "{error}");
+    }
+}
+
+#[test]
 fn typing_cast_requires_two_positional_arguments() {
     // Verified against python3: the keyword form returns 1; the invalid
     // arities raise TypeError. Refuse forms the identity lowering cannot
