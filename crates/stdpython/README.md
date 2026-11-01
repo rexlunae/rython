@@ -143,6 +143,11 @@ The default thread exception reporter ignores `SystemExit`, ending only
 the exiting thread after its cleanup runs.
 The converter refuses Python attribute writes and direct reads of Rust's
 exception payload fields; modeled caught-class attributes stay readable.
+Builtin exception values retain positional argument reprs separately from
+their display text. Generated code can store, pass, return, and re-raise
+them; raising an existing value preserves its Python binding. The compiler
+guards mutable/unknown argument representations, unmodeled specialized
+constructors, and possibly-unbound exception locals before lowering.
 
 ✅ **Complete built-in exception tree**: every CPython built-in exception
 name is modeled, and `except` matching walks the real hierarchy —

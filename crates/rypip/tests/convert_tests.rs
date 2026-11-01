@@ -78,6 +78,26 @@ fn default_exception_and_ordinary_class_display_keep_their_cpython_behavior() {
 }
 
 #[test]
+fn builtin_exception_values_and_arguments_match_cpython() {
+    for (name, source, expected) in [
+        ("exception_values", include_str!("../../../eval/idioms/programs/exception_values.py"), include_bytes!("../../../eval/idioms/programs/exception_values.expected").as_slice()),
+        ("exception_args", include_str!("../../../eval/idioms/programs/exception_args.py"), include_bytes!("../../../eval/idioms/programs/exception_args.expected").as_slice()),
+    ] {
+        let scratch = Scratch::new(name);
+        let file = scratch.path().join("app.py");
+        fs::write(&file, source).unwrap();
+        let package = rypip::discover(&file).unwrap();
+        let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+        assert!(build_generated(&krate.root).success());
+        let output = Command::new(krate.root.join("target/debug/app")).output().unwrap();
+        // Verified against python3 (3.12 and 3.14); pins captured from stdout.
+        assert_eq!(output.stdout, expected, "{name}");
+        assert!(output.stderr.is_empty(), "{name}: {:?}", output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{name}");
+    }
+}
+
+#[test]
 #[cfg(unix)]
 fn system_exit_preserves_status_handlers_and_cleanup() {
     let scratch = Scratch::new("system-exit");

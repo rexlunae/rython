@@ -1,0 +1,29 @@
+{
+  "converter_commit": "09d87d1",
+  "repo_head": "09d87d1",
+  "rypip_path": "/home/tserica/rython-tmp/bigint-baseline-target/debug/rypip",
+  "oracle": "CPython 3.14.4 (pins captured under 3.11)",
+  "passed": 0,
+  "total": 2,
+  "passing": [],
+  "programs": {
+    "exception_args": {
+      "program": "exception_args",
+      "warnings": 0,
+      "status": "output-mismatch",
+      "detail": "line 1: expected \"('a', 'b')\", got 'a, b'"
+    },
+    "exception_values": {
+      "program": "exception_values",
+      "warnings": 6,
+      "status": "build-failed",
+      "errors": 23,
+      "histogram": {
+        "E0618": 17,
+        "E0425": 4,
+        "E0432": 1,
+        "E0433": 1
+      }
+    }
+  }
+}

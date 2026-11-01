@@ -2942,6 +2942,16 @@ impl FunctionDef {
         // that read at conversion time (issue #457 review): loud, not
         // silently a different value.
         refuse_reads_of_assert_raises_locals(&effective_body, &scope)?;
+        let exception_locals = scope.assigned.iter().chain(param_names.iter())
+            .filter(|name| !fn_mutable_globals.contains(*name)
+                && options.name_types.get(*name).is_some_and(crate::ast::tree::arguments::is_exception_typeinfo))
+            .cloned().collect();
+        if let Some((name, line)) = crate::ast::tree::binding_flow::first_unbound_read(
+            &effective_body, &param_names, &exception_locals,
+        )
+        {
+            return Err(format!("exception value `{name}` may be read before assignment or after an except binding is cleared (line {line}); initialize a fresh name before the try/conditional block and use a different except target; rython refuses to expose a fabricated default exception").into());
+        }
         // Issue #79's cheap guard: reject aliasing shapes rython cannot
         // model (`b = a` on a container that is later mutated, and passing
         // a container to a function that mutates it) at conversion time

@@ -54,7 +54,13 @@
     "entry_no_guard": {
       "status": "pass"
     },
+    "exception_args": {
+      "status": "pass"
+    },
     "exception_display": {
+      "status": "pass"
+    },
+    "exception_values": {
       "status": "pass"
     },
     "factory_return": {

@@ -596,7 +596,11 @@ pub(crate) fn exception_union_typeinfo(
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<crate::TypeInfo> {
-    let (members, has_none) = union_annotation_members(annotation)?;
+    let (members, has_none) = match union_annotation_members(annotation) {
+        Some(union) => union,
+        None if is_exception_class_member(annotation, symbols, options) => (vec![annotation], false),
+        None => return None,
+    };
     if members.is_empty()
         || !members
             .iter()

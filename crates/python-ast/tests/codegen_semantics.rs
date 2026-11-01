@@ -30043,6 +30043,148 @@ fn custom_exception_display_is_a_conversion_error_at_the_definition() {
 }
 
 #[test]
+fn unsupported_builtin_exception_arguments_are_refused_at_conversion() {
+    // Verified against python3: list arguments remain live after the
+    // exception is constructed; specialized builtins render more than
+    // BaseException's args tuple. Neither can be a snapshot of str(args).
+    for source in [
+        "def f() -> None:\n    data = [1]\n    error = ValueError(data)\n    data.append(2)\n    print(error)\n",
+        "def f(value: object) -> None:\n    raise ValueError(value)\n",
+        "def f() -> None:\n    error = ValueError(())\n",
+        "def f() -> None:\n    error = ValueError((1, None))\n",
+        "def f() -> None:\n    error = ValueError((1,2,3,4,5,6,7,8,9))\n",
+        "def f() -> None:\n    error = ValueError(b'x')\n",
+        "def f() -> None:\n    error = ValueError(bytearray(b'x'))\n",
+        "def nothing() -> None:\n    return None\ndef f() -> None:\n    error = ValueError(nothing())\n    print(error)\n",
+        "def f() -> None:\n    raise OSError(2, 'missing')\n",
+        "def f() -> None:\n    raise SyntaxError('bad', ('app.py', 3, 1, 'x'))\n",
+        "class ParseFailure(IndentationError):\n    pass\ndef f() -> None:\n    raise ParseFailure('bad', ('app.py', 3, 1, 'x'))\n",
+        "class ParseFailure(TabError):\n    pass\nclass Child(ParseFailure):\n    pass\ndef f() -> None:\n    error = Child('bad', ('app.py', 3, 1, 'x'))\n",
+        "def f() -> None:\n    raise UnicodeDecodeError('utf8', b'x', 0, 1, 'bad')\n",
+        "def f() -> None:\n    raise ExceptionGroup('bad', [])\n",
+        "def f() -> None:\n    raise ValueError(message='bad')\n",
+        "def f() -> None:\n    args = ('a', 'b')\n    raise ValueError(*args)\n",
+    ] {
+        let error = compile_err(source, "exception_arguments.py");
+        assert!(error.contains("exception construction") && error.contains("refuses"), "{error}");
+    }
+}
+
+#[test]
+fn builtin_exception_construction_respects_function_and_parameter_shadowing() {
+    let output = compile(
+        "def ValueError(value: str) -> str:\n    return value\ndef main() -> None:\n    print(ValueError('ordinary'))\n",
+        "shadowed_exception.py",
+    );
+    assert!(!output.contains("PyException :: new"), "{output}");
+    let output = compile(
+        "from typing import Callable\ndef use(ValueError: Callable[[str], str]) -> str:\n    return ValueError('ordinary')\n",
+        "exception_parameter.py",
+    );
+    assert!(!output.contains("PyException :: new"), "{output}");
+}
+
+#[test]
+fn exception_value_hoisting_cannot_expose_a_default() {
+    // Verified against python3: f(False) and the post-handler read each
+    // raise UnboundLocalError, never an empty Exception placeholder.
+    for source in [
+        "def f(flag: bool) -> None:\n    try:\n        if flag:\n            error = ValueError('x')\n    except TypeError:\n        pass\n    print(str(error))\n",
+        "def f() -> None:\n    error = ValueError('x')\n    try:\n        raise error\n    except ValueError as error:\n        print(str(error))\n    print(str(error))\n",
+    ] {
+        let error = compile_err(source, "unbound_exception.py");
+        assert!(error.contains("error")
+            && (error.contains("fabricated default") || error.contains("cannot unbind a binding")), "{error}");
+    }
+}
+
+#[test]
+fn exception_reads_only_merge_branches_that_can_reach_them() {
+    // Verified against python3: f(True) prints x; f(False) returns or
+    // raises before reaching the read, so neither exposes an unbound local.
+    for exit in ["return", "raise TypeError('stopped')"] {
+        let source = format!(
+            "def f(flag: bool) -> None:\n    if flag:\n        error = ValueError('x')\n    else:\n        {exit}\n    print(str(error))\n"
+        );
+        let output = compile(&source, "exception_branch.py");
+        assert!(output.contains("fn f"), "{output}");
+    }
+    for body in [
+        "    for item in range(2):\n        if flag:\n            error = ValueError('x')\n        else:\n            continue\n        print(str(error))\n",
+        "    while flag:\n        if flag:\n            error = ValueError('x')\n        else:\n            break\n        print(str(error))\n",
+        "    try:\n        error = ValueError('x')\n    except TypeError:\n        return\n    print(str(error))\n",
+        "    try:\n        if flag:\n            error = ValueError('x')\n        else:\n            return\n    finally:\n        print('cleanup')\n    print(str(error))\n",
+    ] {
+        compile(&format!("def f(flag: bool) -> None:\n{body}"), "exception_flow.py");
+    }
+}
+
+#[test]
+fn unbound_exception_reads_follow_every_shared_visitor_body() {
+    // Verified against python3: when flag is False, each reached read
+    // raises UnboundLocalError. In particular, return still runs finally,
+    // and loop-else executes even when the loop body never runs.
+    for (asynchronous, body) in [
+        ("", "    while not flag:\n        print(str(error))\n        break\n"),
+        ("", "    for item in range(0):\n        pass\n    else:\n        print(str(error))\n"),
+        ("", "    try:\n        pass\n    except TypeError:\n        return\n    else:\n        print(str(error))\n"),
+        ("", "    try:\n        return\n    finally:\n        print(str(error))\n"),
+        ("", "    with manager:\n        print(str(error))\n"),
+        ("async ", "    async for item in manager:\n        print(str(error))\n    else:\n        print(str(error))\n"),
+        ("async ", "    async with manager:\n        print(str(error))\n"),
+    ] {
+        let source = format!(
+            "{asynchronous}def f(flag: bool, manager) -> None:\n    if flag:\n        error = ValueError('x')\n{body}"
+        );
+        let error = compile_err(&source, "unbound_visitor_body.py");
+        assert!(error.contains("exception value `error`") && error.contains("fabricated default"), "{body}: {error}");
+    }
+    // Nested definitions are independent scopes; their parameter/local
+    // reads must not be charged to an uninitialized enclosing binding.
+    compile(
+        "def f(flag: bool) -> None:\n    if flag:\n        error = ValueError('outer')\n    def inner(error: BaseException) -> None:\n        print(str(error))\n",
+        "exception_nested_scope.py",
+    );
+}
+
+#[test]
+fn exception_comprehension_targets_shadow_outer_bindings() {
+    // Verified against python3: the comprehension reads its own bound
+    // target even when f(False) leaves the outer error unbound.
+    for expr in [
+        "[str(error) for error in [ValueError('inner')] if str(error) == 'inner']",
+        "{str(error): repr(error) for error in [ValueError('inner')]}",
+        "sorted({str(error) for error in [ValueError('inner')]})",
+        "sum(len(str(error)) for error in [ValueError('inner')])",
+        "[str(other) for error in [ValueError('inner')] for other in [error]]",
+        "[str(error) for (error, item) in [(ValueError('inner'), 1)]]",
+        "[str(error) for item in range(1) if str(error := ValueError('walrus')) == 'walrus']",
+    ] {
+        let source = format!(
+            "def f(flag: bool) -> None:\n    if flag:\n        error = ValueError('outer')\n        print(str(error))\n    print({expr})\n"
+        );
+        compile(&source, "exception_comprehension.py");
+    }
+}
+
+#[test]
+fn exception_comprehensions_do_not_fabricate_outer_or_later_bindings() {
+    // Verified against python3: the first iterable reads the outer
+    // scope; later generator targets are unbound locals until assigned;
+    // and no iteration target leaks back into the enclosing scope.
+    for source in [
+        "def f(flag: bool) -> None:\n    if flag:\n        error = ValueError('outer')\n    print([str(error) for error in [error]])\n",
+        "def f(flag: bool) -> None:\n    if flag:\n        error = ValueError('outer')\n    print([str(error) for item in range(1)])\n",
+        "def f() -> None:\n    error = ValueError('outer')\n    print([item for item in range(1) if str(error) for error in [ValueError('inner')]])\n",
+        "def f(flag: bool) -> None:\n    if flag:\n        error = ValueError('outer')\n    print([str(error) for error in [ValueError('inner')]])\n    print(str(error))\n",
+        "def f(flag: bool) -> None:\n    if flag:\n        error = ValueError('outer')\n    print([str(error := ValueError('walrus')) for item in range(0)])\n    print(str(error))\n",
+    ] {
+        let error = compile_err(source, "unbound_exception_comprehension.py");
+        assert!(error.contains("exception value `error`") && error.contains("fabricated default"), "{error}");
+    }
+}
+
+#[test]
 fn exception_display_bindings_follow_the_shared_scope_visitor() {
     // Bindings, not just undecorated methods: aliases, conditional defs,
     // async defs and property-decorated defs must not disappear either.

@@ -2432,6 +2432,15 @@ impl CodeGen for ImportFrom {
                 }
             }
         }
+        if self.level == 0
+            && matches!(crate::ast::tree::interpreter_state::InterpreterModule::from_name(&self.module),
+                Some(crate::ast::tree::interpreter_state::InterpreterModule::Builtins))
+            && self.names.iter().all(|alias| crate::ast::tree::raise_stmt::is_builtin_exception_name(&alias.name))
+        {
+            // Constructors and handlers resolve these names directly;
+            // builtin exception classes have no Rust module items.
+            return Ok(TokenStream::new());
+        }
         // annotations map to Rust types directly, so the import itself
         // lowers to nothing.
         if crate::AnnotationModule::from_name(self.module.split('.').next().unwrap_or(""))
