@@ -1,5 +1,14 @@
 # Evaluating a JIT for rython (issue #166)
 
+> **Superseded.** The maintainer decided that a JIT is a project goal; the
+> design is [`jit.md`](jit.md). This evaluation is kept as the record of
+> the objections the design had to answer. Its recommendation not to build
+> a JIT, and the non-goals it quotes, no longer stand: the non-goals were
+> narrowed in [`goals-and-design.md`](goals-and-design.md), and the
+> preconditions in "Recommendation", item 4 (semantics identical to the AOT
+> path, a checked-in gate, `std`-tier only, opt-in) are the requirements
+> `jit.md` is built around.
+
 This document evaluates issue #166 ("feat: A JIT compiler") against the
 project's stated contract. It is an evaluation, not a design commitment:
 its conclusion is a recommendation to **not** build a JIT now, and to split

@@ -68,7 +68,8 @@ will need refactoring. Grep for these; each maps to a rewrite in §2.
 
 | Pattern | Why |
 |---|---|
-| `eval(`, `exec(`, `compile(`, dynamic `__import__` | No runtime dynamism, permanently |
+| `eval(`, `exec(`, `compile(` | Not available in converted output. The JIT ([`jit.md`](jit.md)) is the planned route to evaluating source at runtime, but it is a design today, not a feature; until it ships, restructure |
+| Dynamic `__import__` | No runtime dynamism, permanently |
 | `getattr(`/`setattr(` for dynamic dispatch | No reflection; use explicit dispatch |
 | Metaclasses, `__init_subclass__`, class decorators | No dynamic class machinery |
 | Monkey-patching (assigning to modules/classes at runtime) | Nothing to patch at runtime |
