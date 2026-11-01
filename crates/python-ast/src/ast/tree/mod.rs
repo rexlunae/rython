@@ -96,6 +96,7 @@ pub use module::*;
 pub mod scope;
 pub use scope::*;
 pub(crate) mod binding_flow;
+pub(crate) mod testcase;
 
 pub mod statement;
 pub use statement::*;

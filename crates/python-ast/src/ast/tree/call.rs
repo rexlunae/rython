@@ -7711,6 +7711,18 @@ impl<'a> CodeGen for Call {
             if n.id == "RLResolver" {
             }
             if let Some((class, class_symbols)) = resolved {
+                if class.is_testcase(&class_symbols, &options) {
+                    for ancestor in class.base_chain_with_options(&class_symbols, &options) {
+                        if !ancestor.infer_fields(&class_symbols, &options)?.is_empty() {
+                            return Err(format!(
+                                "manual construction of TestCase `{}` with instance fields is not supported yet; \
+                                 use unittest.main() so setUp runs before each test; \
+                                 rython refuses to silently expose unassigned attribute defaults",
+                                class.name,
+                            ).into());
+                        }
+                    }
+                }
                 // The CONSTRUCTED type's Rust name: for a @classmethod's
                 // `cls(...)` the receiver identifier `cls` is not a Rust
                 // type in scope — the class's OWN name is (urllib3's

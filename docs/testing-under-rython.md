@@ -62,7 +62,7 @@ landed** (PR #345 and successors). Three parts of the issue are now stale:
 
 `crates/stdpython/src/stdlib/unittest.rs:544` still holds the fallback
 `unittest::main()`, which raises a loud `NotImplementedError` — the
-correct posture for a module with no direct `unittest.TestCase` subclass
+correct posture for a module with no `unittest.TestCase` subclass
 (`emit_test_runner` returns `None` there, by design; see its doc comment).
 
 ## What works today (verified)
@@ -89,8 +89,24 @@ if __name__ == "__main__":
 `rypip convert` → `cargo build` → run: exit 0, matching `python3` exit 0.
 Adding a failing test (`self.assertEqual(1, 2)`) makes both exit 1.
 
+Test methods may create fields directly (`self.total = 3` followed by
+`self.assertEqual(self.total, 3)`), including when the class has no
+`__init__` or `setUp` (issue #480). The runner follows the MRO for
+inherited tests, fixtures, default arguments and gates (issue #511),
+constructing a fresh instance per test. A field read must follow an
+assignment on every path, or an initialization on every successful
+`setUp` exit. A different test's writes and calls to helpers establish no
+initialization facts; helpers must initialize their own reads. Uncertain
+reads, receiver escapes/captures, attribute deletion, shadowed class
+members/methods, and custom constructors/attribute hooks fail conversion with a
+line and rewrite, so construction defaults never stand in for missing
+Python attributes. Manual construction of field-bearing cases and
+explicit lifecycle calls/captures are refused; use `unittest.main()` to
+preserve fixture order. Native pins cover fixtures and errors against CPython
+3.12 and 3.14.
+
 The original unittest measurements used CPython 3.14 and rython `a055a18`;
-the #457 and #482 pins below update the affected rows:
+the #457, #480 and #482 pins below update the affected rows:
 
 | Construct | Converts | Builds | Runs | Matches CPython |
 |---|---|---|---|---|

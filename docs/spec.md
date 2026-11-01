@@ -1888,6 +1888,28 @@ impl Point {
   a read of it through the class (`Class.name`, `cls.name`) is a loud
   `compile_error!` naming the attribute and the rewrite — never the
   boxed None (issue #417); a `self.name` read of it fails in rustc.
+- **TestCase method-created fields** (issues #480, #511): a direct or
+  inherited `unittest.TestCase` subclass discovers `self.attr = ...`
+  through the shared method-field analysis even without `__init__` or
+  `setUp`. The runner follows the MRO for tests, overrides, default
+  arguments, fixtures, and gates, and constructs a fresh instance for
+  every test. A path-sensitive binding check requires each field read to
+  follow an assignment on every reachable path. Tests and `tearDown`
+  inherit only the fields initialized on every successful exit from
+  `setUp`; another test's writes supply no facts, and `tearDown` cannot
+  assume a test completed its writes before raising. Helpers must
+  initialize their own field reads; calls do not establish field facts.
+  Unproved reads, receiver escapes or captures, attribute deletion,
+  class members shadowed by fields, and custom constructors or attribute
+  hooks are conversion errors naming the construct, line, and rewrite.
+  A class value shadowing a method is refused too, rather than silently
+  calling the inherited method through Rust's trait lookup.
+  Manual construction of cases with fields and explicit calls/captures
+  of lifecycle methods (including through `super()`) are refused: use
+  `unittest.main()` so the fixture-order proof applies. If `setUp` has
+  no successful exit, neither the test nor `tearDown` is reached.
+  These restrictions prevent Rust construction defaults from becoming
+  observable as Python values before assignment.
 - **Construction**: `Point(1.0, 2.0)` lowers to `Point::new(…)?`. The
   synthesized `new` defaults the struct then runs `__init__`. A
   user-defined method named `new` is a loud error.
@@ -2976,6 +2998,7 @@ accepted as permanent spec:
 | A thread's unhandled exception prints CPython's header and final exception line but no traceback frames | Model limit (no frames) — same family as §8's messages |
 | External `pytest.main` runner calls and values (`console_main` and `cmdline.main`, import aliases and crate re-exports included; copying module/cmdline objects into ordinary value slots is also refused) are refused at conversion with the Python location and a rewrite to CPython's `python -m pytest` or the supported unittest subset. There is no automatic collection: a module defining only `test_*` functions remains a library, and `import pytest` alone retains the external-module warning (#456). Ordinary shadowing parameters and crate siblings keep their behavior | Loud (issue #482); a requested runner call could previously be dropped with a warning in multi-module conversion |
 | `unittest.main()`'s report is CPython's `TextTestRunner` output at the default verbosity, except that an ERROR or FAIL block's traceback prints CPython's header and final exception line but no traceback frames | Model limit (no frames) — the thread-exception entry's family (issue #334, Phase 3) |
+| A `TestCase` field first assigned in a test method is discovered without requiring `__init__` or `setUp`. Each test gets a new instance; inherited tests, fixtures, default arguments and gates follow the MRO. Binding-flow checks reject uncertain reads (including cross-test state and teardown reads relying on a test completing), receiver escapes/captures, deletion, shadowed class members, custom constructors and attribute hooks before a Rust default can be observed. Manual construction of field-bearing cases and explicit lifecycle calls/captures are refused; use `unittest.main()` | Correct-or-loud (issues #480, #511); pinned against CPython 3.12 and 3.14 |
 | TCP `socket.bind()` binds AND starts listening (std::net has no half-bound TCP socket); a connection can be accepted by the OS before `listen()` runs, and binding a client socket before `connect()` is a loud error | Model limit of the std::net backend |
 | `URLError`'s reason text inside CPython's `<urlopen error …>` shape is the HTTP backend's wording, not CPython's | Model limit of the wrapped-crate convention (§10.2.1) |
 | `HTTPError` carries CPython's message but not the error response's body/headers (exceptions are string-tagged values) | Model limit; §8.1 representation |

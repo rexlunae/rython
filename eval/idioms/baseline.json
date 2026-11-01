@@ -177,6 +177,9 @@
     "system_exit_cleanup": {
       "status": "pass"
     },
+    "testcase_method_fields": {
+      "status": "pass"
+    },
     "text_stats": {
       "status": "pass"
     },

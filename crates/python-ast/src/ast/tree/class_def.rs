@@ -2325,17 +2325,25 @@ impl ClassDef {
         options: &PythonOptions,
     ) -> Result<Vec<(String, crate::TypeInfo)>, Box<dyn std::error::Error>> {
         let mut fields: Vec<(String, crate::TypeInfo)> = Vec::new();
-        // A unittest TestCase without `__init__` initializes in `setUp`,
-        // which the generated runner calls before every test (idna's
-        // `self.tld_strings`): its stores are the fields, which hold their
-        // defaults from construction until setUp runs — no test observes
-        // them before (issue #334).
+        // TestCase fields may first be assigned in setUp OR a test body
+        // (#480). Even without either initializer, run the shared method
+        // store analysis below. The TestCase binding-flow guard at emission
+        // ensures no Python read can observe the Rust construction defaults.
+        let empty_init = FunctionDef {
+            name: "__init__".to_string(),
+            args: Box::default(),
+            body: Vec::new(),
+            decorator_list: Vec::new(),
+            returns: None,
+        };
         let Some(init) = self.init_method().or_else(|| {
-            self.bases
-                .iter()
-                .any(crate::ast::tree::module::is_testcase_base)
-                .then(|| self.methods().find(|m| m.name == "setUp"))
-                .flatten()
+            self.is_testcase(symbols, options).then(|| {
+                self.methods()
+                    .find(|m| {
+                        super::testcase::Member::from_name(&m.name) == super::testcase::Member::Setup
+                    })
+                    .unwrap_or(&empty_init)
+            })
         }) else {
             return Ok(fields);
         };
@@ -2856,6 +2864,22 @@ impl ClassDef {
             let mut method_types: std::collections::HashMap<String, crate::TypeInfo> =
                 std::collections::HashMap::new();
             crate::collect_local_types(&method.body, &mut method_types);
+            // Test methods can have typed, defaulted parameters. Reuse
+            // annotation resolution rather than boxing `self.x = amount`
+            // merely because the value came from a method parameter.
+            if self.is_testcase(symbols, options) {
+                for parameter in method.args.posonlyargs.iter()
+                    .chain(&method.args.args)
+                    .chain(&method.args.kwonlyargs)
+                {
+                    if let Some(annotation) = parameter.annotation.as_deref()
+                        && let Some(ty) = crate::resolve_alias_typeinfo(annotation, symbols, options)
+                            .or_else(|| crate::annotation_type_info(annotation))
+                    {
+                        method_types.entry(parameter.arg.clone()).or_insert(ty);
+                    }
+                }
+            }
             let mut method_stores = Vec::new();
             collect_field_stores(&method.body, &mut method_stores);
             for store in method_stores {
@@ -4403,6 +4427,7 @@ StatementType::Assign(a)
         // embedded base struct).
         let fields = self.own_fields(&symbols, &options)?;
         self.validate_thread_field_initialization(&fields, &symbols, &options)?;
+        self.validate_testcase_fields(&symbols, &options)?;
 
         // The embedded base struct occupies `__rython_base`; a user field of
         // the same name would collide with it.

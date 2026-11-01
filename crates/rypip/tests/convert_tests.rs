@@ -13138,6 +13138,50 @@ fn unittest_run(name: &str, source: &str) -> (String, String, i32) {
 }
 
 #[test]
+fn unittest_method_created_fields_match_cpython() {
+    let (stdout, stderr, code) = unittest_run("ut_method_fields",
+        include_str!("../../../eval/idioms/programs/testcase_method_fields.py"));
+    // Verified against python3 (3.12 and 3.14).
+    assert_eq!(stdout, "7\n10\n");
+    assert_eq!(stderr, "..\n----------------------------------------------------------------------\nRan 2 tests in T\n\nOK");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn unittest_method_fields_preserve_inheritance_fixtures_and_errors() {
+    let (stdout, stderr, code) = unittest_run("ut_field_lifecycle",
+        include_str!("fixtures/testcase_fields_lifecycle.py"));
+    // Verified against python3 (3.12 and 3.14). Traceback frames are
+    // omitted under the existing no-frames ledger entry (spec §12).
+    assert_eq!(stdout, concat!(
+        "base 3\nbranches 3 4\nraise 6\nreturn 5\nchild 7\nchild 7\n",
+        "error setup 4\nerror body 3\nerror cleanup 4\n",
+        "setup 11\nbody 3 12\nteardown 12\n",
+        "setup 11\nbody 3 12\nteardown 12\n",
+        "setup 11\nbody 8 11\nteardown 11\n",
+        "broken setup 1\n",
+        "teardown setup 2\nteardown body 4\nbroken teardown 2\n",
+    ));
+    assert_eq!(stderr, concat!(
+        "......E...EssE\n",
+        "======================================================================\n",
+        "ERROR: test_error (__main__.ErrorAfterStore.test_error)\n",
+        "----------------------------------------------------------------------\n",
+        "Traceback (most recent call last):\nValueError: boom\n\n",
+        "======================================================================\n",
+        "ERROR: test_never (__main__.SetupFailure.test_never)\n",
+        "----------------------------------------------------------------------\n",
+        "Traceback (most recent call last):\nRuntimeError: setup broke\n\n",
+        "======================================================================\n",
+        "ERROR: test_total (__main__.TeardownFailure.test_total)\n",
+        "----------------------------------------------------------------------\n",
+        "Traceback (most recent call last):\nRuntimeError: teardown broke\n\n",
+        "----------------------------------------------------------------------\nRan 14 tests in T\n\nFAILED (errors=3, skipped=2)",
+    ));
+    assert_eq!(code, 1);
+}
+
+#[test]
 fn unittest_main_prints_cpythons_report() {
     // Issue #334, Phase 3: `unittest.main()` prints CPython's report on
     // stderr: a status character per test, the ERROR and FAIL blocks, the

@@ -64,20 +64,37 @@ impl Paths {
 struct Analysis<'a> {
     watched: &'a Names,
     reads: HashMap<String, usize>,
+    subject: Subject,
+}
+
+#[derive(Clone, Copy)]
+enum Subject {
+    Locals,
+    ReceiverFields,
 }
 
 impl Analysis<'_> {
+    fn name<'a>(&self, expr: &'a ExprType) -> Option<&'a str> {
+        match (self.subject, expr) {
+            (Subject::Locals, ExprType::Name(name)) => Some(&name.id),
+            (Subject::ReceiverFields, ExprType::Attribute(attr)) if visit::is_self(&attr.value) => {
+                Some(&attr.attr)
+            }
+            _ => None,
+        }
+    }
+
     fn bind(&self, bound: &mut Names, names: impl IntoIterator<Item = String>) {
         bound.extend(names.into_iter().filter(|name| self.watched.contains(name)));
     }
 
     fn expr(&mut self, expr: &ExprType, bound: &mut Names, line: usize) {
-        if let ExprType::Name(name) = expr
-            && self.watched.contains(&name.id)
-            && !bound.contains(&name.id)
+        if let Some(name) = self.name(expr)
+            && self.watched.contains(name)
+            && !bound.contains(name)
         {
             self.reads
-                .entry(name.id.clone())
+                .entry(name.to_owned())
                 .and_modify(|old| *old = (*old).min(line))
                 .or_insert(line);
         }
@@ -89,9 +106,11 @@ impl Analysis<'_> {
             let mut inner = bound.clone();
             // All iteration targets are locals of the comprehension,
             // including a later generator's not-yet-initialized target.
-            for generator in generators {
-                for name in visit::target_names(&generator.target) {
-                    inner.remove(name);
+            if matches!(self.subject, Subject::Locals) {
+                for generator in generators {
+                    for name in visit::target_names(&generator.target) {
+                        inner.remove(name);
+                    }
                 }
             }
             for (index, generator) in generators.iter().enumerate() {
@@ -117,12 +136,7 @@ impl Analysis<'_> {
                 // The visitor exposes target, value; Python evaluates the
                 // value before binding the target (which is not a load).
                 self.expr(children[1], bound, line);
-                self.bind(
-                    bound,
-                    visit::target_names(children[0])
-                        .into_iter()
-                        .map(str::to_owned),
-                );
+                self.target(children[0], bound, line, false);
             }
             ExprType::IfExp(_) => {
                 self.expr(children[0], bound, line);
@@ -172,16 +186,17 @@ impl Analysis<'_> {
     }
 
     fn target(&mut self, expr: &ExprType, bound: &mut Names, line: usize, load: bool) {
-        match expr {
-            ExprType::Name(_) => {
-                if load {
-                    self.expr(expr, bound, line);
-                }
-                self.bind(
-                    bound,
-                    visit::target_names(expr).into_iter().map(str::to_owned),
-                );
+        if let Some(name) = self.name(expr) {
+            if load {
+                self.expr(expr, bound, line);
             }
+            self.bind(bound, [name.to_owned()]);
+            return;
+        }
+        match expr {
+            // Local names cannot initialize receiver fields. Local-mode
+            // name targets were already handled through `name` above.
+            ExprType::Name(_) => {}
             ExprType::Tuple(_) | ExprType::List(_) | ExprType::Starred(_) => {
                 for child in visit::subexprs_for(expr, Descend::OwnScope) {
                     self.target(child, bound, line, load);
@@ -331,19 +346,26 @@ impl Analysis<'_> {
                 }
                 if let StatementType::Delete(targets) = &stmt.statement {
                     for target in targets {
-                        for name in visit::target_names(target) {
+                        if let Some(name) = self.name(target) {
                             bound.remove(name);
+                        }
+                        if matches!(self.subject, Subject::Locals) {
+                            for name in visit::target_names(target) {
+                                bound.remove(name);
+                            }
                         }
                     }
                 }
-                if matches!(
-                    stmt.statement,
-                    StatementType::Import(_)
-                        | StatementType::ImportFrom(_)
-                        | StatementType::FunctionDef(_)
-                        | StatementType::AsyncFunctionDef(_)
-                        | StatementType::ClassDef(_)
-                ) {
+                if matches!(self.subject, Subject::Locals)
+                    && matches!(
+                        stmt.statement,
+                        StatementType::Import(_)
+                            | StatementType::ImportFrom(_)
+                            | StatementType::FunctionDef(_)
+                            | StatementType::AsyncFunctionDef(_)
+                            | StatementType::ClassDef(_)
+                    )
+                {
                     let conditional = visit::conditional_walrus_names(stmt);
                     self.bind(
                         &mut bound,
@@ -381,6 +403,7 @@ pub(crate) fn first_unbound_read(
     let mut analysis = Analysis {
         watched,
         reads: HashMap::new(),
+        subject: Subject::Locals,
     };
     let initialized = initialized
         .iter()
@@ -392,4 +415,31 @@ pub(crate) fn first_unbound_read(
         .reads
         .into_iter()
         .min_by(|(an, al), (bn, bl)| (al, an).cmp(&(bl, bn)))
+}
+
+/// The same path-sensitive analysis for TestCase's statically stored
+/// attributes. A successful fixture supplies only fields initialized on
+/// EVERY normal exit; a raising fixture never reaches the test. Calls do
+/// not establish facts about fields (helpers are checked independently).
+pub(crate) fn receiver_field_bindings(
+    body: &[Statement],
+    initialized: &Names,
+    watched: &Names,
+) -> Result<Option<Names>, (String, usize)> {
+    let mut analysis = Analysis {
+        watched,
+        reads: HashMap::new(),
+        subject: Subject::ReceiverFields,
+    };
+    let mut paths = analysis.block(body, initialized.clone());
+    if let Some(read) = analysis
+        .reads
+        .into_iter()
+        .min_by(|(an, al), (bn, bl)| (al, an).cmp(&(bl, bn)))
+    {
+        return Err(read);
+    }
+    let mut normal = paths.take(Exit::Next);
+    join(&mut normal, paths.take(Exit::Return));
+    Ok(normal)
 }

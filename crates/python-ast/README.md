@@ -194,6 +194,15 @@ def fibonacci(n):
 - **Advanced**: Lambda expressions, conditional expressions, subscripting
 
 #### ⚠️ Experimental/Limited Support
+- **unittest fields**: `TestCase` methods can create instance fields without
+  `__init__` or `setUp`. The runner follows the MRO for tests and fixtures
+  and creates a fresh instance per test. Path-sensitive checks reject reads
+  before assignment (including cross-test state), receiver escapes/captures,
+  attribute deletion, custom constructors/attribute hooks, and class members
+  shadowed by fields (or class values shadowing methods). Manual construction of field-bearing cases and
+  explicit lifecycle calls are refused; use `unittest.main()`. Helpers
+  must initialize their own field reads; a
+  helper call supplies no initialization facts (issues #480, #511).
 - **Async/Await**: Parsing supported, code generation experimental
 - **Decorators**: Parsing supported, code generation limited
 - **Exception Handling**: Parsing supported, code generation experimental

@@ -6253,6 +6253,91 @@ fn every_entry_point_allows_dead_code_for_the_lib_copy() {
 }
 
 #[test]
+fn unittest_method_fields_use_the_existing_layout_and_fresh_cases() {
+    let out = compile(include_str!("../../../eval/idioms/programs/testcase_method_fields.py"), "tc_fields.py");
+    assert!(out.contains("pub total : i64"), "{out}");
+    assert_eq!(out.matches("let mut __rython_tc = Totals :: new () ?").count(), 2, "{out}");
+
+    // A return/raise on a branch cannot make the subsequent read unbound.
+    let out = compile("import unittest\nclass T(unittest.TestCase):\n    total: int\n    def test_a(self, flag: bool = False):\n        if flag:\n            return\n        else:\n            self.total = 3\n        print(self.total)\n", "tc_flow.py");
+    assert!(out.contains("pub total : i64"), "{out}");
+}
+
+#[test]
+fn unittest_method_fields_refuse_unassigned_reads() {
+    for (methods, field, line) in [
+        ("    def test_a(self, flag: bool = False):\n        if flag:\n            self.total = 3\n        total = 99\n        print(self.total)\n", "total", 7),
+        ("    def test_a(self):\n        print(self.total)\n        self.total = 3\n", "total", 4),
+        ("    def test_a(self):\n        self.total = 3\n    def test_b(self):\n        print(self.total)\n", "total", 6),
+        ("    def test_a(self):\n        self.total = 3\n    def tearDown(self):\n        print(self.total)\n", "total", 6),
+        ("    def setUp(self, flag: bool = False):\n        if flag:\n            self.total = 3\n    def test_a(self):\n        print(self.total)\n", "total", 7),
+        ("    def setUp(self, flag: bool = False):\n        if flag:\n            return\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "total", 8),
+        ("    def test_a(self):\n        try:\n            raise ValueError()\n            self.total = 3\n        except ValueError:\n            print(self.total)\n", "total", 8),
+        ("    def test_a(self):\n        for total in range(0):\n            self.total = 3\n        print(self.total)\n", "total", 6),
+        ("    def test_a(self):\n        total = (total := 99)\n        print([total for total in range(1)])\n        print(self.total)\n        self.total = 3\n", "total", 6),
+        ("    def test_a(self):\n        self.helper()\n        self.total = 3\n    def helper(self):\n        print(self.total)\n", "total", 7),
+        ("    def test_a(self):\n        self.total += 1\n        self.total = 3\n", "total", 4),
+        ("    def test_a(self):\n        self.total[0] = 9\n        self.total = [3]\n", "total", 4),
+        ("    def test_a(self):\n        print([self.total for total in range(1)])\n        self.total = 3\n", "total", 4),
+        ("    def test_a(self, flag: bool = False):\n        try:\n            if flag:\n                return\n        finally:\n            print(self.total)\n        self.total = 3\n", "total", 8),
+        ("    def test_a(self):\n        with self.assertRaises(ValueError):\n            raise ValueError()\n            self.total = 3\n        print(self.total)\n", "total", 7),
+    ] {
+        let error = compile_err(&format!("import unittest\nclass T(unittest.TestCase):\n{methods}"), "tc_unbound.py");
+        assert!(error.contains(&format!("attribute `self.{field}` may be read before assignment")), "{error}");
+        assert!(error.contains(&format!("line {line}")) && error.contains("assign the attribute on every path")
+            && error.contains("refuses to silently"), "{error}");
+    }
+}
+
+#[test]
+fn unittest_method_fields_refuse_opaque_attribute_presence() {
+    for (members, construct) in [
+        ("    def test_a(self):\n        self.total = 3\n        del self.total\n        print(self.total)\n", "attribute deletion"),
+        ("    def test_a(self):\n        print(getattr(self, 'total', 99))\n        self.total = 3\n", "receiver escape"),
+        ("    def test_a(self):\n        read = lambda: self.total\n        print(read())\n        self.total = 3\n", "capture"),
+        ("    def test_a(self):\n        def read():\n            return self.total\n        print(read())\n        self.total = 3\n", "capture"),
+        ("    def setUp(self):\n        self.test_a()\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "lifecycle access"),
+        ("    def setUp(self):\n        super().setUp()\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "receiver escape"),
+        ("    total = 9\n    def test_a(self):\n        print(self.total)\n        self.total = 3\n", "class member `total`"),
+        ("    def __getattribute__(self, name: str):\n        return 9\n    def test_a(self):\n        self.total = 3\n        print(self.total)\n", "method `__getattribute__`"),
+        ("    def __init__(self):\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "method `__init__`"),
+    ] {
+        let error = compile_err(&format!("import unittest\nclass T(unittest.TestCase):\n{members}"), "tc_opaque.py");
+        assert!(error.contains(construct) && error.contains("line ")
+            && error.contains("not supported yet") && error.contains("refuses to silently"), "{error}");
+    }
+    for hook in ["__getattr__", "__setattr__", "__delattr__", "__new__"] {
+        let error = compile_err(&format!("import unittest\nclass T(unittest.TestCase):\n    def {hook}(self, name: str):\n        pass\n    def test_a(self):\n        self.total = 3\n        print(self.total)\n"), "tc_hook.py");
+        assert!(error.contains(&format!("method `{hook}`")) && error.contains("line 3")
+            && error.contains("use ordinary assignments"), "{error}");
+    }
+}
+
+#[test]
+fn unittest_manual_construction_cannot_bypass_field_initialization() {
+    for construction in ["T()", "Alias()"] {
+        let error = compile_err(&format!("import unittest\nclass T(unittest.TestCase):\n    def setUp(self):\n        self.total = 3\n    def test_a(self):\n        print(self.total)\nAlias = T\nvalue = {construction}\nvalue.test_a()\n"), "tc_manual.py");
+        assert!(error.contains("manual construction of TestCase `T`")
+            && error.contains("tc_manual.py:8") && error.contains("use unittest.main()")
+            && error.contains("refuses to silently"), "{error}");
+    }
+}
+
+#[test]
+fn unittest_inherited_fields_cannot_assume_an_overridden_setup_ran() {
+    let error = compile_err("import unittest\nclass Base(unittest.TestCase):\n    def setUp(self):\n        self.total = 3\n    def test_a(self):\n        print(self.total)\nclass Child(Base):\n    def setUp(self):\n        pass\nif __name__ == '__main__':\n    unittest.main()\n", "tc_inherited.py");
+    assert!(error.contains("TestCase `Child`") && error.contains("self.total")
+        && error.contains("line 6") && error.contains("before assignment"), "{error}");
+}
+
+#[test]
+fn unittest_inherited_methods_cannot_be_silently_unshadowed() {
+    let error = compile_err("import unittest\nclass Base(unittest.TestCase):\n    def test_a(self):\n        print('base')\nclass Child(Base):\n    test_a = 7\nif __name__ == '__main__':\n    unittest.main()\n", "tc_shadowed.py");
+    assert!(error.contains("TestCase `Child`") && error.contains("class member `test_a`")
+        && error.contains("line 6") && error.contains("use distinct"), "{error}");
+}
+
+#[test]
 fn unittest_main_emits_a_test_runner() {
     // issue #334: `unittest.main()` in a `__main__` block lowers to an
     // emitted runner that constructs each *TestCase subclass and calls its
