@@ -46,8 +46,6 @@ pub struct ScopeBindings {
     /// hoisted declaration for these names gets a `Default::default()`
     /// initializer instead of a bare `let mut x;` (issue #78).
     pub closure_captured_uninit: HashSet<String>,
-    /// Loads seen on a path where the local may not hold a value.
-    pub possibly_unbound_reads: HashMap<String, usize>,
     /// `for`-target names whose value is observed after the loop (a read in
     /// a later statement that no re-binding shadows). These lower to stores
     /// into the hoisted binding, never shadowing fresh bindings (issue #80).
@@ -126,8 +124,6 @@ struct Analysis<'r> {
     needs_mut: HashSet<String>,
     optional: HashSet<String>,
     closure_captured_uninit: HashSet<String>,
-    possibly_unbound_reads: HashMap<String, usize>,
-    current_line: usize,
     /// Names assigned inside a `with self.assertRaises(E):` body (see
     /// `ScopeBindings::assert_raises_body_names`).
     assert_raises_body_names: HashSet<String>,
@@ -323,8 +319,6 @@ pub(crate) fn analyze_scope_typed(
         needs_mut: HashSet::new(),
         optional: HashSet::new(),
         closure_captured_uninit: HashSet::new(),
-        possibly_unbound_reads: HashMap::new(),
-        current_line: 0,
         assert_raises_body_names: HashSet::new(),
         leaked_loop_targets: HashSet::new(),
         state: HashMap::new(),
@@ -341,8 +335,6 @@ pub(crate) fn analyze_scope_typed(
         needs_mut: HashSet::new(),
         optional: HashSet::new(),
         closure_captured_uninit: HashSet::new(),
-        possibly_unbound_reads: HashMap::new(),
-        current_line: 0,
         assert_raises_body_names: HashSet::new(),
         leaked_loop_targets: HashSet::new(),
         state: initialized
@@ -366,7 +358,6 @@ pub(crate) fn analyze_scope_typed(
         needs_mut: a.needs_mut,
         optional: a.optional,
         closure_captured_uninit: a.closure_captured_uninit,
-        possibly_unbound_reads: a.possibly_unbound_reads,
         assert_raises_body_names: a.assert_raises_body_names,
         leaked_loop_targets: a.leaked_loop_targets,
     }
@@ -779,8 +770,6 @@ pub(crate) fn class_call_resolver<'a>(
 
 fn walk_stmts(body: &[Statement], a: &mut Analysis<'_>, multi: bool) {
     for stmt in body {
-        let previous_line = a.current_line;
-        a.current_line = stmt.lineno.unwrap_or(0);
         match &stmt.statement {
             StatementType::Assign(assign) => {
                 walk_expr(&assign.value, a);
@@ -899,15 +888,7 @@ fn walk_stmts(body: &[Statement], a: &mut Analysis<'_>, multi: bool) {
                 let mut exits = Vec::new();
                 for handler in &s.handlers {
                     a.state = handler_entry.clone();
-                    if let Some(name) = &handler.name {
-                        a.state.insert(name.clone(), Init::Yes);
-                    }
                     walk_stmts(&handler.body, a, multi);
-                    // Python clears an `except ... as name` binding on
-                    // leaving the handler, including an older binding.
-                    if let Some(name) = &handler.name {
-                        a.state.insert(name.clone(), Init::No);
-                    }
                     exits.push(std::mem::replace(&mut a.state, HashMap::new()));
                 }
                 // The else path continues from the completed body.
@@ -937,7 +918,6 @@ fn walk_stmts(body: &[Statement], a: &mut Analysis<'_>, multi: bool) {
             // Nested definitions are their own scopes.
             _ => {}
         }
-        a.current_line = previous_line;
     }
 }
 
@@ -1096,11 +1076,6 @@ fn walk_subscript_kind(kind: &crate::SubscriptKind, a: &mut Analysis<'_>) {
 
 fn walk_expr(expr: &ExprType, a: &mut Analysis<'_>) {
     match expr {
-        ExprType::Name(name) => {
-            if a.init_of(&name.id) != Init::Yes {
-                a.possibly_unbound_reads.entry(name.id.clone()).or_insert(a.current_line);
-            }
-        }
         ExprType::Call(call) => walk_call(call, a),
         ExprType::BinOp(op) => {
             walk_expr(&op.left, a);

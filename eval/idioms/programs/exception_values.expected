@@ -31,6 +31,15 @@ state 2
 KeyError((1, 'key'))
 None SyntaxError()
 bad SyntaxError('bad')
+None ParseFailure()
+None NestedParseFailure()
+None TabFailure()
+None SyntaxFailure()
+indent ParseFailure('indent')
+caught syntax None NestedParseFailure()
+returning branch returning
+raising branch raising
+caught branch stopped
 () SSLError()
 ('tls',) SSLError('tls')
 dns gaierror('dns')

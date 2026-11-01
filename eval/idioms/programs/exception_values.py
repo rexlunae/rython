@@ -8,6 +8,38 @@ calls = 0
 state = 1
 
 
+class ParseFailure(IndentationError):
+    pass
+
+
+class NestedParseFailure(ParseFailure):
+    pass
+
+
+class TabFailure(TabError):
+    pass
+
+
+class SyntaxFailure(SyntaxError):
+    pass
+
+
+def returning_branch(flag: bool) -> None:
+    if flag:
+        error = ValueError("returning")
+    else:
+        return
+    print("returning branch", str(error))
+
+
+def raising_branch(flag: bool) -> None:
+    if flag:
+        error = ValueError("raising")
+    else:
+        raise TypeError("stopped")
+    print("raising branch", str(error))
+
+
 def argument(value: str) -> str:
     global calls
     calls += 1
@@ -98,6 +130,27 @@ def main() -> None:
     ssl_one = SSLError("tls")
     print(str(syntax_empty), repr(syntax_empty))
     print(str(syntax), repr(syntax))
+    parse_empty = ParseFailure()
+    nested_empty = NestedParseFailure()
+    tab_empty = TabFailure()
+    custom_syntax_empty = SyntaxFailure()
+    parse_message = ParseFailure("indent")
+    print(str(parse_empty), repr(parse_empty))
+    print(str(nested_empty), repr(nested_empty))
+    print(str(tab_empty), repr(tab_empty))
+    print(str(custom_syntax_empty), repr(custom_syntax_empty))
+    print(str(parse_message), repr(parse_message))
+    try:
+        raise NestedParseFailure()
+    except SyntaxError as parse_error:
+        print("caught syntax", str(parse_error), repr(parse_error))
+    returning_branch(True)
+    returning_branch(False)
+    raising_branch(True)
+    try:
+        raising_branch(False)
+    except TypeError as branch_error:
+        print("caught branch", str(branch_error))
     print(str(ssl_empty), repr(ssl_empty))
     print(str(ssl_one), repr(ssl_one))
     dns = gaierror("dns")

@@ -2942,11 +2942,13 @@ impl FunctionDef {
         // that read at conversion time (issue #457 review): loud, not
         // silently a different value.
         refuse_reads_of_assert_raises_locals(&effective_body, &scope)?;
-        if let Some((name, line)) = scope.possibly_unbound_reads.iter()
-            .filter(|(name, _)| !fn_mutable_globals.contains(*name)
-                && (scope.assigned.contains(*name) || param_names.contains(*name))
+        let exception_locals = scope.assigned.iter().chain(param_names.iter())
+            .filter(|name| !fn_mutable_globals.contains(*name)
                 && options.name_types.get(*name).is_some_and(crate::ast::tree::arguments::is_exception_typeinfo))
-            .min_by_key(|(name, line)| (**line, name.as_str()))
+            .cloned().collect();
+        if let Some((name, line)) = crate::ast::tree::binding_flow::first_unbound_read(
+            &effective_body, &param_names, &exception_locals,
+        )
         {
             return Err(format!("exception value `{name}` may be read before assignment or after an except binding is cleared (line {line}); initialize a fresh name before the try/conditional block and use a different except target; rython refuses to expose a fabricated default exception").into());
         }

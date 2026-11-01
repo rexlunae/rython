@@ -2216,9 +2216,14 @@ fn class_str_rule(
 ) -> Result<Option<ExceptionStr>, Box<dyn std::error::Error>> {
     // Custom overrides are refused at the class definition. The builtin
     // ancestor's rule still matters, even behind several user classes.
-    Ok(exception_mro(cls, symbols, options)?.into_iter().find_map(|(name, definition)| {
-        definition.is_none().then(|| ExceptionStr::from_name(&name)).flatten()
-    }))
+    for (name, definition) in exception_mro(cls, symbols, options)? {
+        if definition.is_none()
+            && let Some(rule) = ExceptionStr::of_builtin(&name)?
+        {
+            return Ok(Some(rule));
+        }
+    }
+    Ok(None)
 }
 
 /// The construction's tokens from what `BaseException.__init__` receives

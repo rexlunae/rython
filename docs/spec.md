@@ -2033,7 +2033,9 @@ not dispatch Python display methods; evaluating an override at construction
 would change when and how often it runs. Format explicit application data
 at each display site and remove the override. Ordinary classes retain
 their display methods, and exceptions without overrides keep the builtin
-display rules, including `KeyError`'s quoted key.
+display rules, including `KeyError`'s quoted key and `SyntaxError`'s
+zero-argument `None` display. Those rules follow the builtin ancestor's
+own MRO, including indirect `IndentationError` and `TabError` subclasses.
 For a one-argument builtin `KeyError`, that quoted display is also the
 original key's repr; construction records it separately so `repr(error)`
 is `KeyError('k')`, rather than quoting the display again (issue #500).
@@ -2072,6 +2074,9 @@ are modeled. Unseen external-class value construction and multi-argument
 raises require the defining module to be converted with the package.
 An exception local that may be read before assignment is a conversion
 error; generated storage defaults must not become Python values.
+Only paths that reach the read participate in this check: a branch that
+returns or raises does not make a later binding possibly unbound. Loop
+exits and `finally` are analyzed at their actual destinations.
 
 `raise E("msg")` lowers to `return Err(PyException::new("E", …))`;
 whether a name is an exception class is decided by a known-name list
