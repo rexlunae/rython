@@ -82,6 +82,10 @@ pub(crate) fn refuse_borrowed_mutable_output(
         match e {
             ExprType::Constant(_) => false,
             ExprType::Name(name) if safe_names.contains(&name.id) => false,
+            ExprType::Attribute(attr)
+                if crate::ast::tree::attribute::builtin_type_name_argument(attr, scope, symbols)
+                    .is_some_and(|arg| !matches!(arg, ExprType::Name(name)
+                        if scope.param_type_vars.contains_key(&name.id))) => false,
             ExprType::Name(_) | ExprType::Attribute(_) | ExprType::Subscript(_)
                 if needs_ownership_proof(&crate::infer_type(Some(ctx), e, scope, symbols)) => true,
             ExprType::Call(call) => {

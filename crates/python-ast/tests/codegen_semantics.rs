@@ -30161,6 +30161,7 @@ fn cast_wrapped_and_returned_mutable_outputs_are_loud() {
         ("def identity(value: list[int]) -> list[int]:\n    return value\n", "identity(item)"),
         ("def str(value: list[int]) -> list[int]:\n    return value\n", "str(item)"),
         ("def list(value: list[int]) -> list[int]:\n    return value\n", "list(item)"),
+        ("class Holder:\n    def __init__(self, value: list[int]):\n        self.__name__ = value\ndef type(value: list[int]) -> Holder:\n    return Holder(value)\n", "type(item).__name__"),
     ] {
         let source = format!("{header}def f() -> None:\n    source = [[1]]\n    result = [{output} for item in source]\n    source[0].append(2)\n    print(source, result)\n");
         let error = compile_err(&source, "borrowed_call_output.py");
