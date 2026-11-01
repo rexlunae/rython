@@ -2019,9 +2019,11 @@ stored display message or exception type. Modeled caught-class fields keep
 their typed read accessors. Other exception values cannot expose Rust's
 payload fields through Python attribute syntax; use `str(error)`,
 `repr(error)`, the supported `code` read, or explicit application data.
-Exception-attribute reflection and method calls are also refused (issue #498).
-Reassigning an exception binding inside its handler is refused; use a fresh
-local name so the original caught class's field types are not reused.
+Exception-attribute reflection and direct method calls on exception objects
+are also refused (issue #498). Methods on modeled scalar fields keep their
+ordinary lowering. An assignment such as `error = ...` inside its
+`except ... as error` handler is refused; use a fresh local name so the
+original caught class's field types are not reused.
 
 ### 8.2 Raising
 
