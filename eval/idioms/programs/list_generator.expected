@@ -1,0 +1,11 @@
+strings ['1']
+filtered [1, 9, 25]
+empty []
+nested [1, 2, 10, 12]
+returned ['1', '2', '3']
+retained [1, 2, 3]
+tuples [(0, '0'), (1, '1'), (2, '2')]
+item 1
+item 2
+caught stop
+after

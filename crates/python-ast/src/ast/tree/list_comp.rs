@@ -8,6 +8,70 @@ use crate::{
     PyAttributeExtractor, extract_list,
 };
 
+/// A borrowed container placed in a comprehension result must retain its
+/// identity. The value model would copy it; reject that boundary rather
+/// than silently detach the result from the source (issue #507).
+pub(crate) fn refuse_borrowed_mutable_output(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::ast::tree::visit;
+    fn mutable(t: &crate::TypeInfo) -> bool {
+        use crate::TypeInfo as T;
+        match t {
+            T::Vec(_) | T::Dict(..) | T::HashSet(_) | T::Collection(..)
+            | T::Bytes | T::NdArray => true,
+            T::Tuple(parts) => parts.iter().any(mutable),
+            T::Option(inner) | T::Borrowed(inner) | T::PyValueMember(inner)
+            | T::PyTuple(inner) => mutable(inner),
+            _ => false,
+        }
+    }
+    fn borrowed(e: &ExprType, ctx: &CodeGenContext, scope: &PythonOptions, symbols: &SymbolTableScopes) -> bool {
+        match e {
+            ExprType::Name(_) | ExprType::Attribute(_) | ExprType::Subscript(_)
+                if mutable(&crate::infer_type(Some(ctx), e, scope, symbols)) => true,
+            // Even a fresh mutable RHS is shared with the walrus target.
+            ExprType::NamedExpr(_) => visit::subexprs_for(e, visit::Descend::OwnScope)
+                .into_iter().skip(1).any(|v|
+                    mutable(&crate::infer_type(Some(ctx), v, scope, symbols))
+                        || borrowed(v, ctx, scope, symbols)),
+            // Follow only stored/selected values, never intermediate
+            // operands such as the mutable input of str(row).
+            ExprType::List(_) | ExprType::Tuple(_) | ExprType::Dict(_) | ExprType::Set(_) =>
+                visit::container_values(e).into_iter().any(|v| borrowed(v, ctx, scope, symbols)),
+            ExprType::IfExp(_) => visit::subexprs_for(e, visit::Descend::OwnScope)
+                .into_iter().skip(1).any(|v| borrowed(v, ctx, scope, symbols)),
+            ExprType::BoolOp(_) => visit::subexprs_for(e, visit::Descend::OwnScope)
+                .into_iter().any(|v| borrowed(v, ctx, scope, symbols)),
+            _ => false,
+        }
+    }
+    if let Some((values, generators)) = visit::comprehension_parts(expr) {
+        let scope = crate::comprehension_scope(generators, Some(ctx), options, symbols);
+        if values.into_iter().any(|value| borrowed(value, ctx, &scope, symbols)) {
+            // Position metadata only; the shared visitor above owns the
+            // enumeration of result expressions and nested generators.
+            let line = match expr {
+                ExprType::ListComp(c) => c.lineno,
+                ExprType::SetComp(c) => c.lineno,
+                ExprType::DictComp(c) => c.lineno,
+                ExprType::GeneratorExp(c) => c.lineno,
+                _ => None,
+            };
+            return Err(format!(
+                "comprehension output borrowing a mutable or undistinguished container (line {}) is not supported yet; \
+                 produce immutable values or explicit fresh container values instead; \
+                 rython refuses to lose sharing between the result and its source",
+                line.unwrap_or(0),
+            ).into());
+        }
+    }
+    Ok(())
+}
+
 /// List comprehension (e.g., [x ** 2 for x in range(10) if x % 2 == 0])
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ListComp {

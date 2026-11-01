@@ -60,6 +60,14 @@ including the empty `SyntaxError`/`IndentationError`/`TabError` display.
 The socket aliases preserve actual class identity: `socket.error` is OSError,
 while gaierror/herror remain distinct subclasses for construction and matching.
 
+Immediate `list(value for ...)` consumption reuses list-comprehension
+lowering, including filters, nested loops, typed results, and exception
+propagation. Comprehensions reject borrowed mutable container output
+places (names, fields, and indexed values), including nested stored values
+and mutable walrus results, where copying would lose sharing. Immutable
+outputs and fresh container literals keep their ordinary lowering. The
+shared bytes/bytearray type is also refused at this borrowing boundary.
+
 ### Prerequisites
 
 - **Rust**: 1.82+ (2024 edition)

@@ -492,6 +492,16 @@ bodies may raise (they run in `Result` contexts). Generator expressions
 are **materialized eagerly** and then iterated — laziness is not modeled
 (deviation, §12.3).
 
+An immediate `list(value for ...)` consumes its generator through the same
+lowering as a list comprehension (issue #506), preserving iteration order,
+filters, nested loops, returned values, and exception propagation.
+Comprehension results that read existing mutable containers by name,
+attribute, or index are refused: copying the iterable would detach those
+values from the source (issue #507). This includes nested stored values,
+conditional selections, and mutable walrus results; the shared
+bytes/bytearray representation is also refused at this borrowing boundary.
+Produce immutable values or explicit fresh container values instead.
+
 ### 4.5 Lambdas
 
 A lambda has two lowerings, decided by where it sits. In a position that
@@ -2923,6 +2933,7 @@ accepted as permanent spec:
 | An `async def main()` CALLED without `await` (both entry spellings: `if __name__ == "__main__": main()` and issue #431's bare module-level `main()`) is now a LOUD conversion error naming the construct and the rewrite (`asyncio.run(main())`, or make `main` a plain `def`). CPython only CREATES the coroutine there and never awaits it, so the body does not run; rython's entry machinery would have installed it as the process entry and RUN the body, printing output CPython never prints. Modelling a never-awaited coroutine (the `RuntimeWarning` and the discarded object) is not implemented, so the conversion refuses rather than silently running different code. `asyncio.run(main())` — the spelling that does run it — keeps converting (issue #455) | Correct-or-loud (was a silent divergence; found in the #431 work) |
 | The kernel device-manifest sub-mode skips the module-wide floating-point scan | Defect, issue #108 |
 | Generator expressions are materialized eagerly (side-effect timing differs from lazy CPython) | Model limit until generator lowering lands |
+| Immediate `list(... for ...)` construction reuses list-comprehension lowering. Comprehensions refuse borrowed mutable container outputs and mutable walrus results rather than silently detach them from their source; immutable values and fresh container literals remain supported (§4.4) | Correct-or-loud (issues #506, #507) |
 | `with` does not call `__enter__`/`__exit__` (Drop approximates cleanup) | Model limit; correct for the supported file objects |
 | `is`/`is not` on non-`None` operands lower to `==`/`!=` | Model limit (no identity model) |
 | `raise X from Y` folds the cause into the message; no `__cause__` | Model limit |

@@ -30148,6 +30148,56 @@ fn unbound_exception_reads_follow_every_shared_visitor_body() {
 }
 
 #[test]
+fn borrowed_mutable_comprehension_outputs_are_loud() {
+    // Verified against python3: these outputs share their inner list
+    // with source; mutating the output changes source too (issue #507).
+    for result in [
+        "[item for item in source]",
+        "list(item for item in source)",
+        "[(item, 0) for item in source]",
+        "[[item] for item in source]",
+        "[item if flag else [] for item in source]",
+        "[(saved := item) for item in source]",
+        "{str(index): item for index, item in enumerate(source)}",
+    ] {
+        let source = format!("def f(flag: bool) -> None:\n    source = [[1]]\n    result = {result}\n    print(source, result)\n");
+        let error = compile_err(&source, "borrowed_comprehension.py");
+        assert!(error.contains("comprehension output") && error.contains("line 3")
+            && error.contains("refuses to lose sharing"), "{error}");
+    }
+    // Verified against python3: saved.append(2) also updates result[0].
+    let error = compile_err(
+        "def f() -> None:\n    result = [(saved := [1]) for value in range(1)]\n    saved.append(2)\n    print(result)\n",
+        "mutable_walrus_comprehension.py",
+    );
+    assert!(error.contains("comprehension output") && error.contains("refuses to lose sharing"), "{error}");
+}
+
+#[test]
+fn immediate_list_generator_lowers_to_a_list() {
+    let output = compile(
+        "def main() -> None:\n    print(list(str(value) for value in [1]))\n",
+        "list_generator.py",
+    );
+    assert!(!output.contains("into_iter"), "the list factory must not receive an unsupported iterator: {output}");
+}
+
+#[test]
+fn list_generator_keeps_set_order_and_bigint_boundaries_loud() {
+    for (source, expected) in [
+        ("def f() -> None:\n    seen = {'a', 'b'}\n    print(list(value for value in seen))\n", "set"),
+        ("def f() -> None:\n    print(list(1180591620717411303424 for value in range(1)))\n", "arbitrary-precision"),
+    ] {
+        let error = compile_err(source, "list_generator_boundary.py");
+        assert!(error.contains(expected) && error.contains("refuses"), "{error}");
+    }
+    compile(
+        "def f() -> None:\n    print(list(str(1180591620717411303424) for value in range(1)))\n",
+        "list_generator_converted_integer.py",
+    );
+}
+
+#[test]
 fn exception_comprehension_targets_shadow_outer_bindings() {
     // Verified against python3: the comprehension reads its own bound
     // target even when f(False) leaves the outer error unbound.

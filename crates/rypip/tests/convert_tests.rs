@@ -78,6 +78,36 @@ fn default_exception_and_ordinary_class_display_keep_their_cpython_behavior() {
 }
 
 #[test]
+fn comprehension_fresh_and_immutable_outputs_match_cpython() {
+    let scratch = Scratch::new("comprehension-owned-output");
+    let file = scratch.path().join("app.py");
+    fs::write(&file, include_str!("fixtures/comprehension_owned_outputs.py")).unwrap();
+    let package = rypip::discover(&file).unwrap();
+    let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/app")).output().unwrap();
+    // Verified against python3.
+    assert_eq!(output.stdout, b"[[0, 9], [1], [2]]\n[[0], [1], [2]]\n[(0, '0'), (1, '1'), (2, '2')]\n['[1]', '[2]']\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn immediate_list_generator_consumption_matches_cpython() {
+    let scratch = Scratch::new("list-generator");
+    let file = scratch.path().join("app.py");
+    fs::write(&file, include_str!("../../../eval/idioms/programs/list_generator.py")).unwrap();
+    let package = rypip::discover(&file).unwrap();
+    let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/app")).output().unwrap();
+    // Verified against python3 (3.12 and 3.14); pin captured from stdout.
+    assert_eq!(output.stdout, include_bytes!("../../../eval/idioms/programs/list_generator.expected"));
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn builtin_exception_values_and_arguments_match_cpython() {
     for (name, source, expected) in [
         ("exception_values", include_str!("../../../eval/idioms/programs/exception_values.py"), include_bytes!("../../../eval/idioms/programs/exception_values.expected").as_slice()),

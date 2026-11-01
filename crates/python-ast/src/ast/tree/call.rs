@@ -5447,6 +5447,20 @@ impl<'a> CodeGen for Call {
                                 .to_string()
                                 .into());
                         }
+                        if let [ExprType::GeneratorExp(generator)] = self.args.as_slice() {
+                            // list consumes the whole generator immediately.
+                            // Reuse list-comprehension lowering, including
+                            // its container-boundary checks, rather than pass
+                            // an IntoIter to the sequence-only PyListFrom.
+                            return ExprType::ListComp(crate::ListComp {
+                                elt: generator.elt.clone(),
+                                generators: generator.generators.clone(),
+                                lineno: generator.lineno,
+                                col_offset: generator.col_offset,
+                                end_lineno: generator.end_lineno,
+                                end_col_offset: generator.end_col_offset,
+                            }).to_rust(ctx, options, symbols);
+                        }
                         // The iterable is consumed: a field or a name read
                         // again later takes the reuse-clone (`list(self.
                         // names)` in a `&self` method would move the field

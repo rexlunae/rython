@@ -131,7 +131,8 @@ a + b` works for ints, floats, strings, and lists; `for x in p` infers
 `IntoIterator` with element propagation; unannotated parameters either
 infer or fail loudly at conversion time),
 classes (struct-based), control flow including `try`/`except`/`finally` and
-loop `else`, comprehensions, f-strings and `str.format` on literal
+loop `else`, comprehensions (including immediate `list(... for ...)`
+consumption), f-strings and `str.format` on literal
 templates, keyword arguments and defaults for user functions (plus
 keyword `replace()` on the datetime family), the core builtins (`print`,
 `len`, `range`, `open`, `sorted`, `min`/`max`, `enumerate`,
@@ -159,6 +160,9 @@ per-thread bag of run-time attributes), `socket` (TCP/UDP
 over std::net with the CPython OSError hierarchy), `urllib.request`
 (`urlopen` for http/https, behind stdpython's opt-in `http-ureq`
 feature that `rypip` enables automatically), and more.
+
+Comprehension outputs that borrow existing mutable containers by name,
+attribute, or index are refused when value copies would lose sharing.
 
 `sys.exit(status)` raises a catchable `SystemExit`: `finally` runs before
 an uncaught exit ends the process. Integer return codes, `None`, booleans,
