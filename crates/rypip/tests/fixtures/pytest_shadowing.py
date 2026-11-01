@@ -9,5 +9,6 @@ def test_helper() -> None:
 def main() -> None:
     run(Runner())
     test_helper()
+    print(list(map(lambda pt: pt, [1, 2])))
 if __name__ == '__main__':
     main()

@@ -30636,6 +30636,10 @@ fn pytest_runner_execution_and_values_are_loud_conversion_errors() {
         "import pytest\npytest.cmdline.main()\n",
         "from pytest import cmdline as cli\ncli.main()\n",
         "import logging, pytest\nlogging.info(pytest.main())\n",
+        "from _pytest.config import main as run_tests\ndef main() -> None:\n    run_tests(['-q'])\nif __name__ == '__main__':\n    main()\n",
+        "import _pytest.config as config\nconfig.main()\n",
+        "import _pytest.config\n_pytest.config.main()\n",
+        "import logging, pytest\nlogging.info((lambda: pytest.main())())\n",
     ] {
         let error = compile_err(source, "pytest_runner.py");
         assert!(error.contains("pytest.main() test execution is not supported yet"), "{source}: {error}");
@@ -30659,6 +30663,8 @@ fn pytest_test_function_names_and_shadowed_runner_names_remain_ordinary_code() {
         "import pytest as pt\nclass Runner:\n    def main(self) -> None:\n        pass\ndef run(pt: Runner) -> None:\n    pt.main()\n",
         "from pytest import main as run_tests\ndef run(run_tests: int) -> int:\n    return run_tests\n",
         "import pytest\nif False:\n    pytest.main()\n",
+        "import pytest as pt\ndef main() -> None:\n    print(list(map(lambda pt: pt, [1, 2])))\n",
+        "from pytest import main as run_tests\ndef main() -> None:\n    print(list(map(lambda run_tests: run_tests, [1, 2])))\n",
     ] {
         compile_as_entry(source, "ordinary_runner.py");
     }
@@ -30670,6 +30676,8 @@ fn pytest_console_entry_is_the_same_unsupported_runner_boundary() {
         "import pytest\npytest.console_main()\n",
         "from pytest import console_main as run_tests\nrun_tests()\n",
         "import pytest\nraise SystemExit(pytest.console_main())\n",
+        "from _pytest.config import console_main as run_tests\nrun_tests()\n",
+        "import _pytest.config as config\nconfig.console_main()\n",
     ] {
         let error = compile_err(source, "pytest_console.py");
         assert!(error.contains("pytest.console_main() test execution is not supported yet"), "{source}: {error}");
@@ -30683,10 +30691,42 @@ fn pytest_module_values_cannot_hide_the_requested_runner() {
         "import pytest\npt = pytest\npt.main()\n",
         "import pytest\ngetattr(pytest, 'main')()\n",
         "from pytest import cmdline\ncli = cmdline\ncli.main()\n",
+        "import logging, pytest\nlogging.info(getattr([pytest][0], 'main')())\n",
+        "import logging, pytest\nlogging.info(getattr({'p': pytest}['p'], 'main')())\n",
+        "import logging, pytest\nlogging.info(getattr(pytest if True else None, 'main')())\n",
+        "import logging, pytest\nlogging.info([pytest][0].main())\n",
     ] {
         let error = compile_err(source, "pytest_module_value.py");
         assert!(error.contains("pytest module/cmdline values are not supported yet")
             || error.contains("pytest.main() test execution is not supported yet"), "{source}: {error}");
         assert!(error.contains("pytest_module_value.py:") && error.contains("python -m pytest"), "{error}");
     }
+}
+
+#[test]
+fn pytest_operand_preflight_respects_the_stack_budget() {
+    // The preflight must fail before a deep expression reaches ordinary
+    // lowering, even when the source has no pytest imports (#482 review).
+    let run = |terms| {
+        std::thread::Builder::new().stack_size(2 * 1024 * 1024).spawn(move || {
+            let mut statement = parse("1\n", "deep_operand.py").unwrap().raw.body.remove(0);
+            let python_ast::StatementType::Expr(expr) = &mut statement.statement else { unreachable!() };
+            let leaf = expr.value.clone();
+            for _ in 1..terms {
+                let left = std::mem::replace(&mut expr.value, leaf.clone());
+                expr.value = python_ast::ExprType::BinOp(python_ast::BinOp {
+                    left: Box::new(left),
+                    op: python_ast::BinOps::Add,
+                    right: Box::new(leaf.clone()),
+                });
+            }
+            python_ast::with_stack_budget(256 * 1024, || {
+                statement.to_rust(CodeGenContext::Module("deep_operand".into()),
+                    PythonOptions::default(), SymbolTableScopes::new())
+                    .map(|_| ()).map_err(|error| error.to_string())
+            })
+        }).unwrap().join().unwrap()
+    };
+    assert!(run(2000).unwrap_err().contains("nests too deeply"));
+    assert_eq!(run(3), Ok(()));
 }

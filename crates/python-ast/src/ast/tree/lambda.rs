@@ -40,6 +40,24 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Lambda {
 
 impl_node_with_positions!(Lambda { lineno, col_offset, end_lineno, end_col_offset });
 
+impl Lambda {
+    /// Parameters shadow imports even when Rust infers their types and no
+    /// type-map entry exists. Keep the same scope for preflight and lowering.
+    pub(crate) fn body_symbols(&self, mut symbols: SymbolTableScopes) -> SymbolTableScopes {
+        symbols.new_scope();
+        for parameter in self.args.posonlyargs.iter().chain(&self.args.args)
+            .chain(&self.args.kwonlyargs).chain(self.args.vararg.iter())
+            .chain(self.args.kwarg.iter())
+        {
+            symbols.insert(parameter.arg.clone(), crate::SymbolTableNode::Assign {
+                position: 0,
+                value: ExprType::Constant(crate::Constant(None)),
+            });
+        }
+        symbols
+    }
+}
+
 impl CodeGen for Lambda {
     type Context = CodeGenContext;
     type Options = PythonOptions;
@@ -64,6 +82,7 @@ impl CodeGen for Lambda {
         // lambda's local, never the enclosing statement's module name.
         let mut options = options;
         options.stmt_binds = None;
+        let symbols = self.body_symbols(symbols);
         let body = wrap_fallible_body(self.body.to_rust(ctx, options, symbols)?);
 
         Ok(quote! {

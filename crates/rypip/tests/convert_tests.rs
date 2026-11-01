@@ -24017,7 +24017,7 @@ fn pytest_function_only_module_stays_a_library() {
 fn pytest_named_tests_and_shadowed_runner_names_keep_native_behavior() {
     for (tag, source, expected) in [
         ("explicit-calls", include_str!("fixtures/pytest_explicit_calls.py"), "called test_add\ncaught test_sub\nafter tests\n"),
-        ("shadowing", include_str!("fixtures/pytest_shadowing.py"), "local main\ntest helper\n"),
+        ("shadowing", include_str!("fixtures/pytest_shadowing.py"), "local main\ntest helper\n[1, 2]\n"),
     ] {
         let scratch = Scratch::new(&format!("pytest-{tag}"));
         let file = scratch.path().join("app.py");
@@ -24047,6 +24047,9 @@ fn pytest_runner_requests_are_refused_in_single_files_and_packages() {
         "import pytest\nraise SystemExit(pytest.main())\n",
         "from pytest import cmdline as cli\nif __name__ == '__main__':\n    cli.main()\n",
         "from pytest import console_main as run_tests\nif __name__ == '__main__':\n    run_tests()\n",
+        "from _pytest.config import main as run_tests\ndef main() -> None:\n    run_tests(['-q'])\nif __name__ == '__main__':\n    main()\n",
+        "import _pytest.config as config\ndef main() -> None:\n    config.main()\nif __name__ == '__main__':\n    main()\n",
+        "from _pytest.config import console_main as run_tests\ndef main() -> None:\n    run_tests()\nif __name__ == '__main__':\n    main()\n",
     ] {
         let file = scratch.path().join("app.py");
         fs::write(&file, source).unwrap();
@@ -24074,6 +24077,8 @@ fn pytest_runner_requests_are_refused_in_single_files_and_packages() {
         "import pytest as pt\nif __name__ == '__main__':\n    pt.main()\n",
         "from pytest import main as run_tests\nif __name__ == '__main__':\n    run_tests()\n",
         "from .bridge import run_tests\nif __name__ == '__main__':\n    run_tests()\n",
+        "from . import bridge\ndef main() -> None:\n    bridge.run_tests()\nif __name__ == '__main__':\n    main()\n",
+        "from . import bridge as b\ndef main() -> None:\n    b.run_tests()\nif __name__ == '__main__':\n    main()\n",
         "import pytest\nif __name__ == '__main__':\n    pytest.cmdline.main()\n",
         "import pytest\nif __name__ == '__main__':\n    pytest.console_main()\n",
     ] {
@@ -24112,6 +24117,10 @@ fn pytest_module_value_aliases_are_refused_before_the_runner_is_lost() {
         "import pytest\npt = pytest\nif __name__ == '__main__':\n    pt.main()\n",
         "import pytest\nif __name__ == '__main__':\n    getattr(pytest, 'main')()\n",
         "from pytest import cmdline\ncli = cmdline\nif __name__ == '__main__':\n    cli.main()\n",
+        "import logging, pytest\ndef main() -> None:\n    logging.info(getattr([pytest][0], 'main')())\nif __name__ == '__main__':\n    main()\n",
+        "import logging, pytest\ndef main() -> None:\n    logging.info(getattr({'p': pytest}['p'], 'main')())\nif __name__ == '__main__':\n    main()\n",
+        "import logging, pytest\ndef main() -> None:\n    logging.info(getattr(pytest if True else None, 'main')())\nif __name__ == '__main__':\n    main()\n",
+        "import logging, pytest\ndef main() -> None:\n    logging.info((lambda: pytest.main())())\nif __name__ == '__main__':\n    main()\n",
     ] {
         let file = scratch.path().join("app.py");
         fs::write(&file, source).unwrap();

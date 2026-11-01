@@ -34,6 +34,24 @@ impl Member {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RunnerAttribute {
+    Skip,
+    SkipReason,
+    ExpectedFailure,
+}
+
+impl RunnerAttribute {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "__unittest_skip__" => Some(Self::Skip),
+            "__unittest_skip_why__" => Some(Self::SkipReason),
+            "__unittest_expecting_failure__" => Some(Self::ExpectedFailure),
+            _ => None,
+        }
+    }
+}
+
 /// A bare receiver can escape to code that observes or changes attribute
 /// presence. Direct attribute receivers are inspected by binding_flow;
 /// the one visitor enumerates every other expression child here.
@@ -66,6 +84,26 @@ impl ClassDef {
         self.base_chain_with_options(symbols, options)
             .iter()
             .any(|c| c.bases.iter().any(super::module::is_testcase_base))
+    }
+
+    pub(crate) fn refuse_manual_testcase_construction(
+        &self,
+        symbols: &SymbolTableScopes,
+        options: &PythonOptions,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.is_testcase(symbols, options) {
+            for ancestor in self.base_chain_with_options(symbols, options) {
+                if !ancestor.infer_fields(symbols, options)?.is_empty() {
+                    return Err(format!(
+                        "manual construction of TestCase `{}` with instance fields is not supported yet; \
+                         use unittest.main() so setUp runs before each test; \
+                         rython refuses to silently expose unassigned attribute defaults",
+                        self.name,
+                    ).into());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_testcase_fields(
@@ -114,6 +152,12 @@ impl ClassDef {
                 if matches!(stmt.statement, StatementType::AnnotatedName { .. }) {
                     return Flow::Continue; // A bare annotation binds no Python value.
                 }
+                if let Some(name) = visit::stmt_bound_names(stmt, visit::Bindings::Scope)
+                    .into_iter().find(|name| RunnerAttribute::from_name(name).is_some())
+                {
+                    conflict = Some((name, stmt.lineno.unwrap_or(0)));
+                    return Flow::Stop;
+                }
                 let method_definition = matches!(
                     stmt.statement,
                     StatementType::FunctionDef(_) | StatementType::AsyncFunctionDef(_)
@@ -131,6 +175,12 @@ impl ClassDef {
                 Flow::Continue
             });
             if let Some((name, line)) = conflict {
+                if RunnerAttribute::from_name(&name).is_some() {
+                    return Err(refuse(
+                        &format!("explicit runner attribute `{name}`"), line,
+                        "use unittest skip/skipIf/skipUnless/expectedFailure decorators without overriding their runner attributes",
+                    ));
+                }
                 return Err(refuse(
                     &format!(
                         "class member `{name}` shadows a method or is shadowed by an instance field"
