@@ -100,11 +100,17 @@ time (checklist questions 3 and 4).
   else about the emitted crate is what `rypip convert` emits now.
 - **`rypip jit`** (new subcommand), a thin CLI over `rython-jit`.
 
-The pieces `rypip run` already has are reused rather than rewritten: the
-host-triple detection (`host_triple()`), the quiet `cargo build --release`
-with artifact discovery from `--message-format=json-render-diagnostics`
-(`cargo_build_executable`), and the work-directory lock
-(`lock_work_dir`), which serializes concurrent builds of one cache entry.
+Some of what `rypip run` has is reused: the host-triple detection
+(`host_triple()`), the quiet `cargo build --release` invocation, and the
+work-directory lock (`lock_work_dir`), which serializes concurrent builds of
+one cache entry. Artifact discovery is **not** reusable as it stands:
+`cargo_build_executable` refuses a crate without a binary target
+(`require_binary`) and selects only `bin` artifacts. The JIT needs the
+library's path, so the artifact-message parsing (the
+`--message-format=json-render-diagnostics` stream) is factored out of it
+into a helper parameterized by target kind, and `cargo_build_executable`
+becomes its `bin` caller; the JIT calls it for `cdylib`. That refactor is
+part of M1.
 
 ### The parser needs a Python installation
 
@@ -189,7 +195,10 @@ it is never interpreted, approximated or run by another route.
 The honest test of "identical by construction" is to measure it. A new
 corpus runner, `eval/jit/run_jit.py`, runs every program in the idiom
 corpus (`eval/idioms/`) through both paths and requires byte-identical
-stdout, stderr and exit status. Its results are checked in as a baseline
+stdout, stderr and exit status. The corpus programs are whole programs with
+an entry point, not functions, so the gate runs them through
+`rypip jit run` (below), which executes a program's entry in-process; it
+cannot use `jit call`. Its results are checked in as a baseline
 and enforced in CI the way `eval/idioms/baseline.json` is: a program may
 not get worse, and the frontier is allowed to be red but not to retreat.
 The corpus includes programs that interleave host and compiled output, to
@@ -206,12 +215,22 @@ compiled.
 **CLI** (`rypip jit`):
 
 ```
+rypip jit run  FILE [ARG ...]            # whole program, in-process; exit status is the program's
 rypip jit call FILE FUNCTION [ARG ...]   # ARGs are Python literals; prints repr(result)
 rypip jit eval EXPRESSION [NAME=VALUE ...]   # from M3
 rypip jit --clear-cache
 ```
 
-`rypip run` stays as it is: it is the exec-based, whole-program path.
+`rypip jit run` is the whole-program path. In `cdylib` mode the converter
+emits a second shim, `ry_entry(argc, argv) -> status`, that runs what the
+binary's `main` runs (module initialization, then the `__main__` body), with
+`sys.argv` set from the arguments. It differs from the binary's `main` in
+one respect: it must not call `process::exit`, which would end the host. An
+uncaught exception prints the same traceback header and final line the
+binary prints and returns status 1, and a `SystemExit` returns its code, so
+the host reports both exactly as the binary's exit would. `rypip run` stays
+as it is: the exec-based, whole-program path that runs the program in its
+own process.
 
 **`eval`/`exec`** (M3). There is no ambient namespace to reach into: the
 converter has none, and it rejects fabricated interpreter namespaces. So
@@ -228,22 +247,25 @@ Each is independently mergeable, gated by tests that diff against
 
 - **M0, this document.** Goal 6 added, the two non-goals narrowed,
   `jit-eval.md` marked superseded. Docs only.
-- **M1, compile, cache, load, call.** `rython-jit` with scalar and `str`
-  arguments and results, exception mapping, the content-hash cache, and
-  `rypip jit call`. *Useful on its own:* a Rust program can call a Python
+- **M1, compile, cache, load, call, run.** `rython-jit` with scalar and
+  `str` arguments and results, exception mapping, the content-hash cache,
+  the artifact-discovery refactor, the `ry_entry` shim, and `rypip jit call`
+  and `rypip jit run`. *Useful on its own:* a Rust program can call a Python
   function it loads at runtime, and the CLI gives repeated runs of an
   unchanged file a cache hit. Gate: transcript tests against `python3` for
-  each marshalled type and each exception path, and a stdout-interleaving
-  test. Measure and record cold and warm latency here.
+  each marshalled type, each exception path and a whole-program run
+  (stdout, stderr, exit status), and a stdout-interleaving test. Measure and
+  record cold and warm latency here.
 - **M2, containers.** `list`, `tuple`, `dict`, `bytes` and nested values
   across the boundary. Gate: round-trip tests against `python3`.
 - **M3, `eval` and `exec`.** The explicit-namespace API and `rypip jit
   eval`. Gate: transcripts against `python3` for the supported subset, and
   `compile_err`-style tests for every refused reflective form.
 - **M4, the differential gate in CI.** `eval/jit/` with its checked-in
-  baseline and a CI job. (Developed alongside M1 and enforced from here; it
-  is listed on its own because it is the milestone that makes the claim
-  checkable.)
+  baseline and a CI job, driving `rypip jit run` over the idiom corpus. (It
+  needs M1's entry path, can be developed alongside it, and is enforced from
+  here; it is listed on its own because it is the milestone that makes the
+  claim checkable.)
 - **M5, opt-in `eval` in converted programs.** `rypip convert --jit` links
   `rython-jit` into the output and lowers `eval`/`exec` to the M3 API. Such
   a program needs Python and a Rust toolchain at runtime, and says so in its
