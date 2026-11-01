@@ -28,9 +28,13 @@ fn interpreter_namespace_access_is_rejected_before_building() {
     let scratch = Scratch::new("interpreter-namespaces");
     // Verified against python3: the issue #488 source prints True twice.
     // There is no static-runtime registry that could preserve those reads.
+    // Both namespace-deletion programs below print "deleted\n" under python3;
+    // conversion must refuse the deletion itself, without a guarded read later.
     for (name, source, construct) in [
         ("registry", "import sys\ndef main() -> None:\n    sys.modules['foo'] = sys\n    print('foo' in sys.modules)\n    print(len(sys.modules) > 0)\nif __name__ == '__main__':\n    main()\n", "sys.modules access"),
         ("registry_read", "import sys as system\nprint(len(system.modules))\n", "sys.modules access"),
+        ("registry_delete", "import sys\ndel sys.modules\nprint('deleted')\n", "sys.modules access"),
+        ("locals_delete", "import builtins\ndel builtins.locals\nprint('deleted')\n", "locals() namespace access"),
         ("local_store", "def f() -> None:\n    locals()['foo'] = 3\nf()\n", "locals() namespace access"),
     ] {
         let file = scratch.path().join(format!("{name}.py"));

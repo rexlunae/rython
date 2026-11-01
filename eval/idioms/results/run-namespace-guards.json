@@ -1,7 +1,7 @@
 {
-  "converter_commit": "db93041",
-  "repo_head": "db93041",
-  "rypip_path": "/home/tserica/rython-tmp/namespace-bin/rypip",
+  "converter_commit": "6655099",
+  "repo_head": "6655099",
+  "rypip_path": "/home/tserica/rython-tmp/namespace-delete-bin/rypip",
   "oracle": "CPython 3.14.4 (pins captured under 3.11)",
   "passed": 62,
   "total": 63,

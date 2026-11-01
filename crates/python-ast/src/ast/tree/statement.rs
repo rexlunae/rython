@@ -1366,6 +1366,7 @@ impl CodeGen for StatementType {
             StatementType::Delete(targets) => {
                 let mut stmts = Vec::new();
                 for target in targets {
+                    crate::ast::tree::interpreter_state::check_target(&target, &options, &symbols)?;
                     // `del tl.name` on a `threading.local()` object (issue
                     // #356): this thread's binding, or AttributeError.
                     if let ExprType::Attribute(t) = &target

@@ -4711,6 +4711,8 @@ fn compile_err(src: &str, name: &str) -> String {
 
 #[test]
 fn interpreter_namespaces_are_refused_instead_of_fabricated_or_ignored() {
+    // Verified against python3: deleting sys.modules or builtins.locals
+    // removes the attribute (hasattr returns False), so dropping del is wrong.
     for statement in [
         "print(sys.modules)",
         "print(len(sys.modules))",
@@ -4723,6 +4725,7 @@ fn interpreter_namespaces_are_refused_instead_of_fabricated_or_ignored() {
         "sys.modules['foo'] = sys",
         "sys.modules = {}",
         "sys.modules['foo'] += 1",
+        "del sys.modules",
         "del sys.modules['foo']",
         "registry = sys.modules",
     ] {
@@ -4736,6 +4739,7 @@ fn interpreter_namespaces_are_refused_instead_of_fabricated_or_ignored() {
         "import sys as system\nprint(system.modules)\n",
         "import os, sys as system\nsystem.modules['foo'] = 1\n",
         "from sys import modules as registry\nprint(registry)\n",
+        "import sys as system\ndel system.modules\n",
     ] {
         let err = compile_err(source, "registry_alias.py");
         assert!(err.contains("sys.modules access is not supported yet"), "{err}");
@@ -4748,6 +4752,8 @@ fn interpreter_namespaces_are_refused_instead_of_fabricated_or_ignored() {
     for source in [
         "import builtins as b\nprint(b.locals())\n",
         "from builtins import locals as scope\nprint(scope())\n",
+        "import builtins\ndel builtins.locals\n",
+        "import builtins as b\ndel b.locals\n",
     ] {
         let err = compile_err(source, "frame_alias.py");
         assert!(err.contains("locals() namespace access is not supported yet"), "{err}");
