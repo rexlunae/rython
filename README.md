@@ -76,9 +76,10 @@ and [`rypip install`](examples/05-rypip-install) turning a
 - [Testing under rython](docs/testing-under-rython.md) — what works today
   for running a Python library's test suite, the exact code sites, and a
   phased plan toward pytest/unittest (issue #334)
-- [Evaluating a JIT](docs/jit-eval.md) — how a JIT measures against the
-  prime directive and the non-goals, and what a first milestone must prove
-  (issue #166)
+- [The JIT](docs/jit.md) — the design for on-demand compilation: convert,
+  build with `rustc`, cache, load in-process (issue #166)
+- [Evaluating a JIT](docs/jit-eval.md) — the earlier evaluation, superseded
+  by the design above and kept for the objections it had to answer
 
 ## Crates
 

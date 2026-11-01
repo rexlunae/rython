@@ -151,10 +151,13 @@ return `Result<T, PyException>` and `?` propagates to the nearest handler.
 
 ### No runtime dynamism
 
-`eval`, `exec`, `compile`, dynamic imports, `globals()`/`locals()` as
-writable dicts, monkey-patching, metaclasses: none of these exist in
-Rython, permanently. Everything a program does is resolved at conversion
-time. Some of CPython's *conversion-time-decidable* dynamism is kept by
+Dynamic imports, `globals()`/`locals()` as writable dicts,
+monkey-patching, metaclasses: none of these exist in Rython,
+permanently. `eval`, `exec` and `compile` do not exist in converted
+output either; the planned [JIT](jit.md) is the one route to evaluating
+source at runtime, and it compiles that source through the same
+conversion instead of interpreting it. Everything a converted program does
+is resolved at conversion time. Some of CPython's *conversion-time-decidable* dynamism is kept by
 evaluating it during conversion instead: `argparse` parser construction
 from literal specs, `functools.partial` over statically known functions,
 f-string and `str.format` templates that are literals.

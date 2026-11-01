@@ -128,7 +128,9 @@ message text, ordering, and float formatting.
   and the `PyValue` boundary (issue #335)
 - [`docs/testing-under-rython.md`](docs/testing-under-rython.md) — running
   Python test suites under rython (issue #334)
-- [`docs/jit-eval.md`](docs/jit-eval.md) — the JIT evaluation (issue #166)
+- [`docs/jit.md`](docs/jit.md) — the JIT design and milestones (issue #166)
+- [`docs/jit-eval.md`](docs/jit-eval.md) — the earlier JIT evaluation,
+  superseded by `jit.md`
 - [`docs/cpython-suite-status.md`](docs/cpython-suite-status.md) — per-file
   status of the 17 CPython stdlib test files under conversion
 

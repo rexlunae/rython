@@ -23,7 +23,10 @@ syntax: every Rython program is a valid Python program, parsed by Python's
 own grammar. The Rython toolchain translates that program into Rust source
 code that depends on one runtime crate (`stdpython`), and `cargo` compiles
 it into a native binary or library. There is no interpreter, no bytecode,
-no GIL, and no Python installation at runtime.
+no GIL, and no Python installation at runtime. (That describes converted
+output. The optional [JIT](jit.md) is a separate tool that runs the same
+conversion on demand, so it needs Python to parse and a Rust toolchain to
+compile; output only acquires that need by explicit opt-in.)
 
 The name covers both the language subset and the toolchain that enforces
 it:
@@ -100,20 +103,39 @@ comes from the model. Where CPython's semantics force a cost
 exact float formatting), Rython pays it, because correctness outranks
 speed.
 
+### 6. On-demand compilation: a JIT
+
+Python is also used where there is no build step: a command line, a
+script that is edited and re-run, a program that is handed source at
+runtime. Rython serves that by compiling **when asked** instead of
+interpreting: the JIT ([`jit.md`](jit.md), issue #166) runs the same
+conversion, builds the result into a shared library with `rustc`, caches it
+by content, and loads it into the running process. Because the code that
+runs is the code the ahead-of-time pipeline would have produced, there is
+one execution model and one conformance surface, and anything the converter
+refuses the JIT refuses too. It is `std`-tier only, and it never changes
+what converted output contains.
+
 ## Non-goals
 
 Naming these is as load-bearing as the goals; each one has been
 deliberately rejected, not merely postponed.
 
 - **Full Python compatibility.** Rython will never run arbitrary PyPI
-  code. `eval`/`exec`, metaclasses, monkey-patching, dynamic imports,
-  `globals()` mutation — the reflective machinery that makes Python
-  Python-the-dynamic-language — is out of scope permanently, because it
-  requires an interpreter at runtime, and "no interpreter at runtime" is
-  the point.
-- **Being a faster Python runtime.** Rython is not a JIT, not a tracing
-  optimizer, and not a drop-in `python3` replacement. Projects that need
-  all of Python, faster, should look at PyPy or CPython's own JIT work.
+  code. Metaclasses, monkey-patching, dynamic imports, `globals()`
+  mutation — the reflective machinery that makes Python
+  Python-the-dynamic-language — is out of scope permanently, because the
+  converter cannot express it and Rython will not grow an interpreter to
+  paper over that. `eval`/`exec` are out of scope *in converted output*;
+  the [JIT](jit.md) is the one route to evaluating source at runtime, and
+  it compiles that source through the same conversion, so it accepts
+  exactly the subset and refuses exactly what `rypip convert` refuses.
+- **Being a faster Python runtime.** Rython is not a tracing or
+  speculating optimizer, has no interpreter tier, and is not a drop-in
+  `python3` replacement. The JIT removes the separate build step; it does
+  not make Python code run faster than the ahead-of-time pipeline would.
+  Projects that need all of Python, faster, should look at PyPy or
+  CPython's own JIT work.
 - **Approximate semantics.** There is no "close enough" mode. A construct
   whose CPython behavior cannot be reproduced exactly is a conversion
   error, never a best-effort translation. This includes cases where the
@@ -307,8 +329,10 @@ The decision test for every such insertion (extending the P1 checklist):
 Prefer a static core + a small value-shaped dynamic seam every time;
 reach for boxed dynamism (`PyValue`, a runtime interpreter slice) only
 when the dynamic surface is genuinely open-ended (heterogeneous
-containers, callables, `eval`), and even then gate it behind an explicit
-opt-in (#334 — the callables model — is the roadmap for those).
+containers, callables), and even then gate it behind an explicit
+opt-in (#334 — the callables model — is the roadmap for those). `eval` is
+not boxed dynamism at all: it goes through the [JIT](jit.md), which
+compiles the evaluated source rather than interpreting it.
 
 ## Future directions
 
@@ -363,7 +387,9 @@ agent) weighing an addition:
    tiers that can't support it?
 4. Does it keep working under the kernel and `no_std` targets' rules, or
    is it correctly rejected there?
-5. Is there an end-to-end test that diffs against `python3`?
+5. Is there an end-to-end test that diffs against `python3`? (A feature
+   reachable through the [JIT](jit.md) also runs its transcript through
+   the JIT path; the differential gate keeps the two identical.)
 6. Does it keep a static core and thread the dynamic part as a typed seam
    (P9), instead of defaulting the construct to boxed dynamism?
 
