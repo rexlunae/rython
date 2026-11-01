@@ -13300,6 +13300,27 @@ pub(crate) fn module_name_shadowed(name: &str, symbols: &SymbolTableScopes) -> b
 /// copy (rython's value-semantics ledger divergence, exactly as ordinary
 /// call arguments behave). Returns Ok(None) when the call is not a
 /// threading.Thread construction.
+/// The `__name__` a `threading.Thread(target=<name>)` thread is named after,
+/// resolved from how `name` is bound; a binding that is not a plain function
+/// is refused (see the call site).
+fn resolve_thread_target_name(
+    name: &str,
+    symbols: &SymbolTableScopes,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match symbols.get(name) {
+        Some(SymbolTableNode::FunctionDef(f)) => Ok(f.name.clone()),
+        Some(SymbolTableNode::ImportFrom(ifm)) => Ok(ifm.defining_name(name)),
+        Some(SymbolTableNode::Alias(canonical)) => Ok(canonical.clone()),
+        Some(SymbolTableNode::Assign { .. }) => Err(format!(
+            "threading.Thread(target={name}): `{name}` is bound by an assignment, so it is a \
+             callable value whose failure the thread body would silently discard and whose \
+             name the thread would report wrongly; pass the function's own name \
+             (`target=<def name>`); rython refuses to silently drop a worker's exception"
+        ).into()),
+        _ => Ok(name.to_string()),
+    }
+}
+
 fn lower_threading_thread(
     call: &Call,
     ctx: &CodeGenContext,
@@ -13409,6 +13430,13 @@ fn lower_threading_thread(
         );
     };
     let target_expr = ExprType::Name(crate::ast::tree::name::Name { id: target.clone() });
+    // The thread's default name is `Thread-N (<target.__name__>)`, the
+    // DEFINING function's name, not the spelling used here (`from .job
+    // import work as do_work` names the thread `work`). A name bound by an
+    // assignment (`t = fail`) is a callable VALUE: its call has no `?` in
+    // the synthesized body, so a failing worker would be reported as
+    // successful. Both are decided from the symbol table, not the spelling.
+    let target_name = resolve_thread_target_name(&target, symbols)?;
     if callee_value_signature(&target_expr, ctx, options, symbols).is_some()
         || options.name_types.contains_key(&target)
         || options.local_types.contains_key(&target)
@@ -13444,7 +13472,7 @@ fn lower_threading_thread(
         keywords: Vec::new(),
     };
     let body = inner.to_rust(ctx.clone(), body_options, symbols.clone())?;
-    let target_name = target.as_str();
+    let target_name = target_name.as_str();
     // Keep the imported spelling in use (Worker::new / th::Thread::new)
     // rather than leaving a now-unused alias in the generated module.
     let thread_class = match call.func.as_ref() {

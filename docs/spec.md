@@ -2601,7 +2601,18 @@ assignment evaluates `args` once at construction, then stores the handle;
 `start` alone runs the target. A thread field must be initialized by an
 unconditional top-level assignment in `__init__` before it is read or
 `self` escapes/is called. Fields read by constructor arguments also need
-preceding unconditional stores. Conditional/missing initialization, an early
+preceding unconditional stores: this holds for EVERY Thread constructor in
+the class, in `__init__` after the first thread store and in any other
+method, where the field must be one `__init__` unconditionally assigns (or
+a class member); otherwise the struct default would be captured where
+CPython raises AttributeError (issue #516). The thread's default name is
+`Thread-N (<target.__name__>)` with the DEFINING function's name, so `from
+.job import work as do_work` names it `work` (issue #514), and a `target=`
+bound by an assignment is a callable value and a conversion error (issue
+#515). Reading an attribute of another class's instance before it is
+assigned (`self.runner.worker` ahead of `self.runner = Runner()`) is the
+general absent-attribute divergence of §12.3, not specific to threads
+(issue #517). Conditional/missing initialization, an early
 constructor return, and deletion are conversion errors; initialize the
 field first and keep it present. Inherited thread fields are currently
 refused (use composition instead). Calls through `super()` before the
@@ -2965,6 +2976,7 @@ accepted as permanent spec:
 
 | Divergence | Status |
 |---|---|
+| Reading an instance attribute before its first assignment (`print(self.x)` ahead of `self.x = 1`, or `self.inner.n` ahead of `self.inner = Inner()`) yields the struct's default value (`0`, `''`, a default instance) where CPython raises `AttributeError`. Thread fields, TestCase fields and Thread constructor arguments are guarded (they refuse the shape loudly); every other class field is not | Open defect (issue #517) |
 | `deque.index(x)` lowers through the shared list-ops arm and raises `ValueError: deque.index(x): x not in deque` (the 3.14 wording the list arm pinned), where CPython 3.12/3.13 say `9 is not in deque` — the wording `deque.remove` and the inherent `deque::index(x, start, stop)` already use. The exception TYPE agrees | Documented version choice, pinned in `python_semantics.rs`; the list arm's wording is the project-wide pin |
 | `unicodedata` answers from the Unicode 16.0.0 database — CPython 3.14's `unidata_version` — for every CPython: an older CPython carries an older database (3.12: 15.0.0, 3.13: 15.1.0), so a code point assigned or re-classified since answers differently there (`category`, `bidirectional`, `combining`, `name`, `normalize`). Code points assigned before 15.0 agree | Model limit (issue #334); a per-CPython database would need one table set per version |
 | Unpacking's ValueError text is CPython 3.11–3.13's: `too many values to unpack (expected 2)`. CPython 3.14 appends the length for a sized sequence (`(expected 2, got 3)` for a tuple, list or dict; not for a str). `not enough values to unpack (expected 2, got 1)` and `cannot unpack non-iterable int object` agree across versions | Model limit; one message set, pinned to the 3.11 transcripts |

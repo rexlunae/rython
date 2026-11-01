@@ -3085,6 +3085,95 @@ impl ClassDef {
     /// definite top-level store before a read (including indirect reads via
     /// a method call or an escaping `self`). Conditional stores cannot prove
     /// initialization. This deliberately rejects rather than inventing None.
+    /// A `threading.Thread(args=...)` constructor binds its arguments when
+    /// it runs, so a `self.attr` argument must already exist then. The
+    /// struct model default-initializes every field, so an argument read
+    /// before the attribute's first assignment would capture that default
+    /// where CPython raises AttributeError (issue #516). An argument is
+    /// accepted when its attribute is a class member, or is stored by an
+    /// unconditional top-level statement of `__init__` that precedes the
+    /// constructor (in `__init__`) or exists at all (in any other method,
+    /// which only runs after `__init__`). Anything else is refused.
+    fn validate_thread_constructor_arguments(
+        &self,
+        symbols: &SymbolTableScopes,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut class_members: std::collections::BTreeSet<String> =
+            self.methods().map(|m| m.name.clone()).collect();
+        for stmt in &self.body {
+            class_members.extend(visit::stmt_bound_names(stmt, visit::Bindings::Scope));
+        }
+        let init_stores = |upto: usize| -> std::collections::BTreeSet<String> {
+            let mut out = std::collections::BTreeSet::new();
+            if let Some(init) = self.init_method() {
+                for stmt in init.body.iter().take(upto) {
+                    if let StatementType::Assign(a) = &stmt.statement {
+                        for target in &a.targets {
+                            if let ExprType::Attribute(attr) = target
+                                && visit::is_self(&attr.value)
+                            {
+                                out.insert(attr.attr.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let after_init = init_stores(usize::MAX);
+        let check = |stmts: &[Statement],
+                     known: &std::collections::BTreeSet<String>|
+         -> Result<(), Box<dyn std::error::Error>> {
+            let mut failure: Option<(String, usize)> = None;
+            visit::walk_stmts(stmts, Descend::SkipDefs, &mut |stmt| {
+                for e in visit::stmt_exprs(stmt) {
+                    visit::walk_expr(e, &mut |x| {
+                        let ExprType::Call(c) = x else { return };
+                        if crate::ThreadingType::constructor(&c.func, symbols)
+                            != Some(crate::ThreadingType::Thread)
+                        {
+                            return;
+                        }
+                        for kw in &c.keywords {
+                            visit::walk_expr(&kw.value, &mut |arg| {
+                                if let ExprType::Attribute(a) = arg
+                                    && visit::is_self(&a.value)
+                                    && !known.contains(&a.attr)
+                                    && !class_members.contains(&a.attr)
+                                    && failure.is_none()
+                                {
+                                    failure = Some((a.attr.clone(), stmt.lineno.unwrap_or(0)));
+                                }
+                            });
+                        }
+                    });
+                }
+                if failure.is_some() { Flow::Stop } else { Flow::Continue }
+            });
+            match failure {
+                None => Ok(()),
+                Some((attr, line)) => Err(format!(
+                    "threading.Thread(...) in class `{}` (line {line}) reads `self.{attr}` \
+                     before it is definitely assigned; CPython raises AttributeError there, \
+                     and the generated struct would capture a default value instead; \
+                     assign `self.{attr}` unconditionally in __init__ before the Thread is \
+                     built; rython refuses to silently bind an absent attribute",
+                    self.name,
+                ).into()),
+            }
+        };
+        for method in self.methods() {
+            if method.name == "__init__" {
+                for (i, stmt) in method.body.iter().enumerate() {
+                    check(std::slice::from_ref(stmt), &init_stores(i))?;
+                }
+            } else {
+                check(&method.body, &after_init)?;
+            }
+        }
+        Ok(())
+    }
+
     fn validate_thread_field_initialization(
         &self,
         fields: &[(String, crate::TypeInfo)],
@@ -4427,6 +4516,7 @@ StatementType::Assign(a)
         // embedded base struct).
         let fields = self.own_fields(&symbols, &options)?;
         self.validate_thread_field_initialization(&fields, &symbols, &options)?;
+        self.validate_thread_constructor_arguments(&symbols)?;
         self.validate_testcase_fields(&symbols, &options)?;
 
         // The embedded base struct occupies `__rython_base`; a user field of

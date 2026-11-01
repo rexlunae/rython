@@ -8127,6 +8127,85 @@ fn thread_instance_fields_match_python_at_runtime() {
 }
 
 #[test]
+fn a_thread_is_named_after_its_defining_function_and_binds_defined_arguments() {
+    // Issue #514: `Thread-N (<target.__name__>)` uses the DEFINING function's
+    // name, not the spelling of `target=`; `from .job import work as do_work`
+    // names the thread `work`. Issue #516's accepted shape: arguments stored
+    // earlier in __init__, and a field __init__ assigns read from another
+    // method, bind exactly what CPython binds.
+    //
+    // Verified against python3 (3.14.4): `python3 -m pkg.cli` prints
+    // `Thread-1 (work)`, then `x 2` and `y 7`.
+    let scratch = Scratch::new("threadnames");
+    let krate = package_crate(
+        &scratch,
+        "threadnames",
+        &[
+            (
+                "job.py",
+                concat!(
+                    "import threading\n",
+                    "\n",
+                    "\n",
+                    "def work() -> None:\n",
+                    "    print(threading.current_thread().name)\n",
+                ),
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "import threading\n",
+                    "from .job import work as do_work\n",
+                    "\n",
+                    "\n",
+                    "def show(label: str, n: int) -> None:\n",
+                    "    print(label, n)\n",
+                    "\n",
+                    "\n",
+                    "class Runner:\n",
+                    "    def __init__(self) -> None:\n",
+                    "        self.worker = threading.Thread(target=do_work)\n",
+                    "\n",
+                    "    def go(self) -> None:\n",
+                    "        self.worker.start()\n",
+                    "        self.worker.join()\n",
+                    "\n",
+                    "\n",
+                    "class Printer:\n",
+                    "    def __init__(self) -> None:\n",
+                    "        self.label = \"x\"\n",
+                    "        self.worker = threading.Thread(target=show, args=(self.label, 2))\n",
+                    "        self.later = \"y\"\n",
+                    "\n",
+                    "    def rebuild(self) -> None:\n",
+                    "        self.worker = threading.Thread(target=show, args=(self.later, 7))\n",
+                    "\n",
+                    "    def go(self) -> None:\n",
+                    "        self.worker.start()\n",
+                    "        self.worker.join()\n",
+                    "        self.rebuild()\n",
+                    "        self.worker.start()\n",
+                    "        self.worker.join()\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    Runner().go()\n",
+                    "    Printer().go()\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    assert_eq!(
+        run_package(&krate, "threadnames"),
+        vec!["Thread-1 (work)", "x 2", "y 7"]
+    );
+}
+
+#[test]
 fn threading_semantics_match_python_at_runtime() {
     // Thread lifecycle (start/join/is_alive), with-lock, RLock reentrancy,
     // Event, Semaphore, active_count — sequenced by join() so the output

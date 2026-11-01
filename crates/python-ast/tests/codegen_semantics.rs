@@ -13749,6 +13749,44 @@ fn thread_instance_fields_refuse_inherited_storage() {
 }
 
 #[test]
+fn thread_targets_and_constructor_arguments_refuse_silent_defaults() {
+    // Issue #515: a target bound by an assignment is a callable VALUE; its
+    // call in the synthesized body has no `?`, so a failing worker would be
+    // reported as successful.
+    let error = compile_err(
+        "import threading\ndef fail() -> None:\n    raise ValueError('x')\nclass Runner:\n    def __init__(self) -> None:\n        target = fail\n        self.worker = threading.Thread(target=target)\n",
+        "thread_local_alias.py",
+    );
+    assert!(error.contains("bound by an assignment") && error.contains("refuses"), "{error}");
+    // Issue #516: an argument read before the attribute's first assignment
+    // would capture the struct default where CPython raises AttributeError:
+    // in __init__ after the thread slot is filled, in a later method, and
+    // after a conditional store.
+    for (shape, source) in [
+        ("init", "        self.worker = threading.Thread(target=work, args=('u',))\n        self.worker = threading.Thread(target=work, args=(self.label,))\n        self.label = 'late'\n"),
+        ("conditional", "        self.worker = threading.Thread(target=work, args=('u',))\n        if flag:\n            self.label = 'set'\n        self.worker = threading.Thread(target=work, args=(self.label,))\n"),
+    ] {
+        let error = compile_err(
+            &format!("import threading\ndef work(label: str) -> None:\n    pass\nclass Runner:\n    def __init__(self, flag: bool) -> None:\n{source}"),
+            "thread_absent_argument.py",
+        );
+        assert!(error.contains("reads `self.label` before it is definitely assigned") && error.contains("refuses"), "{shape}: {error}");
+    }
+    let error = compile_err(
+        "import threading\ndef work(label: str) -> None:\n    pass\nclass Runner:\n    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work, args=('u',))\n    def configure(self) -> None:\n        self.worker = threading.Thread(target=work, args=(self.label,))\n        self.label = 'late'\n",
+        "thread_absent_argument_method.py",
+    );
+    assert!(error.contains("reads `self.label` before it is definitely assigned"), "{error}");
+    // The accepted shape: arguments stored earlier in __init__, and a field
+    // that __init__ assigns (later) read from another method.
+    let (out, _warnings) = compile_with_warnings(
+        "import threading\ndef work(label: str, n: int) -> None:\n    print(label, n)\nclass Runner:\n    def __init__(self) -> None:\n        self.label = 'x'\n        self.worker = threading.Thread(target=work, args=(self.label, 2))\n        self.later = 'y'\n    def rebuild(self) -> None:\n        self.worker = threading.Thread(target=work, args=(self.later, 7))\n",
+        "thread_defined_arguments.py",
+    );
+    assert!(out.contains("Thread :: new"), "{out}");
+}
+
+#[test]
 fn thread_instance_fields_refuse_unsupported_methods_and_targets() {
     for method in ["join(0.1)", "join(timeout=0.1)", "run()", "start(1)"] {
         let source = format!("import threading\ndef work() -> None:\n    pass\nclass Runner:\n    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work)\n    def go(self) -> None:\n        self.worker.{method}\n");
