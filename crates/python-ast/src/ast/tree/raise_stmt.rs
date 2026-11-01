@@ -427,6 +427,17 @@ fn exception_value(
     options: PythonOptions,
     symbols: SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    if crate::ast::tree::system_exit::ExitCall::of(exc, &options, &symbols)
+        == Some(crate::ast::tree::system_exit::ExitCall::Constructor)
+    {
+        return Ok(quote!(stdpython::PyException::system_exit(vec![])));
+    }
+    if let ExprType::Call(call) = exc
+        && crate::ast::tree::system_exit::ExitCall::of(&call.func, &options, &symbols)
+            == Some(crate::ast::tree::system_exit::ExitCall::Constructor)
+    {
+        return Ok(crate::ast::tree::system_exit::lower(call, &ctx, &options, &symbols)?.expect("resolved constructor"));
+    }
     // A runtime-ambiguous alias (`try: R = Root / except: R = Exception`)
     // names no one class: loud (Devin review on #330).
     let alias_name = match exc {

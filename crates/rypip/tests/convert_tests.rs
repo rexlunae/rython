@@ -24,6 +24,62 @@ fn build_generated(root: &Path) -> std::process::ExitStatus {
 }
 
 #[test]
+#[cfg(unix)]
+fn system_exit_preserves_status_handlers_and_cleanup() {
+    let scratch = Scratch::new("system-exit");
+    let file = scratch.path().join("app.py");
+    fs::write(&file, include_str!("fixtures/system_exit.py")).unwrap();
+    let package = rypip::discover(&file).unwrap();
+    let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    let build = Command::new("cargo").arg("build").env_remove("RUSTFLAGS").current_dir(&krate.root).output().unwrap();
+    let diagnostics = String::from_utf8_lossy(&build.stderr);
+    assert!(build.status.success(), "{diagnostics}");
+    assert!(!diagnostics.contains("--> src/"), "generated crate must be warning-clean: {diagnostics}");
+    // Verified against python3: stdout, stderr, and POSIX process status.
+    for (kind, status, stdout, stderr) in [
+        ("plain", 3, "kind plain\n", ""),
+        ("zero", 0, "kind zero\n", ""),
+        ("wrap", 0, "kind wrap\n", ""),
+        ("negative", 255, "kind negative\n", ""),
+        ("max", 255, "kind max\n", ""),
+        ("none", 0, "kind none\n", ""),
+        ("null", 0, "kind null\n", ""),
+        ("true", 1, "kind true\n", ""),
+        ("false", 0, "kind false\n", ""),
+        ("text", 1, "kind text\npartial", "bad input\n"),
+        ("float", 1, "kind float\n", "1.25\n"),
+        ("bytes", 1, "kind bytes\n", "b'bye'\n"),
+        ("tuple", 1, "kind tuple\n", "('bad', 3, None)\n"),
+        ("cleanup", 7, "kind cleanup\ncleanup\n", ""),
+        ("caught", 0, "kind caught\ncaught 7 SystemExit(7) 7\nafter\n", ""),
+        ("override", 0, "kind override\nreplaced replaced\n", ""),
+        ("return", 9, "kind return\n", ""),
+        ("reraise", 4, "kind reraise\nhandler\ncleanup\n", ""),
+        ("constructed", 5, "kind constructed\n5 SystemExit(5) 5\n", ""),
+        ("bare", 0, "kind bare\n", ""),
+        ("multi", 1, "kind multi\n", "('a', 2)\n"),
+        ("call_none", 0, "kind call_none\nno result\n", ""),
+        ("option_none", 0, "kind option_none\n", ""),
+        ("option_some", 4, "kind option_some\n", ""),
+        ("alias", 6, "kind alias\n", ""),
+    ] {
+        let output = Command::new(krate.root.join("target/debug/app")).arg(kind).output().unwrap();
+        assert_eq!(output.status.code(), Some(status), "{kind}");
+        assert_eq!(output.stdout, stdout.as_bytes(), "{kind}");
+        assert_eq!(output.stderr, stderr.as_bytes(), "{kind}");
+    }
+    // Verified against python3 with stderr redirected to stdout: shutdown
+    // flushes the partial stdout line before printing the exit message.
+    let (mut reader, writer) = std::io::pipe().unwrap();
+    let mut child = Command::new(krate.root.join("target/debug/app")).arg("text")
+        .stdout(writer.try_clone().unwrap()).stderr(writer).spawn().unwrap();
+    let mut combined = String::new();
+    std::io::Read::read_to_string(&mut reader, &mut combined).unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(1));
+    assert_eq!(combined, "kind text\npartialbad input\n");
+}
+
+#[test]
 fn interpreter_namespace_access_is_rejected_before_building() {
     let scratch = Scratch::new("interpreter-namespaces");
     // Verified against python3: the issue #488 source prints True twice.

@@ -55,6 +55,7 @@ use core::hash::Hash;
 
 mod py_integer;
 pub use py_integer::PyInteger;
+mod system_exit;
 
 /// f64 math used by core Python semantics (`//`, `**`, round(), float
 /// repr). The inherent f64 methods live in std, not core, so without std
@@ -8435,6 +8436,9 @@ impl PyException {
 #[cfg(feature = "pyo3-interop")]
 impl From<PyException> for pyo3::PyErr {
     fn from(e: PyException) -> pyo3::PyErr {
+        if let Some(error) = e.system_exit_pyerr() {
+            return error;
+        }
         let msg = e.message.clone();
         // One parse into the built-in exception enum (see
         // builtin_exceptions): every built-in type raises its real Python
@@ -8469,6 +8473,19 @@ impl PyException {
 pub fn exit_uncaught(e: &PyException) -> ! {
     use std::io::Write;
     let _ = std::io::stdout().flush();
+    match e.system_exit_status() {
+        Ok(Some((status, message))) => {
+            if let Some(message) = message {
+                let _ = writeln!(std::io::stderr(), "{}", message);
+            }
+            std::process::exit(status);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("rython: an uncaught SystemExit has no recorded code: {}", error);
+            std::process::exit(1);
+        }
+    }
     eprintln!("Traceback (most recent call last):");
     eprintln!("{}", e.format_exception_only());
     std::process::exit(1);

@@ -40,6 +40,7 @@ const ISINSTANCE_TARGET_NAMES: &[&str] = &[
 /// module whose surface is an enum that knows (unicodedata).
 fn stdlib_fn_fallible(root: &str, fname: &str) -> bool {
     FALLIBLE_STDLIB_FN.contains(&fname)
+        || crate::ast::tree::system_exit::ExitCall::runtime_function(root, fname)
         || (crate::StdModule::from_name(root) == Some(crate::StdModule::Unicodedata)
             && crate::ast::tree::std_module::UnicodedataItem::from_name(fname)
                 .is_some_and(|item| item.is_fallible_fn()))
@@ -2533,6 +2534,13 @@ impl<'a> CodeGen for Call {
             return Err(namespace.refusal().into());
         }
         crate::ast::tree::interpreter_state::check_target(&self.func, &options, &symbols)?;
+        if let Some(tokens) = crate::ast::tree::system_exit::lower(&self, &ctx, &options, &symbols)? {
+            return Ok(tokens);
+        }
+        crate::ast::tree::system_exit::check_mutation(&self.func, &options, &symbols)?;
+        for value in self.args.iter().chain(self.keywords.iter().map(|keyword| &keyword.value)) {
+            crate::ast::tree::system_exit::reject_function_value(value, &options, &symbols)?;
+        }
         if crate::ast::tree::big_integer::is_integer_limit_call(&self, &options, &symbols) {
             return Err("sys integer decimal-conversion limit APIs are not supported yet; use the default 4300-digit limit; rython refuses to silently ignore a limit change or invent its value".into());
         }
@@ -5089,6 +5097,7 @@ impl<'a> CodeGen for Call {
                     }
                     "getattr" => {
                         InterpreterNamespace::check_attribute_call(&self, &options, &symbols)?;
+                        crate::ast::tree::system_exit::check_reflection(&self, &options, &symbols)?;
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
@@ -5139,6 +5148,7 @@ impl<'a> CodeGen for Call {
                     }
                     "hasattr" => {
                         InterpreterNamespace::check_attribute_call(&self, &options, &symbols)?;
+                        crate::ast::tree::system_exit::check_reflection(&self, &options, &symbols)?;
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }
@@ -5157,6 +5167,7 @@ impl<'a> CodeGen for Call {
                     }
                     "setattr" => {
                         InterpreterNamespace::check_attribute_call(&self, &options, &symbols)?;
+                        crate::ast::tree::system_exit::check_reflection(&self, &options, &symbols)?;
                         if !self.keywords.is_empty() {
                             return Err(unexpected(self.keywords[0].arg.as_deref()));
                         }

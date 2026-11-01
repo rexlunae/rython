@@ -4710,6 +4710,53 @@ fn compile_err(src: &str, name: &str) -> String {
 }
 
 #[test]
+fn system_exit_calls_propagate_the_original_code() {
+    let source = "import sys as system\nfrom sys import exit as stop\ndef f() -> None:\n    system.exit()\ndef g() -> None:\n    stop(None)\ndef make() -> SystemExit:\n    return SystemExit(3)\n";
+    let out = compile(source, "exit_calls.py");
+    assert!(out.contains("ExitCode :: Missing) ?"), "{out}");
+    assert!(out.contains("stop (stdpython :: PyValue :: None_) ?"), "{out}");
+    assert!(out.contains("PyException :: system_exit"), "{out}");
+}
+
+#[test]
+fn unsupported_system_exit_edges_are_conversion_errors() {
+    for source in [
+        "import sys\nsys.exit(status=3)\n",
+        "import sys\nsys.exit(1, 2)\n",
+        "import sys\nsys.exit(*[1])\n",
+        "import sys\nsys.exit([1, 2])\n",
+        "import sys\nsys.exit(18446744073709551616)\n",
+        "import sys\nprint(sys.exit)\n",
+        "from sys import exit\nprint(exit)\n",
+        "import sys\nfrom functools import partial\ncallback = partial(sys.exit, 3)\n",
+        "SystemExit(code=3)\n",
+        "SystemExit({'code': 3})\n",
+        "class Quit(SystemExit):\n    pass\n",
+    ] {
+        let error = compile_err(source, "unsupported_exit.py");
+        assert!(error.contains("sys.exit") || error.contains("SystemExit"), "{source}: {error}");
+        assert!(error.contains("refuses"), "{source}: {error}");
+    }
+}
+
+#[test]
+fn exit_recognition_preserves_ordinary_methods_and_shadowed_names() {
+    let source = "class Shell:\n    def exit(self, status: int) -> int:\n        return status + 1\ndef SystemExit(status: int) -> int:\n    return status + 2\ndef read(sys: Shell) -> int:\n    return sys.exit(3)\nprint(read(Shell()))\nprint(SystemExit(3))\n";
+    let out = compile(source, "shadowed_exit.py");
+    assert!(!out.contains("stdpython :: sys :: exit"), "{out}");
+    assert!(!out.contains("PyException :: system_exit"), "{out}");
+}
+
+#[test]
+fn system_exit_code_mutation_and_reflection_are_loud() {
+    for statement in ["error.code = 0", "error.code += 1", "del error.code", "error.code.append(1)", "print(getattr(error, 'code'))", "print(hasattr(error, 'code'))", "setattr(error, 'code', 0)"] {
+        let source = format!("error = SystemExit(3)\n{statement}\n");
+        let error = compile_err(&source, "exit_code.py");
+        assert!(error.contains("SystemExit.code") && error.contains("refuses"), "{statement}: {error}");
+    }
+}
+
+#[test]
 fn interpreter_namespaces_are_refused_instead_of_fabricated_or_ignored() {
     // Verified against python3: deleting sys.modules or builtins.locals
     // removes the attribute (hasattr returns False), so dropping del is wrong.
@@ -18198,8 +18245,8 @@ fn an_option_callee_result_into_a_boxed_union_param_coerces() {
         "optunionarg.py",
     );
     assert!(
-        out.contains("match (resolve_default_timeout (timeout) ?) {")
-            || out.contains("match(resolve_default_timeout(timeout)?){"),
+        out.contains("match resolve_default_timeout (timeout) ? {")
+            || out.contains("match resolve_default_timeout(timeout)?{"),
         "the Option-typed callee result must coerce into the boxed param: {}",
         out
     );
@@ -18265,8 +18312,8 @@ fn a_property_read_local_on_a_factory_local_coerces_into_a_boxed_union_param() {
         out
     );
     assert!(
-        out.contains("match (read_timeout) { Some (__rython_v) => PyValue :: from (__rython_v) , None => stdpython :: PyValue :: None_ , }")
-            || out.contains("match(read_timeout){Some(__rython_v)=>PyValue::from((__rython_v)),None=>stdpython::PyValue::None_,}"),
+        out.contains("match read_timeout { Some (__rython_v) => PyValue :: from (__rython_v) , None => stdpython :: PyValue :: None_ , }")
+            || out.contains("match read_timeout{Some(__rython_v)=>PyValue::from((__rython_v)),None=>stdpython::PyValue::None_,}"),
         "the Option<f64> local must coerce into the boxed param: {}",
         out
     );

@@ -559,7 +559,7 @@ pub fn coerce_tokens(
             let inner_boxed = coerce_tokens(quote!(__rython_v), inner, &TypeInfo::PyValue)
                 .unwrap_or_else(|| quote!(PyValue::from(__rython_v)));
             Some(quote!(
-                match (#tokens) {
+                match #tokens {
                     Some(__rython_v) => #inner_boxed,
                     None => stdpython::PyValue::None_,
                 }
@@ -1301,6 +1301,11 @@ fn infer_type_inner(
             }
         }
         ExprType::Call(call) => match call.func.as_ref() {
+            func if crate::ast::tree::system_exit::ExitCall::of(func, options, symbols)
+                == Some(crate::ast::tree::system_exit::ExitCall::Constructor) =>
+            {
+                crate::ast::tree::arguments::exception_typeinfo(false)
+            }
             ExprType::Name(n) if symbols.get(&n.id).is_none()
                 && call.args.len() == 1
                 && infer_type_inner(ctx, &call.args[0], options, symbols) == TypeInfo::BigInt
@@ -1636,6 +1641,9 @@ fn infer_type_inner(
                 return t;
             }
             let receiver_type = infer_type_inner(ctx, &attr.value, options, symbols);
+            if crate::ast::tree::system_exit::code_attribute(attr, options, symbols) {
+                return TypeInfo::PyValue;
+            }
             // Any attribute of a `threading.local()` object is a run-time
             // attribute: a boxed value (issue #356).
             if matches!(receiver_type, TypeInfo::Threading(crate::ThreadingType::Local)) {

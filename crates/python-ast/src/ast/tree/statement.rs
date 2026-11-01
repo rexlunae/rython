@@ -836,6 +836,13 @@ impl CodeGen for StatementType {
                 }
             }
             StatementType::Return(Some(e)) => {
+                if let ExprType::Call(call) = &e.value
+                    && crate::ast::tree::system_exit::ExitCall::of(&call.func, &options, &symbols)
+                        == Some(crate::ast::tree::system_exit::ExitCall::Function)
+                {
+                    let exit = crate::ast::tree::system_exit::lower(call, &ctx, &options, &symbols)?.expect("resolved sys.exit call");
+                    return Ok(quote! { #exit; unreachable!("sys.exit returned successfully") });
+                }
                 if crate::ast::tree::type_ctx::type_mentions_bigint(&crate::infer_type(Some(&ctx), &e.value, &options, &symbols)) {
                     return Err("returning an arbitrary-precision integer across a function boundary is not supported yet; keep the value in an integer local and return its string representation if needed instead of narrowing or boxing it; rython refuses to silently lose its value".into());
                 }
@@ -1367,6 +1374,7 @@ impl CodeGen for StatementType {
                 let mut stmts = Vec::new();
                 for target in targets {
                     crate::ast::tree::interpreter_state::check_target(&target, &options, &symbols)?;
+                    crate::ast::tree::system_exit::check_mutation(&target, &options, &symbols)?;
                     // `del tl.name` on a `threading.local()` object (issue
                     // #356): this thread's binding, or AttributeError.
                     if let ExprType::Attribute(t) = &target

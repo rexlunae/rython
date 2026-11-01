@@ -86,36 +86,55 @@ fn decode_argument(index: usize, arg: std::ffi::OsString) -> String {
     }
 }
 
-#[cfg(feature = "std")]
 python_function! {
-    /// sys.exit - exit the program
-    pub fn exit<T>(code: T) -> !
+    /// Raise SystemExit; only an uncaught exception at entry ends the process.
+    pub fn exit<T>(code: T) -> Result<(), crate::PyException>
     where [T: Into<ExitCode>]
-    [signature: (code)]
-    [concrete_types: (String) -> !]
+    [signature: (code=None)]
+    [concrete_types: (String) -> Result<(), crate::PyException>]
     {
-        let exit_code = code.into();
-        match exit_code {
-            ExitCode::Code(c) => std::process::exit(c),
-            ExitCode::Message(msg) => {
-                eprintln!("{}", msg);
-                std::process::exit(1);
-            }
+        let args = match code.into() {
+            ExitCode::Missing => Vec::new(),
+            code => vec![code.into_value()],
+        };
+        Err(crate::PyException::system_exit(args))
+    }
+}
+
+/// The no-argument call has no BaseException args (`sys.exit(None)` has one).
+pub fn exit_none() -> Result<(), crate::PyException> {
+    exit(ExitCode::Missing)
+}
+
+/// Preserve the Python value until an uncaught SystemExit ends the process.
+pub enum ExitCode {
+    Missing,
+    Code(i32),
+    Message(String),
+    Value(crate::PyValue),
+}
+
+impl ExitCode {
+    fn into_value(self) -> crate::PyValue {
+        match self {
+            Self::Missing => unreachable!("the no-argument exit has no value"),
+            Self::Code(code) => crate::PyValue::Int(i64::from(code)),
+            Self::Message(message) => crate::PyValue::Str(message),
+            Self::Value(value) => value,
         }
     }
 }
 
-/// Helper enum to handle both numeric exit codes and string messages
-pub enum ExitCode {
-    Code(i32),
-    Message(String),
+macro_rules! exit_code_from_int {
+    ($($ty:ty),*) => {$(
+        impl From<$ty> for ExitCode {
+            fn from(code: $ty) -> Self {
+                Self::Value(crate::PyValue::Int(i64::from(code)))
+            }
+        }
+    )*};
 }
-
-impl From<i32> for ExitCode {
-    fn from(code: i32) -> Self {
-        ExitCode::Code(code)
-    }
-}
+exit_code_from_int!(i8, i16, i32, i64, u8, u16, u32);
 
 impl From<&str> for ExitCode {
     fn from(message: &str) -> Self {
@@ -129,41 +148,28 @@ impl From<String> for ExitCode {
     }
 }
 
-// Add support for other common integer types
-impl From<i8> for ExitCode {
-    fn from(code: i8) -> Self {
-        ExitCode::Code(code as i32)
+impl From<crate::PyValue> for ExitCode {
+    fn from(code: crate::PyValue) -> Self {
+        Self::Value(code)
     }
 }
 
-impl From<u8> for ExitCode {
-    fn from(code: u8) -> Self {
-        ExitCode::Code(code as i32)
+impl From<bool> for ExitCode {
+    fn from(code: bool) -> Self {
+        Self::Value(crate::PyValue::Bool(code))
     }
 }
 
-impl From<i16> for ExitCode {
-    fn from(code: i16) -> Self {
-        ExitCode::Code(code as i32)
+impl From<()> for ExitCode {
+    fn from(_: ()) -> Self {
+        Self::Value(crate::PyValue::None_)
     }
 }
 
-impl From<u16> for ExitCode {
-    fn from(code: u16) -> Self {
-        ExitCode::Code(code as i32)
+impl From<f64> for ExitCode {
+    fn from(code: f64) -> Self {
+        Self::Value(crate::PyValue::Float(code))
     }
-}
-
-/// sys.exit - no-std version (panics instead of exiting)
-/// 
-/// In no-std environments, we cannot actually exit the process,
-/// so we panic with the exit code information instead.
-#[cfg(not(feature = "std"))]
-pub fn exit<T>(code: T) -> ! 
-where
-    T: Into<i32> + core::fmt::Display,
-{
-    panic!("sys.exit called with code: {}", code);
 }
 
 python_function! {
