@@ -1906,17 +1906,6 @@ fn convert_on_this_thread(
     if opts.driver && (opts.kernel_module || opts.pyo3 || opts.no_std) {
         bail!("--driver cannot be combined with --kernel-module, --pyo3, or --no-std");
     }
-    if opts.pyo3 || opts.driver {
-        let target = if opts.pyo3 { "PyO3" } else { "driver" };
-        for module in &package.modules {
-            let ast = parse_enhanced(&module.source, parse_filename(module))
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            if let Some(line) = python_ast::first_big_integer_literal_line(&ast.raw.body) {
-                bail!("arbitrary-precision integer literal ({} line {line}) is not supported by the {target} target yet; use in-range operands or ordinary alloc/std conversion; rython refuses to silently narrow it", module.file.display());
-            }
-        }
-    }
-
     let entry_file = package.entry_module().map(|m| m.file.clone());
 
     // Async usage across the package: any async construct (async def/await/
@@ -3283,6 +3272,13 @@ fn conversion_base_options(
     PythonOptions::from(python_ast::PythonOptionsData {
         lossy_warnings: opts.warnings != WarningMode::Allow,
         no_std: opts.no_std,
+        big_integer_target: if opts.pyo3 {
+            python_ast::BigIntegerTarget::PyO3
+        } else if opts.driver {
+            python_ast::BigIntegerTarget::Driver
+        } else {
+            python_ast::BigIntegerTarget::StdPython
+        },
         rust_modules: std::rc::Rc::new(rust_modules.clone()),
         python_modules: std::rc::Rc::new(python_module_names.clone()),
         module_defs: std::rc::Rc::new(module_defs.clone()),

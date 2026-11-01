@@ -407,11 +407,14 @@ impl CodeGen for Constant {
     fn to_rust(
         self,
         _ctx: Self::Context,
-        _options: Self::Options,
+        options: Self::Options,
         _symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
         match self.0 {
             Some(c) if integer_type(&c) == Some(crate::TypeInfo::BigInt) => {
+                if let Some(target) = options.big_integer_target.unsupported_name() {
+                    return Err(format!("arbitrary-precision integer literal is not supported by the {target} target yet; use in-range operands or ordinary alloc/std conversion; rython refuses to silently narrow it").into());
+                }
                 let decimal = c.to_string();
                 Ok(quote!(stdpython::PyInteger::from_decimal(#decimal)
                     .expect("validated Python integer literal")))

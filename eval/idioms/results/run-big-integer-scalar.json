@@ -1,13 +1,14 @@
 {
-  "converter_commit": "bdb0f25",
-  "repo_head": "bdb0f25",
+  "converter_commit": "bf71dd8",
+  "repo_head": "bf71dd8",
   "rypip_path": "target/debug/rypip",
   "oracle": "CPython 3.14.4 (pins captured under 3.11)",
-  "passed": 61,
-  "total": 62,
+  "passed": 62,
+  "total": 63,
   "passing": [
     "__main__",
     "bank",
+    "big_integer_converted_values",
     "big_integer_scalar",
     "boxed_constructor",
     "boxed_numeric_equality",
@@ -76,6 +77,11 @@
     },
     "bank": {
       "program": "bank",
+      "warnings": 0,
+      "status": "pass"
+    },
+    "big_integer_converted_values": {
+      "program": "big_integer_converted_values",
       "warnings": 0,
       "status": "pass"
     },

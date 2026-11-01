@@ -41,6 +41,13 @@ print keywords/non-scalar companions, and kernel/PyO3/driver targets. A string
 produced from the integer can cross an ordinary function boundary. Local scalar
 operations work in the alloc-only runtime as well as std.
 
+Supported scalar results can cross boundaries appropriate to their types:
+a string result can enter a container, act as a dictionary key or subscript
+receiver, or be iterated. These checks apply to the value entering each
+boundary, rather than intermediate bigint operands.
+PyO3 and driver target checks run when a literal is emitted, so inactive
+branches and shadowed definitions do not reject a conversion.
+
 ## Representation and remaining integration
 
 Python integers are unbounded. Promoting only oversized literals is not

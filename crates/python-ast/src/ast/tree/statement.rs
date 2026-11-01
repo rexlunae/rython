@@ -74,8 +74,7 @@ impl CodeGen for Statement {
             | StatementType::Expr(_) | StatementType::Call(_) | StatementType::If(_)
             | StatementType::While(_) | StatementType::Return(_) | StatementType::Assert { .. })
             && crate::ast::tree::visit::stmt_exprs(&self).into_iter().any(|e|
-                crate::ast::tree::visit::any_expr(e, |e|
-                    crate::ast::tree::type_ctx::type_mentions_bigint(&crate::infer_type(Some(&ctx), e, &options, &symbols))))
+                crate::ast::tree::type_ctx::type_mentions_bigint(&crate::infer_type(Some(&ctx), e, &options, &symbols)))
         {
             return Err(format!("arbitrary-precision integer use in this statement (line {}) is not supported yet; keep it in scalar assignments, arithmetic or display; rython refuses to silently narrow or ignore it", self.lineno.unwrap_or(0)).into());
         }

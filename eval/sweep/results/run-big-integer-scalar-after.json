@@ -1,14 +1,14 @@
 {
   "schema_version": 2,
-  "rypip_commit": "bdb0f25f816e1f37554cfe4af5dac9f61027644f",
-  "repo_head": "bdb0f25f816e1f37554cfe4af5dac9f61027644f",
+  "rypip_commit": "bf71dd821234fbe0d989cd29d437e6891b4ac216",
+  "repo_head": "bf71dd821234fbe0d989cd29d437e6891b4ac216",
   "provenance": {
-    "source_commit": "bdb0f25f816e1f37554cfe4af5dac9f61027644f",
-    "source_sha256": "0d306afb3c007f490d31eb255f9b5ab54dee281ae19ab7d0d8f0581fd31a5344",
+    "source_commit": "bf71dd821234fbe0d989cd29d437e6891b4ac216",
+    "source_sha256": "6682205eb9cbd4ba48d461ea5da1b0027bf849b866cef43b535722e74bab72e6",
     "source_dirty": true
   },
-  "rypip_path": "/home/tserica/rython/target/debug/rypip",
-  "rypip_sha256": "b4dc0a421ad7a54f27ffbe40c68fee9b2b43b967479a1e0e552a358e63aa0c1e",
+  "rypip_path": "/home/tserica/rython-tmp/bigint-review-measured-bin/rypip",
+  "rypip_sha256": "c74be3c0999a78d2b4f94d9aad919ef74c6b01b665c642e2f116d5d7300a106a",
   "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8",
   "build_target": "",
   "cargo_config_sha256": "cf387f1bc10e20abe200b9081688b3c0f1d1866b243e95c29d96b6417a24b62f",
@@ -100,5 +100,5 @@
     }
   },
   "measurement_complete": false,
-  "elapsed_seconds": 108.9
+  "elapsed_seconds": 318.0
 }

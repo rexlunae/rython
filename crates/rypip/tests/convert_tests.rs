@@ -39,6 +39,21 @@ fn oversized_integer_scalar_program_matches_cpython() {
 }
 
 #[test]
+fn converted_big_integer_results_cross_storage_boundaries() {
+    let scratch = Scratch::new("big-integer-converted-values");
+    let file = scratch.path().join("app.py");
+    fs::write(&file, include_str!("../../../eval/idioms/programs/big_integer_converted_values.py")).unwrap();
+    let package = rypip::discover(&file).unwrap();
+    let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/app")).output().unwrap();
+    // Verified against python3.
+    assert_eq!(output.stdout, b"['18446744073709551616', '18446744073709551617']\n('18446744073709551616',)\n18446744073709551617\n18446744073709551618\n1\n18446744073709551616\n18446744073709551616\n['18446744073709551616', '18446744073709551617']\n['18446744073709551616', '18446744073709551617']\n18446744073709551616\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn unbounded_integer_literals_are_loud_on_targets_without_the_runtime() {
     let scratch = Scratch::new("big-integer-targets");
     let file = scratch.path().join("app.py");
@@ -52,8 +67,35 @@ fn unbounded_integer_literals_are_loud_on_targets_without_the_runtime() {
         let err = rypip::convert(&package, &scratch.path().join(name), &options).unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("arbitrary-precision integer literal"), "{name}: {message}");
-        assert!(message.contains("line 2"), "{name}: {message}");
+        assert!(message.contains("line 2") || message.contains("<module>:2:"), "{name}: {message}");
         assert!(message.contains("refuses to silently narrow"), "{name}: {message}");
+    }
+}
+
+#[test]
+fn bigint_target_policy_only_checks_emitted_literals() {
+    let scratch = Scratch::new("big-integer-inactive-target");
+    // Verified against python3: each source leaves answer() returning 42;
+    // the large integer is in a shadowed definition or an inactive branch.
+    for (case, source) in [
+        ("shadowed", "def answer() -> int:\n    unused = 18446744073709551616\n    return 0\ndef answer() -> int:\n    return 42\n"),
+        ("type_checking", "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    UNUSED = 18446744073709551616\ndef answer() -> int:\n    return 42\n"),
+        ("version_gate", "import sys\nif sys.version_info < (3, 0):\n    UNUSED = 18446744073709551616\ndef answer() -> int:\n    return 42\n"),
+        ("constant_false", "if False:\n    UNUSED = 18446744073709551616\ndef answer() -> int:\n    return 42\n"),
+    ] {
+        let file = scratch.path().join(format!("{case}.py"));
+        fs::write(&file, source).unwrap();
+        let package = rypip::discover(&file).unwrap();
+        for (target, options) in [
+            ("pyo3", ConvertOptions { pyo3: true, ..Default::default() }),
+            ("driver", ConvertOptions { driver: true, ..Default::default() }),
+        ] {
+            let output = scratch.path().join(format!("{case}-{target}"));
+            let krate = rypip::convert(&package, &output, &options)
+                .unwrap_or_else(|error| panic!("{case}/{target}: {error:#}"));
+            let code = fs::read_to_string(krate.root.join("src/lib.rs")).unwrap();
+            assert!(!code.contains("PyInteger"), "{case}/{target}: {code}");
+        }
     }
 }
 

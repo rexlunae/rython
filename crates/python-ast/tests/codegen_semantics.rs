@@ -4733,7 +4733,11 @@ fn unsupported_big_integer_boundaries_fail_at_conversion() {
         ("x = 18446744073709551616 + 0.5", "non-integer operand"),
         ("x: int = 18446744073709551616", "annotated binding"),
         ("x = [18446744073709551616]", "in containers"),
+        ("x = [18446744073709551616, 'text']", "in containers"),
+        ("x = {18446744073709551616: 'text'}", "in containers"),
+        ("x = ['text', [18446744073709551616]]", "in containers"),
         ("x = [1][18446744073709551616]", "in a subscript"),
+        ("for value in 18446744073709551616: pass", "use in this statement"),
         ("x = hex(18446744073709551616)", "through this call"),
         ("x = 18446744073709551616 .bit_length()", "integer methods"),
         ("x = 1 < 18446744073709551616 < 3", "single numeric comparison"),
@@ -4743,7 +4747,7 @@ fn unsupported_big_integer_boundaries_fail_at_conversion() {
         ("x = f'{18446744073709551616:x}'", "format specifications"),
         ("x = lambda: 18446744073709551616", "from a lambda"),
         ("print(18446744073709551616, sep=':')", "print keywords"),
-        ("raise ValueError(18446744073709551616)", "use in this statement"),
+        ("raise ValueError(18446744073709551616)", "integer exception arguments"),
         ("assert False, 18446744073709551616", "assertion message"),
     ] {
         let err = compile_err(&format!("def f():\n    {body}\n"), "big_boundary.py");

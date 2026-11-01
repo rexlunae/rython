@@ -194,9 +194,15 @@ impl<'a> CodeGen for Assign {
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let value_type = crate::infer_type(Some(&ctx), &self.value, &options, &symbols);
-        if self.targets.iter().filter(|t| !matches!(t, ExprType::Name(_))).any(|target|
-            crate::ast::tree::visit::any_expr_for(target, crate::ast::tree::visit::Descend::All, &mut |e|
-                crate::ast::tree::type_ctx::type_mentions_bigint(&crate::infer_type(Some(&ctx), e, &options, &symbols))))
+        if self.targets.iter().filter(|t| !matches!(t, ExprType::Name(_))).any(|target| {
+            use crate::ast::tree::visit;
+            visit::target_names(target).into_iter().any(|name|
+                options.name_types.get(name).is_some_and(crate::ast::tree::type_ctx::type_mentions_bigint))
+                || visit::any_expr(target, |e|
+                    matches!(e, ExprType::Subscript(_) | ExprType::Attribute(_))
+                        && visit::subexprs(e).into_iter().any(|operand|
+                            crate::ast::tree::type_ctx::type_mentions_bigint(&crate::infer_type(Some(&ctx), operand, &options, &symbols))))
+        })
         {
             return Err("an arbitrary-precision integer in an assignment target is not supported yet; use a bounded integer index or an integer local; rython refuses to silently truncate it".into());
         }

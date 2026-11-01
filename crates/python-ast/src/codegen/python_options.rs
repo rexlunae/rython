@@ -10,6 +10,26 @@ use std::ffi::CString;
 
 use crate::TypeInfo;
 
+/// Target policy applied only when a bigint literal is emitted, after
+/// inactive statements and shadowed definitions have been removed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BigIntegerTarget {
+    #[default]
+    StdPython,
+    PyO3,
+    Driver,
+}
+
+impl BigIntegerTarget {
+    pub fn unsupported_name(self) -> Option<&'static str> {
+        match self {
+            Self::StdPython => None,
+            Self::PyO3 => Some("PyO3"),
+            Self::Driver => Some("driver"),
+        }
+    }
+}
+
 /// Supported async runtimes for Python async code generation
 #[derive(Clone, Debug, PartialEq)]
 pub enum AsyncRuntime {
@@ -502,6 +522,9 @@ pub struct PythonOptionsData {
     /// surfacing as resolution errors when the generated crate builds.
     pub no_std: bool,
 
+    /// Runtime/ABI policy for arbitrary-precision integer emission.
+    pub big_integer_target: BigIntegerTarget,
+
     /// Force a numpy execution backend for the generated program
     /// ("scalar", "rayon", "simd", "cuda", "vulkan"), overriding the
     /// `RYPY_NUMPY_BACKEND` env var and np.set_backend defaults. The
@@ -912,6 +935,7 @@ impl Default for PythonOptionsData {
             this_module_path: Vec::new(),
             local_types: std::rc::Rc::new(std::collections::HashMap::new()),
             no_std: false,
+            big_integer_target: BigIntegerTarget::StdPython,
             numpy_backend: None,
             hierarchy_classes: std::rc::Rc::new(std::collections::HashSet::new()),
             hierarchy_roots: std::rc::Rc::new(std::collections::HashMap::new()),

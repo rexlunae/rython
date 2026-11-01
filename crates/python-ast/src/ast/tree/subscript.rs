@@ -172,7 +172,7 @@ impl CodeGen for Subscript {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        if crate::ast::tree::visit::any_expr_for(&ExprType::Subscript(self.clone()), crate::ast::tree::visit::Descend::All, &mut |e|
+        if crate::ast::tree::visit::subexprs(&ExprType::Subscript(self.clone())).into_iter().any(|e|
             crate::ast::tree::type_ctx::type_mentions_bigint(&crate::infer_type(Some(&ctx), e, &options, &symbols)))
         {
             return Err("an arbitrary-precision integer in a subscript is not supported yet; use a bounded integer index; rython refuses to silently truncate it".into());

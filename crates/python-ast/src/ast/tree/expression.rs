@@ -247,9 +247,9 @@ impl<'a> CodeGen for ExprType {
         {
             return Err("returning an arbitrary-precision integer from a lambda is not supported yet; keep it in an integer local; rython refuses to silently box or narrow it".into());
         }
-        if matches!(self, ExprType::List(_) | ExprType::Tuple(_) | ExprType::Dict(_)
-            | ExprType::Set(_) | ExprType::ListComp(_) | ExprType::SetComp(_) | ExprType::DictComp(_))
-            && crate::ast::tree::visit::any_expr_for(&self, crate::ast::tree::visit::Descend::All, &mut |e|
+        let container_values = crate::ast::tree::visit::container_values(&self);
+        if !container_values.is_empty()
+            && std::iter::once(&self).chain(container_values).any(|e|
                 crate::ast::tree::type_ctx::type_mentions_bigint(&crate::infer_type(Some(&ctx), e, &options, &symbols)))
         {
             return Err("arbitrary-precision integers in containers are not supported yet; keep the value in an integer local; rython refuses to silently narrow or box it".into());

@@ -837,6 +837,21 @@ pub fn subexprs(e: &ExprType) -> Vec<&ExprType> {
     subexprs_for(e, Descend::All)
 }
 
+/// Values stored by a container expression. A call's intermediate
+/// operands and comprehension filters are not storage boundaries.
+pub fn container_values(e: &ExprType) -> Vec<&ExprType> {
+    match e {
+        ExprType::List(items) => items.iter().collect(),
+        ExprType::Tuple(tuple) => tuple.elts.iter().collect(),
+        ExprType::Set(set) => set.elts.iter().collect(),
+        ExprType::Dict(dict) => dict.keys.iter().flatten().chain(dict.values.iter()).collect(),
+        ExprType::ListComp(comp) => vec![&comp.elt],
+        ExprType::SetComp(comp) => vec![&comp.elt],
+        ExprType::DictComp(comp) => vec![&comp.key, &comp.value],
+        _ => Vec::new(),
+    }
+}
+
 /// The direct subexpressions a walk with `descend` enters, collected.
 pub fn subexprs_for(e: &ExprType, descend: Descend) -> Vec<&ExprType> {
     let mut out = Vec::new();
