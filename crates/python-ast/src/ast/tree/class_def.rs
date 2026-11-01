@@ -3402,6 +3402,9 @@ impl CodeGen for ClassDef {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        if let Some(line) = crate::ast::tree::big_integer::class_storage_line(&self.body, &options, &symbols) {
+            return Err(format!("arbitrary-precision integer class storage (line {line}) is not supported yet; construct the value in a method's local instead; rython refuses to silently drop or narrow it").into());
+        }
         // `self` is consumed by value and bound mutably so the dataclass
         // synthesis can prepend the generated __init__ to the body.
         let class_name = crate::safe_ident(&self.name);

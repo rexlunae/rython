@@ -39,6 +39,9 @@ use crate::{
 pub enum TypeInfo {
     /// `i64`
     Int,
+    /// `stdpython::PyInteger`: an integer value introduced by an oversized
+    /// literal. Its arithmetic promotes/demotes internally without narrowing.
+    BigInt,
     /// `f64`
     Float,
     /// `bool`
@@ -154,6 +157,7 @@ impl PartialEq for TypeInfo {
 pub(crate) fn type_mentions_heap(t: &TypeInfo) -> bool {
     match t {
         TypeInfo::PyValue
+        | TypeInfo::BigInt
         | TypeInfo::PyValueMember(_)
         | TypeInfo::String
         | TypeInfo::StrRef
@@ -348,6 +352,7 @@ impl TypeInfo {
     pub fn to_rust_type(&self) -> TokenStream {
         match self {
             TypeInfo::Int => quote!(i64),
+            TypeInfo::BigInt => quote!(stdpython::PyInteger),
             TypeInfo::Float => quote!(f64),
             TypeInfo::Bool => quote!(bool),
             TypeInfo::StrRef => quote!(&'static str),
@@ -435,6 +440,7 @@ impl TypeInfo {
     pub fn display(&self) -> String {
         match self {
             TypeInfo::Int => "int".into(),
+            TypeInfo::BigInt => "int (arbitrary precision)".into(),
             TypeInfo::Float => "float".into(),
             TypeInfo::Bool => "bool".into(),
             TypeInfo::StrRef | TypeInfo::String => "str".into(),
@@ -512,6 +518,7 @@ pub fn coerce_tokens(
         // only way to compile them at all, and the alternative (rustc
         // error) is no more informative.
         (TypeInfo::Int, TypeInfo::Float) => Some(quote!((#tokens) as f64)),
+        (TypeInfo::Int, TypeInfo::BigInt) => Some(quote!(stdpython::PyInteger::from((#tokens) as i64))),
         // Option<PyValue> → PyValue (issue #137 round 27): reading an
         // OPTIONAL boxed field where the bare boxed value is wanted.
         // Python's None IS `PyValue::None_`, so the empty case is not a
@@ -907,7 +914,7 @@ fn infer_type_inner(
                 return t;
             }
             match &c.0 {
-                Some(litrs::Literal::Integer(_)) => TypeInfo::Int,
+                Some(l @ litrs::Literal::Integer(_)) => crate::ast::tree::constant::integer_type(l).unwrap(),
                 Some(litrs::Literal::Float(_)) => TypeInfo::Float,
                 Some(litrs::Literal::Bool(_)) => TypeInfo::Bool,
                 Some(litrs::Literal::String(_)) => TypeInfo::StrRef,
@@ -919,6 +926,12 @@ fn infer_type_inner(
             }
         },
         ExprType::Name(n) => {
+            // The legacy local-types map records Python's spelling `int`
+            // for literal assignments. Preserve the richer representation
+            // chosen for an oversized literal instead of narrowing it.
+            if options.name_types.get(&n.id) == Some(&TypeInfo::BigInt) {
+                return TypeInfo::BigInt;
+            }
             // 1. The per-function annotation map (params + literal assigns).
             if let Some(py) = options.local_types.get(&n.id) {
                 return py_type(py);
@@ -1219,7 +1232,7 @@ fn infer_type_inner(
         }
         ExprType::UnaryOp(u) => match u.op {
             crate::Ops::Not => TypeInfo::Bool,
-            crate::Ops::USub | crate::Ops::UAdd => {
+            crate::Ops::USub | crate::Ops::UAdd | crate::Ops::Invert => {
                 infer_type_inner(ctx, &u.operand, options, symbols)
             }
             _ => TypeInfo::PyObject,
@@ -1267,7 +1280,7 @@ fn infer_type_inner(
             if a == b {
                 a
             } else if is_numeric(&a) && is_numeric(&b) {
-                TypeInfo::Float
+                numeric_join(&a, &b)
             } else if is_stringy(&a) && is_stringy(&b) {
                 TypeInfo::String
             } else if crate::is_none_expr(&i.orelse)
@@ -1288,6 +1301,13 @@ fn infer_type_inner(
             }
         }
         ExprType::Call(call) => match call.func.as_ref() {
+            ExprType::Name(n) if symbols.get(&n.id).is_none()
+                && call.args.len() == 1
+                && infer_type_inner(ctx, &call.args[0], options, symbols) == TypeInfo::BigInt
+                && crate::ast::tree::big_integer::IntegerBuiltin::from_name(&n.id).is_some() =>
+            {
+                crate::ast::tree::big_integer::IntegerBuiltin::from_name(&n.id).unwrap().result_type()
+            }
             // `threading.local()` (or an imported `local()`) constructs the
             // per-thread attribute object (issue #356), whose attribute
             // access lowers dynamically.
@@ -2202,7 +2222,7 @@ fn py_type(py: &str) -> TypeInfo {
 }
 
 fn is_numeric(t: &TypeInfo) -> bool {
-    matches!(t, TypeInfo::Int | TypeInfo::Float)
+    matches!(t, TypeInfo::Int | TypeInfo::BigInt | TypeInfo::Float)
 }
 
 fn is_stringy(t: &TypeInfo) -> bool {
@@ -2235,6 +2255,7 @@ pub fn unify(a: TypeInfo, b: TypeInfo) -> TypeInfo {
         return a;
     }
     match (&a, &b) {
+        (TypeInfo::Int, TypeInfo::BigInt) | (TypeInfo::BigInt, TypeInfo::Int) => TypeInfo::BigInt,
         (TypeInfo::Vec(x), TypeInfo::Vec(y)) => {
             TypeInfo::Vec(Box::new(unify((**x).clone(), (**y).clone())))
         }
@@ -2374,6 +2395,8 @@ pub fn join_known_types<'a>(types: impl IntoIterator<Item = &'a TypeInfo>) -> Ty
 fn numeric_join(a: &TypeInfo, b: &TypeInfo) -> TypeInfo {
     if matches!(a, TypeInfo::Float) || matches!(b, TypeInfo::Float) {
         TypeInfo::Float
+    } else if matches!(a, TypeInfo::BigInt) || matches!(b, TypeInfo::BigInt) {
+        TypeInfo::BigInt
     } else {
         TypeInfo::Int
     }
@@ -2753,6 +2776,9 @@ pub fn render_typed(
         },
         _ => actual,
     };
+    if type_mentions_bigint(&actual) && actual != expected {
+        return Err(format!("an arbitrary-precision integer cannot enter the `{}` representation yet; keep it in an unannotated integer local instead of narrowing or boxing it; rython refuses to silently lose its value", expected.display()).into());
+    }
     // Round 83 (the generics directive): an OPTION-typed value into a
     // CONCRETE slot (`self.decompress(self._data)` where the field is
     // `bytes | None` — urllib3's DeflateDecoder, whose None stores
@@ -3163,6 +3189,20 @@ pub fn is_boxable_value_type(t: &TypeInfo) -> bool {
             // A range (PyValue::Range — issue #335).
             | TypeInfo::Range
     )
+}
+
+/// Whether a value carries an arbitrary-precision integer at any nesting
+/// depth. Boundary checks use the same structural predicate.
+pub(crate) fn type_mentions_bigint(t: &TypeInfo) -> bool {
+    match t {
+        TypeInfo::BigInt => true,
+        TypeInfo::Vec(t) | TypeInfo::PyTuple(t) | TypeInfo::HashSet(t)
+        | TypeInfo::Option(t) | TypeInfo::Borrowed(t) | TypeInfo::PyValueMember(t) => type_mentions_bigint(t),
+        TypeInfo::Dict(k, v) => type_mentions_bigint(k) || type_mentions_bigint(v),
+        TypeInfo::Tuple(ts) | TypeInfo::Collection(_, ts) => ts.iter().any(type_mentions_bigint),
+        TypeInfo::Callable(args, ret) => args.iter().any(type_mentions_bigint) || type_mentions_bigint(ret),
+        _ => false,
+    }
 }
 
 /// `call_arg_expected_type` with the SYMBOLS-AWARE exception-union rule
@@ -4385,7 +4425,7 @@ fn analyze_statement_types(
                         // operands are names). The two paths agree
                         // everywhere else; this is the one shape where
                         // only infer_type has the operand types.
-                        ExprType::BinOp(_) => match (options, symbols) {
+                        ExprType::BinOp(_) | ExprType::UnaryOp(_) => match (options, symbols) {
                             (Some(options), Some(symbols)) => {
                                 infer_type(None, &assign.value, &analysis_view(options, info), symbols)
                             }
@@ -4503,6 +4543,12 @@ fn analyze_statement_types(
                     other => other,
                 };
                 let annotated = assign.annotation.is_some();
+                if !annotated && !info.annotated_names.contains(&name.id)
+                    && matches!(t, TypeInfo::Int | TypeInfo::BigInt)
+                    && info.name_types.get(&name.id) == Some(&TypeInfo::BigInt)
+                {
+                    t = TypeInfo::BigInt;
+                }
                 if annotated {
                     info.annotated_names.insert(name.id.clone());
                 }
@@ -4595,6 +4641,13 @@ fn analyze_statement_types(
             }
         }
         StatementType::AugAssign(a) => {
+            if let ExprType::Name(n) = &a.target
+                && !info.annotated_names.contains(&n.id)
+                && let (Some(options), Some(symbols)) = (options, symbols)
+                && infer_type(None, &a.value, &analysis_view(options, info), symbols) == TypeInfo::BigInt
+            {
+                info.name_types.insert(n.id.clone(), TypeInfo::BigInt);
+            }
             count_expr_reads(&a.target, info);
             count_expr_reads(&a.value, info);
         }
@@ -4817,7 +4870,7 @@ pub(crate) fn syntactic_type(expr: &ExprType) -> TypeInfo {
                 return t;
             }
             match &c.0 {
-                Some(litrs::Literal::Integer(_)) => TypeInfo::Int,
+                Some(l @ litrs::Literal::Integer(_)) => crate::ast::tree::constant::integer_type(l).unwrap(),
                 Some(litrs::Literal::Float(_)) => TypeInfo::Float,
                 Some(litrs::Literal::Bool(_)) => TypeInfo::Bool,
                 Some(litrs::Literal::String(_)) => TypeInfo::StrRef,
@@ -5914,6 +5967,14 @@ pub fn call_return_typeinfo(
     symbols: Option<&SymbolTableScopes>,
     options: Option<&PythonOptions>,
 ) -> Option<TypeInfo> {
+    if let (ExprType::Name(n), Some(symbols), Some(options)) = (call.func.as_ref(), symbols, options)
+        && symbols.get(&n.id).is_none()
+        && call.args.len() == 1
+        && infer_type(None, &call.args[0], options, symbols) == TypeInfo::BigInt
+        && let Some(builtin) = crate::ast::tree::big_integer::IntegerBuiltin::from_name(&n.id)
+    {
+        return Some(builtin.result_type());
+    }
     let ExprType::Name(callee) = call.func.as_ref() else {
         // An ATTRIBUTE callee on a CLASS-typed receiver (`inv.find(name)`
         // where inv = Inventory() — the idiom corpus's find): resolve the
@@ -6307,6 +6368,9 @@ fn resolve_type_inner(
             use crate::ast::tree::bin_ops::BinOps as Op;
             let l = resolve_type_inner(&b.left, info, symbols, options);
             let r = resolve_type_inner(&b.right, info, symbols, options);
+            if matches!(l, TypeInfo::BigInt) || matches!(r, TypeInfo::BigInt) {
+                return if matches!(b.op, Op::Div) { TypeInfo::Float } else { TypeInfo::BigInt };
+            }
             match (&b.op, &l, &r) {
                 (Op::Add | Op::Sub | Op::Mult | Op::FloorDiv | Op::Mod, TypeInfo::Int, TypeInfo::Int) => {
                     TypeInfo::Int

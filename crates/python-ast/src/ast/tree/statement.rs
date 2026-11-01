@@ -70,6 +70,20 @@ impl CodeGen for Statement {
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         crate::stack_guard::check()?;
+        if !matches!(&self.statement, StatementType::Assign(_) | StatementType::AugAssign(_)
+            | StatementType::Expr(_) | StatementType::Call(_) | StatementType::If(_)
+            | StatementType::While(_) | StatementType::Return(_) | StatementType::Assert { .. })
+            && crate::ast::tree::visit::stmt_exprs(&self).into_iter().any(|e|
+                crate::ast::tree::visit::any_expr(e, |e|
+                    crate::ast::tree::type_ctx::type_mentions_bigint(&crate::infer_type(Some(&ctx), e, &options, &symbols))))
+        {
+            return Err(format!("arbitrary-precision integer use in this statement (line {}) is not supported yet; keep it in scalar assignments, arithmetic or display; rython refuses to silently narrow or ignore it", self.lineno.unwrap_or(0)).into());
+        }
+        if let StatementType::Assert { msg: Some(message), .. } = &self.statement
+            && crate::ast::tree::type_ctx::type_mentions_bigint(&crate::infer_type(Some(&ctx), message, &options, &symbols))
+        {
+            return Err(format!("an arbitrary-precision integer assertion message (line {}) is not supported yet; convert the message with str(value) first; rython refuses to change exception construction timing", self.lineno.unwrap_or(0)).into());
+        }
         let (lineno, col_offset) = (self.lineno, self.col_offset);
         let (end_lineno, end_col_offset) = (self.end_lineno, self.end_col_offset);
         // The statement's binding marks (Devin review on #338, rounds 8 to
@@ -823,6 +837,9 @@ impl CodeGen for StatementType {
                 }
             }
             StatementType::Return(Some(e)) => {
+                if crate::ast::tree::type_ctx::type_mentions_bigint(&crate::infer_type(Some(&ctx), &e.value, &options, &symbols)) {
+                    return Err("returning an arbitrary-precision integer across a function boundary is not supported yet; keep the value in an integer local and return its string representation if needed instead of narrowing or boxing it; rython refuses to silently lose its value".into());
+                }
                 // Whether the returned value is already an Option — computed
                 // BEFORE the tokens below move `symbols`, the final Some()
                 // wrap (a `-> T | None` function returning a plain member)

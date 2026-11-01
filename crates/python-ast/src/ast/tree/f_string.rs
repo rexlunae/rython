@@ -188,6 +188,14 @@ impl FormattedValue {
         options: &PythonOptions,
         symbols: &SymbolTableScopes,
     ) -> Result<(String, TokenStream), Box<dyn std::error::Error>> {
+        if self.format_spec.is_some()
+            && crate::infer_type(Some(ctx), &self.value, options, symbols) == crate::TypeInfo::BigInt
+        {
+            return Err("format specifications on arbitrary-precision integers are not supported yet; use an unformatted interpolation or str(value); rython refuses to silently narrow it".into());
+        }
+        if crate::infer_type(Some(ctx), &self.value, options, symbols) == crate::TypeInfo::BigInt {
+            return Ok(("{}".to_string(), quote!((#value).checked_decimal()?)));
+        }
         // Python conversion codes are the ASCII values of 's', 'r', 'a'.
         let is_repr = matches!(self.conversion, Some(114) | Some(97));
 

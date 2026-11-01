@@ -120,10 +120,6 @@ deliberately rejected, not merely postponed.
   approximation would almost always be right (e.g. chained assignment to
   a container literal, issue #104): *almost always* is precisely the kind
   of bug that escapes review.
-- **Silent bignum fallback.** `int` is `i64`. An opt-in bigint tier is
-  planned (see *Future directions*), but transparently switching
-  representations based on value magnitude — with its pervasive
-  performance and layout consequences — is not.
 - **Hiding the Rust.** The generated crate is the deliverable. Rython
   does not wrap the output in a launcher, a bundle format, or a build
   system of its own; it emits a crate and gets out of cargo's way.
@@ -256,7 +252,7 @@ by the compiler.
 Features are added when they can be added *whole* — with CPython-pinned
 tests, loud edges, and readable output — and not before. The roadmap
 (generalized decorators, generators as iterator-struct lowering,
-inheritance and dunder protocols, an opt-in bigint tier, binary file
+inheritance and dunder protocols, automatic integer promotion, binary file
 modes) is ordered by what unblocks real programs, but no feature ships in
 a half-state where some uses silently misbehave. "Supported" is a binary
 property of a construct, and the test suite is its definition.
@@ -317,16 +313,15 @@ opt-in (#334 — the callables model — is the roadmap for those).
 ## Future directions
 
 Recorded here so they read as intentions, not accidents. Each will land
-under the same rules as everything else: opt-in where it changes the
-model, loud where it can't be whole, transcript-tested against the
-reference where it can.
+under the same rules as everything else: explicit about model changes,
+loud where they cannot be whole, and transcript-tested against the
+reference where they can.
 
-- **An opt-in bigint tier.** A feature flag backing `int` with an
-  arbitrary-precision crate, for programs that need Python's unbounded
-  integers and accept the representation cost. This also retires the
-  integer-overflow panic — under bigints, overflow simply doesn't
-  happen, matching CPython. The default stays `i64`; a silent,
-  magnitude-triggered switch stays a non-goal.
+- **Automatic integer promotion.** Python integers should grow without
+  overflow, using a small representation where possible and an
+  arbitrary-precision representation when needed. The first scalar slice
+  handles oversized literals; ordinary integers still use `i64`. The work and its boundaries are described
+  in [automatic-integers.md](automatic-integers.md).
 - **Opt-in dynamic typing at the edges.** A boxed value type, behind a
   flag or explicit annotation, for the few places where limited
   dynamism buys real compatibility — heterogeneous collections first.
@@ -339,7 +334,7 @@ reference where it can.
   exception for the case: true division by zero should raise instead
   of silently yielding `inf` (issue #107), arithmetic on `None` should
   become a catchable `TypeError`, exceptions should propagate through
-  lambda boundaries, and the bigint tier removes the overflow question
+  lambda boundaries, and automatic promotion removes the overflow question
   altogether.
 - **A richer class model**: inheritance — single first, multiple
   eventually — plus common dunder protocols and generalized decorator

@@ -53,6 +53,9 @@ use alloc::sync::Arc;
 use core::fmt::{Debug, Display};
 use core::hash::Hash;
 
+mod py_integer;
+pub use py_integer::PyInteger;
+
 /// f64 math used by core Python semantics (`//`, `**`, round(), float
 /// repr). The inherent f64 methods live in std, not core, so without std
 /// these delegate to libm; the two agree on every case we rely on.

@@ -86,11 +86,21 @@ impl CodeGen for UnaryOp {
         // unary minus on PyValue — USub routes through py_neg (a TypeError
         // panic for unmodeled operands, matching the PySub contract).
         // Computed before `options`/`symbols` are moved below.
+        let operand_type = crate::infer_type(Some(&ctx), &self.operand, &options, &symbols);
         let operand_is_boxed = matches!(
-            crate::infer_type(Some(&ctx), &self.operand, &options, &symbols),
+            operand_type,
             crate::TypeInfo::PyValue | crate::TypeInfo::PyObject
         );
         let operand = self.operand.clone().to_rust(ctx, options, symbols)?;
+        if matches!(operand_type, crate::TypeInfo::BigInt) {
+            return match self.op {
+                Ops::USub => Ok(quote!(- &(#operand))),
+                Ops::UAdd => Ok(quote!((#operand).clone())),
+                Ops::Invert => Ok(quote!(!(#operand).clone())),
+                Ops::Not => Ok(quote!(!(#operand).is_truthy())),
+                _ => Err("unknown arbitrary-precision integer unary operator".into()),
+            };
+        }
         match self.op {
             // `~x` is Rust's bitwise complement, but `not x` is a
             // TRUTHINESS test: `not 5` is False, where `!5i64` is -6.

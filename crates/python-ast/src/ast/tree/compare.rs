@@ -127,6 +127,35 @@ impl CodeGen for Compare {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        let big = std::iter::once(self.left.as_ref()).chain(self.comparators.iter())
+            .any(|e| crate::infer_type(Some(&ctx), e, &options, &symbols) == crate::TypeInfo::BigInt);
+        if big {
+            if self.ops.len() != 1
+                || self.ops.iter().any(|op| matches!(op, Compares::Is | Compares::IsNot | Compares::In | Compares::NotIn))
+                || std::iter::once(self.left.as_ref()).chain(self.comparators.iter())
+                    .any(|e| !matches!(crate::infer_type(Some(&ctx), e, &options, &symbols),
+                        crate::TypeInfo::Int | crate::TypeInfo::BigInt | crate::TypeInfo::Float | crate::TypeInfo::Bool))
+            {
+                return Err("this arbitrary-precision integer comparison is not supported yet; use a single numeric comparison; rython refuses to silently narrow the integer".into());
+            }
+            let render = |expr: &ExprType| -> Result<TokenStream, Box<dyn std::error::Error>> {
+                let tokens = expr.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+                Ok(if crate::infer_type(Some(&ctx), expr, &options, &symbols) == crate::TypeInfo::Int {
+                    quote!((#tokens) as i64)
+                } else { tokens })
+            };
+            let left = render(&self.left)?;
+            let right = render(&self.comparators[0])?;
+            return Ok(match self.ops[0] {
+                Compares::Eq => quote!((#left).py_eq(&(#right))),
+                Compares::NotEq => quote!((#left).py_ne(&(#right))),
+                Compares::Lt => quote!((#left).py_lt(&(#right))),
+                Compares::LtE => quote!((#left).py_le(&(#right))),
+                Compares::Gt => quote!((#left).py_gt(&(#right))),
+                Compares::GtE => quote!((#left).py_ge(&(#right))),
+                _ => unreachable!(),
+            });
+        }
         // A CHAINED comparison (`a < b < c`) must evaluate every operand
         // exactly once — the naive `a < b && b < c` expansion evaluates
         // `b` twice, running its side effects twice and, for a

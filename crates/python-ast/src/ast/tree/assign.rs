@@ -193,6 +193,38 @@ impl<'a> CodeGen for Assign {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        let value_type = crate::infer_type(Some(&ctx), &self.value, &options, &symbols);
+        if self.targets.iter().filter(|t| !matches!(t, ExprType::Name(_))).any(|target|
+            crate::ast::tree::visit::any_expr_for(target, crate::ast::tree::visit::Descend::All, &mut |e|
+                crate::ast::tree::type_ctx::type_mentions_bigint(&crate::infer_type(Some(&ctx), e, &options, &symbols))))
+        {
+            return Err("an arbitrary-precision integer in an assignment target is not supported yet; use a bounded integer index or an integer local; rython refuses to silently truncate it".into());
+        }
+        if crate::ast::tree::type_ctx::type_mentions_bigint(&value_type) {
+            let pinned_to_small = matches!(self.targets.as_slice(), [ExprType::Name(n)]
+                if options.name_types.get(&n.id) == Some(&crate::TypeInfo::Int));
+            if self.annotation.is_some() || pinned_to_small || !matches!(self.targets.as_slice(), [ExprType::Name(_)]) {
+                return Err("an arbitrary-precision integer assignment to an annotated binding or a non-local target is not supported yet; keep it in an unannotated integer local; rython refuses to silently narrow it".into());
+            }
+        }
+        if let [ExprType::Name(n)] = self.targets.as_slice()
+            && options.name_types.get(&n.id) == Some(&crate::TypeInfo::BigInt)
+            && value_type == crate::TypeInfo::Int
+        {
+            let target = crate::safe_ident(&n.id);
+            let value = crate::render_typed(&self.value, ctx, options, symbols, Some(crate::TypeInfo::BigInt))?;
+            return Ok(quote!(#target = #value;));
+        }
+        if value_type == crate::TypeInfo::BigInt
+            && let [ExprType::Name(n)] = self.targets.as_slice()
+            && !options.scope_global_writables.contains(&n.id)
+        {
+            // Integers are immutable values. An alias assignment can clone
+            // the representation without breaking Python's mutation model.
+            let target = crate::safe_ident(&n.id);
+            let value = crate::render_reused(&self.value, ctx, options, symbols)?;
+            return Ok(quote!(#target = #value;));
+        }
         // A `lambda` bound to a NAME whose type is a callable value
         // (issue #122): the name's type — from its uses, or from an
         // annotation — is what types the lambda's parameters, so the

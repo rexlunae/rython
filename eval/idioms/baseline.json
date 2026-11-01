@@ -6,6 +6,9 @@
     "bank": {
       "status": "pass"
     },
+    "big_integer_scalar": {
+      "status": "pass"
+    },
     "boxed_constructor": {
       "status": "pass"
     },

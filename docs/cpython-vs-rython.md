@@ -68,14 +68,17 @@ Each of these is a tradeoff taken knowingly. The pattern to notice: in
 every case, the failure mode is *loud* — a conversion error, a typed
 exception, or a panic — never a silently different answer.
 
-### Integers: `i64`, not arbitrary precision
+### Integers: bounded ordinary arithmetic, unbounded oversized literals
 
-CPython's `int` grows without bound; Rython's `int` is a 64-bit signed
-integer that does not grow. Overflow **panics in debug builds**; in
+CPython's `int` grows without bound; Rython's ordinary integer arithmetic
+still uses 64-bit signed integers that do not grow. Overflow **panics in debug builds**; in
 release builds (which `rypip build`/`install` produce) Rust's unchecked
 arithmetic currently wraps silently — a ledgered gap
 ([spec §12.2](spec.md)), and part of why overflow-adjacent arithmetic
-is out of contract until the bigint tier lands.
+is out of contract until the bigint migration is complete. Oversized scalar
+literals now use `PyInteger` automatically, and their arithmetic grows without
+overflow; unsupported boundaries are conversion errors. See
+[automatic-integers.md](automatic-integers.md) for the supported slice.
 
 - **Bought**: machine-speed arithmetic, `Copy` semantics, no allocation
   for numbers, viability in `no_std` and kernel contexts.

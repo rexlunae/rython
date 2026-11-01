@@ -18,6 +18,15 @@ The default Python runtime library for the Rython compiler ecosystem. This crate
 
 ## Architecture
 
+`PyInteger` provides the unbounded scalar integer runtime used for oversized
+Python literals. It keeps small values in `i64` storage and promotes checked
+addition, subtraction and multiplication to `num-bigint`; floor division,
+modulo, numeric comparisons, hashing and decimal display preserve Python's
+integer semantics. It is available in both the alloc and std tiers. Compiler
+integration is currently limited to the scalar slice documented in
+[automatic-integers.md](../../docs/automatic-integers.md); ordinary generated
+integers still use the bounded `i64` runtime.
+
 This library uses a generic trait-based design that mirrors Python's built-in behavior:
 
 ### Conversion Traits

@@ -14,6 +14,7 @@ pub mod await_kw;
 pub use await_kw::*;
 
 pub mod bin_ops;
+pub(crate) mod big_integer;
 pub use bin_ops::*;
 
 pub mod bool_ops;

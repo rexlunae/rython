@@ -271,6 +271,12 @@ fn generate_kernel_lib_rs(
     let ast =
         parse_enhanced(source, "<kernel>".to_string()).map_err(|e| anyhow::anyhow!("{}", e))?;
 
+    // The kernel shim has no arbitrary-precision integer runtime. Inspect
+    // every body through the shared visitor, including the device mode.
+    if let Some(line) = python_ast::first_big_integer_literal_line(&ast.raw.body) {
+        anyhow::bail!("arbitrary-precision integer literal (line {line}) is not supported by the kernel shim yet; use in-range integer operands or the alloc/std target; rython refuses to silently narrow it");
+    }
+
     // The kernel runs with the FPU in a lazy-save state: reject
     // floating-point usage loudly instead of emitting code that can corrupt
     // userspace state (issue #87). Unconditional — the device-manifest
@@ -1899,6 +1905,16 @@ fn convert_on_this_thread(
     }
     if opts.driver && (opts.kernel_module || opts.pyo3 || opts.no_std) {
         bail!("--driver cannot be combined with --kernel-module, --pyo3, or --no-std");
+    }
+    if opts.pyo3 || opts.driver {
+        let target = if opts.pyo3 { "PyO3" } else { "driver" };
+        for module in &package.modules {
+            let ast = parse_enhanced(&module.source, parse_filename(module))
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            if let Some(line) = python_ast::first_big_integer_literal_line(&ast.raw.body) {
+                bail!("arbitrary-precision integer literal ({} line {line}) is not supported by the {target} target yet; use in-range operands or ordinary alloc/std conversion; rython refuses to silently narrow it", module.file.display());
+            }
+        }
     }
 
     let entry_file = package.entry_module().map(|m| m.file.clone());
