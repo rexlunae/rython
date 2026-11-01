@@ -48,6 +48,7 @@ pub mod import;
 pub use import::*;
 
 pub(crate) mod interpreter_state;
+pub(crate) mod pytest;
 
 pub mod keyword;
 pub use keyword::*;

@@ -1,4 +1,4 @@
-# Running Python test suites under rython (issue #334)
+# Running Python test suites under rython (issues #334 and #482)
 
 This document records what actually works today for running a Python
 library's test suite through rython, what does not, the exact code sites
@@ -14,13 +14,13 @@ Deviation ledger: [`spec.md`](spec.md) §12.
 - **`unittest` suites work today, for a bounded subset.** A `unittest`
   module converts, builds, and runs; assertions, fixtures and gates are
   lowered; exit status matches CPython (0 on pass, 1 on failure).
-- **One common construct is broken:** `with self.assertRaises(...)` whose
-  body ends in a `raise` statement converts silently and then fails to
-  build. Reproducer and root cause below.
-- **`pytest` is not supported at all** — not partially, not with warnings.
-  A pytest module converts "successfully", then fails to build on a
-  phantom `use crate::pytest;`. Zero occurrences of the string `pytest`
-  exist in `crates/`.
+- **`with self.assertRaises(...): raise ...` works** since #457. The
+  former build failure and its cause are recorded below as history.
+- **There is no pytest runner or automatic collection.** A module with
+  only `test_*` functions remains a library. An unresolved `import pytest`
+  warns through the external-module channel (#456); attempts to use
+  `pytest.main`, including imported aliases and runner values, fail
+  conversion with a rewrite (#482).
 - **Callables-as-data is implemented**, which is what the issue's original
   text says is missing. The issue's own text is stale on this point.
 
@@ -89,7 +89,8 @@ if __name__ == "__main__":
 `rypip convert` → `cargo build` → run: exit 0, matching `python3` exit 0.
 Adding a failing test (`self.assertEqual(1, 2)`) makes both exit 1.
 
-Verified against CPython (3.14) and rython `rypip` built from `a055a18`:
+The original unittest measurements used CPython 3.14 and rython `a055a18`;
+the #457 and #482 pins below update the affected rows:
 
 | Construct | Converts | Builds | Runs | Matches CPython |
 |---|---|---|---|---|
@@ -98,10 +99,11 @@ Verified against CPython (3.14) and rython `rypip` built from `a055a18`:
 | `assertTrue` | yes | yes | yes | pass/fail outcome yes |
 | `setUp` fixture | yes | yes | yes | yes |
 | `with self.assertRaises(E): f()` | yes | yes | yes | yes |
-| `with self.assertRaises(E): raise E(...)` | yes | **no** | — | **broken** |
+| `with self.assertRaises(E): raise E(...)` | yes | yes | yes | yes (#457) |
 | `@unittest.skip` / `skipIf` / `skipUnless` | yes | yes | yes | yes (gates honoured) |
 | `@expectedFailure` | yes | yes | yes | yes |
-| pytest-style module | "yes" | **no** | — | **no support** |
+| Function-only `test_*` module | yes | yes (library) | no binary | no implicit collection, as with `python file.py` |
+| External `pytest.main(...)` / imported alias | **conversion error** | — | — | no runner; run under CPython or port to unittest |
 
 ### The runner's output (Phase 3, done)
 
@@ -142,7 +144,11 @@ off. A clean run now reports `Ran N tests` and `OK`, so zero tests
 and two passing tests are no longer indistinguishable. Pinned end to end
 by `unittest_main_prints_cpythons_report` (convert_tests).
 
-## The defect: `raise` as the last statement of `assertRaises`
+## Historical defect: `raise` as the last statement of `assertRaises`
+
+Fixed by #457; the native regression is
+`unittest_assert_raises_with_a_raise_builds_and_runs`. The original
+reproducer and analysis follow.
 
 ### Reproducer
 
@@ -239,7 +245,7 @@ closure). A correct fix makes `guarantees_return` treat a `with` whose body
 merely *raises* as not guaranteeing the enclosing return, or gives the
 assertRaises lowering its own tail accounting.
 
-### Why the test suite does not catch it
+### Why the old test suite did not catch it
 
 `crates/python-ast/tests/codegen_semantics.rs:6275`
 (`unittest_assert_raises_with_statement_lowers`) asserts only on the
@@ -250,9 +256,10 @@ assert!(out.contains("assert_raises (\"ValueError\"") /* … */);
 ```
 
 Its body is `int("x")` — a *call*, not a `raise` — so it exercises the
-shape that happens to work. No test in the suite compiles the generated
-crate for this construct, so the failure is invisible to
-`cargo test --workspace`.
+shape that happens to work. Before #457, no test compiled the generated
+crate for this construct,
+so the failure was invisible to `cargo test --workspace`. The native
+regression test added by #457 covers it now.
 
 This is worth stating plainly: **a codegen-shape assertion is not a
 correctness test.** AGENTS.md's "every behavior claim needs a
@@ -260,40 +267,78 @@ CPython-verified test" is satisfied by an end-to-end pin that builds and
 runs; a `contains()` check on tokens is necessary but not sufficient, and
 this defect is the evidence.
 
-## `pytest` has no support
+## pytest: libraries stay libraries; runner requests are refused
 
-A pytest-style module:
+Consider issue #482's complete example:
 
 ```python
-import pytest
-
-
-def test_add():
+def test_add() -> None:
     assert 1 + 1 == 2
+
+
+def test_sub() -> None:
+    assert 2 - 1 == 0
 ```
 
-`rypip convert` reports success and exits 0. The generated module then
-fails to build:
+`python3 app.py` exits 0 with empty stdout and stderr: defining the
+functions does not call them. Rython converts it to a library containing
+both functions, with no `src/main.rs`. `cargo build` succeeds; `cargo run`
+exits 101 with `a bin target must be available`. Neither tool reports a
+successful test run. Explicitly calling the functions still executes their
+assertions; an ordinary function named `test_*` is never rejected or
+implicitly collected.
 
+Adding `import pytest` does not select an entry point. Since #456, an
+unresolved import is dropped with an `external-module divergence` warning;
+it no longer emits a phantom `use crate::pytest;`. That warning does not
+provide pytest functionality.
+
+A request to run pytest is different:
+
+```python
+import pytest as pt
+
+if __name__ == "__main__":
+    raise SystemExit(pt.main(["-q", "test_math.py"]))
 ```
-error[E0432]: unresolved import `crate::pytest`
-   | use crate::pytest;
-   |     no `pytest` in the root
+
+There is no faithful pytest runner in the native runtime. Conversion
+refuses `pytest.main(...)`, `pt.main(...)`, `from pytest import main`
+followed by `main(...)`, and imported `as` spellings. References to the
+runner as a value (`runner = pytest.main`) are refused too, as are calls
+through crate re-exports of the imported runner. The public
+`pytest.console_main()` and `pytest.cmdline.main()` entrypoints have the
+same boundary. Copying pytest module/cmdline objects into ordinary value
+slots is refused before a placeholder could hide a subsequent runner call;
+use `import pytest as pt` for a module alias. The diagnostic includes
+the Python location and asks the user to run `python -m pytest` under
+CPython or port the suite to the supported unittest subset with an
+explicit `unittest.main()` entry. This is a conversion error even with
+`-W allow`. Parameters shadowing the import and real crate siblings named
+`pytest` retain their own behavior.
+
+Before the #482 guard, execution context mattered: a single-file runner
+could emit unresolved Rust calls, whereas a multi-module package could
+drop the call through the external-module warning path and produce a
+binary with no test output and exit 0. That explicit execution request was
+the silent gap; the function-only library was not.
+
+The CPython oracle is reproducible in an isolated environment (the
+measurement host's global packages are not a blocker):
+
+```sh
+python3 -m venv /tmp/rython-pytest-oracle
+/tmp/rython-pytest-oracle/bin/python -m pip install pytest==8.4.2
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONHASHSEED=0 \
+  /tmp/rython-pytest-oracle/bin/python -m pytest -q test_math.py
 ```
 
-and **no runner is emitted** — there is no `main.rs`, and the module's
-`test_*` functions are never called. The converter treats `pytest` as a
-crate-sibling import (the documented `--no-deps` contract,
-`crates/python-ast/src/ast/tree/import.rs`) rather than as an unsupported
-framework.
-
-This violates the "new unsupported edges must be loud" rule: the program
-converts without a warning and produces a crate that does not build. It
-should be a conversion error naming the construct.
-
-Confirmed by search: `pytest` appears **0 times** in `crates/`. The
-`StdModule` enum (`crates/python-ast/src/ast/tree/std_module.rs:106`) has
-`unittest` and no `pytest`.
+With the two functions above, pytest 8.4.2 reports one failure and one pass
+and exits 1. Calling `pytest.main(...)` directly returns its status; a
+script discarding that value still exits 0, but prints the test report.
+`raise SystemExit(pytest.main(...))` propagates status 1. Native transcript
+controls pin the library and explicit-function-call behavior against
+CPython 3.12 and 3.14; conversion-error tests pin the runner boundary.
 
 ## The real remaining gap for `unittest`: bound methods through unmodeled bases
 
@@ -314,7 +359,10 @@ is not.** `assertIs`, `assertRaisesRegex`, `assertMultiLineEqual`, and
 Ordered by cost-to-value, each phase independently landable under the
 prime directive.
 
-### Phase 1 — fix the `raise`-in-`assertRaises` defect (small, do first)
+### Phase 1 — fix the `raise`-in-`assertRaises` defect (done, #457)
+
+The following describes the former defect;
+`unittest_assert_raises_with_a_raise_builds_and_runs` now pins the fix.
 
 A one-shape bug with a known localization and a CPython-verified
 reproducer. The fix is in the **enclosing-return** accounting, not in the
@@ -337,19 +385,16 @@ The pin must be **end-to-end** (convert, build, run, diff exit status
 against `python3`), not a token check — the existing token pin
 (`codegen_semantics.rs:6275`) is exactly why this shipped.
 
-### Phase 2 — make `pytest` loud, and decide whether to support it
+### Phase 2 — make explicit pytest execution loud (done, #482)
 
-Distinguish "unmodeled framework" from "crate sibling import". A bare
-`import pytest` / `from pytest import …` with no crate sibling should be a
-conversion error naming the construct and the rewrite (port the tests to
-`unittest` under rython, or run them under CPython).
+Keep imports and function definitions as module/library code. Refuse the
+unsupported runner rather than silently drop a requested test run. See
+the pytest section above for the guarded spellings and the CPython oracle.
 
-Supporting pytest properly is a substantially larger project: fixtures,
-`conftest.py`, parametrization, `assert` rewriting. Note that rython does
-**not** need `assert` rewriting — it has no `assert` in the generated
-language to enhance — but it does need fixtures and collection. Whether that
-is in scope is a product decision, not an implementation one; this document
-does not recommend it.
+Supporting pytest itself remains a separate, substantially larger project:
+collection, fixtures, `conftest.py`, parametrization, plugins, and assertion
+rewriting all need reference behavior. Installing pytest in an isolated
+environment supplies an oracle; it does not supply a native runner.
 
 ### Phase 3 — match CPython's runner output (done)
 
@@ -373,18 +418,14 @@ Only after the above: the remaining assertion methods, transitive
 per-file wall for all 17 CPython stdlib test files and is the better
 running record for this phase.
 
-## Status of issue #334
+## Status of issues #334 and #482
 
-**Open, and correctly so — but its premise is stale.** The stated cause
-(callables as values) is implemented. What blocks the subject is a
-different, narrower list:
+Issue #334 closed after #476 landed the unittest report; #457 also fixed
+the `raise`-in-`assertRaises` build failure. The general `TestCase` surface
+still has limits described above and in `cpython-suite-status.md`.
 
-1. the `raise`-in-`assertRaises` defect (Phase 1);
-2. pytest converting silently into a non-building crate (Phase 2);
-3. ~~the runner's non-CPython output format (Phase 3)~~ — done, apart from
-   traceback frames (§12.3);
-4. the general `TestCase` surface beyond twelve hardcoded assertions.
-
-It cannot be closed today, but it should be **rewritten**: the callable-value
-framing is done, and keeping it makes the issue read as more unstarted than
-it is.
+Issue #482 carried over the pytest question. Its function-only example is
+normal library behavior, not evidence of a successful native test run.
+The actionable gap was an explicit pytest runner request being accepted
+and dropped in a package; the conversion guard makes that request loud.
+A full pytest runner remains unimplemented.

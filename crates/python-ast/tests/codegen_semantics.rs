@@ -30428,3 +30428,82 @@ fn a_shadowed_definition_under_module_control_flow_is_not_deduped() {
         "the unconditional definition stays: {out}"
     );
 }
+
+#[test]
+fn pytest_runner_execution_and_values_are_loud_conversion_errors() {
+    // Issue #482: an import is not a test request, but pytest.main is.
+    // Match the imported object, including aliases; never test_* spelling.
+    for source in [
+        "import pytest\npytest.main()\n",
+        "import pytest as pt\npt.main(['-q'])\n",
+        "import math, pytest as pt\npt.main()\n",
+        "from pytest import main\nmain()\n",
+        "from pytest import main as run_tests\nrun_tests()\n",
+        "import pytest\ndef run() -> None:\n    pytest.main()\n",
+        "def run() -> None:\n    import pytest as pt\n    pt.main()\n",
+        "def run() -> None:\n    from pytest import main as run_tests\n    run_tests()\n",
+        "import pytest\nif __name__ == '__main__':\n    pytest.main()\n",
+        "from pytest import main\nif __name__ == '__main__':\n    main()\n",
+        "from pytest import *\nif __name__ == '__main__':\n    main()\n",
+        "import pytest\nraise SystemExit(pytest.main())\n",
+        "import pytest\nrunner = pytest.main\nrunner()\n",
+        "from pytest import main as run_tests\nrunner = run_tests\nrunner()\n",
+        "import pytest\nprint(pytest.main)\n",
+        "import pytest\ntry:\n    pass\nfinally:\n    pytest.main()\n",
+        "import pytest\npytest.cmdline.main()\n",
+        "from pytest import cmdline as cli\ncli.main()\n",
+        "import logging, pytest\nlogging.info(pytest.main())\n",
+    ] {
+        let error = compile_err(source, "pytest_runner.py");
+        assert!(error.contains("pytest.main() test execution is not supported yet"), "{source}: {error}");
+        assert!(error.contains("pytest_runner.py:"), "{source}: {error}");
+        assert!(error.contains("python -m pytest") && error.contains("unittest.main()"), "{source}: {error}");
+        assert!(error.contains("refuses to silently ignore requested test execution"), "{source}: {error}");
+    }
+}
+
+#[test]
+fn pytest_test_function_names_and_shadowed_runner_names_remain_ordinary_code() {
+    let out = compile(
+        "def test_add() -> None:\n    assert 1 + 1 == 2\ndef test_sub() -> None:\n    assert 2 - 1 == 0\n",
+        "pytest_library.py",
+    );
+    assert!(out.contains("fn test_add") && out.contains("fn test_sub"), "{out}");
+    assert!(!out.contains("fn main"), "a library must not acquire a test runner: {out}");
+    for source in [
+        "def main() -> None:\n    pass\nmain()\n",
+        "class Runner:\n    def main(self) -> None:\n        pass\ndef run(pytest: Runner) -> None:\n    pytest.main()\n",
+        "import pytest as pt\nclass Runner:\n    def main(self) -> None:\n        pass\ndef run(pt: Runner) -> None:\n    pt.main()\n",
+        "from pytest import main as run_tests\ndef run(run_tests: int) -> int:\n    return run_tests\n",
+        "import pytest\nif False:\n    pytest.main()\n",
+    ] {
+        compile_as_entry(source, "ordinary_runner.py");
+    }
+}
+
+#[test]
+fn pytest_console_entry_is_the_same_unsupported_runner_boundary() {
+    for source in [
+        "import pytest\npytest.console_main()\n",
+        "from pytest import console_main as run_tests\nrun_tests()\n",
+        "import pytest\nraise SystemExit(pytest.console_main())\n",
+    ] {
+        let error = compile_err(source, "pytest_console.py");
+        assert!(error.contains("pytest.console_main() test execution is not supported yet"), "{source}: {error}");
+        assert!(error.contains("pytest_console.py:") && error.contains("python -m pytest"), "{error}");
+    }
+}
+
+#[test]
+fn pytest_module_values_cannot_hide_the_requested_runner() {
+    for source in [
+        "import pytest\npt = pytest\npt.main()\n",
+        "import pytest\ngetattr(pytest, 'main')()\n",
+        "from pytest import cmdline\ncli = cmdline\ncli.main()\n",
+    ] {
+        let error = compile_err(source, "pytest_module_value.py");
+        assert!(error.contains("pytest module/cmdline values are not supported yet")
+            || error.contains("pytest.main() test execution is not supported yet"), "{source}: {error}");
+        assert!(error.contains("pytest_module_value.py:") && error.contains("python -m pytest"), "{error}");
+    }
+}

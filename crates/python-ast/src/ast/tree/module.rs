@@ -1589,6 +1589,13 @@ impl CodeGen for Module {
                         && options.numpy_backend.is_none();
                     
                     if is_simple_main_call {
+                        // An imported pytest.main is a runner request too.
+                        // This promotion bypasses normal statement lowering,
+                        // so check it before consuming the call (#482).
+                        for statement in &if_stmt.body {
+                            crate::ast::tree::pytest::reject_in_statement(statement, &options, &symbols)
+                                .map_err(|error| wrap_module_error(&module_filename, error))?;
+                        }
                         // For simple main() calls, we'll use the user's main function directly
                         // Set a flag to indicate we should not rename the main function
                         has_main_code = true;

@@ -2529,6 +2529,14 @@ impl<'a> CodeGen for Call {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        crate::ast::tree::pytest::reject_in_expr(&self.func, &options, &symbols)?;
+        // Some call lowerings reject types or drop external calls before
+        // rendering arguments. An explicit runner nested there still
+        // needs the pytest diagnostic, including SystemExit(pytest.main()).
+        for value in self.args.iter().chain(self.keywords.iter().map(|keyword| &keyword.value)) {
+            crate::ast::tree::pytest::reject_in_expr(value, &options, &symbols)?;
+            crate::ast::tree::pytest::reject_module_value(value, &options, &symbols)?;
+        }
         use crate::ast::tree::interpreter_state::InterpreterNamespace;
         if let Some(namespace) = InterpreterNamespace::from_call(&self, &options, &symbols) {
             return Err(namespace.refusal().into());

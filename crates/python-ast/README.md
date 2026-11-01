@@ -76,6 +76,13 @@ request for a concrete `typing.Callable` signature. They cannot silently
 skip the call or substitute `None`; typed and boxed callable paths keep
 their modeled runtime behavior.
 
+Pytest runner references (`pytest.main`, `console_main`, `cmdline.main`,
+including imported aliases and function values) are refused during
+conversion. There is no native pytest collection or runner; run the suite under CPython or port to the supported
+unittest subset with an explicit `unittest.main()` entry. Ordinary
+`test_*` function definitions keep their library semantics. Copying pytest
+module/cmdline objects into ordinary value slots is also refused.
+
 ### Prerequisites
 
 - **Rust**: 1.82+ (2024 edition)

@@ -22765,6 +22765,8 @@ fn a_pytest_import_is_a_warning_not_a_broken_crate() {
         "the dropped import must warn through the definition channel: {:?}",
         krate.warnings
     );
+    assert!(!krate.has_binary, "importing pytest does not request a test run");
+    assert!(!krate.root.join("src/main.rs").exists());
     let status = build_generated(&krate.root);
     assert!(
         status.success(),
@@ -23891,4 +23893,137 @@ fn a_none_narrowed_optional_reads_its_class_constant() {
         "the narrowing makes the receiver a plain instance"
     );
     assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn pytest_function_only_module_stays_a_library() {
+    // Issue #482's exact example. Verified against python3.
+    // On CPython 3.12 and 3.14,
+    // executing this source has empty stdout/stderr and exits 0; neither
+    // function is called. Building a library does not claim tests passed.
+    let scratch = Scratch::new("pytest-library");
+    let file = scratch.path().join("app.py");
+    fs::write(&file, include_str!("fixtures/pytest_library.py")).unwrap();
+    let package = rypip::discover(&file).unwrap();
+    let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    assert!(!krate.has_binary);
+    assert!(!krate.root.join("src/main.rs").exists());
+    let source = fs::read_to_string(krate.root.join("src/app.rs")).unwrap();
+    assert!(source.contains("fn test_add") && source.contains("fn test_sub"), "{source}");
+    assert!(build_generated(&krate.root).success());
+    let run = Command::new("cargo").arg("run").current_dir(&krate.root).output().unwrap();
+    assert_eq!(run.status.code(), Some(101));
+    assert!(run.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("a bin target must be available"));
+}
+
+#[test]
+fn pytest_named_tests_and_shadowed_runner_names_keep_native_behavior() {
+    for (tag, source, expected) in [
+        ("explicit-calls", include_str!("fixtures/pytest_explicit_calls.py"), "called test_add\ncaught test_sub\nafter tests\n"),
+        ("shadowing", include_str!("fixtures/pytest_shadowing.py"), "local main\ntest helper\n"),
+    ] {
+        let scratch = Scratch::new(&format!("pytest-{tag}"));
+        let file = scratch.path().join("app.py");
+        fs::write(&file, source).unwrap();
+        let package = rypip::discover(&file).unwrap();
+        let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+        assert!(build_generated(&krate.root).success());
+        let output = Command::new(krate.root.join("target/debug/app")).output().unwrap();
+        // Verified against python3. Shadowing used pytest 8.4.2 in a venv.
+        assert_eq!(output.stdout, expected.as_bytes(), "{tag}");
+        assert!(output.stderr.is_empty(), "{tag}: {:?}", output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{tag}");
+    }
+}
+
+#[test]
+fn pytest_runner_requests_are_refused_in_single_files_and_packages() {
+    let scratch = Scratch::new("pytest-runner");
+    for source in [
+        "import pytest\nif __name__ == '__main__':\n    pytest.main()\n",
+        "import pytest as pt\nif __name__ == '__main__':\n    pt.main(['-q'])\n",
+        "from pytest import main\nif __name__ == '__main__':\n    main()\n",
+        "from pytest import *\nif __name__ == '__main__':\n    main()\n",
+        "from pytest import main as run_tests\nif __name__ == '__main__':\n    run_tests()\n",
+        "def run() -> None:\n    import pytest as pt\n    pt.main()\n",
+        "import pytest\nrunner = pytest.main\n",
+        "import pytest\nraise SystemExit(pytest.main())\n",
+        "from pytest import cmdline as cli\nif __name__ == '__main__':\n    cli.main()\n",
+        "from pytest import console_main as run_tests\nif __name__ == '__main__':\n    run_tests()\n",
+    ] {
+        let file = scratch.path().join("app.py");
+        fs::write(&file, source).unwrap();
+        let package = rypip::discover(&file).unwrap();
+        // Even -W allow must not turn explicit test execution into success.
+        let options = ConvertOptions {
+            warnings: rypip::convert::WarningMode::Allow,
+            ..Default::default()
+        };
+        let error = rypip::convert(&package, &scratch.path().join("crate"), &options)
+            .expect_err(&format!("runner source must be refused: {source}"));
+        let message = format!("{error:#}");
+        assert!(message.contains("pytest.") && message.contains("test execution is not supported yet"), "{source}: {message}");
+        assert!(message.contains("app.py:"), "{message}");
+        assert!(message.contains("python -m pytest") && message.contains("refuses"), "{message}");
+    }
+
+    let root = scratch.path().join("package");
+    fs::create_dir_all(root.join("example")).unwrap();
+    fs::write(root.join("pyproject.toml"), "[project]\nname = \"example\"\nversion = \"0.1.0\"\n").unwrap();
+    fs::write(root.join("example/__init__.py"), "").unwrap();
+    fs::write(root.join("example/bridge.py"), "from pytest import main as run_tests\n").unwrap();
+    fs::write(root.join("example/test_math.py"), include_str!("fixtures/pytest_library.py")).unwrap();
+    for source in [
+        "import pytest as pt\nif __name__ == '__main__':\n    pt.main()\n",
+        "from pytest import main as run_tests\nif __name__ == '__main__':\n    run_tests()\n",
+        "from .bridge import run_tests\nif __name__ == '__main__':\n    run_tests()\n",
+        "import pytest\nif __name__ == '__main__':\n    pytest.cmdline.main()\n",
+        "import pytest\nif __name__ == '__main__':\n    pytest.console_main()\n",
+    ] {
+        fs::write(root.join("example/__main__.py"), source).unwrap();
+        let package = rypip::discover(&root).unwrap();
+        let error = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("pytest.") && message.contains("test execution is not supported yet"), "{source}: {message}");
+        assert!(message.contains("__main__.py:"), "{message}");
+    }
+}
+
+#[test]
+fn pytest_named_crate_siblings_keep_their_own_main() {
+    let scratch = Scratch::new("pytest-sibling");
+    let root = scratch.path().join("example");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(scratch.path().join("pyproject.toml"), "[project]\nname = \"example\"\nversion = \"0.1.0\"\n").unwrap();
+    fs::write(root.join("__init__.py"), "").unwrap();
+    fs::write(root.join("pytest.py"), "def main() -> None:\n    print('sibling main')\n").unwrap();
+    fs::write(root.join("__main__.py"), "from . import pytest as local\nfrom .pytest import main as run_tests\nif __name__ == '__main__':\n    local.main()\n    run_tests()\n").unwrap();
+    let package = rypip::discover(scratch.path()).unwrap();
+    let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/example")).output().unwrap();
+    // Verified against python3. Invoked as python -m example, without pytest.
+    assert_eq!(output.stdout, b"sibling main\nsibling main\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn pytest_module_value_aliases_are_refused_before_the_runner_is_lost() {
+    let scratch = Scratch::new("pytest-module-value");
+    for source in [
+        "import pytest\npt = pytest\nif __name__ == '__main__':\n    pt.main()\n",
+        "import pytest\nif __name__ == '__main__':\n    getattr(pytest, 'main')()\n",
+        "from pytest import cmdline\ncli = cmdline\nif __name__ == '__main__':\n    cli.main()\n",
+    ] {
+        let file = scratch.path().join("app.py");
+        fs::write(&file, source).unwrap();
+        let package = rypip::discover(&file).unwrap();
+        let error = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("pytest module/cmdline values are not supported yet")
+            || message.contains("pytest.main() test execution is not supported yet"), "{source}: {message}");
+        assert!(message.contains("app.py") && message.contains("python -m pytest"), "{message}");
+    }
 }

@@ -71,6 +71,15 @@ statements after it after the program body, and the generated entry runs
 them before. Packages without an entry module convert to library crates
 and cannot be `install`ed.
 
+A module containing only `test_*` functions is also a library: conversion
+and `cargo build` do not run the tests; `cargo run` reports that no binary
+target exists. An unresolved `import pytest` emits an external-module
+warning. Explicit pytest runner calls and values (`pytest.main`,
+`console_main`, `cmdline.main`, including import aliases) are conversion
+errors even with `-W allow`; run pytest under CPython or port to the supported unittest subset with an explicit
+entry. Copying pytest module/cmdline objects into value slots is also
+refused. See [testing under rython](../../docs/testing-under-rython.md).
+
 ## Unannotated parameters (parameter type inference)
 
 Annotations were de facto mandatory: an unannotated parameter used to lower

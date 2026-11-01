@@ -73,9 +73,9 @@ and [`rypip install`](examples/05-rypip-install) turning a
 - [The frontier](docs/frontier.md) — the measured rustc-error frontier on
   the pinned package corpus, the boxed-`PyValue` boundary that dominates
   it, and the candidate designs (issue #335)
-- [Testing under rython](docs/testing-under-rython.md) — what works today
-  for running a Python library's test suite, the exact code sites, and a
-  phased plan toward pytest/unittest (issue #334)
+- [Testing under rython](docs/testing-under-rython.md) — bounded unittest
+  support, the explicit pytest runner boundary, and ways to test a
+  converted library (#334, #482)
 - [The JIT](docs/jit.md) — the design for on-demand compilation: convert,
   build with `rustc`, cache, load in-process (issue #166)
 - [Evaluating a JIT](docs/jit-eval.md) — the earlier evaluation, superseded
@@ -189,6 +189,12 @@ errors; see [the exception specification](docs/spec.md#8-exceptions).
 
 Known gaps:
 
+- **pytest**: no automatic collection or native runner. Function-only
+  test modules remain libraries; external `import pytest` warns, and
+  `pytest.main`, `console_main`, and `cmdline.main` calls or runner values
+  (including imported aliases) are conversion errors. Copying pytest
+  module objects into value slots is also refused. Run pytest under
+  CPython or port to the supported unittest subset with an explicit entry.
 - **Numbers**: ordinary integers use `i64`. Oversized scalar literals
   automatically use `PyInteger`, backed by `num-bigint`; their `+`, `-`,
   `*`, `//` and `%` arithmetic grows without overflow. This first slice
