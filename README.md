@@ -177,6 +177,7 @@ Their positional scalar/tuple arguments retain Python's `str` and `repr`
 forms, including the args tuple for multi-argument messages. Mutable or
 unknown arguments and unsupported specialized constructors are conversion
 errors; see [the exception specification](docs/spec.md#8-exceptions).
+`socket.gaierror` and `herror` keep their distinct OSError subtype matching.
 
 Known gaps:
 

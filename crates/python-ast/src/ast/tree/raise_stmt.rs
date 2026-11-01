@@ -330,15 +330,18 @@ pub fn is_builtin_exception_name(name: &str) -> bool {
 }
 
 /// CPython's stdlib exception ALIASES: `socket.timeout` IS TimeoutError
-/// and the socket error family IS OSError (Python ≥3.10 aliases the
-/// class objects), so raises and except-clauses through these names
+/// and `socket.error` IS OSError (Python aliases these class objects).
+/// gaierror/herror retain their distinct subclass names. Raises and
+/// except-clauses through these names
 /// canonicalize to the builtin the runtime's hierarchy walk knows
 /// (urllib3's pyopenssl `raise timeout(...)` under `from socket import
 /// timeout` — issue #137).
 pub(crate) fn stdlib_exception_canonical(module: &str, name: &str) -> Option<&'static str> {
     match (module, name) {
         ("socket", "timeout") => Some("TimeoutError"),
-        ("socket", "error" | "gaierror" | "herror") => Some("OSError"),
+        ("socket", "error") => Some("OSError"),
+        ("socket", "gaierror") => Some("gaierror"),
+        ("socket", "herror") => Some("herror"),
         // The ssl exception family is in stdpython's runtime hierarchy
         // under its own names (SSLError IS-A OSError), so the canonical
         // form is the bare name; CertificateError is CPython's alias of

@@ -1970,11 +1970,12 @@ the checked-in table in stdpython carries it (regenerated and verified
 by python-ast's `exception_tree_is_current` test, so the runtime can
 never silently diverge from the reference interpreter). The
 `EnvironmentError`/`IOError` aliases resolve to `OSError` for matching
-(they are the same class object), and the stdlib exception aliases
-(`socket.timeout` IS `TimeoutError`, the `socket.error`/`gaierror`/
-`herror` family IS `OSError` — CPython aliases the class objects)
-canonicalize at conversion time on both the raise and the except side,
-however they were imported or renamed (issue #137). An exception type
+(they are the same class object). The stdlib aliases `socket.timeout`
+(IS `TimeoutError`) and `socket.error` (IS `OSError`) canonicalize at
+conversion time on both the raise and the except side, however they were
+imported or renamed (issue #137). `socket.gaierror` and `socket.herror`
+retain their distinct subclass names; neither catches other OSError
+subclasses (issue #503). An exception type
 outside the built-in tree is caught only by `Exception`,
 `BaseException`, or its exact name. `except (A, B)` ORs the names; a
 dotted name matches on its final attribute; a bare `except:` catches
@@ -2904,6 +2905,7 @@ accepted as permanent spec:
 | Exception classes defining or inheriting custom `__str__` / `__repr__` bindings are refused at conversion, naming the defining class, binding and line. The old marker lowering discarded these methods and silently displayed the raise argument instead | Loud (issue #483); format explicit application data at its display sites |
 | A one-argument builtin `KeyError` records the original key's repr separately from its quoted display message. `repr(error)` preserves the original key type and quoting, and the key expression is evaluated once | Correct (issue #500); the old repr fallback quoted the display as another string |
 | Builtin exception calls share their construction/type in value and raise positions. Argument evaluation is once and ordered; str/repr preserve Python scalar spelling and original argument structure, including multi-argument tuple messages. Unsupported mutable/unknown representations and specialized forms, and potentially-unbound exception locals, are refused (§8.2) | Correct-or-loud (issues #477, #478, #502) |
+| Socket exception canonicalization keeps `gaierror` and `herror` as distinct OSError subclasses; they do not catch each other or FileNotFoundError. Only `socket.error` aliases OSError | Correct (issue #503); the old alias map broadened their handlers |
 | True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |
 | Exception message shapes: `int()`'s message carries "with base 10" and `float()`'s quotes the string as Python's repr (#339, round 10); `open` and stream errors are CPython's `[Errno N] text: 'path'` form (#339); the `KeyError` key quoting is single-quoted like CPython (round 99) | Correct (was a defect class in issue #82's family) |
 | An uncaught exception prints CPython's traceback header and final line but no traceback frames | Model limit (no frames) — the thread-exception entry's family (issue #479) |

@@ -33,3 +33,8 @@ None SyntaxError()
 bad SyntaxError('bad')
 () SSLError()
 ('tls',) SSLError('tls')
+dns gaierror('dns')
+host herror('host')
+OSError caught FileNotFoundError
+gaierror caught gaierror('dns')
+socket.error alias OSError('os')

@@ -50,6 +50,8 @@ elements, and modeled exceptions. Tuple elements require known types.
 Mutable/unknown values (including the shared bytes/bytearray type), keywords,
 splats, and unmodeled specialized constructor forms are refused. An exception
 local that may be unbound is refused before a generated default can be read.
+The socket aliases preserve actual class identity: `socket.error` is OSError,
+while gaierror/herror remain distinct subclasses for construction and matching.
 
 ### Prerequisites
 

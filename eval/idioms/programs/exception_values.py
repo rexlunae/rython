@@ -1,7 +1,9 @@
-Alias = ValueError
 from builtins import ValueError as ImportedError
 import builtins as builtin
+from socket import error as SocketError, gaierror, herror
 from ssl import SSLError
+
+Alias = ValueError
 calls = 0
 state = 1
 
@@ -98,6 +100,30 @@ def main() -> None:
     print(str(syntax), repr(syntax))
     print(str(ssl_empty), repr(ssl_empty))
     print(str(ssl_one), repr(ssl_one))
+    dns = gaierror("dns")
+    host = herror("host")
+    print(str(dns), repr(dns))
+    print(str(host), repr(host))
+    try:
+        raise FileNotFoundError("missing")
+    except gaierror:
+        print("wrong gaierror match")
+    except herror:
+        print("wrong herror match")
+    except OSError:
+        print("OSError caught FileNotFoundError")
+    try:
+        raise dns
+    except herror:
+        print("wrong sibling match")
+    except gaierror as network_error:
+        print("gaierror caught", repr(network_error))
+    try:
+        raise SocketError("os")
+    except gaierror:
+        print("wrong socket.error match")
+    except OSError as os_error:
+        print("socket.error alias", repr(os_error))
 
 
 if __name__ == "__main__":
