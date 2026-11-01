@@ -2974,7 +2974,7 @@ fn nested_def_bare_name_default_converts() {
     // expression default still stays loud — see
     // omitted_defaults_must_be_constant.)
     let module = crate::parse(
-        "x = \"prefix\"\nsep = \"-\"\ndef join(words):\n    def glue(a=x, b=sep) -> str:\n        return a + b\n    return [glue() for _ in words]\n",
+        "x = \"prefix\"\nsep = \"-\"\ndef join(words: list[str]) -> list[str]:\n    def glue(a: str=x, b: str=sep) -> str:\n        return a + b\n    return [glue() for _ in words]\n",
         "nestednamedefault.py",
     )
     .unwrap();
@@ -11113,23 +11113,11 @@ fn unannotated_method_parameter_lowers_as_boxed_pyvalue() {
 }
 
 #[test]
-fn callable_parameter_call_drops_as_a_noop() {
-    // A callable parameter called as a function: the callable-as-value
-    // divergence (issue #122) — the call site drops to the boxed None and
-    // -W reports it.
-    let (out, warnings) = compile_with_warnings("def f(cb):\n    return cb(1)\n", "inf_callable.py");
-    assert!(
-        out.contains("stdpython :: PyValue :: None_"),
-        "the call through the callable must drop to a no-op: {}",
-        out
-    );
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("call through callable value `cb`") && w.contains("dropped")),
-        "the callable-as-value divergence must be reported through -W: {:?}",
-        warnings
-    );
+fn unresolved_callable_parameter_calls_are_conversion_errors() {
+    // Verified against python3: f(lambda x: x + 1) returns 2, not None.
+    let error = compile_err("def f(cb):\n    return cb(1)\n", "inf_callable.py");
+    assert!(error.contains("call through unresolved callable `cb`")
+        && error.contains("typing.Callable") && error.contains("refuses to drop"), "{error}");
 }
 
 #[test]
@@ -17305,22 +17293,17 @@ fn ununifiable_operands_keep_the_loud_boolean_approximation() {
 }
 
 #[test]
-fn option_and_untyped_call_uses_the_option_arm() {
-    // Round 43: `ca and expanduser(ca)` (urllib3's ca_certs) — the first
-    // operand is Option<String>, the second is a CALL whose return type
-    // infers PyObject (method/module-call returns are unresolved) but
-    // renders the inner String. The fold must still use the
-    // operand-returning Option arm (Some-wrap the truthy arm), not the
-    // `&&` boolean approximation (which rustc rejects — Option has no
-    // bool operator).
+fn option_and_callable_call_uses_the_option_arm() {
+    // An Option<String> combined with a scalar-returning callable must
+    // keep the operand-returning Option fold and Some-wrap the RHS.
     let out = compile(
-        "def pick(ca: str | None, fn) -> str | None:\n    return ca and fn(ca)\n",
+        "from typing import Callable\ndef pick(ca: str | None, fn: Callable[[str], str]) -> str | None:\n    return ca and fn(ca)\n",
         "andcall.py",
     );
     assert!(
         out.contains("__rython_and") && out.contains("is_truthy () { Some (")
             || out.contains("__rython_and") && out.contains("is_truthy() { Some("),
-        "Option and an untyped call must use the operand-returning fold: {}",
+        "Option and a scalar call must use the operand-returning fold: {}",
         out
     );
     assert!(
@@ -19749,28 +19732,14 @@ fn set_literal_call_uses_the_runtime_conversion() {
 }
 
 #[test]
-fn call_through_a_boxed_value_drops_loudly() {
-    // Issue #122's callable-as-value divergence: a call whose callee is a
-    // boxed/String/Option VALUE (a `pool_cls(...)`-style class-name local,
-    // or an unresolvable self member like `self._tunnel()` — a method
-    // inherited from an external base) lowers to the warned no-op (the
-    // boxed None), never a `value(...)` E0618 string-call or an E0599.
-    let out = compile_with_warnings(
-        concat!(
-            "def take(cb) -> str:\n",
-            "    return cb(\"x\")\n",
-            "\n",
-            "def run():\n",
-            "    f = take\n",
-            "    return f(\"y\")\n",
-        ),
+fn an_unresolved_callable_parameter_is_loud_through_a_function_alias() {
+    // Verified against python3: run() returns "x" through the callback.
+    let error = compile_err(
+        "def take(cb) -> str:\n    return cb(\"x\")\ndef identity(value: str) -> str:\n    return value\ndef run() -> str:\n    f = take\n    return f(identity)\n",
         "cb.py",
     );
-    assert!(
-        out.0.contains("PyValue :: None_") || out.0.contains("PyValue::None_"),
-        "the call through the callable value must lower to the boxed None: {}",
-        out.0
-    );
+    assert!(error.contains("call through unresolved callable `cb`")
+        && error.contains("typing.Callable") && error.contains("refuses to drop"), "{error}");
 }
 
 #[test]
@@ -30170,6 +30139,24 @@ fn cast_wrapped_and_returned_mutable_outputs_are_loud() {
 }
 
 #[test]
+fn unresolved_callable_parameters_cannot_drop_calls() {
+    // Verified against python3: label is the callback passed to collect,
+    // not the same-named scalar module function; it returns the inner list.
+    for result in ["[label(value) for value in values]", "[label(values[0])]"] {
+        let source = format!(
+            "from typing import Any\ndef label(value: list[int]) -> str:\n    return str(value)\ndef identity(value: list[int]) -> list[int]:\n    return value\ndef collect(label, values: list[list[int]]) -> list[Any]:\n    return {result}\ndef main() -> None:\n    source = [[1]]\n    result = collect(identity, source)\n    source[0].append(2)\n    print(source, result)\n"
+        );
+        let error = compile_err(&source, "unresolved_callable_output.py");
+        if result.contains(" for ") {
+            assert!(error.contains("comprehension output") && error.contains("unresolved"), "{error}");
+        } else {
+            assert!(error.contains("call through unresolved callable `label`")
+                && error.contains("typing.Callable") && error.contains("refuses to drop the call"), "{error}");
+        }
+    }
+}
+
+#[test]
 fn callable_comprehension_targets_cannot_claim_builtin_ownership() {
     // Verified against python3: both callable targets return the source
     // inner list; mutating source[0] must update the collected value.
@@ -30199,6 +30186,11 @@ fn subclass_registry_ownership_proof_never_drops_filters_or_arguments() {
         let error = compile_err(&source, "subclass_registry_output.py");
         assert!(error.contains("comprehension output") && error.contains("refuses to lose sharing"), "{error}");
     }
+    let error = compile_err(
+        "class Base:\n    pass\nclass Child(Base):\n    pass\ndef collect(Base):\n    return [kind() for kind in Base.__subclasses__()]\n",
+        "shadowed_registry.py",
+    );
+    assert!(error.contains("comprehension output") && error.contains("unresolved"), "{error}");
 }
 
 #[test]
@@ -30225,6 +30217,9 @@ fn unresolved_comprehension_output_requires_ownership_proof() {
         "from typing import Any\ndef collect(values: list[Any]) -> list[Any]:\n    return [(item, 0) for item in values]\n",
         "def collect(values):\n    return [item + [] for item in values]\n",
         "from typing import Callable\ndef collect(values: list[list[int]], f: Callable[[list[int]], list[int]]) -> list[list[int]]:\n    return [f(item) for item in values]\n",
+        "from typing import Any\ndef label(value: int) -> str:\n    return str(value)\ndef collect(label: Any, values: list[int]) -> list[Any]:\n    return [label(value) for value in values]\n",
+        "import typing\ndef collect(typing, values: list[int]):\n    return [typing.cast(int, value) for value in values]\n",
+        "class Receiver:\n    @staticmethod\n    def label(value: int) -> str:\n        return str(value)\ndef collect(Receiver, values: list[int]):\n    return [Receiver.label(value) for value in values]\n",
     ] {
         let error = compile_err(source, "unknown_output.py");
         assert!(error.contains("unresolved") && error.contains("annotate immutable output types")

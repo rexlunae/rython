@@ -80,9 +80,7 @@ impl TypingCall {
             Some(current)
         };
         match func {
-            ExprType::Name(name) if !options.local_types.contains_key(&name.id)
-                && !options.name_types.contains_key(&name.id)
-                && !options.called_params.contains(&name.id) => {
+            ExprType::Name(name) if !crate::ast::tree::type_ctx::name_is_locally_bound(&name.id, options) => {
                 let name = canonical(&name.id)?;
                 let SymbolTableNode::ImportFrom(import) = symbols.get(&name)? else { return None; };
                 if !is_typing(&import.module) { return None; }
@@ -92,8 +90,7 @@ impl TypingCall {
             }
             ExprType::Attribute(attr) => {
                 let ExprType::Name(name) = attr.value.as_ref() else { return None; };
-                if options.local_types.contains_key(&name.id) || options.name_types.contains_key(&name.id)
-                    || options.called_params.contains(&name.id) {
+                if crate::ast::tree::type_ctx::name_is_locally_bound(&name.id, options) {
                     return None;
                 }
                 let name = canonical(&name.id)?;

@@ -2595,9 +2595,7 @@ impl<'a> CodeGen for Call {
         // Other annotation-only typing calls retain their no-runtime
         // lowering; cast was handled above through the shared authority.
         if let ExprType::Name(name) = self.func.as_ref()
-            && !options.local_types.contains_key(&name.id)
-            && !options.name_types.contains_key(&name.id)
-            && !options.called_params.contains(&name.id)
+            && !crate::ast::tree::type_ctx::name_is_locally_bound(&name.id, &options)
             && let Some(SymbolTableNode::ImportFrom(import)) = symbols.get(&name.id)
             && crate::is_typing(&import.module)
         {
@@ -10925,12 +10923,12 @@ let mutating_self_field = boxed_self_ref_receiver
         if let ExprType::Name(callee_name) = self.func.as_ref()
             && options.called_params.contains(&callee_name.id)
         {
-            options.definition_warnings.borrow_mut().push(format!(
-                "call through callable value `{}` is dropped (the \
-                 callable-as-value divergence, issue #122)",
+            return Err(format!(
+                "call through unresolved callable `{}` is not supported yet; \
+                 annotate the parameter with typing.Callable and concrete argument/return types; \
+                 rython refuses to drop the call or invent a None result",
                 callee_name.id
-            ));
-            return Ok(quote!(stdpython::PyValue::None_));
+            ).into());
         }
 
         // A unittest assertion on a receiver (`self.assertEqual(a, b)`,

@@ -2240,9 +2240,12 @@ pub(crate) fn is_unshadowed_builtin(
 ) -> bool {
     (symbols.get(name).is_none()
         || crate::ast::tree::module::import_binds_builtin_self_alias(name, symbols, options))
-        && !options.local_types.contains_key(name)
-        && !options.name_types.contains_key(name)
-        && !options.called_params.contains(name)
+        && !name_is_locally_bound(name, options)
+}
+
+pub(crate) fn name_is_locally_bound(name: &str, options: &PythonOptions) -> bool {
+    options.local_types.contains_key(name) || options.name_types.contains_key(name)
+        || options.called_params.contains(name) || options.param_type_vars.contains_key(name)
 }
 
 fn builtin_call_type(name: &str) -> Option<TypeInfo> {

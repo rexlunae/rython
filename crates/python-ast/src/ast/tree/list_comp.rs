@@ -89,6 +89,29 @@ pub(crate) fn refuse_borrowed_mutable_output(
             ExprType::Name(_) | ExprType::Attribute(_) | ExprType::Subscript(_)
                 if needs_ownership_proof(&crate::infer_type(Some(ctx), e, scope, symbols)) => true,
             ExprType::Call(call) => {
+                // An unresolved local call cannot borrow a static
+                // function/module/class's result contract from an outer
+                // binding of the same spelling (including boxed calls).
+                use crate::ast::tree::type_ctx::name_is_locally_bound;
+                match call.func.as_ref() {
+                    ExprType::Name(name) if name_is_locally_bound(&name.id, scope)
+                        && crate::ast::tree::call::callee_value_signature(&call.func, ctx, scope, symbols).is_none() => return true,
+                    ExprType::Attribute(attr) => {
+                        if let ExprType::Name(receiver) = attr.value.as_ref()
+                            && name_is_locally_bound(&receiver.id, scope)
+                            && matches!(symbols.get(&receiver.id), Some(crate::SymbolTableNode::ClassDef(_)
+                                | crate::SymbolTableNode::Import(_) | crate::SymbolTableNode::ImportFrom(_)))
+                        {
+                            let ty = crate::infer_type(Some(ctx), &attr.value, scope, symbols);
+                            let unresolved = matches!(ty, crate::TypeInfo::PyObject | crate::TypeInfo::PyValue | crate::TypeInfo::ClassValue)
+                                || scope.param_type_vars.contains_key(&receiver.id)
+                                    && !scope.name_types.contains_key(&receiver.id)
+                                    && !scope.local_types.contains_key(&receiver.id);
+                            if unresolved { return true; }
+                        }
+                    }
+                    _ => {}
+                }
                 if let Some(value) = crate::ast::tree::annotation_module::cast_value(call, scope, symbols) {
                     return borrowed(value, ctx, scope, symbols, safe_names);
                 }
@@ -376,8 +399,7 @@ fn subclass_registry_base(
     if attr.attr != "__subclasses__" { return None; }
     let ExprType::Name(base) = attr.value.as_ref() else { return None; };
     if !matches!(symbols.get(&base.id), Some(crate::SymbolTableNode::ClassDef(_)))
-        || options.local_types.contains_key(&base.id) || options.name_types.contains_key(&base.id)
-        || options.called_params.contains(&base.id) { return None; }
+        || crate::ast::tree::type_ctx::name_is_locally_bound(&base.id, options) { return None; }
     let ExprType::Call(element) = comp.elt.as_ref() else { return None; };
     if !element.args.is_empty() || !element.keywords.is_empty() { return None; }
     match (element.func.as_ref(), &generator.target) {

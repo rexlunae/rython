@@ -71,6 +71,11 @@ safe members. Immutable outputs and fresh container literals keep their
 ordinary lowering. The shared bytes/bytearray type is also refused at
 this borrowing boundary.
 
+Calls through an unresolved callable parameter fail conversion with a
+request for a concrete `typing.Callable` signature. They cannot silently
+skip the call or substitute `None`; typed and boxed callable paths keep
+their modeled runtime behavior.
+
 ### Prerequisites
 
 - **Rust**: 1.82+ (2024 edition)
