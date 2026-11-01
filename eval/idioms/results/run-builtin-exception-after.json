@@ -1,7 +1,7 @@
 {
-  "converter_commit": "5fcca71",
-  "repo_head": "5fcca71",
-  "rypip_path": "/home/tserica/rython-tmp/pr504-review-bin/rypip",
+  "converter_commit": "178fdd2",
+  "repo_head": "178fdd2",
+  "rypip_path": "/home/tserica/rython-tmp/pr504-comprehension-bin/rypip",
   "oracle": "CPython 3.14.4 (pins captured under 3.11)",
   "passed": 66,
   "total": 67,
