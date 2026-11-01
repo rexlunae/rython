@@ -33,6 +33,8 @@ original code and argument reprs. Statuses are immutable scalars or tuples;
 unsupported statuses, code mutation/reflection, and subclasses are refused
 during conversion. Static import aliases work; passing `sys.exit` as a
 function value is refused.
+Exception attribute writes and direct reads of Rust payload fields are
+refused. Modeled caught-class fields keep their typed accessors.
 
 ### Prerequisites
 

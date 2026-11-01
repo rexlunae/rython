@@ -141,6 +141,8 @@ traceback. Catching it keeps the process alive and runs normal cleanup.
 `PyException::system_exit` also preserves code and args through PyO3.
 The default thread exception reporter ignores `SystemExit`, ending only
 the exiting thread after its cleanup runs.
+The converter refuses Python attribute writes and direct reads of Rust's
+exception payload fields; modeled caught-class attributes stay readable.
 
 ✅ **Complete built-in exception tree**: every CPython built-in exception
 name is modeled, and `except` matching walks the real hierarchy —

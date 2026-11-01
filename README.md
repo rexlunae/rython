@@ -165,6 +165,8 @@ an uncaught exit ends the process. Integer return codes, `None`, booleans,
 strings, floats, bytes, and immutable scalar tuples are supported. The
 exception's `code` can be read; mutation, reflection, mutable or unbounded
 statuses, and `SystemExit` subclasses are conversion errors.
+Exception attribute writes are refused; Python attributes cannot overwrite
+Rust's internal exception message or type.
 
 Known gaps:
 

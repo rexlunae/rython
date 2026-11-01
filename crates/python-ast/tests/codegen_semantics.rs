@@ -4757,6 +4757,26 @@ fn system_exit_code_mutation_and_reflection_are_loud() {
 }
 
 #[test]
+fn python_exception_attributes_do_not_expose_rust_payload_fields() {
+    // Verified against python3: assigning ValueError.message creates an
+    // auxiliary attribute; str(error) must still be "original" (#498).
+    for statement in ["error.message = 'changed'", "error.exception_type = 'Other'", "error.message += 'x'", "del error.message"] {
+        let source = format!("def f():\n    try:\n        raise ValueError('original')\n    except ValueError as error:\n        {statement}\n");
+        let error = compile_err(&source, "exception_payload.py");
+        assert!(error.contains("exception attribute") && error.contains("refuses"), "{statement}: {error}");
+    }
+    for field in ["message", "exception_type", "attrs", "args_repr", "discriminant", "user_ancestors"] {
+        let source = format!("def f():\n    error = SystemExit(3)\n    print(error.{field})\n");
+        let error = compile_err(&source, "exception_payload.py");
+        assert!(error.contains("exception attribute") && error.contains("refuses"), "{field}: {error}");
+    }
+    let ordinary = compile("class Payload:\n    def __init__(self):\n        self.message = 'original'\ndef read(value: Payload) -> str:\n    value.message = 'changed'\n    return value.message\n", "ordinary_payload.py");
+    assert!(ordinary.contains("fn read"));
+    let error = compile_err("def f():\n    try:\n        raise ValueError('x')\n    except ValueError as error:\n        error = SystemExit(3)\n", "exception_rebind.py");
+    assert!(error.contains("exception binding") && error.contains("fresh local name"), "{error}");
+}
+
+#[test]
 fn interpreter_namespaces_are_refused_instead_of_fabricated_or_ignored() {
     // Verified against python3: deleting sys.modules or builtins.locals
     // removes the attribute (hasattr returns False), so dropping del is wrong.

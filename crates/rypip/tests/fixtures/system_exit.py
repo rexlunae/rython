@@ -5,6 +5,13 @@ from sys import exit as stop
 quit = sys.exit
 
 
+class AppError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__("display")
+        self.message = message
+        self.code = message
+
+
 def leave() -> None:
     stop(7)
 
@@ -116,6 +123,15 @@ def main() -> int:
         thread.start()
         thread.join()
         print("joined")
+        return 0
+    if kind == "attrs":
+        try:
+            raise AppError("stored")
+        except AppError as error:
+            print(error.message)
+            print(error.message.upper())
+            print(error.code.upper())
+            print(str(error))
         return 0
     return 3
 

@@ -24,6 +24,25 @@ fn build_generated(root: &Path) -> std::process::ExitStatus {
 }
 
 #[test]
+fn exception_payload_stores_and_reads_are_refused_by_the_package_converter() {
+    let scratch = Scratch::new("exception-payload");
+    // Verified against python3: the message-store source prints original,
+    // and a new SystemExit has no Python attribute named message.
+    for source in [
+        "def f() -> None:\n    try:\n        raise ValueError('original')\n    except ValueError as error:\n        error.message = 'changed'\n        print(str(error))\nf()\n",
+        "def f() -> None:\n    error = SystemExit(3)\n    print(error.message)\nf()\n",
+    ] {
+        let file = scratch.path().join("app.py");
+        fs::write(&file, source).unwrap();
+        let package = rypip::discover(&file).unwrap();
+        let error = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("exception attribute") && message.contains("refuses"), "{message}");
+        assert!(message.contains("app.py"), "{message}");
+    }
+}
+
+#[test]
 #[cfg(unix)]
 fn system_exit_preserves_status_handlers_and_cleanup() {
     let scratch = Scratch::new("system-exit");
@@ -63,6 +82,7 @@ fn system_exit_preserves_status_handlers_and_cleanup() {
         ("option_some", 4, "kind option_some\n", ""),
         ("alias", 6, "kind alias\n", ""),
         ("thread", 0, "kind thread\nworker cleanup\njoined\n", ""),
+        ("attrs", 0, "kind attrs\nstored\nSTORED\nSTORED\ndisplay\n", ""),
     ] {
         let output = Command::new(krate.root.join("target/debug/app")).arg(kind).output().unwrap();
         assert_eq!(output.status.code(), Some(status), "{kind}");

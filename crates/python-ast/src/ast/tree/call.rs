@@ -2537,7 +2537,7 @@ impl<'a> CodeGen for Call {
         if let Some(tokens) = crate::ast::tree::system_exit::lower(&self, &ctx, &options, &symbols)? {
             return Ok(tokens);
         }
-        crate::ast::tree::system_exit::check_mutation(&self.func, &options, &symbols)?;
+        crate::ast::tree::system_exit::check_method_call(&self.func, &ctx, &options, &symbols)?;
         for value in self.args.iter().chain(self.keywords.iter().map(|keyword| &keyword.value)) {
             crate::ast::tree::system_exit::reject_function_value(value, &options, &symbols)?;
         }

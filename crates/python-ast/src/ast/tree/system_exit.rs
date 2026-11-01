@@ -226,16 +226,52 @@ impl ExitAttribute {
 
 pub(crate) fn code_attribute(
     attr: &crate::Attribute,
+    ctx: Option<&CodeGenContext>,
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> bool {
+    // A caught user class already has typed field accessors, including
+    // fields named code. Do not widen those fields to a boxed SystemExit code.
+    if ctx.is_some_and(CodeGenContext::in_except_handler)
+        && let ExprType::Name(name) = attr.value.as_ref()
+        && let Some(SymbolTableNode::ExceptBinding(Some(class))) = symbols.get(&name.id)
+        && crate::ast::tree::call::resolve_construction_class(class, symbols, options).is_some()
+    {
+        return false;
+    }
     ExitAttribute::from_name(&attr.attr).is_some()
-        && crate::ast::tree::arguments::is_exception_typeinfo(&crate::infer_type(
-            None,
-            &attr.value,
-            options,
-            symbols,
+        && exception_receiver(&attr.value, options, symbols)
+}
+
+fn caught_receiver(expr: &ExprType, symbols: &SymbolTableScopes) -> bool {
+    matches!(expr, ExprType::Name(name) if matches!(symbols.get(&name.id), Some(SymbolTableNode::ExceptBinding(_))))
+}
+
+fn exception_receiver(
+    expr: &ExprType,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    caught_receiver(expr, symbols)
+        || crate::ast::tree::arguments::is_exception_typeinfo(&crate::infer_type(
+            None, expr, options, symbols,
         ))
+}
+
+/// Caught-class fields have their existing typed accessors. Other exception
+/// values must never fall through to raw Rust struct-field access.
+pub(crate) fn check_read(
+    attr: &crate::Attribute,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !(ctx.in_except_handler() && caught_receiver(&attr.value, symbols))
+        && exception_receiver(&attr.value, options, symbols)
+    {
+        return Err(format!("exception attribute `{}` access is not supported in this position yet; use str(error), repr(error), SystemExit.code, or explicit typed application data; rython refuses to expose Rust exception payload fields as Python attributes", attr.attr).into());
+    }
+    Ok(())
 }
 
 /// Stored exception fields are immutable in the generated value model.
@@ -244,11 +280,44 @@ pub(crate) fn check_mutation(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut field = None;
+    crate::ast::tree::visit::any_expr(expr, |expr| {
+        if let ExprType::Attribute(attr) = expr
+            && exception_receiver(&attr.value, options, symbols)
+        {
+            field = Some(attr.attr.clone());
+            true
+        } else {
+            false
+        }
+    });
+    if let Some(field) = field {
+        if ExitAttribute::from_name(&field).is_some() {
+            return Err("SystemExit.code mutation or method calls are not supported yet; keep a typed local status and raise SystemExit(status) again; rython refuses to drop a code change or mutate a cloned value".into());
+        }
+        return Err(format!("exception attribute `{field}` mutation or method calls are not supported yet; use str(error), repr(error), modeled field reads, or explicit application state; rython refuses to overwrite Rust exception payload fields or drop a Python attribute change").into());
+    }
+    Ok(())
+}
+
+/// Calls on ordinary typed field values keep their normal lowering. Only
+/// methods on the exception itself and the boxed SystemExit code are refused.
+pub(crate) fn check_method_call(
+    func: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let ExprType::Attribute(attr) = func
+        && exception_receiver(&attr.value, options, symbols)
+    {
+        return check_mutation(func, options, symbols);
+    }
     if crate::ast::tree::visit::any_expr(
-        expr,
-        |expr| matches!(expr, ExprType::Attribute(attr) if code_attribute(attr, options, symbols)),
+        func,
+        |expr| matches!(expr, ExprType::Attribute(attr) if code_attribute(attr, Some(ctx), options, symbols)),
     ) {
-        return Err("SystemExit.code mutation or method calls are not supported yet; keep a typed local status and raise SystemExit(status) again; rython refuses to drop a code change or mutate a cloned value".into());
+        return Err("SystemExit.code method calls are not supported yet; bind the code to an explicitly typed scalar local first; rython refuses to mutate a cloned value or guess a method".into());
     }
     Ok(())
 }
@@ -258,14 +327,16 @@ pub(crate) fn check_reflection(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let (Some(receiver), Some(ExprType::Constant(name))) = (call.args.first(), call.args.get(1))
-        && let Some(litrs::Literal::String(name)) = &name.0
-        && ExitAttribute::from_name(name.value()).is_some()
-        && crate::ast::tree::arguments::is_exception_typeinfo(&crate::infer_type(
-            None, receiver, options, symbols,
-        ))
+    if let Some(receiver) = call.args.first()
+        && exception_receiver(receiver, options, symbols)
     {
-        return Err("reflection on SystemExit.code is not supported yet; read error.code directly or keep a typed local status; rython refuses to invent an attribute result or drop a code change".into());
+        if let Some(ExprType::Constant(name)) = call.args.get(1)
+            && let Some(litrs::Literal::String(name)) = &name.0
+            && ExitAttribute::from_name(name.value()).is_some()
+        {
+            return Err("reflection on SystemExit.code is not supported yet; read error.code directly or keep a typed local status; rython refuses to invent an attribute result or drop a code change".into());
+        }
+        return Err("reflection on exception attributes is not supported yet; read modeled fields directly or keep explicit typed application data; rython refuses to fabricate an attribute result or drop a Python attribute change".into());
     }
     Ok(())
 }

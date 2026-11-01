@@ -1641,7 +1641,7 @@ fn infer_type_inner(
                 return t;
             }
             let receiver_type = infer_type_inner(ctx, &attr.value, options, symbols);
-            if crate::ast::tree::system_exit::code_attribute(attr, options, symbols) {
+            if crate::ast::tree::system_exit::code_attribute(attr, ctx, options, symbols) {
                 return TypeInfo::PyValue;
             }
             // Any attribute of a `threading.local()` object is a run-time
