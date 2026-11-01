@@ -8,6 +8,196 @@ use crate::{
     PyAttributeExtractor, extract_list,
 };
 
+/// A borrowed container placed in a comprehension result must retain its
+/// identity. The value model would copy it; reject that boundary rather
+/// than silently detach the result from the source (issue #507).
+pub(crate) fn refuse_borrowed_mutable_output(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::ast::tree::visit;
+    if let ExprType::ListComp(comp) = expr
+        && subclass_registry_base(comp, options, symbols).is_some()
+    {
+        return Ok(());
+    }
+    fn needs_ownership_proof(t: &crate::TypeInfo) -> bool {
+        use crate::TypeInfo as T;
+        match t {
+            T::Vec(_) | T::Dict(..) | T::HashSet(_) | T::Collection(..)
+            | T::Bytes | T::NdArray | T::PyObject | T::PyValue | T::StrOrBytes => true,
+            T::Tuple(parts) => parts.iter().any(needs_ownership_proof),
+            T::Option(inner) | T::Borrowed(inner) | T::PyValueMember(inner)
+            | T::PyTuple(inner) => needs_ownership_proof(inner),
+            _ => false,
+        }
+    }
+    fn immutable(t: &crate::TypeInfo) -> bool {
+        use crate::TypeInfo as T;
+        match t {
+            T::Int | T::BigInt | T::Float | T::Bool | T::String | T::StrRef
+            | T::Complex | T::Range => true,
+            T::Tuple(parts) => parts.iter().all(immutable),
+            T::Option(inner) | T::Borrowed(inner) | T::PyValueMember(inner)
+            | T::PyTuple(inner) => immutable(inner),
+            _ => false,
+        }
+    }
+    fn fresh_call(call: &crate::Call, ty: &crate::TypeInfo, ctx: &CodeGenContext, scope: &PythonOptions, symbols: &SymbolTableScopes) -> bool {
+        use crate::TypeInfo as T;
+        use crate::ast::tree::collections_types::DefaultFactoryClass as Factory;
+        if let ExprType::Attribute(attr) = call.func.as_ref() {
+            let receiver = crate::infer_type(Some(ctx), &attr.value, scope, symbols);
+            if matches!(receiver, T::PyObject | T::PyValue)
+                && crate::ast::tree::type_ctx::StrMethod::from_name(&attr.attr).is_some()
+            {
+                // An unresolved string receiver lowers through PyStrOps;
+                // its typed method table guarantees owned scalar/string
+                // results (or a new Vec<String>), not a borrowed container.
+                return true;
+            }
+            // An immutable builtin receiver cannot own a mutable result
+            // which a method could return by reference.
+            if immutable(&receiver) { return true; }
+        }
+        let ExprType::Name(name) = call.func.as_ref() else { return false; };
+        if !crate::ast::tree::type_ctx::is_unshadowed_builtin(&name.id, scope, symbols) { return false; }
+        let Some(factory) = Factory::from_builtin_name(&name.id) else { return false; };
+        match factory {
+            Factory::List | Factory::Set | Factory::Dict => {
+                // These copy their outer container. Nested members must
+                // already preserve identity; an unknown member is no proof.
+                call.args.is_empty() && call.keywords.is_empty() || match ty {
+                    T::Vec(item) | T::HashSet(item) => !needs_ownership_proof(item),
+                    T::Dict(key, value) => !needs_ownership_proof(key) && !needs_ownership_proof(value),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+    fn borrowed(e: &ExprType, ctx: &CodeGenContext, scope: &PythonOptions, symbols: &SymbolTableScopes, safe_names: &std::collections::HashSet<String>) -> bool {
+        match e {
+            ExprType::Constant(_) => false,
+            ExprType::Name(name) if safe_names.contains(&name.id) => false,
+            ExprType::Attribute(attr)
+                if crate::ast::tree::attribute::builtin_type_name_argument(attr, scope, symbols)
+                    .is_some_and(|arg| !matches!(arg, ExprType::Name(name)
+                        if scope.param_type_vars.contains_key(&name.id))) => false,
+            ExprType::Name(_) | ExprType::Attribute(_) | ExprType::Subscript(_)
+                if needs_ownership_proof(&crate::infer_type(Some(ctx), e, scope, symbols)) => true,
+            ExprType::Call(call) => {
+                // An unresolved local call cannot borrow a static
+                // function/module/class's result contract from an outer
+                // binding of the same spelling (including boxed calls).
+                use crate::ast::tree::type_ctx::name_is_locally_bound;
+                match call.func.as_ref() {
+                    ExprType::Name(name) if name_is_locally_bound(&name.id, scope)
+                        && crate::ast::tree::call::callee_value_signature(&call.func, ctx, scope, symbols).is_none() => return true,
+                    ExprType::Attribute(attr) => {
+                        if let ExprType::Name(receiver) = attr.value.as_ref()
+                            && name_is_locally_bound(&receiver.id, scope)
+                            && matches!(symbols.get(&receiver.id), Some(crate::SymbolTableNode::ClassDef(_)
+                                | crate::SymbolTableNode::Import(_) | crate::SymbolTableNode::ImportFrom(_)))
+                        {
+                            let ty = crate::infer_type(Some(ctx), &attr.value, scope, symbols);
+                            let unresolved = matches!(ty, crate::TypeInfo::PyObject | crate::TypeInfo::PyValue | crate::TypeInfo::ClassValue)
+                                || scope.param_type_vars.contains_key(&receiver.id)
+                                    && !scope.name_types.contains_key(&receiver.id)
+                                    && !scope.local_types.contains_key(&receiver.id);
+                            if unresolved { return true; }
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(value) = crate::ast::tree::annotation_module::cast_value(call, scope, symbols) {
+                    return borrowed(value, ctx, scope, symbols, safe_names);
+                }
+                let ty = crate::infer_type(Some(ctx), e, scope, symbols);
+                // Imported scalar returns can be known even when the
+                // general inferrer keeps the call opaque (it avoids
+                // naming another module's concrete class in this one).
+                let scalar_return = matches!(ty, crate::TypeInfo::PyObject)
+                    && crate::call_return_typeinfo(call, Some(symbols), Some(scope))
+                        .is_some_and(|result| immutable(&result));
+                needs_ownership_proof(&ty) && !scalar_return
+                    && !fresh_call(call, &ty, ctx, scope, symbols)
+            }
+            // Even a fresh mutable RHS is shared with the walrus target.
+            ExprType::NamedExpr(_) => visit::subexprs_for(e, visit::Descend::OwnScope)
+                .into_iter().skip(1).any(|v|
+                    needs_ownership_proof(&crate::infer_type(Some(ctx), v, scope, symbols))
+                        || borrowed(v, ctx, scope, symbols, safe_names)),
+            // Follow only stored/selected values, never intermediate
+            // operands such as the mutable input of str(row).
+            ExprType::List(_) | ExprType::Tuple(_) | ExprType::Dict(_) | ExprType::Set(_) =>
+                visit::container_values(e).into_iter().any(|v| borrowed(v, ctx, scope, symbols, safe_names)),
+            ExprType::IfExp(_) => visit::subexprs_for(e, visit::Descend::OwnScope)
+                .into_iter().skip(1).any(|v| borrowed(v, ctx, scope, symbols, safe_names)),
+            ExprType::BoolOp(_) => visit::subexprs_for(e, visit::Descend::OwnScope)
+                .into_iter().any(|v| borrowed(v, ctx, scope, symbols, safe_names)),
+            // Builtin sequence/set operators produce a fresh outer
+            // container, but their members can still alias the operands.
+            ExprType::BinOp(op) => {
+                use crate::{BinOps as B, TypeInfo as T};
+                let ty = crate::infer_type(Some(ctx), e, scope, symbols);
+                let fresh = match (&ty, &op.op) {
+                    (T::Vec(item), B::Add | B::Mult)
+                    | (T::HashSet(item), B::Sub | B::BitAnd | B::BitOr | B::BitXor) =>
+                        !needs_ownership_proof(item),
+                    (T::Bytes, B::Add) => true,
+                    _ => false,
+                };
+                needs_ownership_proof(&ty) && !fresh
+            }
+            // Nested comprehensions enforce their own output boundary
+            // when lowered; each evaluation constructs a fresh result.
+            ExprType::ListComp(_) | ExprType::SetComp(_) | ExprType::DictComp(_)
+            | ExprType::GeneratorExp(_) => false,
+            _ => needs_ownership_proof(&crate::infer_type(Some(ctx), e, scope, symbols)),
+        }
+    }
+    if let Some((values, generators)) = visit::comprehension_parts(expr) {
+        let prefixes = crate::ast::tree::type_ctx::comprehension_prefix_scopes(generators, Some(ctx), options, symbols);
+        let mut safe_names = std::collections::HashSet::new();
+        for (generator, prefix) in generators.iter().zip(&prefixes) {
+            let names = visit::target_names(&generator.target);
+            for name in &names { safe_names.remove(*name); }
+            // A heterogeneous tuple may not have one inferable element
+            // type, but every possible element can still be proven safe.
+            if let crate::TypeInfo::Tuple(parts) = crate::infer_type(Some(ctx), &generator.iter, prefix, symbols)
+                && !parts.is_empty() && parts.iter().all(|t| !needs_ownership_proof(t))
+            {
+                safe_names.extend(names.into_iter().map(str::to_owned));
+            }
+        }
+        let mut scope = crate::comprehension_scope(generators, Some(ctx), options, symbols);
+        for (name, inner) in comprehension_filter_narrowings(generators, &scope) {
+            apply_comprehension_narrowing(&mut scope, &name, inner);
+        }
+        if values.into_iter().any(|value| borrowed(value, ctx, &scope, symbols, &safe_names)) {
+            // Position metadata only; the shared visitor above owns the
+            // enumeration of result expressions and nested generators.
+            let line = match expr {
+                ExprType::ListComp(c) => c.lineno,
+                ExprType::SetComp(c) => c.lineno,
+                ExprType::DictComp(c) => c.lineno,
+                ExprType::GeneratorExp(c) => c.lineno,
+                _ => None,
+            };
+            return Err(format!(
+                "comprehension output borrowing a mutable, unresolved, or undistinguished value (line {}) is not supported yet; \
+                 annotate immutable output types or produce explicit fresh container values instead; \
+                 rython refuses to lose sharing between the result and its source",
+                line.unwrap_or(0),
+            ).into());
+        }
+    }
+    Ok(())
+}
+
 /// List comprehension (e.g., [x ** 2 for x in range(10) if x % 2 == 0])
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ListComp {
@@ -191,6 +381,30 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Comprehension {
             ifs,
             is_async,
         })
+    }
+}
+
+/// The existing static registry lowering constructs each known subclass
+/// afresh. Keep its exact, side-effect-free shape as the ownership proof.
+fn subclass_registry_base(
+    comp: &ListComp,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<String> {
+    let [generator] = comp.generators.as_slice() else { return None; };
+    if generator.is_async || !generator.ifs.is_empty() { return None; }
+    let ExprType::Call(iter) = &generator.iter else { return None; };
+    if !iter.args.is_empty() || !iter.keywords.is_empty() { return None; }
+    let ExprType::Attribute(attr) = iter.func.as_ref() else { return None; };
+    if attr.attr != "__subclasses__" { return None; }
+    let ExprType::Name(base) = attr.value.as_ref() else { return None; };
+    if !matches!(symbols.get(&base.id), Some(crate::SymbolTableNode::ClassDef(_)))
+        || crate::ast::tree::type_ctx::name_is_locally_bound(&base.id, options) { return None; }
+    let ExprType::Call(element) = comp.elt.as_ref() else { return None; };
+    if !element.args.is_empty() || !element.keywords.is_empty() { return None; }
+    match (element.func.as_ref(), &generator.target) {
+        (ExprType::Name(callee), ExprType::Name(target)) if callee.id == target.id => Some(base.id.clone()),
+        _ => None,
     }
 }
 
@@ -452,45 +666,7 @@ impl CodeGen for ListComp {
         // modules are invisible (a divergence on the ledger), and a
         // non-construction element stays on the general path below.
         {
-            let registry_shape = self.generators.len() == 1
-                && {
-                    let iter_is_subclasses = match &self.generators[0].iter {
-                        ExprType::Call(c) => matches!(
-                            c.func.as_ref(),
-                            ExprType::Attribute(a)
-                                if a.attr == "__subclasses__"
-                                    && matches!(
-                                        a.value.as_ref(),
-                                        ExprType::Name(b)
-                                            if matches!(
-                                                symbols.get(&b.id),
-                                                Some(crate::SymbolTableNode::ClassDef(_))
-                                            )
-                                    )
-                        ),
-                        _ => false,
-                    };
-                    iter_is_subclasses
-                }
-                && match self.elt.as_ref() {
-                    ExprType::Call(c) => matches!(c.func.as_ref(), ExprType::Name(t)
-                        if match &self.generators[0].target {
-                            ExprType::Name(tn) => tn.id == t.id,
-                            _ => false,
-                        }),
-                    _ => false,
-                };
-            if registry_shape {
-                let base_name = match &self.generators[0].iter {
-                    ExprType::Call(c) => match c.func.as_ref() {
-                        ExprType::Attribute(a) => match a.value.as_ref() {
-                            ExprType::Name(b) => b.id.clone(),
-                            _ => unreachable!("checked above"),
-                        },
-                        _ => unreachable!("checked above"),
-                    },
-                    _ => unreachable!("checked above"),
-                };
+            if let Some(base_name) = subclass_registry_base(&self, &options, &symbols) {
                 let members: Vec<String> =
                     crate::ast::tree::hierarchy::subtree(&options, &base_name)
                         .map(|v| {

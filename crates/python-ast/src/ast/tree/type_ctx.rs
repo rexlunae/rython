@@ -1301,12 +1301,15 @@ fn infer_type_inner(
             }
         }
         ExprType::Call(call) => match call.func.as_ref() {
+            func if let Some((_, result)) = crate::ast::tree::call::callee_value_signature(
+                func, ctx.unwrap_or(&CodeGenContext::Module(String::new())), options, symbols,
+            ) => result,
             func if crate::ast::tree::system_exit::ExitCall::of(func, options, symbols)
                 == Some(crate::ast::tree::system_exit::ExitCall::Constructor) =>
             {
                 crate::ast::tree::arguments::exception_typeinfo(false)
             }
-            ExprType::Name(n) if symbols.get(&n.id).is_none()
+            ExprType::Name(n) if is_unshadowed_builtin(&n.id, options, symbols)
                 && call.args.len() == 1
                 && infer_type_inner(ctx, &call.args[0], options, symbols) == TypeInfo::BigInt
                 && crate::ast::tree::big_integer::IntegerBuiltin::from_name(&n.id).is_some() =>
@@ -1351,7 +1354,7 @@ fn infer_type_inner(
             // `round(x)` is an int; `round(x, n)` keeps the number's type
             // (a float stays a float, an int an int) — CPython's rule. A
             // `round` the module binds itself is its own function.
-            ExprType::Name(n) if n.id == "round" && symbols.get("round").is_none() => {
+            ExprType::Name(n) if n.id == "round" && is_unshadowed_builtin(&n.id, options, symbols) => {
                 match call.args.as_slice() {
                     [_] => TypeInfo::Int,
                     [x, _] => match infer_type(ctx, x, options, symbols) {
@@ -1364,14 +1367,15 @@ fn infer_type_inner(
             // `all(...)` / `any(...)` return a plain bool (the runtime's
             // are infallible `-> bool`), unless the module binds its own.
             ExprType::Name(n)
-                if matches!(n.id.as_str(), "all" | "any") && symbols.get(&n.id).is_none() =>
+                if matches!(n.id.as_str(), "all" | "any") && is_unshadowed_builtin(&n.id, options, symbols) =>
             {
                 TypeInfo::Bool
             }
             _ if crate::ast::tree::raise_stmt::constructs_exception(call, symbols, options) => {
                 crate::ast::tree::arguments::exception_typeinfo(false)
             }
-            ExprType::Name(n) => match builtin_call_type(&n.id) {
+            ExprType::Name(n) => match is_unshadowed_builtin(&n.id, options, symbols)
+                .then(|| builtin_call_type(&n.id)).flatten() {
                 Some(t) => t,
                 None => match symbols.get(&n.id) {
                     // A class-construction call produces an instance of the
@@ -1414,6 +1418,14 @@ fn infer_type_inner(
                 },
             },
             ExprType::Attribute(attr) => {
+                if let TypeInfo::Collection(crate::CollectionsType::Counter, args) =
+                    infer_type_inner(ctx, &attr.value, options, symbols)
+                    && crate::ast::tree::collections_types::CounterMethod::from_name(&attr.attr)
+                        == Some(crate::ast::tree::collections_types::CounterMethod::MostCommon)
+                {
+                    let key = args.first().cloned().unwrap_or(TypeInfo::PyObject);
+                    return TypeInfo::Vec(Box::new(TypeInfo::Tuple(vec![key, TypeInfo::Int])));
+                }
                 // numpy functions produce arrays (`np.sum`, `numpy.mean`).
                 let on_numpy = matches!(
                     attr.value.as_ref(),
@@ -1783,6 +1795,9 @@ fn infer_type_inner(
             }
             match container {
             TypeInfo::Vec(inner) | TypeInfo::PyTuple(inner) => *inner,
+            // Python string indexing yields an owned one-character str,
+            // the same representation as the subscript lowering.
+            TypeInfo::String | TypeInfo::StrRef => TypeInfo::String,
             TypeInfo::Dict(_, v) => *v,
             // `d[i]` of a deque is its element; `m[k]` of a collections
             // mapping is its value.
@@ -2130,6 +2145,20 @@ fn named_fn_return_type(
 /// iterable, or a `map` over a callable this cannot resolve (a lambda, a
 /// bound method like `str.strip`). The caller then falls back to the
 /// name-only table, so `list` keeps its boxed-element answer.
+#[derive(Clone, Copy)]
+enum IteratorBuiltin { Sorted, Enumerate, Filter, List, Reversed, Tuple, Map, Zip, Sum }
+impl IteratorBuiltin {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "sorted" => Self::Sorted, "enumerate" => Self::Enumerate,
+            "filter" => Self::Filter, "list" => Self::List,
+            "reversed" => Self::Reversed, "tuple" => Self::Tuple,
+            "map" => Self::Map, "zip" => Self::Zip, "sum" => Self::Sum,
+            _ => return None,
+        })
+    }
+}
+
 fn iterator_builtin_type(
     name: &str,
     call: &crate::Call,
@@ -2137,12 +2166,13 @@ fn iterator_builtin_type(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Option<TypeInfo> {
+    if !is_unshadowed_builtin(name, options, symbols) { return None; }
     let elem_of =
         |e: &ExprType| iterable_element_type(&infer_type(ctx, e, options, symbols));
-    match name {
+    match IteratorBuiltin::from_name(name)? {
         // sorted/filter preserve the element type; the iterable is the
         // last positional argument (`sorted(xs)`, `filter(pred, xs)`).
-        "sorted" => {
+        IteratorBuiltin::Sorted => {
             let e = elem_of(call.args.first()?)?;
             Some(TypeInfo::Vec(Box::new(e)))
         }
@@ -2151,23 +2181,23 @@ fn iterator_builtin_type(
         // corpus's `for (i, (name, item)) in enumerate(...)` — the
         // nested destructure binds the element types, so the loop-body
         // method calls resolve their receiver's class).
-        "enumerate" => {
+        IteratorBuiltin::Enumerate => {
             let elem = elem_of(call.args.first()?)?;
             Some(TypeInfo::Vec(Box::new(TypeInfo::Tuple(vec![
                 TypeInfo::Int,
                 elem,
             ]))))
         }
-        "filter" | "list" | "reversed" => {
+        IteratorBuiltin::Filter | IteratorBuiltin::List | IteratorBuiltin::Reversed => {
             Some(TypeInfo::Vec(Box::new(elem_of(call.args.last()?)?)))
         }
-        "tuple" => Some(TypeInfo::PyTuple(Box::new(tuple_call_element(
+        IteratorBuiltin::Tuple => Some(TypeInfo::PyTuple(Box::new(tuple_call_element(
             call, ctx, options, symbols,
         )?))),
         // map's element type is the CALLABLE's return type, not the
         // iterable's. Two arguments only: `map(f, a, b)` lowers through
         // map2 and is left to the name-only table.
-        "map" if call.args.len() == 2 => {
+        IteratorBuiltin::Map if call.args.len() == 2 => {
             let f = call.args.first()?;
             // The iterable must still be a real iterable — an untyped one
             // means the lowering itself is on shaky ground.
@@ -2176,8 +2206,46 @@ fn iterator_builtin_type(
                 f, options, symbols,
             )?)))
         }
+        IteratorBuiltin::Zip => {
+            if let [ExprType::Starred(star)] = call.args.as_slice() {
+                let row = elem_of(&star.value)?;
+                let element = iterable_element_type(&row)?;
+                Some(TypeInfo::Vec(Box::new(TypeInfo::Vec(Box::new(element)))))
+            } else if call.args.len() == 2 {
+                Some(TypeInfo::Vec(Box::new(TypeInfo::Tuple(vec![
+                    elem_of(&call.args[0])?, elem_of(&call.args[1])?,
+                ]))))
+            } else { None }
+        }
+        // PySum's scalar implementations return a number, never a
+        // borrowed container. Unknown/custom accumulators stay unknown.
+        IteratorBuiltin::Sum if call.args.len() == 1 && call.keywords.is_empty() => {
+            match elem_of(&call.args[0])? {
+                TypeInfo::Int | TypeInfo::Bool => Some(TypeInfo::Int),
+                TypeInfo::Float => Some(TypeInfo::Float),
+                _ => None,
+            }
+        }
         _ => None,
     }
+}
+
+/// Keep builtin typing and lowering on the same name-resolution rule.
+/// Inferred bindings include comprehension targets, which need not have
+/// an entry in the symbol table or legacy annotation map.
+pub(crate) fn is_unshadowed_builtin(
+    name: &str,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    (symbols.get(name).is_none()
+        || crate::ast::tree::module::import_binds_builtin_self_alias(name, symbols, options))
+        && !name_is_locally_bound(name, options)
+}
+
+pub(crate) fn name_is_locally_bound(name: &str, options: &PythonOptions) -> bool {
+    options.local_types.contains_key(name) || options.name_types.contains_key(name)
+        || options.called_params.contains(name) || options.param_type_vars.contains_key(name)
 }
 
 fn builtin_call_type(name: &str) -> Option<TypeInfo> {
@@ -3824,32 +3892,7 @@ pub fn analyze_function_types_with_class(
             // local stayed unknown and the Option-field reads on it
             // never unwrapped, E0609).
             let cast_value = match &a.value {
-                crate::ExprType::Call(call)
-                    if call.args.len() == 2
-                        && (matches!(
-                            call.func.as_ref(),
-                            crate::ExprType::Name(n)
-                                if n.id == "cast"
-                                    && matches!(
-                                        symbols.get(&n.id),
-                                        Some(crate::SymbolTableNode::ImportFrom(i))
-                                            if crate::AnnotationModule::from_name(
-                                                i.module.split('.').next().unwrap_or("")
-                                            ) == Some(crate::AnnotationModule::Typing)
-                                    )
-                        ) || matches!(
-                            call.func.as_ref(),
-                            crate::ExprType::Attribute(attr)
-                                if attr.attr == "cast"
-                                    && matches!(
-                                        attr.value.as_ref(),
-                                        crate::ExprType::Name(m)
-                                            if crate::is_typing(&m.id)
-                                    )
-                        )) =>
-                {
-                    Some(&call.args[1])
-                }
+                crate::ExprType::Call(call) => crate::ast::tree::annotation_module::cast_value(call, options, symbols),
                 _ => None,
             };
             let value_ref = cast_value.unwrap_or(&a.value);
@@ -6185,6 +6228,13 @@ pub(crate) fn method_return_typeinfo(
     class_symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<TypeInfo> {
+    // Generator methods are emitted as Vec<T>, using this same element
+    // inference; their Iterator[T] annotation alone would look opaque.
+    if crate::body_has_yields(&method.body) {
+        return crate::ast::tree::function_def::generator_element_type(
+            method.returns.as_deref(), &method.body, options, class_symbols,
+        ).map(|element| TypeInfo::Vec(Box::new(element)));
+    }
     if let Some(ann) = method.returns.as_deref() {
         return resolve_alias_typeinfo(ann, class_symbols, options);
     }
@@ -6553,6 +6603,7 @@ pub(crate) fn bind_fresh(scope: &mut PythonOptions, target: &ExprType, ty: Optio
 /// `if` installed (a narrowed Option read unwraps; the fresh binding is
 /// not an Option). Devin review on #318.
 pub(crate) fn bind_fresh_name(scope: &mut PythonOptions, name: &str, ty: Option<&TypeInfo>) {
+    std::rc::Rc::make_mut(&mut scope.local_types).remove(name);
     std::rc::Rc::make_mut(&mut scope.narrowed_names).remove(name);
     std::rc::Rc::make_mut(&mut scope.optional_names).remove(name);
     std::rc::Rc::make_mut(&mut scope.narrowed_class_origin).remove(name);

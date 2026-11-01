@@ -74,6 +74,34 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Attribute {
     }
 }
 
+#[derive(Clone, Copy)]
+enum BuiltinCallAttribute { TypeName }
+
+impl BuiltinCallAttribute {
+    fn from_names(callee: &str, attribute: &str) -> Option<Self> {
+        match (callee, attribute) {
+            ("type", "__name__") => Some(Self::TypeName),
+            _ => None,
+        }
+    }
+}
+
+/// The argument of the builtin `type(value).__name__` read. Lowering
+/// and ownership analysis share this exact, shadow-aware classifier.
+pub(crate) fn builtin_type_name_argument<'a>(
+    attr: &'a Attribute,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Option<&'a ExprType> {
+    let ExprType::Call(call) = attr.value.as_ref() else { return None; };
+    let ExprType::Name(name) = call.func.as_ref() else { return None; };
+    BuiltinCallAttribute::from_names(&name.id, &attr.attr)?;
+    if !crate::ast::tree::type_ctx::is_unshadowed_builtin(&name.id, options, symbols)
+        || !call.keywords.is_empty() { return None; }
+    let [arg] = call.args.as_slice() else { return None; };
+    Some(arg)
+}
+
 impl<'a> CodeGen for Attribute {
     type Context = CodeGenContext;
     type Options = PythonOptions;
@@ -126,12 +154,8 @@ impl<'a> CodeGen for Attribute {
         // (`PyValue::py_type_name` — "str"/"int"/... exactly Python's
         // spelling), so urllib3's `type(x).__name__` TypeError messages
         // carry CPython's text instead of an E0609.
-        if self.attr == "__name__"
-            && let ExprType::Call(call) = self.value.as_ref()
-            && matches!(call.func.as_ref(), ExprType::Name(n) if n.id == "type")
-            && call.args.len() == 1
-        {
-            if matches!(call.args.first(), Some(ExprType::Name(n)) if n.id == "self")
+        if let Some(arg) = builtin_type_name_argument(&self, &options, &symbols) {
+            if matches!(arg, ExprType::Name(n) if n.id == "self")
                 && let Some(enclosing) = ctx.enclosing_class_name()
             {
                 // In a trait default `self` is the IMPLEMENTOR — a method
@@ -146,7 +170,6 @@ impl<'a> CodeGen for Attribute {
             // The runtime path needs a CONCRETE argument: an inferred
             // generic parameter would need a `PyValue: From<T>` bound
             // this cannot add. Non-generic names and expressions only.
-            let arg = call.args.first().expect("len checked above");
             let generic_param = matches!(arg, ExprType::Name(n)
                 if options.param_type_vars.contains_key(&n.id));
             if generic_param {

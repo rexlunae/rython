@@ -2583,26 +2583,23 @@ impl<'a> CodeGen for Call {
                 _ => return Err("passing an arbitrary-precision integer through this call is not supported yet; keep the value in scalar arithmetic or use print/bool/int/str/repr/hash/abs/float; rython refuses to silently narrow it".into()),
             }
         }
-        // typing-module calls are compile-time-only: TypeVar, Protocol,
-        // TypeAlias, runtime_checkable, Literal, ... exist only for
-        // the type system (annotations are strings under `from __future__
-        // import annotations`), so a call lowers to nothing — the same
-        // treatment the `from typing import ...` import already gets.
-        // `cast(T, value)` is special: it IS a runtime identity (the value
-        // passes through unchanged), so it lowers to its VALUE argument —
-        // an empty lowering would break `cookie_jar = cast("CookieJar",
-        // prep._cookies)` into `cookie_jar = ;` (requests' auth).
-        if let ExprType::Name(n) = self.func.as_ref() {
-            if let Some(SymbolTableNode::ImportFrom(i)) = symbols.get(&n.id) {
-                if crate::AnnotationModule::from_name(i.module.split('.').next().unwrap_or(""))
-                    == Some(crate::AnnotationModule::Typing)
-                {
-                    if n.id == "cast" && self.args.len() == 2 {
-                        return self.args[1].clone().to_rust(ctx, options, symbols);
-                    }
-                    return Ok(TokenStream::new());
-                }
-            }
+        // typing.cast is a runtime identity. The same classifier is
+        // used by ownership analysis and type inference, including aliases.
+        if crate::ast::tree::annotation_module::TypingCall::of_callee(
+            &self.func, &options, &symbols,
+        ) == Some(crate::ast::tree::annotation_module::TypingCall::Cast) {
+            let value = crate::ast::tree::annotation_module::cast_value(&self, &options, &symbols)
+                .ok_or("typing.cast(...) requires two positional arguments in rython; use cast(type, value); rython refuses to drop or misbind an argument")?;
+            return value.clone().to_rust(ctx, options, symbols);
+        }
+        // Other annotation-only typing calls retain their no-runtime
+        // lowering; cast was handled above through the shared authority.
+        if let ExprType::Name(name) = self.func.as_ref()
+            && !crate::ast::tree::type_ctx::name_is_locally_bound(&name.id, &options)
+            && let Some(SymbolTableNode::ImportFrom(import)) = symbols.get(&name.id)
+            && crate::is_typing(&import.module)
+        {
+            return Ok(TokenStream::new());
         }
         // A `collections` class the runtime defines but the converter
         // cannot construct (`ChainMap(d1, d2)`, `collections.Counter(xs)`):
@@ -2618,20 +2615,6 @@ impl<'a> CodeGen for Call {
                 rewrite
             )
             .into());
-        }
-        // `typing.cast(T, value)` — the MODULE-QUALIFIED form of the
-        // runtime-identity cast (`typing.cast(ProxyConfig,
-        // self.proxy_config)` — urllib3's _connect_tls_proxy): same
-        // lowering as the imported `cast` name above — the value passes
-        // through unchanged (round 94 — without it the call fell to the
-        // external-module drop and the local became `PyValue::None_`,
-        // breaking every field read on it, E0609).
-        if let ExprType::Attribute(attr) = self.func.as_ref()
-            && attr.attr == "cast"
-            && self.args.len() == 2
-            && matches!(attr.value.as_ref(), ExprType::Name(m) if crate::is_typing(&m.id))
-        {
-            return self.args[1].clone().to_rust(ctx, options, symbols);
         }
         // A mutating METHOD call on a module-level container (`X.append(v)`,
         // `return X.pop()` — issues #337, #122) runs under the static's lock
@@ -3363,25 +3346,7 @@ impl<'a> CodeGen for Call {
                     | "tuple"
                     | "next"
                     | "id"
-            )) && (symbols.get(bname).is_none()
-                // An import of a BUILTIN-CLASS self-alias (`from .compat
-                // import str` where compat does `str = str` — requests'
-                // py2 shim): the self-alias emits no runtime item, so the
-                // name still IS the builtin — dispatch to the builtin arm
-                // (the generic import path would render a dangling static
-                // read, `(*str).clone()(...)`).
-                || crate::ast::tree::module::import_binds_builtin_self_alias(
-                    bname,
-                    &symbols,
-                    &options,
-                ))
-                // A loop element shadowing the builtin (`for filter in ...:
-                // filter(**kwargs)` — botocore's docs client): the call
-                // through the untyped element is dropped at the generic
-                // fallback — do not treat it as the builtin. A local of
-                // the same name shadows the builtin the same way.
-                && !options.called_params.contains(bname)
-                && !options.local_types.contains_key(bname)
+            )) && crate::ast::tree::type_ctx::is_unshadowed_builtin(bname, &options, &symbols)
             {
                 let mut rendered = Vec::new();
                 for arg in &self.args {
@@ -5446,6 +5411,20 @@ impl<'a> CodeGen for Call {
                             return Err("list() takes at most 1 positional argument"
                                 .to_string()
                                 .into());
+                        }
+                        if let [ExprType::GeneratorExp(generator)] = self.args.as_slice() {
+                            // list consumes the whole generator immediately.
+                            // Reuse list-comprehension lowering, including
+                            // its container-boundary checks, rather than pass
+                            // an IntoIter to the PyListFrom implementations.
+                            return ExprType::ListComp(crate::ListComp {
+                                elt: generator.elt.clone(),
+                                generators: generator.generators.clone(),
+                                lineno: generator.lineno,
+                                col_offset: generator.col_offset,
+                                end_lineno: generator.end_lineno,
+                                end_col_offset: generator.end_col_offset,
+                            }).to_rust(ctx, options, symbols);
                         }
                         // The iterable is consumed: a field or a name read
                         // again later takes the reuse-clone (`list(self.
@@ -10944,12 +10923,12 @@ let mutating_self_field = boxed_self_ref_receiver
         if let ExprType::Name(callee_name) = self.func.as_ref()
             && options.called_params.contains(&callee_name.id)
         {
-            options.definition_warnings.borrow_mut().push(format!(
-                "call through callable value `{}` is dropped (the \
-                 callable-as-value divergence, issue #122)",
+            return Err(format!(
+                "call through unresolved callable `{}` is not supported yet; \
+                 annotate the parameter with typing.Callable and concrete argument/return types; \
+                 rython refuses to drop the call or invent a None result",
                 callee_name.id
-            ));
-            return Ok(quote!(stdpython::PyValue::None_));
+            ).into());
         }
 
         // A unittest assertion on a receiver (`self.assertEqual(a, b)`,

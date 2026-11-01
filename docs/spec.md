@@ -492,6 +492,26 @@ bodies may raise (they run in `Result` contexts). Generator expressions
 are **materialized eagerly** and then iterated — laziness is not modeled
 (deviation, §12.3).
 
+An immediate `list(value for ...)` consumes its generator through the same
+lowering as a list comprehension (issue #506), preserving iteration order,
+filters, nested loops, returned values, and exception propagation.
+Comprehension results that read existing mutable containers by name,
+attribute, or index are refused: copying the iterable would detach those
+values from the source (issue #507). This includes nested stored values,
+conditional selections, mutable walrus results, and identity calls such
+as `typing.cast` (whose type argument does not make a copy). Calls returning
+mutable values and unresolved or boxed outputs are refused unless their
+ownership is proven. The shared bytes/bytearray representation is also
+refused at this borrowing boundary. Annotate immutable output types or
+produce explicit fresh container values with safe members instead.
+
+The existing static registry form `[kind() for kind in Base.__subclasses__()]`
+constructs fresh instances from the converted class hierarchy. Its ownership
+proof requires an unshadowed known base, one synchronous generator, no
+filters, and no iterator or constructor arguments. Other variants are
+refused rather than silently dropping a filter or argument (issue #509).
+Live discovery of classes outside the converted hierarchy is not modeled.
+
 ### 4.5 Lambdas
 
 A lambda has two lowerings, decided by where it sits. In a position that
@@ -2923,6 +2943,9 @@ accepted as permanent spec:
 | An `async def main()` CALLED without `await` (both entry spellings: `if __name__ == "__main__": main()` and issue #431's bare module-level `main()`) is now a LOUD conversion error naming the construct and the rewrite (`asyncio.run(main())`, or make `main` a plain `def`). CPython only CREATES the coroutine there and never awaits it, so the body does not run; rython's entry machinery would have installed it as the process entry and RUN the body, printing output CPython never prints. Modelling a never-awaited coroutine (the `RuntimeWarning` and the discarded object) is not implemented, so the conversion refuses rather than silently running different code. `asyncio.run(main())` — the spelling that does run it — keeps converting (issue #455) | Correct-or-loud (was a silent divergence; found in the #431 work) |
 | The kernel device-manifest sub-mode skips the module-wide floating-point scan | Defect, issue #108 |
 | Generator expressions are materialized eagerly (side-effect timing differs from lazy CPython) | Model limit until generator lowering lands |
+| Immediate `list(... for ...)` construction reuses list-comprehension lowering. Comprehensions refuse borrowed mutable container outputs, mutable walrus results, identity casts, and unresolved outputs without an ownership proof rather than silently detach them from their source; immutable values and fresh container literals remain supported (§4.4) | Correct-or-loud (issues #506, #507) |
+| Static subclass-registry comprehensions construct fresh instances from the converted hierarchy. Filters and iterator/constructor arguments are refused instead of discarded (§4.4); live runtime class discovery is not modeled | Correct-or-loud (issue #509); static discovery remains a model limit |
+| Calls through unresolved callable parameters fail conversion, naming the parameter and requesting concrete `typing.Callable` argument/return types. The old fallback skipped the invocation and returned `None`, including when a same-named scalar module function made a comprehension output appear immutable | Loud (issue #510); typed and boxed callable paths remain modeled |
 | `with` does not call `__enter__`/`__exit__` (Drop approximates cleanup) | Model limit; correct for the supported file objects |
 | `is`/`is not` on non-`None` operands lower to `==`/`!=` | Model limit (no identity model) |
 | `raise X from Y` folds the cause into the message; no `__cause__` | Model limit |

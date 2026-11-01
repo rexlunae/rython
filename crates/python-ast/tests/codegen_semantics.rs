@@ -1747,7 +1747,7 @@ fn with_without_target_still_evaluates() {
 
 #[test]
 fn comprehension_binds_target() {
-    let out = compile("doubled = [x * 2 for x in items]", "comp.py");
+    let out = compile("items = [1, 2, 3]\ndoubled = [x * 2 for x in items]", "comp.py");
     assert!(out.contains("for x in"), "generated: {}", out);
     assert!(!out.contains("_item"), "generated: {}", out);
     assert!(out.contains("push"), "generated: {}", out);
@@ -1755,13 +1755,13 @@ fn comprehension_binds_target() {
 
 #[test]
 fn comprehension_condition_uses_continue() {
-    let out = compile("evens = [x for x in items if x % 2 == 0]", "comp2.py");
+    let out = compile("items = [1, 2, 3]\nevens = [x for x in items if x % 2 == 0]", "comp2.py");
     assert!(out.contains("continue"), "generated: {}", out);
 }
 
 #[test]
 fn multi_generator_comprehension_nests_loops() {
-    let out = compile("pairs = [x + y for x in a for y in b]", "comp3.py");
+    let out = compile("a = [1, 2]\nb = [3, 4]\npairs = [x + y for x in a for y in b]", "comp3.py");
     let for_count = out.matches("for ").count();
     assert!(for_count >= 2, "expected nested loops, generated: {}", out);
     assert!(!out.contains("vec ! []"), "generated: {}", out);
@@ -1769,7 +1769,7 @@ fn multi_generator_comprehension_nests_loops() {
 
 #[test]
 fn dict_comprehension_inserts_pairs() {
-    let out = compile("m = {k: v for k in keys}", "comp4.py");
+    let out = compile("keys = [\"a\"]\nv = 1\nm = {k: v for k in keys}", "comp4.py");
     assert!(out.contains("insert"), "generated: {}", out);
     assert!(out.contains("PyDict"), "generated: {}", out);
 }
@@ -2974,7 +2974,7 @@ fn nested_def_bare_name_default_converts() {
     // expression default still stays loud — see
     // omitted_defaults_must_be_constant.)
     let module = crate::parse(
-        "sep = \"-\"\ndef join(words):\n    def glue(a=x, b=sep):\n        return a + b\n    return [glue() for _ in words]\n",
+        "x = \"prefix\"\nsep = \"-\"\ndef join(words: list[str]) -> list[str]:\n    def glue(a: str=x, b: str=sep) -> str:\n        return a + b\n    return [glue() for _ in words]\n",
         "nestednamedefault.py",
     )
     .unwrap();
@@ -11113,23 +11113,11 @@ fn unannotated_method_parameter_lowers_as_boxed_pyvalue() {
 }
 
 #[test]
-fn callable_parameter_call_drops_as_a_noop() {
-    // A callable parameter called as a function: the callable-as-value
-    // divergence (issue #122) — the call site drops to the boxed None and
-    // -W reports it.
-    let (out, warnings) = compile_with_warnings("def f(cb):\n    return cb(1)\n", "inf_callable.py");
-    assert!(
-        out.contains("stdpython :: PyValue :: None_"),
-        "the call through the callable must drop to a no-op: {}",
-        out
-    );
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("call through callable value `cb`") && w.contains("dropped")),
-        "the callable-as-value divergence must be reported through -W: {:?}",
-        warnings
-    );
+fn unresolved_callable_parameter_calls_are_conversion_errors() {
+    // Verified against python3: f(lambda x: x + 1) returns 2, not None.
+    let error = compile_err("def f(cb):\n    return cb(1)\n", "inf_callable.py");
+    assert!(error.contains("call through unresolved callable `cb`")
+        && error.contains("typing.Callable") && error.contains("refuses to drop"), "{error}");
 }
 
 #[test]
@@ -17305,22 +17293,17 @@ fn ununifiable_operands_keep_the_loud_boolean_approximation() {
 }
 
 #[test]
-fn option_and_untyped_call_uses_the_option_arm() {
-    // Round 43: `ca and expanduser(ca)` (urllib3's ca_certs) — the first
-    // operand is Option<String>, the second is a CALL whose return type
-    // infers PyObject (method/module-call returns are unresolved) but
-    // renders the inner String. The fold must still use the
-    // operand-returning Option arm (Some-wrap the truthy arm), not the
-    // `&&` boolean approximation (which rustc rejects — Option has no
-    // bool operator).
+fn option_and_callable_call_uses_the_option_arm() {
+    // An Option<String> combined with a scalar-returning callable must
+    // keep the operand-returning Option fold and Some-wrap the RHS.
     let out = compile(
-        "def pick(ca: str | None, fn) -> str | None:\n    return ca and fn(ca)\n",
+        "from typing import Callable\ndef pick(ca: str | None, fn: Callable[[str], str]) -> str | None:\n    return ca and fn(ca)\n",
         "andcall.py",
     );
     assert!(
         out.contains("__rython_and") && out.contains("is_truthy () { Some (")
             || out.contains("__rython_and") && out.contains("is_truthy() { Some("),
-        "Option and an untyped call must use the operand-returning fold: {}",
+        "Option and a scalar call must use the operand-returning fold: {}",
         out
     );
     assert!(
@@ -19749,28 +19732,14 @@ fn set_literal_call_uses_the_runtime_conversion() {
 }
 
 #[test]
-fn call_through_a_boxed_value_drops_loudly() {
-    // Issue #122's callable-as-value divergence: a call whose callee is a
-    // boxed/String/Option VALUE (a `pool_cls(...)`-style class-name local,
-    // or an unresolvable self member like `self._tunnel()` — a method
-    // inherited from an external base) lowers to the warned no-op (the
-    // boxed None), never a `value(...)` E0618 string-call or an E0599.
-    let out = compile_with_warnings(
-        concat!(
-            "def take(cb) -> str:\n",
-            "    return cb(\"x\")\n",
-            "\n",
-            "def run():\n",
-            "    f = take\n",
-            "    return f(\"y\")\n",
-        ),
+fn an_unresolved_callable_parameter_is_loud_through_a_function_alias() {
+    // Verified against python3: run() returns "x" through the callback.
+    let error = compile_err(
+        "def take(cb) -> str:\n    return cb(\"x\")\ndef identity(value: str) -> str:\n    return value\ndef run() -> str:\n    f = take\n    return f(identity)\n",
         "cb.py",
     );
-    assert!(
-        out.0.contains("PyValue :: None_") || out.0.contains("PyValue::None_"),
-        "the call through the callable value must lower to the boxed None: {}",
-        out.0
-    );
+    assert!(error.contains("call through unresolved callable `cb`")
+        && error.contains("typing.Callable") && error.contains("refuses to drop"), "{error}");
 }
 
 #[test]
@@ -30144,6 +30113,176 @@ fn unbound_exception_reads_follow_every_shared_visitor_body() {
     compile(
         "def f(flag: bool) -> None:\n    if flag:\n        error = ValueError('outer')\n    def inner(error: BaseException) -> None:\n        print(str(error))\n",
         "exception_nested_scope.py",
+    );
+}
+
+#[test]
+fn cast_wrapped_and_returned_mutable_outputs_are_loud() {
+    // Verified against python3: casts and identity-returning helpers keep
+    // the inner list shared; source[0].append(2) updates result[0].
+    for (header, output) in [
+        ("from typing import cast\n", "cast(list[int], item)"),
+        ("from typing import cast as checked\n", "checked(list[int], item)"),
+        ("import typing\n", "typing.cast(list[int], item)"),
+        ("import typing as types\n", "types.cast(list[int], item)"),
+        ("from typing import cast\n", "cast(str, item)"),
+        ("from typing import cast\n", "cast(tuple[list[int], int], (item, 0))"),
+        ("def identity(value: list[int]) -> list[int]:\n    return value\n", "identity(item)"),
+        ("def str(value: list[int]) -> list[int]:\n    return value\n", "str(item)"),
+        ("def list(value: list[int]) -> list[int]:\n    return value\n", "list(item)"),
+        ("class Holder:\n    def __init__(self, value: list[int]):\n        self.__name__ = value\ndef type(value: list[int]) -> Holder:\n    return Holder(value)\n", "type(item).__name__"),
+    ] {
+        let source = format!("{header}def f() -> None:\n    source = [[1]]\n    result = [{output} for item in source]\n    source[0].append(2)\n    print(source, result)\n");
+        let error = compile_err(&source, "borrowed_call_output.py");
+        assert!(error.contains("comprehension output") && error.contains("refuses to lose sharing"), "{error}");
+    }
+}
+
+#[test]
+fn unresolved_callable_parameters_cannot_drop_calls() {
+    // Verified against python3: label is the callback passed to collect,
+    // not the same-named scalar module function; it returns the inner list.
+    for result in ["[label(value) for value in values]", "[label(values[0])]"] {
+        let source = format!(
+            "from typing import Any\ndef label(value: list[int]) -> str:\n    return str(value)\ndef identity(value: list[int]) -> list[int]:\n    return value\ndef collect(label, values: list[list[int]]) -> list[Any]:\n    return {result}\ndef main() -> None:\n    source = [[1]]\n    result = collect(identity, source)\n    source[0].append(2)\n    print(source, result)\n"
+        );
+        let error = compile_err(&source, "unresolved_callable_output.py");
+        if result.contains(" for ") {
+            assert!(error.contains("comprehension output") && error.contains("unresolved"), "{error}");
+        } else {
+            assert!(error.contains("call through unresolved callable `label`")
+                && error.contains("typing.Callable") && error.contains("refuses to drop the call"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn callable_comprehension_targets_cannot_claim_builtin_ownership() {
+    // Verified against python3: both callable targets return the source
+    // inner list; mutating source[0] must update the collected value.
+    for (header, callback, result, target, output_type) in [
+        ("def identity(value: list[int]) -> list[int]:\n    return value\n", "identity", "list(source[0])", "list", "list[int]"),
+        ("class Holder:\n    def __init__(self, value: list[int]):\n        self.__name__ = value\ndef identity(value: list[int]) -> Holder:\n    return Holder(value)\n", "identity", "type(source[0]).__name__", "type", "Holder"),
+    ] {
+        let source = format!(
+            "from typing import Callable\n{header}def main() -> None:\n    source = [[1]]\n    callbacks: list[Callable[[list[int]], {output_type}]] = [{callback}]\n    result = [{result} for {target} in callbacks]\n    source[0].append(2)\n    print(source, result)\n"
+        );
+        let error = compile_err(&source, "callable_target_ownership.py");
+        assert!(error.contains("comprehension output") && error.contains("refuses to lose sharing"), "{error}");
+    }
+}
+
+#[test]
+fn subclass_registry_ownership_proof_never_drops_filters_or_arguments() {
+    // Verified against python3: the False filter produces an empty list;
+    // passing 3 constructs a Child whose value is 3, not its default 1.
+    for result in [
+        "[kind() for kind in Base.__subclasses__() if False]",
+        "[kind(3) for kind in Base.__subclasses__()]",
+    ] {
+        let source = format!(
+            "class Base:\n    pass\nclass Child(Base):\n    def __init__(self, value: int = 1):\n        self.value = value\ndef main() -> None:\n    result: list[Base] = {result}\n    print(len(result))\n"
+        );
+        let error = compile_err(&source, "subclass_registry_output.py");
+        assert!(error.contains("comprehension output") && error.contains("refuses to lose sharing"), "{error}");
+    }
+    let error = compile_err(
+        "class Base:\n    pass\nclass Child(Base):\n    pass\ndef collect(Base):\n    return [kind() for kind in Base.__subclasses__()]\n",
+        "shadowed_registry.py",
+    );
+    assert!(error.contains("comprehension output") && error.contains("unresolved"), "{error}");
+}
+
+#[test]
+fn typing_cast_requires_two_positional_arguments() {
+    // Verified against python3: the keyword form returns 1; the invalid
+    // arities raise TypeError. Refuse forms the identity lowering cannot
+    // bind instead of discarding an argument or the whole call.
+    for expression in ["cast(int)", "cast(int, 1, 2)", "cast(typ=int, val=1)"] {
+        let source = format!("from typing import cast\ndef f() -> None:\n    print({expression})\n");
+        let error = compile_err(&source, "cast_arguments.py");
+        assert!(error.contains("typing.cast(...) requires two positional arguments")
+            && error.contains("refuses to drop or misbind"), "{error}");
+    }
+}
+
+#[test]
+fn unresolved_comprehension_output_requires_ownership_proof() {
+    // Verified against python3: the untyped and Any-typed forms can
+    // receive inner lists and must preserve their sharing too.
+    for source in [
+        "def collect(values):\n    return [item for item in values]\n",
+        "def collect(values):\n    return [item[0] for item in values]\n",
+        "from typing import Any\ndef collect(values: list[Any]) -> list[Any]:\n    return [item for item in values]\n",
+        "from typing import Any\ndef collect(values: list[Any]) -> list[Any]:\n    return [(item, 0) for item in values]\n",
+        "def collect(values):\n    return [item + [] for item in values]\n",
+        "from typing import Callable\ndef collect(values: list[list[int]], f: Callable[[list[int]], list[int]]) -> list[list[int]]:\n    return [f(item) for item in values]\n",
+        "from typing import Any\ndef label(value: int) -> str:\n    return str(value)\ndef collect(label: Any, values: list[int]) -> list[Any]:\n    return [label(value) for value in values]\n",
+        "import typing\ndef collect(typing, values: list[int]):\n    return [typing.cast(int, value) for value in values]\n",
+        "class Receiver:\n    @staticmethod\n    def label(value: int) -> str:\n        return str(value)\ndef collect(Receiver, values: list[int]):\n    return [Receiver.label(value) for value in values]\n",
+    ] {
+        let error = compile_err(source, "unknown_output.py");
+        assert!(error.contains("unresolved") && error.contains("annotate immutable output types")
+            && error.contains("refuses to lose sharing"), "{error}");
+    }
+    // An explicit scalar annotation proves the pass-through is safe.
+    compile("def collect(values: list[int]) -> list[int]:\n    return [item for item in values]\n", "typed_output.py");
+    // List concatenation creates a new outer list, retaining the shared
+    // inner lists; mutating values[0][0] must still update the output.
+    let error = compile_err(
+        "def collect(values: list[list[list[int]]]) -> list[list[list[int]]]:\n    return [item + [] for item in values]\n",
+        "nested_concat_output.py",
+    );
+    assert!(error.contains("comprehension output") && error.contains("refuses to lose sharing"), "{error}");
+}
+
+#[test]
+fn borrowed_mutable_comprehension_outputs_are_loud() {
+    // Verified against python3: these outputs share their inner list
+    // with source; mutating the output changes source too (issue #507).
+    for result in [
+        "[item for item in source]",
+        "list(item for item in source)",
+        "[(item, 0) for item in source]",
+        "[[item] for item in source]",
+        "[item if flag else [] for item in source]",
+        "[(saved := item) for item in source]",
+        "{str(index): item for index, item in enumerate(source)}",
+    ] {
+        let source = format!("def f(flag: bool) -> None:\n    source = [[1]]\n    result = {result}\n    print(source, result)\n");
+        let error = compile_err(&source, "borrowed_comprehension.py");
+        assert!(error.contains("comprehension output") && error.contains("line 3")
+            && error.contains("refuses to lose sharing"), "{error}");
+    }
+    // Verified against python3: saved.append(2) also updates result[0].
+    let error = compile_err(
+        "def f() -> None:\n    result = [(saved := [1]) for value in range(1)]\n    saved.append(2)\n    print(result)\n",
+        "mutable_walrus_comprehension.py",
+    );
+    assert!(error.contains("comprehension output") && error.contains("refuses to lose sharing"), "{error}");
+}
+
+#[test]
+fn immediate_list_generator_lowers_to_a_list() {
+    let output = compile(
+        "def main() -> None:\n    print(list(str(value) for value in [1]))\n",
+        "list_generator.py",
+    );
+    assert!(!output.contains("into_iter"), "the list factory must not receive an unsupported iterator: {output}");
+}
+
+#[test]
+fn list_generator_keeps_set_order_and_bigint_boundaries_loud() {
+    for (source, expected) in [
+        ("def f() -> None:\n    seen = {'a', 'b'}\n    print(list(value for value in seen))\n", "set"),
+        ("def f() -> None:\n    print(list(1180591620717411303424 for value in range(1)))\n", "arbitrary-precision"),
+    ] {
+        let error = compile_err(source, "list_generator_boundary.py");
+        assert!(error.contains(expected) && error.contains("refuses"), "{error}");
+    }
+    compile(
+        "def f() -> None:\n    print(list(str(1180591620717411303424) for value in range(1)))\n",
+        "list_generator_converted_integer.py",
     );
 }
 
