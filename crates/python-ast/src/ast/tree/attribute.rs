@@ -85,6 +85,11 @@ impl<'a> CodeGen for Attribute {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        if let Some(namespace) = crate::ast::tree::interpreter_state::InterpreterNamespace::from_attribute(
+            &self, &options, &symbols,
+        ) {
+            return Err(namespace.refusal().into());
+        }
         if crate::infer_type(Some(&ctx), &self.value, &options, &symbols) == crate::TypeInfo::BigInt {
             return Err("arbitrary-precision integer attributes are not supported yet; keep the value in scalar arithmetic; rython refuses to silently replace or narrow it".into());
         }
@@ -765,16 +770,6 @@ impl<'a> CodeGen for Attribute {
                     | ("ssl", "OPENSSL_VERSION_INFO")
             );
 
-            // `sys.modules` — the process's import registry (requests'
-            // packages.py aliasing): rython's crate is static, so the
-            // registry is always empty — the read lowers to an empty dict
-            // (list(sys.modules) iterates nothing, indexing misses).
-            if crate::StdModule::from_name(&value_str) == Some(crate::StdModule::Sys)
-                && self.attr == "modules"
-            {
-                return Ok(quote!(PyDict::<String, stdpython::PyValue>::from([])));
-            }
-
             if needs_deref {
                 // Wrap dereferenced values in parentheses to ensure correct precedence
                 // This prevents *sys::executable.to_string() and ensures (*sys::executable).to_string()
@@ -1027,6 +1022,9 @@ pub(crate) fn to_rust_place_expr(
     symbols: &SymbolTableScopes,
     deref: bool,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    if let Some(namespace) = crate::ast::tree::interpreter_state::InterpreterNamespace::from_expr(expr, options, symbols) {
+        return Err(namespace.refusal().into());
+    }
     match expr {
         ExprType::Attribute(attr) => {
             // Mirror the module-path guard from to_rust: a store target

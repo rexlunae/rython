@@ -75,6 +75,7 @@ impl CodeGen for AugAssign {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        crate::ast::tree::interpreter_state::check_target(&self.target, &options, &symbols)?;
         let target_type = crate::infer_type(Some(&ctx), &self.target, &options, &symbols);
         let value_type = crate::infer_type(Some(&ctx), &self.value, &options, &symbols);
         if matches!(target_type, crate::TypeInfo::BigInt) || matches!(value_type, crate::TypeInfo::BigInt) {

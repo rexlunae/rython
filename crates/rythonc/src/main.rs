@@ -107,9 +107,19 @@ fn main() -> Result<()> {
             ..Default::default()
         });
 
-        let module_name = format!("{}", input.to_string_lossy());
-        let py = read_to_string(input.clone())?;
-        let ast = parse(&py, &module_name)?;
+        let source_filename = input.to_string_lossy().into_owned();
+        // A source path is diagnostic context, not a Python identifier.
+        // Parent directories may contain spaces, dots, or hyphens.
+        let parser_filename = input.file_name()
+            .with_context(|| format!("input has no filename: {}", input.display()))?
+            .to_string_lossy();
+        let py = read_to_string(&input)
+            .with_context(|| format!("reading {}", input.display()))?;
+        let mut ast = parse(&py, &parser_filename)
+            .map_err(|error| anyhow::anyhow!("failed to parse {}: {}", source_filename, error))?;
+        let module_name = ast.name.as_ref().map(|name| name.id.clone())
+            .unwrap_or_else(|| "__main__".to_string());
+        ast.filename = Some(source_filename.clone());
 
         let output = if args.ast_only {
             if args.pretty {
@@ -138,7 +148,7 @@ fn main() -> Result<()> {
                     .map_err(|e| {
                         anyhow::anyhow!(
                             "failed to compile {}: {}",
-                            module_name,
+                            source_filename,
                             python_ast::format_error_chain(e.as_ref())
                         )
                     })?;
@@ -148,7 +158,7 @@ fn main() -> Result<()> {
                 // single-file CLI silently discarded them, so a dropped
                 // call looked like a clean conversion).
                 for w in options.definition_warnings.borrow().iter() {
-                    eprintln!("warning: {}: {}", module_name, w);
+                    eprintln!("warning: {}: {}", source_filename, w);
                 }
                 if args.pretty {
                     let unformatted = rust.to_string();

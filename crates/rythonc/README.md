@@ -18,6 +18,10 @@ By default, the output is fairly minimal. If you would like more human-readable 
 
 By default, the output is printed to stdout. To save it in a file, use the `-o` flag.
 
+Input paths may be absolute or relative and may contain spaces, dots, or
+hyphens in parent directories. Only the input filename supplies the Python
+module identifier; diagnostics retain the original source path.
+
 ```
 Usage: rythonc [OPTIONS] [INPUTS]...
 

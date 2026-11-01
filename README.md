@@ -170,6 +170,9 @@ Known gaps:
   [the integer migration plan](docs/automatic-integers.md).
 - **Dynamic typing**: variables keep one type; heterogeneous lists and
   reassigning a name to a different type don't convert.
+- **Interpreter namespaces**: `sys.modules` and builtin `locals()` access
+  are conversion errors. Use explicit imports and application-owned
+  dictionaries instead of CPython's import registry or frame dictionaries.
 - **Language features**: generators/`yield`, `async`/`await`,
   `eval`/`exec`, multiple inheritance and dunder
   protocols are not supported yet. Decorators are handled through a

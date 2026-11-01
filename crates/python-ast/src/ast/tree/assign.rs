@@ -193,6 +193,9 @@ impl<'a> CodeGen for Assign {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        for target in &self.targets {
+            crate::ast::tree::interpreter_state::check_target(target, &options, &symbols)?;
+        }
         let value_type = crate::infer_type(Some(&ctx), &self.value, &options, &symbols);
         if self.targets.iter().filter(|t| !matches!(t, ExprType::Name(_))).any(|target| {
             use crate::ast::tree::visit;
@@ -1457,24 +1460,6 @@ impl<'a> CodeGen for Assign {
         let render_subscript_store = |sub: &crate::Subscript,
                                       value: &TokenStream|
          -> Result<TokenStream, Box<dyn std::error::Error>> {
-            // The dynamic-import machinery (`locals()[pkg] = ...`,
-            // `sys.modules[...] = ...` — requests/packages.py) is a
-            // documented divergence: the stores are no-ops (the module
-            // aliasing has no rython equivalent).
-            let is_dynamic_import_store = match sub.value.as_ref() {
-                ExprType::Call(c) => {
-                    matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "locals")
-                }
-                ExprType::Attribute(a) => {
-                    a.attr == "modules"
-                        && matches!(a.value.as_ref(), ExprType::Name(n)
-                            if crate::StdModule::from_name(&n.id) == Some(crate::StdModule::Sys))
-                }
-                _ => false,
-            };
-            if is_dynamic_import_store {
-                return Ok(quote!(()));
-            }
             // The receiver must be a PLACE (nested subscripts thread
             // through py_index_mut): the Load lowering would clone, and the
             // store would silently land on the clone.
