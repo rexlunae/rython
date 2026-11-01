@@ -102,6 +102,9 @@
     "line_tally": {
       "status": "pass"
     },
+    "list_generator": {
+      "status": "pass"
+    },
     "math_bare_imports": {
       "status": "pass"
     },
