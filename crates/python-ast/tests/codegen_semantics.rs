@@ -30148,6 +30148,43 @@ fn unbound_exception_reads_follow_every_shared_visitor_body() {
 }
 
 #[test]
+fn exception_comprehension_targets_shadow_outer_bindings() {
+    // Verified against python3: the comprehension reads its own bound
+    // target even when f(False) leaves the outer error unbound.
+    for expr in [
+        "[str(error) for error in [ValueError('inner')] if str(error) == 'inner']",
+        "{str(error): repr(error) for error in [ValueError('inner')]}",
+        "sorted({str(error) for error in [ValueError('inner')]})",
+        "sum(len(str(error)) for error in [ValueError('inner')])",
+        "[str(other) for error in [ValueError('inner')] for other in [error]]",
+        "[str(error) for (error, item) in [(ValueError('inner'), 1)]]",
+        "[str(error) for item in range(1) if str(error := ValueError('walrus')) == 'walrus']",
+    ] {
+        let source = format!(
+            "def f(flag: bool) -> None:\n    if flag:\n        error = ValueError('outer')\n        print(str(error))\n    print({expr})\n"
+        );
+        compile(&source, "exception_comprehension.py");
+    }
+}
+
+#[test]
+fn exception_comprehensions_do_not_fabricate_outer_or_later_bindings() {
+    // Verified against python3: the first iterable reads the outer
+    // scope; later generator targets are unbound locals until assigned;
+    // and no iteration target leaks back into the enclosing scope.
+    for source in [
+        "def f(flag: bool) -> None:\n    if flag:\n        error = ValueError('outer')\n    print([str(error) for error in [error]])\n",
+        "def f(flag: bool) -> None:\n    if flag:\n        error = ValueError('outer')\n    print([str(error) for item in range(1)])\n",
+        "def f() -> None:\n    error = ValueError('outer')\n    print([item for item in range(1) if str(error) for error in [ValueError('inner')]])\n",
+        "def f(flag: bool) -> None:\n    if flag:\n        error = ValueError('outer')\n    print([str(error) for error in [ValueError('inner')]])\n    print(str(error))\n",
+        "def f(flag: bool) -> None:\n    if flag:\n        error = ValueError('outer')\n    print([str(error := ValueError('walrus')) for item in range(0)])\n    print(str(error))\n",
+    ] {
+        let error = compile_err(source, "unbound_exception_comprehension.py");
+        assert!(error.contains("exception value `error`") && error.contains("fabricated default"), "{error}");
+    }
+}
+
+#[test]
 fn exception_display_bindings_follow_the_shared_scope_visitor() {
     // Bindings, not just undecorated methods: aliases, conditional defs,
     // async defs and property-decorated defs must not disappear either.

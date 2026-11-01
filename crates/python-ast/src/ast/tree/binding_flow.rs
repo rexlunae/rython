@@ -81,6 +81,36 @@ impl Analysis<'_> {
                 .and_modify(|old| *old = (*old).min(line))
                 .or_insert(line);
         }
+        if let Some((elements, generators)) = visit::comprehension_parts(expr) {
+            if let Some(first) = generators.first() {
+                // Only the first iterable runs in the enclosing scope.
+                self.expr(&first.iter, bound, line);
+            }
+            let mut inner = bound.clone();
+            // All iteration targets are locals of the comprehension,
+            // including a later generator's not-yet-initialized target.
+            for generator in generators {
+                for name in visit::target_names(&generator.target) {
+                    inner.remove(name);
+                }
+            }
+            for (index, generator) in generators.iter().enumerate() {
+                if index > 0 {
+                    self.expr(&generator.iter, &mut inner, line);
+                }
+                self.target(&generator.target, &mut inner, line, false);
+                for filter in &generator.ifs {
+                    self.expr(filter, &mut inner, line);
+                }
+            }
+            for element in elements {
+                self.expr(element, &mut inner, line);
+            }
+            // Targets never leak out. A walrus binds the enclosing local
+            // and is visible to subsequent inner expressions, but no
+            // iteration is guaranteed, so it adds no definite outer fact.
+            return;
+        }
         let children = visit::subexprs_for(expr, Descend::OwnScope);
         match expr {
             ExprType::NamedExpr(_) => {
@@ -131,16 +161,6 @@ impl Analysis<'_> {
                     let mut entry = before.clone();
                     self.expr(child, &mut entry, line);
                     bound.extend(entry);
-                }
-            }
-            ExprType::ListComp(_)
-            | ExprType::SetComp(_)
-            | ExprType::DictComp(_)
-            | ExprType::GeneratorExp(_) => {
-                // A comprehension can run zero times: no store inside it
-                // establishes a definite binding in the enclosing scope.
-                for child in children {
-                    self.expr(child, &mut bound.clone(), line);
                 }
             }
             _ => {

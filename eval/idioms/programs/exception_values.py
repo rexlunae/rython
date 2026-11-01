@@ -40,6 +40,18 @@ def raising_branch(flag: bool) -> None:
     print("raising branch", str(error))
 
 
+def comprehension_scope(flag: bool) -> None:
+    if flag:
+        error = ValueError("outer")
+        print("outer before comprehension", str(error))
+    print("list", [str(error) for error in [ValueError("inner")] if str(error) == "inner"])
+    print("dict", {str(error): repr(error) for error in [ValueError("inner")]})
+    print("set", sorted({str(error) for error in [ValueError("inner")]}))
+    print("generator", sum(len(str(error)) for error in [ValueError("inner")]))
+    print("nested", [str(other) for error in [ValueError("inner")] for other in [error]])
+    print("unpacked", [str(error) for (error, item) in [(ValueError("inner"), 1)]])
+
+
 def argument(value: str) -> str:
     global calls
     calls += 1
@@ -151,6 +163,8 @@ def main() -> None:
         raising_branch(False)
     except TypeError as branch_error:
         print("caught branch", str(branch_error))
+    comprehension_scope(False)
+    comprehension_scope(True)
     print(str(ssl_empty), repr(ssl_empty))
     print(str(ssl_one), repr(ssl_one))
     dns = gaierror("dns")

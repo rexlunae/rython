@@ -2077,6 +2077,12 @@ error; generated storage defaults must not become Python values.
 Only paths that reach the read participate in this check: a branch that
 returns or raises does not make a later binding possibly unbound. Loop
 exits and `finally` are analyzed at their actual destinations.
+A comprehension's first iterable reads the enclosing bindings; its
+iteration targets are separate locals, bound in generator order before
+their filters and result expressions. A later, not-yet-bound target cannot
+read an older outer binding (issue #505). Targets never leak out, and a
+walrus assignment inside a possibly-empty comprehension does not prove
+the enclosing name is bound after it.
 
 `raise E("msg")` lowers to `return Err(PyException::new("E", …))`;
 whether a name is an exception class is decided by a known-name list
@@ -2909,7 +2915,7 @@ accepted as permanent spec:
 | Exception attribute writes are conversion errors: assigning an auxiliary Python `error.message` cannot overwrite the Rust display payload. Direct reads of Rust implementation fields on exception values are refused; modeled caught-class field reads remain supported | Loud (issue #498); the old message store silently changed str(error) |
 | Exception classes defining or inheriting custom `__str__` / `__repr__` bindings are refused at conversion, naming the defining class, binding and line. The old marker lowering discarded these methods and silently displayed the raise argument instead | Loud (issue #483); format explicit application data at its display sites |
 | A one-argument builtin `KeyError` records the original key's repr separately from its quoted display message. `repr(error)` preserves the original key type and quoting, and the key expression is evaluated once | Correct (issue #500); the old repr fallback quoted the display as another string |
-| Builtin exception calls share their construction/type in value and raise positions. Argument evaluation is once and ordered; str/repr preserve Python scalar spelling and original argument structure, including multi-argument tuple messages. Unsupported mutable/unknown representations and specialized forms, and potentially-unbound exception locals, are refused (§8.2) | Correct-or-loud (issues #477, #478, #502) |
+| Builtin exception calls share their construction/type in value and raise positions. Argument evaluation is once and ordered; str/repr preserve Python scalar spelling and original argument structure, including multi-argument tuple messages. Unsupported mutable/unknown representations and specialized forms, and potentially-unbound exception locals, are refused (§8.2). Comprehension bindings are checked in their own scope and generator order; a read before a later target's assignment is refused rather than using an outer value | Correct-or-loud (issues #477, #478, #502, #505) |
 | Socket exception canonicalization keeps `gaierror` and `herror` as distinct OSError subclasses; they do not catch each other or FileNotFoundError. Only `socket.error` aliases OSError | Correct (issue #503); the old alias map broadened their handlers |
 | True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |
 | Exception message shapes: `int()`'s message carries "with base 10" and `float()`'s quotes the string as Python's repr (#339, round 10); `open` and stream errors are CPython's `[Errno N] text: 'path'` form (#339); the `KeyError` key quoting is single-quoted like CPython (round 99) | Correct (was a defect class in issue #82's family) |

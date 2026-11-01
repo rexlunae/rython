@@ -102,7 +102,7 @@ fn unbound_read<'a>(e: &'a ExprType, visible: &Names, enclosing: &Names) -> Opti
         }
         _ => {}
     }
-    if let Some((elts, generators)) = comprehension(e) {
+    if let Some((elts, generators)) = visit::comprehension_parts(e) {
         let first = generators.first()?;
         if let Some(name) = unbound_read(&first.iter, visible, enclosing) {
             return Some(name);
@@ -130,17 +130,6 @@ fn unbound_read<'a>(e: &'a ExprType, visible: &Names, enclosing: &Names) -> Opti
         found.is_none()
     });
     found
-}
-
-/// A comprehension's element expressions and generators, when `e` is one.
-fn comprehension(e: &ExprType) -> Option<(Vec<&ExprType>, &[crate::Comprehension])> {
-    match e {
-        ExprType::ListComp(c) => Some((vec![c.elt.as_ref()], &c.generators)),
-        ExprType::GeneratorExp(c) => Some((vec![c.elt.as_ref()], &c.generators)),
-        ExprType::SetComp(c) => Some((vec![c.elt.as_ref()], &c.generators)),
-        ExprType::DictComp(c) => Some((vec![c.key.as_ref(), c.value.as_ref()], &c.generators)),
-        _ => None,
-    }
 }
 
 /// Check one scope's statements: their expressions against `visible`,

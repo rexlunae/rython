@@ -510,6 +510,20 @@ pub fn def_owns_name(f: &crate::FunctionDef, name: &str) -> bool {
     })
 }
 
+/// A comprehension's result expressions and generators. Scope/flow
+/// analyses need these roles, rather than the flat subexpression order:
+/// the first iterable runs in the enclosing scope; each target binds in
+/// the inner scope before its filters, later iterables, and the result.
+pub fn comprehension_parts(e: &ExprType) -> Option<(Vec<&ExprType>, &[crate::Comprehension])> {
+    match e {
+        ExprType::ListComp(c) => Some((vec![c.elt.as_ref()], &c.generators)),
+        ExprType::GeneratorExp(c) => Some((vec![c.elt.as_ref()], &c.generators)),
+        ExprType::SetComp(c) => Some((vec![c.elt.as_ref()], &c.generators)),
+        ExprType::DictComp(c) => Some((vec![c.key.as_ref(), c.value.as_ref()], &c.generators)),
+        _ => None,
+    }
+}
+
 /// Call `f` on each direct subexpression of `e` that a walk with
 /// `descend` enters, in source order, until `f` returns false; returns
 /// false when stopped. The ONE enumeration behind `subexprs`,

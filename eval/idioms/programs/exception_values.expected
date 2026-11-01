@@ -40,6 +40,19 @@ caught syntax None NestedParseFailure()
 returning branch returning
 raising branch raising
 caught branch stopped
+list ['inner']
+dict {'inner': "ValueError('inner')"}
+set ['inner']
+generator 5
+nested ['inner']
+unpacked ['inner']
+outer before comprehension outer
+list ['inner']
+dict {'inner': "ValueError('inner')"}
+set ['inner']
+generator 5
+nested ['inner']
+unpacked ['inner']
 () SSLError()
 ('tls',) SSLError('tls')
 dns gaierror('dns')

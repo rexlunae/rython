@@ -51,8 +51,11 @@ Mutable/unknown values (including the shared bytes/bytearray type), keywords,
 splats, and unmodeled specialized constructor forms are refused. An exception
 local that may be unbound is refused before a generated default can be read.
 The shared-visitor flow check merges only paths reaching the read, preserving
-return/raise, loop-exit, handler-clearing, and finally behavior. Custom
-exceptions inherit display policies through the builtin ancestor's MRO,
+return/raise, loop-exit, handler-clearing, and finally behavior. The
+comprehension targets bind in their own scope after the first iterable;
+filters and later iterables see only targets already assigned. The check
+does not turn inner target/walrus bindings into definite outer bindings.
+Custom exceptions inherit display policies through the builtin ancestor's MRO,
 including the empty `SyntaxError`/`IndentationError`/`TabError` display.
 The socket aliases preserve actual class identity: `socket.error` is OSError,
 while gaierror/herror remain distinct subclasses for construction and matching.
