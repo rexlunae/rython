@@ -3348,25 +3348,7 @@ impl<'a> CodeGen for Call {
                     | "tuple"
                     | "next"
                     | "id"
-            )) && (symbols.get(bname).is_none()
-                // An import of a BUILTIN-CLASS self-alias (`from .compat
-                // import str` where compat does `str = str` — requests'
-                // py2 shim): the self-alias emits no runtime item, so the
-                // name still IS the builtin — dispatch to the builtin arm
-                // (the generic import path would render a dangling static
-                // read, `(*str).clone()(...)`).
-                || crate::ast::tree::module::import_binds_builtin_self_alias(
-                    bname,
-                    &symbols,
-                    &options,
-                ))
-                // A loop element shadowing the builtin (`for filter in ...:
-                // filter(**kwargs)` — botocore's docs client): the call
-                // through the untyped element is dropped at the generic
-                // fallback — do not treat it as the builtin. A local of
-                // the same name shadows the builtin the same way.
-                && !options.called_params.contains(bname)
-                && !options.local_types.contains_key(bname)
+            )) && crate::ast::tree::type_ctx::is_unshadowed_builtin(bname, &options, &symbols)
             {
                 let mut rendered = Vec::new();
                 for arg in &self.args {

@@ -2231,6 +2231,8 @@ fn iterator_builtin_type(
 }
 
 /// Keep builtin typing and lowering on the same name-resolution rule.
+/// Inferred bindings include comprehension targets, which need not have
+/// an entry in the symbol table or legacy annotation map.
 pub(crate) fn is_unshadowed_builtin(
     name: &str,
     options: &PythonOptions,
@@ -2239,6 +2241,7 @@ pub(crate) fn is_unshadowed_builtin(
     (symbols.get(name).is_none()
         || crate::ast::tree::module::import_binds_builtin_self_alias(name, symbols, options))
         && !options.local_types.contains_key(name)
+        && !options.name_types.contains_key(name)
         && !options.called_params.contains(name)
 }
 

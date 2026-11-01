@@ -30170,6 +30170,22 @@ fn cast_wrapped_and_returned_mutable_outputs_are_loud() {
 }
 
 #[test]
+fn callable_comprehension_targets_cannot_claim_builtin_ownership() {
+    // Verified against python3: both callable targets return the source
+    // inner list; mutating source[0] must update the collected value.
+    for (header, callback, result, target, output_type) in [
+        ("def identity(value: list[int]) -> list[int]:\n    return value\n", "identity", "list(source[0])", "list", "list[int]"),
+        ("class Holder:\n    def __init__(self, value: list[int]):\n        self.__name__ = value\ndef identity(value: list[int]) -> Holder:\n    return Holder(value)\n", "identity", "type(source[0]).__name__", "type", "Holder"),
+    ] {
+        let source = format!(
+            "from typing import Callable\n{header}def main() -> None:\n    source = [[1]]\n    callbacks: list[Callable[[list[int]], {output_type}]] = [{callback}]\n    result = [{result} for {target} in callbacks]\n    source[0].append(2)\n    print(source, result)\n"
+        );
+        let error = compile_err(&source, "callable_target_ownership.py");
+        assert!(error.contains("comprehension output") && error.contains("refuses to lose sharing"), "{error}");
+    }
+}
+
+#[test]
 fn subclass_registry_ownership_proof_never_drops_filters_or_arguments() {
     // Verified against python3: the False filter produces an empty list;
     // passing 3 constructs a Child whose value is 3, not its default 1.
