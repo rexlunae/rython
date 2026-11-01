@@ -8075,6 +8075,58 @@ fn warnings_module_matches_python_transcript() {
 }
 
 #[test]
+fn thread_instance_fields_match_python_at_runtime() {
+    // Verified against python3 (CPython 3.14.4 and 3.12.14).
+    // The names pin that Default creates no placeholder threads; the
+    // argument/created/ready ordering pins constructor-time argument binding.
+    for (name, source, expected) in [
+        (
+            "thread_instance_field_original",
+            concat!(
+                "import threading\n\n",
+                "def work() -> None:\n    print(\"worked\")\n\n",
+                "class Runner:\n",
+                "    def __init__(self) -> None:\n",
+                "        self.worker = threading.Thread(target=work)\n\n",
+                "    def go(self) -> None:\n",
+                "        self.worker.start()\n",
+                "        self.worker.join()\n\n",
+                "def main() -> None:\n    Runner().go()\n\n",
+                "if __name__ == \"__main__\":\n    main()\n",
+            ),
+            "worked\n",
+        ),
+        (
+            "thread_instance_field",
+            include_str!("../../../eval/idioms/programs/thread_instance_field.py"),
+            "False\nworked\nFalse\n",
+        ),
+        (
+            "thread_instance_field_aliases",
+            include_str!("fixtures/thread_instance_field_aliases.py"),
+            "before 1\nargument aliased\ncreated\nready\nFalse\naliased 7 Thread-1 (work)\nFalse\ndirect 9 Thread-2 (work)\nlast 11 Thread-3 (work)\n",
+        ),
+    ] {
+        let scratch = Scratch::new(name);
+        let file = scratch.path().join(format!("{name}.py"));
+        fs::write(&file, source).unwrap();
+        let pkg = rypip::discover(&file).expect("discover");
+        let krate = rypip::convert(&pkg, &scratch.path().join("crate"), &ConvertOptions::default())
+            .expect("convert");
+        let status = Command::new("cargo").arg("build")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env("RUSTFLAGS", "-D warnings")
+            .current_dir(&krate.root).status().expect("build generated crate");
+        assert!(status.success(), "{name}: warning-clean build");
+        let output = Command::new(krate.root.join(format!("target/debug/{name}")))
+            .output().expect("run generated binary");
+        assert!(output.status.success(), "{name}: {:?}", output);
+        assert_eq!(output.stdout, expected.as_bytes(), "{name}: stdout");
+        assert!(output.stderr.is_empty(), "{name}: {:?}", output);
+    }
+}
+
+#[test]
 fn threading_semantics_match_python_at_runtime() {
     // Thread lifecycle (start/join/is_alive), with-lock, RLock reentrancy,
     // Event, Semaphore, active_count — sequenced by join() so the output

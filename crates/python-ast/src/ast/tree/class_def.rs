@@ -3044,7 +3044,161 @@ impl ClassDef {
                 fields.push((name, crate::TypeInfo::PyValue));
             }
         }
+        // Thread has no side-effect-free Python default constructor. The
+        // absent storage slot stays None until the actual Python assignment;
+        // it must never allocate a placeholder Thread or consume its name.
+        // Existing Option field stores/receivers insert Some / unwrap.
+        for (_, ty) in &mut fields {
+            if *ty == crate::TypeInfo::Threading(crate::ThreadingType::Thread) {
+                *ty = crate::TypeInfo::Option(Box::new(ty.clone()));
+            }
+        }
         Ok(fields)
+    }
+
+    /// The Option backing a Thread field is absent storage, not a Python
+    /// constructor. Until we model missing instance attributes, require a
+    /// definite top-level store before a read (including indirect reads via
+    /// a method call or an escaping `self`). Conditional stores cannot prove
+    /// initialization. This deliberately rejects rather than inventing None.
+    fn validate_thread_field_initialization(
+        &self,
+        fields: &[(String, crate::TypeInfo)],
+        symbols: &SymbolTableScopes,
+        options: &PythonOptions,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::ast::tree::threading_types::ThreadMethod;
+        let inherited: std::collections::BTreeSet<String> = self.cross_module_chain(symbols, options)
+            .iter().skip(1).flat_map(|(base, syms, opts, _)| {
+                base.infer_fields(syms, opts).unwrap_or_default().into_iter()
+                    .filter(|(_, ty)| ThreadMethod::receiver_is_thread(ty))
+                    .map(|(name, _)| name)
+            }).collect();
+        // Base initialization and virtual dispatch need a separate flow
+        // model before inherited absent slots can be exposed safely.
+        if !inherited.is_empty() {
+            return Err(format!(
+                "inherited thread fields of class `{}` (line {}) are not supported yet; \
+                 use composition; rython refuses to silently expose uninitialized thread fields",
+                self.name, self.body.first().and_then(|s| s.lineno).unwrap_or(0),
+            ).into());
+        }
+        let mut thread_fields: std::collections::BTreeSet<String> = fields.iter()
+            .filter(|(_, ty)| ThreadMethod::receiver_is_thread(ty))
+            .map(|(name, _)| name.clone()).collect();
+        // Also catch a Thread first stored outside __init__, including a
+        // class with no __init__ (infer_fields has no layout in that case).
+        for method in self.methods() {
+            let mut names = std::collections::HashMap::new();
+            visit::walk_stmts(&method.body, Descend::SkipDefs, &mut |stmt| {
+                if let StatementType::Assign(a) = &stmt.statement
+                    && let [ExprType::Name(n)] = a.targets.as_slice()
+                    && let ExprType::Call(c) = &a.value
+                    && crate::ThreadingType::constructor(&c.func, symbols)
+                        == Some(crate::ThreadingType::Thread)
+                {
+                    names.insert(n.id.clone(), crate::TypeInfo::Threading(crate::ThreadingType::Thread));
+                }
+                Flow::Continue
+            });
+            let mut stores = Vec::new();
+            collect_field_stores(&method.body, &mut stores);
+            for store in stores {
+                let holds_thread = match store.value {
+                    ExprType::Call(c) => crate::ThreadingType::constructor(&c.func, symbols)
+                        == Some(crate::ThreadingType::Thread),
+                    ExprType::Name(n) => names.get(&n.id).is_some_and(ThreadMethod::receiver_is_thread),
+                    _ => false,
+                };
+                if holds_thread {
+                    thread_fields.insert(store.attr);
+                }
+            }
+        }
+        if thread_fields.is_empty() {
+            return Ok(());
+        }
+        let refusal = |line: usize, reason: &str| -> Box<dyn std::error::Error> {
+            format!(
+                "thread field(s) {} of class `{}` at line {} {} is not supported yet; \
+                 initialize each field unconditionally in __init__ before reading it or \
+                 passing/calling self, and keep the attribute present; \
+                 rython refuses to silently replace an uninitialized thread field with None",
+                thread_fields.iter().map(|f| format!("`self.{f}`")).collect::<Vec<_>>().join(", "),
+                self.name, line, reason,
+            ).into()
+        };
+        for method in self.methods() {
+            let mut deletion = None;
+            visit::walk_stmts(&method.body, Descend::SkipDefs, &mut |stmt| {
+                if let StatementType::Delete(targets) = &stmt.statement
+                    && targets.iter().any(|target| visit::any_expr(target, |e| {
+                        matches!(e, ExprType::Attribute(a)
+                            if visit::is_self(&a.value) && thread_fields.contains(&a.attr))
+                    }))
+                {
+                    deletion = Some(stmt.lineno.unwrap_or(0));
+                    return Flow::Stop;
+                }
+                Flow::Continue
+            });
+            if let Some(line) = deletion {
+                return Err(refusal(line, "deletion"));
+            }
+        }
+        let mut pending = thread_fields.clone();
+        let mut initialized = std::collections::BTreeSet::new();
+        let Some(init) = self.init_method() else {
+            return Err(refusal(self.body.first().and_then(|s| s.lineno).unwrap_or(0), "without __init__ initialization"));
+        };
+        for stmt in &init.body {
+            if pending.is_empty() {
+                break;
+            }
+            let mut early_read = None;
+            visit::walk_stmts(std::slice::from_ref(stmt), Descend::SkipDefs, &mut |s| {
+                if matches!(s.statement, StatementType::Return(_))
+                    || visit::stmt_exprs(s).iter().any(|e| {
+                        reads_uninitialized_self(e, &initialized)
+                    })
+                    || visit::stmt_targets(s).iter().any(|target| {
+                        // A direct assignment creates the attribute; other
+                        // targets evaluate their receiver (or read-modify-write).
+                        if matches!(s.statement, StatementType::Assign(_))
+                            && matches!(target, ExprType::Attribute(a) if visit::is_self(&a.value))
+                        {
+                            false
+                        } else {
+                            reads_uninitialized_self(target, &initialized)
+                        }
+                    })
+                {
+                    early_read = Some(s.lineno.unwrap_or(0));
+                    return Flow::Stop;
+                }
+                Flow::Continue
+            });
+            if let Some(line) = early_read {
+                return Err(refusal(line, "a possibly uninitialized read or constructor return"));
+            }
+            // Only this statement's unconditional stores count. The shared
+            // visitor above inspects nested bodies but never promotes their
+            // conditional stores to definite initialization.
+            if let StatementType::Assign(a) = &stmt.statement {
+                for target in &a.targets {
+                    if let ExprType::Attribute(attr) = target
+                        && visit::is_self(&attr.value)
+                    {
+                        pending.remove(&attr.attr);
+                        initialized.insert(attr.attr.clone());
+                    }
+                }
+            }
+        }
+        if !pending.is_empty() {
+            return Err(refusal(self.body.first().and_then(|s| s.lineno).unwrap_or(0), "conditional or missing __init__ initialization"));
+        }
+        Ok(())
     }
 
     /// A class's OWN fields: its `__init__` stores minus the stores that
@@ -3381,6 +3535,20 @@ struct FieldStore<'a> {
     /// The store's annotation (`self.x: list[float] = ...`), which pins
     /// the field type when the value cannot be inferred.
     annotation: Option<&'a ExprType>,
+}
+
+fn reads_uninitialized_self(
+    expr: &ExprType,
+    initialized: &std::collections::BTreeSet<String>,
+) -> bool {
+    match expr {
+        ExprType::Attribute(a) if visit::is_self(&a.value) => !initialized.contains(&a.attr),
+        // A method/property call or escaped self could expose any missing
+        // field. Ordinary argument fields also need a preceding store:
+        // reading self.label before assigning it must not capture a default.
+        e if visit::is_self(e) || crate::ast::tree::scope::is_super_call(e) => true,
+        _ => visit::subexprs(expr).iter().any(|e| reads_uninitialized_self(e, initialized)),
+    }
 }
 
 /// Collect `self.attr = ...` stores anywhere in a body (recursing into
@@ -4234,6 +4402,7 @@ StatementType::Assign(a)
         // stores that belong to a base class's fields (those write into the
         // embedded base struct).
         let fields = self.own_fields(&symbols, &options)?;
+        self.validate_thread_field_initialization(&fields, &symbols, &options)?;
 
         // The embedded base struct occupies `__rython_base`; a user field of
         // the same name would collide with it.
@@ -5708,10 +5877,12 @@ fn infer_field_type(
         // A constructed instance of a known class types the field as that
         // class's struct.
         ExprType::Call(call) => match call.func.as_ref() {
-            // `self._local = threading.local()` (requests' HTTPDigestAuth):
-            // the per-thread attribute object (issue #356).
-            func if crate::ast::tree::type_ctx::threading_local_ctor(func, symbols) => {
-                Some(crate::TypeInfo::Threading(crate::ThreadingType::Local))
+            // Keep runtime handles typed through instance stores, using
+            // the same import-aware constructor authority as local inference.
+            func if let Some(kind @ (crate::ThreadingType::Thread | crate::ThreadingType::Local)) =
+                crate::ThreadingType::constructor(func, symbols) =>
+            {
+                Some(crate::TypeInfo::Threading(kind))
             }
             // `self.queue = deque()` / `self.cache = OrderedDict()` /
             // `self.index = defaultdict(list)`: the runtime collections

@@ -13586,7 +13586,7 @@ fn threading_thread_lowers_target_and_args_statically() {
         out
     );
     assert!(
-        out.contains("let label = (label) . clone ()"),
+        out.contains("let __rython_thread_arg_0 = (label) . clone ()"),
         "args must be cloned into the closure: {}",
         out
     );
@@ -13595,6 +13595,104 @@ fn threading_thread_lowers_target_and_args_statically() {
         "thread bodies report unhandled exceptions: {}",
         out
     );
+}
+
+#[test]
+fn thread_instance_fields_keep_typed_storage_and_lifecycle_calls() {
+    for (import, constructor) in [
+        ("import threading", "threading.Thread"),
+        ("import threading as th", "th.Thread"),
+        ("from threading import Thread", "Thread"),
+        ("from threading import Thread as Worker", "Worker"),
+    ] {
+        let source = format!(
+            "{import}\ndef work() -> None:\n    print('worked')\nclass Runner:\n    def __init__(self) -> None:\n        self.worker = {constructor}(target=work)\n    def go(self) -> None:\n        self.worker.start()\n        self.worker.join()\n        print(self.worker.is_alive())\n"
+        );
+        let (out, warnings) = compile_with_warnings(&source, "thread_field.py");
+        assert!(out.contains("pub worker : Option < threading :: Thread >"), "{out}");
+        assert!(out.contains("self . worker = Some ("), "{out}");
+        assert!(out.contains(". start ()") && out.contains(". join ()") && out.contains(". is_alive ()"), "{out}");
+        assert_eq!(out.matches(":: new (\"work\"").count(), 1, "{out}");
+        assert!(!warnings.iter().any(|w| w.contains("dropped")), "{warnings:?}");
+        let error = compile_nostd(&source, "thread_field.py").expect_err("Thread needs std");
+        assert!(error.contains("std tier"), "{error}");
+    }
+}
+
+#[test]
+fn thread_instance_fields_refuse_uninitialized_or_deleted_storage() {
+    for body in [
+        "    def __init__(self, flag: bool) -> None:\n        if flag:\n            self.worker = threading.Thread(target=work)\n",
+        "    def __init__(self) -> None:\n        print(self.worker)\n        self.worker = threading.Thread(target=work)\n",
+        "    def __init__(self) -> None:\n        self.worker.extra = 1\n        self.worker = threading.Thread(target=work)\n",
+        "    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work, args=(self.label,))\n        self.label = 'late'\n",
+        "    def __init__(self, flag: bool) -> None:\n        if flag:\n            self.label = 'conditional'\n        self.worker = threading.Thread(target=work, args=(self.label,))\n",
+        "    def __init__(self) -> None:\n        self.go()\n        self.worker = threading.Thread(target=work)\n    def go(self) -> None:\n        self.worker.start()\n",
+        "    def __init__(self, flag: bool) -> None:\n        if flag:\n            return\n        self.worker = threading.Thread(target=work)\n",
+        "    def configure(self) -> None:\n        self.worker = threading.Thread(target=work)\n",
+        "    def __init__(self) -> None:\n        pass\n    def configure(self) -> None:\n        worker = threading.Thread(target=work)\n        self.worker = worker\n",
+        "    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work)\n    def clear(self) -> None:\n        del self.worker\n",
+    ] {
+        let source = format!("import threading\ndef work() -> None:\n    pass\nclass Runner:\n{body}");
+        let error = compile_err(&source, "thread_uninitialized.py");
+        assert!(error.contains("thread field") && error.contains("line") && error.contains("initialize"), "{error}");
+        assert!(error.contains("refuses"), "{error}");
+    }
+}
+
+#[test]
+fn thread_instance_fields_refuse_inherited_storage() {
+    for body in [
+        "        pass\n",
+        "        if flag:\n            super().__init__()\n",
+        "        super().__init__()\n",
+    ] {
+        let source = format!("import threading\ndef work() -> None:\n    pass\nclass Runner:\n    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work)\nclass Child(Runner):\n    def __init__(self, flag: bool) -> None:\n{body}");
+        let error = compile_err(&source, "thread_inheritance.py");
+        assert!(error.contains("inherited thread fields") && error.contains("composition") && error.contains("refuses"), "{error}");
+    }
+    let error = compile_err(
+        "import threading\ndef work() -> None:\n    pass\nclass Runner:\n    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work)\nclass Child(Runner):\n    def clear(self) -> None:\n        del self.worker\n",
+        "thread_inherited_delete.py",
+    );
+    assert!(error.contains("inherited thread fields") && error.contains("refuses"), "{error}");
+    let error = compile_err(
+        "import threading\ndef work() -> None:\n    pass\nclass Base:\n    def __init__(self) -> None:\n        pass\nclass Child(Base):\n    def __init__(self) -> None:\n        super().__init__()\n        self.worker = threading.Thread(target=work)\n",
+        "thread_super_early.py",
+    );
+    assert!(error.contains("thread field") && error.contains("uninitialized"), "{error}");
+}
+
+#[test]
+fn thread_instance_fields_refuse_unsupported_methods_and_targets() {
+    for method in ["join(0.1)", "join(timeout=0.1)", "run()", "start(1)"] {
+        let source = format!("import threading\ndef work() -> None:\n    pass\nclass Runner:\n    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work)\n    def go(self) -> None:\n        self.worker.{method}\n");
+        let error = compile_err(&source, "thread_operation.py");
+        assert!(error.contains("threading.Thread") && error.contains("not supported yet") && error.contains("refuses"), "{error}");
+    }
+    for (import, parameter, constructor) in [
+        ("import threading as th", "th", "th.Thread"),
+        ("from threading import Thread as Worker", "Worker", "Worker"),
+    ] {
+        let source = format!("{import}\ndef work() -> None:\n    pass\nclass Runner:\n    def __init__(self, {parameter}: str) -> None:\n        self.worker = {constructor}(target=work)\n");
+        let error = compile_err(&source, "thread_shadowed.py");
+        assert!(error.contains("shadowed") || error.contains("cannot infer a type for attribute `self.worker`"), "{error}");
+    }
+    let error = compile_err(
+        "import threading\nfrom typing import Callable\nclass Runner:\n    def __init__(self, work: Callable[[], None]) -> None:\n        self.worker = threading.Thread(target=work)\n",
+        "thread_callable.py",
+    );
+    assert!(error.contains("callable VALUE") && error.contains("thread boundary"), "{error}");
+    let error = compile_err(
+        "import threading\nclass Runner:\n    def __init__(self, work: str) -> None:\n        self.worker = threading.Thread(target=work)\n",
+        "thread_target_value.py",
+    );
+    assert!(error.contains("callable VALUE") && error.contains("thread boundary"), "{error}");
+    let error = compile_err(
+        "import threading\ndef work(n: int) -> None:\n    pass\nclass Runner:\n    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work, args=(*[1],))\n",
+        "thread_starred.py",
+    );
+    assert!(error.contains("starred arguments") && error.contains("refuses"), "{error}");
 }
 
 #[test]

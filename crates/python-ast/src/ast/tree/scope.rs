@@ -530,7 +530,7 @@ pub(crate) fn chain_base_name(expr: &ExprType) -> Option<&str> {
 /// Whether `expr` is the real Python `super()` shape: a bare `super()` call
 /// (no arguments). The receiver of `super().m(...)` — its mutation targets
 /// the enclosing method's self even though the chain bottoms out in a Call.
-fn is_super_call(expr: &ExprType) -> bool {
+pub(crate) fn is_super_call(expr: &ExprType) -> bool {
     matches!(
         expr,
         ExprType::Call(c)

@@ -156,7 +156,8 @@ lookup, normalize),
 `collections` (partial — issue #427; `deque`, `defaultdict`, `OrderedDict`
 and `Counter` construct, `ChainMap`/`namedtuple` do not), `pathlib`, `glob`,
 `subprocess`, `tempfile`,
-`threading` (Thread with static targets, Lock/RLock/Event/Semaphore
+`threading` (Thread with static targets, including initialized instance fields
+and aliased imports; Lock/RLock/Event/Semaphore
 with a real `with lock:` acquire/release lowering, `local()` as a
 per-thread bag of run-time attributes), `socket` (TCP/UDP
 over std::net with the CPython OSError hierarchy), `urllib.request`

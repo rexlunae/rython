@@ -180,6 +180,9 @@
     "text_stats": {
       "status": "pass"
     },
+    "thread_instance_field": {
+      "status": "pass"
+    },
     "tokenizer": {
       "status": "pass"
     },

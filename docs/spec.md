@@ -2570,6 +2570,24 @@ An unhandled exception in a thread prints CPython's
 traceback frames). `start()`/`join()` misuse panics with CPython's
 RuntimeError text (§12.2 family).
 
+Thread constructor/result inference retains the handle through locals and
+instance fields, including `import threading as th` and
+`from threading import Thread as Worker` (issue #481). Thread fields use
+`Option<threading::Thread>` as initially absent storage: struct defaults do
+not construct threads, consume thread names, or run targets. The real
+assignment evaluates `args` once at construction, then stores the handle;
+`start` alone runs the target. A thread field must be initialized by an
+unconditional top-level assignment in `__init__` before it is read or
+`self` escapes/is called. Fields read by constructor arguments also need
+preceding unconditional stores. Conditional/missing initialization, an early
+constructor return, and deletion are conversion errors; initialize the
+field first and keep it present. Inherited thread fields are currently
+refused (use composition instead). Calls through `super()` before the
+thread fields are initialized are also refused, since they may expose
+`self`. The lifecycle methods take no arguments
+in this subset; timeout joins and unmodeled Thread methods are conversion
+errors rather than dropped calls.
+
 `threading.local()` (issue #356 — requests' `HTTPDigestAuth`) is
 `threading::Local`: an object whose attributes are created at run time
 and are PER THREAD, each thread starting with none. Its attributes are

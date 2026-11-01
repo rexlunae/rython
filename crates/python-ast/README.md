@@ -16,6 +16,15 @@ A Rust library for parsing Python code into Abstract Syntax Trees (AST) and expe
 
 ## 🚀 Quick Start
 
+`threading.Thread` retains its runtime handle type through local variables
+and initialized instance fields, including aliased imports. Field defaults
+do not construct placeholder threads; arguments bind at the Python
+constructor point, and `start()` runs the target. Initialize thread fields
+unconditionally in `__init__` before reading them or exposing `self`.
+Conditional/missing initialization, field deletion, inherited thread fields,
+callable-value targets, and lifecycle arguments
+(including join timeouts) are conversion errors.
+
 Oversized scalar integer literals lower exactly to `stdpython::PyInteger`
 without passing through a float. Scalar arithmetic and supported builtins
 retain the integer's value; unsupported unbounded-integer boundaries are
