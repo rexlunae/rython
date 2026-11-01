@@ -35,6 +35,12 @@ during conversion. Static import aliases work; passing `sys.exit` as a
 function value is refused.
 Exception attribute writes and direct reads of Rust payload fields are
 refused. Modeled caught-class fields keep their typed accessors.
+Exception classes with custom `__str__` or `__repr__` bindings are refused,
+including inherited overrides and aliases. Their display-time calls and
+side effects cannot be replaced by a message computed at construction;
+format explicit application data at each display site instead.
+One-argument builtin `KeyError` construction retains the key's repr for
+both its quoted display and its exception repr, evaluating the key once.
 
 ### Prerequisites
 

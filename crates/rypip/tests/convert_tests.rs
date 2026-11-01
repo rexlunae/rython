@@ -43,6 +43,41 @@ fn exception_payload_stores_and_reads_are_refused_by_the_package_converter() {
 }
 
 #[test]
+fn custom_exception_display_is_refused_by_the_package_converter() {
+    let scratch = Scratch::new("exception-display");
+    // Verified against python3: custom str runs at EACH display, and
+    // custom repr supplies the repr. Construction-time rendering cannot
+    // preserve either the call timing or the side effects.
+    for method in ["__str__", "__repr__"] {
+        let file = scratch.path().join("app.py");
+        fs::write(&file, format!(
+            "class AppError(Exception):\n    def {method}(self) -> str:\n        print('called')\n        return 'custom'\ndef main() -> None:\n    try:\n        raise AppError('k')\n    except AppError as error:\n        print('caught')\n        print(str(error))\n        print(error)\n        print(repr(error))\nif __name__ == '__main__':\n    main()\n"
+        )).unwrap();
+        let package = rypip::discover(&file).unwrap();
+        let error = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("exception class `AppError`") && message.contains(method), "{message}");
+        assert!(message.contains("app.py") && message.contains("line 2"), "{message}");
+        assert!(message.contains("display site") && message.contains("refuses to silently ignore"), "{message}");
+    }
+}
+
+#[test]
+fn default_exception_and_ordinary_class_display_keep_their_cpython_behavior() {
+    let scratch = Scratch::new("default-exception-display");
+    let file = scratch.path().join("app.py");
+    fs::write(&file, include_str!("../../../eval/idioms/programs/exception_display.py")).unwrap();
+    let package = rypip::discover(&file).unwrap();
+    let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/app")).output().unwrap();
+    // Verified against python3.
+    assert_eq!(output.stdout, b"k\nk\nChild('k')\n'k'\nKeyError('k')\n5\nKeyError(5)\n(1, 'a')\nKeyError((1, 'a'))\n'again'\nKeyError('again')\ncalls 1\npretty\npretty\nPretty()\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 #[cfg(unix)]
 fn system_exit_preserves_status_handlers_and_cleanup() {
     let scratch = Scratch::new("system-exit");

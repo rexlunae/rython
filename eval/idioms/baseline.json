@@ -54,6 +54,9 @@
     "entry_no_guard": {
       "status": "pass"
     },
+    "exception_display": {
+      "status": "pass"
+    },
     "factory_return": {
       "status": "pass"
     },

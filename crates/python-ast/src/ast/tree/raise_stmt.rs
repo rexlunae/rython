@@ -601,12 +601,25 @@ fn exception_value(
                             quote!(format!(#fmt, #(#args),*))
                         }
                     };
-                    return Ok(match ancestors {
+                    let construct = |message: TokenStream| match &ancestors {
                         Some(ancestors) => quote!(PyException::new_with_attrs_and_ancestors(
-                            #kind, #msg, vec![], vec![#(#ancestors),*]
+                            #kind, #message, vec![], vec![#(#ancestors),*]
                         )),
-                        None => quote!(PyException::new(#kind, #msg)),
-                    });
+                        None => quote!(PyException::new(#kind, #message)),
+                    };
+                    if is_key_error && call.args.len() == 1 {
+                        // KeyError's one-argument display is already the
+                        // argument's repr. Retain that same rendering for
+                        // repr(error), instead of quoting the display as
+                        // another string argument (issue #500). Evaluate
+                        // the original argument and its repr only once.
+                        let exception = construct(quote!(&__rython_key_arg_repr));
+                        return Ok(quote!({
+                            let __rython_key_arg_repr = #msg;
+                            #exception.with_args_repr(vec![__rython_key_arg_repr])
+                        }));
+                    }
+                    return Ok(construct(msg));
                 }
             }
             let tokens = exc.clone().to_rust(ctx, options, symbols)?;

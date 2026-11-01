@@ -167,6 +167,11 @@ exception's `code` can be read; mutation, reflection, mutable or unbounded
 statuses, and `SystemExit` subclasses are conversion errors.
 Exception attribute writes are refused; Python attributes cannot overwrite
 Rust's internal exception message or type.
+Exception classes defining or inheriting custom `__str__` / `__repr__`
+bindings are refused during conversion; format application data explicitly
+at its display sites instead.
+For a one-argument builtin `KeyError`, `str(error)` quotes the key and
+`repr(error)` preserves its original representation (`KeyError('k')`).
 
 Known gaps:
 

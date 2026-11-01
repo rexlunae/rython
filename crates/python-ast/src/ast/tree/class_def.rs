@@ -81,6 +81,51 @@ pub struct ClassKeyword {
     pub value: ExprType,
 }
 
+/// Exception markers have no display-method dispatch. Parse the Python
+/// spellings once, at the class binding boundary, before dropping a body.
+#[derive(Clone, Copy)]
+enum ExceptionDisplay {
+    Str,
+    Repr,
+}
+
+impl ExceptionDisplay {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "__str__" => Some(Self::Str),
+            "__repr__" => Some(Self::Repr),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Str => "__str__",
+            Self::Repr => "__repr__",
+        }
+    }
+
+    fn binding(class: &ClassDef) -> Option<(Self, usize)> {
+        let mut found = None;
+        visit::walk_stmts(&class.body, Descend::OwnScope, &mut |statement| {
+            if let Some(display) = visit::stmt_bound_names(statement, visit::Bindings::Scope)
+                .iter().find_map(|name| Self::from_name(name))
+            {
+                found = Some((display, statement.lineno.unwrap_or(0)));
+                return Flow::Stop;
+            }
+            if visit::opens_scope(statement) {
+                // A method's locals and a nested class's methods do not
+                // bind attributes on this exception class.
+                Flow::Skip
+            } else {
+                Flow::Continue
+            }
+        });
+        found
+    }
+}
+
 impl<'a, 'py> FromPyObject<'a, 'py> for ClassKeyword {
     type Error = pyo3::PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
@@ -3424,6 +3469,18 @@ impl CodeGen for ClassDef {
             // TypeError at class creation otherwise): loud here, at the
             // definition (Devin review on #330).
             let mro = crate::ast::tree::raise_stmt::exception_mro(&self, &symbols, &options)?;
+            for (owner, definition) in &mro {
+                if let Some((class, _)) = definition
+                    && let Some((display, line)) = ExceptionDisplay::binding(class)
+                {
+                    return Err(format!(
+                        "exception class `{}` defines or inherits `{}` (defined by `{owner}`, line {line}), \
+                         which is not supported yet; format explicit application data at each display site \
+                         and remove the override; rython refuses to silently ignore it",
+                        self.name, display.as_str(),
+                    ).into());
+                }
+            }
             if mro.iter().skip(1).any(|(name, definition)| definition.is_none()
                 && crate::ast::tree::system_exit::ExitCall::builtin(name).is_some()) {
                 return Err("SystemExit subclasses are not supported yet; use builtin SystemExit or sys.exit(status) and catch SystemExit explicitly; rython refuses to lose an inherited exit code".into());
