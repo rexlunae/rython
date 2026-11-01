@@ -1,7 +1,7 @@
 {
-  "converter_commit": "512c011",
-  "repo_head": "512c011",
-  "rypip_path": "/home/tserica/rython-tmp/list-generator-after-bin/rypip",
+  "converter_commit": "fbebabd",
+  "repo_head": "fbebabd",
+  "rypip_path": "/home/tserica/rython-tmp/pr508-consumed-bin/rypip",
   "oracle": "CPython 3.14.4 (pins captured under 3.11)",
   "passed": 67,
   "total": 68,
@@ -415,5 +415,14 @@
       "warnings": 0,
       "status": "pass"
     }
-  }
+  },
+  "provenance": {
+    "source_commit": "fbebabdc52a582a808d71bc59d0a7e68f4ae5a28",
+    "source_sha256": "d511861ccdda1a8e02905c8548cd3d1576f84d97e8822d1e7628b730ba5c06a2",
+    "source_dirty": false
+  },
+  "rypip_sha256": "c2c56922020161bca86c5f30b03a0df9e8eabc12ff1da080d590b441a1f62074",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8",
+  "build_target": "",
+  "cargo_config_sha256": "cf387f1bc10e20abe200b9081688b3c0f1d1866b243e95c29d96b6417a24b62f"
 }

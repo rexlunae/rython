@@ -505,6 +505,13 @@ ownership is proven. The shared bytes/bytearray representation is also
 refused at this borrowing boundary. Annotate immutable output types or
 produce explicit fresh container values with safe members instead.
 
+The existing static registry form `[kind() for kind in Base.__subclasses__()]`
+constructs fresh instances from the converted class hierarchy. Its ownership
+proof requires an unshadowed known base, one synchronous generator, no
+filters, and no iterator or constructor arguments. Other variants are
+refused rather than silently dropping a filter or argument (issue #509).
+Live discovery of classes outside the converted hierarchy is not modeled.
+
 ### 4.5 Lambdas
 
 A lambda has two lowerings, decided by where it sits. In a position that
@@ -2937,6 +2944,8 @@ accepted as permanent spec:
 | The kernel device-manifest sub-mode skips the module-wide floating-point scan | Defect, issue #108 |
 | Generator expressions are materialized eagerly (side-effect timing differs from lazy CPython) | Model limit until generator lowering lands |
 | Immediate `list(... for ...)` construction reuses list-comprehension lowering. Comprehensions refuse borrowed mutable container outputs, mutable walrus results, identity casts, and unresolved outputs without an ownership proof rather than silently detach them from their source; immutable values and fresh container literals remain supported (§4.4) | Correct-or-loud (issues #506, #507) |
+| Static subclass-registry comprehensions construct fresh instances from the converted hierarchy. Filters and iterator/constructor arguments are refused instead of discarded (§4.4); live runtime class discovery is not modeled | Correct-or-loud (issue #509); static discovery remains a model limit |
+| Calls through unresolved callable parameters fail conversion, naming the parameter and requesting concrete `typing.Callable` argument/return types. The old fallback skipped the invocation and returned `None`, including when a same-named scalar module function made a comprehension output appear immutable | Loud (issue #510); typed and boxed callable paths remain modeled |
 | `with` does not call `__enter__`/`__exit__` (Drop approximates cleanup) | Model limit; correct for the supported file objects |
 | `is`/`is not` on non-`None` operands lower to `==`/`!=` | Model limit (no identity model) |
 | `raise X from Y` folds the cause into the message; no `__cause__` | Model limit |
