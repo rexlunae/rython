@@ -1487,6 +1487,19 @@ fn immutable_exception_argument(expr: &ExprType, st: &Construction) -> bool {
 
 fn bind_message_parts(st: &mut Construction, exprs: &[ExprType]) -> Result<Vec<ExprType>, Box<dyn std::error::Error>> {
     exprs.iter().enumerate().map(|(i, expr)| {
+        if matches!(expr, ExprType::Tuple(_)) && immutable_exception_argument(expr, st) {
+            // A tuple expression owns its String/exception elements. Bind
+            // one value for both str and repr, cloning immutable places
+            // so the caller's bindings remain readable.
+            let name = exc_temp(0, "m", i);
+            let ident = crate::safe_ident(&name);
+            let value = immutable_tuple_value(expr, st)?;
+            st.prelude.push(quote!(let #ident = #value;));
+            let mut types = (*st.options.name_types).clone();
+            types.insert(name.clone(), crate::infer_type(Some(&st.ctx), expr, &st.options, &st.symbols));
+            st.options.name_types = std::rc::Rc::new(types);
+            return Ok(ExprType::Name(crate::Name { id: name }));
+        }
         let captured = st.captures(exprs, i, false);
         if !captured && !st.may_run_code(expr) {
             Ok(expr.clone())
@@ -1494,6 +1507,18 @@ fn bind_message_parts(st: &mut Construction, exprs: &[ExprType]) -> Result<Vec<E
             st.bind_temp(exc_temp(0, "m", i), expr, captured)
         }
     }).collect()
+}
+
+/// Lower an immutable tuple value without moving a caller's elements.
+fn immutable_tuple_value(expr: &ExprType, st: &Construction) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    if let ExprType::Tuple(tuple) = expr {
+        let values = tuple.elts.iter().map(|part| immutable_tuple_value(part, st)).collect::<Result<Vec<_>, _>>()?;
+        return Ok(quote!((#(#values,)*)));
+    }
+    let value = message_value_tokens(expr, st.ctx.clone(), st.options.clone(), st.symbols.clone())?;
+    Ok(if matches!(expr, ExprType::Name(_) | ExprType::Attribute(_)) {
+        quote!((#value).clone())
+    } else { value })
 }
 
 fn args_message(

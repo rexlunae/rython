@@ -33,6 +33,10 @@ def optional(value: int | None) -> BaseException:
     return ValueError((1, value))
 
 
+def owned_text() -> str:
+    return "owned"
+
+
 def main() -> None:
     error = ValueError("v")
     print(str(error))
@@ -71,6 +75,10 @@ def main() -> None:
     present = optional(3)
     print(str(absent), repr(absent))
     print(str(present), repr(present))
+    text = owned_text()
+    owned_tuple = ValueError((text,))
+    print(str(owned_tuple), repr(owned_tuple))
+    print("retained", text)
     none_result = Exception(None)
     print(str(none_result), repr(none_result))
     capture = TypeError(state, next_state())
