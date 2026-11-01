@@ -1,0 +1,15 @@
+k
+k
+Child('k')
+'k'
+KeyError('k')
+5
+KeyError(5)
+(1, 'a')
+KeyError((1, 'a'))
+'again'
+KeyError('again')
+calls 1
+pretty
+pretty
+Pretty()

@@ -29997,11 +29997,11 @@ fn unittest_main_with_an_unsupported_argument_is_refused() {
 }
 
 #[test]
-fn a_key_error_subclass_with_its_own_str_keeps_the_plain_message() {
-    // Issue #475: the repr rule is `KeyError.__str__`; a class that defines
-    // `__str__` before KeyError in its MRO does not inherit it, so its
-    // message stays `str(arg)` (no `py_repr`).
-    let out = compile(
+fn a_key_error_subclass_with_its_own_str_is_refused() {
+    // Verified against python3: str(Plain("k")) is "custom", not "k".
+    // Issue #483: merely opting out of KeyError's repr rule (#475) still
+    // drops the override. Refuse it until display-time dispatch is modeled.
+    let err = compile_err(
         concat!(
             "class Plain(KeyError):\n",
             "    def __str__(self) -> str:\n",
@@ -30014,8 +30014,8 @@ fn a_key_error_subclass_with_its_own_str_keeps_the_plain_message() {
         "plain_key_error.py",
     );
     assert!(
-        out.contains("\"Plain\" , format ! (\"{}\" , \"k\")"),
-        "no repr for an own __str__: {out}"
+        err.contains("exception class `Plain`") && err.contains("`__str__`"),
+        "an override cannot become a plain message: {err}"
     );
     let out = compile(
         concat!(
@@ -30025,6 +30025,69 @@ fn a_key_error_subclass_with_its_own_str_keeps_the_plain_message() {
         "builtin_key_error.py",
     );
     assert!(out.contains("PyRepr :: py_repr"), "a builtin KeyError takes the repr: {out}");
+}
+
+#[test]
+fn custom_exception_display_is_a_conversion_error_at_the_definition() {
+    // Verified against python3: the str override prints custom for
+    // str(error); the repr override prints custom for repr(error).
+    for method in ["__str__", "__repr__"] {
+        let src = format!(
+            "class AppError(Exception):\n    def {method}(self) -> str:\n        return 'custom'\ndef main() -> None:\n    try:\n        raise AppError('k')\n    except AppError as error:\n        print(str(error))\n        print(repr(error))\n"
+        );
+        let err = compile_err(&src, "exception_display.py");
+        assert!(err.contains("exception class `AppError`") && err.contains(method), "{err}");
+        assert!(err.contains("line 2") && err.contains("display site"), "{err}");
+        assert!(err.contains("refuses to silently ignore"), "{err}");
+    }
+}
+
+#[test]
+fn exception_display_bindings_follow_the_shared_scope_visitor() {
+    // Bindings, not just undecorated methods: aliases, conditional defs,
+    // async defs and property-decorated defs must not disappear either.
+    for body in [
+        "    __str__ = lambda self: 'custom'\n",
+        "    if True:\n        def __repr__(self) -> str:\n            return 'custom'\n",
+        "    async def __str__(self) -> str:\n        return 'custom'\n",
+        "    @property\n    def __repr__(self):\n        return lambda: 'custom'\n",
+    ] {
+        let src = format!("class Root(Exception):\n{body}\nclass Child(Root):\n    pass\n");
+        let err = compile_err(&src, "display_binding.py");
+        assert!(err.contains("exception class `Root`") && err.contains("refuses to silently ignore"), "{err}");
+    }
+    // Local bindings and a nested ordinary class's methods do not bind
+    // display overrides on the enclosing exception class.
+    let out = compile(
+        "class Root(Exception):\n    def helper(self) -> None:\n        __str__ = 'local'\n    class Details:\n        def __repr__(self) -> str:\n            return 'details'\n",
+        "nested_display_names.py",
+    );
+    assert!(out.contains("struct Root"), "{out}");
+}
+
+#[test]
+fn an_imported_exception_display_override_is_refused_through_its_mro() {
+    // Lower ONLY the child module: the defining module's own refusal
+    // must not be the only protection against an inherited override.
+    let root = parse(
+        "class Root(Exception):\n    def __repr__(self) -> str:\n        return 'custom'\n",
+        "errors.py",
+    ).unwrap();
+    let child = parse(
+        "from errors import Root as Parent\nclass Child(Parent):\n    pass\n",
+        "app.py",
+    ).unwrap();
+    let symbols = child.clone().find_symbols(SymbolTableScopes::new());
+    let options = PythonOptions::from(PythonOptionsData {
+        module_defs: std::rc::Rc::new(std::collections::HashMap::from([
+            (vec!["errors".to_string()], std::rc::Rc::new(root)),
+        ])),
+        ..Default::default()
+    });
+    let err = child.to_rust(CodeGenContext::Module("app".into()), options, symbols)
+        .expect_err("an inherited override must not become the default repr").to_string();
+    assert!(err.contains("exception class `Child`") && err.contains("`__repr__`"), "{err}");
+    assert!(err.contains("defined by `Root`") && err.contains("line 2"), "{err}");
 }
 
 #[test]
