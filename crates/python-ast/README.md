@@ -89,8 +89,9 @@ Pytest runner references (`pytest.main`, `console_main`, `cmdline.main`,
 including imported aliases and function values) are refused during
 conversion. There is no native pytest collection or runner; run the suite under CPython or port to the supported
 unittest subset with an explicit `unittest.main()` entry. Ordinary
-`test_*` function definitions keep their library semantics. Copying pytest
-module/cmdline objects into ordinary value slots is also refused.
+`test_*` function definitions keep their library semantics. Using the
+pytest module itself as a value is also refused; member reads such as
+`pytest.mark.slow` keep the external-module warning.
 
 ### Prerequisites
 

@@ -185,6 +185,20 @@ pub(crate) fn reject_runner(
     Err(format!("{spelling} test execution is not supported yet: rython has no pytest collection or runner; run the suite with CPython (`python -m pytest`), or port it to the supported unittest subset with an explicit unittest.main() entry; rython refuses to silently ignore requested test execution (including runner function values)").into())
 }
 
+/// Whether `expr` names a pytest module (or its cmdline/config namespace).
+pub(crate) fn is_module_namespace(
+    expr: &ExprType,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    Ok(!options.unindexed_crate_modules
+        && matches!(
+            PytestBinding::of(expr, options, symbols, &mut HashSet::new())?,
+            Some(PytestBinding::Module | PytestBinding::Cmdline
+                | PytestBinding::InternalPackage | PytestBinding::Config)
+        ))
+}
+
 /// Module/cmdline objects cannot be copied into a boxed placeholder and
 /// later used to bypass the runner guard. Import aliases remain supported;
 /// this check runs only when a value is actually lowered, not while walking
@@ -194,14 +208,12 @@ pub(crate) fn reject_module_value(
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !options.unindexed_crate_modules
-        && matches!(
-            PytestBinding::of(expr, options, symbols, &mut HashSet::new())?,
-            Some(PytestBinding::Module | PytestBinding::Cmdline
-                | PytestBinding::InternalPackage | PytestBinding::Config)
-        )
-    {
-        return Err("pytest module/cmdline values are not supported yet: copying an external pytest object would lose its runner; use import aliases for module names, and run tests with CPython (`python -m pytest`) or port to the supported unittest subset with an explicit unittest.main() entry; rython refuses to silently lose requested test execution through a module value".into());
+    if is_module_namespace(expr, options, symbols)? {
+        let spelling = match expr {
+            ExprType::Name(name) => format!("`{}`", name.id),
+            _ => "a pytest module".to_string(),
+        };
+        return Err(format!("the pytest module {spelling} used as a value (compared, passed, stored or returned) is not supported yet: the generated crate has no pytest object, and a copied placeholder could reach its runner; use pytest's members by attribute (`pytest.mark.slow`), and run tests with CPython (`python -m pytest`) or port to the supported unittest subset with an explicit unittest.main() entry; rython refuses to silently replace the module").into());
     }
     Ok(())
 }

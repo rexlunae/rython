@@ -1893,17 +1893,33 @@ impl Point {
   through the shared method-field analysis even without `__init__` or
   `setUp`. The runner follows the MRO for tests, overrides, default
   arguments, fixtures, and gates, and constructs a fresh instance for
-  every test. A path-sensitive binding check requires each field read to
+  every test. Each ancestor's base resolves in the module that defines
+  it, so `Child(Middle)` is a TestCase when `Middle` comes from another
+  module whose own import brings in a TestCase base. A gate condition or
+  test default argument inherited from another module is refused: the
+  runner would evaluate it against this module's names. A path-sensitive binding check requires each field read to
   follow an assignment on every reachable path. Tests and `tearDown`
   inherit only the fields initialized on every successful exit from
   `setUp`; another test's writes supply no facts, and `tearDown` cannot
-  assume a test completed its writes before raising. Helpers must
-  initialize their own field reads; calls do not establish field facts.
+  assume a test completed its writes before raising. A helper method may
+  read the fields every successful `setUp` exit assigns, unless `setUp`
+  reaches it (directly or through other helpers): such a helper can run
+  before those stores, so it must initialize its own reads. Calls do not
+  establish field facts. `@staticmethod`/`@classmethod` members have no
+  instance receiver and are not analyzed. A class data attribute that a
+  field shadows (`value = 0`, then `self.value = 5` in `setUp`) follows
+  the field rule, so a read before the instance store is refused rather
+  than seeing the struct default where CPython sees the class value.
   Unproved reads, receiver escapes or captures, attribute deletion,
-  class members shadowed by fields, and custom constructors or attribute
+  a method shadowed by a field, and custom constructors or attribute
   hooks are conversion errors naming the construct, line, and rewrite.
   A class value shadowing a method is refused too, rather than silently
-  calling the inherited method through Rust's trait lookup.
+  calling the inherited method through Rust's trait lookup. Runner flags
+  set by hand (`__unittest_skip__`, `__unittest_skip_why__`,
+  `__unittest_expecting_failure__`, as class attributes or as
+  `test_b.__unittest_skip__ = True`) are refused for every TestCase,
+  since CPython's runner reads them and the emitted runner honors only
+  the decorators (issue #512).
   Manual construction of cases with fields and explicit calls/captures
   of lifecycle methods (including through `super()`) are refused: use
   `unittest.main()` so the fixture-order proof applies. If `setUp` has
@@ -2576,10 +2592,11 @@ modes, `seek`/`tell`, file-based `json.dump`/`load`.
 ### 10.5 Threading and networking
 
 **`threading`** (std tier): `Thread(target=, args=, daemon=)` —
-the target must be a plain function name and args a tuple/list literal
-(a `PyCallable` is not `Send`, so a callable VALUE cannot cross a
-thread boundary — §3.6; the lowering resolves the target at conversion
-time, the `functools.partial` model), `start()`, `join()`,
+the target must be a function name (imported or re-exported included)
+or a nested `def`, and args a tuple/list literal (a parameter or an
+assigned local holding a callable is a VALUE whose `__name__` the
+thread's default name needs — refused, §3.6; the lowering resolves the
+target at conversion time, the `functools.partial` model), `start()`, `join()`,
 `is_alive()`, `Lock`/`RLock` (`acquire`/`release`/`locked`, CPython's
 RuntimeError messages, catchable), `Event`
 (`is_set`/`set`/`clear`/`wait`), `Semaphore`, `current_thread().name`
@@ -2602,14 +2619,20 @@ assignment evaluates `args` once at construction, then stores the handle;
 unconditional top-level assignment in `__init__` before it is read or
 `self` escapes/is called. Fields read by constructor arguments also need
 preceding unconditional stores: this holds for EVERY Thread constructor in
-the class, in `__init__` after the first thread store and in any other
-method, where the field must be one `__init__` unconditionally assigns (or
-a class member); otherwise the struct default would be captured where
-CPython raises AttributeError (issue #516). The thread's default name is
-`Thread-N (<target.__name__>)` with the DEFINING function's name, so `from
-.job import work as do_work` names it `work` (issue #514), and a `target=`
-bound by an assignment is a callable value and a conversion error (issue
-#515). Reading an attribute of another class's instance before it is
+the class. In `__init__`, the store must come earlier in its top-level
+statements. Any other method can run during `__init__` (a `self` method
+call, an escaping `self`, `super()`, a closure over `self`) or after an
+early `return`, so it may rely only on the stores `__init__` makes before
+the first such statement, or on a class constant that no instance store
+shadows; otherwise the struct default would be captured where CPython
+raises AttributeError or reads the class attribute (issue #516). A
+`self.field` argument is copied into the thread at construction (the
+container semantics above). The thread's default name is
+`Thread-N (<target.__name__>)` with the DEFINING function's name,
+following import and re-export chains, so `from .job import work as
+do_work` names it `work` and a package `__init__` re-exporting `work as
+job` still names it `work` (issue #514); a `target=` bound by an
+assignment is a callable value and a conversion error (issue #515). Reading an attribute of another class's instance before it is
 assigned (`self.runner.worker` ahead of `self.runner = Runner()`) is the
 general absent-attribute divergence of §12.3, not specific to threads
 (issue #517). Conditional/missing initialization, an early
@@ -3008,9 +3031,9 @@ accepted as permanent spec:
 | Release-mode integer overflow may wrap (debug panics) | Bounded by §12.2's contract |
 | A non-daemon thread never joined is joined when its LAST handle drops (at latest, end of `main`) — CPython joins at interpreter exit, so a fire-and-forget thread can block a scope exit earlier than CPython would | Model limit; the common create/start/join shape is identical |
 | A thread's unhandled exception prints CPython's header and final exception line but no traceback frames | Model limit (no frames) — same family as §8's messages |
-| External `pytest.main` runner calls and values (`console_main` and `cmdline.main`, import aliases and crate re-exports included; copying module/cmdline objects into ordinary value slots is also refused) are refused at conversion with the Python location and a rewrite to CPython's `python -m pytest` or the supported unittest subset. There is no automatic collection: a module defining only `test_*` functions remains a library, and `import pytest` alone retains the external-module warning (#456). Ordinary shadowing parameters and crate siblings keep their behavior | Loud (issue #482); a requested runner call could previously be dropped with a warning in multi-module conversion |
+| External `pytest.main` runner calls and values (`console_main` and `cmdline.main`, import aliases and crate re-exports included; the pytest module or its cmdline namespace used as a value — compared, passed, stored or returned — is also refused, while a member read such as `pytest.mark.slow` or `pytest.raises(...)` keeps the external-module warning) are refused at conversion with the Python location and a rewrite to CPython's `python -m pytest` or the supported unittest subset. There is no automatic collection: a module defining only `test_*` functions remains a library, and `import pytest` alone retains the external-module warning (#456). Ordinary shadowing parameters and crate siblings keep their behavior | Loud (issue #482); a requested runner call could previously be dropped with a warning in multi-module conversion |
 | `unittest.main()`'s report is CPython's `TextTestRunner` output at the default verbosity, except that an ERROR or FAIL block's traceback prints CPython's header and final exception line but no traceback frames | Model limit (no frames) — the thread-exception entry's family (issue #334, Phase 3) |
-| A `TestCase` field first assigned in a test method is discovered without requiring `__init__` or `setUp`. Each test gets a new instance; inherited tests, fixtures, default arguments and gates follow the MRO. Binding-flow checks reject uncertain reads (including cross-test state and teardown reads relying on a test completing), receiver escapes/captures, deletion, shadowed class members, custom constructors and attribute hooks before a Rust default can be observed. Manual construction of field-bearing cases and explicit lifecycle calls/captures are refused; use `unittest.main()` | Correct-or-loud (issues #480, #511); pinned against CPython 3.12 and 3.14 |
+| A `TestCase` field first assigned in a test method is discovered without requiring `__init__` or `setUp`. Each test gets a new instance; inherited tests, fixtures, default arguments and gates follow the MRO, each ancestor resolved in its defining module. Binding-flow checks reject uncertain reads (including cross-test state, teardown reads relying on a test completing, and helpers `setUp` reaches), receiver escapes/captures, deletion, methods shadowed by fields or class values, custom constructors and attribute hooks before a Rust default can be observed. Manual construction of field-bearing cases (including `t = T(); t.setUp()`, which CPython runs) and explicit lifecycle calls/captures are refused; use `unittest.main()` | Correct-or-loud (issues #480, #511, #512, #513); pinned against CPython 3.12 and 3.14 |
 | TCP `socket.bind()` binds AND starts listening (std::net has no half-bound TCP socket); a connection can be accepted by the OS before `listen()` runs, and binding a client socket before `connect()` is a loud error | Model limit of the std::net backend |
 | `URLError`'s reason text inside CPython's `<urlopen error …>` shape is the HTTP backend's wording, not CPython's | Model limit of the wrapped-crate convention (§10.2.1) |
 | `HTTPError` carries CPython's message but not the error response's body/headers (exceptions are string-tagged values) | Model limit; §8.1 representation |

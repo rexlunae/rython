@@ -262,6 +262,24 @@ impl<'a> CodeGen for ExprType {
 }
 
 impl ExprType {
+    /// Render the RECEIVER of an attribute read or method call. A pytest
+    /// module there (`pytest` in `pytest.mark.slow`, `pytest.raises(...)`)
+    /// is a namespace, not a copied value, so the module-value refusal
+    /// does not apply; the runner refusal still does.
+    pub(crate) fn to_rust_receiver(
+        self,
+        ctx: CodeGenContext,
+        options: PythonOptions,
+        symbols: SymbolTableScopes,
+    ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
+        if !crate::ast::tree::pytest::is_module_namespace(&self, &options, &symbols)? {
+            return self.to_rust(ctx, options, symbols);
+        }
+        crate::stack_guard::check()?;
+        crate::ast::tree::pytest::reject_runner(&self, &options, &symbols)?;
+        self.to_rust_inner(ctx, options, symbols)
+    }
+
     fn to_rust_inner(
         self,
         ctx: CodeGenContext,

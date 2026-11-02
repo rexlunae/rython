@@ -720,7 +720,7 @@ impl<'a> CodeGen for Attribute {
                         .contains(&self.attr)
                 }));
         // The fallibility rule (the review's fix 2, round 99): a method
-        let mut value_tokens = self.value.to_rust(ctx, options, symbols)?;
+        let mut value_tokens = self.value.to_rust_receiver(ctx, options, symbols)?;
         if let Some(_inner) = option_receiver {
             let attr_name = self.attr.clone();
             value_tokens = quote!((#value_tokens).clone().unwrap_or_else(|| {

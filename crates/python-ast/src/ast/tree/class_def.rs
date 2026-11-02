@@ -3090,10 +3090,13 @@ impl ClassDef {
     /// struct model default-initializes every field, so an argument read
     /// before the attribute's first assignment would capture that default
     /// where CPython raises AttributeError (issue #516). An argument is
-    /// accepted when its attribute is a class member, or is stored by an
-    /// unconditional top-level statement of `__init__` that precedes the
-    /// constructor (in `__init__`) or exists at all (in any other method,
-    /// which only runs after `__init__`). Anything else is refused.
+    /// accepted when its attribute is a class member no instance store
+    /// shadows, or is stored by an unconditional top-level statement of
+    /// `__init__` that precedes the constructor (in `__init__`). Any other
+    /// method can run during
+    /// `__init__` (a `self.method()` call, an escaping `self`) or after
+    /// an early `return`, so it may assume only the stores that precede
+    /// the first such statement. Anything else is refused.
     fn validate_thread_constructor_arguments(
         &self,
         symbols: &SymbolTableScopes,
@@ -3103,6 +3106,11 @@ impl ClassDef {
         for stmt in &self.body {
             class_members.extend(visit::stmt_bound_names(stmt, visit::Bindings::Scope));
         }
+        // A class attribute that an instance store shadows is a struct
+        // field: before that store, the generated code reads the field's
+        // default where CPython reads the class attribute.
+        let instance_stores = self.instance_store_names();
+        class_members.retain(|name| !instance_stores.contains(name));
         let init_stores = |upto: usize| -> std::collections::BTreeSet<String> {
             let mut out = std::collections::BTreeSet::new();
             if let Some(init) = self.init_method() {
@@ -3120,7 +3128,31 @@ impl ClassDef {
             }
             out
         };
-        let after_init = init_stores(usize::MAX);
+        // The attributes another method may rely on: `__init__`'s stores
+        // before its first statement that can return early or run other
+        // code on this instance (issue #516's review).
+        let mut init_field_stores = Vec::new();
+        if let Some(init) = self.init_method() {
+            collect_field_stores(&init.body, &mut init_field_stores);
+        }
+        let stored: std::collections::BTreeSet<String> =
+            init_field_stores.into_iter().map(|store| store.attr).collect();
+        let constants = class_constant_names(&self.body);
+        let first_interruption = self.init_method().and_then(|init| {
+            init.body.iter().position(|stmt| {
+                visit::any_stmt(std::slice::from_ref(stmt), Descend::SkipDefs, |s| {
+                    matches!(s.statement, StatementType::Return(_))
+                })
+                // A nested def or lambda that touches `self` can run later
+                // from anywhere, so it counts as an escape where it is made.
+                || visit::any_stmt(std::slice::from_ref(stmt), Descend::All, |s| {
+                    visit::stmt_all_exprs(s)
+                        .into_iter()
+                        .any(|e| runs_instance_code(e, &stored, &constants))
+                })
+            })
+        });
+        let after_init = init_stores(first_interruption.unwrap_or(usize::MAX));
         let check = |stmts: &[Statement],
                      known: &std::collections::BTreeSet<String>|
          -> Result<(), Box<dyn std::error::Error>> {
@@ -3260,7 +3292,12 @@ impl ClassDef {
             }
         }
         let mut pending = thread_fields.clone();
-        let mut initialized = std::collections::BTreeSet::new();
+        // A class constant read through `self` is the class attribute,
+        // unless an instance store makes it a field (whose default would
+        // be read instead).
+        let instance_stores = self.instance_store_names();
+        let mut initialized = class_constant_names(&self.body);
+        initialized.retain(|name| !instance_stores.contains(name));
         let Some(init) = self.init_method() else {
             return Err(refusal(self.body.first().and_then(|s| s.lineno).unwrap_or(0), "without __init__ initialization"));
         };
@@ -3312,6 +3349,15 @@ impl ClassDef {
             return Err(refusal(self.body.first().and_then(|s| s.lineno).unwrap_or(0), "conditional or missing __init__ initialization"));
         }
         Ok(())
+    }
+
+    /// Every attribute some method of this class stores through `self`.
+    fn instance_store_names(&self) -> std::collections::BTreeSet<String> {
+        let mut stores = Vec::new();
+        for method in self.methods() {
+            collect_field_stores(&method.body, &mut stores);
+        }
+        stores.into_iter().map(|store| store.attr).collect()
     }
 
     /// A class's OWN fields: its `__init__` stores minus the stores that
@@ -3648,6 +3694,37 @@ struct FieldStore<'a> {
     /// The store's annotation (`self.x: list[float] = ...`), which pins
     /// the field type when the value cannot be inferred.
     annotation: Option<&'a ExprType>,
+}
+
+/// The class body's literal constants (`INTERVAL = 5`). Reading one
+/// through `self` finds the class attribute, so it is never absent and
+/// runs no code. Any other class-level binding may be a callable.
+fn class_constant_names(body: &[Statement]) -> std::collections::BTreeSet<String> {
+    body.iter()
+        .filter(|stmt| {
+            matches!(&stmt.statement, StatementType::Assign(a)
+                if matches!(a.value, ExprType::Constant(_) | ExprType::NoneType(_)))
+        })
+        .flat_map(|stmt| visit::stmt_bound_names(stmt, visit::Bindings::Scope))
+        .collect()
+}
+
+/// Whether evaluating `expr` can run code that sees this instance,
+/// beyond reading or writing one of the `stored` attributes or a class
+/// constant: a method or property access, an escaping `self`, or a
+/// `super()` call.
+fn runs_instance_code(
+    expr: &ExprType,
+    stored: &std::collections::BTreeSet<String>,
+    constants: &std::collections::BTreeSet<String>,
+) -> bool {
+    match expr {
+        ExprType::Attribute(a) if visit::is_self(&a.value) => {
+            !stored.contains(&a.attr) && !constants.contains(&a.attr)
+        }
+        e if visit::is_self(e) || crate::ast::tree::scope::is_super_call(e) => true,
+        _ => visit::subexprs(expr).iter().any(|e| runs_instance_code(e, stored, constants)),
+    }
 }
 
 fn reads_uninitialized_self(

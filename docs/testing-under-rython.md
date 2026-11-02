@@ -96,13 +96,25 @@ inherited tests, fixtures, default arguments and gates (issue #511),
 constructing a fresh instance per test. A field read must follow an
 assignment on every path, or an initialization on every successful
 `setUp` exit. A different test's writes and calls to helpers establish no
-initialization facts; helpers must initialize their own reads. Uncertain
-reads, receiver escapes/captures, attribute deletion, shadowed class
-members/methods, and custom constructors/attribute hooks fail conversion with a
-line and rewrite, so construction defaults never stand in for missing
-Python attributes. Manual construction of field-bearing cases and
-explicit lifecycle calls/captures are refused; use `unittest.main()` to
-preserve fixture order. Native pins cover fixtures and errors against CPython
+initialization facts. A helper method may read what every successful
+`setUp` exit assigned, unless `setUp` reaches it (directly or through
+other helpers) — such a helper can run before those stores, so it must
+initialize its own reads. `@staticmethod` and `@classmethod` members have
+no instance receiver and are not checked. A class data attribute that an
+instance field shadows (`value = 0` with `self.value = 5` in `setUp`) is
+accepted; reads of it follow the same rule as any other field. Uncertain
+reads, receiver escapes/captures, attribute deletion, a method shadowed by
+a class value or an instance field, and custom constructors/attribute
+hooks fail conversion with a line and rewrite, so construction defaults
+never stand in for missing Python attributes. These restrictions apply to
+a TestCase that has instance fields: one with none has no default to
+expose. Manual construction of field-bearing cases (including
+`t = T(); t.setUp(); t.test_a()`, which CPython runs) and explicit
+lifecycle calls/captures are refused; use `unittest.main()` to preserve
+fixture order. Setting a runner flag by hand (`__unittest_skip__`,
+`__unittest_skip_why__` or `__unittest_expecting_failure__`, as a class
+attribute or as `test_b.__unittest_skip__ = True`) is refused for every
+TestCase; use the decorators. Native pins cover fixtures and errors against CPython
 3.12 and 3.14.
 
 The original unittest measurements used CPython 3.14 and rython `a055a18`;
@@ -324,9 +336,11 @@ followed by `main(...)`, and imported `as` spellings. References to the
 runner as a value (`runner = pytest.main`) are refused too, as are calls
 through crate re-exports of the imported runner. The public
 `pytest.console_main()` and `pytest.cmdline.main()` entrypoints have the
-same boundary. Copying pytest module/cmdline objects into ordinary value
-slots is refused before a placeholder could hide a subsequent runner call;
-use `import pytest as pt` for a module alias. The diagnostic includes
+same boundary. Using the pytest module or its cmdline namespace as a value
+(compared, passed, stored or returned) is refused before a placeholder
+could hide a subsequent runner call; use `import pytest as pt` for a
+module alias. Member reads such as `pytest.mark.slow` and
+`pytest.raises(...)` keep the external-module warning. The diagnostic includes
 the Python location and asks the user to run `python -m pytest` under
 CPython or port the suite to the supported unittest subset with an
 explicit `unittest.main()` entry. This is a conversion error even with
