@@ -5959,6 +5959,50 @@ fn value_returning_main_gets_a_wrapper_entry_point() {
 }
 
 #[test]
+fn a_sync_program_body_is_a_function_main_reports_from() {
+    // Issue #166: the program body is `__rython_main__`, returning the
+    // escaping exception, and `fn main` only reports it — so the JIT's
+    // `ry_entry` runs exactly the body the binary runs, without the
+    // process exit. All three sync entry shapes take it: a guarded
+    // `main()`, a guarded block of statements, and module-level code
+    // with no guard.
+    let guarded_call = compile(
+        concat!(
+            "def main() -> None:\n",
+            "    print(\"hi\")\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+        "guarded.py",
+    );
+    let guarded_block = compile(
+        concat!(
+            "if __name__ == \"__main__\":\n",
+            "    x = 1\n",
+            "    print(x)\n",
+        ),
+        "block.py",
+    );
+    let module_code = compile("print(\"top\")\n", "toplevel.py");
+    for out in [&guarded_call, &guarded_block, &module_code] {
+        assert!(
+            out.contains("pub (crate) fn __rython_main__ () -> Result < () , PyException >"),
+            "the program body is a function: {}",
+            out
+        );
+        assert!(
+            out.contains(
+                "fn main () { if let Err (e) = __rython_main__ () { stdpython :: exit_uncaught (& e) ; } }"
+            ),
+            "main runs the body and reports an escaping exception: {}",
+            out
+        );
+    }
+    assert!(guarded_call.contains("python_main () ?"), "{}", guarded_call);
+}
+
+#[test]
 fn module_scope_upper_case_locals_allow_non_snake_case() {
     // A module global used only at module level lowers to a local of the
     // init body (`let REG;`), and a `__main__` block's names to locals of

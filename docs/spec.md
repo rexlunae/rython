@@ -2220,7 +2220,10 @@ exception escaping a lambda (§4.5).
   module-level code) and the body — the user's `main`, renamed
   `python_main`, when the block is just `main()` — and reports an
   uncaught exception as CPython does (the traceback header and final
-  line, no frames), exiting 1 (issue #479). A dedicated `__main__.py` is
+  line, no frames), exiting 1 (issue #479). For a synchronous program the
+  startup and body are a function, `__rython_main__`, returning the
+  escaping exception, and `fn main` only reports it — the body the JIT's
+  `ry_entry` runs without ending its host (§11.5). A dedicated `__main__.py` is
   bin-only; any other entry module appears in both the library and the
   binary.
 - A bare module-level `main()` is only the entry point as the module
@@ -2884,6 +2887,32 @@ and format specs are loud errors.
 transpiler into an ordinary std crate (plus `libc`). It cannot be
 combined with `--kernel-module`, `--no-std`, or `--pyo3`, and none of
 this section's kernel restrictions apply to it.
+
+### 11.5 The JIT (`rypip jit`, `rython-jit`)
+
+Milestone M1 of [`jit.md`](jit.md) (issue #166), `std` tier and Unix only.
+The JIT compiles exactly what `rypip convert` compiles — the converter's
+cdylib mode is the plain conversion plus a generated C-ABI boundary module
+— and refuses exactly what it refuses (the converter's message, verbatim).
+`rypip jit run FILE ARG...` runs a single-file program in-process with
+`sys.argv` = `[FILE, ARG...]` (installed through the runtime's one
+program-arguments seam before anything reads it), its output and exit
+status the binary's; `rypip jit call FILE FUNCTION ARG...` is
+`python3 -c 'import M; print(repr(M.FUNCTION(ARG, ...)))'` with
+`sys.argv == ['-c']`, ARGs read by CPython's `ast.literal_eval`. Only
+`int` (64-bit), `float`, `bool`, `str` and `None` cross the boundary in M1,
+by a function's annotations: any other parameter or result type, defaults,
+`*args`/`**kwargs`, keyword- or positional-only parameters, decorators,
+generators and `async def` are a loud error naming the type or construct
+when called, and an argument of another type than its annotation is never
+converted. An escaping exception comes back as a `PyException` (type,
+message, argument reprs, ancestry), `SystemExit` as an exit code and
+message, a panic as a panic; the library never ends the process for any of
+them. A loaded library serves either calls (the module imported) or its
+program entry (run as `__main__`), once per process, never both; packages,
+`rython.toml` manifests, `from rython import rust` path dependencies and
+async program entries are refused. The rest of the contract — the cache,
+its key, the stdout flush rule — is [`jit.md`](jit.md)'s "M1 as built".
 
 ---
 

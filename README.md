@@ -22,7 +22,12 @@ command-line shape: it converts into a scratch crate (reused across runs),
 builds it quietly, and executes the binary with your arguments, streams
 and working directory, exiting with the program's status — no new
 semantics, just `python program.py` without the interpreter (Unix only for
-now: `sys.argv[0]` is set through the exec).
+now: `sys.argv[0]` is set through the exec). `rypip jit run program.py
+args` is the same conversion through the [JIT](docs/jit.md): the program
+is built into a shared library, cached by content (an unchanged file
+costs a `dlopen` on the next run) and run inside rypip's process, and
+`rypip jit call module.py function args` calls one function, printing
+the `repr` of its result.
 
 **2. Using Python inside Rust projects.**
 The `python-mod` proc-macros (`python_module!`, `python_module_nostd!`)
@@ -76,8 +81,9 @@ and [`rypip install`](examples/05-rypip-install) turning a
 - [Testing under rython](docs/testing-under-rython.md) — bounded unittest
   support, the explicit pytest runner boundary, and ways to test a
   converted library (#334, #482)
-- [The JIT](docs/jit.md) — the design for on-demand compilation: convert,
-  build with `rustc`, cache, load in-process (issue #166)
+- [The JIT](docs/jit.md) — on-demand compilation: convert, build with
+  `rustc`, cache, load in-process (issue #166); milestone M1 (`rython-jit`,
+  `rypip jit run`/`call`) is implemented, its measured latency recorded
 - [Evaluating a JIT](docs/jit-eval.md) — the earlier evaluation, superseded
   by the design above and kept for the objections it had to answer
 
@@ -87,7 +93,8 @@ and [`rypip install`](examples/05-rypip-install) turning a
 |---|---|
 | [`python-ast`](crates/python-ast) | Core library — parses Python AST and transpiles to Rust |
 | [`python-mod`](crates/python-mod) | Proc-macro for including Python modules in Rust source |
-| [`rypip`](crates/rypip) | pip-like tool — converts/builds/installs Python packages as Rust crates |
+| [`rypip`](crates/rypip) | pip-like tool — converts/builds/installs Python packages as Rust crates; `rypip jit` |
+| [`rython-jit`](crates/rython-jit) | JIT host — compiles Python on demand into a cached shared library, loads it, calls into it |
 | [`rythonc`](crates/rythonc) | CLI compiler — `rythonc input.py → output.rs` |
 | [`stdpython`](crates/stdpython) | Python standard library runtime implemented in Rust |
 
@@ -105,6 +112,12 @@ cargo run -p rypip -- install path/to/package
 
 # Convert for embedded/wasm targets (core+alloc only, no OS)
 cargo run -p rypip -- convert path/to/package --out my-crate --no-std
+
+# Run a program in-process through the JIT (cached under ~/.cache/rython/jit)
+cargo run -p rypip -- jit run program.py arg1 arg2
+
+# Call one function of a module through the JIT; prints repr(result)
+cargo run -p rypip -- jit call module.py add 2 40
 
 # Compile a single Python file to Rust source
 cargo run -p rythonc -- input.py -o output.rs
