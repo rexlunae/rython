@@ -1661,6 +1661,12 @@ impl CodeGen for Module {
                                 let exits = unittest_main_exits(call).map_err(|e| {
                                     wrap_module_error(&module_filename, e.into())
                                 })?;
+                                refuse_cross_module_runner_inputs(
+                                    &module_raw_body,
+                                    &symbols,
+                                    &options,
+                                )
+                                .map_err(|e| wrap_module_error(&module_filename, e.into()))?;
                                 if let Some(runner) = emit_test_runner(
                                     &module_raw_body,
                                     exits,
@@ -7544,7 +7550,7 @@ fn test_method_names(
     options: &crate::PythonOptions,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for class in class_def.base_chain_with_options(symbols, options) {
+    for (class, ..) in class_def.cross_module_chain(symbols, options) {
         for method in class.methods() {
             if super::testcase::Member::from_name(&method.name) == super::testcase::Member::Test
                 && !out.contains(&method.name)
@@ -7555,6 +7561,86 @@ fn test_method_names(
     }
     out.sort();
     out
+}
+
+/// A TestCase's MRO lookup of `name`, each ancestor resolved in its
+/// defining module: the method, and whether that module is another one.
+fn testcase_method(
+    class_def: &crate::ClassDef,
+    name: &str,
+    symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> Option<(crate::FunctionDef, bool)> {
+    class_def
+        .cross_module_chain(symbols, options)
+        .into_iter()
+        .find_map(|(c, _, _, path)| {
+            c.methods().find(|m| m.name == name).cloned().map(|m| (m, path.is_some()))
+        })
+}
+
+/// The runner renders gate conditions and test-method defaults in THIS
+/// module. One inherited from a class in another module would be evaluated
+/// against the wrong names, so it is refused.
+fn refuse_cross_module_runner_inputs(
+    module_stmts: &[crate::Statement],
+    symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> Result<(), String> {
+    let conditional = |decorators: &[crate::ExprType]| {
+        run_gates(decorators)
+            .iter()
+            .any(|g| matches!(g, RunGate::SkipIf(_) | RunGate::SkipUnless(_)))
+    };
+    let mut classes: Vec<crate::ClassDef> = Vec::new();
+    collect_class_defs(module_stmts, &mut classes);
+    // A base spelled through its module (`class Child(cases.Base)`) is not
+    // followed by the base chain, so a TestCase reached that way would be
+    // silently left out of the run.
+    for c in &classes {
+        for base in &c.bases {
+            let crate::ExprType::Attribute(a) = base else { continue };
+            let crate::ExprType::Name(m) = a.value.as_ref() else { continue };
+            let Some(path) = crate_module_bound_to(&m.id, symbols, options) else { continue };
+            let Some((base_class, base_symbols)) = module_class_def(options, &path, &a.attr) else {
+                continue;
+            };
+            let mut base_options = defining_module_context(options, &path);
+            base_options.this_module_path = path.clone();
+            if base_class.is_testcase(&base_symbols, &base_options) {
+                return Err(format!(
+                    "unittest.main(): class `{}` derives from the TestCase `{}.{}` through its \
+                     module, which the emitted runner cannot follow yet; import the class by \
+                     name (`from .{} import {}`); rython refuses to silently leave its tests out",
+                    c.name, m.id, a.attr, m.id, a.attr
+                ));
+            }
+        }
+    }
+    for c in classes.iter().filter(|c| c.is_testcase(symbols, options)) {
+        let refuse = |what: String| {
+            Err(format!(
+                "unittest.main(): TestCase `{}` inherits {what} from another module, which \
+                 the emitted runner would evaluate against this module's names; this is not \
+                 supported yet; repeat the gate or default in this module; rython refuses to \
+                 silently evaluate it in the wrong scope",
+                c.name
+            ))
+        };
+        for (ancestor, _, _, path) in c.cross_module_chain(symbols, options) {
+            if path.is_some() && conditional(&ancestor.decorator_list) {
+                return refuse(format!("`{}`'s skipIf/skipUnless condition", ancestor.name));
+            }
+        }
+        for m in test_method_names(c, symbols, options) {
+            if let Some((def, true)) = testcase_method(c, &m, symbols, options)
+                && (conditional(&def.decorator_list) || !def.args.defaults.is_empty())
+            {
+                return refuse(format!("`{m}`'s skipIf/skipUnless condition or default argument"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Emit the runner tokens for a `unittest.main()` site, or None when the
@@ -7621,12 +7707,12 @@ fn emit_test_runner(
         // `setUp`/`tearDown` are per-test fixtures (CPython runs setUp before
         // and tearDown after every test method); an exception in either is
         // reported against the test, as `TestCase.run` reports it.
-        let setup = if c.method_on_mro_with_options("setUp", &symbols, &options).is_some() {
+        let setup = if testcase_method(c, "setUp", &symbols, &options).is_some() {
             quote!(|__rython_tc: &mut #cname| __rython_tc.setUp().map(|_| ()))
         } else {
             quote!(|_: &mut #cname| Ok(()))
         };
-        let teardown = if c.method_on_mro_with_options("tearDown", &symbols, &options).is_some() {
+        let teardown = if testcase_method(c, "tearDown", &symbols, &options).is_some() {
             quote!(|__rython_tc: &mut #cname| __rython_tc.tearDown().map(|_| ()))
         } else {
             quote!(|_: &mut #cname| Ok(()))
@@ -7639,7 +7725,7 @@ fn emit_test_runner(
             // rendered against the parameter's slot (an unannotated one is
             // the boxed value). A parameter without a default is CPython's
             // TypeError at the call — left to rustc's arity error, loudly.
-            let test_def = c.method_on_mro_with_options(&m, &symbols, &options);
+            let test_def = testcase_method(c, &m, &symbols, &options).map(|(def, _)| def);
             let mut default_args: Vec<TokenStream> = Vec::new();
             if let Some(def) = &test_def {
                 let params: Vec<&crate::Parameter> =
@@ -7679,9 +7765,9 @@ fn emit_test_runner(
             // skipIf/skipUnless is an identity decorator, so an ancestor's
             // active skip still applies; combining their active gates
             // preserves that behavior.
-            let mut gates: Vec<RunGate> = c.base_chain_with_options(&symbols, &options)
+            let mut gates: Vec<RunGate> = c.cross_module_chain(&symbols, &options)
                 .iter()
-                .flat_map(|class| run_gates(&class.decorator_list))
+                .flat_map(|(class, ..)| run_gates(&class.decorator_list))
                 .collect();
             gates.extend(run_gates(&method_decorators));
             let truth = |cond: &crate::ExprType| -> Option<TokenStream> {
@@ -8003,6 +8089,39 @@ pub fn resolve_imported_class_with_path(
         // so stop there.
         Some(crate::SymbolTableNode::Alias(canonical)) if canonical != name => {
             resolve_imported_class_with_path(options, path, canonical, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+/// The `__name__` of the function the crate module at `path` binds as
+/// `name`, following re-export chains (`from .worker_impl import work as
+/// job` in a package `__init__`) to the defining `def`. None when the
+/// chain leaves the crate or ends at something other than a function.
+pub(crate) fn imported_function_name(
+    options: &PythonOptions,
+    path: &[String],
+    name: &str,
+    depth: usize,
+) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    let key = module_defs_key(options, path)?;
+    let info = module_class_info(options, key)?;
+    match info.symbols.get(name) {
+        Some(crate::SymbolTableNode::FunctionDef(f)) => Some(f.name.clone()),
+        Some(crate::SymbolTableNode::ImportFrom(i)) => {
+            let ctx = defining_module_context(options, key);
+            imported_function_name(
+                options,
+                &i.resolved_module_path(&ctx),
+                &i.defining_name(name),
+                depth + 1,
+            )
+        }
+        Some(crate::SymbolTableNode::Alias(canonical)) if canonical != name => {
+            imported_function_name(options, key, canonical, depth + 1)
         }
         _ => None,
     }

@@ -3785,6 +3785,9 @@ impl FunctionDef {
                                 | crate::TypeInfo::Tuple(_)
                                 | crate::TypeInfo::PyTuple(_)
                                 | crate::TypeInfo::HashSet(_)
+                                // A Thread field is Option-backed absent
+                                // storage; `return self.worker` unwraps it.
+                                | crate::TypeInfo::Threading(crate::ThreadingType::Thread)
                         ) && !options.fn_return_is_pyvalue
                             && !options.fn_return_is_option
                     })

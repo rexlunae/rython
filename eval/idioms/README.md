@@ -102,3 +102,5 @@ as an improvement over any recorded error count.
 | `collections_ordereddict` | `OrderedDict` insertion order, `move_to_end`, `popitem(last=...)`, `KeyError` text, `repr` (the 3.12 form) |
 | `shared_slot_mutation` | a list of shared objects mutated through an index (`slots[0].n += 5`, `slots[1].n = 40`, `slots[2].n *= 2`) beside plain `list[int]`/`dict[str, int]` slot stores — the two need different `mut` decisions, and both are printed after the mutation |
 | `thread_instance_field` | a typed Thread instance field, start/join and printed lifecycle state (issue #481) |
+| `thread_nested_target` | a nested `def` as a Thread target, a field argument bound at construction, a Thread field returned from a method (#519 review) |
+| `testcase_setup_helpers` | a TestCase helper reading setUp's fields, a helper setUp calls, a class default setUp overrides, `@staticmethod`/`@classmethod` members (#519 review) |

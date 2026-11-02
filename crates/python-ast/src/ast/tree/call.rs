@@ -2535,7 +2535,6 @@ impl<'a> CodeGen for Call {
         // needs the pytest diagnostic, including SystemExit(pytest.main()).
         for value in self.args.iter().chain(self.keywords.iter().map(|keyword| &keyword.value)) {
             crate::ast::tree::pytest::reject_in_expr(value, &options, &symbols)?;
-            crate::ast::tree::pytest::reject_module_value(value, &options, &symbols)?;
         }
         use crate::ast::tree::interpreter_state::InterpreterNamespace;
         if let Some(namespace) = InterpreterNamespace::from_call(&self, &options, &symbols) {
@@ -8530,7 +8529,7 @@ impl<'a> CodeGen for Call {
                                 false,
                             )?
                         } else {
-                            attr.value.clone().to_rust(
+                            attr.value.clone().to_rust_receiver(
                                 ctx.clone(),
                                 options.clone(),
                                 symbols.clone(),
@@ -8723,7 +8722,7 @@ let mutating_self_field = boxed_self_ref_receiver
             } else {
                 attr.value
                     .clone()
-                    .to_rust(ctx.clone(), options.clone(), symbols.clone())?
+                    .to_rust_receiver(ctx.clone(), options.clone(), symbols.clone())?
             };
             let receiver = if let Some(_inner) = option_receiver {
                 if crate::ast::tree::scope::mutates_receiver(&attr.attr) {
@@ -13291,36 +13290,67 @@ pub(crate) fn module_name_shadowed(name: &str, symbols: &SymbolTableScopes) -> b
     )
 }
 
-/// `threading.Thread(target=f, args=(...), daemon=...)`: callables are not
-/// values in rython, so the constructor's target is resolved statically (a
-/// plain function name) and the thread body is synthesized as a closure at
-/// conversion time — the same model functools.partial uses. Name-elements
-/// of args are CLONED into the closure: shared-identity runtime objects
-/// (locks, events, sockets) keep sharing through the clone, containers
-/// copy (rython's value-semantics ledger divergence, exactly as ordinary
-/// call arguments behave). Returns Ok(None) when the call is not a
-/// threading.Thread construction.
 /// The `__name__` a `threading.Thread(target=<name>)` thread is named after,
-/// resolved from how `name` is bound; a binding that is not a plain function
-/// is refused (see the call site).
+/// resolved from how `name` is bound: an alias or import follows its chain
+/// (re-exports included) to the defining `def`. A binding that is not a
+/// plain function, or an alias chain that loops back on itself, is refused.
 fn resolve_thread_target_name(
     name: &str,
     symbols: &SymbolTableScopes,
+    options: &PythonOptions,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    match symbols.get(name) {
-        Some(SymbolTableNode::FunctionDef(f)) => Ok(f.name.clone()),
-        Some(SymbolTableNode::ImportFrom(ifm)) => Ok(ifm.defining_name(name)),
-        Some(SymbolTableNode::Alias(canonical)) => Ok(canonical.clone()),
-        Some(SymbolTableNode::Assign { .. }) => Err(format!(
-            "threading.Thread(target={name}): `{name}` is bound by an assignment, so it is a \
-             callable value whose failure the thread body would silently discard and whose \
-             name the thread would report wrongly; pass the function's own name \
-             (`target=<def name>`); rython refuses to silently drop a worker's exception"
-        ).into()),
-        _ => Ok(name.to_string()),
+    let mut chain: Vec<String> = Vec::new();
+    let mut current = name.to_string();
+    loop {
+        if chain.contains(&current) {
+            chain.push(current);
+            // The symbol table keeps each name's last binding, so after
+            // `b = a; a = b` the function `a` first named is lost.
+            return Err(format!(
+                "threading.Thread(target={name}): `{name}` is rebound through an alias cycle \
+                 ({}), so conversion cannot tell which function it names or what the thread's \
+                 default name is; pass the function by its own name; rython refuses to guess \
+                 the target",
+                chain.join(" -> "),
+            ).into());
+        }
+        chain.push(current.clone());
+        match symbols.get(&current) {
+            Some(SymbolTableNode::FunctionDef(f)) => return Ok(f.name.clone()),
+            Some(SymbolTableNode::ImportFrom(ifm)) => {
+                let defining = ifm.defining_name(&current);
+                return Ok(crate::ast::tree::module::imported_function_name(
+                    options,
+                    &ifm.resolved_module_path(options),
+                    &defining,
+                    0,
+                )
+                .unwrap_or(defining));
+            }
+            Some(SymbolTableNode::Alias(canonical)) if *canonical != current => {
+                current = canonical.clone();
+            }
+            Some(SymbolTableNode::Assign { .. }) => return Err(format!(
+                "threading.Thread(target={name}): `{current}` is bound by an assignment, so it is a \
+                 callable value whose failure the thread body would silently discard and whose \
+                 name the thread would report wrongly; pass the function's own name \
+                 (`target=<def name>`); rython refuses to silently drop a worker's exception"
+            ).into()),
+            _ => return Ok(current),
+        }
     }
 }
 
+/// `threading.Thread(target=f, args=(...), daemon=...)`: callables are not
+/// values in rython, so the constructor's target is resolved statically (a
+/// function name or a nested `def`) and the thread body is synthesized as
+/// a closure at conversion time — the same model functools.partial uses.
+/// Each argument is evaluated into a binding where the constructor runs,
+/// as CPython does: shared-identity runtime objects (locks, events,
+/// sockets) keep sharing through the clone, containers copy (rython's
+/// value-semantics ledger divergence, exactly as ordinary call arguments
+/// behave). Returns Ok(None) when the call is not a threading.Thread
+/// construction.
 fn lower_threading_thread(
     call: &Call,
     ctx: &CodeGenContext,
@@ -13436,12 +13466,25 @@ fn lower_threading_thread(
     // assignment (`t = fail`) is a callable VALUE: its call has no `?` in
     // the synthesized body, so a failing worker would be reported as
     // successful. Both are decided from the symbol table, not the spelling.
-    let target_name = resolve_thread_target_name(&target, symbols)?;
-    if callee_value_signature(&target_expr, ctx, options, symbols).is_some()
-        || options.name_types.contains_key(&target)
-        || options.local_types.contains_key(&target)
+    // A nested `def` is a closure value whose call propagates its
+    // exception, and its `__name__` is the name it was defined under.
+    let nested_def = options.nested_closures.contains_key(&target);
+    let target_name = if nested_def {
+        target.clone()
+    } else {
+        resolve_thread_target_name(&target, symbols, options)?
+    };
+    if !nested_def
+        && (callee_value_signature(&target_expr, ctx, options, symbols).is_some()
+            || options.name_types.contains_key(&target)
+            || options.local_types.contains_key(&target))
     {
-        return Err("threading.Thread(target=...): a callable VALUE cannot cross a thread boundary; use a module-level function name; rython refuses to silently drop the target".into());
+        return Err(format!(
+            "threading.Thread(target={target}): `{target}` is a callable VALUE (a parameter \
+             or an assigned local), whose `__name__` the thread's default name needs and \
+             conversion cannot know; pass a module-level function or a nested `def` by its \
+             own name; rython refuses to silently misname the thread"
+        ).into());
     }
     // Bind every argument at the Python constructor point, not when start()
     // eventually runs the closure. This also keeps a `self.field` argument
@@ -13459,6 +13502,16 @@ fn lower_threading_thread(
         let value = crate::render_typed_reused(
             arg, ctx.clone(), options.clone(), symbols.clone(), None,
         )?;
+        // A field read cannot move out of the borrowed receiver: the
+        // thread gets its own copy, as an ordinary argument would.
+        let value = if matches!(arg, ExprType::Attribute(a) if root_name(&a.value) == Some("self"))
+            && !crate::infer_type(Some(ctx), arg, options, symbols).is_copy()
+            && !value.to_string().ends_with(". clone ()")
+        {
+            quote!(Clone::clone(&(#value)))
+        } else {
+            value
+        };
         clones.push(quote!(let #ident = #value;));
         name_types.insert(name.clone(), crate::infer_type(Some(ctx), arg, options, symbols));
         bound_args.push(ExprType::Name(crate::ast::tree::name::Name { id: name }));

@@ -6298,7 +6298,9 @@ fn unittest_method_fields_refuse_opaque_attribute_presence() {
         ("    def test_a(self):\n        def read():\n            return self.total\n        print(read())\n        self.total = 3\n", "capture"),
         ("    def setUp(self):\n        self.test_a()\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "lifecycle access"),
         ("    def setUp(self):\n        super().setUp()\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "receiver escape"),
-        ("    total = 9\n    def test_a(self):\n        print(self.total)\n        self.total = 3\n", "class member `total`"),
+        // A class data attribute an instance field shadows is accepted
+        // (#519 review); reading it before the instance store is not.
+        ("    total = 9\n    def test_a(self):\n        print(self.total)\n        self.total = 3\n", "attribute `self.total` may be read before assignment"),
         ("    def __getattribute__(self, name: str):\n        return 9\n    def test_a(self):\n        self.total = 3\n        print(self.total)\n", "method `__getattribute__`"),
         ("    def __init__(self):\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "method `__init__`"),
     ] {
@@ -6328,6 +6330,57 @@ fn unittest_inherited_fields_cannot_assume_an_overridden_setup_ran() {
     let error = compile_err("import unittest\nclass Base(unittest.TestCase):\n    def setUp(self):\n        self.total = 3\n    def test_a(self):\n        print(self.total)\nclass Child(Base):\n    def setUp(self):\n        pass\nif __name__ == '__main__':\n    unittest.main()\n", "tc_inherited.py");
     assert!(error.contains("TestCase `Child`") && error.contains("self.total")
         && error.contains("line 6") && error.contains("before assignment"), "{error}");
+}
+
+#[test]
+fn unittest_runner_flags_set_by_hand_are_refused() {
+    // Issue #512 and the #519 review: CPython's runner reads
+    // `__unittest_skip__` off the class AND off the test function
+    // (verified against python3: `test_b.__unittest_skip__ = True` reports
+    // `OK (skipped=1)`), so either spelling would silently run a test
+    // CPython skips. Fieldless cases are covered too.
+    for (shape, body) in [
+        ("class flag", "    __unittest_skip__ = True\n    def test_a(self):\n        print('a')\n"),
+        ("class reason", "    __unittest_skip_why__ = 'manual'\n    def test_a(self):\n        print('a')\n"),
+        ("method flag", "    def test_a(self):\n        print('a')\n    test_a.__unittest_skip__ = True\n"),
+        ("method expected failure", "    def test_a(self):\n        print('a')\n    test_a.__unittest_expecting_failure__ = True\n"),
+        ("with fields", "    def setUp(self):\n        self.n = 1\n    def test_a(self):\n        print(self.n)\n    test_a.__unittest_skip__ = True\n"),
+    ] {
+        let error = compile_err(
+            &format!("import unittest\nclass T(unittest.TestCase):\n{body}if __name__ == '__main__':\n    unittest.main()\n"),
+            "tc_runner_flag.py",
+        );
+        assert!(error.contains("TestCase `T` explicit runner attribute `__unittest_")
+            && error.contains("use unittest skip") && error.contains("refuses"), "{shape}: {error}");
+    }
+}
+
+#[test]
+fn unittest_fields_allow_helpers_class_defaults_and_static_members() {
+    // #519 review regressions, each converting again (the end-to-end
+    // transcript is pinned in convert_tests.rs): a helper reached only from
+    // tests reads setUp's fields; a class data attribute setUp overrides;
+    // a @staticmethod's first parameter is not a receiver.
+    compile_as_entry(
+        "import unittest\nclass T(unittest.TestCase):\n    value = 0\n    def setUp(self):\n        self.value = 5\n    def doubled(self) -> int:\n        return self.value * 2\n    @staticmethod\n    def describe(n: int) -> str:\n        return 'count=' + str(n)\n    def test_a(self):\n        print(self.describe(self.doubled()))\nif __name__ == '__main__':\n    unittest.main()\n",
+        "tc_helpers.py",
+    );
+    // A helper setUp reaches can run before setUp's stores, so it must
+    // initialize its own reads, directly or through another helper.
+    for call in ["self.show()", "self.relay()"] {
+        let error = compile_err(
+            &format!("import unittest\nclass T(unittest.TestCase):\n    def setUp(self):\n        {call}\n        self.value = 5\n    def relay(self) -> None:\n        self.show()\n    def show(self) -> None:\n        print(self.value)\n    def test_a(self):\n        self.show()\nif __name__ == '__main__':\n    unittest.main()\n"),
+            "tc_early_helper.py",
+        );
+        assert!(error.contains("attribute `self.value` may be read before assignment in `show`")
+            && error.contains("a helper that setUp calls"), "{call}: {error}");
+    }
+    // A class value still may not hide a method, nor a method a field.
+    let error = compile_err(
+        "import unittest\nclass T(unittest.TestCase):\n    def setUp(self):\n        self.check = 1\n    def check(self) -> int:\n        return 2\n    def test_a(self):\n        print(self.check)\nif __name__ == '__main__':\n    unittest.main()\n",
+        "tc_method_field.py",
+    );
+    assert!(error.contains("class member `check`") && error.contains("use distinct"), "{error}");
 }
 
 #[test]
@@ -13758,6 +13811,15 @@ fn thread_targets_and_constructor_arguments_refuse_silent_defaults() {
         "thread_local_alias.py",
     );
     assert!(error.contains("bound by an assignment") && error.contains("refuses"), "{error}");
+    // Devin review on #533: `b = a; a = b` leaves an alias cycle in the
+    // (last-binding) symbol table. CPython names the thread after `work`
+    // (verified against python3); conversion cannot recover that binding,
+    // so it refuses instead of following the cycle forever.
+    let error = compile_err(
+        "import threading\nfrom job import work as a\nb = a\na = b\ndef main() -> None:\n    t = threading.Thread(target=a)\n    t.start()\n",
+        "thread_alias_cycle.py",
+    );
+    assert!(error.contains("alias cycle (a -> b -> a)") && error.contains("refuses"), "{error}");
     // Issue #516: an argument read before the attribute's first assignment
     // would capture the struct default where CPython raises AttributeError:
     // in __init__ after the thread slot is filled, in a later method, and
@@ -13787,6 +13849,55 @@ fn thread_targets_and_constructor_arguments_refuse_silent_defaults() {
 }
 
 #[test]
+fn thread_constructor_arguments_cannot_assume_init_completed() {
+    // #519 review: another method may run DURING __init__ (a self method
+    // call, an escaping self, super()) or after an early return, before a
+    // later store. CPython raises AttributeError for `self.n` there
+    // (verified against python3: `'Runner' object has no attribute 'n'`);
+    // binding the struct default would print `work 0`.
+    let header = "import threading\ndef work(n: int) -> None:\n    print('work', n)\n";
+    for (shape, init) in [
+        ("method call", "        self.worker = threading.Thread(target=work, args=(0,))\n        self.rebuild()\n        self.n = 7\n"),
+        ("early return", "        self.worker = threading.Thread(target=work, args=(0,))\n        if not ready:\n            return\n        self.n = 7\n"),
+        ("escaping self", "        self.worker = threading.Thread(target=work, args=(0,))\n        register(self)\n        self.n = 7\n"),
+    ] {
+        let source = format!(
+            "{header}def register(r: object) -> None:\n    pass\nclass Runner:\n    def __init__(self, ready: bool) -> None:\n{init}    def rebuild(self) -> None:\n        self.worker = threading.Thread(target=work, args=(self.n,))\n"
+        );
+        let error = compile_err(&source, "thread_init_interrupted.py");
+        assert!(error.contains("reads `self.n` before it is definitely assigned") && error.contains("refuses"), "{shape}: {error}");
+    }
+    // A class attribute that an instance store shadows is a struct field:
+    // before `bump` runs, CPython reads the class value (5) where the field
+    // default (0) would be bound.
+    let error = compile_err(
+        &format!("{header}class Runner:\n    n = 5\n    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work, args=(0,))\n    def bump(self) -> None:\n        self.n = 7\n    def rebuild(self) -> None:\n        self.worker = threading.Thread(target=work, args=(self.n,))\n"),
+        "thread_shadowed_class_attribute.py",
+    );
+    assert!(error.contains("reads `self.n` before it is definitely assigned"), "{error}");
+    // A class constant never shadowed by an instance store is the class
+    // attribute, so reading it does not end the definite prefix, in either
+    // guard (the field-initialization guard used to refuse it).
+    let (out, _warnings) = compile_with_warnings(
+        &format!("{header}class Runner:\n    INTERVAL = 3\n    def __init__(self) -> None:\n        self.interval = self.INTERVAL\n        self.worker = threading.Thread(target=work, args=(self.interval,))\n        self.n = 7\n    def rebuild(self) -> None:\n        self.worker = threading.Thread(target=work, args=(self.n,))\n"),
+        "thread_class_constant.py",
+    );
+    assert!(out.contains("Thread :: new"), "{out}");
+}
+
+#[test]
+fn a_self_field_thread_argument_is_cloned_not_moved() {
+    // #519 review: `let __rython_thread_arg_0 = self.items;` moved out of
+    // the borrowed receiver (E0507). The thread gets its own copy, as the
+    // §10.5 container-argument semantics state.
+    let out = compile(
+        "import threading\ndef fill(xs: list[int]) -> None:\n    xs.append(1)\nclass Holder:\n    def __init__(self) -> None:\n        self.items: list[int] = []\n        self.worker = threading.Thread(target=fill, args=(self.items,))\n",
+        "thread_field_argument.py",
+    );
+    assert!(out.contains("let __rython_thread_arg_0 = Clone :: clone (& (self . items))"), "{out}");
+}
+
+#[test]
 fn thread_instance_fields_refuse_unsupported_methods_and_targets() {
     for method in ["join(0.1)", "join(timeout=0.1)", "run()", "start(1)"] {
         let source = format!("import threading\ndef work() -> None:\n    pass\nclass Runner:\n    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work)\n    def go(self) -> None:\n        self.worker.{method}\n");
@@ -13805,12 +13916,12 @@ fn thread_instance_fields_refuse_unsupported_methods_and_targets() {
         "import threading\nfrom typing import Callable\nclass Runner:\n    def __init__(self, work: Callable[[], None]) -> None:\n        self.worker = threading.Thread(target=work)\n",
         "thread_callable.py",
     );
-    assert!(error.contains("callable VALUE") && error.contains("thread boundary"), "{error}");
+    assert!(error.contains("callable VALUE") && error.contains("refuses"), "{error}");
     let error = compile_err(
         "import threading\nclass Runner:\n    def __init__(self, work: str) -> None:\n        self.worker = threading.Thread(target=work)\n",
         "thread_target_value.py",
     );
-    assert!(error.contains("callable VALUE") && error.contains("thread boundary"), "{error}");
+    assert!(error.contains("callable VALUE") && error.contains("refuses"), "{error}");
     let error = compile_err(
         "import threading\ndef work(n: int) -> None:\n    pass\nclass Runner:\n    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work, args=(*[1],))\n",
         "thread_starred.py",
@@ -30735,10 +30846,30 @@ fn pytest_module_values_cannot_hide_the_requested_runner() {
         "import logging, pytest\nlogging.info([pytest][0].main())\n",
     ] {
         let error = compile_err(source, "pytest_module_value.py");
-        assert!(error.contains("pytest module/cmdline values are not supported yet")
+        assert!(error.contains("used as a value (compared, passed, stored or returned) is not supported yet")
             || error.contains("pytest.main() test execution is not supported yet"), "{source}: {error}");
         assert!(error.contains("pytest_module_value.py:") && error.contains("python -m pytest"), "{error}");
     }
+}
+
+#[test]
+fn pytest_members_are_namespace_reads_and_the_module_value_is_named() {
+    // #519 review: an attribute receiver is a namespace, not a copied
+    // module value, so `pytest.mark.slow` and `pytest.raises(...)` keep the
+    // external-module path they had before the runner guard. Using the
+    // module itself as a value is refused with a message naming it.
+    for source in [
+        "import pytest\npytestmark = pytest.mark.slow\n",
+        "import pytest\ndef test_raises() -> None:\n    with pytest.raises(ZeroDivisionError):\n        print(1 // 0)\n",
+    ] {
+        compile(source, "pytest_member.py");
+    }
+    let error = compile_err(
+        "import pytest\ndef present() -> bool:\n    return pytest is not None\n",
+        "pytest_compared.py",
+    );
+    assert!(error.contains("the pytest module `pytest` used as a value")
+        && error.contains("<module>:3:5") && error.contains("refuses"), "{error}");
 }
 
 #[test]

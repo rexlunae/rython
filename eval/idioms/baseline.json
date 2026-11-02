@@ -180,10 +180,16 @@
     "testcase_method_fields": {
       "status": "pass"
     },
+    "testcase_setup_helpers": {
+      "status": "pass"
+    },
     "text_stats": {
       "status": "pass"
     },
     "thread_instance_field": {
+      "status": "pass"
+    },
+    "thread_nested_target": {
       "status": "pass"
     },
     "tokenizer": {

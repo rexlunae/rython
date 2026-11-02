@@ -77,8 +77,8 @@ target exists. An unresolved `import pytest` emits an external-module
 warning. Explicit pytest runner calls and values (`pytest.main`,
 `console_main`, `cmdline.main`, including import aliases) are conversion
 errors even with `-W allow`; run pytest under CPython or port to the supported unittest subset with an explicit
-entry. Copying pytest module/cmdline objects into value slots is also
-refused. See [testing under rython](../../docs/testing-under-rython.md).
+entry. Using the pytest module itself as a value is also refused;
+member reads such as `pytest.mark.slow` keep the external-module warning. See [testing under rython](../../docs/testing-under-rython.md).
 
 ## Unannotated parameters (parameter type inference)
 

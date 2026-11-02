@@ -79,11 +79,41 @@ fn opaque_receiver(expr: &ExprType, lifecycle: &HashSet<&str>) -> bool {
         .any(|child| opaque_receiver(child, lifecycle))
 }
 
+/// Whether a method has no instance receiver (`@staticmethod`,
+/// `@classmethod`), so it cannot read or write instance attributes.
+fn has_no_receiver(method: &FunctionDef) -> bool {
+    matches!(
+        super::decorator::parse_decorator(&method.decorator_list),
+        Ok(Some(super::decorator::Decorator::StaticMethod | super::decorator::Decorator::ClassMethod))
+    )
+}
+
+/// The methods `body` reaches through its receiver (`self.helper(...)`,
+/// or `self.helper` passed on as a value).
+fn receiver_members(body: &[crate::Statement]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    visit::walk_stmts(body, Descend::All, &mut |stmt| {
+        for expr in visit::stmt_all_exprs(stmt) {
+            visit::walk_expr(expr, &mut |e| {
+                if let ExprType::Attribute(a) = e
+                    && visit::is_self(&a.value)
+                {
+                    out.insert(a.attr.clone());
+                }
+            });
+        }
+        Flow::Continue
+    });
+    out
+}
+
 impl ClassDef {
     pub(crate) fn is_testcase(&self, symbols: &SymbolTableScopes, options: &PythonOptions) -> bool {
-        self.base_chain_with_options(symbols, options)
+        // Each ancestor resolves its own base in its defining module, so an
+        // imported base's imported base is found (Devin review on #519).
+        self.cross_module_chain(symbols, options)
             .iter()
-            .any(|c| c.bases.iter().any(super::module::is_testcase_base))
+            .any(|(c, ..)| c.bases.iter().any(super::module::is_testcase_base))
     }
 
     pub(crate) fn refuse_manual_testcase_construction(
@@ -92,8 +122,10 @@ impl ClassDef {
         options: &PythonOptions,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if self.is_testcase(symbols, options) {
-            for ancestor in self.base_chain_with_options(symbols, options) {
-                if !ancestor.infer_fields(symbols, options)?.is_empty() {
+            for (ancestor, ancestor_symbols, ancestor_options, _) in
+                self.cross_module_chain(symbols, options)
+            {
+                if !ancestor.infer_fields(&ancestor_symbols, &ancestor_options)?.is_empty() {
                     return Err(format!(
                         "manual construction of TestCase `{}` with instance fields is not supported yet; \
                          use unittest.main() so setUp runs before each test; \
@@ -106,6 +138,11 @@ impl ClassDef {
         Ok(())
     }
 
+    /// The receiver restrictions here protect the proof that no read of an
+    /// instance attribute sees a struct default. A TestCase with no
+    /// instance fields has no default to expose, so only the runner-flag
+    /// and method-shadowing refusals (which are about what runs, not about
+    /// fields) apply to it.
     pub(crate) fn validate_testcase_fields(
         &self,
         symbols: &SymbolTableScopes,
@@ -114,13 +151,13 @@ impl ClassDef {
         if !self.is_testcase(symbols, options) {
             return Ok(());
         }
-        let chain = self.base_chain_with_options(symbols, options);
+        let chain = self.cross_module_chain(symbols, options);
         let mut fields = HashSet::new();
         let mut methods: Vec<&FunctionDef> = Vec::new();
-        for class in &chain {
+        for (class, class_symbols, class_options, _) in &chain {
             fields.extend(
                 class
-                    .infer_fields(symbols, options)?
+                    .infer_fields(class_symbols, class_options)?
                     .into_iter()
                     .map(|(name, _)| name),
             );
@@ -143,20 +180,47 @@ impl ClassDef {
             )
             .into()
         };
-        // A class attribute/method shadowed by a field, or a class value
-        // hiding an inherited method, needs Python's instance-then-class
-        // lookup. A plain struct cannot supply it.
-        for class in &chain {
+        // CPython's runner reads its skip/expected-failure flags off the
+        // class and the test function, so binding one by hand (as a class
+        // attribute or `test_b.__unittest_skip__ = True`) changes what runs.
+        // The emitted runner honors only the decorators.
+        for (class, ..) in &chain {
+            let mut flag = None;
+            visit::walk_stmts(&class.body, Descend::OwnScope, &mut |stmt| {
+                let bound = visit::stmt_bound_names(stmt, visit::Bindings::Scope);
+                let attribute_targets = visit::stmt_targets(stmt).into_iter().filter_map(|t| match t {
+                    ExprType::Attribute(a) => Some(a.attr.clone()),
+                    _ => None,
+                });
+                if let Some(name) = bound
+                    .into_iter()
+                    .chain(attribute_targets)
+                    .find(|name| RunnerAttribute::from_name(name).is_some())
+                {
+                    flag = Some((name, stmt.lineno.unwrap_or(0)));
+                    return Flow::Stop;
+                }
+                Flow::Continue
+            });
+            if let Some((name, line)) = flag {
+                return Err(format!(
+                    "TestCase `{}` explicit runner attribute `{name}` at line {line} is not supported yet; \
+                     use unittest skip/skipIf/skipUnless/expectedFailure decorators without setting \
+                     their runner attributes; rython refuses to silently run a test CPython would skip",
+                    self.name
+                ).into());
+            }
+        }
+        // A class value hiding an inherited method needs Python's
+        // instance-then-class lookup, which a plain struct cannot supply.
+        // A class DATA attribute that an instance field shadows is fine:
+        // the field proof below refuses any read that could come before
+        // the instance store, so the struct default is never observed.
+        for (class, ..) in &chain {
             let mut conflict = None;
             visit::walk_stmts(&class.body, Descend::OwnScope, &mut |stmt| {
                 if matches!(stmt.statement, StatementType::AnnotatedName { .. }) {
                     return Flow::Continue; // A bare annotation binds no Python value.
-                }
-                if let Some(name) = visit::stmt_bound_names(stmt, visit::Bindings::Scope)
-                    .into_iter().find(|name| RunnerAttribute::from_name(name).is_some())
-                {
-                    conflict = Some((name, stmt.lineno.unwrap_or(0)));
-                    return Flow::Stop;
                 }
                 let method_definition = matches!(
                     stmt.statement,
@@ -165,7 +229,7 @@ impl ClassDef {
                 if let Some(name) = visit::stmt_bound_names(stmt, visit::Bindings::Scope)
                     .into_iter()
                     .find(|name| {
-                        fields.contains(name)
+                        (method_definition && fields.contains(name))
                             || (!method_definition && methods.iter().any(|m| m.name == *name))
                     })
                 {
@@ -175,23 +239,36 @@ impl ClassDef {
                 Flow::Continue
             });
             if let Some((name, line)) = conflict {
-                if RunnerAttribute::from_name(&name).is_some() {
-                    return Err(refuse(
-                        &format!("explicit runner attribute `{name}`"), line,
-                        "use unittest skip/skipIf/skipUnless/expectedFailure decorators without overriding their runner attributes",
-                    ));
-                }
                 return Err(refuse(
                     &format!(
                         "class member `{name}` shadows a method or is shadowed by an instance field"
                     ),
                     line,
-                    "use distinct class and instance attribute names",
+                    "use distinct method and attribute names",
                 ));
             }
         }
         if fields.is_empty() {
             return Ok(());
+        }
+        // A helper may run from setUp (directly or through other helpers)
+        // before setUp's stores; any other helper runs only from a test or
+        // tearDown, after setUp returned.
+        let mut early_helpers: HashSet<String> = HashSet::new();
+        let mut frontier: Vec<&FunctionDef> = methods
+            .iter()
+            .copied()
+            .filter(|m| Member::from_name(&m.name) == Member::Setup)
+            .collect();
+        while let Some(method) = frontier.pop() {
+            for name in receiver_members(&method.body) {
+                if let Some(helper) = methods.iter().find(|m| {
+                    m.name == name && Member::from_name(&m.name) == Member::Helper
+                }) && early_helpers.insert(name)
+                {
+                    frontier.push(helper);
+                }
+            }
         }
         let empty = HashSet::new();
         let mut setup_fields = Some(empty.clone());
@@ -210,9 +287,12 @@ impl ClassDef {
                 .iter()
                 .filter(|m| Member::from_name(&m.name) == member)
             {
+                if has_no_receiver(method) {
+                    continue;
+                }
                 let line = chain
                     .iter()
-                    .flat_map(|c| &c.body)
+                    .flat_map(|(c, ..)| &c.body)
                     .find_map(|stmt| {
                         matches!(&stmt.statement, StatementType::FunctionDef(m) if m == *method)
                             .then_some(stmt.lineno.unwrap_or(0))
@@ -256,7 +336,9 @@ impl ClassDef {
                         "keep self attribute access in direct assignments and reads",
                     ));
                 }
-                let initialized = if matches!(member, Member::Test | Member::Teardown) {
+                let after_setup = matches!(member, Member::Test | Member::Teardown)
+                    || (member == Member::Helper && !early_helpers.contains(&method.name));
+                let initialized = if after_setup {
                     let Some(initialized) = &setup_fields else {
                         // setUp has no successful exit: the runner invokes
                         // neither the test nor tearDown. Explicit TestCase
@@ -270,7 +352,7 @@ impl ClassDef {
                 let bound = binding_flow::receiver_field_bindings(&body, initialized, &fields)
                     .map_err(|(field, line)| refuse(
                         &format!("attribute `self.{field}` may be read before assignment in `{}`", method.name),
-                        line, "assign the attribute on every path before reading it (or initialize it unconditionally in setUp); helpers must initialize their own reads"))?;
+                        line, "assign the attribute on every path before reading it (or initialize it unconditionally in setUp); a helper that setUp calls must initialize its own reads"))?;
                 if member == Member::Setup {
                     setup_fields = bound;
                 }

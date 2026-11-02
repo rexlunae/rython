@@ -8206,6 +8206,88 @@ fn a_thread_is_named_after_its_defining_function_and_binds_defined_arguments() {
 }
 
 #[test]
+fn thread_targets_follow_reexports_and_nested_defs() {
+    // #519 review: a re-exported alias (`from .worker_impl import work as
+    // job` in a package `__init__`) names the thread after the DEFINING
+    // function, a nested `def` is a valid target again, a Thread field is
+    // returned from a `-> threading.Thread` method, and a field argument is
+    // bound when the constructor runs.
+    //
+    // Verified against python3 (3.14.4): `python3 -m threadtargets.cli`.
+    let scratch = Scratch::new("threadtargets");
+    let krate = package_crate(
+        &scratch,
+        "threadtargets",
+        &[
+            (
+                "jobs/worker_impl.py",
+                concat!(
+                    "import threading\n",
+                    "\n",
+                    "\n",
+                    "def work() -> None:\n",
+                    "    print(\"worker\", threading.current_thread().name)\n",
+                ),
+            ),
+            ("jobs/__init__.py", "from .worker_impl import work as job\n"),
+            (
+                "cli.py",
+                concat!(
+                    "import threading\n",
+                    "from .jobs import job\n",
+                    "\n",
+                    "\n",
+                    "class Runner:\n",
+                    "    def __init__(self) -> None:\n",
+                    "        self.label = \"items\"\n",
+                    "        self.worker = threading.Thread(target=job)\n",
+                    "\n",
+                    "    def handle(self) -> threading.Thread:\n",
+                    "        return self.worker\n",
+                    "\n",
+                    "    def relabel(self) -> None:\n",
+                    "        self.worker = threading.Thread(target=show, args=(self.label,))\n",
+                    "\n",
+                    "\n",
+                    "def show(label: str) -> None:\n",
+                    "    print(\"show\", label, threading.current_thread().name)\n",
+                    "\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    r = Runner()\n",
+                    "    r.worker.start()\n",
+                    "    r.worker.join()\n",
+                    "    print(\"alive\", r.handle().is_alive())\n",
+                    "    r.relabel()\n",
+                    "    r.worker.start()\n",
+                    "    r.worker.join()\n",
+                    "\n",
+                    "    def inner(n: int) -> None:\n",
+                    "        print(\"inner\", n, threading.current_thread().name)\n",
+                    "\n",
+                    "    n = threading.Thread(target=inner, args=(5,))\n",
+                    "    n.start()\n",
+                    "    n.join()\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    main()\n",
+                ),
+            ),
+        ],
+    );
+    assert_eq!(
+        run_package(&krate, "threadtargets"),
+        vec![
+            "worker Thread-1 (work)",
+            "alive False",
+            "show items Thread-2 (show)",
+            "inner 5 Thread-3 (inner)",
+        ]
+    );
+}
+
+#[test]
 fn threading_semantics_match_python_at_runtime() {
     // Thread lifecycle (start/join/is_alive), with-lock, RLock reentrancy,
     // Event, Semaphore, active_count — sequenced by join() so the output
@@ -13139,7 +13221,9 @@ fn package_crate(scratch: &Scratch, pkg_name: &str, files: &[(&str, &str)]) -> r
     fs::create_dir_all(&pkg).unwrap();
     fs::write(pkg.join("__init__.py"), "").unwrap();
     for (file, source) in files {
-        fs::write(pkg.join(file), source).unwrap();
+        let path = pkg.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
     }
     let out = scratch.path().join("crate");
     let pkg = rypip::discover(scratch.path()).expect("discover");
@@ -13224,6 +13308,145 @@ fn unittest_method_created_fields_match_cpython() {
     assert_eq!(stdout, "7\n10\n");
     assert_eq!(stderr, "..\n----------------------------------------------------------------------\nRan 2 tests in T\n\nOK");
     assert_eq!(code, 0);
+}
+
+#[test]
+fn unittest_helpers_class_defaults_and_static_members_match_cpython() {
+    // #519 review regressions: a helper reached only from tests reads
+    // setUp's fields, a helper setUp calls initializes its own reads, a
+    // class data attribute setUp overrides, and @staticmethod/@classmethod
+    // members (no instance receiver).
+    let (stdout, stderr, code) = unittest_run("ut_helpers",
+        include_str!("fixtures/testcase_helpers_and_class_defaults.py"));
+    // Verified against python3 (3.14.4).
+    assert_eq!(stdout, "offset 1\nscaled 7\ncount=2 label 1\n");
+    assert_eq!(stderr, "...\n----------------------------------------------------------------------\nRan 3 tests in T\n\nOK");
+    assert_eq!(code, 0);
+}
+
+/// Convert a package whose conversion must fail; the error text.
+fn package_convert_err(scratch: &Scratch, pkg_name: &str, files: &[(&str, &str)]) -> String {
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        format!("[project]\nname = \"{pkg_name}\"\nversion = \"0.1.0\"\n"),
+    )
+    .unwrap();
+    let pkg = scratch.path().join(pkg_name);
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("__init__.py"), "").unwrap();
+    for (file, source) in files {
+        fs::write(pkg.join(file), source).unwrap();
+    }
+    let pkg = rypip::discover(scratch.path()).expect("discover");
+    let error = rypip::convert(&pkg, &scratch.path().join("crate"), &ConvertOptions::default())
+        .expect_err("conversion must fail loudly");
+    format!("{error:#}")
+}
+
+#[test]
+fn unittest_finds_a_testcase_through_a_multi_module_base_chain() {
+    // Devin review on #519: each ancestor resolves its base in ITS module,
+    // so `Child(Middle)` -> `Middle(Root)` (middle.py imports Root) ->
+    // `Root(unittest.TestCase)` is a TestCase. CPython (verified with
+    // python3 3.14.4, `python3 -m tcchain.cli`) runs Child.test_x and
+    // prints `child test 42`. Building that entry module is the separate
+    // cross-module-subclass defect (#530), so this pins the emitted runner.
+    let scratch = Scratch::new("tcchain");
+    let krate = package_crate(
+        &scratch,
+        "tcchain",
+        &[
+            ("root.py", "import unittest\n\n\nclass Root(unittest.TestCase):\n    pass\n"),
+            ("middle.py", "from .root import Root\n\n\nclass Middle(Root):\n    pass\n"),
+            (
+                "cli.py",
+                concat!(
+                    "import unittest\n",
+                    "from .middle import Middle\n",
+                    "\n",
+                    "\n",
+                    "class Child(Middle):\n",
+                    "    def setUp(self) -> None:\n",
+                    "        self.n = 41\n",
+                    "\n",
+                    "    def test_x(self) -> None:\n",
+                    "        self.n += 1\n",
+                    "        print(\"child test\", self.n)\n",
+                    "\n",
+                    "\n",
+                    "if __name__ == \"__main__\":\n",
+                    "    unittest.main()\n",
+                ),
+            ),
+        ],
+    );
+    let cli = fs::read_to_string(krate.root.join("src/cli.rs")).unwrap();
+    assert!(cli.contains("__rython_tc . test_x ()") || cli.contains("__rython_tc.test_x()"), "{cli}");
+    assert!(cli.contains("test_x (__main__.Child.test_x)"), "{cli}");
+}
+
+#[test]
+fn unittest_cross_module_runner_inputs_and_qualified_construction_are_refused() {
+    // A gate condition or test default inherited from another module would
+    // be rendered against this module's names (#519 review): refused.
+    let scratch = Scratch::new("tcgate");
+    let error = package_convert_err(
+        &scratch,
+        "tcgate",
+        &[
+            (
+                "base.py",
+                "import unittest\nSLOW = True\n\n\n@unittest.skipIf(SLOW, \"slow\")\nclass Base(unittest.TestCase):\n    def test_one(self) -> None:\n        print(\"one\")\n",
+            ),
+            (
+                "cli.py",
+                "import unittest\nfrom .base import Base\n\n\nclass Child(Base):\n    pass\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+            ),
+        ],
+    );
+    assert!(error.contains("TestCase `Child` inherits `Base`'s skipIf/skipUnless condition from another module")
+        && error.contains("refuses"), "{error}");
+    // A TestCase base spelled through its module is not followed by the
+    // base chain. CPython runs Child's inherited and own tests (verified
+    // with python3 3.14.4: `Ran 3 tests`); leaving them out is refused.
+    let scratch = Scratch::new("tcattrbase");
+    let error = package_convert_err(
+        &scratch,
+        "tcattrbase",
+        &[
+            (
+                "cases.py",
+                "import unittest\n\n\nclass Base(unittest.TestCase):\n    def test_base(self) -> None:\n        print(\"base test\")\n",
+            ),
+            (
+                "cli.py",
+                "import unittest\nfrom . import cases\n\n\nclass Child(cases.Base):\n    def test_child(self) -> None:\n        print(\"child test\")\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+            ),
+        ],
+    );
+    assert!(error.contains("class `Child` derives from the TestCase `cases.Base` through its module")
+        && error.contains("refuses"), "{error}");
+    // Issue #513: constructing a field-bearing TestCase through a sibling
+    // module (`cases.T()`) is the same manual construction as `T()`.
+    // CPython raises `AttributeError: 'T' object has no attribute 'total'`
+    // (verified with python3 3.14.4); a struct default would print 0.
+    let scratch = Scratch::new("tcqualified");
+    let error = package_convert_err(
+        &scratch,
+        "tcqualified",
+        &[
+            (
+                "cases.py",
+                "import unittest\n\n\nclass T(unittest.TestCase):\n    def setUp(self) -> None:\n        self.total = 3\n\n    def test_a(self) -> None:\n        print(\"total\", self.total)\n",
+            ),
+            (
+                "cli.py",
+                "from . import cases\n\n\ndef main() -> None:\n    t = cases.T()\n    t.test_a()\n\n\nif __name__ == \"__main__\":\n    main()\n",
+            ),
+        ],
+    );
+    assert!(error.contains("manual construction of TestCase `T` with instance fields")
+        && error.contains("cli.py") && error.contains("refuses"), "{error}");
 }
 
 #[test]
@@ -24206,7 +24429,7 @@ fn pytest_module_value_aliases_are_refused_before_the_runner_is_lost() {
         let package = rypip::discover(&file).unwrap();
         let error = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap_err();
         let message = format!("{error:#}");
-        assert!(message.contains("pytest module/cmdline values are not supported yet")
+        assert!(message.contains("used as a value (compared, passed, stored or returned) is not supported yet")
             || message.contains("pytest.main() test execution is not supported yet"), "{source}: {message}");
         assert!(message.contains("app.py") && message.contains("python -m pytest"), "{message}");
     }
