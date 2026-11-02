@@ -13811,6 +13811,15 @@ fn thread_targets_and_constructor_arguments_refuse_silent_defaults() {
         "thread_local_alias.py",
     );
     assert!(error.contains("bound by an assignment") && error.contains("refuses"), "{error}");
+    // Devin review on #533: `b = a; a = b` leaves an alias cycle in the
+    // (last-binding) symbol table. CPython names the thread after `work`
+    // (verified against python3); conversion cannot recover that binding,
+    // so it refuses instead of following the cycle forever.
+    let error = compile_err(
+        "import threading\nfrom job import work as a\nb = a\na = b\ndef main() -> None:\n    t = threading.Thread(target=a)\n    t.start()\n",
+        "thread_alias_cycle.py",
+    );
+    assert!(error.contains("alias cycle (a -> b -> a)") && error.contains("refuses"), "{error}");
     // Issue #516: an argument read before the attribute's first assignment
     // would capture the struct default where CPython raises AttributeError:
     // in __init__ after the thread slot is filled, in a later method, and

@@ -13293,34 +13293,51 @@ pub(crate) fn module_name_shadowed(name: &str, symbols: &SymbolTableScopes) -> b
 /// The `__name__` a `threading.Thread(target=<name>)` thread is named after,
 /// resolved from how `name` is bound: an alias or import follows its chain
 /// (re-exports included) to the defining `def`. A binding that is not a
-/// plain function is refused (see the call site).
+/// plain function, or an alias chain that loops back on itself, is refused.
 fn resolve_thread_target_name(
     name: &str,
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    match symbols.get(name) {
-        Some(SymbolTableNode::FunctionDef(f)) => Ok(f.name.clone()),
-        Some(SymbolTableNode::ImportFrom(ifm)) => {
-            let defining = ifm.defining_name(name);
-            Ok(crate::ast::tree::module::imported_function_name(
-                options,
-                &ifm.resolved_module_path(options),
-                &defining,
-                0,
-            )
-            .unwrap_or(defining))
+    let mut chain: Vec<String> = Vec::new();
+    let mut current = name.to_string();
+    loop {
+        if chain.contains(&current) {
+            chain.push(current);
+            // The symbol table keeps each name's last binding, so after
+            // `b = a; a = b` the function `a` first named is lost.
+            return Err(format!(
+                "threading.Thread(target={name}): `{name}` is rebound through an alias cycle \
+                 ({}), so conversion cannot tell which function it names or what the thread's \
+                 default name is; pass the function by its own name; rython refuses to guess \
+                 the target",
+                chain.join(" -> "),
+            ).into());
         }
-        Some(SymbolTableNode::Alias(canonical)) if canonical != name => {
-            resolve_thread_target_name(canonical, symbols, options)
+        chain.push(current.clone());
+        match symbols.get(&current) {
+            Some(SymbolTableNode::FunctionDef(f)) => return Ok(f.name.clone()),
+            Some(SymbolTableNode::ImportFrom(ifm)) => {
+                let defining = ifm.defining_name(&current);
+                return Ok(crate::ast::tree::module::imported_function_name(
+                    options,
+                    &ifm.resolved_module_path(options),
+                    &defining,
+                    0,
+                )
+                .unwrap_or(defining));
+            }
+            Some(SymbolTableNode::Alias(canonical)) if *canonical != current => {
+                current = canonical.clone();
+            }
+            Some(SymbolTableNode::Assign { .. }) => return Err(format!(
+                "threading.Thread(target={name}): `{current}` is bound by an assignment, so it is a \
+                 callable value whose failure the thread body would silently discard and whose \
+                 name the thread would report wrongly; pass the function's own name \
+                 (`target=<def name>`); rython refuses to silently drop a worker's exception"
+            ).into()),
+            _ => return Ok(current),
         }
-        Some(SymbolTableNode::Assign { .. }) => Err(format!(
-            "threading.Thread(target={name}): `{name}` is bound by an assignment, so it is a \
-             callable value whose failure the thread body would silently discard and whose \
-             name the thread would report wrongly; pass the function's own name \
-             (`target=<def name>`); rython refuses to silently drop a worker's exception"
-        ).into()),
-        _ => Ok(name.to_string()),
     }
 }
 
