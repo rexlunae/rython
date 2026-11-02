@@ -25,6 +25,63 @@ pub enum ThreadingType {
 }
 
 impl ThreadingType {
+    /// The imported constructor hidden by a compiler-renamed local. This
+    /// classifies a refusal, never a construction: Python calls the local
+    /// value, whereas a Rust module path could accidentally use the import.
+    pub(crate) fn shadowed_constructor(
+        func: &crate::ExprType,
+        symbols: &crate::SymbolTableScopes,
+    ) -> Option<Self> {
+        let mut original = func.clone();
+        let name = match &mut original {
+            crate::ExprType::Name(n) => n,
+            crate::ExprType::Attribute(a) => match a.value.as_mut() {
+                crate::ExprType::Name(n) => n,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let prefix = crate::ast::tree::rename::shadowing_local_ident("");
+        name.id = name.id.strip_prefix(&prefix)?.to_string();
+        Self::constructor(&original, symbols)
+    }
+
+    /// Resolve a constructor through its actual import binding, including
+    /// `import threading as th` and `from threading import Thread as Worker`.
+    /// Inference and lowering must agree on the same constructor.
+    pub(crate) fn constructor(
+        func: &crate::ExprType,
+        symbols: &crate::SymbolTableScopes,
+    ) -> Option<Self> {
+        use crate::{ExprType, StdModule, SymbolTableNode};
+        match func {
+            ExprType::Name(n) => match symbols.get(&n.id) {
+                Some(SymbolTableNode::ImportFrom(i))
+                    if i.level == 0
+                        && StdModule::from_name(&i.module) == Some(StdModule::Threading) =>
+                {
+                    Self::from_name(&i.defining_name(&n.id))
+                }
+                _ => None,
+            },
+            ExprType::Attribute(a) => {
+                let ExprType::Name(n) = a.value.as_ref() else { return None };
+                let module = match symbols.get(&n.id) {
+                    Some(SymbolTableNode::Import(i)) => i.names.iter().any(|alias| {
+                        alias.asname.as_deref().unwrap_or(&alias.name) == n.id
+                            && StdModule::from_name(&alias.name) == Some(StdModule::Threading)
+                    }),
+                    Some(SymbolTableNode::Alias(module)) => {
+                        StdModule::from_name(module) == Some(StdModule::Threading)
+                    }
+                    _ => false,
+                };
+                module.then(|| Self::from_name(&a.attr)).flatten()
+            }
+            _ => None,
+        }
+    }
+
     /// Parse a Python identifier (an attribute or imported name) at the
     /// AST boundary. The caller is responsible for having established that
     /// the name resolves against the `threading` module.
@@ -72,6 +129,41 @@ impl ThreadingType {
             ThreadingType::Event => quote!(threading::Event),
             ThreadingType::Semaphore => quote!(threading::Semaphore),
             ThreadingType::Local => quote!(threading::Local),
+        }
+    }
+}
+
+/// The supported lifecycle methods of a typed Thread handle. One boundary
+/// for method names, shared by result inference and call lowering.
+#[derive(Clone, Copy)]
+pub(crate) enum ThreadMethod {
+    Start,
+    Join,
+    IsAlive,
+}
+
+impl ThreadMethod {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "start" => Some(Self::Start),
+            "join" => Some(Self::Join),
+            "is_alive" => Some(Self::IsAlive),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn result_type(self) -> crate::TypeInfo {
+        match self {
+            Self::Start | Self::Join => crate::TypeInfo::Custom(quote!(())),
+            Self::IsAlive => crate::TypeInfo::Bool,
+        }
+    }
+
+    pub(crate) fn receiver_is_thread(ty: &crate::TypeInfo) -> bool {
+        match ty {
+            crate::TypeInfo::Threading(ThreadingType::Thread) => true,
+            crate::TypeInfo::Option(inner) => Self::receiver_is_thread(inner),
+            _ => false,
         }
     }
 }

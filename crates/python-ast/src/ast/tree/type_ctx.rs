@@ -1316,11 +1316,12 @@ fn infer_type_inner(
             {
                 crate::ast::tree::big_integer::IntegerBuiltin::from_name(&n.id).unwrap().result_type()
             }
-            // `threading.local()` (or an imported `local()`) constructs the
-            // per-thread attribute object (issue #356), whose attribute
-            // access lowers dynamically.
-            func if threading_local_ctor(func, symbols) => {
-                TypeInfo::Threading(crate::ThreadingType::Local)
+            // Runtime handles retain their type through locals and fields
+            // (issues #356 / #481), including aliased imports.
+            func if let Some(kind @ (crate::ThreadingType::Thread | crate::ThreadingType::Local)) =
+                crate::ThreadingType::constructor(func, symbols) =>
+            {
+                TypeInfo::Threading(kind)
             }
             // The builtin `open` in a text mode returns the text file.
             _ if is_text_open_call(call, symbols) => file_typeinfo(),
@@ -1418,6 +1419,13 @@ fn infer_type_inner(
                 },
             },
             ExprType::Attribute(attr) => {
+                if crate::ast::tree::threading_types::ThreadMethod::receiver_is_thread(
+                    &infer_type_inner(ctx, &attr.value, options, symbols),
+                ) && let Some(method) =
+                    crate::ast::tree::threading_types::ThreadMethod::from_name(&attr.attr)
+                {
+                    return method.result_type();
+                }
                 if let TypeInfo::Collection(crate::CollectionsType::Counter, args) =
                     infer_type_inner(ctx, &attr.value, options, symbols)
                     && crate::ast::tree::collections_types::CounterMethod::from_name(&attr.attr)
@@ -2431,26 +2439,7 @@ pub fn unify(a: TypeInfo, b: TypeInfo) -> TypeInfo {
 /// unshadowed module name, or a name `from threading import local [as x]`
 /// bound (issue #356).
 pub(crate) fn threading_local_ctor(func: &ExprType, symbols: &SymbolTableScopes) -> bool {
-    match func {
-        ExprType::Attribute(attr) => {
-            matches!(attr.value.as_ref(), ExprType::Name(m)
-                if crate::StdModule::from_name(&m.id) == Some(crate::StdModule::Threading)
-                    && !crate::module_name_shadowed(crate::StdModule::Threading.name(), symbols))
-                && crate::ThreadingType::from_name(&attr.attr) == Some(crate::ThreadingType::Local)
-        }
-        ExprType::Name(n) => match symbols.get(&n.id) {
-            Some(SymbolTableNode::ImportFrom(i)) => {
-                crate::StdModule::from_name(&i.module) == Some(crate::StdModule::Threading)
-                    && i.names.iter().any(|a| {
-                        a.asname.as_deref().unwrap_or(&a.name) == n.id
-                            && crate::ThreadingType::from_name(&a.name)
-                                == Some(crate::ThreadingType::Local)
-                    })
-            }
-            _ => false,
-        },
-        _ => false,
-    }
+    crate::ThreadingType::constructor(func, symbols) == Some(crate::ThreadingType::Local)
 }
 
 /// The join of a literal's KNOWN member types, folded in order: two
@@ -5340,6 +5329,11 @@ pub fn resolve_alias_typeinfo(
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<TypeInfo> {
+    // Runtime handle annotations follow the same imports as construction,
+    // before the external-module fallback can erase them into PyValue.
+    if let Some(kind) = crate::ThreadingType::constructor(ann, symbols) {
+        return Some(TypeInfo::Threading(kind));
+    }
     resolving(
         Resolving::Alias,
         ResolveKey::Node(ann as *const ExprType as usize),
@@ -6025,6 +6019,12 @@ pub fn call_return_typeinfo(
     symbols: Option<&SymbolTableScopes>,
     options: Option<&PythonOptions>,
 ) -> Option<TypeInfo> {
+    if let Some(symbols) = symbols
+        && let Some(kind @ (crate::ThreadingType::Thread | crate::ThreadingType::Local)) =
+            crate::ThreadingType::constructor(&call.func, symbols)
+    {
+        return Some(TypeInfo::Threading(kind));
+    }
     if let (Some(symbols), Some(options)) = (symbols, options)
         && crate::ast::tree::raise_stmt::constructs_exception(call, symbols, options)
     {

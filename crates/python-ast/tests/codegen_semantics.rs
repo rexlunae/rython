@@ -6253,6 +6253,91 @@ fn every_entry_point_allows_dead_code_for_the_lib_copy() {
 }
 
 #[test]
+fn unittest_method_fields_use_the_existing_layout_and_fresh_cases() {
+    let out = compile(include_str!("../../../eval/idioms/programs/testcase_method_fields.py"), "tc_fields.py");
+    assert!(out.contains("pub total : i64"), "{out}");
+    assert_eq!(out.matches("let mut __rython_tc = Totals :: new () ?").count(), 2, "{out}");
+
+    // A return/raise on a branch cannot make the subsequent read unbound.
+    let out = compile("import unittest\nclass T(unittest.TestCase):\n    total: int\n    def test_a(self, flag: bool = False):\n        if flag:\n            return\n        else:\n            self.total = 3\n        print(self.total)\n", "tc_flow.py");
+    assert!(out.contains("pub total : i64"), "{out}");
+}
+
+#[test]
+fn unittest_method_fields_refuse_unassigned_reads() {
+    for (methods, field, line) in [
+        ("    def test_a(self, flag: bool = False):\n        if flag:\n            self.total = 3\n        total = 99\n        print(self.total)\n", "total", 7),
+        ("    def test_a(self):\n        print(self.total)\n        self.total = 3\n", "total", 4),
+        ("    def test_a(self):\n        self.total = 3\n    def test_b(self):\n        print(self.total)\n", "total", 6),
+        ("    def test_a(self):\n        self.total = 3\n    def tearDown(self):\n        print(self.total)\n", "total", 6),
+        ("    def setUp(self, flag: bool = False):\n        if flag:\n            self.total = 3\n    def test_a(self):\n        print(self.total)\n", "total", 7),
+        ("    def setUp(self, flag: bool = False):\n        if flag:\n            return\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "total", 8),
+        ("    def test_a(self):\n        try:\n            raise ValueError()\n            self.total = 3\n        except ValueError:\n            print(self.total)\n", "total", 8),
+        ("    def test_a(self):\n        for total in range(0):\n            self.total = 3\n        print(self.total)\n", "total", 6),
+        ("    def test_a(self):\n        total = (total := 99)\n        print([total for total in range(1)])\n        print(self.total)\n        self.total = 3\n", "total", 6),
+        ("    def test_a(self):\n        self.helper()\n        self.total = 3\n    def helper(self):\n        print(self.total)\n", "total", 7),
+        ("    def test_a(self):\n        self.total += 1\n        self.total = 3\n", "total", 4),
+        ("    def test_a(self):\n        self.total[0] = 9\n        self.total = [3]\n", "total", 4),
+        ("    def test_a(self):\n        print([self.total for total in range(1)])\n        self.total = 3\n", "total", 4),
+        ("    def test_a(self, flag: bool = False):\n        try:\n            if flag:\n                return\n        finally:\n            print(self.total)\n        self.total = 3\n", "total", 8),
+        ("    def test_a(self):\n        with self.assertRaises(ValueError):\n            raise ValueError()\n            self.total = 3\n        print(self.total)\n", "total", 7),
+    ] {
+        let error = compile_err(&format!("import unittest\nclass T(unittest.TestCase):\n{methods}"), "tc_unbound.py");
+        assert!(error.contains(&format!("attribute `self.{field}` may be read before assignment")), "{error}");
+        assert!(error.contains(&format!("line {line}")) && error.contains("assign the attribute on every path")
+            && error.contains("refuses to silently"), "{error}");
+    }
+}
+
+#[test]
+fn unittest_method_fields_refuse_opaque_attribute_presence() {
+    for (members, construct) in [
+        ("    def test_a(self):\n        self.total = 3\n        del self.total\n        print(self.total)\n", "attribute deletion"),
+        ("    def test_a(self):\n        print(getattr(self, 'total', 99))\n        self.total = 3\n", "receiver escape"),
+        ("    def test_a(self):\n        read = lambda: self.total\n        print(read())\n        self.total = 3\n", "capture"),
+        ("    def test_a(self):\n        def read():\n            return self.total\n        print(read())\n        self.total = 3\n", "capture"),
+        ("    def setUp(self):\n        self.test_a()\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "lifecycle access"),
+        ("    def setUp(self):\n        super().setUp()\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "receiver escape"),
+        ("    total = 9\n    def test_a(self):\n        print(self.total)\n        self.total = 3\n", "class member `total`"),
+        ("    def __getattribute__(self, name: str):\n        return 9\n    def test_a(self):\n        self.total = 3\n        print(self.total)\n", "method `__getattribute__`"),
+        ("    def __init__(self):\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "method `__init__`"),
+    ] {
+        let error = compile_err(&format!("import unittest\nclass T(unittest.TestCase):\n{members}"), "tc_opaque.py");
+        assert!(error.contains(construct) && error.contains("line ")
+            && error.contains("not supported yet") && error.contains("refuses to silently"), "{error}");
+    }
+    for hook in ["__getattr__", "__setattr__", "__delattr__", "__new__"] {
+        let error = compile_err(&format!("import unittest\nclass T(unittest.TestCase):\n    def {hook}(self, name: str):\n        pass\n    def test_a(self):\n        self.total = 3\n        print(self.total)\n"), "tc_hook.py");
+        assert!(error.contains(&format!("method `{hook}`")) && error.contains("line 3")
+            && error.contains("use ordinary assignments"), "{error}");
+    }
+}
+
+#[test]
+fn unittest_manual_construction_cannot_bypass_field_initialization() {
+    for construction in ["T()", "Alias()"] {
+        let error = compile_err(&format!("import unittest\nclass T(unittest.TestCase):\n    def setUp(self):\n        self.total = 3\n    def test_a(self):\n        print(self.total)\nAlias = T\nvalue = {construction}\nvalue.test_a()\n"), "tc_manual.py");
+        assert!(error.contains("manual construction of TestCase `T`")
+            && error.contains("tc_manual.py:8") && error.contains("use unittest.main()")
+            && error.contains("refuses to silently"), "{error}");
+    }
+}
+
+#[test]
+fn unittest_inherited_fields_cannot_assume_an_overridden_setup_ran() {
+    let error = compile_err("import unittest\nclass Base(unittest.TestCase):\n    def setUp(self):\n        self.total = 3\n    def test_a(self):\n        print(self.total)\nclass Child(Base):\n    def setUp(self):\n        pass\nif __name__ == '__main__':\n    unittest.main()\n", "tc_inherited.py");
+    assert!(error.contains("TestCase `Child`") && error.contains("self.total")
+        && error.contains("line 6") && error.contains("before assignment"), "{error}");
+}
+
+#[test]
+fn unittest_inherited_methods_cannot_be_silently_unshadowed() {
+    let error = compile_err("import unittest\nclass Base(unittest.TestCase):\n    def test_a(self):\n        print('base')\nclass Child(Base):\n    test_a = 7\nif __name__ == '__main__':\n    unittest.main()\n", "tc_shadowed.py");
+    assert!(error.contains("TestCase `Child`") && error.contains("class member `test_a`")
+        && error.contains("line 6") && error.contains("use distinct"), "{error}");
+}
+
+#[test]
 fn unittest_main_emits_a_test_runner() {
     // issue #334: `unittest.main()` in a `__main__` block lowers to an
     // emitted runner that constructs each *TestCase subclass and calls its
@@ -13586,7 +13671,7 @@ fn threading_thread_lowers_target_and_args_statically() {
         out
     );
     assert!(
-        out.contains("let label = (label) . clone ()"),
+        out.contains("let __rython_thread_arg_0 = (label) . clone ()"),
         "args must be cloned into the closure: {}",
         out
     );
@@ -13595,6 +13680,142 @@ fn threading_thread_lowers_target_and_args_statically() {
         "thread bodies report unhandled exceptions: {}",
         out
     );
+}
+
+#[test]
+fn thread_instance_fields_keep_typed_storage_and_lifecycle_calls() {
+    for (import, constructor) in [
+        ("import threading", "threading.Thread"),
+        ("import threading as th", "th.Thread"),
+        ("from threading import Thread", "Thread"),
+        ("from threading import Thread as Worker", "Worker"),
+    ] {
+        let source = format!(
+            "{import}\ndef work() -> None:\n    print('worked')\nclass Runner:\n    def __init__(self) -> None:\n        self.worker = {constructor}(target=work)\n    def go(self) -> None:\n        self.worker.start()\n        self.worker.join()\n        print(self.worker.is_alive())\n"
+        );
+        let (out, warnings) = compile_with_warnings(&source, "thread_field.py");
+        assert!(out.contains("pub worker : Option < threading :: Thread >"), "{out}");
+        assert!(out.contains("self . worker = Some ("), "{out}");
+        assert!(out.contains(". start ()") && out.contains(". join ()") && out.contains(". is_alive ()"), "{out}");
+        assert_eq!(out.matches(":: new (\"work\"").count(), 1, "{out}");
+        assert!(!warnings.iter().any(|w| w.contains("dropped")), "{warnings:?}");
+        let error = compile_nostd(&source, "thread_field.py").expect_err("Thread needs std");
+        assert!(error.contains("std tier"), "{error}");
+    }
+}
+
+#[test]
+fn thread_instance_fields_refuse_uninitialized_or_deleted_storage() {
+    for body in [
+        "    def __init__(self, flag: bool) -> None:\n        if flag:\n            self.worker = threading.Thread(target=work)\n",
+        "    def __init__(self) -> None:\n        print(self.worker)\n        self.worker = threading.Thread(target=work)\n",
+        "    def __init__(self) -> None:\n        self.worker.extra = 1\n        self.worker = threading.Thread(target=work)\n",
+        "    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work, args=(self.label,))\n        self.label = 'late'\n",
+        "    def __init__(self, flag: bool) -> None:\n        if flag:\n            self.label = 'conditional'\n        self.worker = threading.Thread(target=work, args=(self.label,))\n",
+        "    def __init__(self) -> None:\n        self.go()\n        self.worker = threading.Thread(target=work)\n    def go(self) -> None:\n        self.worker.start()\n",
+        "    def __init__(self, flag: bool) -> None:\n        if flag:\n            return\n        self.worker = threading.Thread(target=work)\n",
+        "    def configure(self) -> None:\n        self.worker = threading.Thread(target=work)\n",
+        "    def __init__(self) -> None:\n        pass\n    def configure(self) -> None:\n        worker = threading.Thread(target=work)\n        self.worker = worker\n",
+        "    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work)\n    def clear(self) -> None:\n        del self.worker\n",
+    ] {
+        let source = format!("import threading\ndef work() -> None:\n    pass\nclass Runner:\n{body}");
+        let error = compile_err(&source, "thread_uninitialized.py");
+        assert!(error.contains("thread field") && error.contains("line") && error.contains("initialize"), "{error}");
+        assert!(error.contains("refuses"), "{error}");
+    }
+}
+
+#[test]
+fn thread_instance_fields_refuse_inherited_storage() {
+    for body in [
+        "        pass\n",
+        "        if flag:\n            super().__init__()\n",
+        "        super().__init__()\n",
+    ] {
+        let source = format!("import threading\ndef work() -> None:\n    pass\nclass Runner:\n    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work)\nclass Child(Runner):\n    def __init__(self, flag: bool) -> None:\n{body}");
+        let error = compile_err(&source, "thread_inheritance.py");
+        assert!(error.contains("inherited thread fields") && error.contains("composition") && error.contains("refuses"), "{error}");
+    }
+    let error = compile_err(
+        "import threading\ndef work() -> None:\n    pass\nclass Runner:\n    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work)\nclass Child(Runner):\n    def clear(self) -> None:\n        del self.worker\n",
+        "thread_inherited_delete.py",
+    );
+    assert!(error.contains("inherited thread fields") && error.contains("refuses"), "{error}");
+    let error = compile_err(
+        "import threading\ndef work() -> None:\n    pass\nclass Base:\n    def __init__(self) -> None:\n        pass\nclass Child(Base):\n    def __init__(self) -> None:\n        super().__init__()\n        self.worker = threading.Thread(target=work)\n",
+        "thread_super_early.py",
+    );
+    assert!(error.contains("thread field") && error.contains("uninitialized"), "{error}");
+}
+
+#[test]
+fn thread_targets_and_constructor_arguments_refuse_silent_defaults() {
+    // Issue #515: a target bound by an assignment is a callable VALUE; its
+    // call in the synthesized body has no `?`, so a failing worker would be
+    // reported as successful.
+    let error = compile_err(
+        "import threading\ndef fail() -> None:\n    raise ValueError('x')\nclass Runner:\n    def __init__(self) -> None:\n        target = fail\n        self.worker = threading.Thread(target=target)\n",
+        "thread_local_alias.py",
+    );
+    assert!(error.contains("bound by an assignment") && error.contains("refuses"), "{error}");
+    // Issue #516: an argument read before the attribute's first assignment
+    // would capture the struct default where CPython raises AttributeError:
+    // in __init__ after the thread slot is filled, in a later method, and
+    // after a conditional store.
+    for (shape, source) in [
+        ("init", "        self.worker = threading.Thread(target=work, args=('u',))\n        self.worker = threading.Thread(target=work, args=(self.label,))\n        self.label = 'late'\n"),
+        ("conditional", "        self.worker = threading.Thread(target=work, args=('u',))\n        if flag:\n            self.label = 'set'\n        self.worker = threading.Thread(target=work, args=(self.label,))\n"),
+    ] {
+        let error = compile_err(
+            &format!("import threading\ndef work(label: str) -> None:\n    pass\nclass Runner:\n    def __init__(self, flag: bool) -> None:\n{source}"),
+            "thread_absent_argument.py",
+        );
+        assert!(error.contains("reads `self.label` before it is definitely assigned") && error.contains("refuses"), "{shape}: {error}");
+    }
+    let error = compile_err(
+        "import threading\ndef work(label: str) -> None:\n    pass\nclass Runner:\n    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work, args=('u',))\n    def configure(self) -> None:\n        self.worker = threading.Thread(target=work, args=(self.label,))\n        self.label = 'late'\n",
+        "thread_absent_argument_method.py",
+    );
+    assert!(error.contains("reads `self.label` before it is definitely assigned"), "{error}");
+    // The accepted shape: arguments stored earlier in __init__, and a field
+    // that __init__ assigns (later) read from another method.
+    let (out, _warnings) = compile_with_warnings(
+        "import threading\ndef work(label: str, n: int) -> None:\n    print(label, n)\nclass Runner:\n    def __init__(self) -> None:\n        self.label = 'x'\n        self.worker = threading.Thread(target=work, args=(self.label, 2))\n        self.later = 'y'\n    def rebuild(self) -> None:\n        self.worker = threading.Thread(target=work, args=(self.later, 7))\n",
+        "thread_defined_arguments.py",
+    );
+    assert!(out.contains("Thread :: new"), "{out}");
+}
+
+#[test]
+fn thread_instance_fields_refuse_unsupported_methods_and_targets() {
+    for method in ["join(0.1)", "join(timeout=0.1)", "run()", "start(1)"] {
+        let source = format!("import threading\ndef work() -> None:\n    pass\nclass Runner:\n    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work)\n    def go(self) -> None:\n        self.worker.{method}\n");
+        let error = compile_err(&source, "thread_operation.py");
+        assert!(error.contains("threading.Thread") && error.contains("not supported yet") && error.contains("refuses"), "{error}");
+    }
+    for (import, parameter, constructor) in [
+        ("import threading as th", "th", "th.Thread"),
+        ("from threading import Thread as Worker", "Worker", "Worker"),
+    ] {
+        let source = format!("{import}\ndef work() -> None:\n    pass\nclass Runner:\n    def __init__(self, {parameter}: str) -> None:\n        self.worker = {constructor}(target=work)\n");
+        let error = compile_err(&source, "thread_shadowed.py");
+        assert!(error.contains("shadowed") || error.contains("cannot infer a type for attribute `self.worker`"), "{error}");
+    }
+    let error = compile_err(
+        "import threading\nfrom typing import Callable\nclass Runner:\n    def __init__(self, work: Callable[[], None]) -> None:\n        self.worker = threading.Thread(target=work)\n",
+        "thread_callable.py",
+    );
+    assert!(error.contains("callable VALUE") && error.contains("thread boundary"), "{error}");
+    let error = compile_err(
+        "import threading\nclass Runner:\n    def __init__(self, work: str) -> None:\n        self.worker = threading.Thread(target=work)\n",
+        "thread_target_value.py",
+    );
+    assert!(error.contains("callable VALUE") && error.contains("thread boundary"), "{error}");
+    let error = compile_err(
+        "import threading\ndef work(n: int) -> None:\n    pass\nclass Runner:\n    def __init__(self) -> None:\n        self.worker = threading.Thread(target=work, args=(*[1],))\n",
+        "thread_starred.py",
+    );
+    assert!(error.contains("starred arguments") && error.contains("refuses"), "{error}");
 }
 
 #[test]
@@ -30427,4 +30648,123 @@ fn a_shadowed_definition_under_module_control_flow_is_not_deduped() {
         out.contains("v1"),
         "the unconditional definition stays: {out}"
     );
+}
+
+#[test]
+fn pytest_runner_execution_and_values_are_loud_conversion_errors() {
+    // Issue #482: an import is not a test request, but pytest.main is.
+    // Match the imported object, including aliases; never test_* spelling.
+    for source in [
+        "import pytest\npytest.main()\n",
+        "import pytest as pt\npt.main(['-q'])\n",
+        "import math, pytest as pt\npt.main()\n",
+        "from pytest import main\nmain()\n",
+        "from pytest import main as run_tests\nrun_tests()\n",
+        "import pytest\ndef run() -> None:\n    pytest.main()\n",
+        "def run() -> None:\n    import pytest as pt\n    pt.main()\n",
+        "def run() -> None:\n    from pytest import main as run_tests\n    run_tests()\n",
+        "import pytest\nif __name__ == '__main__':\n    pytest.main()\n",
+        "from pytest import main\nif __name__ == '__main__':\n    main()\n",
+        "from pytest import *\nif __name__ == '__main__':\n    main()\n",
+        "import pytest\nraise SystemExit(pytest.main())\n",
+        "import pytest\nrunner = pytest.main\nrunner()\n",
+        "from pytest import main as run_tests\nrunner = run_tests\nrunner()\n",
+        "import pytest\nprint(pytest.main)\n",
+        "import pytest\ntry:\n    pass\nfinally:\n    pytest.main()\n",
+        "import pytest\npytest.cmdline.main()\n",
+        "from pytest import cmdline as cli\ncli.main()\n",
+        "import logging, pytest\nlogging.info(pytest.main())\n",
+        "from _pytest.config import main as run_tests\ndef main() -> None:\n    run_tests(['-q'])\nif __name__ == '__main__':\n    main()\n",
+        "import _pytest.config as config\nconfig.main()\n",
+        "import _pytest.config\n_pytest.config.main()\n",
+        "import logging, pytest\nlogging.info((lambda: pytest.main())())\n",
+    ] {
+        let error = compile_err(source, "pytest_runner.py");
+        assert!(error.contains("pytest.main() test execution is not supported yet"), "{source}: {error}");
+        assert!(error.contains("pytest_runner.py:"), "{source}: {error}");
+        assert!(error.contains("python -m pytest") && error.contains("unittest.main()"), "{source}: {error}");
+        assert!(error.contains("refuses to silently ignore requested test execution"), "{source}: {error}");
+    }
+}
+
+#[test]
+fn pytest_test_function_names_and_shadowed_runner_names_remain_ordinary_code() {
+    let out = compile(
+        "def test_add() -> None:\n    assert 1 + 1 == 2\ndef test_sub() -> None:\n    assert 2 - 1 == 0\n",
+        "pytest_library.py",
+    );
+    assert!(out.contains("fn test_add") && out.contains("fn test_sub"), "{out}");
+    assert!(!out.contains("fn main"), "a library must not acquire a test runner: {out}");
+    for source in [
+        "def main() -> None:\n    pass\nmain()\n",
+        "class Runner:\n    def main(self) -> None:\n        pass\ndef run(pytest: Runner) -> None:\n    pytest.main()\n",
+        "import pytest as pt\nclass Runner:\n    def main(self) -> None:\n        pass\ndef run(pt: Runner) -> None:\n    pt.main()\n",
+        "from pytest import main as run_tests\ndef run(run_tests: int) -> int:\n    return run_tests\n",
+        "import pytest\nif False:\n    pytest.main()\n",
+        "import pytest as pt\ndef main() -> None:\n    print(list(map(lambda pt: pt, [1, 2])))\n",
+        "from pytest import main as run_tests\ndef main() -> None:\n    print(list(map(lambda run_tests: run_tests, [1, 2])))\n",
+    ] {
+        compile_as_entry(source, "ordinary_runner.py");
+    }
+}
+
+#[test]
+fn pytest_console_entry_is_the_same_unsupported_runner_boundary() {
+    for source in [
+        "import pytest\npytest.console_main()\n",
+        "from pytest import console_main as run_tests\nrun_tests()\n",
+        "import pytest\nraise SystemExit(pytest.console_main())\n",
+        "from _pytest.config import console_main as run_tests\nrun_tests()\n",
+        "import _pytest.config as config\nconfig.console_main()\n",
+    ] {
+        let error = compile_err(source, "pytest_console.py");
+        assert!(error.contains("pytest.console_main() test execution is not supported yet"), "{source}: {error}");
+        assert!(error.contains("pytest_console.py:") && error.contains("python -m pytest"), "{error}");
+    }
+}
+
+#[test]
+fn pytest_module_values_cannot_hide_the_requested_runner() {
+    for source in [
+        "import pytest\npt = pytest\npt.main()\n",
+        "import pytest\ngetattr(pytest, 'main')()\n",
+        "from pytest import cmdline\ncli = cmdline\ncli.main()\n",
+        "import logging, pytest\nlogging.info(getattr([pytest][0], 'main')())\n",
+        "import logging, pytest\nlogging.info(getattr({'p': pytest}['p'], 'main')())\n",
+        "import logging, pytest\nlogging.info(getattr(pytest if True else None, 'main')())\n",
+        "import logging, pytest\nlogging.info([pytest][0].main())\n",
+    ] {
+        let error = compile_err(source, "pytest_module_value.py");
+        assert!(error.contains("pytest module/cmdline values are not supported yet")
+            || error.contains("pytest.main() test execution is not supported yet"), "{source}: {error}");
+        assert!(error.contains("pytest_module_value.py:") && error.contains("python -m pytest"), "{error}");
+    }
+}
+
+#[test]
+fn pytest_operand_preflight_respects_the_stack_budget() {
+    // The preflight must fail before a deep expression reaches ordinary
+    // lowering, even when the source has no pytest imports (#482 review).
+    let run = |terms| {
+        std::thread::Builder::new().stack_size(2 * 1024 * 1024).spawn(move || {
+            let mut statement = parse("1\n", "deep_operand.py").unwrap().raw.body.remove(0);
+            let python_ast::StatementType::Expr(expr) = &mut statement.statement else { unreachable!() };
+            let leaf = expr.value.clone();
+            for _ in 1..terms {
+                let left = std::mem::replace(&mut expr.value, leaf.clone());
+                expr.value = python_ast::ExprType::BinOp(python_ast::BinOp {
+                    left: Box::new(left),
+                    op: python_ast::BinOps::Add,
+                    right: Box::new(leaf.clone()),
+                });
+            }
+            python_ast::with_stack_budget(256 * 1024, || {
+                statement.to_rust(CodeGenContext::Module("deep_operand".into()),
+                    PythonOptions::default(), SymbolTableScopes::new())
+                    .map(|_| ()).map_err(|error| error.to_string())
+            })
+        }).unwrap().join().unwrap()
+    };
+    assert!(run(2000).unwrap_err().contains("nests too deeply"));
+    assert_eq!(run(3), Ok(()));
 }

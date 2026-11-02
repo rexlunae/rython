@@ -2529,6 +2529,14 @@ impl<'a> CodeGen for Call {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        crate::ast::tree::pytest::reject_in_expr(&self.func, &options, &symbols)?;
+        // Some call lowerings reject types or drop external calls before
+        // rendering arguments. An explicit runner nested there still
+        // needs the pytest diagnostic, including SystemExit(pytest.main()).
+        for value in self.args.iter().chain(self.keywords.iter().map(|keyword| &keyword.value)) {
+            crate::ast::tree::pytest::reject_in_expr(value, &options, &symbols)?;
+            crate::ast::tree::pytest::reject_module_value(value, &options, &symbols)?;
+        }
         use crate::ast::tree::interpreter_state::InterpreterNamespace;
         if let Some(namespace) = InterpreterNamespace::from_call(&self, &options, &symbols) {
             return Err(namespace.refusal().into());
@@ -2860,6 +2868,33 @@ impl<'a> CodeGen for Call {
         // time (the functools.partial model).
         if let Some(tokens) = lower_threading_thread(&self, &ctx, &options, &symbols)? {
             return Ok(tokens);
+        }
+        // A Thread stored in an instance field is a runtime handle, never
+        // an unmodeled callable member of the enclosing class (#481).
+        if let ExprType::Attribute(attr) = self.func.as_ref() {
+            use crate::ast::tree::threading_types::ThreadMethod;
+            let ty = crate::infer_type(Some(&ctx), &attr.value, &options, &symbols);
+            if ThreadMethod::receiver_is_thread(&ty) {
+                if ThreadMethod::from_name(&attr.attr).is_none()
+                    || !self.args.is_empty() || !self.keywords.is_empty()
+                {
+                    return Err(format!(
+                        "threading.Thread.{} with these arguments is not supported yet; \
+                         use start(), join() or is_alive() without arguments; \
+                         rython refuses to silently drop a thread operation",
+                        attr.attr,
+                    ).into());
+                }
+                let receiver = attr.value.clone().to_rust(ctx, options, symbols)?;
+                let receiver = if matches!(ty, crate::TypeInfo::Option(_)) {
+                    let message = format!("AttributeError: 'NoneType' object has no attribute '{}'", attr.attr);
+                    quote!((#receiver).as_ref().unwrap_or_else(|| panic!(#message)))
+                } else {
+                    receiver
+                };
+                let method = crate::safe_ident(&attr.attr);
+                return Ok(quote!((#receiver).#method()));
+            }
         }
         // `threading.Semaphore()` — CPython's default initial value is 1;
         // the runtime constructor takes the value explicitly.
@@ -7676,6 +7711,7 @@ impl<'a> CodeGen for Call {
             if n.id == "RLResolver" {
             }
             if let Some((class, class_symbols)) = resolved {
+                class.refuse_manual_testcase_construction(&class_symbols, &options)?;
                 // The CONSTRUCTED type's Rust name: for a @classmethod's
                 // `cls(...)` the receiver identifier `cls` is not a Rust
                 // type in scope — the class's OWN name is (urllib3's
@@ -7958,9 +7994,10 @@ impl<'a> CodeGen for Call {
             // binds `s` to `sessions`).
             mod_path.push(ifm.defining_name(&receiver.id));
             if options.module_defs.contains_key(&mod_path)
-                && let Some((_class, _cs)) =
+                && let Some((class, class_symbols)) =
                     crate::module_class_def(&options, &mod_path, &attr.attr)
             {
+                class.refuse_manual_testcase_construction(&class_symbols, &options)?;
                 // The FULL crate path: `sessions.Session()` renders as
                 // `crate::requests::sessions::Session::new()` — a bare
                 // `Session` is only in scope if the module imports the
@@ -13263,35 +13300,56 @@ pub(crate) fn module_name_shadowed(name: &str, symbols: &SymbolTableScopes) -> b
 /// copy (rython's value-semantics ledger divergence, exactly as ordinary
 /// call arguments behave). Returns Ok(None) when the call is not a
 /// threading.Thread construction.
+/// The `__name__` a `threading.Thread(target=<name>)` thread is named after,
+/// resolved from how `name` is bound; a binding that is not a plain function
+/// is refused (see the call site).
+fn resolve_thread_target_name(
+    name: &str,
+    symbols: &SymbolTableScopes,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match symbols.get(name) {
+        Some(SymbolTableNode::FunctionDef(f)) => Ok(f.name.clone()),
+        Some(SymbolTableNode::ImportFrom(ifm)) => Ok(ifm.defining_name(name)),
+        Some(SymbolTableNode::Alias(canonical)) => Ok(canonical.clone()),
+        Some(SymbolTableNode::Assign { .. }) => Err(format!(
+            "threading.Thread(target={name}): `{name}` is bound by an assignment, so it is a \
+             callable value whose failure the thread body would silently discard and whose \
+             name the thread would report wrongly; pass the function's own name \
+             (`target=<def name>`); rython refuses to silently drop a worker's exception"
+        ).into()),
+        _ => Ok(name.to_string()),
+    }
+}
+
 fn lower_threading_thread(
     call: &Call,
     ctx: &CodeGenContext,
     options: &PythonOptions,
     symbols: &SymbolTableScopes,
 ) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
-    let is_thread_name =
-        |name: &str| crate::ThreadingType::from_name(name) == Some(crate::ThreadingType::Thread);
-    let is_thread = match call.func.as_ref() {
-        ExprType::Attribute(attr) => {
-            is_thread_name(&attr.attr)
-                && matches!(attr.value.as_ref(), ExprType::Name(n)
-                    if crate::StdModule::from_name(&n.id)
-                        == Some(crate::StdModule::Threading))
-                && !module_name_shadowed(crate::StdModule::Threading.name(), symbols)
-        }
-        ExprType::Name(n) => {
-            is_thread_name(&n.id)
-                && matches!(
-                    symbols.get("Thread"),
-                    Some(SymbolTableNode::ImportFrom(i))
-                        if crate::StdModule::from_name(&i.module)
-                            == Some(crate::StdModule::Threading)
-                )
-        }
-        _ => false,
-    };
-    if !is_thread {
+    if crate::ThreadingType::shadowed_constructor(&call.func, symbols) == Some(crate::ThreadingType::Thread) {
+        return Err("threading.Thread constructor import is shadowed by a local value; rename the parameter/local or use an unshadowed import; rython refuses to silently drop the constructor or call the wrong binding".into());
+    }
+    if crate::ThreadingType::constructor(&call.func, symbols) != Some(crate::ThreadingType::Thread) {
         return Ok(None);
+    }
+    // Parameters are recorded in the scope's type maps rather than as
+    // symbol-table assignments. Rust module paths would ignore a same-named
+    // value binding, while Python looks up that value first.
+    let imported_name = match call.func.as_ref() {
+        ExprType::Name(n) => &n.id,
+        ExprType::Attribute(a) => match a.value.as_ref() {
+            ExprType::Name(n) => &n.id,
+            _ => unreachable!("classified Thread constructor"),
+        },
+        _ => unreachable!("classified Thread constructor"),
+    };
+    if options.name_types.contains_key(imported_name) || options.local_types.contains_key(imported_name) {
+        return Err(format!(
+            "threading.Thread constructor import `{imported_name}` is shadowed by a local value; \
+             rename the parameter/local or use an unshadowed import; \
+             rython refuses to silently construct a Thread through the wrong binding",
+        ).into());
     }
     if !call.args.is_empty() {
         return Err(
@@ -13371,31 +13429,66 @@ fn lower_threading_thread(
                 .into(),
         );
     };
-    // The synthesized body call lowers through the normal machinery, so
-    // argument marshalling and exception propagation match a direct call.
+    let target_expr = ExprType::Name(crate::ast::tree::name::Name { id: target.clone() });
+    // The thread's default name is `Thread-N (<target.__name__>)`, the
+    // DEFINING function's name, not the spelling used here (`from .job
+    // import work as do_work` names the thread `work`). A name bound by an
+    // assignment (`t = fail`) is a callable VALUE: its call has no `?` in
+    // the synthesized body, so a failing worker would be reported as
+    // successful. Both are decided from the symbol table, not the spelling.
+    let target_name = resolve_thread_target_name(&target, symbols)?;
+    if callee_value_signature(&target_expr, ctx, options, symbols).is_some()
+        || options.name_types.contains_key(&target)
+        || options.local_types.contains_key(&target)
+    {
+        return Err("threading.Thread(target=...): a callable VALUE cannot cross a thread boundary; use a module-level function name; rython refuses to silently drop the target".into());
+    }
+    // Bind every argument at the Python constructor point, not when start()
+    // eventually runs the closure. This also keeps a `self.field` argument
+    // from capturing a borrowed self in the spawned 'static closure.
+    let mut clones = Vec::new();
+    let mut bound_args = Vec::new();
+    let mut body_options = options.clone();
+    let mut name_types = options.name_types.as_ref().clone();
+    for (i, arg) in thread_args.iter().enumerate() {
+        if matches!(arg, ExprType::Starred(_)) {
+            return Err("threading.Thread(args=...): starred arguments are not supported yet; pass a tuple/list of explicit arguments; rython refuses to misbind thread arguments".into());
+        }
+        let name = format!("__rython_thread_arg_{i}");
+        let ident = crate::safe_ident(&name);
+        let value = crate::render_typed_reused(
+            arg, ctx.clone(), options.clone(), symbols.clone(), None,
+        )?;
+        clones.push(quote!(let #ident = #value;));
+        name_types.insert(name.clone(), crate::infer_type(Some(ctx), arg, options, symbols));
+        bound_args.push(ExprType::Name(crate::ast::tree::name::Name { id: name }));
+    }
+    body_options.name_types = std::rc::Rc::new(name_types);
+    // The synthesized body call uses ordinary argument marshalling and
+    // exception propagation, exactly like a direct call of the target.
     let inner = Call {
-        func: Box::new(ExprType::Name(crate::ast::tree::name::Name {
-            id: target.clone(),
-        })),
-        args: thread_args.clone(),
+        func: Box::new(target_expr),
+        args: bound_args,
         keywords: Vec::new(),
     };
-    let body = inner.to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-    // Clone captured names OUTSIDE the move closure, so the caller's
-    // bindings stay usable after start().
-    let mut clones = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for arg in &thread_args {
-        if let ExprType::Name(n) = arg {
-            if !matches!(n.id.as_str(), "True" | "False" | "None") && seen.insert(n.id.clone()) {
-                let ident = crate::safe_ident(&n.id);
-                clones.push(quote!(let #ident = (#ident).clone();));
-            }
+    let body = inner.to_rust(ctx.clone(), body_options, symbols.clone())?;
+    let target_name = target_name.as_str();
+    // Keep the imported spelling in use (Worker::new / th::Thread::new)
+    // rather than leaving a now-unused alias in the generated module.
+    let thread_class = match call.func.as_ref() {
+        ExprType::Name(n) => {
+            let class = crate::safe_ident(&n.id);
+            quote!(#class)
         }
-    }
-    let target_name = target.as_str();
+        ExprType::Attribute(a) => {
+            let module = a.value.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())?;
+            let class = crate::safe_ident(&a.attr);
+            quote!(#module::#class)
+        }
+        _ => unreachable!("classified Thread constructor"),
+    };
     Ok(Some(quote! {
-        threading::Thread::new(#target_name, #daemon, {
+        #thread_class::new(#target_name, #daemon, {
             #(#clones)*
             move || {
                 let __rython_thread_body = || -> Result<(), PyException> {

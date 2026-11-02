@@ -73,9 +73,9 @@ and [`rypip install`](examples/05-rypip-install) turning a
 - [The frontier](docs/frontier.md) — the measured rustc-error frontier on
   the pinned package corpus, the boxed-`PyValue` boundary that dominates
   it, and the candidate designs (issue #335)
-- [Testing under rython](docs/testing-under-rython.md) — what works today
-  for running a Python library's test suite, the exact code sites, and a
-  phased plan toward pytest/unittest (issue #334)
+- [Testing under rython](docs/testing-under-rython.md) — bounded unittest
+  support, the explicit pytest runner boundary, and ways to test a
+  converted library (#334, #482)
 - [The JIT](docs/jit.md) — the design for on-demand compilation: convert,
   build with `rustc`, cache, load in-process (issue #166)
 - [Evaluating a JIT](docs/jit-eval.md) — the earlier evaluation, superseded
@@ -156,12 +156,22 @@ lookup, normalize),
 `collections` (partial — issue #427; `deque`, `defaultdict`, `OrderedDict`
 and `Counter` construct, `ChainMap`/`namedtuple` do not), `pathlib`, `glob`,
 `subprocess`, `tempfile`,
-`threading` (Thread with static targets, Lock/RLock/Event/Semaphore
+`threading` (Thread with static targets, including initialized instance fields
+and aliased imports; Lock/RLock/Event/Semaphore
 with a real `with lock:` acquire/release lowering, `local()` as a
 per-thread bag of run-time attributes), `socket` (TCP/UDP
 over std::net with the CPython OSError hierarchy), `urllib.request`
 (`urlopen` for http/https, behind stdpython's opt-in `http-ureq`
 feature that `rypip` enables automatically), and more.
+
+`unittest.TestCase` fields may first be assigned in a test method, without
+`__init__` or `setUp`. The runner creates a fresh instance per test and
+discovers inherited tests and fixtures. Reads must follow an assignment on
+every path, or an unconditional `setUp` initialization; uncertain attribute
+presence, receiver escapes, and field reads relying on another test or an
+opaque helper are conversion errors. Manual construction of cases with
+fields is refused; use `unittest.main()` to preserve fixture order
+(issues #480, #511).
 
 Comprehension outputs that borrow existing mutable containers by name,
 attribute, or index are refused when value copies would lose sharing.
@@ -189,6 +199,12 @@ errors; see [the exception specification](docs/spec.md#8-exceptions).
 
 Known gaps:
 
+- **pytest**: no automatic collection or native runner. Function-only
+  test modules remain libraries; external `import pytest` warns, and
+  `pytest.main`, `console_main`, and `cmdline.main` calls or runner values
+  (including imported aliases) are conversion errors. Copying pytest
+  module objects into value slots is also refused. Run pytest under
+  CPython or port to the supported unittest subset with an explicit entry.
 - **Numbers**: ordinary integers use `i64`. Oversized scalar literals
   automatically use `PyInteger`, backed by `num-bigint`; their `+`, `-`,
   `*`, `//` and `%` arithmetic grows without overflow. This first slice

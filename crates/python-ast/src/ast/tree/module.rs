@@ -1589,6 +1589,13 @@ impl CodeGen for Module {
                         && options.numpy_backend.is_none();
                     
                     if is_simple_main_call {
+                        // An imported pytest.main is a runner request too.
+                        // This promotion bypasses normal statement lowering,
+                        // so check it before consuming the call (#482).
+                        for statement in &if_stmt.body {
+                            crate::ast::tree::pytest::reject_in_statement(statement, &options, &symbols)
+                                .map_err(|error| wrap_module_error(&module_filename, error))?;
+                        }
                         // For simple main() calls, we'll use the user's main function directly
                         // Set a flag to indicate we should not rename the main function
                         has_main_code = true;
@@ -7530,18 +7537,20 @@ fn unittest_main_exits(call: &crate::Call) -> Result<bool, String> {
     Ok(exits)
 }
 
-/// The `test_*` method names directly defined on a class, in the sorted
-/// order CPython's TestLoader runs them.
-fn test_method_names(class_def: &crate::ClassDef) -> Vec<String> {
+/// The test methods visible on the MRO, in TestLoader's sorted order.
+fn test_method_names(
+    class_def: &crate::ClassDef,
+    symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for s in &class_def.body {
-        match &s.statement {
-            crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f) => {
-                if f.name.starts_with("test") && !out.contains(&f.name) {
-                    out.push(format!("{}", f.name));
-                }
+    for class in class_def.base_chain_with_options(symbols, options) {
+        for method in class.methods() {
+            if super::testcase::Member::from_name(&method.name) == super::testcase::Member::Test
+                && !out.contains(&method.name)
+            {
+                out.push(method.name.clone());
             }
-            _ => {}
         }
     }
     out.sort();
@@ -7600,7 +7609,7 @@ fn emit_test_runner(
     // with three_way_cmp) — not definition order.
     let mut test_classes: Vec<&crate::ClassDef> = classes
         .iter()
-        .filter(|c| c.bases.iter().any(is_testcase_base))
+        .filter(|c| c.is_testcase(&symbols, &options))
         .collect();
     test_classes.sort_by(|a, b| a.name.cmp(&b.name));
     if test_classes.is_empty() {
@@ -7612,17 +7621,17 @@ fn emit_test_runner(
         // `setUp`/`tearDown` are per-test fixtures (CPython runs setUp before
         // and tearDown after every test method); an exception in either is
         // reported against the test, as `TestCase.run` reports it.
-        let setup = if class_defines_method(c, "setUp") {
+        let setup = if c.method_on_mro_with_options("setUp", &symbols, &options).is_some() {
             quote!(|__rython_tc: &mut #cname| __rython_tc.setUp().map(|_| ()))
         } else {
             quote!(|_: &mut #cname| Ok(()))
         };
-        let teardown = if class_defines_method(c, "tearDown") {
+        let teardown = if c.method_on_mro_with_options("tearDown", &symbols, &options).is_some() {
             quote!(|__rython_tc: &mut #cname| __rython_tc.tearDown().map(|_| ()))
         } else {
             quote!(|_: &mut #cname| Ok(()))
         };
-        for m in test_method_names(c) {
+        for m in test_method_names(c, &symbols, &options) {
             let mident = quote::format_ident!("{}", m);
             // A test method with DEFAULTED parameters (`def test_encode(self,
             // encode=None, skip_bytes=False)` — idna's tests, issue #334):
@@ -7630,15 +7639,7 @@ fn emit_test_runner(
             // rendered against the parameter's slot (an unannotated one is
             // the boxed value). A parameter without a default is CPython's
             // TypeError at the call — left to rustc's arity error, loudly.
-            let test_def = c.body.iter().find_map(|s| match &s.statement {
-                crate::StatementType::FunctionDef(f)
-                | crate::StatementType::AsyncFunctionDef(f)
-                    if f.name == m =>
-                {
-                    Some(f.clone())
-                }
-                _ => None,
-            });
+            let test_def = c.method_on_mro_with_options(&m, &symbols, &options);
             let mut default_args: Vec<TokenStream> = Vec::new();
             if let Some(def) = &test_def {
                 let params: Vec<&crate::Parameter> =
@@ -7674,7 +7675,14 @@ fn emit_test_runner(
                 .as_ref()
                 .map(|f| f.decorator_list.clone())
                 .unwrap_or_default();
-            let mut gates = run_gates(&c.decorator_list);
+            // TestCase's class gate flags are inherited too. A false
+            // skipIf/skipUnless is an identity decorator, so an ancestor's
+            // active skip still applies; combining their active gates
+            // preserves that behavior.
+            let mut gates: Vec<RunGate> = c.base_chain_with_options(&symbols, &options)
+                .iter()
+                .flat_map(|class| run_gates(&class.decorator_list))
+                .collect();
             gates.extend(run_gates(&method_decorators));
             let truth = |cond: &crate::ExprType| -> Option<TokenStream> {
                 crate::ExprType::Call(crate::Call {
@@ -7770,18 +7778,6 @@ fn docstring_value(body: &[crate::Statement]) -> Option<String> {
         },
         _ => None,
     }
-}
-
-/// Whether the class defines a method with this exact name in its own body
-/// (`setUp`/`tearDown` — the per-test fixtures the runner calls).
-fn class_defines_method(class_def: &crate::ClassDef, name: &str) -> bool {
-    class_def.body.iter().any(|s| {
-        matches!(
-            &s.statement,
-            crate::StatementType::FunctionDef(f) | crate::StatementType::AsyncFunctionDef(f)
-                if f.name == name
-        )
-    })
 }
 
 /// Is `name` — a class of the CURRENT module (options.this_module_path) —

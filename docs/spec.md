@@ -1888,6 +1888,28 @@ impl Point {
   a read of it through the class (`Class.name`, `cls.name`) is a loud
   `compile_error!` naming the attribute and the rewrite — never the
   boxed None (issue #417); a `self.name` read of it fails in rustc.
+- **TestCase method-created fields** (issues #480, #511): a direct or
+  inherited `unittest.TestCase` subclass discovers `self.attr = ...`
+  through the shared method-field analysis even without `__init__` or
+  `setUp`. The runner follows the MRO for tests, overrides, default
+  arguments, fixtures, and gates, and constructs a fresh instance for
+  every test. A path-sensitive binding check requires each field read to
+  follow an assignment on every reachable path. Tests and `tearDown`
+  inherit only the fields initialized on every successful exit from
+  `setUp`; another test's writes supply no facts, and `tearDown` cannot
+  assume a test completed its writes before raising. Helpers must
+  initialize their own field reads; calls do not establish field facts.
+  Unproved reads, receiver escapes or captures, attribute deletion,
+  class members shadowed by fields, and custom constructors or attribute
+  hooks are conversion errors naming the construct, line, and rewrite.
+  A class value shadowing a method is refused too, rather than silently
+  calling the inherited method through Rust's trait lookup.
+  Manual construction of cases with fields and explicit calls/captures
+  of lifecycle methods (including through `super()`) are refused: use
+  `unittest.main()` so the fixture-order proof applies. If `setUp` has
+  no successful exit, neither the test nor `tearDown` is reached.
+  These restrictions prevent Rust construction defaults from becoming
+  observable as Python values before assignment.
 - **Construction**: `Point(1.0, 2.0)` lowers to `Point::new(…)?`. The
   synthesized `new` defaults the struct then runs `__init__`. A
   user-defined method named `new` is a loud error.
@@ -2570,6 +2592,35 @@ An unhandled exception in a thread prints CPython's
 traceback frames). `start()`/`join()` misuse panics with CPython's
 RuntimeError text (§12.2 family).
 
+Thread constructor/result inference retains the handle through locals and
+instance fields, including `import threading as th` and
+`from threading import Thread as Worker` (issue #481). Thread fields use
+`Option<threading::Thread>` as initially absent storage: struct defaults do
+not construct threads, consume thread names, or run targets. The real
+assignment evaluates `args` once at construction, then stores the handle;
+`start` alone runs the target. A thread field must be initialized by an
+unconditional top-level assignment in `__init__` before it is read or
+`self` escapes/is called. Fields read by constructor arguments also need
+preceding unconditional stores: this holds for EVERY Thread constructor in
+the class, in `__init__` after the first thread store and in any other
+method, where the field must be one `__init__` unconditionally assigns (or
+a class member); otherwise the struct default would be captured where
+CPython raises AttributeError (issue #516). The thread's default name is
+`Thread-N (<target.__name__>)` with the DEFINING function's name, so `from
+.job import work as do_work` names it `work` (issue #514), and a `target=`
+bound by an assignment is a callable value and a conversion error (issue
+#515). Reading an attribute of another class's instance before it is
+assigned (`self.runner.worker` ahead of `self.runner = Runner()`) is the
+general absent-attribute divergence of §12.3, not specific to threads
+(issue #517). Conditional/missing initialization, an early
+constructor return, and deletion are conversion errors; initialize the
+field first and keep it present. Inherited thread fields are currently
+refused (use composition instead). Calls through `super()` before the
+thread fields are initialized are also refused, since they may expose
+`self`. The lifecycle methods take no arguments
+in this subset; timeout joins and unmodeled Thread methods are conversion
+errors rather than dropped calls.
+
 `threading.local()` (issue #356 — requests' `HTTPDigestAuth`) is
 `threading::Local`: an object whose attributes are created at run time
 and are PER THREAD, each thread starting with none. Its attributes are
@@ -2925,6 +2976,7 @@ accepted as permanent spec:
 
 | Divergence | Status |
 |---|---|
+| Reading an instance attribute before its first assignment (`print(self.x)` ahead of `self.x = 1`, or `self.inner.n` ahead of `self.inner = Inner()`) yields the struct's default value (`0`, `''`, a default instance) where CPython raises `AttributeError`. Thread fields, TestCase fields and Thread constructor arguments are guarded (they refuse the shape loudly); every other class field is not | Open defect (issue #517) |
 | `deque.index(x)` lowers through the shared list-ops arm and raises `ValueError: deque.index(x): x not in deque` (the 3.14 wording the list arm pinned), where CPython 3.12/3.13 say `9 is not in deque` — the wording `deque.remove` and the inherent `deque::index(x, start, stop)` already use. The exception TYPE agrees | Documented version choice, pinned in `python_semantics.rs`; the list arm's wording is the project-wide pin |
 | `unicodedata` answers from the Unicode 16.0.0 database — CPython 3.14's `unidata_version` — for every CPython: an older CPython carries an older database (3.12: 15.0.0, 3.13: 15.1.0), so a code point assigned or re-classified since answers differently there (`category`, `bidirectional`, `combining`, `name`, `normalize`). Code points assigned before 15.0 agree | Model limit (issue #334); a per-CPython database would need one table set per version |
 | Unpacking's ValueError text is CPython 3.11–3.13's: `too many values to unpack (expected 2)`. CPython 3.14 appends the length for a sized sequence (`(expected 2, got 3)` for a tuple, list or dict; not for a str). `not enough values to unpack (expected 2, got 1)` and `cannot unpack non-iterable int object` agree across versions | Model limit; one message set, pinned to the 3.11 transcripts |
@@ -2956,7 +3008,9 @@ accepted as permanent spec:
 | Release-mode integer overflow may wrap (debug panics) | Bounded by §12.2's contract |
 | A non-daemon thread never joined is joined when its LAST handle drops (at latest, end of `main`) — CPython joins at interpreter exit, so a fire-and-forget thread can block a scope exit earlier than CPython would | Model limit; the common create/start/join shape is identical |
 | A thread's unhandled exception prints CPython's header and final exception line but no traceback frames | Model limit (no frames) — same family as §8's messages |
+| External `pytest.main` runner calls and values (`console_main` and `cmdline.main`, import aliases and crate re-exports included; copying module/cmdline objects into ordinary value slots is also refused) are refused at conversion with the Python location and a rewrite to CPython's `python -m pytest` or the supported unittest subset. There is no automatic collection: a module defining only `test_*` functions remains a library, and `import pytest` alone retains the external-module warning (#456). Ordinary shadowing parameters and crate siblings keep their behavior | Loud (issue #482); a requested runner call could previously be dropped with a warning in multi-module conversion |
 | `unittest.main()`'s report is CPython's `TextTestRunner` output at the default verbosity, except that an ERROR or FAIL block's traceback prints CPython's header and final exception line but no traceback frames | Model limit (no frames) — the thread-exception entry's family (issue #334, Phase 3) |
+| A `TestCase` field first assigned in a test method is discovered without requiring `__init__` or `setUp`. Each test gets a new instance; inherited tests, fixtures, default arguments and gates follow the MRO. Binding-flow checks reject uncertain reads (including cross-test state and teardown reads relying on a test completing), receiver escapes/captures, deletion, shadowed class members, custom constructors and attribute hooks before a Rust default can be observed. Manual construction of field-bearing cases and explicit lifecycle calls/captures are refused; use `unittest.main()` | Correct-or-loud (issues #480, #511); pinned against CPython 3.12 and 3.14 |
 | TCP `socket.bind()` binds AND starts listening (std::net has no half-bound TCP socket); a connection can be accepted by the OS before `listen()` runs, and binding a client socket before `connect()` is a loud error | Model limit of the std::net backend |
 | `URLError`'s reason text inside CPython's `<urlopen error …>` shape is the HTTP backend's wording, not CPython's | Model limit of the wrapped-crate convention (§10.2.1) |
 | `HTTPError` carries CPython's message but not the error response's body/headers (exceptions are string-tagged values) | Model limit; §8.1 representation |

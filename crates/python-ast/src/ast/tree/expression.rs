@@ -232,6 +232,8 @@ impl<'a> CodeGen for ExprType {
         symbols: Self::SymbolTable,
     ) -> std::result::Result<TokenStream, Box<dyn std::error::Error>> {
         crate::stack_guard::check()?;
+        crate::ast::tree::pytest::reject_runner(&self, &options, &symbols)?;
+        crate::ast::tree::pytest::reject_module_value(&self, &options, &symbols)?;
         crate::ast::tree::list_comp::refuse_borrowed_mutable_output(&self, &ctx, &options, &symbols)?;
         let selection_has_bigint = match &self {
             ExprType::BoolOp(b) => b.values.iter().any(|e|

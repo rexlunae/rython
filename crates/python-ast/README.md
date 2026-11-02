@@ -16,6 +16,15 @@ A Rust library for parsing Python code into Abstract Syntax Trees (AST) and expe
 
 ## 🚀 Quick Start
 
+`threading.Thread` retains its runtime handle type through local variables
+and initialized instance fields, including aliased imports. Field defaults
+do not construct placeholder threads; arguments bind at the Python
+constructor point, and `start()` runs the target. Initialize thread fields
+unconditionally in `__init__` before reading them or exposing `self`.
+Conditional/missing initialization, field deletion, inherited thread fields,
+callable-value targets, and lifecycle arguments
+(including join timeouts) are conversion errors.
+
 Oversized scalar integer literals lower exactly to `stdpython::PyInteger`
 without passing through a float. Scalar arithmetic and supported builtins
 retain the integer's value; unsupported unbounded-integer boundaries are
@@ -75,6 +84,13 @@ Calls through an unresolved callable parameter fail conversion with a
 request for a concrete `typing.Callable` signature. They cannot silently
 skip the call or substitute `None`; typed and boxed callable paths keep
 their modeled runtime behavior.
+
+Pytest runner references (`pytest.main`, `console_main`, `cmdline.main`,
+including imported aliases and function values) are refused during
+conversion. There is no native pytest collection or runner; run the suite under CPython or port to the supported
+unittest subset with an explicit `unittest.main()` entry. Ordinary
+`test_*` function definitions keep their library semantics. Copying pytest
+module/cmdline objects into ordinary value slots is also refused.
 
 ### Prerequisites
 
@@ -178,6 +194,15 @@ def fibonacci(n):
 - **Advanced**: Lambda expressions, conditional expressions, subscripting
 
 #### ⚠️ Experimental/Limited Support
+- **unittest fields**: `TestCase` methods can create instance fields without
+  `__init__` or `setUp`. The runner follows the MRO for tests and fixtures
+  and creates a fresh instance per test. Path-sensitive checks reject reads
+  before assignment (including cross-test state), receiver escapes/captures,
+  attribute deletion, custom constructors/attribute hooks, and class members
+  shadowed by fields (or class values shadowing methods). Manual construction of field-bearing cases and
+  explicit lifecycle calls are refused; use `unittest.main()`. Helpers
+  must initialize their own field reads; a
+  helper call supplies no initialization facts (issues #480, #511).
 - **Async/Await**: Parsing supported, code generation experimental
 - **Decorators**: Parsing supported, code generation limited
 - **Exception Handling**: Parsing supported, code generation experimental
