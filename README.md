@@ -172,6 +172,10 @@ presence, receiver escapes, and field reads relying on another test or an
 opaque helper are conversion errors. Manual construction of cases with
 fields is refused; use `unittest.main()` to preserve fixture order
 (issues #480, #511).
+`with self.subTest(name=value):` records each failure with its named context
+and continues the test method. Positional messages, `msg=`, `**kwargs`,
+unmodeled context-value reprs, `as` targets, additional context managers,
+and control transfers out of a subtest body are refused (issue #525).
 
 Comprehension outputs that borrow existing mutable containers by name,
 attribute, or index are refused when value copies would lose sharing.

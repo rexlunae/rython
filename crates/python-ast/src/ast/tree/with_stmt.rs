@@ -30,14 +30,7 @@ pub(crate) fn assert_raises_cm_name(expr: &ExprType) -> Option<String> {
 }
 
 /// Whether a `with` expression is the unittest `self.subTest(...)` context
-/// manager. CPython's subTest(**) only REFRAMES reporting (each iteration is
-/// recorded as its own sub-result); it does not suppress exceptions or alter
-/// control flow — a passing subTest passes and a failing one fails. So the
-/// lowering runs the body directly, which reproduces the exact pass/fail
-/// outcome (exit code / recorded failure). The per-subtest-named reporting
-/// granularity of CPython's runner is not reproduced (rython's runner counts
-/// whole test methods); that is a runner-visibility difference, not an
-/// observable pass/fail divergence, and is documented at the call site.
+/// manager.
 fn is_subtest_cm(expr: &ExprType) -> bool {
     let ExprType::Call(c) = expr else {
         return false;
@@ -45,11 +38,11 @@ fn is_subtest_cm(expr: &ExprType) -> bool {
     let ExprType::Attribute(a) = c.func.as_ref() else {
         return false;
     };
-    a.attr == "subTest"
+    a.attr == "subTest" && matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self")
 }
 
-/// Whether a `with` body contains a `return`/`break`/`continue` that would
-/// have to escape the closure the assertRaises lowering wraps it in.
+/// Whether a `with` body contains a control transfer that would have to
+/// escape the closure its lowering wraps it in.
 fn body_escapes_a_closure(body: &[Statement]) -> bool {
     crate::ast::tree::visit::any_stmt(
         body,
@@ -63,6 +56,31 @@ fn body_escapes_a_closure(body: &[Statement]) -> bool {
             )
         },
     )
+}
+
+fn has_subtest_repr(ty: &crate::TypeInfo) -> bool {
+    match ty {
+        crate::TypeInfo::Int
+        | crate::TypeInfo::BigInt
+        | crate::TypeInfo::Float
+        | crate::TypeInfo::Bool
+        | crate::TypeInfo::StrRef
+        | crate::TypeInfo::String
+        | crate::TypeInfo::Complex
+        | crate::TypeInfo::PyValue => true,
+        crate::TypeInfo::Vec(inner)
+        | crate::TypeInfo::PyTuple(inner)
+        | crate::TypeInfo::Option(inner)
+        | crate::TypeInfo::PyValueMember(inner)
+        | crate::TypeInfo::Borrowed(inner) => has_subtest_repr(inner),
+        crate::TypeInfo::Dict(key, value) => {
+            has_subtest_repr(key) && has_subtest_repr(value)
+        }
+        crate::TypeInfo::Tuple(items) => {
+            !items.is_empty() && items.len() <= 8 && items.iter().all(has_subtest_repr)
+        }
+        _ => false,
+    }
 }
 
 /// Whether a with-item's context expression is a threading synchronization
@@ -183,16 +201,76 @@ impl CodeGen for With {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // `with self.subTest(...):` — the unittest reporting CM (issue #334).
-        // It only reframes per-iteration REPORTING; for the observable test
-        // outcome the body's pass/fail is unchanged, so run the body directly
-        // (a closure would be WRONG here — a subTest body may legitimately
-        // return/break/continue, and subTest does not suppress exceptions).
-        // See `is_subtest_cm` for the reporting-only divergence note.
-        if self.items.len() == 1
-            && self.items[0].optional_vars.is_none()
-            && is_subtest_cm(&self.items[0].context_expr)
+        // `with self.subTest(...):` catches a body exception as a subtest
+        // failure and lets the test method continue. A closure models this
+        // boundary; control-flow transfers that would escape it are refused.
+        if self
+            .items
+            .iter()
+            .any(|item| is_subtest_cm(&item.context_expr))
         {
+            if self.items.len() != 1 || self.items[0].optional_vars.is_some() {
+                return Err(format!(
+                    "`with self.subTest(...)` at line {} must be the only context manager \
+                     and cannot bind an `as` target; rython refuses to silently skip \
+                     subtest failure handling",
+                    self.lineno.unwrap_or(0)
+                )
+                .into());
+            }
+            if body_escapes_a_closure(&self.body) {
+                return Err(format!(
+                    "`with self.subTest(...)` at line {} containing `return`, `break`, or \
+                     `continue` is not supported yet; move that control flow outside the \
+                     subTest body; rython refuses to silently change its target",
+                    self.lineno.unwrap_or(0)
+                )
+                .into());
+            }
+            let ExprType::Call(subtest_call) = &self.items[0].context_expr else {
+                unreachable!("is_subtest_cm only matches calls");
+            };
+            if !subtest_call.args.is_empty()
+                || subtest_call
+                    .keywords
+                    .iter()
+                    .any(|keyword| keyword.arg.is_none() || keyword.arg.as_deref() == Some("msg"))
+            {
+                return Err(format!(
+                     "`self.subTest` at line {} supports named context parameters only; positional \
+                      messages, `msg=`, and `**kwargs` are not supported yet; use \
+                      `name=value`; \
+                     rython refuses to silently change subtest reporting",
+                    self.lineno.unwrap_or(0)
+                )
+                .into());
+            }
+            let mut context_values = Vec::new();
+            for keyword in &subtest_call.keywords {
+                let name = keyword
+                    .arg
+                    .as_ref()
+                    .expect("unpacked kwargs rejected above");
+                let ty = crate::infer_type(Some(&ctx), &keyword.value, &options, &symbols);
+                if !has_subtest_repr(&ty) {
+                    return Err(format!(
+                        "`self.subTest({name}=...)` at line {} has a value without a \
+                         supported Python repr; use a scalar or supported container; \
+                         rython refuses to silently change subtest reporting",
+                        keyword.lineno.or(self.lineno).unwrap_or(0)
+                    )
+                    .into());
+                }
+                let value = keyword.value.clone().to_rust(
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?;
+                context_values.push(quote! {
+                    (#name.to_string(), stdpython::PyRepr::py_repr(&(#value)))
+                });
+            }
+            let context = quote!(vec![#(#context_values),*]);
             let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
                 .body
                 .iter()
@@ -202,8 +280,16 @@ impl CodeGen for With {
                 })
                 .collect();
             let body_tokens = body_tokens?;
+            let tail = if crate::ast::tree::function_def::guarantees_return(&self.body) {
+                quote!()
+            } else {
+                quote!(Ok(()))
+            };
             return Ok(quote! {
-                #(#body_tokens;)*
+                stdpython::unittest::run_subtest(#context, || -> Result<(), PyException> {
+                    #(#body_tokens;)*
+                    #tail
+                })?;
             });
         }
         // `with self.assertRaises(Exc):` — the unittest context-manager form
