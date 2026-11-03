@@ -6342,6 +6342,37 @@ fn unittest_method_fields_refuse_opaque_attribute_presence() {
 }
 
 #[test]
+fn testcase_super_refusals_name_call_lines() {
+    let cases = [
+        (
+            "import unittest\nclass Mixin:\n    def setUp(self):\n        pass\nclass Extra:\n    pass\nclass T(Mixin, unittest.TestCase, Extra):\n    def setUp(self):\n        super().setUp()\n",
+            "method resolution order",
+            9,
+        ),
+        (
+            "import unittest\nclass T(unittest.TestCase):\n    def setUp(self):\n        super().unknown()\n",
+            "unittest.TestCase.unknown",
+            4,
+        ),
+        (
+            "import unittest\nclass Base(unittest.TestCase):\n    @classmethod\n    def setUp(cls):\n        pass\nclass T(Base):\n    def setUp(self):\n        super().setUp()\n",
+            "classmethod or staticmethod",
+            8,
+        ),
+        (
+            "import unittest\nclass T(unittest.TestCase):\n    def setUp(self):\n        super().setUp(1)\n",
+            "passes arguments",
+            4,
+        ),
+    ];
+    for (source, message, line) in cases {
+        let error = compile_err(source, "tc_super_refusal.py");
+        assert!(error.contains(message) && error.contains(&format!("line {line}:")), "{error}");
+        assert!(error.contains("refuses"), "{error}");
+    }
+}
+
+#[test]
 fn unittest_manual_construction_cannot_bypass_field_initialization() {
     for construction in ["T()", "Alias()"] {
         let error = compile_err(&format!("import unittest\nclass T(unittest.TestCase):\n    def setUp(self):\n        self.total = 3\n    def test_a(self):\n        print(self.total)\nAlias = T\nvalue = {construction}\nvalue.test_a()\n"), "tc_manual.py");

@@ -5521,6 +5521,9 @@ impl ClassDef {
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         let class_name = crate::safe_ident(&self.name);
         let trait_name = format_ident!("{}Trait", self.name);
+        let testcase_anchor = (!options.module_defs.is_empty()
+            && self.is_testcase(symbols, options))
+        .then(|| (self.name.clone(), options.this_module_path.clone()));
 
         // The per-class trait is PUBLIC (inherited methods are called
         // cross-module: the struct is `pub` and re-exported, so the traits
@@ -5605,6 +5608,7 @@ impl ClassDef {
                 class: self.name.clone(),
                 generic: true,
                 super_target: None,
+                testcase_anchor: testcase_anchor.clone(),
                 force_mut_self: options
                     .trait_mut_self
                     .get(&self.name)
@@ -5672,6 +5676,7 @@ impl ClassDef {
                 class: self.name.clone(),
                 generic: true,
                 super_target: None,
+                testcase_anchor: testcase_anchor.clone(),
                 force_mut_self,
             };
             super_trampolines.extend(
@@ -5897,6 +5902,7 @@ impl ClassDef {
                         class: self.name.clone(),
                         generic: false,
                         super_target: Some(dname),
+                        testcase_anchor: testcase_anchor.clone(),
                         force_mut_self: options
                             .trait_mut_self
                             .get(&ancestor.name)
@@ -5927,6 +5933,7 @@ impl ClassDef {
                             class: ancestor.name.clone(),
                             generic: false,
                             super_target: None,
+                            testcase_anchor: testcase_anchor.clone(),
                             force_mut_self: options
                                 .trait_mut_self
                                 .get(&ancestor.name)
@@ -8172,6 +8179,7 @@ impl ClassDef {
                     class: ancestor.name.clone(),
                     generic: false,
                     super_target: None,
+                    testcase_anchor: None,
                     force_mut_self,
                 };
                 let rendered = emitted.to_rust(trait_ctx, a_opts.clone(), a_syms.clone())?;

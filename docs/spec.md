@@ -1922,8 +1922,11 @@ impl Point {
   assume a test completed its writes before raising. A helper method may
   read the fields every successful `setUp` exit assigns, unless `setUp`
   reaches it (directly or through other helpers): such a helper can run
-  before those stores, so it must initialize its own reads. Calls do not
-  establish field facts. `@staticmethod`/`@classmethod` members have no
+  before those stores, so it must initialize its own reads. Ordinary
+  calls do not establish field facts; a statically resolved
+  `super().method(...)` call is analyzed through its target body, so its
+  field reads and normal-exit stores participate in the proof.
+  `@staticmethod`/`@classmethod` members have no
   instance receiver and are not analyzed. A class data attribute that a
   field shadows (`value = 0`, then `self.value = 5` in `setUp`) follows
   the field rule, so a read before the instance store is refused rather
@@ -1944,6 +1947,9 @@ impl Point {
   `super().tearDown()` resolve along a statically modeled TestCase base
   chain (including TestCase's no-op hook); an MRO or target the converter
   cannot resolve is refused rather than lowered to a recursive self-call.
+  Other zero-argument `super().method(...)` calls in a TestCase body use
+  the same resolved chain and are accepted only when the target and MRO
+  are modeled; unsupported targets are refused with the call's source line.
   If `setUp` has no successful exit, neither the test nor `tearDown` is
   reached.
   These restrictions prevent Rust construction defaults from becoming

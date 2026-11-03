@@ -13753,6 +13753,70 @@ fn unittest_main_runs_the_selected_version_gated_testcase() {
 }
 
 #[test]
+fn unittest_cross_module_super_setup_uses_descendant_testcase_mro() {
+    // Verified against CPython 3.14.4: calling Child.test_setup prints
+    // "middle before", "middle after", and "child test". The re-emitted
+    // Middle.setUp body must retain its own symbols for expressions while
+    // resolving super() against Child's full ancestry.
+    let scratch = Scratch::new("tcsetupchain");
+    let krate = package_crate(
+        &scratch,
+        "tcsetupchain",
+        &[
+            (
+                "root.py",
+                "import unittest\n\n\nclass Root(unittest.TestCase):\n    pass\n",
+            ),
+            (
+                "middle.py",
+                "from .root import Root\n\n\nclass Middle(Root):\n    def setUp(self):\n        print(\"middle before\")\n        super().setUp()\n        print(\"middle after\")\n",
+            ),
+            (
+                "cli.py",
+                "from .middle import Middle\n\n\nclass Child(Middle):\n    def test_setup(self):\n        self.setUp()\n        print(\"child test\")\n",
+            ),
+            (
+                "runner.py",
+                "from .cli import Child\n\n\nif __name__ == \"__main__\":\n    case = Child()\n    case.test_setup()\n",
+            ),
+        ],
+    );
+    assert_eq!(
+        run_package(&krate, "tcsetupchain"),
+        [
+            "middle before",
+            "middle after",
+            "child test",
+        ]
+    );
+}
+
+#[test]
+fn unittest_cross_module_super_default_argument_is_refused_with_line() {
+    let scratch = Scratch::new("tcsuperdefault");
+    let error = package_convert_err(
+        &scratch,
+        "tcsuperdefault",
+        &[
+            (
+                "root.py",
+                "import unittest\nDEFAULT = 42\n\n\nclass Root(unittest.TestCase):\n    def setUp(self, value=DEFAULT):\n        self.value = value\n",
+            ),
+            (
+                "middle.py",
+                "from .root import Root\n\n\nclass Middle(Root):\n    def setUp(self):\n        super().setUp()\n",
+            ),
+            (
+                "cli.py",
+                "import unittest\nfrom .middle import Middle\n\n\nclass Child(Middle):\n    def test_value(self):\n        print(self.value)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+            ),
+        ],
+    );
+    assert!(error.contains("default arguments are defined in another module"), "{error}");
+    assert!(error.contains("line 6:") && error.contains("refuses"), "{error}");
+}
+
+#[test]
 fn unittest_cross_module_runner_inputs_and_qualified_construction_are_refused() {
     // A gate condition or test default inherited from another module would
     // be rendered against this module's names (#519 review): refused.

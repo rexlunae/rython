@@ -128,10 +128,11 @@ pub(crate) fn testcase_super_target(
     call: &crate::Call,
 ) -> Result<SuperTarget, String> {
     let name = super_method_name(call).unwrap_or_default();
+    let line = call.lineno.unwrap_or(0);
     let owner_name = chain.get(owner).map_or("?", |(c, ..)| c.name.as_str());
     if !mro_is_chain_then_testcase(chain) {
         return Err(format!(
-            "super().{name}(...) in TestCase class `{owner_name}` is not supported yet: \
+            "line {line}: super().{name}(...) in TestCase class `{owner_name}` is not supported yet: \
              its method resolution order passes a base rython does not follow (only a \
              single-inheritance chain ending in unittest.TestCase, or `Child(Mixin, \
              unittest.TestCase)`, is resolved); restructure the bases that way; rython \
@@ -142,7 +143,7 @@ pub(crate) fn testcase_super_target(
         if let Some(method) = class.methods().find(|m| m.name == name) {
             if has_no_receiver(method) {
                 return Err(format!(
-                    "super().{name}(...) in TestCase class `{owner_name}` reaches the \
+                    "line {line}: super().{name}(...) in TestCase class `{owner_name}` reaches the \
                      classmethod or staticmethod `{}.{name}`, which is not supported yet; \
                      call it through the class (`{}.{name}(...)`); rython refuses to pass \
                      the instance where CPython passes the class",
@@ -161,7 +162,7 @@ pub(crate) fn testcase_super_target(
         // the runner calls class fixtures.
         Some(Fixture::SetUpClass | Fixture::TearDownClass) => {
             return Err(format!(
-                "super().{name}() in TestCase class `{owner_name}` is not supported yet: \
+                "line {line}: super().{name}() in TestCase class `{owner_name}` is not supported yet: \
                  the emitted test runner does not run class fixtures \
                  (setUpClass/tearDownClass, issue #526); move the class fixture's work \
                  into setUp/tearDown; rython refuses to silently skip it"
@@ -169,7 +170,7 @@ pub(crate) fn testcase_super_target(
         }
         None => {
             return Err(format!(
-                "super().{name}(...) in TestCase class `{owner_name}` reaches \
+                "line {line}: super().{name}(...) in TestCase class `{owner_name}` reaches \
                  `unittest.TestCase.{name}`, which rython does not model as a base \
                  implementation yet; call `self.{name}(...)` from a class that does not \
                  override `{name}`; rython refuses to call the subclass's own `{name}` \
@@ -179,7 +180,7 @@ pub(crate) fn testcase_super_target(
     }
     if !call.args.is_empty() || !call.keywords.is_empty() {
         return Err(format!(
-            "super().{name}(...) in TestCase class `{owner_name}` passes arguments to \
+            "line {line}: super().{name}(...) in TestCase class `{owner_name}` passes arguments to \
              `unittest.TestCase.{name}`, which takes none (CPython raises TypeError); \
              this is not supported; remove the arguments; rython refuses to silently \
              drop them"
@@ -194,21 +195,50 @@ pub(crate) fn testcase_super_target(
 /// ancestor whose body is re-emitted as a trait default). `None` when
 /// `enclosing` is not a TestCase class.
 pub(crate) fn resolve_testcase_super(
-    enclosing: &ClassDef,
+    enclosing: &str,
     owner: &str,
     call: &crate::Call,
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
+    anchor: Option<(&str, &[String])>,
 ) -> Option<Result<(SuperTarget, Vec<ChainEntry>), String>> {
-    if !enclosing.is_testcase(symbols, options) {
+    let line = call.lineno.unwrap_or(0);
+    let (class, class_symbols, class_options) = if let Some((anchor_name, path)) = anchor {
+        let Some((class, class_symbols)) = crate::module_class_def(options, path, anchor_name)
+        else {
+            return Some(Err(format!(
+                "line {line}: cannot resolve TestCase ancestry for `{anchor_name}` while \
+                 lowering super().{}(...); this is not supported yet; keep the override in \
+                 its defining module; rython refuses to guess its base implementation",
+                super_method_name(call).unwrap_or_default()
+            )));
+        };
+        let mut class_options = options.clone();
+        let is_package = options.module_defs.keys().any(|k| {
+            k.len() > path.len() && k[..path.len()] == path[..]
+        });
+        class_options.module_path = if is_package {
+            path.to_vec()
+        } else {
+            path[..path.len().saturating_sub(1)].to_vec()
+        };
+        class_options.this_module_path = path.to_vec();
+        (class, class_symbols, class_options)
+    } else {
+        let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(enclosing) else {
+            return None;
+        };
+        (class.clone(), symbols.clone(), options.clone())
+    };
+    if !class.is_testcase(&class_symbols, &class_options) {
         return None;
     }
-    let chain = enclosing.cross_module_chain(symbols, options);
+    let chain = class.cross_module_chain(&class_symbols, &class_options);
     let Some(index) = chain.iter().position(|(c, ..)| c.name == owner) else {
         return Some(Err(format!(
-            "super() in `{owner}` is not on TestCase class `{}`'s base chain; \
+            "line {line}: super() in `{owner}` is not on TestCase class `{}`'s base chain; \
              this is not supported yet; call the base method explicitly",
-            enclosing.name
+            class.name
         )));
     };
     Some(testcase_super_target(&chain, index, call).map(|target| (target, chain)))
@@ -233,12 +263,16 @@ pub(crate) fn is_noop_testcase_super(
     if super_method_name(call).is_none() {
         return false;
     }
-    let Some(crate::SymbolTableNode::ClassDef(class)) = symbols.get(enclosing) else {
-        return false;
-    };
     let owner = ctx.super_target().unwrap_or(enclosing);
     matches!(
-        resolve_testcase_super(&class, owner, call, symbols, options),
+        resolve_testcase_super(
+            enclosing,
+            owner,
+            call,
+            symbols,
+            options,
+            ctx.testcase_anchor(),
+        ),
         Some(Ok((SuperTarget::NoOp, _)))
     )
 }

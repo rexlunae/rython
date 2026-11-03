@@ -7,6 +7,7 @@ use crate::{
     CodeGen, CodeGenContext, ExprType, Keyword, PythonOptions, SymbolTableNode, SymbolTableScopes,
     extract_required_attr,
 };
+use crate::ast::node::Node;
 use crate::ast::tree::std_module::variant as rt_variant;
 use crate::ast::tree::MathFn;
 
@@ -537,6 +538,7 @@ fn lower_assert_raises(
     let inner = crate::Call {
         func: Box::new(call.args[1].clone()),
         args: call.args[2..].to_vec(),
+        lineno: call.lineno,
         keywords: call
             .keywords
             .iter()
@@ -1284,6 +1286,7 @@ pub struct Call {
     pub func: Box<ExprType>,
     pub args: Vec<ExprType>,
     pub keywords: Vec<Keyword>,
+    pub lineno: Option<usize>,
 }
 
 impl<'a, 'py> FromPyObject<'a, 'py> for Call {
@@ -1298,6 +1301,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Call {
             func: Box::new(func),
             args,
             keywords,
+            lineno: ob.lineno(),
         })
     }
 }
@@ -3812,6 +3816,7 @@ impl<'a> CodeGen for Call {
                                     })),
                                     args: vec![c.args[0].clone(), self.args[1].clone()],
                                     keywords: Vec::new(),
+                                    lineno: c.lineno,
                                 };
                                 return isinstance.to_rust(ctx.clone(), options.clone(), symbols.clone());
                             }
@@ -8150,15 +8155,17 @@ impl<'a> CodeGen for Call {
                 // A TestCase family states its method resolution order
                 // statically (issue #524): `super().m(...)` reaches a later
                 // chain class's `m`, or TestCase's own method — a no-op
-                // fixture, or a loud refusal. Never the self-call below.
+                // fixture, or a loud refusal. The concrete subclass's MRO
+                // anchor is separate from `symbols`: a re-emitted method
+                // keeps its defining-module scope for all body expressions.
                 if attr.attr != "__init__"
-                    && let Some(SymbolTableNode::ClassDef(enclosing_class)) = symbols.get(enclosing)
                     && let Some(resolved) = crate::ast::tree::testcase::resolve_testcase_super(
-                        &enclosing_class,
+                        enclosing,
                         &super_owner,
                         &self,
                         &symbols,
                         &options,
+                        ctx.testcase_anchor(),
                     )
                 {
                     let (target, chain) = resolved?;
@@ -8178,12 +8185,12 @@ impl<'a> CodeGen for Call {
                             || sig.args.kw_defaults.iter().any(Option::is_some))
                     {
                         return Err(format!(
-                            "super().{}(...) in TestCase class `{}` reaches `{}.{}`, whose \
+                            "line {}: super().{}(...) in TestCase class `{}` reaches `{}.{}`, whose \
                              default arguments are defined in another module; this is not \
                              supported yet; pass every argument explicitly or define the \
                              method in this module; rython refuses to evaluate the defaults \
                              against this module's names",
-                            attr.attr, super_owner, definer.name, attr.attr
+                            self.lineno.unwrap_or(0), attr.attr, super_owner, definer.name, attr.attr
                         )
                         .into());
                     }
@@ -12086,6 +12093,7 @@ fn lower_str_format_runtime(
             })),
             args: vec![value.clone()],
             keywords: Vec::new(),
+            lineno: None,
         })
         .to_rust(ctx.clone(), options.clone(), symbols.clone())
     };
@@ -13604,6 +13612,7 @@ fn lower_threading_thread(
         func: Box::new(target_expr),
         args: bound_args,
         keywords: Vec::new(),
+        lineno: call.lineno,
     };
     let body = inner.to_rust(ctx.clone(), body_options, symbols.clone())?;
     let target_name = target_name.as_str();
