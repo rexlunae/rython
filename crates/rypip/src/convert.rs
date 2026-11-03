@@ -2078,7 +2078,7 @@ fn convert_on_this_thread(
                 module,
                 &mut warnings,
                 &base_options,
-                &module.path.join("."),
+                &module.import_path.join("."),
             )?;
             transpiled.push((module, code));
         }
@@ -2644,7 +2644,7 @@ fn convert_driver(
                 dep_module,
                 &mut warnings,
                 &base_options,
-                &dep_module.path.join("."),
+                &dep_module.import_path.join("."),
             )?;
             dep_transpiled.push((dep_module, dep_code));
         }
@@ -3181,22 +3181,22 @@ fn transpile(
 /// A package discovered from a source root whose `__init__.py` has an
 /// empty relative path needs that root directory as the leading Python
 /// package name (`pkg/helper.py` → `pkg.helper`). Metadata-discovered
-/// packages already carry their import root in `module.path`.
+/// packages already carry their import root in `module.import_path`.
 fn package_module_name_prefix(package: &crate::package::PyPackage) -> Option<String> {
     let root_init = package
         .modules
         .iter()
-        .find(|module| module.is_init && module.path.is_empty())?;
+        .find(|module| module.is_init && module.import_path.is_empty())?;
     root_init
         .file
         .parent()
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
-        .map(crate::package::sanitize_name)
+        .map(str::to_string)
 }
 
 fn package_module_name(module: &PyModule, prefix: Option<&str>) -> String {
-    let relative = module.path.join(".");
+    let relative = module.import_path.join(".");
     match (prefix, relative.is_empty()) {
         (Some(prefix), true) => prefix.to_string(),
         (Some(prefix), false) => format!("{prefix}.{relative}"),
@@ -4274,6 +4274,7 @@ fn python_module_deps(
             let file = abs.clone();
             let module = PyModule {
                 path: vec![name.clone()],
+                import_path: import_name.split('.').map(str::to_string).collect(),
                 source,
                 file,
                 is_init: false,
@@ -4301,8 +4302,13 @@ fn python_module_deps(
                 format!("python-module `{import_name}`: discovering {}", abs.display())
             })?;
             let prefix = sanitize_name(import_name);
+            let import_prefix: Vec<String> =
+                import_name.split('.').map(str::to_string).collect();
             for module in &mut pkg.modules {
                 module.path.insert(0, prefix.clone());
+                module
+                    .import_path
+                    .splice(0..0, import_prefix.iter().cloned());
                 // The package's own __init__ was discovered as the root
                 // (empty path); after prefixing it IS the package init.
                 if module.path.len() == 1 && module.file.file_name() == Some("__init__.py".as_ref())

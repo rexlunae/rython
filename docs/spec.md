@@ -759,10 +759,11 @@ Consequences, all enforced loudly:
 - Imports of user modules within the converted package resolve to the
   generated Rust modules.
 - In package conversion, an unshadowed module-level `__name__` read is
-  the module's dotted Python import name (`pkg.helper` for
-  `pkg/helper.py`); the separately generated executable entry copy uses
-  `__main__`. The package integration transcript pins both against
-  CPython (issue #534).
+  the module's dotted Python import name (`MyPkg.helper` for
+  `MyPkg/helper.py`), preserving its import spelling independently of
+  sanitized Rust module identifiers; the separately generated executable
+  entry copy uses `__main__`. The package integration transcript pins both
+  against CPython (issue #534).
 - **Import guards are decided statically.** A module-level
   `try: import X … except ImportError:` (bare, or a tuple of
   ImportError/AttributeError) folds at conversion time, because

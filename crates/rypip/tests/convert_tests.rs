@@ -132,8 +132,13 @@ fn comprehension_imported_scalars_and_counter_items_match_cpython() {
 #[test]
 fn imported_module_name_matches_cpython_and_executable_entry_stays_main() {
     let scratch = Scratch::new("imported-module-name");
-    let package_dir = scratch.path().join("pkg");
+    let package_dir = scratch.path().join("MyPkg");
     fs::create_dir_all(&package_dir).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"pkg\"\nversion = \"0.1.0\"\n\n[tool.setuptools]\npackages = [\"MyPkg\"]\n",
+    )
+    .unwrap();
     fs::write(package_dir.join("__init__.py"), "").unwrap();
     fs::write(
         package_dir.join("helper.py"),
@@ -147,13 +152,13 @@ fn imported_module_name_matches_cpython_and_executable_entry_stays_main() {
     .unwrap();
 
     let cpython = Command::new("python3")
-        .args(["-m", "pkg.main"])
+        .args(["-m", "MyPkg.main"])
         .current_dir(scratch.path())
         .output()
         .unwrap();
     assert!(cpython.status.success(), "{:?}", cpython.stderr);
     // Verified against python3.
-    assert_eq!(cpython.stdout, b"pkg.helper\n__main__\n");
+    assert_eq!(cpython.stdout, b"MyPkg.helper\n__main__\n");
 
     let package = rypip::discover(scratch.path()).unwrap();
     let krate = rypip::convert(
@@ -167,7 +172,7 @@ fn imported_module_name_matches_cpython_and_executable_entry_stays_main() {
         .output()
         .unwrap();
     // Verified against python3.
-    assert_eq!(output.stdout, b"pkg.helper\n__main__\n");
+    assert_eq!(output.stdout, b"MyPkg.helper\n__main__\n");
     assert!(output.stderr.is_empty(), "{:?}", output.stderr);
     assert_eq!(output.status.code(), Some(0));
 }
