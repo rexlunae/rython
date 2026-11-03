@@ -14222,6 +14222,84 @@ fn a_one_argument_key_error_prints_its_argument_repr() {
 }
 
 #[test]
+fn unittest_skip_gate_rebinding_after_definition_is_refused() {
+    let scratch = Scratch::new("tcgate-rebind");
+    // Verified against python3 3.14.4: the class case prints no stdout and
+    // stderr ends `Ran 3 tests ... OK (skipped=3)`; the method case prints no
+    // stdout and ends `Ran 1 test ... OK (skipped=1)`. CPython snapshots the
+    // condition when each decorator runs, so a later module store cannot
+    // change the gate. Rython refuses these cases rather than evaluate them
+    // at test-runner time.
+    for (name, source, expected_name, progress, ran, summary) in [
+        (
+            "tcgate-class-rebind",
+            concat!(
+                "import unittest\n",
+                "\n",
+                "SLOW = True\n",
+                "@unittest.skipIf(SLOW, 'slow')\n",
+                "class Base(unittest.TestCase):\n",
+                "    def test_one(self): pass\n",
+                "class Child(Base):\n",
+                "    def test_two(self): pass\n",
+                "SLOW = False\n",
+                "if __name__ == '__main__':\n",
+                "    unittest.main()\n",
+            ),
+            "SLOW",
+            "sss",
+            "Ran 3 tests in ",
+            "OK (skipped=3)",
+        ),
+        (
+            "tcgate-method-rebind",
+            concat!(
+                "import unittest\n",
+                "\n",
+                "FAST = False\n",
+                "class T(unittest.TestCase):\n",
+                "    @unittest.skipUnless(FAST, 'slow machine')\n",
+                "    def test_one(self): pass\n",
+                "FAST = True\n",
+                "if __name__ == '__main__':\n",
+                "    unittest.main()\n",
+            ),
+            "FAST",
+            "s",
+            "Ran 1 test in ",
+            "OK (skipped=1)",
+        ),
+    ] {
+        let error = package_convert_err(&scratch, name, &[("cli.py", source)]);
+        let python = Command::new("python3")
+            .arg(scratch.path().join(name).join("cli.py"))
+            .env("PYTHONHASHSEED", "0")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .output()
+            .unwrap();
+        assert!(python.status.success(), "{python:?}");
+        assert!(python.stdout.is_empty(), "{:?}", python.stdout);
+        let report = String::from_utf8(python.stderr).unwrap();
+        let lines: Vec<_> = report.lines().collect();
+        assert_eq!(lines.len(), 5, "{report:?}");
+        assert_eq!(lines[0], progress, "{report:?}");
+        assert_eq!(lines[1], "----------------------------------------------------------------------", "{report:?}");
+        assert!(lines[2].starts_with(ran), "{report:?}");
+        assert_eq!(lines[3], "", "{report:?}");
+        assert_eq!(lines[4], summary, "{report:?}");
+        assert!(
+            error.contains("skipIf` condition") || error.contains("skipUnless` condition"),
+            "{error}"
+        );
+        assert!(error.contains(expected_name), "{error}");
+        assert!(
+            error.contains("rebound at line") && error.contains("refuses to silently evaluate"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn unittest_skip_and_expected_failure_gates_match_cpython() {
     // issue #371: skip/skipIf/skipUnless (on a method or a class) keep a
     // test from running at all — it is not constructed, set up, or run —
