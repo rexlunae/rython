@@ -2068,12 +2068,18 @@ fn convert_on_this_thread(
     );
     let mut transpiled: Vec<(&PyModule, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    let package_name_prefix = package_module_name_prefix(package);
     for (_name, dep) in &python_deps {
         for module in &dep.modules {
             if !reachable.contains(&module.path) {
                 continue;
             }
-            let code = transpile(module, &mut warnings, &base_options)?;
+            let code = transpile(
+                module,
+                &mut warnings,
+                &base_options,
+                &module.path.join("."),
+            )?;
             transpiled.push((module, code));
         }
     }
@@ -2117,11 +2123,21 @@ fn convert_on_this_thread(
         } else {
             &base_options
         };
-        let code = transpile(module, &mut warnings, options)?;
+        let code = transpile(
+            module,
+            &mut warnings,
+            options,
+            &package_module_name(module, package_name_prefix.as_deref()),
+        )?;
         if is_entry {
             let mut bin_options = entry_options.clone();
             bin_options.bin_crate_root = true;
-            entry_bin_code = Some(transpile(module, &mut Vec::new(), &bin_options)?);
+            entry_bin_code = Some(transpile(
+                module,
+                &mut Vec::new(),
+                &bin_options,
+                "__main__",
+            )?);
         }
         transpiled.push((module, code));
     }
@@ -2610,7 +2626,13 @@ fn convert_driver(
         package_uses_async,
         &package.name,
     );
-    let code = transpile(module, &mut warnings, &base_options)?;
+    let package_name_prefix = package_module_name_prefix(package);
+    let code = transpile(
+        module,
+        &mut warnings,
+        &base_options,
+        &package_module_name(module, package_name_prefix.as_deref()),
+    )?;
 
     let mut dep_transpiled: Vec<(&PyModule, String)> = Vec::new();
     for (_name, dep) in &python_deps {
@@ -2618,7 +2640,12 @@ fn convert_driver(
             if !reachable.contains(&dep_module.path) {
                 continue;
             }
-            let dep_code = transpile(dep_module, &mut warnings, &base_options)?;
+            let dep_code = transpile(
+                dep_module,
+                &mut warnings,
+                &base_options,
+                &dep_module.path.join("."),
+            )?;
             dep_transpiled.push((dep_module, dep_code));
         }
     }
@@ -3089,6 +3116,7 @@ fn transpile(
     module: &PyModule,
     warnings: &mut Vec<String>,
     base_options: &PythonOptions,
+    python_module_name: &str,
 ) -> Result<String> {
     let ast = parse_enhanced(&module.source, parse_filename(module))
         .map_err(|e| anyhow::anyhow!("{} ({})", e, module.file.display()))?;
@@ -3113,6 +3141,7 @@ fn transpile(
         .cloned()
         .unwrap_or_else(|| "lib".to_string());
     let mut options = base_options.clone();
+    options.python_module_name = Some(python_module_name.to_string());
     // Relative imports resolve against the current module's package path;
     // empty at the crate root (the default when unset).
     options.module_path = module_package_path(module);
@@ -3147,6 +3176,33 @@ fn transpile(
         warnings.push(format!("{}: {}", parse_filename(module), w));
     }
     Ok(tokens.to_string())
+}
+
+/// A package discovered from a source root whose `__init__.py` has an
+/// empty relative path needs that root directory as the leading Python
+/// package name (`pkg/helper.py` → `pkg.helper`). Metadata-discovered
+/// packages already carry their import root in `module.path`.
+fn package_module_name_prefix(package: &crate::package::PyPackage) -> Option<String> {
+    let root_init = package
+        .modules
+        .iter()
+        .find(|module| module.is_init && module.path.is_empty())?;
+    root_init
+        .file
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(crate::package::sanitize_name)
+}
+
+fn package_module_name(module: &PyModule, prefix: Option<&str>) -> String {
+    let relative = module.path.join(".");
+    match (prefix, relative.is_empty()) {
+        (Some(prefix), true) => prefix.to_string(),
+        (Some(prefix), false) => format!("{prefix}.{relative}"),
+        (None, true) => "lib".to_string(),
+        (None, false) => relative,
+    }
 }
 
 /// Whether any module of the package contains async constructs (async def/

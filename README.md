@@ -17,6 +17,8 @@ calls it as its last top-level statement, that call (what `python
 file.py` runs) — becomes `fn main`, and the generated code
 depends only on the `stdpython` runtime. The output is a starting point for
 a permanent port — readable Rust you can refactor, not an opaque bundle.
+Package modules retain their dotted Python `__name__`; the executable
+entry still sees `__main__`.
 `rypip run program.py -- args` is the same pipeline behind CPython's
 command-line shape: it converts into a scratch crate (reused across runs),
 builds it quietly, and executes the binary with your arguments, streams

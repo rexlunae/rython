@@ -130,6 +130,49 @@ fn comprehension_imported_scalars_and_counter_items_match_cpython() {
 }
 
 #[test]
+fn imported_module_name_matches_cpython_and_executable_entry_stays_main() {
+    let scratch = Scratch::new("imported-module-name");
+    let package_dir = scratch.path().join("pkg");
+    fs::create_dir_all(&package_dir).unwrap();
+    fs::write(package_dir.join("__init__.py"), "").unwrap();
+    fs::write(
+        package_dir.join("helper.py"),
+        "def module_name() -> str:\n    return __name__\n",
+    )
+    .unwrap();
+    fs::write(
+        package_dir.join("main.py"),
+        "from .helper import module_name\n\ndef main() -> None:\n    print(module_name())\n    print(__name__)\n\nif __name__ == '__main__':\n    main()\n",
+    )
+    .unwrap();
+
+    let cpython = Command::new("python3")
+        .args(["-m", "pkg.main"])
+        .current_dir(scratch.path())
+        .output()
+        .unwrap();
+    assert!(cpython.status.success(), "{:?}", cpython.stderr);
+    // Verified against python3.
+    assert_eq!(cpython.stdout, b"pkg.helper\n__main__\n");
+
+    let package = rypip::discover(scratch.path()).unwrap();
+    let krate = rypip::convert(
+        &package,
+        &scratch.path().join("crate"),
+        &ConvertOptions::default(),
+    )
+    .unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/pkg"))
+        .output()
+        .unwrap();
+    // Verified against python3.
+    assert_eq!(output.stdout, b"pkg.helper\n__main__\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn immediate_list_generator_consumption_matches_cpython() {
     let scratch = Scratch::new("list-generator");
     let file = scratch.path().join("app.py");

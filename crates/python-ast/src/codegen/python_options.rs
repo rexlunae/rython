@@ -510,6 +510,13 @@ pub struct PythonOptionsData {
     /// importable `pub static`s.
     pub this_module_path: Vec<String>,
 
+    /// The Python import name of the current module, such as
+    /// `pkg.submodule`. Package conversion sets this per module so an
+    /// unshadowed `__name__` read has the same value it would under CPython.
+    /// `None` preserves the runtime's `__main__` fallback for single-file
+    /// executable conversions.
+    pub python_module_name: Option<String>,
+
     /// Statically-known types of names in the CURRENT scope (parameter
     /// annotations and literal assignments), as canonical Python type
     /// names ("int", "float", "str", "bool"). Set per function; consumed
@@ -933,6 +940,7 @@ impl Default for PythonOptionsData {
             statically_module_names: std::rc::Rc::new(std::collections::HashSet::new()),
             module_path: Vec::new(),
             this_module_path: Vec::new(),
+            python_module_name: None,
             local_types: std::rc::Rc::new(std::collections::HashMap::new()),
             no_std: false,
             big_integer_target: BigIntegerTarget::StdPython,
