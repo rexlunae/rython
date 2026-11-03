@@ -762,6 +762,13 @@ pub struct PythonOptionsData {
     pub module_defs:
         std::rc::Rc<std::collections::HashMap<Vec<String>, std::rc::Rc<crate::Module>>>,
 
+    /// Each crate module's Python `__name__` (`impt.cases`) by its
+    /// `module_defs` key, as the converter knows it from the package
+    /// layout. What CPython prints for a class of that module — a test's
+    /// id in a unittest report (issue #522). Empty in single-module
+    /// conversion; see `module::python_module_name` for a missing key.
+    pub module_python_names: std::rc::Rc<std::collections::HashMap<Vec<String>, String>>,
+
     /// True while a MODULE-LEVEL control-flow statement (an `if`, a
     /// `try`, a loop, a `with`) is lowered into `__module_init__`: an
     /// import nested in it has its `use` hoisted to module scope by the
@@ -971,6 +978,7 @@ impl Default for PythonOptionsData {
             in_async_def: false,
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),
             module_defs: std::rc::Rc::new(std::collections::HashMap::new()),
+            module_python_names: std::rc::Rc::new(std::collections::HashMap::new()),
             in_module_init_body: false,
             init_binding_marks: std::rc::Rc::new(std::collections::HashMap::new()),
             stmt_binds: None,

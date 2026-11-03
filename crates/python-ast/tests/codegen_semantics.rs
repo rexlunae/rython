@@ -6468,6 +6468,80 @@ fn unittest_main_emits_a_test_runner() {
 }
 
 #[test]
+fn unittest_main_refuses_testcases_stored_in_unsupported_forms() {
+    for (store, source) in [
+        (
+            "list",
+            "cases = [T]\n",
+        ),
+        (
+            "unpacking",
+            "case, other = T, None\n",
+        ),
+        (
+            "walrus",
+            "cases = (case := T)\n",
+        ),
+    ] {
+        let error = compile_err_as_entry(
+            &format!(
+                "import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n        pass\n{source}if __name__ == '__main__':\n    unittest.main()\n"
+            ),
+            "tc_unfollowed.py",
+        );
+        assert!(
+            error.contains("binds a name to the TestCase `T` as a value")
+                && error.contains("line ")
+                && error.contains("bind the class with `class`, `from ... import`, or a plain `Name = Class` alias")
+                && error.contains("refuses to silently run or skip"),
+            "{store}: {error}"
+        );
+    }
+}
+
+#[test]
+fn unittest_main_refuses_uncertain_multi_module_star_imports() {
+    let cases = parse(
+        "import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n        pass\n__all__ = dynamic_exports()\n",
+        "cases.py",
+    )
+    .unwrap();
+    let entry = parse(
+        "from .cases import *\nimport unittest\nif __name__ == '__main__':\n    unittest.main()\n",
+        "cli.py",
+    )
+    .unwrap();
+    let module_defs = std::collections::HashMap::from([
+        (vec!["pkg".to_string(), "cases".to_string()], std::rc::Rc::new(cases)),
+        (vec!["pkg".to_string(), "cli".to_string()], std::rc::Rc::new(entry.clone())),
+    ]);
+    let options = PythonOptions::from(PythonOptionsData {
+        is_executable_entry: true,
+        module_defs: std::rc::Rc::new(module_defs),
+        module_path: vec!["pkg".to_string()],
+        python_namespace: "pkg".to_string(),
+        this_module_path: vec!["pkg".to_string(), "cli".to_string()],
+        ..Default::default()
+    });
+    let symbols = entry.clone().find_symbols(SymbolTableScopes::new());
+    let error = entry
+        .to_rust(
+            CodeGenContext::Module("cli".to_string()),
+            options,
+            symbols,
+        )
+        .expect_err("unknown star exports that may include a TestCase must be refused");
+    let error = error.to_string();
+    assert!(
+        error.contains("`from cases import *` at line 1 may bind the TestCase `T`")
+            && error.contains("which names it binds is not known at conversion")
+            && error.contains("import the TestCase classes by name")
+            && error.contains("refuses to silently run or skip"),
+        "{error}"
+    );
+}
+
+#[test]
 fn unittest_asserts_lower_to_runtime_assert_helpers() {
     // issue #334: `self.assertEqual(a, b)` / `self.assertTrue(x)` /
     // `self.assertFalse(x)` are inherited TestCase members — not methods or
