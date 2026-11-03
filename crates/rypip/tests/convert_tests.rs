@@ -163,6 +163,122 @@ fn imported_exception_tracebacks_keep_the_defining_module_and_matching() {
 }
 
 #[test]
+fn exception_qualification_uses_import_layout_and_entry_emission_context() {
+    let scratch = Scratch::new("exception-import-layout");
+    let root = scratch.path().join("widgets");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"widget-tools\"\nversion = \"0.1.0\"\n[tool.setuptools]\npackages = [\"widgets\"]\n").unwrap();
+    fs::write(root.join("__init__.py"), "").unwrap();
+    fs::write(root.join("errors.py"),
+        "class BadInput(Exception):\n    pass\ndef fail() -> None:\n    raise BadInput('boom')\n").unwrap();
+    fs::write(root.join("helper.py"), concat!(
+        "from .cli import EntryError, fail_entry\n",
+        "def fail_imported() -> None:\n",
+        "    raise EntryError('imported')\n",
+        "def call_imported() -> None:\n",
+        "    fail_entry()\n",
+        "def catch_imported() -> None:\n",
+        "    try:\n",
+        "        fail_entry()\n",
+        "    except EntryError as error:\n",
+        "        print('caught', str(error), repr(error))\n",
+    )).unwrap();
+    fs::write(root.join("cli.py"), concat!(
+        "import sys\n",
+        "class EntryError(Exception):\n",
+        "    pass\n",
+        "def fail_entry() -> None:\n",
+        "    raise EntryError('entry')\n",
+        "def main() -> None:\n",
+        "    from .helper import fail_imported, call_imported, catch_imported\n",
+        "    from .errors import fail\n",
+        "    mode = sys.argv[1]\n",
+        "    if mode == 'imported':\n",
+        "        fail_imported()\n",
+        "    elif mode == 'library':\n",
+        "        call_imported()\n",
+        "    elif mode == 'caught':\n",
+        "        catch_imported()\n",
+        "    elif mode == 'layout':\n",
+        "        fail()\n",
+        "    elif mode == 'builtin':\n",
+        "        raise ValueError('boom')\n",
+        "    else:\n",
+        "        fail_entry()\n",
+        "if __name__ == '__main__':\n",
+        "    main()\n",
+    )).unwrap();
+    let package = rypip::discover(scratch.path()).unwrap();
+    let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    assert!(build_generated(&krate.root).success());
+    // Verified against python3. Omit only the documented traceback frames.
+    for (mode, stdout, stderr, status) in [
+        ("imported", "", "Traceback (most recent call last):\nwidgets.cli.EntryError: imported\n", 1),
+        ("library", "", "Traceback (most recent call last):\nwidgets.cli.EntryError: entry\n", 1),
+        ("entry", "", "Traceback (most recent call last):\nEntryError: entry\n", 1),
+        ("layout", "", "Traceback (most recent call last):\nwidgets.errors.BadInput: boom\n", 1),
+        ("builtin", "", "Traceback (most recent call last):\nValueError: boom\n", 1),
+        ("caught", "caught entry EntryError('entry')\n", "", 0),
+    ] {
+        let python = Command::new("python3").args(["-m", "widgets.cli", mode])
+            .env("PYTHONHASHSEED", "0").current_dir(scratch.path()).output().unwrap();
+        assert_eq!(python.stdout, stdout.as_bytes(), "CPython {mode}");
+        assert_eq!(python.status.code(), Some(status), "CPython {mode}");
+        let python_stderr = String::from_utf8(python.stderr).unwrap();
+        let without_frames = if status == 0 { python_stderr } else {
+            format!("Traceback (most recent call last):\n{}\n", python_stderr.lines().last().unwrap())
+        };
+        assert_eq!(without_frames, stderr, "CPython {mode}");
+        let output = Command::new(krate.root.join("target/debug/widget_tools")).arg(mode).output().unwrap();
+        assert_eq!(output.stdout, stdout.as_bytes(), "{mode}");
+        assert_eq!(output.stderr, stderr.as_bytes(), "{mode}");
+        assert_eq!(output.status.code(), Some(status), "{mode}");
+    }
+}
+
+#[test]
+fn exception_qualification_uses_discovered_src_package_not_distribution_name() {
+    let scratch = Scratch::new("exception-src-layout");
+    let root = scratch.path().join("src/widgets");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"widget-tools\"\nversion = \"0.1.0\"\n").unwrap();
+    fs::write(root.join("__init__.py"), "").unwrap();
+    fs::write(root.join("errors.py"),
+        "class BadInput(Exception):\n    pass\ndef fail() -> None:\n    raise BadInput('boom')\n").unwrap();
+    fs::write(root.join("cli.py"), concat!(
+        "from .errors import BadInput, fail\n",
+        "def main() -> None:\n",
+        "    try:\n",
+        "        fail()\n",
+        "    except BadInput as error:\n",
+        "        print('caught', str(error), repr(error))\n",
+        "    fail()\n",
+        "if __name__ == '__main__':\n",
+        "    main()\n",
+    )).unwrap();
+    // Verified against python3; the src container is on sys.path, not
+    // part of __module__. Only traceback frames are omitted.
+    let stdout = b"caught boom BadInput('boom')\n";
+    let stderr = b"Traceback (most recent call last):\nwidgets.errors.BadInput: boom\n";
+    let python = Command::new("python3").args(["-m", "widgets.cli"])
+        .env("PYTHONHASHSEED", "0").current_dir(scratch.path().join("src")).output().unwrap();
+    assert_eq!(python.stdout, stdout);
+    assert_eq!(python.status.code(), Some(1));
+    let python_stderr = String::from_utf8(python.stderr).unwrap();
+    assert_eq!(format!("Traceback (most recent call last):\n{}\n",
+        python_stderr.lines().last().unwrap()).as_bytes(), stderr);
+    let package = rypip::discover(scratch.path()).unwrap();
+    let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/widget_tools")).output().unwrap();
+    assert_eq!(output.stdout, stdout);
+    assert_eq!(output.stderr, stderr);
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
 fn comprehension_fresh_and_immutable_outputs_match_cpython() {
     let scratch = Scratch::new("comprehension-owned-output");
     let file = scratch.path().join("app.py");

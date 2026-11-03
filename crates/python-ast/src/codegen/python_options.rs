@@ -511,6 +511,9 @@ pub struct PythonOptionsData {
     pub this_module_path: Vec<String>,
     /// The converter-selected module running as `__main__`, if any.
     pub executable_entry_module: Option<Vec<String>>,
+    /// Importable dotted names keyed by converter module paths, independent
+    /// of the distribution's Cargo name.
+    pub module_import_names: std::rc::Rc<std::collections::HashMap<Vec<String>, String>>,
 
     /// Statically-known types of names in the CURRENT scope (parameter
     /// annotations and literal assignments), as canonical Python type
@@ -936,6 +939,7 @@ impl Default for PythonOptionsData {
             module_path: Vec::new(),
             this_module_path: Vec::new(),
             executable_entry_module: None,
+            module_import_names: Default::default(),
             local_types: std::rc::Rc::new(std::collections::HashMap::new()),
             no_std: false,
             big_integer_target: BigIntegerTarget::StdPython,

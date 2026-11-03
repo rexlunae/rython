@@ -2067,6 +2067,12 @@ fn convert_on_this_thread(
         &package.name,
     );
     base_options.executable_entry_module = package.entry_module().map(|m| m.path.clone());
+    base_options.module_import_names = std::rc::Rc::new(
+        package.modules.iter().map(|m| (m.path.clone(), module_import_name(m)))
+            .chain(python_deps.iter().flat_map(|(_, dep)| dep.modules.iter())
+                .map(|m| (m.path.clone(), m.path.join("."))))
+            .collect(),
+    );
     let mut transpiled: Vec<(&PyModule, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for (_name, dep) in &python_deps {
@@ -2597,13 +2603,19 @@ fn convert_driver(
             .filter(|m| reachable.contains(&m.path)),
     );
     let (package_uses_async, _) = package_async_flags(package);
-    let base_options = conversion_base_options(
+    let mut base_options = conversion_base_options(
         opts,
         &rust_modules,
         &python_module_names,
         &module_defs,
         package_uses_async,
         &package.name,
+    );
+    base_options.module_import_names = std::rc::Rc::new(
+        package.modules.iter().map(|m| (m.path.clone(), module_import_name(m)))
+            .chain(python_deps.iter().flat_map(|(_, dep)| dep.modules.iter())
+                .map(|m| (m.path.clone(), m.path.join("."))))
+            .collect(),
     );
     let code = transpile(module, &mut warnings, &base_options)?;
 
@@ -3257,6 +3269,34 @@ fn package_surface_features(
     }
     needed.sort();
     needed
+}
+
+/// Source package directories, not distribution metadata, determine Python's
+/// `__module__`. Stop before layout containers such as `src`.
+fn module_import_name(module: &PyModule) -> String {
+    let mut parts = Vec::new();
+    if !module.is_init {
+        if let Some(stem) = module.file.file_stem().and_then(|s| s.to_str()) {
+            parts.push(stem.to_string());
+        }
+    }
+    let mut directory = module.file.parent();
+    while let Some(dir) = directory {
+        if !dir.join("__init__.py").is_file() {
+            break;
+        }
+        if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
+            parts.push(name.to_string());
+        }
+        directory = dir.parent();
+    }
+    // Explicit namespace packages and py-modules already have importable
+    // paths in discovery, even when no __init__.py chain exists.
+    if module.path.len() >= parts.len() && !module.path.is_empty() {
+        return module.path.join(".");
+    }
+    parts.reverse();
+    parts.join(".")
 }
 
 /// Conversion-level PythonOptions shared by every module of one conversion

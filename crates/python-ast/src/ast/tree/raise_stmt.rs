@@ -949,16 +949,14 @@ pub(crate) fn exception_construction(
 
 fn exception_module_name(path: &[String], options: &PythonOptions) -> String {
     let path = crate::ast::tree::module::module_defs_key(options, path).unwrap_or(path);
-    if options.executable_entry_module.as_deref() == Some(path) || options.module_defs.is_empty() {
-        "__main__".to_string()
-    } else if path.first() == Some(&options.python_namespace)
-        || path.first().is_some_and(|root| options.python_modules.contains(root))
+    if (options.bin_crate_root
+        && options.executable_entry_module.as_deref() == Some(path)
+        && options.this_module_path == path)
+        || options.module_defs.is_empty()
     {
-        path.join(".")
+        "__main__".to_string()
     } else {
-        std::iter::once(options.python_namespace.as_str())
-            .chain(path.iter().map(String::as_str))
-            .collect::<Vec<_>>().join(".")
+        options.module_import_names.get(path).cloned().unwrap_or_else(|| path.join("."))
     }
 }
 
