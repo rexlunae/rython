@@ -2885,9 +2885,15 @@ impl<'a> CodeGen for Call {
                     ).into());
                 }
                 let receiver = attr.value.clone().to_rust(ctx, options, symbols)?;
+                // An Option-typed receiver's None is the Python value None
+                // (the thread-field guard proves the absent state before
+                // the first store is never read): CPython raises a
+                // catchable AttributeError naming the method (issue #529).
                 let receiver = if matches!(ty, crate::TypeInfo::Option(_)) {
-                    let message = format!("AttributeError: 'NoneType' object has no attribute '{}'", attr.attr);
-                    quote!((#receiver).as_ref().unwrap_or_else(|| panic!(#message)))
+                    let message = format!("'NoneType' object has no attribute '{}'", attr.attr);
+                    quote!((#receiver).as_ref().ok_or_else(|| {
+                        PyException::new("AttributeError", #message)
+                    })?)
                 } else {
                     receiver
                 };

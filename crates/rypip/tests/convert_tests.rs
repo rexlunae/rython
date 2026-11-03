@@ -8127,6 +8127,146 @@ fn thread_instance_fields_match_python_at_runtime() {
 }
 
 #[test]
+fn a_lazily_created_thread_field_matches_python_at_runtime() {
+    // Issue #529: `self.t = None` in __init__, `self.t = Thread(...)` in a
+    // later method. The field is Option<threading::Thread> whose None is the
+    // Python value None: `if self.t is not None:` skips a stop before start,
+    // and a lifecycle call on None raises CPython's catchable AttributeError.
+    // Verified against python3 (3.14.4): stdout, and exit code 0 with empty
+    // stderr.
+    for (name, source, expected) in [
+        (
+            "lazy_thread_issue",
+            concat!(
+                "import threading\n\n\n",
+                "def work(n: int) -> None:\n",
+                "    print(\"work\", n, threading.current_thread().name)\n\n\n",
+                "class Pool:\n",
+                "    def __init__(self):\n",
+                "        self.t = None\n",
+                "        self.n = 3\n\n",
+                "    def start(self):\n",
+                "        self.t = threading.Thread(target=work, args=(self.n,))\n",
+                "        self.t.start()\n\n",
+                "    def stop(self):\n",
+                "        if self.t is not None:\n",
+                "            self.t.join()\n",
+                "            print(\"joined\", self.t.is_alive())\n\n\n",
+                "def main():\n",
+                "    p = Pool()\n",
+                "    p.stop()\n",
+                "    p.start()\n",
+                "    p.stop()\n\n\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+            "work 3 Thread-1 (work)\njoined False\n",
+        ),
+        (
+            "thread_lazy_field",
+            include_str!("../../../eval/idioms/programs/thread_lazy_field.py"),
+            include_str!("../../../eval/idioms/programs/thread_lazy_field.expected"),
+        ),
+        (
+            "thread_lazy_field_none",
+            include_str!("fixtures/thread_lazy_field_none.py"),
+            "work 1 Thread-1 (work)\neager False\ncaught 'NoneType' object has no attribute 'join'\nwork 2 Thread-2 (work)\njoined False\nnone? False\nno thread\nwork 10 Thread-3 (work)\n",
+        ),
+    ] {
+        let scratch = Scratch::new(name);
+        let file = scratch.path().join(format!("{name}.py"));
+        fs::write(&file, source).unwrap();
+        let pkg = rypip::discover(&file).expect("discover");
+        let krate = rypip::convert(
+            &pkg,
+            &scratch.path().join("crate"),
+            &ConvertOptions::default(),
+        )
+        .expect("convert");
+        assert!(
+            !krate.warnings.iter().any(|w| w.contains("dropped")),
+            "{name}: {:?}",
+            krate.warnings
+        );
+        let status = Command::new("cargo")
+            .arg("build")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env("RUSTFLAGS", "-D warnings")
+            .current_dir(&krate.root)
+            .status()
+            .expect("build generated crate");
+        assert!(status.success(), "{name}: warning-clean build");
+        let output = Command::new(krate.root.join(format!("target/debug/{name}")))
+            .output()
+            .expect("run generated binary");
+        assert!(output.status.success(), "{name}: {:?}", output);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "{name}: stdout"
+        );
+        assert!(output.stderr.is_empty(), "{name}: {:?}", output);
+    }
+    // An uncaught start() on the None value. Verified against python3
+    // (3.14.4): stdout `before True`, exit 1, and stderr ending in
+    // `AttributeError: 'NoneType' object has no attribute 'start'`. rython's
+    // traceback has no frames (the §12.3 model limit), so the header and the
+    // exception line are the whole stderr.
+    let scratch = Scratch::new("lazy_thread_none_start");
+    let file = scratch.path().join("lazy_thread_none_start.py");
+    fs::write(
+        &file,
+        concat!(
+            "import threading\n\n\n",
+            "def work(n: int) -> None:\n",
+            "    print(\"work\", n)\n\n\n",
+            "class Pool:\n",
+            "    def __init__(self):\n",
+            "        self.t = None\n",
+            "        self.n = 3\n\n",
+            "    def make(self):\n",
+            "        self.t = threading.Thread(target=work, args=(self.n,))\n\n",
+            "    def run(self):\n",
+            "        print(\"before\", self.t is None)\n",
+            "        self.t.start()\n",
+            "        print(\"unreachable\")\n\n\n",
+            "def main():\n",
+            "    p = Pool()\n",
+            "    p.run()\n",
+            "    p.make()\n\n\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(
+        &pkg,
+        &scratch.path().join("crate"),
+        &ConvertOptions::default(),
+    )
+    .expect("convert");
+    let status = Command::new("cargo")
+        .arg("build")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env("RUSTFLAGS", "-D warnings")
+        .current_dir(&krate.root)
+        .status()
+        .expect("build generated crate");
+    assert!(status.success(), "warning-clean build");
+    let output = Command::new(krate.root.join("target/debug/lazy_thread_none_start"))
+        .output()
+        .expect("run generated binary");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "before True\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "Traceback (most recent call last):\nAttributeError: 'NoneType' object \
+         has no attribute 'start'\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
 fn a_thread_is_named_after_its_defining_function_and_binds_defined_arguments() {
     // Issue #514: `Thread-N (<target.__name__>)` uses the DEFINING function's
     // name, not the spelling of `target=`; `from .job import work as do_work`

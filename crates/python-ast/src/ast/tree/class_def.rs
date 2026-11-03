@@ -2857,10 +2857,35 @@ impl ClassDef {
         // dynamic divergences. `__init__` still wins every name it knows.
         let mut method_field_stores: std::collections::BTreeMap<String, Vec<ObservedStore>> =
             std::collections::BTreeMap::new();
+        // Issue #529: an attribute `__init__` declares with nothing but an
+        // unannotated `None` (`self.t = None`) is boxed above (the None-only
+        // divergence), and a later method's store keeps that type. A boxed
+        // value cannot hold a Thread handle, so when every other store of
+        // such an attribute is a Thread (or None again), the stores join
+        // into `Option<threading::Thread>` instead: None is the Python
+        // value None. The absent state before the `__init__` store shares
+        // the Option's None, which is sound only because the
+        // thread-field guard proves that store precedes every read.
+        let none_declared: std::collections::BTreeSet<String> = fields
+            .iter()
+            .filter(|(name, ty)| {
+                *ty == crate::TypeInfo::PyValue
+                    && !annotated_fields.contains(name)
+                    && !class_annotations.contains_key(name)
+                    && stores
+                        .iter()
+                        .filter(|s| s.attr == *name)
+                        .all(|s| crate::is_none_expr(s.value))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut none_declared_stores: std::collections::BTreeMap<String, Vec<ObservedStore>> =
+            std::collections::BTreeMap::new();
         for method in self.methods() {
             if method.name == "__init__" {
                 continue;
             }
+            let thread_locals = thread_bound_locals(&method.body, symbols);
             let mut method_types: std::collections::HashMap<String, crate::TypeInfo> =
                 std::collections::HashMap::new();
             crate::collect_local_types(&method.body, &mut method_types);
@@ -2887,6 +2912,21 @@ impl ClassDef {
                 // field write (same contract as the __init__ pass).
                 if self.is_property_setter(&store.attr) {
                     continue;
+                }
+                if none_declared.contains(&store.attr) {
+                    let observed = if crate::is_none_expr(store.value) {
+                        ObservedStore::NoneLiteral
+                    } else if stores_thread(store.value, &thread_locals, symbols) {
+                        ObservedStore::Typed(crate::TypeInfo::Threading(
+                            crate::ThreadingType::Thread,
+                        ))
+                    } else {
+                        ObservedStore::Unknown
+                    };
+                    none_declared_stores
+                        .entry(store.attr.clone())
+                        .or_default()
+                        .push(observed);
                 }
                 if fields.iter().any(|(name, _)| *name == store.attr) {
                     // Round 83: a None store in a METHOD joins a
@@ -2953,6 +2993,25 @@ impl ClassDef {
                     .entry(store.attr.clone())
                     .or_default()
                     .push(observed);
+            }
+        }
+
+        let thread = crate::TypeInfo::Threading(crate::ThreadingType::Thread);
+        for (attr, observed) in none_declared_stores {
+            let holds_thread = observed
+                .iter()
+                .any(|o| matches!(o, ObservedStore::Typed(t) if *t == thread));
+            let only_thread_or_none = observed.iter().all(|o| {
+                matches!(o, ObservedStore::NoneLiteral)
+                    || matches!(o, ObservedStore::Typed(t) if *t == thread)
+            });
+            // Any other store keeps the boxed field; the thread-field guard
+            // then refuses the Thread store into it.
+            if holds_thread
+                && only_thread_or_none
+                && let Some(slot) = fields.iter_mut().find(|(name, _)| *name == attr)
+            {
+                slot.1 = crate::TypeInfo::Option(Box::new(thread.clone()));
             }
         }
 
@@ -3213,52 +3272,52 @@ impl ClassDef {
         options: &PythonOptions,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::ast::tree::threading_types::ThreadMethod;
-        let inherited: std::collections::BTreeSet<String> = self.cross_module_chain(symbols, options)
-            .iter().skip(1).flat_map(|(base, syms, opts, _)| {
-                base.infer_fields(syms, opts).unwrap_or_default().into_iter()
-                    .filter(|(_, ty)| ThreadMethod::receiver_is_thread(ty))
-                    .map(|(name, _)| name)
-            }).collect();
+        let inherited_fields: Vec<(String, crate::TypeInfo)> = self
+            .cross_module_chain(symbols, options)
+            .iter()
+            .skip(1)
+            .flat_map(|(base, syms, opts, _)| base.infer_fields(syms, opts).unwrap_or_default())
+            .collect();
         // Base initialization and virtual dispatch need a separate flow
         // model before inherited absent slots can be exposed safely.
-        if !inherited.is_empty() {
+        if inherited_fields
+            .iter()
+            .any(|(_, ty)| ThreadMethod::receiver_is_thread(ty))
+        {
             return Err(format!(
                 "inherited thread fields of class `{}` (line {}) are not supported yet; \
                  use composition; rython refuses to silently expose uninitialized thread fields",
-                self.name, self.body.first().and_then(|s| s.lineno).unwrap_or(0),
-            ).into());
+                self.name,
+                self.body.first().and_then(|s| s.lineno).unwrap_or(0),
+            )
+            .into());
         }
-        let mut thread_fields: std::collections::BTreeSet<String> = fields.iter()
+        let mut thread_fields: std::collections::BTreeSet<String> = fields
+            .iter()
             .filter(|(_, ty)| ThreadMethod::receiver_is_thread(ty))
-            .map(|(name, _)| name.clone()).collect();
+            .map(|(name, _)| name.clone())
+            .collect();
         // Also catch a Thread first stored outside __init__, including a
         // class with no __init__ (infer_fields has no layout in that case).
+        // Each Thread store's line is kept for the field-type check below.
+        let mut thread_stores: Vec<(String, usize)> = Vec::new();
         for method in self.methods() {
-            let mut names = std::collections::HashMap::new();
+            let thread_locals = thread_bound_locals(&method.body, symbols);
             visit::walk_stmts(&method.body, Descend::SkipDefs, &mut |stmt| {
                 if let StatementType::Assign(a) = &stmt.statement
-                    && let [ExprType::Name(n)] = a.targets.as_slice()
-                    && let ExprType::Call(c) = &a.value
-                    && crate::ThreadingType::constructor(&c.func, symbols)
-                        == Some(crate::ThreadingType::Thread)
+                    && stores_thread(&a.value, &thread_locals, symbols)
                 {
-                    names.insert(n.id.clone(), crate::TypeInfo::Threading(crate::ThreadingType::Thread));
+                    for target in &a.targets {
+                        if let ExprType::Attribute(attr) = target
+                            && visit::is_self(&attr.value)
+                        {
+                            thread_fields.insert(attr.attr.clone());
+                            thread_stores.push((attr.attr.clone(), stmt.lineno.unwrap_or(0)));
+                        }
+                    }
                 }
                 Flow::Continue
             });
-            let mut stores = Vec::new();
-            collect_field_stores(&method.body, &mut stores);
-            for store in stores {
-                let holds_thread = match store.value {
-                    ExprType::Call(c) => crate::ThreadingType::constructor(&c.func, symbols)
-                        == Some(crate::ThreadingType::Thread),
-                    ExprType::Name(n) => names.get(&n.id).is_some_and(ThreadMethod::receiver_is_thread),
-                    _ => false,
-                };
-                if holds_thread {
-                    thread_fields.insert(store.attr);
-                }
-            }
         }
         if thread_fields.is_empty() {
             return Ok(());
@@ -3269,9 +3328,16 @@ impl ClassDef {
                  initialize each field unconditionally in __init__ before reading it or \
                  passing/calling self, and keep the attribute present; \
                  rython refuses to silently replace an uninitialized thread field with None",
-                thread_fields.iter().map(|f| format!("`self.{f}`")).collect::<Vec<_>>().join(", "),
-                self.name, line, reason,
-            ).into()
+                thread_fields
+                    .iter()
+                    .map(|f| format!("`self.{f}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.name,
+                line,
+                reason,
+            )
+            .into()
         };
         for method in self.methods() {
             let mut deletion = None;
@@ -3299,7 +3365,10 @@ impl ClassDef {
         let mut initialized = class_constant_names(&self.body);
         initialized.retain(|name| !instance_stores.contains(name));
         let Some(init) = self.init_method() else {
-            return Err(refusal(self.body.first().and_then(|s| s.lineno).unwrap_or(0), "without __init__ initialization"));
+            return Err(refusal(
+                self.body.first().and_then(|s| s.lineno).unwrap_or(0),
+                "without __init__ initialization",
+            ));
         };
         for stmt in &init.body {
             if pending.is_empty() {
@@ -3346,7 +3415,35 @@ impl ClassDef {
             }
         }
         if !pending.is_empty() {
-            return Err(refusal(self.body.first().and_then(|s| s.lineno).unwrap_or(0), "conditional or missing __init__ initialization"));
+            return Err(refusal(
+                self.body.first().and_then(|s| s.lineno).unwrap_or(0),
+                "conditional or missing __init__ initialization",
+            ));
+        }
+        // A Thread stored into a field whose other stores are not threads
+        // or None (`self.t = 0` in __init__, `self.t = Thread(...)` later):
+        // the field's one Rust type cannot hold the handle, and a boxed
+        // value would drop every start()/join() on it (issue #529).
+        for (attr, line) in thread_stores {
+            let ty = fields
+                .iter()
+                .chain(&inherited_fields)
+                .find(|(name, _)| *name == attr)
+                .map(|(_, ty)| ty);
+            if let Some(ty) = ty
+                && !ThreadMethod::receiver_is_thread(ty)
+            {
+                return Err(format!(
+                    "thread field `self.{attr}` of class `{}` (line {line}) is also \
+                     assigned a value that is neither a threading.Thread nor None \
+                     (its stores type the field `{}`), which is not supported yet; \
+                     keep the attribute a thread or None (annotate it \
+                     `Optional[threading.Thread]`) and store the other value in a \
+                     separate attribute; rython refuses to silently drop the \
+                     thread's start()/join() calls",
+                    self.name, ty.display(),
+                ).into());
+            }
         }
         Ok(())
     }
@@ -3776,6 +3873,46 @@ fn collect_field_stores<'a>(body: &'a [Statement], out: &mut Vec<FieldStore<'a>>
         }
         Flow::Continue
     });
+}
+
+/// The locals some plain assignment in `body` binds to a
+/// `threading.Thread(...)` construction (`worker = threading.Thread(...)`,
+/// later stored as `self.worker = worker`). Nested scopes stay out: their
+/// names are not this method's locals.
+fn thread_bound_locals(
+    body: &[Statement],
+    symbols: &SymbolTableScopes,
+) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    visit::walk_stmts(body, Descend::SkipDefs, &mut |stmt| {
+        if let StatementType::Assign(a) = &stmt.statement
+            && let [ExprType::Name(n)] = a.targets.as_slice()
+            && let ExprType::Call(c) = &a.value
+            && crate::ThreadingType::constructor(&c.func, symbols)
+                == Some(crate::ThreadingType::Thread)
+        {
+            names.insert(n.id.clone());
+        }
+        Flow::Continue
+    });
+    names
+}
+
+/// Whether a field store's value is a Thread handle: a constructor call,
+/// or a local `thread_bound_locals` found bound to one.
+fn stores_thread(
+    value: &ExprType,
+    thread_locals: &std::collections::BTreeSet<String>,
+    symbols: &SymbolTableScopes,
+) -> bool {
+    match value {
+        ExprType::Call(c) => {
+            crate::ThreadingType::constructor(&c.func, symbols)
+                == Some(crate::ThreadingType::Thread)
+        }
+        ExprType::Name(n) => thread_locals.contains(&n.id),
+        _ => false,
+    }
 }
 
 impl CodeGen for ClassDef {

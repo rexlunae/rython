@@ -13930,6 +13930,151 @@ fn thread_instance_fields_refuse_unsupported_methods_and_targets() {
 }
 
 #[test]
+fn a_lazily_created_thread_field_joins_its_none_store_into_option_thread() {
+    // Issue #529: `self.t = None` in __init__ and `self.t = Thread(...)` in
+    // another method is one attribute holding a thread or None. It used to
+    // box into PyValue (E0277) and drop start()/join()/is_alive() with
+    // warnings. The stores join into Option<threading::Thread>, whose None
+    // is the Python value None: a lifecycle call on it raises CPython's
+    // catchable AttributeError (the runtime pins live in convert_tests).
+    for (import, constructor) in [
+        ("import threading", "threading.Thread"),
+        ("import threading as th", "th.Thread"),
+        ("from threading import Thread", "Thread"),
+        ("from threading import Thread as Worker", "Worker"),
+    ] {
+        for (shape, store) in [
+            (
+                "direct",
+                format!("        self.t = {constructor}(target=work, args=(self.n,))\n"),
+            ),
+            (
+                "local",
+                format!(
+                    "        t = {constructor}(target=work, args=(self.n,))\n        self.t = t\n        t.start()\n"
+                ),
+            ),
+        ] {
+            let source = format!(
+                "{import}\ndef work(n: int) -> None:\n    print('work', n)\nclass Pool:\n    def __init__(self):\n        self.t = None\n        self.n = 3\n    def start(self):\n{store}    def stop(self):\n        if self.t is not None:\n            self.t.join()\n            print('joined', self.t.is_alive())\n            self.t = None\n"
+            );
+            let (out, warnings) = compile_with_warnings(&source, "lazy_thread_field.py");
+            assert!(
+                out.contains("pub t : Option < threading :: Thread >"),
+                "{shape} {import}: {out}"
+            );
+            assert!(out.contains("self . t = None ;"), "{shape} {import}: {out}");
+            assert!(
+                out.contains(". join ()") && out.contains(". is_alive ()"),
+                "{shape} {import}: {out}"
+            );
+            assert!(
+                out.contains("PyException :: new (\"AttributeError\" , \"'NoneType' object has no attribute 'join'\")"),
+                "{shape} {import}: {out}"
+            );
+            assert!(
+                !out.contains("PyValue :: from (threading"),
+                "{shape} {import}: {out}"
+            );
+            assert!(
+                !warnings.iter().any(|w| w.contains("dropped")),
+                "{shape} {import}: {warnings:?}"
+            );
+            match shape {
+                // The constructor path follows the import spelling
+                // (`threading::Thread`, `th::Thread`, `Thread`, `Worker`).
+                "direct" => assert!(
+                    out.contains("self . t = Some (") && out.contains(":: new (\"work\""),
+                    "{out}"
+                ),
+                // The local is read again after the store: the field takes
+                // a clone of the Arc handle, the same thread (no E0382).
+                _ => assert!(out.contains("self . t = Some ((t) . clone ())"), "{out}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn a_lazily_created_thread_field_refuses_unsound_stores_and_initialization() {
+    // Issue #529: only None and Thread stores join into Option<Thread>. Any
+    // other value leaves a field type that cannot hold the handle, so the
+    // Thread store is refused at conversion instead of failing E0277 (or,
+    // were a boxed Thread ever modeled, silently dropping start()/join()).
+    let header = "import threading\ndef work(n: int) -> None:\n    print('work', n)\ndef make() -> object:\n    return 1\nclass Pool:\n";
+    let start = "    def start(self):\n        self.t = threading.Thread(target=work, args=(1,))\n";
+    for (shape, body, field_type) in [
+        (
+            "int field",
+            "    def __init__(self):\n        self.t = 0\n",
+            "`int`",
+        ),
+        (
+            "int store",
+            "    def __init__(self):\n        self.t = None\n    def other(self):\n        self.t = 5\n",
+            "`any`",
+        ),
+        (
+            "unknown store",
+            "    def __init__(self):\n        self.t = None\n    def other(self):\n        self.t = make()\n",
+            "`any`",
+        ),
+    ] {
+        let error = compile_err(&format!("{header}{body}{start}"), "lazy_thread_mixed.py");
+        assert!(
+            error.contains("thread field `self.t` of class `Pool` (line ")
+                && error.contains("neither a threading.Thread nor None")
+                && error.contains(field_type)
+                && error.contains("Optional[threading.Thread]")
+                && error.contains("refuses"),
+            "{shape}: {error}"
+        );
+    }
+    // The None store is the attribute's initialization, so the #481/#516
+    // guards still demand it unconditionally in __init__ before any read:
+    // a conditional None, a read before it, a None stored only by another
+    // method, and deletion all leave a state where CPython raises
+    // AttributeError for the attribute itself.
+    for body in [
+        "    def __init__(self, flag: bool):\n        if flag:\n            self.t = None\n",
+        "    def __init__(self):\n        print(self.t)\n        self.t = None\n",
+        "    def __init__(self):\n        self.n = 1\n    def reset(self):\n        self.t = None\n",
+        "    def __init__(self):\n        self.t = None\n    def clear(self):\n        del self.t\n",
+    ] {
+        let error = compile_err(
+            &format!("{header}{body}{start}"),
+            "lazy_thread_uninitialized.py",
+        );
+        assert!(
+            error.contains("thread field(s) `self.t`")
+                && error.contains("initialize")
+                && error.contains("refuses"),
+            "{error}"
+        );
+    }
+    let error = compile_err(
+        &format!("{header}    def __init__(self):\n        self.t = None\n{start}class Child(Pool):\n    def __init__(self):\n        super().__init__()\n"),
+        "lazy_thread_inherited.py",
+    );
+    assert!(
+        error.contains("inherited thread fields") && error.contains("refuses"),
+        "{error}"
+    );
+    // Constructor arguments keep #516's definite-assignment rule.
+    let error = compile_err(
+        &format!(
+            "{header}    def __init__(self):\n        self.t = None\n    def configure(self):\n        self.m = 2\n    def start(self):\n        self.t = threading.Thread(target=work, args=(self.m,))\n"
+        ),
+        "lazy_thread_argument.py",
+    );
+    assert!(
+        error.contains("reads `self.m` before it is definitely assigned")
+            && error.contains("refuses"),
+        "{error}"
+    );
+}
+
+#[test]
 fn threading_thread_unsupported_shapes_error_loudly() {
     // A lambda target is the callable-as-value divergence: loud.
     let err = compile_err(
