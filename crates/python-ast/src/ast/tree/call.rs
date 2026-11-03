@@ -11087,6 +11087,22 @@ let mutating_self_field = boxed_self_ref_receiver
                     },
                 ))
         {
+            // A subclassed receiver can dispatch to a method defined only
+            // by a subclass (issue #520). A typed base stub gives the trait
+            // machinery that slot; the fallback must not erase the call.
+            if options.hierarchy_roots.contains_key(&class.name) {
+                return Err(format!(
+                    "call to `{}.{}(...)` on subclassed class `{}` cannot be \
+                     resolved as a supported method or callable field yet; \
+                     declare a method stub with concrete argument/return types \
+                     on `{}` and override it in subclasses; \
+                     rython refuses to drop the call or invent a None result",
+                    crate::ast::tree::call::expr_chain_spelling(&attr.value),
+                    attr.attr,
+                    class.name,
+                    class.name
+                ).into());
+            }
             options.definition_warnings.borrow_mut().push(format!(
                 "call to `{}.{}(...)` is dropped: the member is neither a \
                  method nor a field of `{}` (the member is an unmodeled \

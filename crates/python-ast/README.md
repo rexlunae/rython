@@ -85,6 +85,10 @@ request for a concrete `typing.Callable` signature. They cannot silently
 skip the call or substitute `None`; typed and boxed callable paths keep
 their modeled runtime behavior.
 
+Calls from a base-class method to a method defined only by subclasses are
+also refused: declare a typed stub on the base class and override it in
+subclasses so the generated trait can dispatch the call.
+
 Pytest runner references (`pytest.main`, `console_main`, `cmdline.main`,
 including imported aliases and function values) are refused during
 conversion. There is no native pytest collection or runner; run the suite under CPython or port to the supported

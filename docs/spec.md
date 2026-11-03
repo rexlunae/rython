@@ -1981,7 +1981,12 @@ impl Point {
   `AttributeError: 'C' object has no attribute 'f'` at the access
   (§12.2). The attribute needs one type across the subclasses that
   assign it, and the class's whole subtree must live in one module;
-  otherwise the read stays the loud unknown field. `type(self)` and
+  otherwise the read stays the loud unknown field. A call such as
+  `self.value()` to a method defined only by subclasses is a conversion
+  error (issue #520), not a dropped call returning `None`. Declare a
+  base method stub with concrete argument/return types (for example,
+  `def value(self) -> int: raise NotImplementedError`) and override it
+  in subclasses to use virtual dispatch. `type(self)` and
   `type(self).__name__` in an inherited method name the INSTANCE's
   class (the trait default's implementor, issue #411), as in CPython.
   Rust structs have no subtyping, so a slot
@@ -3031,6 +3036,7 @@ accepted as permanent spec:
 | Immediate `list(... for ...)` construction reuses list-comprehension lowering. Comprehensions refuse borrowed mutable container outputs, mutable walrus results, identity casts, and unresolved outputs without an ownership proof rather than silently detach them from their source; immutable values and fresh container literals remain supported (§4.4) | Correct-or-loud (issues #506, #507) |
 | Static subclass-registry comprehensions construct fresh instances from the converted hierarchy. Filters and iterator/constructor arguments are refused instead of discarded (§4.4); live runtime class discovery is not modeled | Correct-or-loud (issue #509); static discovery remains a model limit |
 | Calls through unresolved callable parameters fail conversion, naming the parameter and requesting concrete `typing.Callable` argument/return types. The old fallback skipped the invocation and returned `None`, including when a same-named scalar module function made a comprehension output appear immutable | Loud (issue #510); typed and boxed callable paths remain modeled |
+| An unresolved method call on a polymorphic base class, including `self.m()` where only a subclass defines `m`, fails conversion rather than skipping the call and returning `None`. Declare a typed method stub on the base to give virtual dispatch a slot | Loud (issue #520); declared base methods and subclass overrides remain modeled |
 | `with` does not call `__enter__`/`__exit__` (Drop approximates cleanup) | Model limit; correct for the supported file objects |
 | `is`/`is not` on non-`None` operands lower to `==`/`!=` | Model limit (no identity model) |
 | `raise X from Y` folds the cause into the message; no `__cause__` | Model limit |
