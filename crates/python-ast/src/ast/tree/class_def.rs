@@ -2878,7 +2878,7 @@ impl ClassDef {
                     && stores
                         .iter()
                         .filter(|s| s.attr == *name)
-                        .all(|s| crate::is_none_expr(s.value))
+                        .all(FieldStore::is_none)
             })
             .map(|(name, _)| name.clone())
             .collect();
@@ -2918,9 +2918,12 @@ impl ClassDef {
                     continue;
                 }
                 if none_declared.contains(&store.attr) {
-                    let observed = if crate::is_none_expr(store.value) {
+                    let observed = if store.is_none() {
                         ObservedStore::NoneLiteral
-                    } else if stores_thread(store.value, &thread_locals, symbols) {
+                    } else if store
+                        .expr()
+                        .is_some_and(|value| stores_thread(value, &thread_locals, symbols))
+                    {
                         ObservedStore::Typed(crate::TypeInfo::Threading(
                             crate::ThreadingType::Thread,
                         ))
