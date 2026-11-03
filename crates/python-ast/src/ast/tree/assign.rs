@@ -273,7 +273,7 @@ impl<'a> CodeGen for Assign {
                 if let Some(values) = literal_elts(&self.value)
                     && let Some(elts) = pattern_elts(target)
                     && values.len() == elts.len()
-                    && values.iter().skip(1).all(|v| inert_store_value(v, target))
+                    && values.iter().skip(1).all(inert_store_value)
                 {
                     let mut stream = TokenStream::new();
                     for (t, v) in elts.iter().zip(values) {
@@ -288,6 +288,15 @@ impl<'a> CodeGen for Assign {
                         );
                     }
                     return Ok(stream);
+                }
+                if has_effectful_later_unpack_value(target, &self.value) {
+                    return Err(
+                        "tuple/list unpacking into attributes with later non-literal RHS values \
+                         is not supported yet; unpack into local names before assigning \
+                         attributes separately; rython refuses to evaluate an RHS expression \
+                         after an earlier target store"
+                            .into(),
+                    );
                 }
             }
         }
@@ -2177,29 +2186,43 @@ fn pattern_has_starred(target: &ExprType) -> bool {
     })
 }
 
-/// Whether evaluating `value` AFTER some of `target`'s stores yields what
-/// evaluating it before them does: it runs no code and reads nothing
-/// those stores can change — a literal, a name the pattern does not bind,
-/// or a container literal of such values. `self.a, self.b = 1, x` may
-/// store `self.a` before evaluating `x`; `self.a, self.b = self.b,
-/// self.a` may not (issue #527).
-fn inert_store_value(value: &ExprType, target: &ExprType) -> bool {
+/// Whether evaluating `value` after an earlier target store is guaranteed
+/// to be observationally inert. Names are not safe: an earlier property
+/// setter can rebind a global or captured name (`self.a, self.b = 1, x`,
+/// issue #542). Literal elements are safe to evaluate after earlier stores.
+fn inert_store_value(value: &ExprType) -> bool {
     match value {
         ExprType::Constant(_) | ExprType::NoneType(_) => true,
         ExprType::UnaryOp(u) => matches!(u.operand.as_ref(), ExprType::Constant(_)),
-        ExprType::Name(n) => !crate::ast::tree::visit::target_binds(target, &n.id),
-        ExprType::Tuple(t) => t.elts.iter().all(|e| inert_store_value(e, target)),
-        ExprType::List(items) => items.iter().all(|e| inert_store_value(e, target)),
+        ExprType::Tuple(t) => t.elts.iter().all(inert_store_value),
+        ExprType::List(items) => items.iter().all(inert_store_value),
         // A set member and a dict key are HASHED, which runs a user
         // class's `__hash__`: only literal ones qualify. A `**spread` (a
         // None key) calls the mapping's keys().
         ExprType::Set(s) => s.elts.iter().all(|e| matches!(e, ExprType::Constant(_))),
         ExprType::Dict(d) => {
             d.keys.iter().all(|k| matches!(k, Some(ExprType::Constant(_))))
-                && d.values.iter().all(|v| inert_store_value(v, target))
+                && d.values.iter().all(inert_store_value)
         }
         _ => false,
     }
+}
+
+/// Whether split stores would evaluate a non-literal element after an
+/// earlier target store. Such a store can run a property setter that
+/// changes the later expression's value (`self.a, self.b = 1, x`).
+fn has_effectful_later_unpack_value(target: &ExprType, value: &ExprType) -> bool {
+    let (Some(targets), Some(values)) = (pattern_elts(target), literal_elts(value)) else {
+        return false;
+    };
+    if targets.len() != values.len() {
+        return false;
+    }
+    values.iter().skip(1).any(|v| !inert_store_value(v))
+        || targets
+            .iter()
+            .zip(values)
+            .any(|(t, v)| has_effectful_later_unpack_value(t, v))
 }
 
 pub(crate) fn is_container_literal(expr: &ExprType) -> bool {

@@ -3861,7 +3861,17 @@ fn paired_leaves<'a>(
         }
     };
     if elts.iter().any(|e| matches!(e, ExprType::Starred(_))) {
-        out.extend(visit::target_leaves(target).into_iter().map(|leaf| (leaf, StoredValue::Starred)));
+        for (index, elt) in elts.iter().enumerate() {
+            if matches!(elt, ExprType::Starred(_)) {
+                out.extend(
+                    visit::target_leaves(elt)
+                        .into_iter()
+                        .map(|leaf| (leaf, StoredValue::Starred)),
+                );
+            } else {
+                paired_leaves(elt, value.element(index, elts.len()), out);
+            }
+        }
         return;
     }
     let literal: Option<&'a [ExprType]> = match &value {

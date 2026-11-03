@@ -708,7 +708,11 @@ each `self.attr` leaf contributes a field, and a paired literal element
 determines its field type (`self.count, self.label = 1, "first"` declares
 an integer and an owned string field). A starred unpacking target that
 stores an attribute is rejected rather than guessing whether the field
-stores one element or the remaining list.
+stores one element or the remaining list. When a later RHS element is a
+non-literal expression, attribute unpacking is also rejected: an earlier
+property setter could mutate a global or captured value that the later
+element reads, whereas Python evaluates the entire RHS before any store.
+Unpack into locals first, then assign the attributes separately.
 
 ### 5.3 `with`
 
