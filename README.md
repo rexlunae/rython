@@ -131,8 +131,9 @@ signatures derived from how the parameter is used — `def add(a, b): return
 a + b` works for ints, floats, strings, and lists; `for x in p` infers
 `IntoIterator` with element propagation; unannotated parameters either
 infer or fail loudly at conversion time),
-classes (struct-based), control flow including `try`/`except`/`finally` and
-loop `else`, comprehensions (including immediate `list(... for ...)`
+classes (struct-based, with single inheritance including imported sibling
+package bases), control flow including `try`/`except`/`finally` and loop
+`else`, comprehensions (including immediate `list(... for ...)`
 consumption, with conversion errors for mutable or unresolved outputs
 whose sharing cannot be preserved), f-strings and `str.format` on literal
 templates, keyword arguments and defaults for user functions (plus
@@ -465,8 +466,7 @@ is complete. What's ahead:
 - Generalized decorator support (unblocks `dataclasses`, `property`,
   user-defined wrappers)
 - Generators and `yield` (likely as iterator-struct lowering)
-- Richer class model: inheritance (single, then multiple), common
-  dunder protocols
+- Richer class model: multiple inheritance and common dunder protocols
 - Automatic arbitrary-precision integer promotion, which will retire the
   current integer overflow limitation
 - An opt-in dynamic-typing escape hatch (boxed values) for multi-type

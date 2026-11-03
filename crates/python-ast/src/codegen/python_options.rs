@@ -157,9 +157,9 @@ pub struct ModuleClassInfo {
     /// (`from .animals import Dog; Dog("Rex")` maps arguments against the
     /// defining module's `__init__`).
     pub classes: std::collections::HashMap<String, crate::ClassDef>,
-    /// Hierarchy classes → trait names (`{Name}Trait` plus ancestors'),
-    /// for the cross-module trait imports the import statement emits.
-    pub traits: std::collections::HashMap<String, Vec<String>>,
+    /// Hierarchy classes → (defining module path, trait name) for the
+    /// class's trait and its ancestors, used by cross-module imports.
+    pub traits: std::collections::HashMap<String, Vec<(Vec<String>, String)>>,
 }
 
 /// State of the one-time cross-module class-resolution cache (see

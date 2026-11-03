@@ -13555,6 +13555,66 @@ fn run_package_status(
     )
 }
 
+#[test]
+fn package_main_inherits_from_a_sibling_module() {
+    let scratch = Scratch::new("main-cross-module-inheritance");
+    let krate = package_crate(
+        &scratch,
+        "maininherit",
+        &[
+            (
+                "base.py",
+                "class Base:\n    def __init__(self, value: int) -> None:\n        self.value = value\n    def get(self) -> int:\n        return self.value\n",
+            ),
+            (
+                "__main__.py",
+                "from .base import Base\nclass Child(Base):\n    def plus_one(self) -> int:\n        return self.get() + 1\ndef main() -> None:\n    child = Child(40)\n    print(child.value)\n    print(child.get())\n    print(child.plus_one())\nif __name__ == '__main__':\n    main()\n",
+            ),
+        ],
+    );
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated package failed to compile");
+    let output = Command::new(krate.root.join("target/debug/maininherit"))
+        .output()
+        .expect("running generated package");
+    // Verified against python3.
+    assert_eq!(output.stdout, b"40\n40\n41\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn imported_base_methods_and_fields_are_available_to_a_package_subclass() {
+    let scratch = Scratch::new("imported-base-inheritance");
+    let krate = package_crate(
+        &scratch,
+        "crossinherit",
+        &[
+            (
+                "base.py",
+                "class Base:\n    def __init__(self, value: int) -> None:\n        self.value = value\n    def get(self) -> int:\n        return self.value\n",
+            ),
+            (
+                "child.py",
+                "from .base import Base\nclass Child(Base):\n    def plus_one(self) -> int:\n        return self.get() + 1\n",
+            ),
+            (
+                "cli.py",
+                "from .child import Child\ndef main() -> None:\n    child = Child(40)\n    print(child.value)\n    print(child.get())\n    print(child.plus_one())\nif __name__ == '__main__':\n    main()\n",
+            ),
+        ],
+    );
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated package failed to compile");
+    let output = Command::new(krate.root.join("target/debug/crossinherit"))
+        .output()
+        .expect("running generated package");
+    // Verified against python3.
+    assert_eq!(output.stdout, b"40\n40\n41\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
 /// Convert, build and run a single-file program; its stderr with the
 /// `Ran N tests in T.TTTs` time normalized to `T`, and its exit code.
 fn unittest_report(name: &str, source: &str) -> (String, i32) {
