@@ -17,7 +17,9 @@ A Rust library for parsing Python code into Abstract Syntax Trees (AST) and expe
 ## 🚀 Quick Start
 
 `threading.Thread` retains its runtime handle type through local variables
-and initialized instance fields, including aliased imports. Field defaults
+and instance fields, including aliased imports. A field initialized to
+`None` and later assigned a Thread retains `Option<Thread>` rather than
+falling back to `PyValue`. Field defaults
 do not construct placeholder threads; arguments bind at the Python
 constructor point, and `start()` runs the target. Initialize thread fields
 unconditionally in `__init__` before reading them or exposing `self`.

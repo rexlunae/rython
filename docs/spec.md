@@ -2615,8 +2615,10 @@ instance fields, including `import threading as th` and
 `Option<threading::Thread>` as initially absent storage: struct defaults do
 not construct threads, consume thread names, or run targets. The real
 assignment evaluates `args` once at construction, then stores the handle;
-`start` alone runs the target. A thread field must be initialized by an
-unconditional top-level assignment in `__init__` before it is read or
+`start` alone runs the target. A field initialized to `None` in `__init__`
+may later receive a Thread and remains an `Option<threading::Thread>`
+(issue #529). A thread field must be initialized by an unconditional
+top-level assignment in `__init__` before it is read or
 `self` escapes/is called. Fields read by constructor arguments also need
 preceding unconditional stores: this holds for EVERY Thread constructor in
 the class. In `__init__`, the store must come earlier in its top-level
