@@ -1894,7 +1894,11 @@ impl Point {
   `setUp`. `unittest.main()` discovers TestCase classes bound in the
   entry module, including supported `from ... import` bindings and
   aliases; each bound name is loaded in name order, and report IDs retain
-  the class's defining module. The runner follows the MRO for tests,
+  the class's defining module. Top-level classes selected by statically
+  resolved version guards remain discoverable after normalization.
+  Bindings the runner cannot track statically (including escaped,
+  unpacked, or walrus-bound TestCase values) are conversion errors rather
+  than silently omitted. The runner follows the MRO for tests,
   overrides, default
   arguments, fixtures, and gates, and constructs a fresh instance for
   every test. Each ancestor's base resolves in the module that defines
