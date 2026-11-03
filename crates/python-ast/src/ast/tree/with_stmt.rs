@@ -157,7 +157,8 @@ fn assert_raises_exception_name(
             crate::ast::tree::raise_stmt::stdlib_exception_canonical(module, &attr.attr)
                 .map(str::to_string)
                 .or_else(|| {
-                    crate::ast::tree::raise_stmt::is_builtin_exception_name(&attr.attr)
+                    (module == "builtins"
+                        && crate::ast::tree::raise_stmt::is_builtin_exception_name(&attr.attr))
                         .then(|| attr.attr.clone())
                 })
                 .ok_or_else(|| format!(

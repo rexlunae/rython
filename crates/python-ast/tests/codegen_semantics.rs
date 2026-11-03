@@ -29869,6 +29869,46 @@ fn assert_raises_dynamic_exception_attribute_is_refused_at_source_location() {
 }
 
 #[test]
+fn assert_raises_unknown_module_exception_attribute_is_refused() {
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "import socket\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(socket.ValueError):\n",
+            "            raise ValueError(\"boom\")\n",
+        ),
+        "assert_raises_unknown_module_exception.py",
+    );
+    assert!(
+        err.contains("line 5")
+            && err.contains("socket.ValueError")
+            && err.contains("not statically known"),
+        "unknown module attributes must not be inferred to be builtin exceptions: {err}"
+    );
+}
+
+#[test]
+fn assert_raises_builtin_module_exception_is_supported() {
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "import builtins\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(builtins.ValueError):\n",
+            "            raise ValueError(\"boom\")\n",
+        ),
+        "assert_raises_builtins_exception.py",
+    );
+    assert!(
+        out.contains("assert_raises (\"ValueError\""),
+        "known builtin exception attributes must retain their canonical name: {out}"
+    );
+}
+
+#[test]
 fn assert_raises_socket_module_alias_is_canonicalized() {
     let out = compile(
         concat!(

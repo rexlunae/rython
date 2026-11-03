@@ -1929,9 +1929,11 @@ impl Point {
 - **`assertRaises` context managers** catch the expected exception and
   propagate an unexpected one. The `as cm` form supports reads of
   `cm.exception` after the block; other uses or bindings of the context
-  object, reads before the block completes, context targets bound under
-  control flow, and control flow escaping the block are refused rather than
-  silently changing the context-manager semantics (issue #523).
+  object, and reads before the block completes are refused. A later read is
+  also refused when control flow cannot prove the target was bound (for
+  example, when the `with` is conditional), as is control flow escaping the
+  block; these cases would silently change context-manager semantics
+  (issue #523).
 - **Construction**: `Point(1.0, 2.0)` lowers to `Point::new(…)?`. The
   synthesized `new` defaults the struct then runs `__init__`. A
   user-defined method named `new` is a loud error.
