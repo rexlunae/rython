@@ -13419,6 +13419,39 @@ fn unittest_main_runs_a_testcase_imported_into_the_entry_module() {
 }
 
 #[test]
+fn unittest_main_runs_the_selected_version_gated_testcase() {
+    let scratch = Scratch::new("ut_version_gated_case");
+    let krate = package_crate(
+        &scratch,
+        "ut_version_gated_case",
+        &[(
+            "cli.py",
+            concat!(
+                "import sys\n",
+                "import unittest\n",
+                "\n",
+                "if sys.version_info >= (3, 11):\n",
+                "    class Versioned(unittest.TestCase):\n",
+                "        def test_selected(self) -> None:\n",
+                "            print(\"selected version\")\n",
+                "else:\n",
+                "    class Versioned(unittest.TestCase):\n",
+                "        def test_other(self) -> None:\n",
+                "            print(\"other version\")\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    unittest.main()\n",
+            ),
+        )],
+    );
+    // Verified against python3 3.14.4: sys.version_info selects the first
+    // class, and unittest.main() runs test_selected exactly once.
+    let (stdout, status) = run_package_status(&krate, "ut_version_gated_case");
+    assert_eq!(stdout, ["selected version"]);
+    assert_eq!(status, 0);
+}
+
+#[test]
 fn unittest_cross_module_runner_inputs_and_qualified_construction_are_refused() {
     // A gate condition or test default inherited from another module would
     // be rendered against this module's names (#519 review): refused.

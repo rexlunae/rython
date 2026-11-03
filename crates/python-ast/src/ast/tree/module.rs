@@ -4407,6 +4407,12 @@ pub(crate) fn splice_gated_branches(
                 let branch = if taken { &i.body } else { &i.orelse };
                 let branch = splice_gated_branches(branch.clone(), options);
                 for b in branch {
+                    // This suite is now in the enclosing scope. In
+                    // particular, a selected module-level class must not
+                    // retain its source indentation and look like a nested
+                    // class hoisted from a preceding class (#543).
+                    let mut b = b;
+                    b.col_offset = s.col_offset;
                     out.push(b);
                 }
                 continue;
