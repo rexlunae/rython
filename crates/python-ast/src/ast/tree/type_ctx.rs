@@ -4831,7 +4831,13 @@ fn analyze_statement_types(
             // exception: the function lowering rewrote every `cm.exception`
             // read to `cm` (issue #523).
             if let StatementType::With(With { items, .. }) = &stmt.statement
-                && crate::ast::tree::with_stmt::is_assert_raises_with(items)
+                && let (Some(symbols), Some(options)) = (symbols, options)
+                && crate::ast::tree::with_stmt::is_testcase_assert_raises_with(
+                    items,
+                    self_class,
+                    symbols,
+                    options,
+                )
                 && let Some(vars) = &items[0].optional_vars
             {
                 seed_binder_types(

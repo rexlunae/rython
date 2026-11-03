@@ -23125,13 +23125,14 @@ fn unittest_assert_raises_with_a_raise_builds_and_runs() {
 fn unittest_assert_raises_as_cm_builds_and_runs() {
     // Issue #523: the `as cm` context manager must suppress the caught
     // exception and expose it as `cm.exception` after the block.
-    // Verified against python3: three tests pass, exit 0.
+    // Verified against python3: four tests pass, exit 0.
     let scratch = Scratch::new("assert-raises-as-cm");
     let file = scratch.path().join("t.py");
     fs::write(
         &file,
         concat!(
             "import unittest\n",
+            "import socket as s\n",
             "\n",
             "class T(unittest.TestCase):\n",
             "    def test_caught_exception(self) -> None:\n",
@@ -23147,6 +23148,11 @@ fn unittest_assert_raises_as_cm_builds_and_runs() {
             "    def test_without_target(self) -> None:\n",
             "        with self.assertRaises(ZeroDivisionError):\n",
             "            1 // 0\n",
+            "\n",
+            "    def test_socket_timeout_alias(self) -> None:\n",
+            "        with self.assertRaises(s.timeout) as cm:\n",
+            "            raise TimeoutError(\"timed out\")\n",
+            "        self.assertEqual(type(cm.exception).__name__, \"TimeoutError\")\n",
             "\n",
             "if __name__ == \"__main__\":\n",
             "    unittest.main()\n",
@@ -23180,7 +23186,7 @@ fn unittest_assert_raises_as_cm_builds_and_runs() {
     assert_eq!(
         output.status.code(),
         Some(0),
-        "three passing assertRaises tests exit 0 like python3: {combined}"
+        "four passing assertRaises tests exit 0 like python3: {combined}"
     );
 }
 

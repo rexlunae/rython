@@ -18,7 +18,11 @@ Deviation ledger: [`spec.md`](spec.md) §12.
   former build failure and its cause are recorded below as history.
 - **`with self.assertRaises(E) as cm:` works** since #523: the matching
   exception is suppressed, and `cm.exception` can be read after the block.
-  Uses of the context object other than `.exception` are refused.
+  Uses of the context object other than `.exception` are refused. `E` must
+  be statically known; dynamic attributes such as
+  `self.failureException` are refused with a source-located error. Aliased
+  imports of known stdlib exception classes (for example
+  `import socket as s; s.timeout`) resolve to their canonical class.
 - **There is no pytest runner or automatic collection.** A module with
   only `test_*` functions remains a library. An unresolved `import pytest`
   warns through the external-module channel (#456); attempts to use

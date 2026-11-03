@@ -1039,7 +1039,12 @@ fn walk_with_body(
     a: &mut Analysis<'_>,
     multi: bool,
 ) {
-    if crate::ast::tree::with_stmt::is_assert_raises_with(items) {
+    if crate::ast::tree::with_stmt::is_testcase_assert_raises_with(
+        items,
+        a.ctx.enclosing_class_name(),
+        a.symbols,
+        a.options,
+    ) {
         let before = a.state.clone();
         walk_stmts(body, a, multi);
         a.record_closure_boundary(&before);

@@ -29849,6 +29849,112 @@ fn assert_raises_context_target_is_only_supported_through_exception() {
 }
 
 #[test]
+fn assert_raises_dynamic_exception_attribute_is_refused_at_source_location() {
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(self.failureException) as cm:\n",
+            "            raise AssertionError(\"boom\")\n",
+        ),
+        "assert_raises_dynamic_exception.py",
+    );
+    assert!(
+        err.contains("line 4")
+            && err.contains("failureException")
+            && err.contains("not statically known"),
+        "dynamic exception attributes must be refused with a location and rewrite: {err}"
+    );
+}
+
+#[test]
+fn assert_raises_socket_module_alias_is_canonicalized() {
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "import socket as s\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(s.timeout):\n",
+            "            raise s.timeout(\"timed out\")\n",
+        ),
+        "assert_raises_socket_alias.py",
+    );
+    assert!(
+        out.contains("assert_raises (\"TimeoutError\""),
+        "`socket.timeout` through alias `s` must use its canonical class name: {out}"
+    );
+}
+
+#[test]
+fn nested_function_parameter_does_not_rebind_assert_raises_target() {
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(ValueError) as cm:\n",
+            "            raise ValueError(\"boom\")\n",
+            "        def helper(cm: int) -> int:\n",
+            "            return cm\n",
+            "        print(str(cm.exception))\n",
+        ),
+        "assert_raises_nested_parameter.py",
+    );
+    assert!(
+        out.contains("helper") && out.contains("assert_raises_exception"),
+        "a nested parameter may shadow the outer context target: {out}"
+    );
+}
+
+#[test]
+fn arbitrary_assert_logs_attribute_uses_generic_with_lowering() {
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "class T:\n",
+            "    def t(self, obj: object) -> None:\n",
+            "        with obj.assertLogs(\"example\"):\n",
+            "            print(\"body\")\n",
+            "        with obj.assertWarns(Warning):\n",
+            "            print(\"body\")\n",
+            "        with obj.assertRaisesRegex(ValueError, \"example\"):\n",
+            "            print(\"body\")\n",
+        ),
+        "generic_assert_logs.py",
+    );
+    assert!(
+        out.contains("body") && !out.contains("assertLogs is not supported"),
+        "an arbitrary receiver must not enter TestCase-specific handling: {out}"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning.contains("dropped")),
+        "the generic path retains its existing loud-drop warning: {warnings:?}"
+    );
+}
+
+#[test]
+fn assert_raises_on_non_testcase_self_uses_generic_with_lowering() {
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "class T:\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(ValueError):\n",
+            "            print(\"body\")\n",
+        ),
+        "non_testcase_assert_raises.py",
+    );
+    assert!(
+        out.contains("body") && !out.contains("assert_raises ("),
+        "a non-TestCase self method must not receive unittest lowering: {out}"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning.contains("dropped")),
+        "the generic path retains its existing loud-drop warning: {warnings:?}"
+    );
+}
+
+#[test]
 fn an_assert_raises_body_that_only_assigns_locally_still_converts() {
     // No read after the block: the closure's locals are fine, and the crate
     // must still convert (the refusal above is narrowly about the read).

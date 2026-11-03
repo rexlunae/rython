@@ -60,7 +60,118 @@ pub(crate) fn testcase_context(expr: &ExprType) -> Option<(TestCaseContext, &cra
     let ExprType::Attribute(a) = c.func.as_ref() else {
         return None;
     };
+    if !matches!(a.value.as_ref(), ExprType::Name(n) if n.id == "self") {
+        return None;
+    }
     TestCaseContext::from_name(&a.attr).map(|kind| (kind, c))
+}
+
+fn is_testcase_receiver(
+    expr: &ExprType,
+    ctx: &CodeGenContext,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    let Some((_, call)) = testcase_context(expr) else {
+        return false;
+    };
+    let ExprType::Attribute(attr) = call.func.as_ref() else {
+        return false;
+    };
+    if !matches!(attr.value.as_ref(), ExprType::Name(name) if name.id == "self") {
+        return false;
+    }
+    let Some(class_name) = ctx.enclosing_class_name() else {
+        return false;
+    };
+    matches!(symbols.get(class_name), Some(SymbolTableNode::ClassDef(class)) if class.is_testcase(symbols, options))
+}
+
+fn assert_raises_exception_name(
+    expr: &ExprType,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+    line: usize,
+) -> Result<String, String> {
+    let Some((_, call)) = testcase_context(expr) else {
+        return Err(format!(
+            "line {line}: `assertRaises` context is not a statically recognized TestCase receiver; \
+             use a named exception class directly; rython refuses to guess which class is caught"
+        ));
+    };
+    let Some(exception) = call.args.first() else {
+        return Err(format!(
+            "line {line}: `assertRaises` needs one statically known exception class; \
+             pass the class directly; rython refuses to guess which class is caught"
+        ));
+    };
+    match exception {
+        ExprType::Name(_) => crate::ast::tree::try_stmt::caught_class_name(exception, symbols, options)
+            .and_then(Result::ok)
+            .ok_or_else(|| format!(
+                "line {line}: `assertRaises` exception class is not statically known; \
+                 name a supported exception class directly; rython refuses to guess which class is caught"
+            ))
+            .map(|name| {
+                if symbols.get(&name).is_none() {
+                    crate::ast::tree::raise_stmt::builtin_class_dunder_name(&name).to_string()
+                } else {
+                    name
+                }
+            }),
+        ExprType::Attribute(attr) => {
+            let ExprType::Name(module_name) = attr.value.as_ref() else {
+                return Err(format!(
+                    "line {line}: dynamic exception attribute `.{}` in `assertRaises` is not supported yet; \
+                     use a statically imported exception class such as `ValueError`; \
+                     rython refuses to guess which class is caught",
+                    attr.attr
+                ));
+            };
+            let mut imported_name = module_name.id.clone();
+            let mut aliased_module = None;
+            let mut imported_module = None;
+            for _ in 0..8 {
+                match symbols.get(&imported_name) {
+                    Some(SymbolTableNode::Alias(target)) => {
+                        aliased_module = Some(target.clone());
+                        imported_name = target.clone();
+                    }
+                    Some(SymbolTableNode::Import(import)) => {
+                        imported_module = import
+                            .names
+                            .iter()
+                            .find(|alias| {
+                                alias.asname.as_deref().unwrap_or(&alias.name) == imported_name
+                            })
+                            .map(|alias| alias.name.clone());
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            let module = imported_module
+                .as_deref()
+                .or(aliased_module.as_deref())
+                .unwrap_or(&module_name.id);
+            crate::ast::tree::raise_stmt::stdlib_exception_canonical(module, &attr.attr)
+                .map(str::to_string)
+                .or_else(|| {
+                    crate::ast::tree::raise_stmt::is_builtin_exception_name(&attr.attr)
+                        .then(|| attr.attr.clone())
+                })
+                .ok_or_else(|| format!(
+                    "line {line}: exception attribute `{}.{}` in `assertRaises` is not statically known; \
+                     use a supported imported exception class directly; \
+                     rython refuses to guess which class is caught",
+                    module_name.id, attr.attr
+                ))
+        }
+        _ => Err(format!(
+            "line {line}: dynamic exception expression in `assertRaises` is not supported yet; \
+             name a supported exception class directly; rython refuses to guess which class is caught"
+        )),
+    }
 }
 
 /// The exception class EXPRESSION of a `self.assertRaises(Exc)` context
@@ -89,6 +200,18 @@ pub(crate) fn is_assert_raises_with(items: &[WithItem]) -> bool {
             .optional_vars
             .as_ref()
             .is_none_or(|v| matches!(v, ExprType::Name(_)))
+}
+
+pub(crate) fn is_testcase_assert_raises_with(
+    items: &[WithItem],
+    class_name: Option<&str>,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> bool {
+    class_name
+        .and_then(|name| symbols.get(name))
+        .is_some_and(|node| matches!(node, SymbolTableNode::ClassDef(class) if class.is_testcase(symbols, options)))
+        && is_assert_raises_with(items)
 }
 
 /// Whether a `with` body contains a `return`, or a `break`/`continue`
@@ -143,8 +266,12 @@ pub enum AssertRaisesTarget {
 pub(crate) fn bind_assert_raises_targets(
     body: &mut [Statement],
     params: &[String],
+    testcase: bool,
 ) -> Result<(), String> {
     use crate::ast::tree::visit::{self, Bindings, Descend, Flow};
+    if !testcase {
+        return Ok(());
+    }
     // The names this scope binds through the supported `as` form, with the
     // line of their first such binding.
     let mut targets: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -173,7 +300,7 @@ pub(crate) fn bind_assert_raises_targets(
     let mut rebound: Option<String> = None;
     visit::walk_stmts(body, Descend::SkipDefs, &mut |s| {
         let own = assert_raises_target_name(s);
-        for name in visit::stmt_bound_names(s, Bindings::Every) {
+        for name in visit::stmt_bound_names(s, Bindings::Scope) {
             if let Some(first) = targets.get(&name)
                 && own != Some(name.as_str())
             {
@@ -576,6 +703,7 @@ impl CodeGen for With {
         let kinds: Vec<TestCaseContext> = self
             .items
             .iter()
+            .filter(|item| is_testcase_receiver(&item.context_expr, &ctx, &symbols, &options))
             .filter_map(|item| testcase_context(&item.context_expr).map(|(kind, _)| kind))
             .collect();
         // `with self.subTest(...):` — the unittest reporting CM (issue #334).
@@ -693,25 +821,12 @@ impl With {
         // The class name as the except clause canonicalizes it — CPython's
         // `expected.__name__` for the failure message, and the name the
         // raise side records for the match.
-        let exc = match crate::ast::tree::try_stmt::caught_class_name(
-            &call.args[0],
+        let exc = assert_raises_exception_name(
+            &self.items[0].context_expr,
             &symbols,
             &options,
-        ) {
-            // A builtin alias (`IOError`) is its class (`OSError`) unless
-            // the module binds the name itself.
-            Some(Ok(name)) if symbols.get(&name).is_none() => {
-                crate::ast::tree::raise_stmt::builtin_class_dunder_name(&name).to_string()
-            }
-            Some(Ok(name)) => name,
-            Some(Err(msg)) => return Err(msg.into()),
-            None => {
-                return Err(unsupported(
-                    "with an exception class that is not a name or a dotted name",
-                    "name the exception class directly",
-                ));
-            }
-        };
+            self.lineno.unwrap_or(0),
+        )?;
         if body_escapes_a_closure(&self.body) {
             return Err(unsupported(
                 "around a `return`, `break` or `continue` that leaves the block (CPython's \
