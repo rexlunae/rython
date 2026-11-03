@@ -197,6 +197,12 @@ unknown arguments and unsupported specialized constructors are conversion
 errors; see [the exception specification](docs/spec.md#8-exceptions).
 `socket.gaierror` and `herror` keep their distinct OSError subtype matching.
 
+Absolute imports of a package's own modules (`from pkg import helper`,
+`from pkg.helper import f`, `import pkg.helper`, including aliases) resolve
+like relative imports, using the Python import name rather than the
+distribution name. Ambiguous root-relative layouts with an inner module
+also named `pkg` reject absolute self-imports; use relative imports.
+
 Known gaps:
 
 - **pytest**: no automatic collection or native runner. Function-only

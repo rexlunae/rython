@@ -11147,6 +11147,32 @@ fn compile_with_options(
 }
 
 #[test]
+fn ambiguous_absolute_self_imports_fail_conversion() {
+    let mut defs = std::collections::HashMap::new();
+    for path in [
+        vec![],
+        vec!["absimp".to_string()],
+        vec!["helper".to_string()],
+    ] {
+        defs.insert(path, std::rc::Rc::new(parse("", "fixture.py").unwrap()));
+    }
+    let options = PythonOptions::from(PythonOptionsData {
+        python_namespace: "absimp".to_string(),
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    });
+    for source in ["from absimp import helper\n", "import absimp.helper\n"] {
+        let error = compile_with_options(source, "cli.py", options.clone())
+            .expect_err("ambiguous absolute self-import must fail loudly");
+        assert!(
+            error.contains("absolute import") && error.contains("ambiguous"),
+            "{error}"
+        );
+        assert!(error.contains("relative spelling"), "{error}");
+    }
+}
+
+#[test]
 fn async_binary_entry_is_feature_gated_and_imports_runtime() {
     // A BINARY conversion (async_runtime_dep) emits the runtime import and
     // the entry attribute behind the async-tokio feature, plus a

@@ -719,8 +719,25 @@ impl<'a> CodeGen for Attribute {
                     crate::ast::tree::module::module_promoted_static_names(&options, &path)
                         .contains(&self.attr)
                 }));
+        // The ROOT of a module chain an unaliased `import pkg` / `import
+        // pkg.sub` binds to a crate package (issue #532): no Rust `use`
+        // binds that name, so the root renders as the package's crate path
+        // — `import absimp.helper; absimp.helper.greet()` inside `absimp`
+        // is `crate::helper::greet()`.
+        let crate_rooted_chain: Option<Vec<String>> = match self.value.as_ref() {
+            ExprType::Name(root) if module_chain && !root_shadowed => {
+                import_bound_crate_package(&root.id, &symbols, &options)
+            }
+            _ => None,
+        };
         // The fallibility rule (the review's fix 2, round 99): a method
-        let mut value_tokens = self.value.to_rust_receiver(ctx, options, symbols)?;
+        let mut value_tokens = match &crate_rooted_chain {
+            Some(path) => {
+                let segs = path.iter().map(|s| crate::safe_ident(s));
+                quote!(crate #(::#segs)*)
+            }
+            None => self.value.to_rust_receiver(ctx, options, symbols)?,
+        };
         if let Some(_inner) = option_receiver {
             let attr_name = self.attr.clone();
             value_tokens = quote!((#value_tokens).clone().unwrap_or_else(|| {
@@ -1419,6 +1436,36 @@ pub(crate) enum FieldRewrite {
     AccessorChain { depth: usize },
 }
 
+/// The crate path of the PACKAGE an unaliased `import pkg` / `import
+/// pkg.sub` binds to `name` (= `pkg`), when that binding has no Rust `use`
+/// of its own: the dotted form (Python binds the package root, while the
+/// emitted `use`, if any, names the leaf), or a package whose crate path is
+/// not its Python name — the converted package's own root under a crate
+/// keyed relative to it, which is the crate itself (`import absimp` inside
+/// `absimp` → the empty path; issue #532). None for anything else; a
+/// vendored `[python-modules]` root keeps its own `crate::<dep>` rendering.
+pub(crate) fn import_bound_crate_package(
+    name: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<Vec<String>> {
+    let Some(SymbolTableNode::Import(im)) = symbols.get(name) else {
+        return None;
+    };
+    if options.python_modules.contains(name) || crate::module_name_shadowed(name, symbols) {
+        return None;
+    }
+    let dotted = im.names.iter().any(|a| {
+        a.asname.is_none() && a.name.contains('.') && a.name.split('.').next() == Some(name)
+    });
+    let plain = im.names.iter().any(|a| a.asname.is_none() && a.name == name);
+    if !dotted && !plain {
+        return None;
+    }
+    let key = crate::ast::tree::module::crate_module_bound_to(name, symbols, options)?;
+    (dotted || !(key.len() == 1 && key[0] == name)).then_some(key)
+}
+
 /// True when a dotted expression chain is rooted at a plain module import
 /// (`import pylev` or `import pylev as p`): `pylev.fn`, `p.alias.sub.fn`.
 /// The root name must be bound to an `Import` node — an ImportFrom binding
@@ -1450,17 +1497,21 @@ pub(crate) fn is_module_path_chain(
                         options,
                     )
                 }
-                // A RELATIVE SUBMODULE import (`from . import exceptions`,
-                // `from .util import ssl_`): the name IS a module when the
-                // submodule exists in the crate — attribute reads resolve
-                // as paths (`exceptions.SecurityWarning`,
+                // A crate SUBMODULE import (`from . import exceptions`,
+                // `from .util import ssl_`, or the absolute spellings —
+                // `from urllib3.contrib import pyopenssl`, `from absimp
+                // import helper` inside `absimp`, issue #532): the name IS a
+                // module when the submodule exists in the crate — attribute
+                // reads resolve as paths (`exceptions.SecurityWarning`,
                 // `ssl_.ALPN_PROTOCOLS`). A sibling that re-exports a
                 // STDPYTHON module (`from .compat import json as
                 // complexjson` — requests' models.py, where compat.py does
                 // `import json`) is ALSO a module path: the import lowered
                 // to `use <stdpython>::json as complexjson;`, so
                 // `complexjson.dumps(...)` resolves as `complexjson::dumps`.
-                Some(SymbolTableNode::ImportFrom(ifm)) if ifm.level > 0 => {
+                // A VALUE import (`from .utils import make_headers`) is not
+                // a module (`module + name` is not a crate module).
+                Some(SymbolTableNode::ImportFrom(ifm)) if ifm.targets_crate(options) => {
                     // The submodule the import names is the DEFINING name
                     // (`from .compat import json as complexjson` binds
                     // `complexjson` to compat's `json`).
@@ -1481,14 +1532,9 @@ pub(crate) fn is_module_path_chain(
                             .is_some()
                         })
                 }
-                // An ABSOLUTE import whose name resolves to a crate
-                // SUBMODULE (`from urllib3.contrib import pyopenssl` —
-                // requests/__init__.py's dead pyopenssl branch): the name
-                // is a module when `module + name` is a module of the
-                // crate — attribute calls resolve as paths
-                // (`pyopenssl::inject_into_urllib3`). A VALUE import
-                // (`from .utils import make_headers`) is not a module
-                // (`module + name` is not a crate module).
+                // An ABSOLUTE import from outside the crate whose `module +
+                // name` is still a crate module (an import from a package
+                // the crate does not convert, naming a module it does).
                 Some(SymbolTableNode::ImportFrom(ifm)) if ifm.level == 0 => {
                     let mut sub = ifm.resolved_module_path(options);
                     sub.push(ifm.defining_name(&n.id));
