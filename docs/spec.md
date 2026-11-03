@@ -1891,7 +1891,11 @@ impl Point {
 - **TestCase method-created fields** (issues #480, #511): a direct or
   inherited `unittest.TestCase` subclass discovers `self.attr = ...`
   through the shared method-field analysis even without `__init__` or
-  `setUp`. The runner follows the MRO for tests, overrides, default
+  `setUp`. `unittest.main()` discovers TestCase classes bound in the
+  entry module, including supported `from ... import` bindings and
+  aliases; each bound name is loaded in name order, and report IDs retain
+  the class's defining module. The runner follows the MRO for tests,
+  overrides, default
   arguments, fixtures, and gates, and constructs a fresh instance for
   every test. Each ancestor's base resolves in the module that defines
   it, so `Child(Middle)` is a TestCase when `Middle` comes from another

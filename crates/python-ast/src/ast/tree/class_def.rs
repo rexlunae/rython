@@ -8237,3 +8237,13 @@ pub(crate) fn hoist_nested_classes(mut body: Vec<Statement>) -> Vec<Statement> {
     }
     body
 }
+
+/// Whether a MODULE-BODY statement is a class [`hoist_nested_classes`]
+/// moved out of its outer class: the hoisted statement keeps its source
+/// position, indented under the outer class, while a class statement of
+/// the module body itself starts in column 0 (a compound statement never
+/// follows a `;`). Python never bound it in the module namespace, so the
+/// unittest loader does not see `Outer.Inner` (issue #522).
+pub(crate) fn is_hoisted_nested_class(s: &Statement) -> bool {
+    matches!(s.statement, StatementType::ClassDef(_)) && s.col_offset.is_some_and(|c| c > 0)
+}

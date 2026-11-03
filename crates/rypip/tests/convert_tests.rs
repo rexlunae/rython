@@ -13386,6 +13386,39 @@ fn unittest_finds_a_testcase_through_a_multi_module_base_chain() {
 }
 
 #[test]
+fn unittest_main_runs_a_testcase_imported_into_the_entry_module() {
+    let scratch = Scratch::new("ut_imported_case");
+    let krate = package_crate(
+        &scratch,
+        "ut_imported_case",
+        &[
+            (
+                "cases.py",
+                "import unittest\n\n\nclass Imported(unittest.TestCase):\n    def test_imported(self) -> None:\n        print(\"imported test\")\n        self.assertEqual(1, 2)\n",
+            ),
+            (
+                "cli.py",
+                "import unittest\nfrom .cases import Imported as Alias\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+            ),
+        ],
+    );
+    assert!(build_generated(&krate.root).success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/ut_imported_case"))
+        .output()
+        .expect("running generated binary");
+    // Verified against Python 3.14.4 with the imported class's
+    // `__module__` set to `ut_imported_case.cases`.
+    assert_eq!(output.stdout, b"imported test\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("FAIL: test_imported (ut_imported_case.cases.Imported.test_imported)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Ran 1 test in "), "{stderr}");
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
 fn unittest_cross_module_runner_inputs_and_qualified_construction_are_refused() {
     // A gate condition or test default inherited from another module would
     // be rendered against this module's names (#519 review): refused.
@@ -13404,8 +13437,14 @@ fn unittest_cross_module_runner_inputs_and_qualified_construction_are_refused() 
             ),
         ],
     );
-    assert!(error.contains("TestCase `Child` inherits `Base`'s skipIf/skipUnless condition from another module")
-        && error.contains("refuses"), "{error}");
+    // `Base` is itself imported into the entry module, so CPython's loader
+    // sees it as a separate test name as well as running the derived Child.
+    assert!(
+        error.contains(
+            "TestCase `Base` is imported with `Base`'s skipIf/skipUnless condition from another module"
+        ) && error.contains("refuses"),
+        "{error}"
+    );
     // A TestCase base spelled through its module is not followed by the
     // base chain. CPython runs Child's inherited and own tests (verified
     // with python3 3.14.4: `Ran 3 tests`); leaving them out is refused.

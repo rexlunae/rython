@@ -1652,23 +1652,37 @@ impl CodeGen for Module {
                             &symbols,
                         )
                         .map_err(|e| wrap_module_error(&module_filename, e.into()))?;
-                        for body_stmt in &if_stmt.body {
+                        for (body_index, body_stmt) in if_stmt.body.iter().enumerate() {
                             // A `unittest.main()` call lowers to the emitted
-                            // test runner (issue #334): construct the module's
-                            // TestCase classes and run their test_* methods,
+                            // test runner (issue #334): construct the TestCase
+                            // classes `__main__` binds when the call runs
+                            // (issue #522) and run their test_* methods,
                             // instead of the runtime's loud stub.
                             if let Some(call) = matched_unittest_main(body_stmt) {
                                 let exits = unittest_main_exits(call).map_err(|e| {
                                     wrap_module_error(&module_filename, e.into())
                                 })?;
-                                refuse_cross_module_runner_inputs(
+                                let (before, nested) = statements_before_runner(
+                                    &module_raw_body[..stmt_index],
+                                    &if_stmt.body[..body_index],
+                                );
+                                let cases = runner_cases(
+                                    &before,
+                                    &nested,
                                     &module_raw_body,
                                     &symbols,
                                     &options,
                                 )
                                 .map_err(|e| wrap_module_error(&module_filename, e.into()))?;
-                                if let Some(runner) = emit_test_runner(
+                                refuse_cross_module_runner_inputs(
                                     &module_raw_body,
+                                    &cases,
+                                    &symbols,
+                                    &options,
+                                )
+                                .map_err(|e| wrap_module_error(&module_filename, e.into()))?;
+                                if let Some(runner) = emit_test_runner(
+                                    &cases,
                                     exits,
                                     ctx.clone(),
                                     options.clone(),
@@ -7579,11 +7593,433 @@ fn testcase_method(
         })
 }
 
+/// One `TestCase` class `unittest.main()` loads (issue #522). CPython's
+/// `TestLoader.loadTestsFromModule` walks `dir(__main__)`, so it runs every
+/// NAME the module has bound to a `TestCase` subclass when the call runs: a
+/// class the module imports as well as one it defines, once per name bound
+/// to it (a class bound under two names runs twice), in name order.
+#[derive(Clone)]
+struct RunnerCase {
+    /// The name the entry module's Rust reaches the class by: the class's
+    /// own, or the crate-import binding it came in through (its `use`).
+    rust_name: String,
+    class: crate::ClassDef,
+    /// The class's `__qualname__`: its name, or `Outer.Inner` for a class
+    /// nested in another (hoisted to module level by the normalization).
+    qualname: String,
+    /// The class's DEFINING scope: its bases, fixtures and tests resolve
+    /// there.
+    symbols: crate::SymbolTableScopes,
+    options: crate::PythonOptions,
+    /// The defining crate module; None for a class of the entry module.
+    module: Option<Vec<String>>,
+}
+
+impl RunnerCase {
+    /// A TestCase class of the entry module itself.
+    fn local(
+        class: &crate::ClassDef,
+        qualname: String,
+        symbols: &crate::SymbolTableScopes,
+        options: &crate::PythonOptions,
+    ) -> Option<Self> {
+        class.is_testcase(symbols, options).then(|| RunnerCase {
+            rust_name: class.name.clone(),
+            class: class.clone(),
+            qualname,
+            symbols: symbols.clone(),
+            options: options.clone(),
+            module: None,
+        })
+    }
+
+    /// `unittest.util.strclass`: the class's `__module__` and
+    /// `__qualname__`, the prefix of a test's id (`__main__.Local`,
+    /// `impt.cases.Imported`).
+    fn class_id(&self, options: &crate::PythonOptions) -> String {
+        let module = match &self.module {
+            Some(key) => python_module_name(options, key),
+            None => "__main__".to_string(),
+        };
+        format!("{module}.{}", self.qualname)
+    }
+}
+
+/// What each `__main__` name holds when `unittest.main()` runs, as far as
+/// the runner cares: a `TestCase` class (`Some`) or anything else (`None`),
+/// one entry per runtime alternative. Values, not names: `X = T` takes
+/// what `T` holds THERE, so a later rebinding of `T` does not reach `X`.
+#[derive(Default)]
+struct CaseFlow {
+    names: std::collections::BTreeMap<String, Vec<Option<RunnerCase>>>,
+    /// The line of each name's latest binding statement, for the errors.
+    lines: HashMap<String, usize>,
+    /// The nested TestCase classes the normalization hoisted, by the name
+    /// their `Outer.Inner` references were rewritten to: no `__main__`
+    /// name, but what an alias of `Outer.Inner` holds.
+    nested: HashMap<String, RunnerCase>,
+}
+
+impl CaseFlow {
+    /// A binding of `name` to `values` (its alternatives). Unconditional,
+    /// it replaces the name's earlier ones; under control flow it is one
+    /// more alternative, and a name first bound there may stay unbound.
+    fn bind(&mut self, name: &str, values: Vec<Option<RunnerCase>>, conditional: bool, line: usize) {
+        self.lines.insert(name.to_string(), line);
+        match self.names.get_mut(name) {
+            Some(alts) if conditional => alts.extend(values),
+            Some(alts) => *alts = values,
+            None if conditional => {
+                self.names.insert(name.to_string(), std::iter::once(None).chain(values).collect());
+            }
+            None => {
+                self.names.insert(name.to_string(), values);
+            }
+        }
+    }
+
+    /// The TestCase `name` may hold.
+    fn holds_testcase(&self, name: &str) -> Option<&RunnerCase> {
+        self.names.get(name)?.iter().flatten().next()
+    }
+
+    /// What reading `name` gives here: its alternatives, a hoisted nested
+    /// class, or (unbound, or bound to no TestCase) nothing the runner runs.
+    fn read(&self, name: &str) -> Vec<Option<RunnerCase>> {
+        match (self.names.get(name), self.nested.get(name)) {
+            (Some(held), _) => held.clone(),
+            (None, Some(nested)) => vec![Some(nested.clone())],
+            (None, None) => vec![None],
+        }
+    }
+}
+
+/// The imported class `name` of the crate module at `key`, when it is a
+/// TestCase: resolved through re-exports to its defining module, whose
+/// scope its MRO resolves in.
+fn imported_runner_case(
+    key: &[String],
+    name: &str,
+    rust_name: &str,
+    options: &crate::PythonOptions,
+) -> Option<RunnerCase> {
+    let (class, symbols, defining) = resolve_imported_class_with_path(options, key, name, 0)?;
+    let mut class_options = defining_module_context(options, &defining);
+    class_options.this_module_path = defining.clone();
+    class.is_testcase(&symbols, &class_options).then(|| RunnerCase {
+        rust_name: rust_name.to_string(),
+        qualname: class.name.clone(),
+        class,
+        symbols,
+        options: class_options,
+        module: Some(defining),
+    })
+}
+
+/// The statements of the entry module that have run when the
+/// `unittest.main()` call in its `__main__` block does: the module body up
+/// to the block, then the block's statements before the call. An earlier
+/// `__main__` block's body is spliced in — in the entry module the guard
+/// holds (the emission reads every such block the same way). A class the
+/// normalization hoisted out of its outer class is no module binding: it
+/// comes back apart, with its `__qualname__` (`Outer.Inner`).
+fn statements_before_runner(
+    module_prefix: &[crate::Statement],
+    block_prefix: &[crate::Statement],
+) -> (Vec<crate::Statement>, Vec<(String, crate::ClassDef)>) {
+    let mut out = Vec::new();
+    let mut nested = Vec::new();
+    // The hoisted classes follow their outer class.
+    let mut outer: Option<&str> = None;
+    for s in module_prefix {
+        match &s.statement {
+            crate::StatementType::ClassDef(c)
+                if crate::ast::tree::class_def::is_hoisted_nested_class(s) =>
+            {
+                let qualname = match outer {
+                    Some(o) => format!("{o}.{}", c.name),
+                    None => c.name.clone(),
+                };
+                nested.push((qualname, c.clone()));
+            }
+            crate::StatementType::ClassDef(c) => {
+                outer = Some(&c.name);
+                out.push(s.clone());
+            }
+            crate::StatementType::If(i) if is_main_guard(&i.test) => {
+                out.extend(i.body.iter().cloned());
+            }
+            _ => out.push(s.clone()),
+        }
+    }
+    out.extend(block_prefix.iter().cloned());
+    (out, nested)
+}
+
+/// The TestCase a value expression may evaluate to, or store as a
+/// container's element: a name holding one, a class read through its
+/// module (`cases.Imported`), either branch of a conditional, an operand
+/// of `and` / `or`, a walrus's value.
+fn testcase_value(
+    e: &crate::ExprType,
+    flow: &CaseFlow,
+    symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> Option<String> {
+    let value = |v: &crate::ExprType| testcase_value(v, flow, symbols, options);
+    match e {
+        crate::ExprType::Name(n) => {
+            flow.read(&n.id).iter().flatten().next().map(|c| c.class.name.clone())
+        }
+        crate::ExprType::Attribute(a) => {
+            let crate::ExprType::Name(m) = a.value.as_ref() else {
+                return None;
+            };
+            let key = crate_module_bound_to(&m.id, symbols, options)?;
+            imported_runner_case(&key, &a.attr, &a.attr, options).map(|c| c.class.name)
+        }
+        crate::ExprType::IfExp(i) => value(&i.body).or_else(|| value(&i.orelse)),
+        crate::ExprType::BoolOp(b) => b.values.iter().find_map(value),
+        crate::ExprType::NamedExpr(ne) => value(&ne.right),
+        crate::ExprType::Starred(st) => value(&st.value),
+        _ => crate::ast::tree::visit::container_values(e).into_iter().find_map(value),
+    }
+}
+
+/// Run `stmts` through the [`CaseFlow`]: each statement's module-scope
+/// bindings, in source order, a control-flow body's as alternatives.
+fn case_flow(
+    stmts: &[crate::Statement],
+    nested: bool,
+    flow: &mut CaseFlow,
+    symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> Result<(), String> {
+    use crate::ast::tree::visit::{
+        Bindings, any_expr_for, conditional_walrus_names, stmt_bound_names, target_names,
+    };
+    for s in stmts {
+        let line = s.lineno.unwrap_or(0);
+        // `if TYPE_CHECKING:` never runs; its `else:` always does.
+        if let crate::StatementType::If(i) = &s.statement
+            && Module::is_type_checking_test(&i.test)
+        {
+            case_flow(&i.orelse, nested, flow, symbols, options)?;
+            continue;
+        }
+        // A loop's own target binds only when the loop runs at all.
+        let conditional = nested
+            || matches!(
+                s.statement,
+                crate::StatementType::For(_) | crate::StatementType::AsyncFor(_)
+            );
+        let conditional_walruses = conditional_walrus_names(s);
+        // A walrus binds its target to its value wherever it sits.
+        let mut walrus_case: Option<String> = None;
+        for e in stmt_exprs(s) {
+            any_expr_for(e, Descend::OwnScope, |x| {
+                if let crate::ExprType::NamedExpr(ne) = x {
+                    walrus_case = testcase_value(&ne.right, flow, symbols, options);
+                }
+                walrus_case.is_some()
+            });
+        }
+        if let Some(class) = walrus_case {
+            return Err(unfollowed_testcase_store(&class, line));
+        }
+        // The forms whose value the runner follows; every other binding
+        // the visitor reports holds something that is not a class.
+        let mut values: HashMap<String, Vec<Option<RunnerCase>>> = HashMap::new();
+        let mut modeled = true;
+        match &s.statement {
+            crate::StatementType::ClassDef(c) => {
+                let case = RunnerCase::local(c, c.name.clone(), symbols, options);
+                values.insert(c.name.clone(), vec![case]);
+            }
+            crate::StatementType::ImportFrom(i) => {
+                let path = i.resolved_module_path(options);
+                if let Some(key) = module_defs_key(options, &path) {
+                    for a in &i.names {
+                        if a.name == "*" {
+                            for n in star_import_names(i, key, line, options)? {
+                                let case = imported_runner_case(key, &n, &n, options);
+                                values.insert(n, vec![case]);
+                            }
+                            continue;
+                        }
+                        let local = a.asname.as_deref().unwrap_or(&a.name);
+                        let case = imported_runner_case(key, &a.name, local, options);
+                        values.insert(local.to_string(), vec![case]);
+                    }
+                }
+            }
+            // `Again = Local`: a second name for what `Local` holds now
+            // (the emission drops the store; the runner reaches the class
+            // by its own binding).
+            crate::StatementType::Assign(a)
+                if matches!(a.value, crate::ExprType::Name(_))
+                    && a.targets.iter().all(|t| matches!(t, crate::ExprType::Name(_))) =>
+            {
+                let held = match &a.value {
+                    crate::ExprType::Name(v) => flow.read(&v.id),
+                    _ => vec![None],
+                };
+                for t in &a.targets {
+                    for n in target_names(t) {
+                        values.insert(n.to_string(), held.clone());
+                    }
+                }
+            }
+            // `del Local`: the name is gone from `dir()`.
+            crate::StatementType::Delete(targets) => {
+                for t in targets {
+                    for n in target_names(t) {
+                        values.insert(n.to_string(), vec![None]);
+                    }
+                }
+            }
+            _ => modeled = false,
+        }
+        // Any other store of a TestCase as a value (`Again = cases.Imported`,
+        // `A, B = Local, Other`, `for cls in (Local, Other):`, a class in a
+        // container or a conditional) binds a name the runner cannot
+        // follow to the class.
+        if !modeled
+            && !stmt_targets(s).is_empty()
+            && let Some(class) =
+                stmt_exprs(s).into_iter().find_map(|e| testcase_value(e, flow, symbols, options))
+        {
+            return Err(unfollowed_testcase_store(&class, line));
+        }
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::from(["*".to_string()]);
+        let mut names = stmt_bound_names(s, Bindings::Scope);
+        let mut extra: Vec<String> = values.keys().cloned().collect();
+        extra.sort();
+        names.extend(extra);
+        for n in names {
+            if !seen.insert(n.clone()) {
+                continue;
+            }
+            let held = values.remove(&n).unwrap_or_else(|| vec![None]);
+            flow.bind(&n, held, conditional || conditional_walruses.contains(&n), line);
+        }
+        // A binding the store flow does not model (an `except ... as`
+        // name, deleted after its handler; a comprehension or lambda
+        // name) may leave the name holding something else.
+        if !opens_scope(s) {
+            for n in stmt_bound_names(s, Bindings::Every) {
+                if seen.insert(n.clone()) {
+                    flow.bind(&n, vec![None], true, line);
+                }
+            }
+        }
+        for body in stmt_bodies_for(s, Descend::OwnScope) {
+            case_flow(body, true, flow, symbols, options)?;
+        }
+    }
+    Ok(())
+}
+
+/// The refusal for a TestCase stored by a form the runner does not follow.
+fn unfollowed_testcase_store(class: &str, line: usize) -> String {
+    format!(
+        "unittest.main(): the statement at line {line} binds a name to the TestCase `{class}` as \
+         a value (through its module, a conditional, a container, an unpacking, a loop or a \
+         walrus), which the emitted runner cannot follow yet; bind the class with `class`, \
+         `from ... import`, or a plain `Name = Class` alias; rython refuses to silently run \
+         or skip its tests"
+    )
+}
+
+/// The names `from <crate module> import *` binds (its exports); refused
+/// when they are unknown and may include a TestCase.
+fn star_import_names(
+    import: &crate::ImportFrom,
+    key: &[String],
+    line: usize,
+    options: &crate::PythonOptions,
+) -> Result<Vec<String>, String> {
+    if let Some(names) = crate::ast::tree::import::star_exports(options, key, 0) {
+        return Ok(names);
+    }
+    let candidates = crate::ast::tree::import::sibling_star_names(options, key);
+    match candidates.iter().find_map(|n| imported_runner_case(key, n, n, options)) {
+        Some(case) => Err(format!(
+            "unittest.main(): `from {} import *` at line {line} may bind the TestCase `{}`, but \
+             which names it binds is not known at conversion; import the TestCase classes by \
+             name; rython refuses to silently run or skip their tests",
+            import.module, case.class.name
+        )),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The TestCase classes a `unittest.main()` call loads, by the `__main__`
+/// name each is bound to, in `dir()` order (issue #522). `before` is what
+/// has run when the call does ([`statements_before_runner`]); a name that
+/// may or may not hold a TestCase then is refused.
+fn runner_cases(
+    before: &[crate::Statement],
+    nested: &[(String, crate::ClassDef)],
+    module_stmts: &[crate::Statement],
+    symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> Result<Vec<(String, RunnerCase)>, String> {
+    let mut flow = CaseFlow::default();
+    for (qualname, class) in nested {
+        if let Some(case) = RunnerCase::local(class, qualname.clone(), symbols, options) {
+            flow.nested.insert(class.name.clone(), case);
+        }
+    }
+    case_flow(before, false, &mut flow, symbols, options)?;
+    // A function that declares a TestCase's name `global` can rebind it
+    // before the runner starts.
+    let mut rebinding: Option<(String, usize)> = None;
+    walk_stmts(module_stmts, Descend::All, &mut |s| {
+        if let crate::StatementType::Global(names) = &s.statement
+            && let Some(n) = names.iter().find(|n| flow.holds_testcase(n).is_some())
+        {
+            rebinding = Some((n.clone(), s.lineno.unwrap_or(0)));
+            return Flow::Stop;
+        }
+        Flow::Continue
+    });
+    if let Some((name, line)) = rebinding {
+        return Err(format!(
+            "unittest.main(): the TestCase name `{name}` is declared `global` at line {line}, so \
+             a function may rebind it before the runner starts; this is not supported yet; give \
+             the function's variable another name; rython refuses to silently run or skip the \
+             tests of a rebound name"
+        ));
+    }
+    let mut cases = Vec::new();
+    for (name, alternatives) in &flow.names {
+        let Some(case) = flow.holds_testcase(name) else {
+            continue;
+        };
+        if alternatives.len() > 1 {
+            return Err(format!(
+                "unittest.main(): `{name}` may or may not be the TestCase `{}` when the runner \
+                 starts (it is bound, rebound or deleted under control flow, line {}); this is \
+                 not supported yet; bind the class unconditionally at module level; rython \
+                 refuses to silently run or skip its tests",
+                case.class.name,
+                flow.lines.get(name).copied().unwrap_or(0)
+            ));
+        }
+        cases.push((name.clone(), case.clone()));
+    }
+    Ok(cases)
+}
+
 /// The runner renders gate conditions and test-method defaults in THIS
-/// module. One inherited from a class in another module would be evaluated
-/// against the wrong names, so it is refused.
+/// module. If a class takes one from another module (its own, imported, or
+/// an ancestor's), it would be evaluated against the wrong names, so it is
+/// refused.
 fn refuse_cross_module_runner_inputs(
     module_stmts: &[crate::Statement],
+    cases: &[(String, RunnerCase)],
     symbols: &crate::SymbolTableScopes,
     options: &crate::PythonOptions,
 ) -> Result<(), String> {
@@ -7617,23 +8053,26 @@ fn refuse_cross_module_runner_inputs(
             }
         }
     }
-    for c in classes.iter().filter(|c| c.is_testcase(symbols, options)) {
+    for (name, case) in cases {
+        let imported = case.module.is_some();
         let refuse = |what: String| {
+            let how = if imported { "is imported with" } else { "inherits" };
             Err(format!(
-                "unittest.main(): TestCase `{}` inherits {what} from another module, which \
+                "unittest.main(): TestCase `{name}` {how} {what} from another module, which \
                  the emitted runner would evaluate against this module's names; this is not \
                  supported yet; repeat the gate or default in this module; rython refuses to \
-                 silently evaluate it in the wrong scope",
-                c.name
+                 silently evaluate it in the wrong scope"
             ))
         };
-        for (ancestor, _, _, path) in c.cross_module_chain(symbols, options) {
-            if path.is_some() && conditional(&ancestor.decorator_list) {
+        for (ancestor, _, _, path) in case.class.cross_module_chain(&case.symbols, &case.options) {
+            if (imported || path.is_some()) && conditional(&ancestor.decorator_list) {
                 return refuse(format!("`{}`'s skipIf/skipUnless condition", ancestor.name));
             }
         }
-        for m in test_method_names(c, symbols, options) {
-            if let Some((def, true)) = testcase_method(c, &m, symbols, options)
+        for m in test_method_names(&case.class, &case.symbols, &case.options) {
+            if let Some((def, other_module)) =
+                testcase_method(&case.class, &m, &case.symbols, &case.options)
+                && (imported || other_module)
                 && (conditional(&def.decorator_list) || !def.args.defaults.is_empty())
             {
                 return refuse(format!("`{m}`'s skipIf/skipUnless condition or default argument"));
@@ -7643,10 +8082,6 @@ fn refuse_cross_module_runner_inputs(
     Ok(())
 }
 
-/// Emit the runner tokens for a `unittest.main()` site, or None when the
-/// module has no direct `unittest.TestCase`-derived classes (nothing to run —
-/// leave `unittest.main()` to the runtime, which then raises its loud
-/// NotImplementedError).
 /// A test-runner gate the emitted runner carries out (issue #371).
 enum RunGate {
     Skip,
@@ -7681,43 +8116,45 @@ fn run_gates(decorators: &[crate::ExprType]) -> Vec<RunGate> {
     out
 }
 
+/// Emit the runner tokens for a `unittest.main()` site, or None when no
+/// TestCase is bound in `__main__` (nothing to run — leave
+/// `unittest.main()` to the runtime, which then raises its loud
+/// NotImplementedError). `cases` are [`runner_cases`]: CPython's
+/// TestLoader visits the module's names in `dir()` order, and each
+/// class's test methods in sorted order (getTestCaseNames sorts with
+/// three_way_cmp) — not definition order.
 fn emit_test_runner(
-    module_stmts: &[crate::Statement],
+    cases: &[(String, RunnerCase)],
     exits: bool,
     ctx: crate::CodeGenContext,
     options: crate::PythonOptions,
     symbols: crate::SymbolTableScopes,
 ) -> Option<TokenStream> {
-    let mut classes: Vec<crate::ClassDef> = Vec::new();
-    collect_class_defs(module_stmts, &mut classes);
-    // CPython's TestLoader visits the module's classes in `dir()` order and
-    // each class's test methods in sorted order (getTestCaseNames sorts
-    // with three_way_cmp) — not definition order.
-    let mut test_classes: Vec<&crate::ClassDef> = classes
-        .iter()
-        .filter(|c| c.is_testcase(&symbols, &options))
-        .collect();
-    test_classes.sort_by(|a, b| a.name.cmp(&b.name));
-    if test_classes.is_empty() {
+    if cases.is_empty() {
         return None;
     }
     let mut stmts = TokenStream::new();
-    for c in test_classes {
-        let cname = quote::format_ident!("{}", c.name);
+    for (_, case) in cases {
+        let c = &case.class;
+        // The class's own scope answers for its MRO: an imported class's
+        // bases, fixtures and tests are its defining module's.
+        let (class_symbols, class_options) = (&case.symbols, &case.options);
+        let cname = quote::format_ident!("{}", case.rust_name);
         // `setUp`/`tearDown` are per-test fixtures (CPython runs setUp before
         // and tearDown after every test method); an exception in either is
         // reported against the test, as `TestCase.run` reports it.
-        let setup = if testcase_method(c, "setUp", &symbols, &options).is_some() {
+        let setup = if testcase_method(c, "setUp", class_symbols, class_options).is_some() {
             quote!(|__rython_tc: &mut #cname| __rython_tc.setUp().map(|_| ()))
         } else {
             quote!(|_: &mut #cname| Ok(()))
         };
-        let teardown = if testcase_method(c, "tearDown", &symbols, &options).is_some() {
+        let teardown = if testcase_method(c, "tearDown", class_symbols, class_options).is_some() {
             quote!(|__rython_tc: &mut #cname| __rython_tc.tearDown().map(|_| ()))
         } else {
             quote!(|_: &mut #cname| Ok(()))
         };
-        for m in test_method_names(c, &symbols, &options) {
+        let class_id = case.class_id(&options);
+        for m in test_method_names(c, class_symbols, class_options) {
             let mident = quote::format_ident!("{}", m);
             // A test method with DEFAULTED parameters (`def test_encode(self,
             // encode=None, skip_bytes=False)` — idna's tests, issue #334):
@@ -7725,7 +8162,10 @@ fn emit_test_runner(
             // rendered against the parameter's slot (an unannotated one is
             // the boxed value). A parameter without a default is CPython's
             // TypeError at the call — left to rustc's arity error, loudly.
-            let test_def = testcase_method(c, &m, &symbols, &options).map(|(def, _)| def);
+            // Defaults render in THIS module: one from another module was
+            // refused (`refuse_cross_module_runner_inputs`).
+            let test_def =
+                testcase_method(c, &m, class_symbols, class_options).map(|(def, _)| def);
             let mut default_args: Vec<TokenStream> = Vec::new();
             if let Some(def) = &test_def {
                 let params: Vec<&crate::Parameter> =
@@ -7765,7 +8205,7 @@ fn emit_test_runner(
             // skipIf/skipUnless is an identity decorator, so an ancestor's
             // active skip still applies; combining their active gates
             // preserves that behavior.
-            let mut gates: Vec<RunGate> = c.cross_module_chain(&symbols, &options)
+            let mut gates: Vec<RunGate> = c.cross_module_chain(class_symbols, class_options)
                 .iter()
                 .flat_map(|(class, ..)| run_gates(&class.decorator_list))
                 .collect();
@@ -7797,10 +8237,11 @@ fn emit_test_runner(
                     RunGate::ExpectedFailure => expected_failure = true,
                 }
             }
-            // `str(test)` — `test_a (__main__.T.test_a)`; the emitted runner
-            // is in the program's `__main__` module — plus, as
+            // `str(test)` — `test_a (__main__.T.test_a)`, the class named by
+            // its DEFINING module (`impt.cases.Imported` for an imported
+            // one, whatever `__main__` binds it as) — plus, as
             // `getDescription` adds it, the docstring's first line.
-            let mut description = format!("{m} (__main__.{}.{m})", c.name);
+            let mut description = format!("{m} ({class_id}.{m})");
             if let Some(doc) = test_def.as_ref().and_then(|f| docstring_value(&f.body))
                 && let Some(first) = doc.trim().lines().next().map(str::trim)
                 && !first.is_empty()
@@ -8193,6 +8634,21 @@ pub fn module_defs_key<'a>(
     } else {
         None
     }
+}
+
+/// The Python `__name__` of the crate module at `key` (`impt.cases`): the
+/// converter's record of it (`module_python_names`), else — for an
+/// embedder that records none — the package namespace joined with the
+/// key, the spelling the import-cycle check uses.
+pub(crate) fn python_module_name(options: &PythonOptions, key: &[String]) -> String {
+    if let Some(name) = options.module_python_names.get(key) {
+        return name.clone();
+    }
+    std::iter::once(options.python_namespace.as_str())
+        .filter(|ns| !ns.is_empty())
+        .chain(key.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// The crate module a NAME is bound to (`from . import idnadata`,

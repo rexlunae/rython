@@ -2064,7 +2064,8 @@ fn convert_on_this_thread(
         &python_module_names,
         &module_defs,
         async_runtime_dep,
-        &package.name,
+        package,
+        &python_deps,
     );
     let mut transpiled: Vec<(&PyModule, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -2602,7 +2603,8 @@ fn convert_driver(
         &python_module_names,
         &module_defs,
         package_uses_async,
-        &package.name,
+        package,
+        &python_deps,
     );
     let code = transpile(module, &mut warnings, &base_options)?;
 
@@ -3267,8 +3269,10 @@ fn conversion_base_options(
     python_module_names: &std::collections::HashSet<String>,
     module_defs: &std::collections::HashMap<Vec<String>, std::rc::Rc<python_ast::Module>>,
     async_runtime_dep: bool,
-    package_name: &str,
+    package: &PyPackage,
+    python_deps: &[(String, PyPackage)],
 ) -> PythonOptions {
+    let package_name = package.name.as_str();
     PythonOptions::from(python_ast::PythonOptionsData {
         lossy_warnings: opts.warnings != WarningMode::Allow,
         no_std: opts.no_std,
@@ -3282,6 +3286,7 @@ fn conversion_base_options(
         rust_modules: std::rc::Rc::new(rust_modules.clone()),
         python_modules: std::rc::Rc::new(python_module_names.clone()),
         module_defs: std::rc::Rc::new(module_defs.clone()),
+        module_python_names: std::rc::Rc::new(module_python_names(package, python_deps)),
         async_runtime_dep,
         // The package's own name: root-qualified absolute self-imports
         // (`from urllib3.connection import ...`, pip's src-layout paths)
@@ -3290,6 +3295,38 @@ fn conversion_base_options(
         python_namespace: package_name.to_string(),
         ..Default::default()
     })
+}
+
+/// Each crate module's Python `__name__` by its module key (issue #522: a
+/// test's id names its class's defining module). A vendored dep's key
+/// already starts with its import name. The package's own keys are
+/// relative to its root package when it has one — the `__init__.py` with
+/// the empty key, named after its directory as `python3 -m impt` names
+/// `impt/cases.py` `impt.cases` — and are the whole name otherwise (a
+/// metadata-declared package's keys carry the package; a flat directory's
+/// modules are top-level).
+fn module_python_names(
+    package: &PyPackage,
+    python_deps: &[(String, PyPackage)],
+) -> HashMap<Vec<String>, String> {
+    let root = package
+        .modules
+        .iter()
+        .find(|m| m.is_init && m.path.is_empty())
+        .and_then(|m| m.file.parent()?.file_name()?.to_str().map(str::to_string));
+    let mut names = HashMap::new();
+    for module in &package.modules {
+        let name: Vec<&str> = root
+            .iter()
+            .map(String::as_str)
+            .chain(module.path.iter().map(String::as_str))
+            .collect();
+        names.insert(module.path.clone(), name.join("."));
+    }
+    for module in python_deps.iter().flat_map(|(_, dep)| dep.modules.iter()) {
+        names.insert(module.path.clone(), module.path.join("."));
+    }
+    names
 }
 
 /// The shim a crate root emits so the package root's init and bound
