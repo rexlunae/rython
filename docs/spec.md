@@ -1948,8 +1948,12 @@ impl Point {
   chain (including TestCase's no-op hook); an MRO or target the converter
   cannot resolve is refused rather than lowered to a recursive self-call.
   Other zero-argument `super().method(...)` calls in a TestCase body use
-  the same resolved chain and are accepted only when the target and MRO
-  are modeled; unsupported targets are refused with the call's source line.
+  the same resolved chain, including user-defined helpers called from a
+  test or fixture. The nearest chain implementation is analyzed in place,
+  so its field reads and normal-exit stores participate in the caller's
+  proof; unsupported MROs, unsupported TestCase methods, or unsupported
+  targets are refused with the call's source line rather than falling
+  back to a possible recursive self-call.
   If `setUp` has no successful exit, neither the test nor `tearDown` is
   reached.
   These restrictions prevent Rust construction defaults from becoming

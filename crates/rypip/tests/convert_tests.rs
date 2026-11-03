@@ -13612,6 +13612,22 @@ fn unittest_direct_testcase_super_setup_matches_cpython() {
 }
 
 #[test]
+fn unittest_super_resolves_user_method_and_propagates_fields() {
+    let (stdout, stderr, code) = unittest_run(
+        "ut_super_helper",
+        include_str!("fixtures/testcase_super_helper.py"),
+    );
+    // Verified against CPython 3.14.4: super().helper() assigns value
+    // before the test reads it.
+    assert_eq!(stdout, "helper 13\n");
+    assert_eq!(
+        stderr,
+        ".\n----------------------------------------------------------------------\nRan 1 test in T\n\nOK"
+    );
+    assert_eq!(code, 0);
+}
+
+#[test]
 fn unittest_helpers_class_defaults_and_static_members_match_cpython() {
     // #519 review regressions: a helper reached only from tests reads
     // setUp's fields, a helper setUp calls initializes its own reads, a
