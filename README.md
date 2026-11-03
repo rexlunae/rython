@@ -296,6 +296,10 @@ line, never a silent behaviour change:
 - **Attribute reads on unannotated parameters** — `p.attr` where `attr`
   is neither a known method nor a field of a known class is a loud
   error (s3transfer's `request.body.disable_callback()`).
+- **Subclass-only method calls in a base method** — a mixin method calling
+  `self.value()` when only subclasses define `value` is refused rather than
+  silently dropping the call. Declare a typed method stub on the base class
+  and override it in subclasses to use virtual dispatch.
 - **Attribute reads on call results** — a field typed from
   `self.x = call(...).attr` needs the callee's return type
   (`get_scheme(...) -> Scheme`, then the dataclass field annotation).
