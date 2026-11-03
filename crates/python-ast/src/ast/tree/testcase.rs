@@ -188,10 +188,15 @@ impl ClassDef {
             let mut flag = None;
             visit::walk_stmts(&class.body, Descend::OwnScope, &mut |stmt| {
                 let bound = visit::stmt_bound_names(stmt, visit::Bindings::Scope);
-                let attribute_targets = visit::stmt_targets(stmt).into_iter().filter_map(|t| match t {
-                    ExprType::Attribute(a) => Some(a.attr.clone()),
-                    _ => None,
-                });
+                // Every attribute leaf, an unpacking target's included
+                // (`test_b.__unittest_skip__, n = True, 0` — #527).
+                let attribute_targets = visit::stmt_targets(stmt)
+                    .into_iter()
+                    .flat_map(visit::target_leaves)
+                    .filter_map(|t| match t {
+                        ExprType::Attribute(a) => Some(a.attr.clone()),
+                        _ => None,
+                    });
                 if let Some(name) = bound
                     .into_iter()
                     .chain(attribute_targets)

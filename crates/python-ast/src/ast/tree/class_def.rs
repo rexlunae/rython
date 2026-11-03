@@ -2020,13 +2020,15 @@ impl ClassDef {
             .filter(|s| s.attr == attr)
             .find(|s| {
                 matches!(
-                    &s.value,
-                    ExprType::Call(c)
+                    s.expr(),
+                    Some(ExprType::Call(c))
                         if matches!(c.func.as_ref(), ExprType::Name(_))
                 )
             })
-            .or_else(|| stores.iter().find(|s| s.attr == attr))?;
-        let class_name = match store.value {
+            // An unpacked element (`self.a, self.b = pair()`) names no
+            // expression to read a class from: the struct's type answers.
+            .or_else(|| stores.iter().find(|s| s.attr == attr && s.expr().is_some()))?;
+        let class_name = match store.expr()? {
             ExprType::Call(call) => match call.func.as_ref() {
                 ExprType::Name(n) => Some(n.id.clone()),
                 _ => None,
@@ -2626,6 +2628,7 @@ impl ClassDef {
 
         let mut stores = Vec::new();
         collect_field_stores(&init.body, &mut stores);
+        refuse_starred_field_store(&stores)?;
         // A store to a PROPERTY name (`self.retries = retries` where
         // retries is `@property` + `@retries.setter` — urllib3's
         // BaseHTTPResponse): Python's assignment invokes the SETTER method,
@@ -2729,7 +2732,7 @@ impl ClassDef {
                 class_annotations.get(&store.attr).cloned()
             })
             .or_else(|| {
-                infer_field_type(store.value, &name_types, symbols, options, &self.name)
+                infer_stored_type(&store.value, &name_types, symbols, options, &self.name)
             });
             match ty {
                 Some(ty) => {
@@ -2763,7 +2766,7 @@ impl ClassDef {
                         // member, and reads unwrap loudly where a concrete value is
                         // required (the round-83 Option→concrete coercion).
                         Some((_, prev))
-                            if crate::is_none_expr(store.value)
+                            if store.is_none()
                                 && !matches!(prev, crate::TypeInfo::Option(_))
                                 && !matches!(prev, crate::TypeInfo::PyValue) =>
                         {
@@ -2907,6 +2910,7 @@ impl ClassDef {
             }
             let mut method_stores = Vec::new();
             collect_field_stores(&method.body, &mut method_stores);
+            refuse_starred_field_store(&method_stores)?;
             for store in method_stores {
                 // A store to a PROPERTY name invokes the setter, not a
                 // field write (same contract as the __init__ pass).
@@ -2938,7 +2942,7 @@ impl ClassDef {
                     // uses. The None store then lowers to the None member,
                     // and reads unwrap loudly where a concrete value is
                     // required (the round-83 Option→concrete coercion).
-                    if crate::is_none_expr(store.value) {
+                    if store.is_none() {
                         let idx = fields
                             .iter()
                             .position(|(name, _)| name == &store.attr)
@@ -2959,8 +2963,8 @@ impl ClassDef {
                 // attribute carries that attribute's type. Without this
                 // the value reads as unknown and the new field boxes,
                 // colliding with the typed field it was copied from.
-                let from_sibling_field = match store.value {
-                    ExprType::Attribute(a)
+                let from_sibling_field = match store.expr() {
+                    Some(ExprType::Attribute(a))
                         if crate::ast::tree::visit::is_self(a.value.as_ref()) =>
                     {
                         fields
@@ -2971,15 +2975,15 @@ impl ClassDef {
                     }
                     _ => None,
                 };
-                let observed = if crate::is_none_expr(store.value) {
+                let observed = if store.is_none() {
                     // A `None` store is the DECLARE half of Python's
                     // ubiquitous declare-then-fill idiom, not a type.
                     ObservedStore::NoneLiteral
                 } else if let Some(t) = from_sibling_field {
                     ObservedStore::Typed(t)
                 } else {
-                    match infer_field_type(
-                        store.value,
+                    match infer_stored_type(
+                        &store.value,
                         &method_types,
                         symbols,
                         options,
@@ -3174,13 +3178,11 @@ impl ClassDef {
             let mut out = std::collections::BTreeSet::new();
             if let Some(init) = self.init_method() {
                 for stmt in init.body.iter().take(upto) {
+                    // Every `self.x` leaf, an unpacking target's included
+                    // (`self.a, self.b = 1, 2` — issue #527).
                     if let StatementType::Assign(a) = &stmt.statement {
                         for target in &a.targets {
-                            if let ExprType::Attribute(attr) = target
-                                && visit::is_self(&attr.value)
-                            {
-                                out.insert(attr.attr.clone());
-                            }
+                            out.extend(visit::self_attr_leaves(target).into_iter().map(str::to_string));
                         }
                     }
                 }
@@ -3303,21 +3305,17 @@ impl ClassDef {
         let mut thread_stores: Vec<(String, usize)> = Vec::new();
         for method in self.methods() {
             let thread_locals = thread_bound_locals(&method.body, symbols);
-            visit::walk_stmts(&method.body, Descend::SkipDefs, &mut |stmt| {
-                if let StatementType::Assign(a) = &stmt.statement
-                    && stores_thread(&a.value, &thread_locals, symbols)
-                {
-                    for target in &a.targets {
-                        if let ExprType::Attribute(attr) = target
-                            && visit::is_self(&attr.value)
-                        {
-                            thread_fields.insert(attr.attr.clone());
-                            thread_stores.push((attr.attr.clone(), stmt.lineno.unwrap_or(0)));
-                        }
-                    }
+            let mut stores = Vec::new();
+            collect_field_stores(&method.body, &mut stores);
+            for store in stores {
+                let holds_thread = store
+                    .expr()
+                    .is_some_and(|value| stores_thread(value, &thread_locals, symbols));
+                if holds_thread {
+                    thread_fields.insert(store.attr.clone());
+                    thread_stores.push((store.attr, store.line.unwrap_or(0)));
                 }
-                Flow::Continue
-            });
+            }
         }
         if thread_fields.is_empty() {
             return Ok(());
@@ -3381,12 +3379,15 @@ impl ClassDef {
                         reads_uninitialized_self(e, &initialized)
                     })
                     || visit::stmt_targets(s).iter().any(|target| {
-                        // A direct assignment creates the attribute; other
-                        // targets evaluate their receiver (or read-modify-write).
-                        if matches!(s.statement, StatementType::Assign(_))
-                            && matches!(target, ExprType::Attribute(a) if visit::is_self(&a.value))
-                        {
-                            false
+                        // A direct assignment creates the attribute, an
+                        // unpacking target's `self.x` leaves included
+                        // (#527); other targets evaluate their receiver
+                        // (or read-modify-write).
+                        if matches!(s.statement, StatementType::Assign(_)) {
+                            visit::target_leaves(target).into_iter().any(|leaf| {
+                                !matches!(leaf, ExprType::Attribute(a) if visit::is_self(&a.value))
+                                    && reads_uninitialized_self(leaf, &initialized)
+                            })
                         } else {
                             reads_uninitialized_self(target, &initialized)
                         }
@@ -3404,13 +3405,9 @@ impl ClassDef {
             // visitor above inspects nested bodies but never promotes their
             // conditional stores to definite initialization.
             if let StatementType::Assign(a) = &stmt.statement {
-                for target in &a.targets {
-                    if let ExprType::Attribute(attr) = target
-                        && visit::is_self(&attr.value)
-                    {
-                        pending.remove(&attr.attr);
-                        initialized.insert(attr.attr.clone());
-                    }
+                for attr in a.targets.iter().flat_map(visit::self_attr_leaves) {
+                    pending.remove(attr);
+                    initialized.insert(attr.to_string());
                 }
             }
         }
@@ -3787,10 +3784,156 @@ fn method_param_names(m: &FunctionDef) -> Vec<String> {    m.args
 /// inference.
 struct FieldStore<'a> {
     attr: String,
-    value: &'a ExprType,
+    value: StoredValue<'a>,
     /// The store's annotation (`self.x: list[float] = ...`), which pins
     /// the field type when the value cannot be inferred.
     annotation: Option<&'a ExprType>,
+    line: Option<usize>,
+}
+
+impl<'a> FieldStore<'a> {
+    /// The stored expression, when the store names one (see
+    /// [`StoredValue::Expr`]).
+    fn expr(&self) -> Option<&'a ExprType> {
+        match self.value {
+            StoredValue::Expr(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Whether the store assigns the `None` literal.
+    fn is_none(&self) -> bool {
+        self.expr().is_some_and(crate::is_none_expr)
+    }
+}
+
+/// What one leaf of an assignment target stores (issue #527).
+#[derive(Clone, Debug)]
+enum StoredValue<'a> {
+    /// The stored expression: a single target's whole value, or the
+    /// element a same-arity tuple/list literal pairs with the leaf
+    /// (`self.a, self.b = 1, "two"` stores `1`, then `"two"`).
+    Expr(&'a ExprType),
+    /// One element of a value that no literal pairs with (`self.a, self.b
+    /// = pair()` stores element 0, then element 1, of the call's result):
+    /// `path` is each unpacking level's (index, arity), outermost first.
+    Element {
+        source: &'a ExprType,
+        path: Vec<(usize, usize)>,
+    },
+    /// A leaf of a pattern with a starred element (`self.first,
+    /// *self.rest = xs`): the conversion refuses the store
+    /// ([`refuse_starred_field_store`]).
+    Starred,
+}
+
+impl<'a> StoredValue<'a> {
+    /// Element `index` of an `arity`-element unpacking of this value.
+    fn element(&self, index: usize, arity: usize) -> Self {
+        match self {
+            Self::Expr(source) => Self::Element { source, path: vec![(index, arity)] },
+            Self::Element { source, path } => {
+                let mut path = path.clone();
+                path.push((index, arity));
+                Self::Element { source, path }
+            }
+            Self::Starred => Self::Starred,
+        }
+    }
+}
+
+/// Pair every leaf of an assignment target with what it stores, in store
+/// order: a single place stores the whole value; a tuple/list pattern
+/// unpacks it element by element, pairing directly with a same-arity
+/// tuple/list literal (Python builds the tuple and unpacks it, which is
+/// the same element for element).
+fn paired_leaves<'a>(
+    target: &'a ExprType,
+    value: StoredValue<'a>,
+    out: &mut Vec<(&'a ExprType, StoredValue<'a>)>,
+) {
+    let elts: &'a [ExprType] = match target {
+        ExprType::Tuple(t) => &t.elts,
+        ExprType::List(items) => items,
+        _ => {
+            out.push((target, value));
+            return;
+        }
+    };
+    if elts.iter().any(|e| matches!(e, ExprType::Starred(_))) {
+        out.extend(visit::target_leaves(target).into_iter().map(|leaf| (leaf, StoredValue::Starred)));
+        return;
+    }
+    let literal: Option<&'a [ExprType]> = match &value {
+        StoredValue::Expr(e) => match *e {
+            ExprType::Tuple(t) => Some(t.elts.as_slice()),
+            ExprType::List(items) => Some(items.as_slice()),
+            _ => None,
+        },
+        _ => None,
+    }
+    .filter(|values| {
+        values.len() == elts.len() && !values.iter().any(|v| matches!(v, ExprType::Starred(_)))
+    });
+    for (index, elt) in elts.iter().enumerate() {
+        let stored = match literal {
+            Some(values) => StoredValue::Expr(&values[index]),
+            None => value.element(index, elts.len()),
+        };
+        paired_leaves(elt, stored, out);
+    }
+}
+
+/// The field type a store contributes: its expression's, or the element
+/// type of the value it unpacks (a fixed-shape tuple's member, a list's
+/// or a variable-length tuple's element, a boxed value's boxed element).
+fn infer_stored_type(
+    value: &StoredValue,
+    name_types: &std::collections::HashMap<String, crate::TypeInfo>,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+    class_name: &str,
+) -> Option<crate::TypeInfo> {
+    use crate::TypeInfo as T;
+    match value {
+        StoredValue::Expr(e) => infer_field_type(e, name_types, symbols, options, class_name),
+        StoredValue::Element { source, path } => {
+            let whole = infer_field_type(source, name_types, symbols, options, class_name)?;
+            let element = path.iter().try_fold(whole, |ty, &(index, arity)| match ty {
+                T::Tuple(mut members) if members.len() == arity => Some(members.swap_remove(index)),
+                T::Vec(e) | T::PyTuple(e) => Some(*e),
+                T::PyValue => Some(T::PyValue),
+                _ => None,
+            })?;
+            // Fields own their strings, as for a direct store.
+            Some(if element == T::StrRef { T::String } else { element })
+        }
+        StoredValue::Starred => None,
+    }
+}
+
+/// The refusal for an unpacking assignment that has a starred target and
+/// stores an attribute (issue #527): the starred place takes a LIST of the
+/// remaining elements, which neither field inference nor the destructuring
+/// store models. Shared by field discovery and the assignment lowering so
+/// both name the same rewrite.
+pub(crate) fn starred_attribute_store_refusal(place: &str, line: Option<usize>) -> String {
+    let at = line.map(|l| format!(", line {l}")).unwrap_or_default();
+    format!(
+        "an unpacking assignment with a starred target that stores the attribute `{place}`{at} \
+         is not supported yet; index the value instead (`first = xs[0]`, `rest = list(xs[1:])`) \
+         and assign each attribute separately; rython refuses to silently store an element \
+         where Python stores a list"
+    )
+}
+
+/// Refuse a field store through a starred unpacking pattern (see
+/// [`starred_attribute_store_refusal`]).
+fn refuse_starred_field_store(stores: &[FieldStore]) -> Result<(), Box<dyn std::error::Error>> {
+    match stores.iter().find(|s| matches!(s.value, StoredValue::Starred)) {
+        Some(store) => Err(starred_attribute_store_refusal(&format!("self.{}", store.attr), store.line).into()),
+        None => Ok(()),
+    }
 }
 
 /// The class body's literal constants (`INTERVAL = 5`). Reading one
@@ -3839,7 +3982,9 @@ fn reads_uninitialized_self(
 }
 
 /// Collect `self.attr = ...` stores anywhere in a body (recursing into
-/// control flow), in first-store order.
+/// control flow), in first-store order. An unpacking target contributes
+/// each `self.attr` leaf (`self.a, (self.b, n) = 1, pair`), paired with
+/// the element it stores (issue #527).
 fn collect_field_stores<'a>(body: &'a [Statement], out: &mut Vec<FieldStore<'a>>) {
     // Nested defs and classes stay out: a `self.x = ...` in a closure or
     // a nested class runs on that scope's schedule (if ever), not the
@@ -3854,20 +3999,30 @@ fn collect_field_stores<'a>(body: &'a [Statement], out: &mut Vec<FieldStore<'a>>
         {
             out.push(FieldStore {
                 attr: attr.to_string(),
-                value: &crate::ExprType::NoneType(crate::ast::tree::constant::Constant(None)),
+                value: StoredValue::Expr(&crate::ExprType::NoneType(
+                    crate::ast::tree::constant::Constant(None),
+                )),
                 annotation: Some(annotation),
+                line: stmt.lineno,
             });
         }
         if let StatementType::Assign(assign) = &stmt.statement {
             for target in &assign.targets {
-                if let ExprType::Attribute(attr) = target
-                    && visit::is_self(attr.value.as_ref())
-                {
-                    out.push(FieldStore {
-                        attr: attr.attr.clone(),
-                        value: &assign.value,
-                        annotation: assign.annotation.as_ref(),
-                    });
+                let mut leaves = Vec::new();
+                paired_leaves(target, StoredValue::Expr(&assign.value), &mut leaves);
+                for (leaf, value) in leaves {
+                    if let ExprType::Attribute(attr) = leaf
+                        && visit::is_self(attr.value.as_ref())
+                    {
+                        out.push(FieldStore {
+                            attr: attr.attr.clone(),
+                            value,
+                            // Python cannot annotate an unpacking target,
+                            // so only a single-place store carries one.
+                            annotation: assign.annotation.as_ref(),
+                            line: stmt.lineno,
+                        });
+                    }
                 }
             }
         }

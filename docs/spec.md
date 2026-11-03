@@ -703,7 +703,12 @@ CPython's `TypeError: cannot unpack non-iterable int object` and its
 in fields` with `fields` boxed) unpacks each row the same way. Any
 other destructure is the plain Rust tuple pattern (a method result
 such as `m.groups()`, a class instance: loud in rustc when the shapes
-disagree).
+disagree). Tuple/list assignment targets may include instance attributes:
+each `self.attr` leaf contributes a field, and a paired literal element
+determines its field type (`self.count, self.label = 1, "first"` declares
+an integer and an owned string field). A starred unpacking target that
+stores an attribute is rejected rather than guessing whether the field
+stores one element or the remaining list.
 
 ### 5.3 `with`
 

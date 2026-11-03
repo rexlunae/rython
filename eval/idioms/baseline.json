@@ -201,6 +201,9 @@
     "tree": {
       "status": "pass"
     },
+    "tuple_field_stores": {
+      "status": "pass"
+    },
     "untyped_method_args": {
       "status": "pass"
     },

@@ -780,8 +780,29 @@ fn tuple_destructuring_stores_through_mut_accessors() {
     );
     let out = compile(src, "tuple_target.py");
     assert!(
-        out.contains("* self . x_mut () , * self . y_mut ()"),
+        (out.contains("* self . x_mut () = 1") && out.contains("* self . y_mut () = 2"))
+            || out.contains("* self . x_mut () , * self . y_mut ()"),
         "tuple targets must destructure through the mut accessors: {}",
+        out
+    );
+}
+
+#[test]
+fn tuple_field_stores_infer_each_field_type() {
+    let out = compile(
+        "class Pair:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.number, self.label = 1, \"first\"\n",
+        "tuple_fields.py",
+    );
+    assert!(
+        out.contains("pub number : i64"),
+        "tuple assignment must declare the numeric field: {}",
+        out
+    );
+    assert!(
+        out.contains("pub label : String"),
+        "tuple assignment must infer an owned String field: {}",
         out
     );
 }

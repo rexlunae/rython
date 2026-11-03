@@ -242,6 +242,55 @@ impl<'a> CodeGen for Assign {
             let value = crate::render_reused(&self.value, ctx, options, symbols)?;
             return Ok(quote!(#target = #value;));
         }
+        // An UNPACKING target that stores an ATTRIBUTE (`self.a, self.b =
+        // 1, "two"` — issue #527). A starred element takes a list of the
+        // rest, which the destructuring store cannot model: refused.
+        if let [target] = self.targets.as_slice()
+            && pattern_elts(target).is_some()
+        {
+            let leaves = crate::ast::tree::visit::target_leaves(target);
+            if let Some(ExprType::Attribute(attr)) =
+                leaves.iter().find(|leaf| matches!(leaf, ExprType::Attribute(_)))
+            {
+                if pattern_has_starred(target) {
+                    let place = match attr.value.as_ref() {
+                        ExprType::Name(n) => format!("{}.{}", n.id, attr.attr),
+                        _ => attr.attr.clone(),
+                    };
+                    return Err(crate::ast::tree::class_def::starred_attribute_store_refusal(
+                        &place, None,
+                    )
+                    .into());
+                }
+                // Paired with a same-arity literal whose later elements
+                // cannot observe an earlier store, the unpacking IS the
+                // element stores in order: Python evaluates every element,
+                // then stores left to right, and only the first element
+                // runs before the first store either way. Each store then
+                // lowers exactly like its single-target form — the field's
+                // coercions (an owned str, the Some wrap, the boxed value),
+                // property setters, and subscript stores included.
+                if let Some(values) = literal_elts(&self.value)
+                    && let Some(elts) = pattern_elts(target)
+                    && values.len() == elts.len()
+                    && values.iter().skip(1).all(|v| inert_store_value(v, target))
+                {
+                    let mut stream = TokenStream::new();
+                    for (t, v) in elts.iter().zip(values) {
+                        stream.extend(
+                            Assign {
+                                targets: vec![t.clone()],
+                                value: v.clone(),
+                                type_comment: None,
+                                annotation: None,
+                            }
+                            .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
+                        );
+                    }
+                    return Ok(stream);
+                }
+            }
+        }
         // A `lambda` bound to a NAME whose type is a callable value
         // (issue #122): the name's type — from its uses, or from an
         // annotation — is what types the lambda's parameters, so the
@@ -1029,16 +1078,21 @@ impl<'a> CodeGen for Assign {
                 // in a generic trait default must store through the mutable
                 // accessors (`*self.x_mut(), *self.y_mut()`), not through
                 // clones of the fields.
-                ExprType::Tuple(tuple) => {
+                // A LIST pattern (`[a, b] = ...`) unpacks exactly as a tuple
+                // pattern does, and a NESTED pattern (`(a, b), c = ...`) is
+                // a nested place (issue #527).
+                ExprType::Tuple(_) | ExprType::List(_) => {
+                    let is_slice = |e: &ExprType| {
+                        matches!(e, ExprType::Subscript(s)
+                            if matches!(s.kind, crate::SubscriptKind::Slice { .. }))
+                    };
+                    let elts = pattern_elts(target).unwrap_or_default();
                     // A destructuring target containing a SLICE subscript
                     // (`self._left[left:right], self._right[left:right] =
                     // [start], [end]` — pip's lazy_wheel): the slice store
                     // has no rython lowering — the whole assignment drops
                     // (documented divergence).
-                    if tuple.elts.iter().any(|e| {
-                        matches!(e, ExprType::Subscript(s)
-                            if matches!(s.kind, crate::SubscriptKind::Slice { .. }))
-                    }) {
+                    if elts.iter().any(is_slice) {
                         options.definition_warnings.borrow_mut().push(
                             "a destructuring assignment with a slice target is dropped \
                              (no rython equivalent)"
@@ -1046,23 +1100,15 @@ impl<'a> CodeGen for Assign {
                         );
                         return Ok(TokenStream::new());
                     }
-                    let mut elts = Vec::with_capacity(tuple.elts.len());
-                    for elt in &tuple.elts {
-                        elts.push(crate::ast::tree::attribute::to_rust_place_expr(
-                            elt, &ctx, &options, &symbols, true,
-                        )?);
+                    // Inside a NESTED pattern the slice store is refused
+                    // rather than dropped: that shape never had the drop.
+                    if crate::ast::tree::visit::target_leaves(target).into_iter().any(is_slice) {
+                        return Err("a slice target inside a nested unpacking pattern is not \
+                                    supported yet; unpack into locals first and assign the \
+                                    slice separately; rython refuses to silently drop it"
+                            .into());
                     }
-                    // A single-element target is still a TUPLE (`x, = f()`):
-                    // the trailing comma is what makes it one, so emit `(x,)`
-                    // — `(x)` would be a parenthesized place and the
-                    // destructuring assignment would not type-check against
-                    // the one-element tuple value.
-                    if elts.len() == 1 {
-                        let only = &elts[0];
-                        quote!((#only,))
-                    } else {
-                        quote!((#(#elts),*))
-                    }
+                    pattern_place(target, &ctx, &options, &symbols)?
                 }
                 _ => {
                     // A plain name target is a STORE into the hoisted
@@ -1220,7 +1266,8 @@ impl<'a> CodeGen for Assign {
                 }
                 // Destructuring assignment to the hoisted names. `target_code`
                 // is already the parenthesized element list.
-                ExprType::Tuple(tuple_target) => {
+                ExprType::Tuple(_) | ExprType::List(_) => {
+                    let target_elts = pattern_elts(target).unwrap_or_default();
                     // A tuple TARGET with a tuple-literal VALUE of the same
                     // arity (`(body, content_type) = (urlencode(fields),
                     // "application/x-www-form-urlencoded")` — urllib3's
@@ -1255,37 +1302,90 @@ impl<'a> CodeGen for Assign {
                                 && matches!(v, ExprType::Constant(c)
                                     if matches!(&c.0, Some(litrs::Literal::String(_)))))
                     };
-                    let needs_slot_typing = matches!(&value_expr, ExprType::Tuple(vt)
-                        if vt.elts.len() == tuple_target.elts.len()
-                            && tuple_target.elts.iter().zip(vt.elts.iter()).any(
-                                |(t, v)| is_owned_pair(t, v) || is_boxed_none_pair(t, v)
-                            ));
+                    // An ATTRIBUTE leaf (`self.a, self.b = self.b, self.a`
+                    // — issue #527; the in-order element stores above took
+                    // every literal whose later elements are inert): each
+                    // element renders against its field's type, as the
+                    // single-target store's value does — an owned str, the
+                    // Some wrap, the boxed value, a clone out of the
+                    // receiver. Python evaluates every element before the
+                    // first store, and so does the destructuring store.
+                    let has_attribute_leaf = crate::ast::tree::visit::target_leaves(target)
+                        .into_iter()
+                        .any(|leaf| matches!(leaf, ExprType::Attribute(_)));
+                    let needs_slot_typing = literal_elts(&value_expr).is_some_and(|values| {
+                        values.len() == target_elts.len()
+                            && (has_attribute_leaf
+                                || matches!(&value_expr, ExprType::Tuple(_))
+                                    && target_elts.iter().zip(values).any(|(t, v)| {
+                                        is_owned_pair(t, v) || is_boxed_none_pair(t, v)
+                                    }))
+                    });
                     if needs_slot_typing {
-                        let ExprType::Tuple(vt) = &value_expr else {
-                            unreachable!("just checked");
-                        };
-                        let mut rendered = Vec::with_capacity(vt.elts.len());
-                        for (t, v) in tuple_target.elts.iter().zip(vt.elts.iter()) {
-                            // Only the STR-LITERAL-INTO-STRING-SLOT and the
-                            // NONE-INTO-BOXED-SLOT pairings re-render typed;
-                            // a self-field read beside them clones out of
-                            // the shared receiver (the swap idiom reads the
-                            // field it re-stores); every other element keeps
-                            // the plain render so unrelated slots (a dropped
-                            // call landing as PyValue::None_ into a
-                            // StrOrBytes-typed body slot) stay exactly as
-                            // before.
+                        // Only the STR-LITERAL-INTO-STRING-SLOT and the
+                        // NONE-INTO-BOXED-SLOT pairings re-render typed, and
+                        // an attribute leaf against its field; a self-field
+                        // read beside them clones out of the shared receiver
+                        // (the swap idiom reads the field it re-stores);
+                        // every other element keeps the plain render so
+                        // unrelated slots (a dropped call landing as
+                        // PyValue::None_ into a StrOrBytes-typed body slot)
+                        // stay exactly as before.
+                        let leaf = |t: &ExprType,
+                                    v: &ExprType|
+                         -> Result<TokenStream, Box<dyn std::error::Error>> {
                             if is_boxed_none_pair(t, v) {
-                                rendered.push(quote!(stdpython::PyValue::None_));
-                            } else if is_owned_pair(t, v) {
-                                rendered.push(crate::render_typed(
+                                return Ok(quote!(stdpython::PyValue::None_));
+                            }
+                            if is_owned_pair(t, v) {
+                                return crate::render_typed(
                                     v,
                                     ctx.clone(),
                                     options.clone(),
                                     symbols.clone(),
                                     Some(crate::TypeInfo::String),
-                                )?);
-                            } else if matches!(v, ExprType::Attribute(a)
+                                );
+                            }
+                            if matches!(t, ExprType::Attribute(_)) {
+                                let slot = crate::infer_type(Some(&ctx), t, &options, &symbols);
+                                if !matches!(slot, crate::TypeInfo::PyObject) {
+                                    // A REUSED immutable or boxed name clones
+                                    // into the field, as `stored_name_needs_
+                                    // clone` does for the single store; a
+                                    // mutable container keeps the move, so
+                                    // aliasing stays loud (issue #79).
+                                    if let ExprType::Name(n) = v
+                                        && options.use_counts.get(&n.id).copied().unwrap_or(0) > 1
+                                    {
+                                        let from = crate::ast::tree::type_ctx::infer_type(
+                                            None, v, &options, &symbols,
+                                        );
+                                        if matches!(
+                                            from,
+                                            crate::TypeInfo::String
+                                                | crate::TypeInfo::Bytes
+                                                | crate::TypeInfo::PyValue
+                                        ) {
+                                            let tokens = v.clone().to_rust(
+                                                ctx.clone(),
+                                                options.clone(),
+                                                symbols.clone(),
+                                            )?;
+                                            let cloned = quote!((#tokens).clone());
+                                            return Ok(crate::coerce_tokens(cloned.clone(), &from, &slot)
+                                                .unwrap_or(cloned));
+                                        }
+                                    }
+                                    return crate::render_typed(
+                                        v,
+                                        ctx.clone(),
+                                        options.clone(),
+                                        symbols.clone(),
+                                        Some(slot),
+                                    );
+                                }
+                            }
+                            if matches!(v, ExprType::Attribute(a)
                                 if crate::ast::tree::visit::is_self(a.value.as_ref()))
                                 && attr_field_is_pyvalue(v)
                             {
@@ -1297,16 +1397,13 @@ impl<'a> CodeGen for Assign {
                                 let tokens = v
                                     .clone()
                                     .to_rust(ctx.clone(), options.clone(), symbols.clone())?;
-                                rendered.push(quote!((#tokens).clone()));
-                            } else {
-                                rendered.push(
-                                    v.clone()
-                                        .to_rust(ctx.clone(), options.clone(), symbols.clone())?,
-                                );
+                                return Ok(quote!((#tokens).clone()));
                             }
-                        }
-                        quote!(#target_code = (#(#rendered),*);)
-                    } else if !tuple_target.elts.iter().any(|t| matches!(t, ExprType::Starred(_)))
+                            v.clone().to_rust(ctx.clone(), options.clone(), symbols.clone())
+                        };
+                        let rendered = render_unpacked(target, &value_expr, &leaf)?;
+                        quote!(#target_code = #rendered;)
+                    } else if !target_elts.iter().any(|t| matches!(t, ExprType::Starred(_)))
                         && match crate::infer_type(Some(&ctx), &value_expr, &options, &symbols) {
                             crate::TypeInfo::PyValue => true,
                             crate::TypeInfo::PyObject => matches!(&value_expr,
@@ -1328,7 +1425,7 @@ impl<'a> CodeGen for Assign {
                         // destructure (a typed tuple is itself; a method
                         // result or a class instance stays the loud
                         // mismatch it was).
-                        let n = tuple_target.elts.len();
+                        let n = target_elts.len();
                         quote!(#target_code = stdpython::PyUnpack::<#n>::py_unpack(#value)?;)
                     } else {
                         quote!(#target_code = #value;)
@@ -2001,6 +2098,107 @@ impl<'a> CodeGen for Assign {
             }
             Ok(stream)
         }
+    }
+}
+
+/// The elements of an unpacking pattern: a tuple or a list target.
+fn pattern_elts(target: &ExprType) -> Option<&[ExprType]> {
+    match target {
+        ExprType::Tuple(t) => Some(&t.elts),
+        ExprType::List(items) => Some(items),
+        _ => None,
+    }
+}
+
+/// The elements of a tuple/list LITERAL with no starred element: what a
+/// pattern of the same arity unpacks element for element.
+fn literal_elts(value: &ExprType) -> Option<&[ExprType]> {
+    pattern_elts(value).filter(|values| !values.iter().any(|v| matches!(v, ExprType::Starred(_))))
+}
+
+/// A tuple expression of already-rendered parts. A one-element tuple
+/// keeps its trailing comma (`x, = f()` is `(x,)`): `(x)` would be a
+/// parenthesized place or value, not a tuple.
+fn tuple_tokens(parts: &[TokenStream]) -> TokenStream {
+    match parts {
+        [only] => quote!((#only,)),
+        _ => quote!((#(#parts),*)),
+    }
+}
+
+/// An unpacking pattern as a destructuring PLACE: each element in its
+/// place flavor (in a generic trait default, `self.x, self.y = v` stores
+/// through the mutable accessors — `*self.x_mut(), *self.y_mut()` — not
+/// through clones of the fields), a nested pattern as a nested tuple.
+fn pattern_place(
+    target: &ExprType,
+    ctx: &CodeGenContext,
+    options: &PythonOptions,
+    symbols: &SymbolTableScopes,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    match pattern_elts(target) {
+        Some(elts) => {
+            let places = elts
+                .iter()
+                .map(|e| pattern_place(e, ctx, options, symbols))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(tuple_tokens(&places))
+        }
+        None => crate::ast::tree::attribute::to_rust_place_expr(target, ctx, options, symbols, true),
+    }
+}
+
+/// An unpacking pattern's VALUE paired element for element with a
+/// same-arity literal (nested patterns with nested literals), each leaf
+/// rendered by `leaf` against what it stores into; a leaf whose value is
+/// not such a literal is rendered whole.
+fn render_unpacked(
+    target: &ExprType,
+    value: &ExprType,
+    leaf: &dyn Fn(&ExprType, &ExprType) -> Result<TokenStream, Box<dyn std::error::Error>>,
+) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    if let (Some(targets), Some(values)) = (pattern_elts(target), literal_elts(value))
+        && targets.len() == values.len()
+    {
+        let parts = targets
+            .iter()
+            .zip(values)
+            .map(|(t, v)| render_unpacked(t, v, leaf))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(tuple_tokens(&parts));
+    }
+    leaf(target, value)
+}
+
+/// Whether an unpacking pattern has a starred element at any depth.
+fn pattern_has_starred(target: &ExprType) -> bool {
+    pattern_elts(target).is_some_and(|elts| {
+        elts.iter().any(|e| matches!(e, ExprType::Starred(_)) || pattern_has_starred(e))
+    })
+}
+
+/// Whether evaluating `value` AFTER some of `target`'s stores yields what
+/// evaluating it before them does: it runs no code and reads nothing
+/// those stores can change — a literal, a name the pattern does not bind,
+/// or a container literal of such values. `self.a, self.b = 1, x` may
+/// store `self.a` before evaluating `x`; `self.a, self.b = self.b,
+/// self.a` may not (issue #527).
+fn inert_store_value(value: &ExprType, target: &ExprType) -> bool {
+    match value {
+        ExprType::Constant(_) | ExprType::NoneType(_) => true,
+        ExprType::UnaryOp(u) => matches!(u.operand.as_ref(), ExprType::Constant(_)),
+        ExprType::Name(n) => !crate::ast::tree::visit::target_binds(target, &n.id),
+        ExprType::Tuple(t) => t.elts.iter().all(|e| inert_store_value(e, target)),
+        ExprType::List(items) => items.iter().all(|e| inert_store_value(e, target)),
+        // A set member and a dict key are HASHED, which runs a user
+        // class's `__hash__`: only literal ones qualify. A `**spread` (a
+        // None key) calls the mapping's keys().
+        ExprType::Set(s) => s.elts.iter().all(|e| matches!(e, ExprType::Constant(_))),
+        ExprType::Dict(d) => {
+            d.keys.iter().all(|k| matches!(k, Some(ExprType::Constant(_))))
+                && d.values.iter().all(|v| inert_store_value(v, target))
+        }
+        _ => false,
     }
 }
 
