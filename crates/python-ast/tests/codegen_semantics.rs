@@ -29909,6 +29909,30 @@ fn nested_function_parameter_does_not_rebind_assert_raises_target() {
 }
 
 #[test]
+fn assert_raises_context_target_is_not_promoted_across_branches() {
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        flag: bool = True\n",
+            "        if flag:\n",
+            "            with self.assertRaises(ValueError) as cm:\n",
+            "                raise ValueError(\"boom\")\n",
+            "        else:\n",
+            "            with self.assertRaises(ValueError) as cm:\n",
+            "                raise ValueError(\"boom\")\n",
+            "        print(str(cm.exception))\n",
+        ),
+        "assert_raises_context_target_branch.py",
+    );
+    assert!(
+        err.contains("assertRaises") || err.contains("cm"),
+        "a context target bound under control flow must be refused, not miscompiled: {err}"
+    );
+}
+
+#[test]
 fn arbitrary_assert_logs_attribute_uses_generic_with_lowering() {
     let (out, warnings) = compile_with_warnings(
         concat!(
