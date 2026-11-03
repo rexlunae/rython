@@ -26701,6 +26701,19 @@ fn a_reused_name_boxed_into_a_parameter_clones_the_read() {
 }
 
 #[test]
+fn a_mixin_call_to_a_subclass_only_method_is_a_conversion_error() {
+    // Verified against python3: T().show() prints "mixin 42", not "mixin None".
+    let error = compile_err(
+        "class Mixin:\n    def show(self):\n        print('mixin', self.value())\n\n\
+         class T(Mixin):\n    def value(self):\n        return 42\n\nT().show()\n",
+        "mixin_dispatch.py",
+    );
+    assert!(error.contains("self.value(...)") && error.contains("Mixin"), "{error}");
+    assert!(error.contains("method stub") && error.contains("argument/return types"), "{error}");
+    assert!(error.contains("refuses to drop the call or invent a None result"), "{error}");
+}
+
+#[test]
 fn a_mixin_declares_accessors_for_its_subclass_fields() {
     // `self.max_redirects` in a mixin that never assigns it (requests'
     // SessionRedirectMixin, issue #335): the mixin's trait declares a

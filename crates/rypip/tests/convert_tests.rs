@@ -20218,6 +20218,63 @@ fn boxed_or_and_return_the_selected_operand() {
 }
 
 #[test]
+fn a_mixin_method_call_requires_a_base_stub_for_virtual_dispatch() {
+    let scratch = Scratch::new("mixin-dispatch");
+    let file = scratch.path().join("mixin_dispatch.py");
+    let source = concat!(
+        "class Mixin:\n",
+        "    def show(self):\n",
+        "        print('mixin', self.value())\n",
+        "\n",
+        "class T(Mixin):\n",
+        "    def value(self):\n",
+        "        return 42\n",
+        "\n",
+        "def main() -> None:\n",
+        "    T().show()\n",
+        "\n",
+        "if __name__ == '__main__':\n",
+        "    main()\n",
+    );
+    let with_stub = source.replacen(
+        "class Mixin:\n",
+        "class Mixin:\n    def value(self) -> int:\n        raise NotImplementedError\n\n",
+        1,
+    );
+    // Verified against python3: declaring the slot preserves the subclass call.
+    for python in [source, with_stub.as_str()] {
+        fs::write(&file, python).unwrap();
+        let output = Command::new("python3")
+            .arg("-B")
+            .arg(&file)
+            .env("PYTHONHASHSEED", "0")
+            .output()
+            .unwrap();
+        assert_eq!(output.stdout, b"mixin 42\n");
+        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    fs::write(&file, source).unwrap();
+    let pkg = rypip::discover(&file).unwrap();
+    let error = rypip::convert(&pkg, &scratch.path().join("refused"), &ConvertOptions::default())
+        .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("self.value(...)") && message.contains("Mixin"), "{message}");
+    assert!(message.contains("mixin_dispatch.py") && message.contains("method stub"), "{message}");
+    assert!(message.contains("refuses to drop the call or invent a None result"), "{message}");
+
+    fs::write(&file, with_stub).unwrap();
+    let pkg = rypip::discover(&file).unwrap();
+    let krate = rypip::convert(&pkg, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/mixin_dispatch")).output().unwrap();
+    assert_eq!(output.stdout, b"mixin 42\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn a_mixin_uses_an_attribute_its_subclasses_define() {
     // A mixin's methods read and store `self.max_redirects`, which only
     // its subclasses assign (requests' SessionRedirectMixin, issue #335):
