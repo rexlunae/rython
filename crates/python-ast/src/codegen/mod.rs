@@ -184,6 +184,21 @@ impl CodeGenContext {
         }
     }
 
+    /// The ORIGINAL definer of a re-emitted override (see
+    /// `Trait::super_target`), through any loop, try, handler, or async
+    /// context nested in its body: `super()` anywhere in that body
+    /// resolves against the definer's base.
+    pub fn super_target(&self) -> Option<&str> {
+        match self {
+            CodeGenContext::Trait { super_target, .. } => super_target.as_deref(),
+            CodeGenContext::Async(inner) => inner.super_target(),
+            CodeGenContext::Loop { parent, .. }
+            | CodeGenContext::TryBlock { parent }
+            | CodeGenContext::ExceptHandler { parent } => parent.super_target(),
+            _ => None,
+        }
+    }
+
     /// Whether this context sits inside a trait DEFAULT body, where `self`
     /// is the trait's generic implementor and field access must go through
     /// the generated accessors (`self.f()`, `self.base().f`).

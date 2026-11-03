@@ -1939,9 +1939,13 @@ impl Point {
   since CPython's runner reads them and the emitted runner honors only
   the decorators (issue #512).
   Manual construction of cases with fields and explicit calls/captures
-  of lifecycle methods (including through `super()`) are refused: use
-  `unittest.main()` so the fixture-order proof applies. If `setUp` has
-  no successful exit, neither the test nor `tearDown` is reached.
+  of lifecycle methods on an instance are refused: use `unittest.main()`
+  so the fixture-order proof applies. In a fixture, `super().setUp()` and
+  `super().tearDown()` resolve along a statically modeled TestCase base
+  chain (including TestCase's no-op hook); an MRO or target the converter
+  cannot resolve is refused rather than lowered to a recursive self-call.
+  If `setUp` has no successful exit, neither the test nor `tearDown` is
+  reached.
   These restrictions prevent Rust construction defaults from becoming
   observable as Python values before assignment.
 - **Construction**: `Point(1.0, 2.0)` lowers to `Point::new(…)?`. The

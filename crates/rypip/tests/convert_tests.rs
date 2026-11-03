@@ -13597,6 +13597,21 @@ fn unittest_method_created_fields_match_cpython() {
 }
 
 #[test]
+fn unittest_direct_testcase_super_setup_matches_cpython() {
+    let (stdout, stderr, code) = unittest_run(
+        "ut_super_setup",
+        include_str!("fixtures/testcase_super_setup.py"),
+    );
+    // Verified against python3.
+    assert_eq!(stdout, "setup before\nsetup after\ntest ready True\n");
+    assert_eq!(
+        stderr,
+        ".\n----------------------------------------------------------------------\nRan 1 test in T\n\nOK"
+    );
+    assert_eq!(code, 0);
+}
+
+#[test]
 fn unittest_helpers_class_defaults_and_static_members_match_cpython() {
     // #519 review regressions: a helper reached only from tests reads
     // setUp's fields, a helper setUp calls initializes its own reads, a

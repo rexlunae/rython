@@ -6324,7 +6324,6 @@ fn unittest_method_fields_refuse_opaque_attribute_presence() {
         ("    def test_a(self):\n        read = lambda: self.total\n        print(read())\n        self.total = 3\n", "capture"),
         ("    def test_a(self):\n        def read():\n            return self.total\n        print(read())\n        self.total = 3\n", "capture"),
         ("    def setUp(self):\n        self.test_a()\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "lifecycle access"),
-        ("    def setUp(self):\n        super().setUp()\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "receiver escape"),
         // A class data attribute an instance field shadows is accepted
         // (#519 review); reading it before the instance store is not.
         ("    total = 9\n    def test_a(self):\n        print(self.total)\n        self.total = 3\n", "attribute `self.total` may be read before assignment"),
