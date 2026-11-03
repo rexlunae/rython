@@ -3206,6 +3206,153 @@ impl ClassDef {
         Ok(())
     }
 
+    /// A composed instance field is represented by its Rust value type, so
+    /// the struct's `Default` placeholder can look like a real Python
+    /// instance before `__init__` assigns the field. Require every such
+    /// field to be initialized unconditionally before the instance can be
+    /// read or escape; this also protects reads outside the defining class.
+    fn validate_composed_field_initialization(
+        &self,
+        fields: &[(String, crate::TypeInfo)],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let composed: std::collections::BTreeSet<String> = fields
+            .iter()
+            .filter_map(|(name, ty)| match ty {
+                crate::TypeInfo::Class(_) => Some(name.clone()),
+                crate::TypeInfo::Option(inner)
+                    if matches!(**inner, crate::TypeInfo::Class(_)) =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        if composed.is_empty() {
+            return Ok(());
+        }
+
+        let refusal = |field: &str, line: usize| -> Box<dyn std::error::Error> {
+            format!(
+                "composed field `self.{field}` in class `{}` at line {line} can expose \
+                 the generated struct's default value where CPython raises \
+                 AttributeError; initialize it unconditionally in `__init__` before \
+                 reading it or allowing the instance to escape; rython refuses to \
+                 silently expose an absent instance field",
+                self.name,
+            )
+            .into()
+        };
+        let Some(init) = self.init_method() else {
+            let field = composed.iter().next().expect("non-empty");
+            return Err(refusal(field, self.body.first().and_then(|s| s.lineno).unwrap_or(0)));
+        };
+
+        let init_stores = |upto: usize| -> std::collections::BTreeSet<String> {
+            let mut out = std::collections::BTreeSet::new();
+            for stmt in init.body.iter().take(upto) {
+                if let StatementType::Assign(a) = &stmt.statement {
+                    for target in &a.targets {
+                        if let ExprType::Attribute(attr) = target
+                            && visit::is_self(&attr.value)
+                        {
+                            out.insert(attr.attr.clone());
+                        }
+                    }
+                }
+            }
+            out
+        };
+
+        let instance_stores = self.instance_store_names();
+        let mut initialized = class_constant_names(&self.body);
+        initialized.retain(|name| !instance_stores.contains(name));
+
+        for stmt in &init.body {
+            let mut reads = Vec::new();
+            let mut can_return_early = false;
+            visit::walk_stmts(std::slice::from_ref(stmt), Descend::SkipDefs, &mut |nested| {
+                for expr in visit::stmt_exprs(nested) {
+                    visit::walk_expr(expr, &mut |e| {
+                        if let ExprType::Attribute(a) = e
+                            && visit::is_self(&a.value)
+                            && composed.contains(&a.attr)
+                            && !initialized.contains(&a.attr)
+                        {
+                            reads.push(a.attr.clone());
+                        }
+                    });
+                }
+                for target in visit::stmt_targets(nested) {
+                    let creates_field = matches!(nested.statement, StatementType::Assign(_))
+                        && matches!(target, ExprType::Attribute(a)
+                            if visit::is_self(&a.value) && composed.contains(&a.attr));
+                    if !creates_field {
+                        visit::walk_expr(target, &mut |e| {
+                            if let ExprType::Attribute(a) = e
+                                && visit::is_self(&a.value)
+                                && composed.contains(&a.attr)
+                                && !initialized.contains(&a.attr)
+                            {
+                                reads.push(a.attr.clone());
+                            }
+                        });
+                    }
+                }
+                if matches!(nested.statement, StatementType::Return(_)) {
+                    can_return_early = true;
+                }
+                Flow::Continue
+            });
+            if let Some(field) = reads.first() {
+                return Err(refusal(field, stmt.lineno.unwrap_or(0)));
+            }
+            if can_return_early {
+                if let Some(field) = composed.iter().find(|field| !initialized.contains(*field)) {
+                    return Err(refusal(field, stmt.lineno.unwrap_or(0)));
+                }
+            }
+            if let StatementType::Assign(a) = &stmt.statement {
+                for target in &a.targets {
+                    if let ExprType::Attribute(attr) = target
+                        && visit::is_self(&attr.value)
+                    {
+                        initialized.insert(attr.attr.clone());
+                    }
+                }
+            }
+        }
+        if let Some(field) = composed.iter().find(|field| !initialized.contains(*field)) {
+            return Err(refusal(field, self.body.first().and_then(|s| s.lineno).unwrap_or(0)));
+        }
+
+        // A method or an escaped `self` can expose the instance while
+        // `__init__` is still running. Only stores before the first such
+        // statement are safe to assume in other methods.
+        let stored = self.instance_store_names();
+        let constants = class_constant_names(&self.body);
+        let first_interruption = init.body.iter().position(|stmt| {
+            visit::any_stmt(std::slice::from_ref(stmt), Descend::SkipDefs, |s| {
+                matches!(s.statement, StatementType::Return(_))
+            }) || visit::any_stmt(std::slice::from_ref(stmt), Descend::All, |s| {
+                visit::stmt_all_exprs(s)
+                    .into_iter()
+                    .any(|e| runs_instance_code(e, &stored, &constants))
+            })
+        });
+        let safe_before_interruption = init_stores(first_interruption.unwrap_or(usize::MAX));
+        if let Some(field) = composed
+            .iter()
+            .find(|field| !safe_before_interruption.contains(*field))
+        {
+            let line = first_interruption
+                .and_then(|i| init.body.get(i))
+                .and_then(|s| s.lineno)
+                .unwrap_or(0);
+            return Err(refusal(field, line));
+        }
+        Ok(())
+    }
+
     fn validate_thread_field_initialization(
         &self,
         fields: &[(String, crate::TypeInfo)],
@@ -4594,6 +4741,7 @@ StatementType::Assign(a)
         let fields = self.own_fields(&symbols, &options)?;
         self.validate_thread_field_initialization(&fields, &symbols, &options)?;
         self.validate_thread_constructor_arguments(&symbols)?;
+        self.validate_composed_field_initialization(&fields)?;
         self.validate_testcase_fields(&symbols, &options)?;
 
         // The embedded base struct occupies `__rython_base`; a user field of
