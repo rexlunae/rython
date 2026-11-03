@@ -166,12 +166,14 @@ feature that `rypip` enables automatically), and more.
 
 `unittest.TestCase` fields may first be assigned in a test method, without
 `__init__` or `setUp`. The runner creates a fresh instance per test and
-discovers inherited tests and fixtures. Reads must follow an assignment on
-every path, or an unconditional `setUp` initialization; uncertain attribute
-presence, receiver escapes, and field reads relying on another test or an
-opaque helper are conversion errors. Manual construction of cases with
-fields is refused; use `unittest.main()` to preserve fixture order
-(issues #480, #511).
+discovers inherited tests and per-test fixtures. Direct `setUpClass` and
+`tearDownClass` class fixtures run once around each class's tests. Inherited
+class fixtures and unsupported signatures are refused. Reads must follow an
+assignment on every path, or an unconditional `setUp` initialization;
+uncertain attribute presence, receiver escapes, and field reads relying on
+another test or an opaque helper are conversion errors. Manual construction
+of cases with fields is refused; use `unittest.main()` to preserve fixture
+order (issues #480, #511, #526).
 
 Comprehension outputs that borrow existing mutable containers by name,
 attribute, or index are refused when value copies would lose sharing.

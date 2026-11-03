@@ -594,6 +594,13 @@ impl TextTestResult {
         status_char('s');
     }
 
+    /// Record a `setUpClass` or `tearDownClass` error as unittest's
+    /// synthetic class-fixture error. CPython prints its status but does not
+    /// include the error holder in the `Ran N tests` count.
+    pub fn add_class_error(&mut self, description: &str, e: &PyException) {
+        self.add_exception(description, e);
+    }
+
     /// Run one test the way `TestCase.run` does: `setUp`, then the test
     /// (only when `setUp` succeeded), then `tearDown` (likewise). Every
     /// part's exception is reported as it happens — a failure when it is

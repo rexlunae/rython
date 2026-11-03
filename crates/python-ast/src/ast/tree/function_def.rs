@@ -4327,6 +4327,14 @@ impl FunctionDef {
             });
         }
 
+        let method_name_lint = if matches!(
+            &ctx,
+            CodeGenContext::Class(_) | CodeGenContext::Trait { .. }
+        ) {
+            quote!(#[allow(non_snake_case)])
+        } else {
+            TokenStream::new()
+        };
         let function = if let Some(docstring) = self.get_docstring() {
             // Convert docstring to Rust doc comments
             let doc_lines: Vec<_> = docstring
@@ -4343,6 +4351,7 @@ impl FunctionDef {
 
             quote! {
                 #(#doc_lines)*
+                #method_name_lint
                 #lossy_warning
                 #visibility #is_async fn #fn_name #generic_header(#receiver #parameters) #return_type #where_clause {
                     #streams
@@ -4350,6 +4359,7 @@ impl FunctionDef {
             }
         } else {
             quote! {
+                #method_name_lint
                 #lossy_warning
                 #visibility #is_async fn #fn_name #generic_header(#receiver #parameters) #return_type #where_clause {
                     #streams
