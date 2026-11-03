@@ -5,6 +5,33 @@
 
 use python_ast::{CodeGen, CodeGenContext, PythonOptions, PythonOptionsData, SymbolTableScopes, parse};
 
+#[test]
+fn rust_keyword_module_identifiers_use_consistent_file_stems() {
+    for (python, rust, stem) in [
+        ("impl", "r#impl", "impl"), ("mod", "r#mod", "mod"),
+        ("self", "self_", "self_"), ("Self", "Self_", "Self_"),
+        ("super", "super_", "super_"), ("crate", "crate_", "crate_"),
+        ("_", "__rython_underscore", "__rython_underscore"),
+        ("ordinary", "ordinary", "ordinary"),
+    ] {
+        assert_eq!(python_ast::module_ident(python).to_string(), rust);
+        assert_eq!(python_ast::module_file_stem(python), stem);
+    }
+    assert_eq!(python_ast::safe_ident("self").to_string(), "self");
+}
+
+#[test]
+fn imports_binding_self_are_refused_with_an_alias_rewrite() {
+    for source in [
+        "import self\n", "import self.child\n", "import other as self\n",
+        "from . import self\n", "from other import value as self\n",
+    ] {
+        let error = compile_err(source, "self_import.py");
+        assert!(error.contains("binds the name `self`"), "{error}");
+        assert!(error.contains("as self_module") && error.contains("refuses"), "{error}");
+    }
+}
+
 /// Two-module crate for the cross-module trait-mut cache tests: module A
 /// defines a hierarchy whose trait widens (Dog's mutating `grow` override
 /// widens Animal's trait), module B imports it and calls `grow` on a

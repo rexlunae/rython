@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use proc_macro2::TokenStream;
 use python_ast::{
-    CodeGen, CodeGenContext, PythonOptions, StatementType, SymbolTableScopes, parse_enhanced,
-    python_annotation_to_rust_type, safe_ident,
+    CodeGen, CodeGenContext, PythonOptions, StatementType, SymbolTableScopes, module_file_stem,
+    module_ident, parse_enhanced, python_annotation_to_rust_type, safe_ident,
 };
 use quote::quote;
 use rust_format::{Formatter, RustFmt};
@@ -2204,10 +2204,15 @@ fn convert_on_this_thread(
             continue;
         }
         let (parent, name) = module.path.split_at(module.path.len() - 1);
-        children
-            .entry(parent.to_vec())
-            .or_default()
-            .push(name[0].clone());
+        // Once per child: a package's `__init__` registers itself AFTER
+        // its submodules when a submodule's file name sorts before
+        // `__init__.py` (`Self.py`, `Image.py`), whose ancestor pass below
+        // already listed the package — and the bin-side declarations do
+        // not dedup (E0428, `pub mod pkg;` twice).
+        let list = children.entry(parent.to_vec()).or_default();
+        if !list.contains(&name[0]) {
+            list.push(name[0].clone());
+        }
         // Intermediate packages ensure their ancestors know about them.
         for depth in 1..parent.len() + 1 {
             let (ancestor, child) = parent.split_at(depth - 1);
@@ -2217,6 +2222,7 @@ fn convert_on_this_thread(
             }
         }
     }
+    refuse_colliding_module_idents(&children)?;
 
     // Write module files. The lint allowances lead each file (they're inner
     // attributes), then the transpiled code (which may itself start with
@@ -2321,7 +2327,7 @@ fn convert_on_this_thread(
             if let Some(kids) = children.get(&Vec::new()) {
                 for kid in kids {
                     if Some(kid) != entry.path.first() {
-                        decls.push_str(&format!("pub mod {};\n", kid));
+                        decls.push_str(&mod_decl(kid));
                     }
                 }
             }
@@ -2635,10 +2641,10 @@ fn convert_driver(
         let mut children: BTreeMap<Vec<String>, Vec<String>> = BTreeMap::new();
         for (dep_module, _) in &dep_transpiled {
             let (parent, name) = dep_module.path.split_at(dep_module.path.len() - 1);
-            children
-                .entry(parent.to_vec())
-                .or_default()
-                .push(name[0].clone());
+            let list = children.entry(parent.to_vec()).or_default();
+            if !list.contains(&name[0]) {
+                list.push(name[0].clone());
+            }
             for depth in 1..parent.len() + 1 {
                 let (ancestor, child) = parent.split_at(depth - 1);
                 let list = children.entry(ancestor.to_vec()).or_default();
@@ -2647,6 +2653,7 @@ fn convert_driver(
                 }
             }
         }
+        refuse_colliding_module_idents(&children)?;
         let mut written: HashSet<Vec<String>> = HashSet::new();
         for (dep_module, dep_code) in &dep_transpiled {
             let decls = mod_decls(&children, &dep_module.path, dep_module.is_init);
@@ -2663,7 +2670,8 @@ fn convert_driver(
         }
         write_missing_containers(&src_dir, &children, &written)?;
         for name in children.get(&Vec::new()).cloned().unwrap_or_default() {
-            lib.push_str(&format!("\npub mod {};", name));
+            lib.push('\n');
+            lib.push_str(&mod_decl(&name));
         }
     }
     write_file(src_dir.join("lib.rs"), format_rust(&lib))?;
@@ -3303,6 +3311,46 @@ fn root_shim() -> String {
     )
 }
 
+/// Refuse two sibling modules whose names render to the same Rust module
+/// identifier: a module named after a keyword that cannot be a raw
+/// identifier is renamed (`self.py` → `pub mod self_;`, see
+/// `python_ast::module_ident`), and a sibling already holding the renamed
+/// spelling (`self_.py`) would share its `pub mod` declaration and file —
+/// one module's code silently replacing the other's (issue #528).
+fn refuse_colliding_module_idents(children: &BTreeMap<Vec<String>, Vec<String>>) -> Result<()> {
+    for (parent, kids) in children {
+        let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+        for kid in kids {
+            let ident = module_ident(kid).to_string();
+            match seen.get(&ident) {
+                Some(other) if *other != kid.as_str() => {
+                    let qualify = |name: &str| {
+                        parent
+                            .iter()
+                            .map(String::as_str)
+                            .chain(std::iter::once(name))
+                            .collect::<Vec<_>>()
+                            .join(".")
+                    };
+                    bail!(
+                        "modules `{}` and `{}` both become the Rust module `{}`: a module \
+                         named after a Rust keyword that cannot be a raw identifier \
+                         (`self`, `Self`, `super`, `crate`, `_`) is renamed, and the renamed \
+                         spelling is already taken; rename one of the two Python modules",
+                        qualify(other),
+                        qualify(kid),
+                        ident
+                    );
+                }
+                _ => {
+                    seen.insert(ident, kid.as_str());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `pub mod child;` declarations for a container module.
 fn mod_decls(
     children: &BTreeMap<Vec<String>, Vec<String>>,
@@ -3315,10 +3363,38 @@ fn mod_decls(
         sorted.sort();
         sorted.dedup();
         for kid in sorted {
-            out.push_str(&format!("pub mod {};\n", kid));
+            out.push_str(&mod_decl(&kid));
         }
     }
     out
+}
+
+/// The file name of a module-rs file, which is also the Rust keyword `mod`.
+const MOD_RS_STEM: &str = "mod";
+
+/// Whether the module `name` takes a directory of its own: a package does,
+/// and so does a module named `mod` (issue #528) — inside a package its
+/// default file `<pkg>/mod.rs` IS the package's own file, so it lives at
+/// `<pkg>/mod/mod.rs` instead, loaded through an explicit `#[path]` (see
+/// [`mod_decl`]).
+fn module_takes_dir(name: &str, is_init: bool) -> bool {
+    is_init || module_file_stem(name) == MOD_RS_STEM
+}
+
+/// One `pub mod child;` declaration, spelled through
+/// `python_ast::module_ident` like every `crate::` path the codegen emits
+/// (`pub mod r#impl;`, `pub mod self_;` — issue #528). A module named
+/// `mod` names its file explicitly: rustc's default `mod.rs` would be the
+/// declaring package's own file (or, at the crate root, a file whose
+/// layout would differ from the nested case), so every such module lives
+/// at `mod/mod.rs` beside its declaration.
+fn mod_decl(kid: &str) -> String {
+    let ident = module_ident(kid);
+    if module_file_stem(kid) == MOD_RS_STEM {
+        format!("#[path = \"{0}/{0}.rs\"]\npub mod {1};\n", MOD_RS_STEM, ident)
+    } else {
+        format!("pub mod {};\n", ident)
+    }
 }
 
 /// A package whose `__init__` the crate does not emit (nothing imports
@@ -3337,7 +3413,7 @@ fn write_missing_containers(
         }
         let mut dir = src_dir.to_path_buf();
         for part in path {
-            dir = dir.join(part);
+            dir = dir.join(module_file_stem(part));
         }
         fs::create_dir_all(&dir)?;
         let file = dir.join("mod.rs");
@@ -3352,19 +3428,22 @@ fn module_file_path(src_dir: &Path, module: &PyModule) -> PathBuf {
     if module.path.is_empty() {
         return src_dir.join("lib.rs");
     }
-    if module.is_init {
+    // The file and directory names are the `pub mod` identifiers rustc
+    // resolves (`pub mod r#impl;` → `impl.rs`, `pub mod self_;` →
+    // `self_.rs`), never the raw Python names (issue #528).
+    let (dirs, name) = module.path.split_at(module.path.len() - 1);
+    if module_takes_dir(&name[0], module.is_init) {
         let mut dir = src_dir.to_path_buf();
         for part in &module.path {
-            dir = dir.join(part);
+            dir = dir.join(module_file_stem(part));
         }
-        return dir.join("mod.rs");
+        return dir.join(format!("{}.rs", MOD_RS_STEM));
     }
-    let (dirs, name) = module.path.split_at(module.path.len() - 1);
     let mut dir = src_dir.to_path_buf();
     for part in dirs {
-        dir = dir.join(part);
+        dir = dir.join(module_file_stem(part));
     }
-    dir.join(format!("{}.rs", name[0]))
+    dir.join(format!("{}.rs", module_file_stem(&name[0])))
 }
 
 /// Generate the PyO3 bindings module: wrappers for every function whose
@@ -3421,7 +3500,7 @@ fn generate_bindings(
         };
         let wrapper_name = safe_ident(&qualified);
         let target = safe_ident(bare);
-        let path: Vec<_> = module.path.iter().map(|p| safe_ident(p)).collect();
+        let path: Vec<_> = module.path.iter().map(|p| module_ident(p)).collect();
         let call = quote!(crate::#(#path::)*#target(#(#arg_names),*));
         // Generated functions return Result<T, PyException>; the wrapper
         // maps a raised exception onto the corresponding real Python

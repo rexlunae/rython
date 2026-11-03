@@ -343,7 +343,7 @@ pub fn variant_path(v: &Variant) -> proc_macro2::TokenStream {
     match &v.module_path {
         None => quote::quote!(#ident),
         Some(path) => {
-            let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+            let segs: Vec<_> = path.iter().map(|p| crate::module_ident(p)).collect();
             quote::quote!(crate #(::#segs)* :: #ident)
         }
     }

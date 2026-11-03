@@ -491,6 +491,152 @@ fn discovers_single_file_module() {
 }
 
 #[test]
+fn rust_keyword_module_names_match_python_at_runtime() {
+    let scratch = Scratch::new("keyword-modules");
+    let pkg_dir = scratch.path().join("app");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    fs::write(pkg_dir.join("__init__.py"), "").unwrap();
+    for (name, value) in [
+        ("impl", 1), ("type", 2), ("self", 3), ("Self", 4),
+        ("super", 5), ("crate", 6), ("_", 7), ("mod", 8),
+        ("outer/impl/self", 9), ("outer/mod/__init__", 10), ("outer/mod/impl", 11),
+    ] {
+        let file = pkg_dir.join(format!("{name}.py"));
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, format!("def number() -> int:\n    return {value}\n")).unwrap();
+    }
+    for dir in ["outer", "outer/impl"] {
+        fs::write(pkg_dir.join(dir).join("__init__.py"), "").unwrap();
+    }
+    fs::write(pkg_dir.join("cli.py"), concat!(
+        "from . import impl, type, self as self_module, Self, super, crate, _, mod\n",
+        "from .outer.impl.self import number as nested_number\n",
+        "from .outer import mod as nested_mod\n",
+        "from .outer.mod.impl import number as deepest_number\n",
+        "\n",
+        "def main() -> None:\n",
+        "    print(impl.number(), type.number(), self_module.number(), Self.number())\n",
+        "    print(super.number(), crate.number(), _.number(), mod.number())\n",
+        "    print(nested_number(), nested_mod.number())\n",
+        "    print(deepest_number())\n",
+        "\n",
+        "if __name__ == '__main__':\n",
+        "    main()\n",
+    )).unwrap();
+
+    let python = Command::new("python3")
+        .args(["-m", "app.cli"])
+        .env("PYTHONHASHSEED", "0")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .current_dir(scratch.path())
+        .output().unwrap();
+    // Verified against python3.
+    assert_eq!(python.stdout, b"1 2 3 4\n5 6 7 8\n9 10\n11\n");
+    assert!(python.status.success(), "{python:?}");
+    assert!(python.stderr.is_empty(), "{python:?}");
+
+    let package = rypip::discover(&pkg_dir).unwrap();
+    let krate = rypip::convert(
+        &package, &scratch.path().join("crate"),
+        &ConvertOptions { pyo3: true, ..Default::default() },
+    ).unwrap();
+    for file in ["src/lib.rs", "src/main.rs"] {
+        let source = fs::read_to_string(krate.root.join(file)).unwrap();
+        for declaration in [
+            "pub mod r#impl;", "pub mod r#type;", "pub mod self_;",
+            "pub mod Self_;", "pub mod super_;", "pub mod crate_;",
+            "pub mod __rython_underscore;", "pub mod r#mod;",
+        ] {
+            assert!(source.contains(declaration), "{file}: {source}");
+        }
+    }
+    for file in [
+        "src/impl.rs", "src/self_.rs", "src/Self_.rs", "src/mod/mod.rs",
+        "src/outer/impl/self_.rs", "src/outer/mod/mod.rs", "src/outer/mod/impl.rs",
+    ] {
+        assert!(krate.root.join(file).is_file(), "missing {file}");
+    }
+    let bindings = fs::read_to_string(krate.root.join("src/python_api.rs")).unwrap();
+    assert!(bindings.contains("crate::self_::number("), "{bindings}");
+    assert!(bindings.contains("crate::outer::r#impl::self_::number("), "{bindings}");
+    assert!(build_generated(&krate.root).success());
+    let rust = Command::new(krate.root.join("target/debug/app")).output().unwrap();
+    assert_eq!(rust.stdout, python.stdout);
+    assert_eq!(rust.stderr, python.stderr);
+    assert_eq!(rust.status.code(), python.status.code());
+}
+
+#[test]
+fn rust_keyword_module_name_collisions_are_refused() {
+    let scratch = Scratch::new("keyword-module-collisions");
+    for (keyword, renamed) in [
+        ("self", "self_"), ("Self", "Self_"), ("super", "super_"),
+        ("crate", "crate_"), ("_", "__rython_underscore"),
+    ] {
+        let pkg_dir = scratch.path().join(keyword);
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(pkg_dir.join("__init__.py"), "").unwrap();
+        for (name, value) in [(keyword, 1), (renamed, 2)] {
+            fs::write(
+                pkg_dir.join(format!("{name}.py")),
+                format!("def number() -> int:\n    return {value}\n"),
+            ).unwrap();
+        }
+        fs::write(pkg_dir.join("cli.py"), format!(
+            "from . import {keyword} as first_module\n\
+             from . import {renamed} as second_module\n\
+             if __name__ == '__main__':\n    print(first_module.number(), second_module.number())\n",
+        )).unwrap();
+        let python = Command::new("python3")
+            .args(["-m", &format!("{keyword}.cli")])
+            .env("PYTHONHASHSEED", "0")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .current_dir(scratch.path())
+            .output().unwrap();
+        // Verified against python3: these are distinct, case-sensitive modules.
+        assert_eq!(python.stdout, b"1 2\n");
+        assert!(python.status.success() && python.stderr.is_empty(), "{python:?}");
+        let package = rypip::discover(&pkg_dir).unwrap();
+        let error = rypip::convert(
+            &package, &scratch.path().join(format!("crate-{keyword}")), &ConvertOptions::default(),
+        ).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(keyword) && message.contains(renamed), "{message}");
+        assert!(message.contains("both become the Rust module") && message.contains("rename"), "{message}");
+    }
+}
+
+#[test]
+fn rust_keyword_module_self_binding_is_refused_instead_of_calling_the_importer() {
+    let scratch = Scratch::new("keyword-module-self-binding");
+    let pkg_dir = scratch.path().join("app");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    fs::write(pkg_dir.join("__init__.py"), "").unwrap();
+    fs::write(pkg_dir.join("self.py"), "def number() -> int:\n    return 12\n").unwrap();
+    fs::write(pkg_dir.join("cli.py"), concat!(
+        "from . import self\n",
+        "def number() -> int:\n    return 99\n",
+        "if __name__ == '__main__':\n    print(self.number())\n",
+    )).unwrap();
+    let python = Command::new("python3")
+        .args(["-m", "app.cli"])
+        .env("PYTHONHASHSEED", "0")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .current_dir(scratch.path())
+        .output().unwrap();
+    // Verified against python3: `self` is the imported module, not the importer.
+    assert_eq!(python.stdout, b"12\n");
+    assert!(python.status.success() && python.stderr.is_empty(), "{python:?}");
+    let package = rypip::discover(&pkg_dir).unwrap();
+    let error = rypip::convert(
+        &package, &scratch.path().join("crate"), &ConvertOptions::default(),
+    ).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("cli.py") && message.contains("binds the name `self`"), "{message}");
+    assert!(message.contains("from . import self as self_module"), "{message}");
+}
+
+#[test]
 fn converts_package_into_crate_layout() {
     let scratch = Scratch::new("convert");
     write_sample_package(scratch.path());

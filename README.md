@@ -424,6 +424,10 @@ green at every step. The rounds fixed, among others:
   package submodules (`from .util import connection, ssl_`), and routes
   stdpython-module re-exports (`from .compat import json as
   complexjson`) to `use <stdpython>::json as complexjson;`.
+- **Rust-keyword module names** — package submodules such as `impl.py`
+  use escaped Rust identifiers consistently in declarations and imports.
+  Names that require renaming reject collisions; import `self.py` with an
+  alias (`from . import self as self_module`).
 - **Submodule imports are reachable** — `from .http2 import probe as
   http2_probe` enqueues `http2/probe.py` so it is transpiled.
 - **Dynamic-module-member divergences** — a read of a module member the

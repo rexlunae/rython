@@ -793,10 +793,12 @@ pub(crate) fn classify_exception_init<'a>(
             StatementType::Expr(e) => match &e.value {
                 ExprType::Call(sc) => {
                     let is_super_init = match sc.func.as_ref() {
+                        // `super().__init__(...)` — the call, never a bare
+                        // `super` name (a module bound to `super` is not the
+                        // base class; issue #528).
                         ExprType::Attribute(attr) if attr.attr == "__init__" => {
-                            matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "super")
-                                || matches!(attr.value.as_ref(), ExprType::Call(c2)
-                                    if matches!(c2.func.as_ref(), ExprType::Name(n) if n.id == "super"))
+                            matches!(attr.value.as_ref(), ExprType::Call(c2)
+                                if matches!(c2.func.as_ref(), ExprType::Name(n) if n.id == "super"))
                         }
                         _ => false,
                     };

@@ -118,6 +118,10 @@ always win over inference.
 ## Generated crates
 
 Each Python module becomes a Rust module; subpackages become nested modules.
+Submodule names keep their Python case; Rust keywords are escaped
+(`impl.py` → `pub mod r#impl;`). Unescapable names are renamed consistently
+in declarations, imports and file paths; collisions are refused. Import
+`self.py` under an alias (`from . import self as self_module`).
 The crate depends on the `stdpython` runtime (locate it with `--stdpython`,
 `RYPIP_STDPYTHON_PATH`, or the copy alongside this tool's source tree).
 

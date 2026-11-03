@@ -3584,7 +3584,7 @@ fn qualify_tokens(
                 match target {
                     Some(path) => {
                         let segs: Vec<_> =
-                            path.iter().map(|p| crate::safe_ident(p)).collect();
+                            path.iter().map(|p| crate::module_ident(p)).collect();
                         let ident = crate::safe_ident(&name);
                         out.extend(quote!(crate #(::#segs)* :: #ident));
                     }
@@ -5408,7 +5408,7 @@ impl ClassDef {
                 match chain.get(1).and_then(|(_, _, _, p)| p.as_ref()) {
                     Some(path) => {
                         let segs: Vec<_> =
-                            path.iter().map(|p| crate::safe_ident(p)).collect();
+                            path.iter().map(|p| crate::module_ident(p)).collect();
                         quote!(: crate #(::#segs)* :: #b_trait)
                     }
                     None => quote!(: #b_trait),
@@ -5839,7 +5839,7 @@ impl ClassDef {
             // (this module need not import it).
             let trait_path = match a_path {
                 Some(path) => {
-                    let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+                    let segs: Vec<_> = path.iter().map(|p| crate::module_ident(p)).collect();
                     quote!(crate #(::#segs)* :: #ancestor_trait)
                 }
                 None => quote!(#ancestor_trait),
@@ -7744,7 +7744,7 @@ impl ClassDef {
             let inner_any_path = match &v.module_path {
                 None => quote!(#inner_any),
                 Some(path) => {
-                    let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+                    let segs: Vec<_> = path.iter().map(|p| crate::module_ident(p)).collect();
                     quote!(crate #(::#segs)* :: #inner_any)
                 }
             };
@@ -7809,7 +7809,7 @@ impl ClassDef {
                     let inner_any_path = match &v.module_path {
                         None => quote!(#inner_any),
                         Some(path) => {
-                            let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+                            let segs: Vec<_> = path.iter().map(|p| crate::module_ident(p)).collect();
                             quote!(crate #(::#segs)* :: #inner_any)
                         }
                     };
@@ -7892,7 +7892,7 @@ impl ClassDef {
             let a_trait = format_ident!("{}Trait", ancestor.name);
             let trait_path = match a_path {
                 Some(path) => {
-                    let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+                    let segs: Vec<_> = path.iter().map(|p| crate::module_ident(p)).collect();
                     quote!(crate #(::#segs)* :: #a_trait)
                 }
                 None => quote!(#a_trait),
