@@ -2058,7 +2058,7 @@ fn convert_on_this_thread(
     // One options object per conversion: the shared `module_defs` and the
     // cross-module trait-mut cache (computed once, reused by every module's
     // transpile via the Rc clone).
-    let base_options = conversion_base_options(
+    let mut base_options = conversion_base_options(
         opts,
         &rust_modules,
         &python_module_names,
@@ -2066,6 +2066,7 @@ fn convert_on_this_thread(
         async_runtime_dep,
         &package.name,
     );
+    base_options.executable_entry_module = package.entry_module().map(|m| m.path.clone());
     let mut transpiled: Vec<(&PyModule, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for (_name, dep) in &python_deps {

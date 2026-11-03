@@ -16,6 +16,11 @@ The default Python runtime library for the Rython compiler ecosystem. This crate
 - **Memory Safe**: All operations maintain Rust's memory safety guarantees
 - **Performance Optimized**: Native Rust implementations provide superior performance to interpreted Python
 
+`PyException::format_exception_only` qualifies imported user exceptions
+with their defining Python module, recorded by the converter with
+`with_module`. Builtins and `__main__` classes remain unqualified; matching,
+`type_name`, and Python str/repr use the original unqualified type.
+
 ## Architecture
 
 `PyInteger` provides the unbounded scalar integer runtime used for oversized

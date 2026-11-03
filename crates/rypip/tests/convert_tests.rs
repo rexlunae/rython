@@ -78,6 +78,91 @@ fn default_exception_and_ordinary_class_display_keep_their_cpython_behavior() {
 }
 
 #[test]
+fn imported_exception_tracebacks_keep_the_defining_module_and_matching() {
+    let scratch = Scratch::new("qualified-imported-exceptions");
+    let root = scratch.path().join("excpkg");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"excpkg\"\nversion = \"0.1.0\"\n").unwrap();
+    fs::write(root.join("__init__.py"), "").unwrap();
+    fs::write(root.join("errors.py"), concat!(
+        "class BadInput(Exception):\n",
+        "    pass\n",
+        "def fail() -> None:\n",
+        "    raise BadInput('boom')\n",
+    )).unwrap();
+    fs::write(root.join("compat.py"),
+        "from .errors import BadInput\n").unwrap();
+    fs::write(root.join("cli.py"), concat!(
+        "import sys\n",
+        "from excpkg.errors import BadInput, fail\n",
+        "from .compat import BadInput as Renamed\n",
+        "class MainError(Exception):\n",
+        "    pass\n",
+        "def main() -> None:\n",
+        "    mode = sys.argv[1]\n",
+        "    if mode == 'caught':\n",
+        "        try:\n",
+        "            fail()\n",
+        "        except BadInput as error:\n",
+        "            print('caught', str(error), repr(error))\n",
+        "        try:\n",
+        "            raise BadInput('direct')\n",
+        "        except BadInput:\n",
+        "            print('direct')\n",
+        "        try:\n",
+        "            fail()\n",
+        "        except Exception:\n",
+        "            print('base')\n",
+        "    elif mode == 'stored':\n",
+        "        error = BadInput('boom')\n",
+        "        raise error\n",
+        "    elif mode == 'alias':\n",
+        "        raise Renamed('boom')\n",
+        "    elif mode == 'bare':\n",
+        "        raise BadInput\n",
+        "    elif mode == 'main':\n",
+        "        raise MainError('boom')\n",
+        "    elif mode == 'builtin':\n",
+        "        raise ValueError('boom')\n",
+        "    else:\n",
+        "        fail()\n",
+        "if __name__ == '__main__':\n",
+        "    main()\n",
+    )).unwrap();
+    let package = rypip::discover(scratch.path()).unwrap();
+    let krate = rypip::convert(&package, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    assert!(build_generated(&krate.root).success());
+    // Verified against python3. Only traceback frames are omitted by the
+    // documented no-frames model (docs/spec.md §12.3).
+    for (mode, stdout, stderr, status) in [
+        ("imported", "", "Traceback (most recent call last):\nexcpkg.errors.BadInput: boom\n", 1),
+        ("stored", "", "Traceback (most recent call last):\nexcpkg.errors.BadInput: boom\n", 1),
+        ("alias", "", "Traceback (most recent call last):\nexcpkg.errors.BadInput: boom\n", 1),
+        ("bare", "", "Traceback (most recent call last):\nexcpkg.errors.BadInput\n", 1),
+        ("main", "", "Traceback (most recent call last):\nMainError: boom\n", 1),
+        ("builtin", "", "Traceback (most recent call last):\nValueError: boom\n", 1),
+        ("caught", "caught boom BadInput('boom')\ndirect\nbase\n", "", 0),
+    ] {
+        let python = Command::new("python3").args(["-m", "excpkg.cli", mode])
+            .env("PYTHONHASHSEED", "0").current_dir(scratch.path()).output().unwrap();
+        assert_eq!(python.stdout, stdout.as_bytes(), "CPython {mode}");
+        assert_eq!(python.status.code(), Some(status), "CPython {mode}");
+        let python_stderr = String::from_utf8(python.stderr).unwrap();
+        let without_frames = if status == 0 {
+            python_stderr
+        } else {
+            format!("Traceback (most recent call last):\n{}\n", python_stderr.lines().last().unwrap())
+        };
+        assert_eq!(without_frames, stderr, "CPython {mode}");
+        let output = Command::new(krate.root.join("target/debug/excpkg")).arg(mode).output().unwrap();
+        assert_eq!(output.stdout, stdout.as_bytes(), "{mode}");
+        assert_eq!(output.stderr, stderr.as_bytes(), "{mode}");
+        assert_eq!(output.status.code(), Some(status), "{mode}");
+    }
+}
+
+#[test]
 fn comprehension_fresh_and_immutable_outputs_match_cpython() {
     let scratch = Scratch::new("comprehension-owned-output");
     let file = scratch.path().join("app.py");
