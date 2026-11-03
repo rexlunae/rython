@@ -1,0 +1,9 @@
+stopped True
+work 3 Thread-1 (work)
+joined False
+stopped True
+stopped True
+alive before start False
+work 4 Thread-2 (work)
+joined False
+stopped True

@@ -103,4 +103,5 @@ as an improvement over any recorded error count.
 | `shared_slot_mutation` | a list of shared objects mutated through an index (`slots[0].n += 5`, `slots[1].n = 40`, `slots[2].n *= 2`) beside plain `list[int]`/`dict[str, int]` slot stores — the two need different `mut` decisions, and both are printed after the mutation |
 | `thread_instance_field` | a typed Thread instance field, start/join and printed lifecycle state (issue #481) |
 | `thread_nested_target` | a nested `def` as a Thread target, a field argument bound at construction, a Thread field returned from a method (#519 review) |
+| `thread_lazy_field` | a Thread field declared `None` in `__init__` and created in a later method, stopped before it starts, reset to `None`, refilled from a local handle (issue #529) |
 | `testcase_setup_helpers` | a TestCase helper reading setUp's fields, a helper setUp calls, a class default setUp overrides, `@staticmethod`/`@classmethod` members (#519 review) |

@@ -1097,7 +1097,9 @@ impl<'a> CodeGen for Assign {
             // without the clone a reused boxed name is moved out from
             // under its later reads (`context = ssl_context` then
             // `elif ssl_context is None` — urllib3's
-            // _ssl_wrap_socket_and_match_hostname).
+            // _ssl_wrap_socket_and_match_hostname). A Thread is an Arc
+            // handle, so its clone is the same thread (`self.t = t` then
+            // `t.start()` — issue #529).
             let stored_name_needs_clone = matches!(&value_expr, ExprType::Name(n)
                 if options.use_counts.get(&n.id).copied().unwrap_or(0) > 1
                     && matches!(
@@ -1105,6 +1107,7 @@ impl<'a> CodeGen for Assign {
                         crate::TypeInfo::String
                             | crate::TypeInfo::Bytes
                             | crate::TypeInfo::PyValue
+                            | crate::TypeInfo::Threading(crate::ThreadingType::Thread)
                     ));
             Ok(match target {
                 ExprType::Name(name) => {
