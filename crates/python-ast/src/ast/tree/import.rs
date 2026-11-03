@@ -1295,7 +1295,7 @@ pub(crate) fn import_site_name_checks(
     };
     let segs: Vec<_> = init_module_path(key)
         .iter()
-        .map(|s| crate::safe_ident(s))
+        .map(|s| crate::module_ident(s))
         .collect();
     let qualified = std::iter::once(options.python_namespace.as_str())
         .filter(|ns| !ns.is_empty())
@@ -1319,7 +1319,7 @@ pub(crate) fn import_site_name_checks(
         sub.push(a.name.clone());
         Some(match crate::module_defs_key(options, &sub) {
             Some(sub_key) => {
-                let sub_segs: Vec<_> = sub_key.iter().map(|s| crate::safe_ident(s)).collect();
+                let sub_segs: Vec<_> = sub_key.iter().map(|s| crate::module_ident(s)).collect();
                 quote! {
                     if #bound.is_err() {
                         crate::#(#sub_segs::)*__module_init__()?;
@@ -1330,6 +1330,34 @@ pub(crate) fn import_site_name_checks(
         })
     });
     quote!(#(#checks)*)
+}
+
+/// Refuse an import that binds the local name `self` (issue #528):
+/// `self` is a Rust keyword with no raw-identifier form, so no `use` can
+/// bind it — and a module-level `self.name` lowers to the path
+/// `self::name`, which in Rust names the IMPORTING module's own item, not
+/// the import's: a module named `self` (`from . import self`) would
+/// silently call the wrong function. An alias (`from . import self as
+/// self_module`) binds an ordinary name; the module path itself renders
+/// `self_` through `module_ident`.
+///
+/// `spelling` yields the statement as written and the statement without
+/// its alias (the stem of the suggested rewrite).
+fn refuse_self_binding(
+    bound: &str,
+    spelling: impl FnOnce() -> (String, String),
+) -> Result<(), Box<dyn std::error::Error>> {
+    if bound != "self" {
+        return Ok(());
+    }
+    let (spelling, unaliased) = spelling();
+    Err(format!(
+        "`{spelling}` binds the name `self`, which is not supported: `self` is a Rust \
+         keyword with no raw-identifier form, and a `self` path in the generated Rust \
+         names the importing module itself, not what the import binds; rython refuses \
+         to silently rebind it. Bind it under another name (`{unaliased} as self_module`)"
+    )
+    .into())
 }
 
 /// The module through which every crate reaches the package root's
@@ -1353,7 +1381,7 @@ fn init_module_path(key: &[String]) -> Vec<String> {
 /// exactly where Python runs it — the import site.
 pub(crate) fn module_init_calls(paths: &[Vec<String>]) -> TokenStream {
     let calls = paths.iter().map(|path| {
-        let segs: Vec<_> = path.iter().map(|s| crate::safe_ident(s)).collect();
+        let segs: Vec<_> = path.iter().map(|s| crate::module_ident(s)).collect();
         quote!(crate::#(#segs::)*__module_init__()?;)
     });
     quote!(#(#calls)*)
@@ -2042,6 +2070,20 @@ impl CodeGen for Import {
         options: Self::Options,
         mut symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+        for alias in self.names.iter() {
+            // `import self` binds the root segment (`import self.sub` too).
+            let bound = alias
+                .asname
+                .as_deref()
+                .unwrap_or_else(|| alias.name.split('.').next().unwrap_or(&alias.name));
+            refuse_self_binding(bound, || {
+                let import = format!("import {}", alias.name);
+                match &alias.asname {
+                    Some(asname) => (format!("{} as {}", import, asname), import),
+                    None => (import.clone(), import),
+                }
+            })?;
+        }
         let mut tokens = TokenStream::new();
         for alias in self.names.iter() {
             // `import rython` is not a runtime module: rust.bind declarations
@@ -2084,10 +2126,10 @@ impl CodeGen for Import {
                         let names = if alias.name.contains('.') {
                             let parts: Vec<&str> = alias.name.split('.').collect();
                             let idents: Vec<_> =
-                                parts.iter().map(|part| crate::safe_ident(part)).collect();
+                                parts.iter().map(|part| crate::module_ident(part)).collect();
                             quote!(#(#idents)::*)
                         } else {
-                            let single_name = crate::safe_ident(&alias.name);
+                            let single_name = crate::module_ident(&alias.name);
                             quote!(#single_name)
                         };
                         let name = crate::safe_ident(asname);
@@ -2266,7 +2308,7 @@ impl CodeGen for Import {
                     } else {
                         let idents: Vec<_> = crate_path
                             .iter()
-                            .map(|part| crate::safe_ident(part))
+                            .map(|part| crate::module_ident(part))
                             .collect();
                         let names = quote!(#(#idents)::*);
 
@@ -2425,6 +2467,15 @@ impl CodeGen for ImportFrom {
         mut symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         debug!("ctx: {:?}", ctx);
+        for alias in &self.names {
+            refuse_self_binding(alias.asname.as_deref().unwrap_or(&alias.name), || {
+                let from = format!("from {}{} import {}", ".".repeat(self.level), self.module, alias.name);
+                match &alias.asname {
+                    Some(asname) => (format!("{} as {}", from, asname), from),
+                    None => (from.clone(), from),
+                }
+            })?;
+        }
         if self.level == 0 {
             for alias in &self.names {
                 if let Some(namespace) = crate::ast::tree::interpreter_state::InterpreterNamespace::from_import(&self.module, &alias.name) {
@@ -2571,7 +2622,7 @@ impl CodeGen for ImportFrom {
                 .into());
             }
             let cut = cur.len() + 1 - self.level;
-            cur[..cut].iter().map(|p| crate::safe_ident(p)).collect()
+            cur[..cut].iter().map(|p| crate::module_ident(p)).collect()
         } else {
             Vec::new()
         };
@@ -2585,11 +2636,11 @@ impl CodeGen for ImportFrom {
         let module_path: Vec<_> = if self.level == 0 {
             let resolved = self.resolved_module_path(&options);
             match crate::module_defs_key(&options, &resolved) {
-                Some(key) => key.iter().map(|p| crate::safe_ident(p)).collect(),
+                Some(key) => key.iter().map(|p| crate::module_ident(p)).collect(),
                 None => parts.iter().map(|part| crate::safe_ident(part)).collect(),
             }
         } else {
-            parts.iter().map(|part| crate::safe_ident(part)).collect()
+            parts.iter().map(|part| crate::module_ident(part)).collect()
         };
         let root = if self.level > 0 {
             quote!(crate)
@@ -2854,7 +2905,20 @@ impl CodeGen for ImportFrom {
                 .map(|m| crate::ast::tree::std_module::runtime_fn_variants(m, &alias.name))
                 .unwrap_or(&[]);
 
-            let name = crate::safe_ident(&alias.name);
+            // A SUBMODULE the from-list names is a module path segment
+            // (`from . import self as s` → `use crate::self_ as s;`, the
+            // spelling of its `pub mod` declaration — issue #528); any
+            // other item keeps its identifier spelling.
+            let names_submodule = {
+                let mut sub = self.resolved_module_path(&options);
+                sub.push(alias.name.clone());
+                crate::module_defs_key(&options, &sub).is_some()
+            };
+            let name = if names_submodule {
+                crate::module_ident(&alias.name)
+            } else {
+                crate::safe_ident(&alias.name)
+            };
             // A name the defining module re-exports from a STDPYTHON
             // module (`from .compat import json as complexjson` where
             // compat.py does `import json` — requests' models.py): the

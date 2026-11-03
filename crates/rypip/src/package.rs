@@ -407,6 +407,28 @@ fn locate_source_root(root: &Path, name: Option<&str>) -> Result<PathBuf> {
     )
 }
 
+/// The module-path segment of a submodule or subpackage of a discovered
+/// package: its Python name, verbatim. Import statements name it with its
+/// exact spelling (`from .Image import open`, `from .Self import x`), so a
+/// lowercased key no longer matched the import and the module was treated
+/// as external (issue #528 — `Self.py` became `self`, colliding with a
+/// sibling `self.py`). Keywords are escaped where the path is RENDERED
+/// (`python_ast::module_ident`), not here. A file stem that is not an
+/// identifier cannot be named by an import statement; it keeps the
+/// identifier-sanitized spelling.
+fn submodule_name(stem: &str) -> String {
+    let is_identifier = stem
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if is_identifier {
+        stem.to_string()
+    } else {
+        sanitize_name(stem)
+    }
+}
+
 /// Recursively collect `.py` modules under `dir`.
 fn collect_modules(dir: &Path, prefix: &[String], out: &mut Vec<PyModule>) -> Result<()> {
     let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
@@ -417,7 +439,7 @@ fn collect_modules(dir: &Path, prefix: &[String], out: &mut Vec<PyModule>) -> Re
         if path.is_dir() {
             // Only recurse into subpackages (dirs with __init__.py).
             if path.join("__init__.py").is_file() {
-                let sub = sanitize_name(
+                let sub = submodule_name(
                     path.file_name()
                         .and_then(|s| s.to_str())
                         .context("invalid directory name")?,
@@ -440,7 +462,7 @@ fn collect_modules(dir: &Path, prefix: &[String], out: &mut Vec<PyModule>) -> Re
         let is_init = stem == "__init__";
         let mut module_path = prefix.to_vec();
         if !is_init {
-            module_path.push(sanitize_name(stem));
+            module_path.push(submodule_name(stem));
         }
         out.push(PyModule {
             path: module_path,

@@ -749,6 +749,12 @@ impl<'a> CodeGen for Attribute {
             !root_shadowed && (module_access_token(&value_str) || module_chain);
 
         if is_module_access {
+            // A member of a module PATH is a path segment: a submodule
+            // named `self` renders `self_` like its `pub mod` declaration
+            // (issue #528). Every other name spells as before —
+            // `module_ident` differs from `safe_ident` only at `self`,
+            // which is no legal non-leading path segment either way.
+            let attr = crate::module_ident(&self.attr);
             // An EXTERNAL module (ssl, socket, zlib, logging, ...) has no
             // generated items: the attribute read lowers to the boxed None
             // with a warning (documented divergence — the external object's
@@ -1074,7 +1080,8 @@ pub(crate) fn to_rust_place_expr(
                 // The attribute is an identifier — interpolating the &str
                 // directly would emit a string literal (`os . "environ"`)
                 // that the Rust compiler rejects.
-                let attr_path = crate::safe_ident(&attr.attr);
+                // A path segment: `module_ident`, as for the load form.
+                let attr_path = crate::module_ident(&attr.attr);
                 // Vendored deps prefix `crate::` at the ROOT segment only;
                 // nested segments already carry it from their own rendering.
                 let vendored_root = matches!(attr.value.as_ref(), ExprType::Name(_))

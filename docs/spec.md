@@ -720,6 +720,16 @@ Python's with-lock discipline. `with lock as x:` (CPython binds
 
 ### 5.4 Imports
 
+Package submodule names retain their Python case. Rust keywords are
+escaped consistently in module declarations and references (`impl.py`
+becomes `pub mod r#impl;`). Names that cannot be raw identifiers are
+renamed (`self` → `self_`, `Self` → `Self_`, `super` → `super_`,
+`crate` → `crate_`, `_` → `__rython_underscore`); sibling names that
+collide after renaming are conversion errors. An import binding the local
+name `self` is refused: use an alias such as `from . import self as
+self_module`. A module named `mod` uses an explicit file path to avoid
+overwriting its package's `mod.rs` (issue #528).
+
 Runtime stdlib modules are already in scope in generated code (each
 module emits `use stdpython::*;`), so `import math` lowers to nothing.
 Consequences, all enforced loudly:
