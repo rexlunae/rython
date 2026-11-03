@@ -16,6 +16,9 @@ Deviation ledger: [`spec.md`](spec.md) §12.
   lowered; exit status matches CPython (0 on pass, 1 on failure).
 - **`with self.assertRaises(...): raise ...` works** since #457. The
   former build failure and its cause are recorded below as history.
+- **`with self.assertRaises(E) as cm:` works** since #523: the matching
+  exception is suppressed, and `cm.exception` can be read after the block.
+  Uses of the context object other than `.exception` are refused.
 - **There is no pytest runner or automatic collection.** A module with
   only `test_*` functions remains a library. An unresolved `import pytest`
   warns through the external-module channel (#456); attempts to use
@@ -128,6 +131,7 @@ the #457, #480 and #482 pins below update the affected rows:
 | `setUp` fixture | yes | yes | yes | yes |
 | `with self.assertRaises(E): f()` | yes | yes | yes | yes |
 | `with self.assertRaises(E): raise E(...)` | yes | yes | yes | yes (#457) |
+| `with self.assertRaises(E) as cm: raise E(...); cm.exception` | yes | yes | yes | yes (#523) |
 | `@unittest.skip` / `skipIf` / `skipUnless` | yes | yes | yes | yes (gates honoured) |
 | `@expectedFailure` | yes | yes | yes | yes |
 | Function-only `test_*` module | yes | yes (library) | no binary | no implicit collection, as with `python file.py` |

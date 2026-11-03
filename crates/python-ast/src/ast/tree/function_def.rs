@@ -2011,6 +2011,25 @@ impl FunctionDef {
         if argparse_rewrite.is_none() {
             crate::ast::tree::closure::hoist_nested_def_defaults(&mut effective_body);
         }
+        // `with self.assertRaises(E) as cm:` binds `cm` to the caught
+        // exception, and each `cm.exception` read is rewritten to `cm`
+        // (issue #523). Runs before every analysis, so all of them see the
+        // reads as an exception-typed local; any other use of the name is
+        // refused here.
+        {
+            let args = &self.args;
+            let params: Vec<String> = args
+                .posonlyargs
+                .iter()
+                .chain(args.args.iter())
+                .chain(args.kwonlyargs.iter())
+                .chain(args.vararg.iter())
+                .chain(args.kwarg.iter())
+                .map(|p| p.arg.clone())
+                .collect();
+            crate::ast::tree::with_stmt::bind_assert_raises_targets(&mut effective_body, &params)
+                .map_err(|e| format!("function `{}`: {}", self.name, e))?;
+        }
 
         // functools cache decorators rewrite the whole definition below;
         // @classmethod/@staticmethod change the method shape; any OTHER
@@ -7413,9 +7432,7 @@ fn refuse_reads_of_assert_raises_locals(
             after.push(stmt);
         }
         if let StatementType::With(w) = &stmt.statement
-            && w.items.len() == 1
-            && w.items[0].optional_vars.is_none()
-            && crate::ast::tree::with_stmt::assert_raises_cm_name(&w.items[0].context_expr).is_some()
+            && crate::ast::tree::with_stmt::is_assert_raises_with(&w.items)
         {
             seen = true;
         }

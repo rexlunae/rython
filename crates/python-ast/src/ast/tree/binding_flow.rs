@@ -323,10 +323,7 @@ impl Analysis<'_> {
                 }
                 let mut paths = self.block(bodies[0], bound);
                 if let StatementType::With(with) = &stmt.statement
-                    && with.items.len() == 1
-                    && with.items[0].optional_vars.is_none()
-                    && super::with_stmt::assert_raises_cm_name(&with.items[0].context_expr)
-                        .is_some()
+                    && super::with_stmt::is_assert_raises_with(&with.items)
                 {
                     // assertRaises can suppress a body exception, but
                     // never a return/break/continue.

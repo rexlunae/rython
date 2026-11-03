@@ -6661,10 +6661,11 @@ fn unittest_assert_raises_with_statement_lowers() {
 }
 
 #[test]
-fn unittest_assert_raises_with_a_returning_body_stays_a_loud_drop() {
-    // A body whose `return` would have to escape the closure cannot use the
-    // closure lowering — it keeps the plain (loud-drop) with lowering.
-    let out = compile(
+fn unittest_assert_raises_with_a_returning_body_is_refused() {
+    // A return exits through __exit__ with no exception, so assertRaises
+    // raises "ValueError not raised". It cannot be represented by the
+    // closure lowering and must be refused rather than run unchecked.
+    let err = compile_err(
         concat!(
             "import unittest\n",
             "class T(unittest.TestCase):\n",
@@ -6675,9 +6676,8 @@ fn unittest_assert_raises_with_a_returning_body_stays_a_loud_drop() {
         "assert_raises_with_ret.py",
     );
     assert!(
-        !out.contains("assert_raises ("),
-        "a returning body must not use the closure lowering: {}",
-        out
+        err.contains("return") && err.contains("not supported yet"),
+        "a returning body must be loudly refused: {err}"
     );
 }
 
@@ -29826,6 +29826,25 @@ fn a_post_block_read_of_an_assert_raises_local_is_refused() {
         err.contains("UnboundLocalError") && err.contains("assertRaises"),
         "the post-block read must be a loud refusal naming the cause: {}",
         err
+    );
+}
+
+#[test]
+fn assert_raises_context_target_is_only_supported_through_exception() {
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(ValueError) as cm:\n",
+            "            raise ValueError(\"boom\")\n",
+            "        print(cm)\n",
+        ),
+        "assert_raises_context_target.py",
+    );
+    assert!(
+        err.contains("used as a value") && err.contains("cm.exception"),
+        "unsupported context-object use must be refused with the supported rewrite: {err}"
     );
 }
 

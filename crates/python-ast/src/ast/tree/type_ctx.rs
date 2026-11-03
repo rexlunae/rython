@@ -4827,6 +4827,20 @@ fn analyze_statement_types(
                     }
                 }
             }
+            // `with self.assertRaises(E) as cm:` binds `cm` to the caught
+            // exception: the function lowering rewrote every `cm.exception`
+            // read to `cm` (issue #523).
+            if let StatementType::With(With { items, .. }) = &stmt.statement
+                && crate::ast::tree::with_stmt::is_assert_raises_with(items)
+                && let Some(vars) = &items[0].optional_vars
+            {
+                seed_binder_types(
+                    vars,
+                    &crate::ast::tree::arguments::exception_typeinfo(false),
+                    &mut info.name_types,
+                    false,
+                );
+            }
             for b in body {
                 analyze_statement_types(b, info, options, symbols, self_class);
             }

@@ -1039,10 +1039,7 @@ fn walk_with_body(
     a: &mut Analysis<'_>,
     multi: bool,
 ) {
-    if items.len() == 1
-        && items[0].optional_vars.is_none()
-        && crate::ast::tree::with_stmt::assert_raises_cm_name(&items[0].context_expr).is_some()
-    {
+    if crate::ast::tree::with_stmt::is_assert_raises_with(items) {
         let before = a.state.clone();
         walk_stmts(body, a, multi);
         a.record_closure_boundary(&before);
