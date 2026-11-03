@@ -1020,10 +1020,9 @@ impl CodeGen for Module {
         // module and every IMPORTING module agree on which names are statics
         // (an importing module renders reads of them as `(*name).clone()`).
         // The inline loop below is the fallback for library/single-module
-        // use, where `this_module_path` is empty and there are no siblings.
-        if !options.this_module_path.is_empty()
-            && options.module_defs.contains_key(&options.this_module_path)
-        {
+        // use without a module index. The package root's empty key is a
+        // real module too: its consumers must agree with its emission.
+        if options.module_defs.contains_key(&options.this_module_path) {
             promoted_statics = module_promoted_static_names(&options, &options.this_module_path)
                 .as_ref()
                 .clone();
@@ -3572,14 +3571,23 @@ fn sibling_imported_names(options: &PythonOptions) -> std::collections::HashSet<
                     }
                     ST::Import(imp) => {
                         for alias in &imp.names {
+                            // Unaliased `import pkg.helper` binds `pkg`,
+                            // not `helper`; its root attributes need the
+                            // same promotion as `import pkg as p; p.VALUE`.
+                            let bound_name = alias.asname.as_deref().unwrap_or_else(|| {
+                                alias.name.split('.').next().unwrap_or(&alias.name)
+                            });
+                            let imported_path = if alias.asname.is_some() {
+                                alias.name.as_str()
+                            } else {
+                                bound_name
+                            };
                             let full = crate::ast::tree::import::import_alias_path(
-                                &alias.name,
+                                imported_path,
                                 &sibling_options,
                             );
-                            if let Some(asname) = &alias.asname
-                                && full == *this_path
-                            {
-                                module_bindings.insert(asname.clone());
+                            if full == *this_path {
+                                module_bindings.insert(bound_name.to_string());
                             }
                         }
                     }

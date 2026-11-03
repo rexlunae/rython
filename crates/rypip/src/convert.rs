@@ -4056,6 +4056,9 @@ fn read_python_module_manifest(
 /// modules (CLI helpers, `__main__` blocks, test utilities) are skipped by
 /// the converter, so a divergent module the program never imports cannot
 /// block conversion.
+/// Root-relative modules of the main package are all seeded here; vendored
+/// packages are prefixed with their import name by `python_module_deps`,
+/// so their absolute self-import paths already match `by_path` literally.
 fn reachable_module_paths(
     package: &PyPackage,
     deps: &[(String, PyPackage)],

@@ -19865,6 +19865,100 @@ fn optional_callable_parameters_match_cpython() {
 }
 
 #[test]
+fn unaliased_package_import_promotes_computed_root_values() {
+    for import in ["import pkg", "import pkg.helper"] {
+        let scratch = Scratch::new("unaliased-package-root-value");
+        let krate = package_crate(
+            &scratch,
+            "pkg",
+            &[
+                ("__init__.py", "VALUE = 1 + 2\n"),
+                ("helper.py", ""),
+                (
+                    "cli.py",
+                    &format!("{import}\n\nif __name__ == '__main__':\n    print(pkg.VALUE)\n"),
+                ),
+            ],
+        );
+        let python = Command::new("python3")
+            .args(["-m", "pkg.cli"])
+            .current_dir(scratch.path())
+            .env("PYTHONHASHSEED", "0")
+            .output()
+            .unwrap();
+        assert!(python.status.success(), "{python:?}");
+        // Verified against python3.
+        assert_eq!(python.stdout, b"3\n");
+        assert!(python.stderr.is_empty(), "{python:?}");
+        assert!(build_generated(&krate.root).success());
+        let generated = Command::new(krate.root.join("target/debug/pkg"))
+            .output()
+            .unwrap();
+        assert_eq!(generated.status.code(), python.status.code());
+        assert_eq!(generated.stdout, python.stdout, "{import}");
+        assert_eq!(generated.stderr, python.stderr, "{import}");
+    }
+}
+
+#[test]
+fn vendored_absolute_self_imports_keep_submodules_reachable() {
+    let scratch = Scratch::new("vendored-absolute-self-import");
+    for (path, source) in [
+        ("app/__init__.py", ""),
+        ("app/cli.py", "import vendorpkg\n\nif __name__ == '__main__':\n    print(vendorpkg.total())\n"),
+        ("vendor/vendorpkg/__init__.py", "from vendorpkg import helper\nfrom vendorpkg.nested import other\nimport vendorpkg.last\n\ndef total() -> int:\n    return helper.value() + other.value() + vendorpkg.last.value()\n"),
+        ("vendor/vendorpkg/helper.py", "def value() -> int:\n    return 1\n"),
+        ("vendor/vendorpkg/nested/__init__.py", ""),
+        ("vendor/vendorpkg/nested/other.py", "def value() -> int:\n    return 2\n"),
+        ("vendor/vendorpkg/last.py", "def value() -> int:\n    return 3\n"),
+        ("vendor/vendorpkg/unused.py", "import re\n"),
+    ] {
+        let file = scratch.path().join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, source).unwrap();
+    }
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = 'app'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("rython.toml"),
+        "[python-modules]\nvendorpkg = { path = 'vendor/vendorpkg' }\n",
+    )
+    .unwrap();
+    let python = Command::new("python3")
+        .args(["-m", "app.cli"])
+        .current_dir(scratch.path())
+        .env("PYTHONPATH", scratch.path().join("vendor"))
+        .env("PYTHONHASHSEED", "0")
+        .output()
+        .unwrap();
+    assert!(python.status.success(), "{python:?}");
+    // Verified against python3.
+    assert_eq!(python.stdout, b"6\n");
+    assert!(python.stderr.is_empty(), "{python:?}");
+    let package = rypip::discover(scratch.path()).unwrap();
+    let krate = rypip::convert(
+        &package,
+        &scratch.path().join("crate"),
+        &ConvertOptions::default(),
+    )
+    .unwrap();
+    for path in ["helper.rs", "nested/other.rs", "last.rs"] {
+        assert!(krate.root.join("src/vendorpkg").join(path).is_file(), "{path}");
+    }
+    assert!(!krate.root.join("src/vendorpkg/unused.rs").exists());
+    assert!(build_generated(&krate.root).success());
+    let generated = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .unwrap();
+    assert_eq!(generated.status.code(), python.status.code());
+    assert_eq!(generated.stdout, python.stdout);
+    assert_eq!(generated.stderr, python.stderr);
+}
+
+#[test]
 fn absolute_self_imports_match_python_across_package_layouts() {
     for (tag, source_prefix, metadata) in [
         ("flat", "", ""),
