@@ -6766,10 +6766,11 @@ fn unittest_assert_raises_with_statement_lowers() {
 }
 
 #[test]
-fn unittest_assert_raises_with_a_returning_body_stays_a_loud_drop() {
-    // A body whose `return` would have to escape the closure cannot use the
-    // closure lowering — it keeps the plain (loud-drop) with lowering.
-    let out = compile(
+fn unittest_assert_raises_with_a_returning_body_is_refused() {
+    // A return exits through __exit__ with no exception, so assertRaises
+    // raises "ValueError not raised". It cannot be represented by the
+    // closure lowering and must be refused rather than run unchecked.
+    let err = compile_err(
         concat!(
             "import unittest\n",
             "class T(unittest.TestCase):\n",
@@ -6780,9 +6781,8 @@ fn unittest_assert_raises_with_a_returning_body_stays_a_loud_drop() {
         "assert_raises_with_ret.py",
     );
     assert!(
-        !out.contains("assert_raises ("),
-        "a returning body must not use the closure lowering: {}",
-        out
+        err.contains("return") && err.contains("not supported yet"),
+        "a returning body must be loudly refused: {err}"
     );
 }
 
@@ -30086,6 +30086,195 @@ fn a_post_block_read_of_an_assert_raises_local_is_refused() {
         err.contains("UnboundLocalError") && err.contains("assertRaises"),
         "the post-block read must be a loud refusal naming the cause: {}",
         err
+    );
+}
+
+#[test]
+fn assert_raises_context_target_is_only_supported_through_exception() {
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(ValueError) as cm:\n",
+            "            raise ValueError(\"boom\")\n",
+            "        print(cm)\n",
+        ),
+        "assert_raises_context_target.py",
+    );
+    assert!(
+        err.contains("used as a value") && err.contains("cm.exception"),
+        "unsupported context-object use must be refused with the supported rewrite: {err}"
+    );
+}
+
+#[test]
+fn assert_raises_dynamic_exception_attribute_is_refused_at_source_location() {
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(self.failureException) as cm:\n",
+            "            raise AssertionError(\"boom\")\n",
+        ),
+        "assert_raises_dynamic_exception.py",
+    );
+    assert!(
+        err.contains("line 4")
+            && err.contains("failureException")
+            && err.contains("not statically known"),
+        "dynamic exception attributes must be refused with a location and rewrite: {err}"
+    );
+}
+
+#[test]
+fn assert_raises_unknown_module_exception_attribute_is_refused() {
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "import socket\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(socket.ValueError):\n",
+            "            raise ValueError(\"boom\")\n",
+        ),
+        "assert_raises_unknown_module_exception.py",
+    );
+    assert!(
+        err.contains("line 5")
+            && err.contains("socket.ValueError")
+            && err.contains("not statically known"),
+        "unknown module attributes must not be inferred to be builtin exceptions: {err}"
+    );
+}
+
+#[test]
+fn assert_raises_builtin_module_exception_is_supported() {
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "import builtins\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(builtins.ValueError):\n",
+            "            raise ValueError(\"boom\")\n",
+        ),
+        "assert_raises_builtins_exception.py",
+    );
+    assert!(
+        out.contains("assert_raises (\"ValueError\""),
+        "known builtin exception attributes must retain their canonical name: {out}"
+    );
+}
+
+#[test]
+fn assert_raises_socket_module_alias_is_canonicalized() {
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "import socket as s\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(s.timeout):\n",
+            "            raise s.timeout(\"timed out\")\n",
+        ),
+        "assert_raises_socket_alias.py",
+    );
+    assert!(
+        out.contains("assert_raises (\"TimeoutError\""),
+        "`socket.timeout` through alias `s` must use its canonical class name: {out}"
+    );
+}
+
+#[test]
+fn nested_function_parameter_does_not_rebind_assert_raises_target() {
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(ValueError) as cm:\n",
+            "            raise ValueError(\"boom\")\n",
+            "        def helper(cm: int) -> int:\n",
+            "            return cm\n",
+            "        print(str(cm.exception))\n",
+        ),
+        "assert_raises_nested_parameter.py",
+    );
+    assert!(
+        out.contains("helper") && out.contains("assert_raises_exception"),
+        "a nested parameter may shadow the outer context target: {out}"
+    );
+}
+
+#[test]
+fn assert_raises_context_target_is_not_promoted_across_branches() {
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        flag: bool = True\n",
+            "        if flag:\n",
+            "            with self.assertRaises(ValueError) as cm:\n",
+            "                raise ValueError(\"boom\")\n",
+            "        else:\n",
+            "            with self.assertRaises(ValueError) as cm:\n",
+            "                raise ValueError(\"boom\")\n",
+            "        print(str(cm.exception))\n",
+        ),
+        "assert_raises_context_target_branch.py",
+    );
+    assert!(
+        err.contains("assertRaises") || err.contains("cm"),
+        "a context target bound under control flow must be refused, not miscompiled: {err}"
+    );
+}
+
+#[test]
+fn arbitrary_assert_logs_attribute_uses_generic_with_lowering() {
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "class T:\n",
+            "    def t(self, obj: object) -> None:\n",
+            "        with obj.assertLogs(\"example\"):\n",
+            "            print(\"body\")\n",
+            "        with obj.assertWarns(Warning):\n",
+            "            print(\"body\")\n",
+            "        with obj.assertRaisesRegex(ValueError, \"example\"):\n",
+            "            print(\"body\")\n",
+        ),
+        "generic_assert_logs.py",
+    );
+    assert!(
+        out.contains("body") && !out.contains("assertLogs is not supported"),
+        "an arbitrary receiver must not enter TestCase-specific handling: {out}"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning.contains("dropped")),
+        "the generic path retains its existing loud-drop warning: {warnings:?}"
+    );
+}
+
+#[test]
+fn assert_raises_on_non_testcase_self_uses_generic_with_lowering() {
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "class T:\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(ValueError):\n",
+            "            print(\"body\")\n",
+        ),
+        "non_testcase_assert_raises.py",
+    );
+    assert!(
+        out.contains("body") && !out.contains("assert_raises ("),
+        "a non-TestCase self method must not receive unittest lowering: {out}"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning.contains("dropped")),
+        "the generic path retains its existing loud-drop warning: {warnings:?}"
     );
 }
 

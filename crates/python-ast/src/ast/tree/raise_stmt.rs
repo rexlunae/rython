@@ -309,6 +309,14 @@ fn is_builtin_alias_name(name: &str) -> bool {
     matches!(name, "EnvironmentError" | "IOError")
 }
 
+/// The class `__name__` a builtin exception name binds: an alias
+/// (`IOError`, `EnvironmentError`) is `OSError`, any other name is itself
+/// — CPython's `assertRaises(IOError)` fails with `OSError not raised`
+/// (issue #523).
+pub(crate) fn builtin_class_dunder_name(name: &str) -> &str {
+    if is_builtin_alias_name(name) { "OSError" } else { name }
+}
+
 /// The `BuiltinException` variant ident for a NON-ALIAS builtin name
 /// (`ValueError` → `ValueError`): the round-52 fast path for a literal
 /// `except ValueError:` clause — the runtime compares the raised

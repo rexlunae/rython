@@ -23669,6 +23669,75 @@ fn unittest_assert_raises_with_a_raise_builds_and_runs() {
 }
 
 #[test]
+fn unittest_assert_raises_as_cm_builds_and_runs() {
+    // Issue #523: the `as cm` context manager must suppress the caught
+    // exception and expose it as `cm.exception` after the block.
+    // Verified against python3: four tests pass, exit 0.
+    let scratch = Scratch::new("assert-raises-as-cm");
+    let file = scratch.path().join("t.py");
+    fs::write(
+        &file,
+        concat!(
+            "import unittest\n",
+            "import socket as s\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    def test_caught_exception(self) -> None:\n",
+            "        with self.assertRaises(ValueError) as cm:\n",
+            "            raise ValueError(\"boom\")\n",
+            "        self.assertEqual(str(cm.exception), \"boom\")\n",
+            "        self.assertEqual(type(cm.exception).__name__, \"ValueError\")\n",
+            "\n",
+            "    def test_unread_target(self) -> None:\n",
+            "        with self.assertRaises(ZeroDivisionError) as cm:\n",
+            "            1 // 0\n",
+            "\n",
+            "    def test_without_target(self) -> None:\n",
+            "        with self.assertRaises(ZeroDivisionError):\n",
+            "            1 // 0\n",
+            "\n",
+            "    def test_socket_timeout_alias(self) -> None:\n",
+            "        with self.assertRaises(s.timeout) as cm:\n",
+            "            raise TimeoutError(\"timed out\")\n",
+            "        self.assertEqual(type(cm.exception).__name__, \"TimeoutError\")\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(
+        status.success(),
+        "the assertRaises-as-cm crate must COMPILE: {}",
+        status
+    );
+
+    let output = Command::new(krate.root.join("target/debug/t"))
+        .output()
+        .expect("running generated binary");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("not declared as mutable") && !combined.contains("error["),
+        "no compile/runtime error text expected: {combined}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "four passing assertRaises tests exit 0 like python3: {combined}"
+    );
+}
+
+#[test]
 fn a_pytest_import_is_a_warning_not_a_broken_crate() {
     // Issue #456: `import pytest` used to convert with NO warning and emit
     // `use crate::pytest;` for a module the crate does not contain, so the

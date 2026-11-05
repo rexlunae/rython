@@ -173,6 +173,9 @@ presence, receiver escapes, and field reads relying on another test or an
 opaque helper are conversion errors. Manual construction of cases with
 fields is refused; use `unittest.main()` to preserve fixture order
 (issues #480, #511).
+`with self.assertRaises(E) as cm:` catches the expected exception and
+supports reading `cm.exception` after the block; other uses of the context
+object are conversion errors (#523).
 
 Comprehension outputs that borrow existing mutable containers by name,
 attribute, or index are refused when value copies would lose sharing.
