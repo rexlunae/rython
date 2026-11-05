@@ -19997,6 +19997,239 @@ fn optional_callable_parameters_match_cpython() {
 }
 
 #[test]
+fn unaliased_package_import_promotes_computed_root_values() {
+    for import in ["import pkg", "import pkg.helper"] {
+        let scratch = Scratch::new("unaliased-package-root-value");
+        let krate = package_crate(
+            &scratch,
+            "pkg",
+            &[
+                ("__init__.py", "VALUE = 1 + 2\n"),
+                ("helper.py", ""),
+                (
+                    "cli.py",
+                    &format!("{import}\n\nif __name__ == '__main__':\n    print(pkg.VALUE)\n"),
+                ),
+            ],
+        );
+        let python = Command::new("python3")
+            .args(["-m", "pkg.cli"])
+            .current_dir(scratch.path())
+            .env("PYTHONHASHSEED", "0")
+            .output()
+            .unwrap();
+        assert!(python.status.success(), "{python:?}");
+        // Verified against python3.
+        assert_eq!(python.stdout, b"3\n");
+        assert!(python.stderr.is_empty(), "{python:?}");
+        assert!(build_generated(&krate.root).success());
+        let generated = Command::new(krate.root.join("target/debug/pkg"))
+            .output()
+            .unwrap();
+        assert_eq!(generated.status.code(), python.status.code());
+        assert_eq!(generated.stdout, python.stdout, "{import}");
+        assert_eq!(generated.stderr, python.stderr, "{import}");
+    }
+}
+
+#[test]
+fn vendored_absolute_self_imports_keep_submodules_reachable() {
+    let scratch = Scratch::new("vendored-absolute-self-import");
+    for (path, source) in [
+        ("app/__init__.py", ""),
+        ("app/cli.py", "import vendorpkg\n\nif __name__ == '__main__':\n    print(vendorpkg.total())\n"),
+        ("vendor/vendorpkg/__init__.py", "from vendorpkg import helper\nfrom vendorpkg.nested import other\nimport vendorpkg.last\n\ndef total() -> int:\n    return helper.value() + other.value() + vendorpkg.last.value()\n"),
+        ("vendor/vendorpkg/helper.py", "def value() -> int:\n    return 1\n"),
+        ("vendor/vendorpkg/nested/__init__.py", ""),
+        ("vendor/vendorpkg/nested/other.py", "def value() -> int:\n    return 2\n"),
+        ("vendor/vendorpkg/last.py", "def value() -> int:\n    return 3\n"),
+        ("vendor/vendorpkg/unused.py", "import re\n"),
+    ] {
+        let file = scratch.path().join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, source).unwrap();
+    }
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = 'app'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("rython.toml"),
+        "[python-modules]\nvendorpkg = { path = 'vendor/vendorpkg' }\n",
+    )
+    .unwrap();
+    let python = Command::new("python3")
+        .args(["-m", "app.cli"])
+        .current_dir(scratch.path())
+        .env("PYTHONPATH", scratch.path().join("vendor"))
+        .env("PYTHONHASHSEED", "0")
+        .output()
+        .unwrap();
+    assert!(python.status.success(), "{python:?}");
+    // Verified against python3.
+    assert_eq!(python.stdout, b"6\n");
+    assert!(python.stderr.is_empty(), "{python:?}");
+    let package = rypip::discover(scratch.path()).unwrap();
+    let krate = rypip::convert(
+        &package,
+        &scratch.path().join("crate"),
+        &ConvertOptions::default(),
+    )
+    .unwrap();
+    for path in ["helper.rs", "nested/other.rs", "last.rs"] {
+        assert!(krate.root.join("src/vendorpkg").join(path).is_file(), "{path}");
+    }
+    assert!(!krate.root.join("src/vendorpkg/unused.rs").exists());
+    assert!(build_generated(&krate.root).success());
+    let generated = Command::new(krate.root.join("target/debug/app"))
+        .output()
+        .unwrap();
+    assert_eq!(generated.status.code(), python.status.code());
+    assert_eq!(generated.stdout, python.stdout);
+    assert_eq!(generated.stderr, python.stderr);
+}
+
+#[test]
+fn absolute_self_imports_match_python_across_package_layouts() {
+    for (tag, source_prefix, metadata) in [
+        ("flat", "", ""),
+        ("src", "src", ""),
+        (
+            "metadata",
+            "",
+            "[tool.setuptools]\npackages = [\"absimp\"]\n",
+        ),
+        ("direct", "", ""),
+    ] {
+        let scratch = Scratch::new(&format!("absolute-self-import-{tag}"));
+        fs::write(
+            scratch.path().join("pyproject.toml"),
+            format!("[project]\nname = \"absimp-tool\"\nversion = \"0.1.0\"\n{metadata}"),
+        )
+        .unwrap();
+        let source_root = scratch.path().join(source_prefix);
+        let package_root = source_root.join("absimp");
+        fs::create_dir_all(&package_root).unwrap();
+        for (name, source) in [
+            ("__init__.py", "print('package loaded')\nVALUE = 7\n"),
+            (
+                "helper.py",
+                "print('helper loaded')\n\ndef greet() -> int:\n    return 42\n",
+            ),
+            (
+                "consumer.py",
+                "from absimp import VALUE\n\ndef value() -> int:\n    return VALUE\n",
+            ),
+            (
+                "cli.py",
+                concat!(
+                    "from absimp import helper\n",
+                    "from absimp import helper as h\n",
+                    "from absimp.helper import greet as g\n",
+                    "import absimp.helper\n",
+                    "import absimp.helper as other\n",
+                    "from absimp.consumer import value\n",
+                    "\n",
+                    "def main() -> None:\n",
+                    "    print(helper.greet(), h.greet(), g())\n",
+                    "    print(absimp.helper.greet(), other.greet(), value())\n",
+                    "\n",
+                    "if __name__ == '__main__':\n",
+                    "    main()\n",
+                ),
+            ),
+        ] {
+            fs::write(package_root.join(name), source).unwrap();
+        }
+        let python = Command::new("python3")
+            .args(["-m", "absimp.cli"])
+            .current_dir(&source_root)
+            .env("PYTHONHASHSEED", "0")
+            .output()
+            .unwrap();
+        assert!(python.status.success(), "{python:?}");
+        // Verified against python3.
+        assert_eq!(
+            python.stdout,
+            b"package loaded\nhelper loaded\n42 42 42\n42 42 7\n"
+        );
+        assert!(python.stderr.is_empty(), "{python:?}");
+        let discover_root = if tag == "direct" {
+            fs::write(
+                package_root.join("pyproject.toml"),
+                "[project]\nname = \"absimp-tool\"\nversion = \"0.1.0\"\n",
+            )
+            .unwrap();
+            package_root.as_path()
+        } else {
+            scratch.path()
+        };
+        let package = rypip::discover(discover_root).unwrap();
+        let krate = rypip::convert(
+            &package,
+            &scratch.path().join("crate"),
+            &ConvertOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            !krate.warnings.iter().any(|w| w.contains("external-module")),
+            "{:?}",
+            krate.warnings
+        );
+        assert!(build_generated(&krate.root).success());
+        let generated = Command::new(krate.root.join("target/debug/absimp_tool"))
+            .output()
+            .unwrap();
+        assert_eq!(generated.status.code(), python.status.code());
+        assert_eq!(generated.stdout, python.stdout, "{tag}");
+        assert_eq!(generated.stderr, python.stderr, "{tag}");
+    }
+}
+
+#[test]
+fn ambiguous_absolute_self_import_is_refused() {
+    let scratch = Scratch::new("ambiguous-absolute-self-import");
+    let package_root = scratch.path().join("absimp");
+    fs::create_dir_all(&package_root).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"absimp\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(package_root.join("__init__.py"), "").unwrap();
+    fs::write(package_root.join("absimp.py"), "VALUE = 99\n").unwrap();
+    fs::write(package_root.join("helper.py"), "VALUE = 42\n").unwrap();
+    fs::write(
+        package_root.join("cli.py"),
+        "from absimp import helper\nprint(helper.VALUE)\n",
+    )
+    .unwrap();
+    let python = Command::new("python3")
+        .args(["-m", "absimp.cli"])
+        .current_dir(scratch.path())
+        .env("PYTHONHASHSEED", "0")
+        .output()
+        .unwrap();
+    assert!(python.status.success(), "{python:?}");
+    // Verified against python3.
+    assert_eq!(python.stdout, b"42\n");
+    let package = rypip::discover(scratch.path()).unwrap();
+    let error = rypip::convert(
+        &package,
+        &scratch.path().join("crate"),
+        &ConvertOptions::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("absolute import") && error.contains("ambiguous"),
+        "{error}"
+    );
+    assert!(error.contains("relative spelling"), "{error}");
+}
+
+#[test]
 fn entry_module_imports_sibling_module_relatively() {
     // The entry `cli.py` doing `from . import data`: the bin's copy of the
     // entry is the bin crate root, which declares `pub mod data;` itself,

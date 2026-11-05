@@ -36,9 +36,22 @@ pub struct PyPackage {
     /// metadata (`[project] dependencies`, `install_requires`), resolved by
     /// the converter against PyPI unless vendored via `[python-modules]`.
     pub dependencies: Vec<String>,
+    /// The IMPORT name of the package whose `__init__.py` is the crate
+    /// root (module path `[]`), when the modules are keyed relative to it
+    /// — the directory name, which an absolute self-import spells (`from
+    /// absimp import helper`) even when the project's name differs
+    /// (`absimp-tool`; issue #532). None when the modules carry their own
+    /// package prefix or there is no root package.
+    pub root_package: Option<String>,
 }
 
 impl PyPackage {
+    /// The name an absolute import of this package's own modules starts
+    /// with: the root package's import name, else the package name.
+    pub fn import_namespace(&self) -> &str {
+        self.root_package.as_deref().unwrap_or(&self.name)
+    }
+
     /// The module that should become the binary entry point: `__main__.py`,
     /// or any module whose source has an `if __name__ == "__main__"` block.
     pub fn entry_module(&self) -> Option<&PyModule> {
@@ -251,6 +264,7 @@ pub fn discover(path: &Path) -> Result<PyPackage> {
                 is_init: false,
             }],
             dependencies: Vec::new(),
+            root_package: None,
         });
     }
 
@@ -298,6 +312,7 @@ pub fn discover(path: &Path) -> Result<PyPackage> {
         }
     }
 
+    let mut root_package = None;
     if !found_metadata_packages {
         // No packaging metadata (or none that names packages): fall back to
         // the historical layout heuristics.
@@ -306,6 +321,17 @@ pub fn discover(path: &Path) -> Result<PyPackage> {
             name = source_root
                 .file_name()
                 .and_then(|s| s.to_str())
+                .map(str::to_string);
+        }
+        // A package directory is imported by its directory name, even
+        // when discover() receives that directory directly. Versioned
+        // sdist directory names that aren't identifiers use the metadata
+        // name instead.
+        if source_root.join("__init__.py").is_file() {
+            root_package = source_root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .filter(|s| is_python_identifier(s))
                 .map(str::to_string);
         }
         collect_modules(&source_root, &[], &mut modules)?;
@@ -323,7 +349,17 @@ pub fn discover(path: &Path) -> Result<PyPackage> {
         root: path.to_path_buf(),
         modules,
         dependencies: meta.dependencies,
+        root_package,
     })
+}
+
+/// Whether `s` is a Python identifier an import statement can spell (ASCII
+/// letters, digits and `_`, not starting with a digit).
+fn is_python_identifier(s: &str) -> bool {
+    s.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The module-path prefix for a package directory resolved from metadata:

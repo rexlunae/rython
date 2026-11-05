@@ -1020,10 +1020,9 @@ impl CodeGen for Module {
         // module and every IMPORTING module agree on which names are statics
         // (an importing module renders reads of them as `(*name).clone()`).
         // The inline loop below is the fallback for library/single-module
-        // use, where `this_module_path` is empty and there are no siblings.
-        if !options.this_module_path.is_empty()
-            && options.module_defs.contains_key(&options.this_module_path)
-        {
+        // use without a module index. The package root's empty key is a
+        // real module too: its consumers must agree with its emission.
+        if options.module_defs.contains_key(&options.this_module_path) {
             promoted_statics = module_promoted_static_names(&options, &options.this_module_path)
                 .as_ref()
                 .clone();
@@ -3482,7 +3481,13 @@ fn count_module_stores(
 fn sibling_imported_names(options: &PythonOptions) -> std::collections::HashSet<String> {
     use crate::StatementType as ST;
     let mut names = std::collections::HashSet::new();
-    if options.module_defs.len() <= 1 || options.this_module_path.is_empty() {
+    // The package ROOT of a crate keyed relative to it (the empty path) is
+    // a module like any other: a sibling's `from . import NAMES` or the
+    // absolute `import absimp; absimp.NAMES` (issue #532) reads its
+    // promoted static.
+    if options.module_defs.len() <= 1
+        || (options.this_module_path.is_empty() && !crate_keys_relative_to_root(options))
+    {
         return names;
     }
     // Every sibling import promotes, wherever it is WRITTEN: a
@@ -3566,12 +3571,23 @@ fn sibling_imported_names(options: &PythonOptions) -> std::collections::HashSet<
                     }
                     ST::Import(imp) => {
                         for alias in &imp.names {
-                            let full: Vec<String> =
-                                alias.name.split('.').map(str::to_string).collect();
-                            if let Some(asname) = &alias.asname
-                                && full == *this_path
-                            {
-                                module_bindings.insert(asname.clone());
+                            // Unaliased `import pkg.helper` binds `pkg`,
+                            // not `helper`; its root attributes need the
+                            // same promotion as `import pkg as p; p.VALUE`.
+                            let bound_name = alias.asname.as_deref().unwrap_or_else(|| {
+                                alias.name.split('.').next().unwrap_or(&alias.name)
+                            });
+                            let imported_path = if alias.asname.is_some() {
+                                alias.name.as_str()
+                            } else {
+                                bound_name
+                            };
+                            let full = crate::ast::tree::import::import_alias_path(
+                                imported_path,
+                                &sibling_options,
+                            );
+                            if full == *this_path {
+                                module_bindings.insert(bound_name.to_string());
                             }
                         }
                     }
@@ -4459,12 +4475,20 @@ pub(crate) fn fold_static_import_trys(
                 .keys()
                 .any(|k| k.first().map(String::as_str) == Some(root))
     };
+    // An `import a.b` resolves through its root, or as a whole when it
+    // names the package's own module under a crate keyed relative to the
+    // root (`import absimp.helper` inside `absimp` — issue #532), where no
+    // key starts with the package's name.
+    let import_resolvable = |name: &str| -> bool {
+        let path: Vec<String> = name.split('.').map(str::to_string).collect();
+        root_resolvable(path.first().map(String::as_str).unwrap_or(""))
+            || crate::module_defs_contains(options, &path)
+    };
     let unresolvable = |st: &crate::StatementType| -> bool {
         match st {
-            crate::StatementType::Import(imp) => imp.names.iter().all(|al| {
-                let root = al.name.split('.').next().unwrap_or("");
-                !root_resolvable(root)
-            }),
+            crate::StatementType::Import(imp) => {
+                imp.names.iter().all(|al| !import_resolvable(&al.name))
+            }
             crate::StatementType::ImportFrom(ifm) => {
                 // Relative imports are crate siblings — resolvable.
                 if ifm.level > 0 {
@@ -4484,10 +4508,9 @@ pub(crate) fn fold_static_import_trys(
     // succeeds, so the ImportError handler is dead.
     let resolvable = |st: &crate::StatementType| -> bool {
         match st {
-            crate::StatementType::Import(imp) => imp.names.iter().all(|al| {
-                let root = al.name.split('.').next().unwrap_or("");
-                root_resolvable(root)
-            }),
+            crate::StatementType::Import(imp) => {
+                imp.names.iter().all(|al| import_resolvable(&al.name))
+            }
             crate::StatementType::ImportFrom(ifm) => {
                 ifm.level > 0
                     || root_resolvable(ifm.module.split('.').next().unwrap_or(""))
@@ -8640,6 +8663,10 @@ pub fn resolve_class_referenced(
 /// (requests' vendored deps: `urllib3.contrib`). An absolute import
 /// (`from boto3.session import ...`) resolves to the root-qualified path,
 /// so try it first, then with the leading (package-root) segment dropped.
+/// The package's own name ALONE (`from absimp import helper` inside
+/// `absimp`) strips to the package root, the empty key, when the crate is
+/// keyed relative to the root (issue #532): the same module the relative
+/// spelling `from . import helper` resolves to.
 /// Returns the matching key (borrowing the caller's `path`) so callers can
 /// index `module_defs` with it, or `None` when neither form is a crate
 /// module.
@@ -8649,16 +8676,16 @@ pub fn module_defs_key<'a>(
 ) -> Option<&'a [String]> {
     if options.module_defs.contains_key(path) {
         Some(path)
-    } else if path.len() > 1
+    } else if let Some((root, rest)) = path.split_first()
         // The stripped form covers ONLY the package's own root-qualified
         // name (`pip._internal...` inside the pip conversion): stripping
         // an arbitrary external root would alias foreign packages onto
         // same-named crate modules (`import h2.connection` resolving to
         // urllib3's connection.py — issue #137 round 18's merge).
-        && path[0] == options.python_namespace
-        && options.module_defs.contains_key(&path[1..])
+        && *root == options.python_namespace
+        && options.module_defs.contains_key(rest)
     {
-        Some(&path[1..])
+        Some(rest)
     } else {
         None
     }
@@ -8677,6 +8704,55 @@ pub(crate) fn python_module_name(options: &PythonOptions, key: &[String]) -> Str
         .chain(key.iter().map(String::as_str))
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// Whether the crate's `module_defs` are keyed RELATIVE to the package
+/// root (the root `__init__` is the empty key — see [`module_defs_key`]),
+/// so the package's own root-qualified name is never a key prefix of its
+/// modules.
+pub(crate) fn crate_keys_relative_to_root(options: &PythonOptions) -> bool {
+    options.module_defs.contains_key::<[String]>(&[])
+}
+
+/// The crate path an ABSOLUTE import names, when it names a module of the
+/// package being converted (`from absimp import helper`, `import
+/// absimp.cases` inside package `absimp`): its `module_defs` key, the
+/// same path the relative spelling (`from . import helper`, `from .
+/// import cases`) resolves to, so every consumer resolves both spellings
+/// alike (issue #532). Any other path is returned unchanged — a module
+/// outside the crate keeps its dotted name for the external checks.
+pub(crate) fn absolute_import_path(options: &PythonOptions, path: Vec<String>) -> Vec<String> {
+    match module_defs_key(options, &path) {
+        Some(key) if key.len() != path.len() => key.to_vec(),
+        _ => path,
+    }
+}
+
+/// The refusal for an absolute self-import the crate's keys cannot
+/// resolve unambiguously (issue #532): with the crate keyed relative to
+/// the package root, a package `absimp` that also contains a module or
+/// subpackage named `absimp` has a key `absimp` that a root-qualified
+/// path would match directly — `from absimp import helper` would look in
+/// `absimp/absimp.py` instead of the package. None when the import is not
+/// a self-import or the layout has no such module.
+pub(crate) fn ambiguous_self_import(options: &PythonOptions, dotted: &str) -> Option<String> {
+    let root = dotted.split('.').next()?;
+    if root != options.python_namespace || !crate_keys_relative_to_root(options) {
+        return None;
+    }
+    let clash = options
+        .module_defs
+        .keys()
+        .any(|k| k.first().map(String::as_str) == Some(root));
+    clash.then(|| {
+        format!(
+            "absolute import of `{dotted}` inside package `{root}`, which also contains \
+             a module or subpackage named `{root}`: rython resolves the package's modules \
+             relative to its root, so the root-qualified spelling is ambiguous and rython \
+             refuses to guess which module it names; use the relative spelling (`from . \
+             import ...`, `from .sub import ...`) or rename the inner `{root}` module"
+        )
+    })
 }
 
 /// The crate module a NAME is bound to (`from . import idnadata`,
@@ -8700,10 +8776,19 @@ pub(crate) fn crate_module_bound_to(
     };
     let path: Vec<String> = match node {
         crate::SymbolTableNode::Import(im) => {
-            let alias = im.names.iter().find(|a| {
-                a.asname.as_deref().unwrap_or(a.name.as_str()) == name
-            })?;
-            // A bare `import pkg.sub` binds `pkg`, not the submodule.
+            // A bare `import pkg.sub` binds `pkg` — the PACKAGE module, not
+            // the submodule (`import absimp.helper` inside `absimp` binds
+            // the package root: issue #532).
+            if let Some(alias) = im.names.iter().find(|a| {
+                a.asname.is_none() && a.name.contains('.') && a.name.split('.').next() == Some(name)
+            }) {
+                let root = alias.name.split('.').next().unwrap_or_default();
+                return module_defs_key(options, &[root.to_string()]).map(<[String]>::to_vec);
+            }
+            let alias = im
+                .names
+                .iter()
+                .find(|a| a.asname.as_deref().unwrap_or(a.name.as_str()) == name)?;
             if alias.asname.is_none() && alias.name.contains('.') {
                 return None;
             }

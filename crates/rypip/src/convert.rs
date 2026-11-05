@@ -3280,7 +3280,7 @@ fn conversion_base_options(
     package: &PyPackage,
     python_deps: &[(String, PyPackage)],
 ) -> PythonOptions {
-    let package_name = package.name.as_str();
+    let import_namespace = package.import_namespace();
     PythonOptions::from(python_ast::PythonOptionsData {
         lossy_warnings: opts.warnings != WarningMode::Allow,
         no_std: opts.no_std,
@@ -3296,11 +3296,13 @@ fn conversion_base_options(
         module_defs: std::rc::Rc::new(module_defs.clone()),
         module_python_names: std::rc::Rc::new(module_python_names(package, python_deps)),
         async_runtime_dep,
-        // The package's own name: root-qualified absolute self-imports
-        // (`from urllib3.connection import ...`, pip's src-layout paths)
-        // strip exactly this leading segment when matching module_defs'
-        // relative keys — never an external root like `h2`.
-        python_namespace: package_name.to_string(),
+        // The package's own IMPORT name (`PyPackage::import_namespace`):
+        // root-qualified absolute self-imports (`from urllib3.connection
+        // import ...`, pip's src-layout paths, `from absimp import helper`
+        // in project `absimp-tool` — issue #532) strip exactly this leading
+        // segment when matching module_defs' relative keys — never an
+        // external root like `h2`.
+        python_namespace: import_namespace.to_string(),
         ..Default::default()
     })
 }
@@ -4054,6 +4056,9 @@ fn read_python_module_manifest(
 /// modules (CLI helpers, `__main__` blocks, test utilities) are skipped by
 /// the converter, so a divergent module the program never imports cannot
 /// block conversion.
+/// Root-relative modules of the main package are all seeded here; vendored
+/// packages are prefixed with their import name by `python_module_deps`,
+/// so their absolute self-import paths already match `by_path` literally.
 fn reachable_module_paths(
     package: &PyPackage,
     deps: &[(String, PyPackage)],
@@ -4268,6 +4273,7 @@ fn python_module_deps(
                     .unwrap_or_else(|| PathBuf::from(".")),
                 modules: vec![module],
                 dependencies: Vec::new(),
+                root_package: None,
             };
             deps.push((import_name.clone(), pkg));
         } else if abs.is_dir() {

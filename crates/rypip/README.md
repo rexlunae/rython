@@ -59,6 +59,14 @@ recursively (skipping hidden and underscore-prefixed directories), and both
 flat and `src/` layouts are recognized. Projects without any packaging
 metadata fall back to the historical layout heuristics.
 
+Absolute self-imports (`from pkg import helper`, `import pkg.helper`,
+including aliases) resolve to the same crate modules as relative imports,
+even when the distribution name differs from `pkg`. In root-relative
+layouts, an inner module or subpackage also named `pkg` makes the absolute
+spelling ambiguous to the converter; use relative imports or rename it.
+Unaliased `import pkg` and `import pkg.helper` both bind `pkg`; reads such
+as `pkg.VALUE` preserve computed package-root values as module items.
+
 A module containing an `if __name__ == "__main__":` block (or a
 `__main__.py`) becomes the binary entry point. So does a module that
 defines `main` and calls it as its last top-level statement with no
