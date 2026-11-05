@@ -1951,12 +1951,18 @@ impl Point {
   method mutates through `self`, directly or transitively through its
   own calls (the analysis follows the call graph, including composed
   fields).
-- **Rejected, loudly**: inheritance from anything but `object`, class
+- **Rejected, loudly**: unknown or external inheritance bases, class
   attributes and any class-level statement besides methods/docstring/
   `pass`, nested classes, `async` methods, and `*args`/`**kwargs` in
-  `__init__`. (For other methods, the `*args`/`**kwargs` rejection
-  fires at each call site; a definition that is never called slips
-  through to rustc.)
+  `__init__`. A known base imported from another module in the generated
+  package is supported; its constructor, fields, and methods participate
+  in the derived class's MRO and the imported traits are brought into scope
+  at call sites. This includes a class declared in package `__main__.py`,
+  which is compiled at the binary crate root. Such entry classes are not
+  included in library-side hierarchy sum types, since the library has no
+  Rust `__main__` module to name. (For other methods, the `*args`/`**kwargs`
+  rejection fires at each call site; a definition that is never called
+  slips through to rustc.)
 - **Dunder protocols are mostly not modeled** — `__init__` has
   semantics, and the MAPPING trio is wired: a user class's own
   `__getitem__` receives `x[k]`, its `__setitem__` receives

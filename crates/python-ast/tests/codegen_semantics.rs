@@ -870,11 +870,15 @@ fn cross_module_class_info_computed_once_and_cached() {
     assert_eq!(dog2.name, "Dog");
     // Traits: Animal is the hierarchy root, so Dog carries DogTrait (own)
     // plus AnimalTrait (its methods re-emit there), nearest first.
-    let traits =
-        python_ast::module_class_traits(&options, &["animals".to_string()]);
+    let traits = python_ast::module_class_traits(&options, &["animals".to_string()]);
     assert_eq!(
-        traits.get("Dog").map(Vec::as_slice),
-        Some(&["DogTrait".to_string(), "AnimalTrait".to_string()][..]),
+        traits.get("Dog").map(|items| {
+            items
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>()
+        }),
+        Some(vec!["DogTrait", "AnimalTrait"]),
         "Dog must import DogTrait (own) + AnimalTrait (methods re-emit there)"
     );
     // A class that does not exist resolves to None without poisoning the cache.
@@ -16417,14 +16421,11 @@ fn annotated_empty_dict_keeps_types_inside_loop() {
     );
 }
 
-/// Issue #137 round 20 (urllib3's RequestMethods): a plain-struct class
-/// subclassed ONLY cross-module emits an ACCESSOR-ONLY companion trait —
-/// the subclass modules' ancestor impls and supertrait bounds name
-/// `{Name}Trait`, so it must exist — while its methods stay INHERENT
-/// (trait-default methods would re-route the subclasses' inherited-call
-/// resolution).
+/// A base class used only by a cross-module subclass still emits its
+/// methods on the trait, so inherited calls dispatch through the subclass
+/// hierarchy instead of relying on the base struct's inherent methods.
 #[test]
-fn cross_module_only_base_emits_accessor_only_trait() {
+fn cross_module_only_base_emits_inherited_method_trait() {
     let mixin_src = "class Mixin:\n    def __init__(self):\n        self.headers = \"\"\n\n\
                      \x20   def ask(self) -> str:\n        return self.headers\n";
     // Convert the DEFINING module with the subclassing module visible in
@@ -16467,8 +16468,8 @@ fn cross_module_only_base_emits_accessor_only_trait() {
         .and_then(|rest| rest.split("impl MixinTrait for Mixin").next())
         .unwrap_or("");
     assert!(
-        !trait_block.contains("fn ask"),
-        "methods must NOT become trait defaults (accessor-only): {}",
+        trait_block.contains("fn ask"),
+        "the trait carries inherited methods: {}",
         out
     );
     assert!(
