@@ -5170,6 +5170,75 @@ fn composed_fields_type_and_resolve_through_chains() {
 }
 
 #[test]
+fn composed_field_reads_refuse_uninitialized_default_placeholders() {
+    // Verified against python3 3.14.4: Outer.__init__ raises
+    // `AttributeError: 'Outer' object has no attribute 'inner'` before the
+    // assignment. A default Inner struct would instead expose its `value`.
+    let before_assignment = concat!(
+        "class Inner:\n",
+        "    def __init__(self):\n",
+        "        self.value = 7\n",
+        "\n",
+        "class Outer:\n",
+        "    def __init__(self):\n",
+        "        print(self.inner.value)\n",
+        "        self.inner = Inner()\n",
+    );
+    let error = compile_err(before_assignment, "compose_uninitialized.py");
+    assert!(
+        error.contains("composed field `self.inner`")
+            && error.contains("CPython raises AttributeError")
+            && error.contains("refuses to silently expose"),
+        "{error}"
+    );
+
+    // Verified against python3 3.14.4 with `Outer(False)`: a conditionally
+    // absent composed field raises AttributeError when read by `value`.
+    let conditional = concat!(
+        "class Inner:\n",
+        "    def __init__(self):\n",
+        "        self.value = 7\n",
+        "\n",
+        "class Outer:\n",
+        "    def __init__(self, flag: bool):\n",
+        "        if flag:\n",
+        "            self.inner = Inner()\n",
+        "\n",
+        "    def value(self) -> int:\n",
+        "        return self.inner.value\n",
+    );
+    let error = compile_err(conditional, "compose_conditional.py");
+    assert!(
+        error.contains("composed field `self.inner`")
+            && error.contains("CPython raises AttributeError"),
+        "{error}"
+    );
+
+    // Verified against python3 3.14.4 with `Outer(True)`: the early return
+    // leaves `inner` absent even though a later top-level store exists.
+    let early_return = concat!(
+        "class Inner:\n",
+        "    def __init__(self):\n",
+        "        self.value = 7\n",
+        "\n",
+        "class Outer:\n",
+        "    def __init__(self, flag: bool):\n",
+        "        if flag:\n",
+        "            return\n",
+        "        self.inner = Inner()\n",
+        "\n",
+        "    def value(self) -> int:\n",
+        "        return self.inner.value\n",
+    );
+    let error = compile_err(early_return, "compose_early_return.py");
+    assert!(
+        error.contains("composed field `self.inner`")
+            && error.contains("CPython raises AttributeError"),
+        "{error}"
+    );
+}
+
+#[test]
 fn unsupported_class_constructs_are_tolerated_metadata() {
     // A base rython cannot emit a struct for (an imported module, a
     // builtin) is tolerated as metadata: the class lowers as a plain
