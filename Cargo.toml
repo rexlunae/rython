@@ -4,6 +4,7 @@ members = [
     "crates/python-ast",
     "crates/python-mod",
     "crates/rypip",
+    "crates/rython-jit",
     "crates/rythonc",
     "crates/rykernel-shim",
     "crates/stdpython",
@@ -28,5 +29,6 @@ homepage = "https://github.com/rexlunae/rython"
 [workspace.dependencies]
 python-ast = { path = "crates/python-ast", version = "1.2.0" }
 python-mod = { path = "crates/python-mod", version = "1.2.0" }
+rython-jit = { path = "crates/rython-jit", version = "1.2.0" }
 rythonc = { path = "crates/rythonc", version = "1.2.0" }
 stdpython = { path = "crates/stdpython", version = "1.2.0" }
