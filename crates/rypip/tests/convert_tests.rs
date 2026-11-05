@@ -13615,6 +13615,78 @@ fn imported_base_methods_and_fields_are_available_to_a_package_subclass() {
     assert_eq!(output.status.code(), Some(0));
 }
 
+#[test]
+fn cross_module_grandparent_constructor_runs() {
+    for entry in [true, false] {
+        let scratch = Scratch::new(if entry { "grandparent-entry" } else { "grandparent-module" });
+        let mut files = vec![
+            ("base.py", "class Grandparent:\n    def __init__(self, value: int) -> None:\n        print('grandparent', value)\n        self.value = value\n"),
+            ("middle.py", "from .base import Grandparent\nclass Parent(Grandparent):\n    pass\n"),
+        ];
+        let child = "from .middle import Parent\nclass Child(Parent):\n    pass\n";
+        let main = "def main() -> None:\n    child = Child(42)\n    print(child.value)\nif __name__ == '__main__':\n    main()\n";
+        let source = format!("{child}{main}");
+        if entry {
+            files.push(("__main__.py", &source));
+        } else {
+            files.push(("child.py", child));
+            files.push(("cli.py", "from .child import Child\ndef main() -> None:\n    child = Child(42)\n    print(child.value)\nif __name__ == '__main__':\n    main()\n"));
+        }
+        let krate = package_crate(&scratch, "grandinherit", &files);
+        let python = Command::new("python3")
+            .args(["-m", if entry { "grandinherit" } else { "grandinherit.cli" }])
+            .env("PYTHONHASHSEED", "0")
+            .current_dir(scratch.path())
+            .output()
+            .unwrap();
+        // Verified against python3.
+        assert_eq!(python.stdout, b"grandparent 42\n42\n");
+        assert!(python.stderr.is_empty());
+        assert_eq!(python.status.code(), Some(0));
+        assert!(build_generated(&krate.root).success());
+        let output = Command::new(krate.root.join("target/debug/grandinherit")).output().unwrap();
+        assert_eq!(output.stdout, python.stdout);
+        assert_eq!(output.stderr, python.stderr);
+        assert_eq!(output.status.code(), python.status.code());
+    }
+}
+
+#[test]
+fn cross_module_grandparent_constructor_argument_mismatches_are_loud() {
+    for (call, error) in [
+        ("Child()", "Grandparent.__init__() missing 1 required positional argument: 'value'"),
+        ("Child(1, 2)", "Grandparent.__init__() takes 2 positional arguments but 3 were given"),
+    ] {
+        let scratch = Scratch::new(if call == "Child()" { "grandparent-missing" } else { "grandparent-extra" });
+        let source = format!("from .middle import Parent\nclass Child(Parent):\n    pass\ndef main() -> None:\n    {call}\nif __name__ == '__main__':\n    main()\n");
+        let krate = package_crate(&scratch, "grandmismatch", &[
+            ("base.py", "class Grandparent:\n    def __init__(self, value: int) -> None:\n        print('constructor ran')\n        self.value = value\n"),
+            ("middle.py", "from .base import Grandparent\nclass Parent(Grandparent):\n    pass\n"),
+            ("__main__.py", &source),
+        ]);
+        let python = Command::new("python3")
+            .args(["-m", "grandmismatch"])
+            .env("PYTHONHASHSEED", "0")
+            .current_dir(scratch.path())
+            .output()
+            .unwrap();
+        // Verified against python3. Static constructor arity errors are
+        // loud build failures rather than CPython's runtime TypeError.
+        assert!(python.stdout.is_empty());
+        assert_eq!(python.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&python.stderr).ends_with(&format!("TypeError: {error}\n")));
+        let build = Command::new("cargo")
+            .arg("build")
+            .env_remove("RUSTFLAGS")
+            .current_dir(&krate.root)
+            .output()
+            .unwrap();
+        assert!(!build.status.success(), "invalid constructor call built successfully");
+        let stderr = String::from_utf8_lossy(&build.stderr);
+        assert!(stderr.contains("error[E0061]"), "{stderr}");
+    }
+}
+
 /// Convert, build and run a single-file program; its stderr with the
 /// `Ran N tests in T.TTTs` time normalized to `T`, and its exit code.
 fn unittest_report(name: &str, source: &str) -> (String, i32) {

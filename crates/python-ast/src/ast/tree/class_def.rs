@@ -1497,20 +1497,9 @@ impl ClassDef {
         symbols: &SymbolTableScopes,
         options: &crate::PythonOptions,
     ) -> Option<FunctionDef> {
-        let mut chain = vec![self.clone()];
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        seen.insert(self.name.clone());
-        while let Some(base) = chain.last().and_then(|c| {
-            c.base_class_with_options(symbols, options)
-        }) {
-            if !seen.insert(base.name.clone()) {
-                break;
-            }
-            chain.push(base);
-        }
-        chain
+        self.cross_module_chain(symbols, options)
             .into_iter()
-            .find_map(|c| c.methods().find(|m| m.name == name).cloned())
+            .find_map(|(c, _, _, _)| c.methods().find(|m| m.name == name).cloned())
     }
 
     /// The class itself followed by every ancestor, nearest base first.
@@ -1613,19 +1602,17 @@ impl ClassDef {
         self.base_chain_impl(symbols, |c, s| c.base_class(s))
     }
 
-    /// An options-aware base chain: the plain chain cannot follow IMPORTED
-    /// bases (no options to resolve the module), so a chain that crosses a
-    /// module boundary (`PoolManager(RequestMethods)` with the field
-    /// stored in the imported base — the field-walk, the property check,
-    /// and the Option-ness resolution need it) stops at the boundary and
-    /// misses the ancestor's fields (E0615/E0609 in generic trait
-    /// defaults). The two share one walk so their shapes cannot drift.
+    /// Follow imported bases in their defining scopes, using the same
+    /// chain as MRO method lookup and ancestor trait generation.
     pub(crate) fn base_chain_with_options(
         &self,
         symbols: &SymbolTableScopes,
         options: &crate::PythonOptions,
     ) -> Vec<ClassDef> {
-        self.base_chain_impl(symbols, |c, s| c.base_class_with_options(s, options))
+        self.cross_module_chain(symbols, options)
+            .into_iter()
+            .map(|(class, _, _, _)| class)
+            .collect()
     }
 
     fn base_chain_impl(
