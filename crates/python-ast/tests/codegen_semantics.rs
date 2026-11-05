@@ -780,9 +780,74 @@ fn tuple_destructuring_stores_through_mut_accessors() {
     );
     let out = compile(src, "tuple_target.py");
     assert!(
-        out.contains("* self . x_mut () , * self . y_mut ()"),
+        (out.contains("* self . x_mut () = 1") && out.contains("* self . y_mut () = 2"))
+            || out.contains("* self . x_mut () , * self . y_mut ()"),
         "tuple targets must destructure through the mut accessors: {}",
         out
+    );
+}
+
+#[test]
+fn tuple_field_stores_infer_each_field_type() {
+    let out = compile(
+        "class Pair:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.number, self.label = 1, \"first\"\n",
+        "tuple_fields.py",
+    );
+    assert!(
+        out.contains("pub number : i64"),
+        "tuple assignment must declare the numeric field: {}",
+        out
+    );
+    assert!(
+        out.contains("pub label : String"),
+        "tuple assignment must infer an owned String field: {}",
+        out
+    );
+}
+
+#[test]
+fn tuple_field_store_refuses_rhs_reads_after_setter_effects() {
+    let error = compile_err(
+        "x = \"before\"\n\
+         class Pair:\n\
+         \x20   @property\n\
+         \x20   def a(self):\n\
+         \x20       return 0\n\
+         \x20   @a.setter\n\
+         \x20   def a(self, value):\n\
+         \x20       global x\n\
+         \x20       x = \"after\"\n\
+         \x20   def update(self):\n\
+         \x20       self.a, self.b = 1, x\n",
+        "tuple_field_order.py",
+    );
+    assert!(
+        error.contains("later non-literal RHS values")
+            && error.contains("unpack into local names before assigning attributes separately")
+            && error.contains("refuses to evaluate an RHS expression after an earlier target store"),
+        "effectful unpacking must fail conversion with a semantics-preserving rewrite: {error}"
+    );
+}
+
+#[test]
+fn starred_tuple_field_store_refusal_has_location_and_rewrite() {
+    let error = compile_err(
+        "class Pair:\n\
+         \x20   def __init__(self, values):\n\
+         \x20       self.first, *self.rest = values\n",
+        "starred_fields.py",
+    );
+    assert!(
+        error.contains("self.rest") && error.contains("line 3"),
+        "starred field-store refusal must identify the target and source line: {error}"
+    );
+    assert!(
+        error.contains("index the value instead")
+            && error.contains("assign each attribute separately")
+            && error.contains("rython refuses to silently store an element where Python stores a list"),
+        "starred field-store refusal must include its rewrite and semantic reason: {error}"
     );
 }
 

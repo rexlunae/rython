@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::ast::tree::visit::{is_self, stmt_bodies, stmt_exprs, subexprs};
+use crate::ast::tree::visit::{is_self, stmt_bodies, stmt_exprs, stmt_targets, subexprs, target_leaves};
 use crate::{ClassDef, CodeGen, ExprType, FunctionDef, PythonOptions, Statement, StatementType, SymbolTableScopes, TypeInfo};
 
 thread_local! {
@@ -886,61 +886,22 @@ fn self_stores(stmts: &[Statement], fields: &mut Vec<String>, self_calls: &mut V
     }
     let mut found = false;
     for s in stmts {
-        match &s.statement {
-            StatementType::Assign(a) => {
-                for t in &a.targets {
-                    if let Some(f) = self_field(t) {
-                        fields.push(f);
-                        found = true;
-                    }
-                }
+        // Every place the statement stores into — an assignment's, an
+        // augmented assignment's, a `for self.x in ..` / `with .. as
+        // self.x` target — flattened through unpacking patterns, so
+        // `self.a, self.b = 1, 2` mutates `a` and `b` (issue #527: a class
+        // mutated only that way was copied out of its holder, and the
+        // mutation was silently lost). `del self.items[i]` / `del
+        // self.cache` mutates the field too (Devin review on #321).
+        let deleted = match &s.statement {
+            StatementType::Delete(targets) => targets.iter().collect(),
+            _ => Vec::new(),
+        };
+        for t in stmt_targets(s).into_iter().chain(deleted).flat_map(target_leaves) {
+            if let Some(f) = self_field(t) {
+                fields.push(f);
+                found = true;
             }
-            StatementType::AugAssign(a) => {
-                if let Some(f) = self_field(&a.target) {
-                    fields.push(f);
-                    found = true;
-                }
-            }
-            // `del self.items[i]`, `del self.cache`: a mutation of the
-            // field (Devin review on #321).
-            StatementType::Delete(targets) => {
-                for t in targets {
-                    if let Some(f) = self_field(t) {
-                        fields.push(f);
-                        found = true;
-                    }
-                }
-            }
-            // `for self.x in ..`, `with .. as self.x`: stores too.
-            StatementType::For(f) => {
-                if let Some(f) = self_field(&f.target) {
-                    fields.push(f);
-                    found = true;
-                }
-            }
-            StatementType::AsyncFor(f) => {
-                if let Some(f) = self_field(&f.target) {
-                    fields.push(f);
-                    found = true;
-                }
-            }
-            StatementType::With(w) => {
-                for item in &w.items {
-                    if let Some(f) = item.optional_vars.as_ref().and_then(self_field) {
-                        fields.push(f);
-                        found = true;
-                    }
-                }
-            }
-            StatementType::AsyncWith(w) => {
-                for item in &w.items {
-                    if let Some(f) = item.optional_vars.as_ref().and_then(self_field) {
-                        fields.push(f);
-                        found = true;
-                    }
-                }
-            }
-            _ => {}
         }
         // The expressions the statement itself evaluates (a call in an
         // `if` test — Devin review on #321), then its bodies.
