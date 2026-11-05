@@ -6787,40 +6787,36 @@ fn unittest_assert_raises_with_a_returning_body_stays_a_loud_drop() {
 }
 
 #[test]
-fn unittest_subtest_context_manager_runs_body_directly() {
-    // `with self.subTest(**kw): body` — the unittest reporting CM. It only
-    // reframes per-iteration reporting (no exception suppression, no control
-    // flow change), so the body runs directly: a passing subTest passes and a
-    // failing one fails, exactly the observable test outcome. No closure is
-    // allowed (a subTest body may legitimately return/break/continue).
+fn unittest_subtest_context_manager_carries_a_failure_boundary() {
+    // `with self.subTest(**kw): body` records an exception and resumes after
+    // the context manager; generated code must contain that boundary.
     let out = compile(
         concat!(
             "import unittest\n",
             "class T(unittest.TestCase):\n",
             "    def t(self):\n",
             "        with self.subTest(step=1):\n",
-            "            if 1 == 2:\n",
-            "                return\n",
             "            self.assertEqual(1, 1)\n",
         ),
         "subtest.py",
     );
     assert!(
-        out.contains("unittest :: assert_eq (") && out.contains("return Ok (())"),
-        "the subTest body must run directly (real asserts, real return): {}",
+        out.contains("unittest :: assert_eq (")
+            && out.contains("unittest :: run_subtest")
+            && out.contains("PyRepr :: py_repr"),
+        "the subTest body must be wrapped with its context (real asserts): {}",
         out
     );
     assert!(
-        !out.contains("subTest") && !out.contains("assert_raises ("),
-        "subTest must not become a closure/assertRaises lowering: {}",
+        !out.contains("assert_raises ("),
+        "subTest must not become an assertRaises lowering: {}",
         out
     );
 }
 
 #[test]
-fn unittest_subtest_does_not_suppress_a_failing_body() {
-    // A body that raises keeps raising (subTest does not suppress) — the
-    // lowering must NOT wrap it in a closure that turns the error into a pass.
+fn unittest_subtest_records_a_failing_body() {
+    // The subTest boundary records a raising body rather than losing it.
     let out = compile(
         concat!(
             "import unittest\n",
@@ -6832,9 +6828,37 @@ fn unittest_subtest_does_not_suppress_a_failing_body() {
         "subtest_raise.py",
     );
     assert!(
-        out.contains("Err (") && !out.contains("assert_raises ("),
-        "a failing subTest body must keep its failure: {}",
+        out.contains("run_subtest") && out.contains("Err (") && !out.contains("assert_raises ("),
+        "a failing subTest body must keep its failure inside the boundary: {}",
         out
+    );
+}
+
+#[test]
+fn unittest_subtest_refuses_control_flow_that_would_escape_its_boundary() {
+    let error = compile_err(
+        "import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n        with self.subTest(step=1):\n            return\n",
+        "subtest_return.py",
+    );
+    assert!(
+        error.contains("`with self.subTest(...)`")
+            && error.contains("`return`, `break`, or `continue`")
+            && error.contains("refuses"),
+        "{error}"
+    );
+}
+
+#[test]
+fn unittest_subtest_refuses_unmodeled_context_values() {
+    let error = compile_err(
+        "import unittest\nclass Value:\n    pass\nclass T(unittest.TestCase):\n    def test_a(self):\n        with self.subTest(value=Value()):\n            pass\n",
+        "subtest_context_value.py",
+    );
+    assert!(
+        error.contains("`self.subTest(value=...)`")
+            && error.contains("without a supported Python repr")
+            && error.contains("refuses"),
+        "{error}"
     );
 }
 

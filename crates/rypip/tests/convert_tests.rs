@@ -14121,6 +14121,62 @@ fn unittest_main_prints_cpythons_report() {
 }
 
 #[test]
+fn unittest_subtests_record_failures_and_continue() {
+    let (stdout, stderr, code) = unittest_run(
+        "ut_subtests",
+        concat!(
+            "import unittest\n",
+            "\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    @unittest.expectedFailure\n",
+            "    def test_expected_subtest(self):\n",
+            "        with self.subTest(step=10):\n",
+            "            self.assertEqual(1, 2)\n",
+            "\n",
+            "    def test_subtests(self):\n",
+            "        for i in range(3):\n",
+            "            with self.subTest(group=\"all\"):\n",
+            "                with self.subTest(step=i):\n",
+            "                    print(\"ran\", i)\n",
+            "                    self.assertEqual(i, 1)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+    );
+    // Verified against python3: stdout is `ran 0/1/2`; stderr has two
+    // subtest-specific failures plus one expected-failure status, while
+    // `Ran` counts methods, not subtests.
+    // The traceback frame lines are omitted per the no-frames entry in §12.
+    assert_eq!(stdout, "ran 0\nran 1\nran 2\n");
+    assert_eq!(
+        stderr,
+        concat!(
+            "xFF\n",
+            "======================================================================\n",
+            "FAIL: test_subtests (__main__.T.test_subtests) (step=0, group='all')\n",
+            "----------------------------------------------------------------------\n",
+            "Traceback (most recent call last):\n",
+            "AssertionError: 0 != 1\n",
+            "\n",
+            "======================================================================\n",
+            "FAIL: test_subtests (__main__.T.test_subtests) (step=2, group='all')\n",
+            "----------------------------------------------------------------------\n",
+            "Traceback (most recent call last):\n",
+            "AssertionError: 2 != 1\n",
+            "\n",
+            "----------------------------------------------------------------------\n",
+            "Ran 2 tests in T\n",
+            "\n",
+            "FAILED (failures=2, expected failures=1)",
+        )
+    );
+    assert_eq!(code, 1);
+}
+
+#[test]
 fn unittest_main_exit_false_returns_and_a_blank_docstring_adds_no_line() {
     // Devin review on #476. `unittest.main(exit=False)` prints the report
     // and RETURNS, so the statement after it runs; a whitespace-only
