@@ -13,7 +13,10 @@ Deviation ledger: [`spec.md`](spec.md) §12.
 
 - **`unittest` suites work today, for a bounded subset.** A `unittest`
   module converts, builds, and runs; assertions, fixtures and gates are
-  lowered; exit status matches CPython (0 on pass, 1 on failure).
+  lowered; exit status matches CPython (0 on pass, 1 on failure). A
+  `skipIf`/`skipUnless` condition that reads a module name rebound after
+  its decorated class is refused, because CPython snapshots it at
+  decoration time and the current runner evaluates it at test time (#521).
 - **`with self.assertRaises(...): raise ...` works** since #457. The
   former build failure and its cause are recorded below as history.
 - **There is no pytest runner or automatic collection.** A module with
@@ -128,7 +131,7 @@ the #457, #480 and #482 pins below update the affected rows:
 | `setUp` fixture | yes | yes | yes | yes |
 | `with self.assertRaises(E): f()` | yes | yes | yes | yes |
 | `with self.assertRaises(E): raise E(...)` | yes | yes | yes | yes (#457) |
-| `@unittest.skip` / `skipIf` / `skipUnless` | yes | yes | yes | yes (gates honoured) |
+| `@unittest.skip` / `skipIf` / `skipUnless` | yes | yes | yes | yes for stable conditions; post-definition module rebinding is refused (#521) |
 | `@expectedFailure` | yes | yes | yes | yes |
 | Function-only `test_*` module | yes | yes (library) | no binary | no implicit collection, as with `python file.py` |
 | External `pytest.main(...)` / imported alias | **conversion error** | — | — | no runner; run under CPython or port to unittest |

@@ -8036,6 +8036,52 @@ fn refuse_cross_module_runner_inputs(
     };
     let mut classes: Vec<crate::ClassDef> = Vec::new();
     collect_class_defs(module_stmts, &mut classes);
+    let mut class_positions = std::collections::HashMap::new();
+    let mut module_stores = Vec::new();
+    walk_stmts(module_stmts, Descend::SkipDefs, &mut |s| {
+        let pos = s.lineno.zip(s.col_offset);
+        if let crate::StatementType::ClassDef(c) = &s.statement
+            && let Some(pos) = pos
+        {
+            class_positions.insert(c.name.clone(), pos);
+        }
+        if let Some(pos) = pos {
+            for name in crate::ast::tree::visit::stmt_bound_names(
+                s,
+                crate::ast::tree::visit::Bindings::Scope,
+            ) {
+                module_stores.push((name, pos));
+            }
+        }
+        Flow::Continue
+    });
+    let refuse_rebound_gate = |class_name: &str,
+                               class_pos: (usize, usize),
+                               decorators: &[crate::ExprType]|
+     -> Result<(), String> {
+        for gate in run_gates(decorators) {
+            let (gate_name, condition) = match gate {
+                RunGate::SkipIf(condition) => ("skipIf", condition),
+                RunGate::SkipUnless(condition) => ("skipUnless", condition),
+                _ => continue,
+            };
+            for name in module_expr_reads(&condition) {
+                if let Some((_, (line, _))) = module_stores
+                    .iter()
+                    .find(|(stored, pos)| stored == &name && *pos > class_pos)
+                {
+                    return Err(format!(
+                        "unittest.main(): `{gate_name}` condition `{name}` on TestCase \
+                         `{class_name}` is rebound at line {line} after its class \
+                         definition; rython cannot preserve the decorator-time value yet; \
+                         move the rebinding before the class or use an unchanged condition; \
+                         rython refuses to silently evaluate it later"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    };
     // A base spelled through its module (`class Child(cases.Base)`) is not
     // followed by the base chain, so a TestCase reached that way would be
     // silently left out of the run.
@@ -8061,6 +8107,23 @@ fn refuse_cross_module_runner_inputs(
     }
     for (name, case) in cases {
         let imported = case.module.is_some();
+        if !imported {
+            let test_names = test_method_names(&case.class, &case.symbols, &case.options);
+            for (ancestor, _, _, path) in
+                case.class.cross_module_chain(&case.symbols, &case.options)
+            {
+                if path.is_none()
+                    && let Some(&class_pos) = class_positions.get(&ancestor.name)
+                {
+                    refuse_rebound_gate(&ancestor.name, class_pos, &ancestor.decorator_list)?;
+                    for name in &test_names {
+                        if let Some(def) = ancestor.methods().find(|m| &m.name == name) {
+                            refuse_rebound_gate(&ancestor.name, class_pos, &def.decorator_list)?;
+                        }
+                    }
+                }
+            }
+        }
         let refuse = |what: String| {
             let how = if imported { "is imported with" } else { "inherits" };
             Err(format!(
@@ -8200,9 +8263,10 @@ fn emit_test_runner(
             // The class's gates, then the method's (issue #371). A skipped
             // test is never constructed, set up, or run — CPython decides
             // the skip before setUp. Each condition is evaluated when the
-            // runner reaches the test; CPython evaluates it when the
-            // decorator runs at import, which differs only for a condition
-            // the module rebinds after defining the class.
+            // runner reaches the test, not when its decorator executes.
+            // The preflight refuses a referenced module name rebound after
+            // the class definition (#521); other expressions with observable
+            // evaluation effects remain a documented timing limit.
             let method_decorators = test_def
                 .as_ref()
                 .map(|f| f.decorator_list.clone())
