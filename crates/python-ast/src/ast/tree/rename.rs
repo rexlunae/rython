@@ -568,6 +568,7 @@ fn rename_expr(expr: &ExprType, from: &str, to: &str) -> ExprType {
         ExprType::Call(c) => ExprType::Call(Call {
             func: Box::new(rename_expr(c.func.as_ref(), from, to)),
             args: c.args.iter().map(|a| rename_expr(a, from, to)).collect(),
+            lineno: c.lineno,
             keywords: c
                 .keywords
                 .iter()
