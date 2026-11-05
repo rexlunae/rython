@@ -2247,6 +2247,14 @@ pub(crate) fn resolve_construction_class(
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
 ) -> Option<(crate::ClassDef, SymbolTableScopes)> {
+    resolve_construction_class_with_path(name, symbols, options).map(|(c, s, _)| (c, s))
+}
+
+pub(crate) fn resolve_construction_class_with_path(
+    name: &str,
+    symbols: &SymbolTableScopes,
+    options: &PythonOptions,
+) -> Option<(crate::ClassDef, SymbolTableScopes, Vec<String>)> {
     resolve_construction_class_depth(name, symbols, options, 0)
 }
 
@@ -2255,12 +2263,12 @@ fn resolve_construction_class_depth(
     symbols: &SymbolTableScopes,
     options: &PythonOptions,
     depth: usize,
-) -> Option<(crate::ClassDef, SymbolTableScopes)> {
+) -> Option<(crate::ClassDef, SymbolTableScopes, Vec<String>)> {
     if depth > 16 {
         return None;
     }
     match symbols.get(name) {
-        Some(SymbolTableNode::ClassDef(c)) => Some((c.clone(), symbols.clone())),
+        Some(SymbolTableNode::ClassDef(c)) => Some((c.clone(), symbols.clone(), options.this_module_path.clone())),
         Some(SymbolTableNode::Alias(canonical)) => {
             resolve_construction_class_depth(canonical, symbols, options, depth + 1)
         }
@@ -2284,7 +2292,7 @@ fn resolve_construction_class_depth(
                     .find(|a| a.asname.as_deref() == Some(name))
                     .map(|a| a.name.clone())
                     .unwrap_or_else(|| name.to_string());
-                crate::resolve_imported_class(options, key, &defining, 0)
+                crate::resolve_imported_class_with_path(options, key, &defining, 0)
             } else {
                 None
             }
@@ -4049,11 +4057,12 @@ impl<'a> CodeGen for Call {
                                     // __init__ message + the attrs + the
                                     // ancestor chain) when the class is
                                     // in-crate; the quoted kind otherwise.
-                                    match resolve_construction_class(&f.id, &symbols, &options) {
-                                        Some((cls, class_symbols)) => {
+                                    match resolve_construction_class_with_path(&f.id, &symbols, &options) {
+                                        Some((cls, class_symbols, module)) => {
                                             crate::ast::tree::raise_stmt::exception_construction(
                                                 &cls,
                                                 &class_symbols,
+                                                &module,
                                                 call,
                                                 ctx.clone(),
                                                 options.clone(),
@@ -7712,10 +7721,10 @@ impl<'a> CodeGen for Call {
         if let ExprType::Name(n) = self.func.as_ref() {
             if n.id == "RLResolver" {
             }
-            let resolved = resolve_construction_class(&n.id, &symbols, &options);
+            let resolved = resolve_construction_class_with_path(&n.id, &symbols, &options);
             if n.id == "RLResolver" {
             }
-            if let Some((class, class_symbols)) = resolved {
+            if let Some((class, class_symbols, module)) = resolved {
                 class.refuse_manual_testcase_construction(&class_symbols, &options)?;
                 // The CONSTRUCTED type's Rust name: for a @classmethod's
                 // `cls(...)` the receiver identifier `cls` is not a Rust
@@ -7756,6 +7765,7 @@ impl<'a> CodeGen for Call {
                     return crate::ast::tree::raise_stmt::exception_construction(
                         &class,
                         &class_symbols,
+                        &module,
                         &self,
                         ctx.clone(),
                         options.clone(),
