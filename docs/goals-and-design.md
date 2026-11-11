@@ -302,9 +302,12 @@ than replacing the whole construct with a boxed any-value:
   left for codegen to refuse loudly, not silently re-typed.
 - **test-runner gate decorators (#371)** — the decorated method/class
   stays a *static* definition; the gate (`@skipUnless`, `@cpython_only`,
-  …) is a dynamic test-runner directive with no static meaning, so it is
-  consumed as a no-op **plus a `-W` warning** — not modeled as a runtime
-  gate object.
+  …) is a test-runner directive, not a runtime gate object. The generated
+  runner carries out the supported gates; because `skipIf`/`skipUnless`
+  conditions are currently read when the runner reaches a test, a
+  module-level rebinding between the decorated class and the runner call
+  is a loud conversion error (#521). Potential writes through `global`
+  declarations in available functions are conservatively refused too.
 - **`csv.writer(lineterminator=...)` (#369)** — the writer stays a plain
   `struct Writer { file, lineterminator }` with `impl`s; the one dynamic
   knob Python's constructor accepts is threaded as a `String` value

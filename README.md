@@ -17,6 +17,8 @@ calls it as its last top-level statement, that call (what `python
 file.py` runs) — becomes `fn main`, and the generated code
 depends only on the `stdpython` runtime. The output is a starting point for
 a permanent port — readable Rust you can refactor, not an opaque bundle.
+Package modules retain their dotted Python `__name__` (including original
+capitalization); the executable entry still sees `__main__`.
 `rypip run program.py -- args` is the same pipeline behind CPython's
 command-line shape: it converts into a scratch crate (reused across runs),
 builds it quietly, and executes the binary with your arguments, streams
@@ -131,8 +133,9 @@ signatures derived from how the parameter is used — `def add(a, b): return
 a + b` works for ints, floats, strings, and lists; `for x in p` infers
 `IntoIterator` with element propagation; unannotated parameters either
 infer or fail loudly at conversion time),
-classes (struct-based), control flow including `try`/`except`/`finally` and
-loop `else`, comprehensions (including immediate `list(... for ...)`
+classes (struct-based, with single inheritance including imported sibling
+package bases), control flow including `try`/`except`/`finally` and loop
+`else`, comprehensions (including immediate `list(... for ...)`
 consumption, with conversion errors for mutable or unresolved outputs
 whose sharing cannot be preserved), f-strings and `str.format` on literal
 templates, keyword arguments and defaults for user functions (plus
@@ -166,12 +169,20 @@ feature that `rypip` enables automatically), and more.
 
 `unittest.TestCase` fields may first be assigned in a test method, without
 `__init__` or `setUp`. The runner creates a fresh instance per test and
-discovers inherited tests and fixtures. Reads must follow an assignment on
+discovers inherited tests and fixtures. Zero-argument `super()` calls in a
+modeled TestCase chain resolve the nearest implementation, including
+TestCase's no-op `setUp`/`tearDown`; resolved bodies contribute to
+field-initialization checks (#524). Reads must follow an assignment on
 every path, or an unconditional `setUp` initialization; uncertain attribute
 presence, receiver escapes, and field reads relying on another test or an
 opaque helper are conversion errors. Manual construction of cases with
 fields is refused; use `unittest.main()` to preserve fixture order
-(issues #480, #511).
+(issues #480, #511). `skipIf`/`skipUnless` conditions must stay unchanged
+between decoration and the runner call; direct rebinding and potential
+writes through `global` functions are conversion errors (#521).
+`with self.assertRaises(E) as cm:` catches the expected exception and
+supports reading `cm.exception` after the block; other uses of the context
+object are conversion errors (#523).
 
 Comprehension outputs that borrow existing mutable containers by name,
 attribute, or index are refused when value copies would lose sharing.
@@ -471,8 +482,7 @@ is complete. What's ahead:
 - Generalized decorator support (unblocks `dataclasses`, `property`,
   user-defined wrappers)
 - Generators and `yield` (likely as iterator-struct lowering)
-- Richer class model: inheritance (single, then multiple), common
-  dunder protocols
+- Richer class model: multiple inheritance and common dunder protocols
 - Automatic arbitrary-precision integer promotion, which will retire the
   current integer overflow limitation
 - An opt-in dynamic-typing escape hatch (boxed values) for multi-type

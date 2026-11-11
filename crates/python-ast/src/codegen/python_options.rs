@@ -157,9 +157,9 @@ pub struct ModuleClassInfo {
     /// (`from .animals import Dog; Dog("Rex")` maps arguments against the
     /// defining module's `__init__`).
     pub classes: std::collections::HashMap<String, crate::ClassDef>,
-    /// Hierarchy classes → trait names (`{Name}Trait` plus ancestors'),
-    /// for the cross-module trait imports the import statement emits.
-    pub traits: std::collections::HashMap<String, Vec<String>>,
+    /// Hierarchy classes → (defining module path, trait name) for the
+    /// class's trait and its ancestors, used by cross-module imports.
+    pub traits: std::collections::HashMap<String, Vec<(Vec<String>, String)>>,
 }
 
 /// State of the one-time cross-module class-resolution cache (see
@@ -509,6 +509,13 @@ pub struct PythonOptionsData {
     /// invisible to other modules), so cross-module constants become
     /// importable `pub static`s.
     pub this_module_path: Vec<String>,
+
+    /// The Python import name of the current module, such as
+    /// `pkg.submodule`. Package conversion sets this per module so an
+    /// unshadowed `__name__` read has the same value it would under CPython.
+    /// `None` preserves the runtime's `__main__` fallback for single-file
+    /// executable conversions.
+    pub python_module_name: Option<String>,
 
     /// Statically-known types of names in the CURRENT scope (parameter
     /// annotations and literal assignments), as canonical Python type
@@ -940,6 +947,7 @@ impl Default for PythonOptionsData {
             statically_module_names: std::rc::Rc::new(std::collections::HashSet::new()),
             module_path: Vec::new(),
             this_module_path: Vec::new(),
+            python_module_name: None,
             local_types: std::rc::Rc::new(std::collections::HashMap::new()),
             no_std: false,
             big_integer_target: BigIntegerTarget::StdPython,

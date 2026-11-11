@@ -685,6 +685,7 @@ impl CodeGen for ListComp {
                         })),
                         args: Vec::new(),
                         keywords: Vec::new(),
+                        lineno: None,
                     });
                     let rendered = match &elt_expected {
                         Some(ty) => crate::render_typed(

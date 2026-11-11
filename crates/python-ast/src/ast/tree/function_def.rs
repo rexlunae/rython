@@ -2011,6 +2011,35 @@ impl FunctionDef {
         if argparse_rewrite.is_none() {
             crate::ast::tree::closure::hoist_nested_def_defaults(&mut effective_body);
         }
+        // `with self.assertRaises(E) as cm:` binds `cm` to the caught
+        // exception, and each `cm.exception` read is rewritten to `cm`
+        // (issue #523). Runs before every analysis, so all of them see the
+        // reads as an exception-typed local; any other use of the name is
+        // refused here.
+        let testcase = ctx
+            .enclosing_class_name()
+            .and_then(|name| symbols.get(name))
+            .is_some_and(|node| {
+                matches!(node, SymbolTableNode::ClassDef(class) if class.is_testcase(&symbols, &options))
+            });
+        {
+            let args = &self.args;
+            let params: Vec<String> = args
+                .posonlyargs
+                .iter()
+                .chain(args.args.iter())
+                .chain(args.kwonlyargs.iter())
+                .chain(args.vararg.iter())
+                .chain(args.kwarg.iter())
+                .map(|p| p.arg.clone())
+                .collect();
+            crate::ast::tree::with_stmt::bind_assert_raises_targets(
+                &mut effective_body,
+                &params,
+                testcase,
+            )
+            .map_err(|e| format!("function `{}`: {}", self.name, e))?;
+        }
 
         // functools cache decorators rewrite the whole definition below;
         // @classmethod/@staticmethod change the method shape; any OTHER
@@ -2941,13 +2970,13 @@ impl FunctionDef {
         // would hand a post-block read a fabricated default instead. Refuse
         // that read at conversion time (issue #457 review): loud, not
         // silently a different value.
-        refuse_reads_of_assert_raises_locals(&effective_body, &scope)?;
+        refuse_reads_of_assert_raises_locals(&effective_body, &scope, testcase)?;
         let exception_locals = scope.assigned.iter().chain(param_names.iter())
             .filter(|name| !fn_mutable_globals.contains(*name)
                 && options.name_types.get(*name).is_some_and(crate::ast::tree::arguments::is_exception_typeinfo))
             .cloned().collect();
         if let Some((name, line)) = crate::ast::tree::binding_flow::first_unbound_read(
-            &effective_body, &param_names, &exception_locals,
+            &effective_body, &param_names, &exception_locals, testcase,
         )
         {
             return Err(format!("exception value `{name}` may be read before assignment or after an except binding is cleared (line {line}); initialize a fresh name before the try/conditional block and use a different except target; rython refuses to expose a fabricated default exception").into());
@@ -3607,11 +3636,13 @@ impl FunctionDef {
                 class,
                 generic,
                 super_target,
+                testcase_anchor,
                 force_mut_self,
             } => CodeGenContext::Trait {
                 class: class.clone(),
                 generic: *generic,
                 super_target: super_target.clone(),
+                testcase_anchor: testcase_anchor.clone(),
                 force_mut_self: *force_mut_self,
             },
             _ => CodeGenContext::Function {
@@ -7402,8 +7433,9 @@ fn same_span(a: &[Statement], b: &[Statement]) -> bool {
 fn refuse_reads_of_assert_raises_locals(
     body: &[Statement],
     scope: &crate::ScopeBindings,
+    testcase: bool,
 ) -> Result<(), String> {
-    if scope.assert_raises_body_names.is_empty() {
+    if !testcase || scope.assert_raises_body_names.is_empty() {
         return Ok(());
     }
     let mut after: Vec<&Statement> = Vec::new();
@@ -7413,9 +7445,8 @@ fn refuse_reads_of_assert_raises_locals(
             after.push(stmt);
         }
         if let StatementType::With(w) = &stmt.statement
-            && w.items.len() == 1
-            && w.items[0].optional_vars.is_none()
-            && crate::ast::tree::with_stmt::assert_raises_cm_name(&w.items[0].context_expr).is_some()
+            && testcase
+            && crate::ast::tree::with_stmt::is_assert_raises_with(&w.items)
         {
             seen = true;
         }
@@ -7547,4 +7578,3 @@ fn record_definite_bindings(
         _ => {}
     }
 }
-

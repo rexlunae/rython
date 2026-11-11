@@ -758,6 +758,12 @@ Consequences, all enforced loudly:
   spelling.
 - Imports of user modules within the converted package resolve to the
   generated Rust modules.
+- In package conversion, an unshadowed module-level `__name__` read is
+  the module's dotted Python import name (`MyPkg.helper` for
+  `MyPkg/helper.py`), preserving its import spelling independently of
+  sanitized Rust module identifiers; the separately generated executable
+  entry copy uses `__main__`. The package integration transcript pins both
+  against CPython (issue #534).
 - **Import guards are decided statically.** A module-level
   `try: import X … except ImportError:` (bare, or a tuple of
   ImportError/AttributeError) folds at conversion time, because
@@ -1922,8 +1928,11 @@ impl Point {
   assume a test completed its writes before raising. A helper method may
   read the fields every successful `setUp` exit assigns, unless `setUp`
   reaches it (directly or through other helpers): such a helper can run
-  before those stores, so it must initialize its own reads. Calls do not
-  establish field facts. `@staticmethod`/`@classmethod` members have no
+  before those stores, so it must initialize its own reads. Ordinary
+  calls do not establish field facts; a statically resolved
+  `super().method(...)` call is analyzed through its target body, so its
+  field reads and normal-exit stores participate in the proof.
+  `@staticmethod`/`@classmethod` members have no
   instance receiver and are not analyzed. A class data attribute that a
   field shadows (`value = 0`, then `self.value = 5` in `setUp`) follows
   the field rule, so a read before the instance store is refused rather
@@ -1939,11 +1948,30 @@ impl Point {
   since CPython's runner reads them and the emitted runner honors only
   the decorators (issue #512).
   Manual construction of cases with fields and explicit calls/captures
-  of lifecycle methods (including through `super()`) are refused: use
-  `unittest.main()` so the fixture-order proof applies. If `setUp` has
-  no successful exit, neither the test nor `tearDown` is reached.
+  of lifecycle methods on an instance are refused: use `unittest.main()`
+  so the fixture-order proof applies. In a fixture, `super().setUp()` and
+  `super().tearDown()` resolve along a statically modeled TestCase base
+  chain (including TestCase's no-op hook); an MRO or target the converter
+  cannot resolve is refused rather than lowered to a recursive self-call.
+  Other zero-argument `super().method(...)` calls in a TestCase body use
+  the same resolved chain, including user-defined helpers called from a
+  test or fixture. The nearest chain implementation is analyzed in place,
+  so its field reads and normal-exit stores participate in the caller's
+  proof; unsupported MROs, unsupported TestCase methods, or unsupported
+  targets are refused with the call's source line rather than falling
+  back to a possible recursive self-call.
+  If `setUp` has no successful exit, neither the test nor `tearDown` is
+  reached.
   These restrictions prevent Rust construction defaults from becoming
   observable as Python values before assignment.
+- **`assertRaises` context managers** catch the expected exception and
+  propagate an unexpected one. The `as cm` form supports reads of
+  `cm.exception` after the block; other uses or bindings of the context
+  object, and reads before the block completes are refused. A later read is
+  also refused when control flow cannot prove the target was bound (for
+  example, when the `with` is conditional), as is control flow escaping the
+  block; these cases would silently change context-manager semantics
+  (issue #523).
 - **Construction**: `Point(1.0, 2.0)` lowers to `Point::new(…)?`. The
   synthesized `new` defaults the struct then runs `__init__`. A
   user-defined method named `new` is a loud error.
@@ -1951,12 +1979,18 @@ impl Point {
   method mutates through `self`, directly or transitively through its
   own calls (the analysis follows the call graph, including composed
   fields).
-- **Rejected, loudly**: inheritance from anything but `object`, class
+- **Rejected, loudly**: unknown or external inheritance bases, class
   attributes and any class-level statement besides methods/docstring/
   `pass`, nested classes, `async` methods, and `*args`/`**kwargs` in
-  `__init__`. (For other methods, the `*args`/`**kwargs` rejection
-  fires at each call site; a definition that is never called slips
-  through to rustc.)
+  `__init__`. A known base imported from another module in the generated
+  package is supported; its constructor, fields, and methods participate
+  in the derived class's MRO and the imported traits are brought into scope
+  at call sites. This includes a class declared in package `__main__.py`,
+  which is compiled at the binary crate root. Such entry classes are not
+  included in library-side hierarchy sum types, since the library has no
+  Rust `__main__` module to name. (For other methods, the `*args`/`**kwargs`
+  rejection fires at each call site; a definition that is never called
+  slips through to rustc.)
 - **Dunder protocols are mostly not modeled** — `__init__` has
   semantics, and the MAPPING trio is wired: a user class's own
   `__getitem__` receives `x[k]`, its `__setitem__` receives
@@ -3025,6 +3059,7 @@ accepted as permanent spec:
 | Divergence | Status |
 |---|---|
 | Reading an instance attribute before its first assignment (`print(self.x)` ahead of `self.x = 1`, or `self.inner.n` ahead of `self.inner = Inner()`) yields the struct's default value (`0`, `''`, a default instance) where CPython raises `AttributeError`. Thread fields, TestCase fields and Thread constructor arguments are guarded (they refuse the shape loudly); every other class field is not | Open defect (issue #517) |
+| `unittest.skipIf` / `skipUnless` conditions are read by the emitted runner when each test is reached, instead of when the decorator executes. A module name read by an effective method or inherited class gate (including a walrus RHS) and rebound between its class definition and this runner call is refused at conversion. Potential writes by functions declaring that name `global` are conservatively refused, without proving whether the function is called; unused overridden method gates and direct writes after the runner call do not trigger this check. Other condition expressions still have runner-time evaluation | Loud for direct and potential global rebinding (issue #521); snapshotting arbitrary decorator expressions remains open |
 | `deque.index(x)` lowers through the shared list-ops arm and raises `ValueError: deque.index(x): x not in deque` (the 3.14 wording the list arm pinned), where CPython 3.12/3.13 say `9 is not in deque` — the wording `deque.remove` and the inherent `deque::index(x, start, stop)` already use. The exception TYPE agrees | Documented version choice, pinned in `python_semantics.rs`; the list arm's wording is the project-wide pin |
 | `unicodedata` answers from the Unicode 16.0.0 database — CPython 3.14's `unidata_version` — for every CPython: an older CPython carries an older database (3.12: 15.0.0, 3.13: 15.1.0), so a code point assigned or re-classified since answers differently there (`category`, `bidirectional`, `combining`, `name`, `normalize`). Code points assigned before 15.0 agree | Model limit (issue #334); a per-CPython database would need one table set per version |
 | Unpacking's ValueError text is CPython 3.11–3.13's: `too many values to unpack (expected 2)`. CPython 3.14 appends the length for a sized sequence (`(expected 2, got 3)` for a tuple, list or dict; not for a str). `not enough values to unpack (expected 2, got 1)` and `cannot unpack non-iterable int object` agree across versions | Model limit; one message set, pinned to the 3.11 transcripts |
