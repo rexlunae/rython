@@ -2058,7 +2058,7 @@ fn convert_on_this_thread(
     // One options object per conversion: the shared `module_defs` and the
     // cross-module trait-mut cache (computed once, reused by every module's
     // transpile via the Rc clone).
-    let mut base_options = conversion_base_options(
+    let base_options = conversion_base_options(
         opts,
         &rust_modules,
         &python_module_names,
@@ -2619,7 +2619,7 @@ fn convert_driver(
             .filter(|m| reachable.contains(&m.path)),
     );
     let (package_uses_async, _) = package_async_flags(package);
-    let mut base_options = conversion_base_options(
+    let base_options = conversion_base_options(
         opts,
         &rust_modules,
         &python_module_names,
@@ -2635,7 +2635,6 @@ fn convert_driver(
         &base_options,
         &package_module_name(module, package_name_prefix.as_deref()),
     )?;
-
 
     let mut dep_transpiled: Vec<(&PyModule, String)> = Vec::new();
     for (_name, dep) in &python_deps {

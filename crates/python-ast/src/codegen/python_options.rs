@@ -509,6 +509,7 @@ pub struct PythonOptionsData {
     /// invisible to other modules), so cross-module constants become
     /// importable `pub static`s.
     pub this_module_path: Vec<String>,
+
     /// The Python import name of the current module, such as
     /// `pkg.submodule`. Package conversion sets this per module so an
     /// unshadowed `__name__` read has the same value it would under CPython.
