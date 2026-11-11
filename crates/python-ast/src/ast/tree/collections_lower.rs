@@ -845,6 +845,7 @@ pub(crate) fn lower_field_factory(
                 func: Box::new(f.clone()),
                 args: Vec::new(),
                 keywords: Vec::new(),
+                lineno: None,
             };
             let call = ExprType::Call(call);
             match lower_ctor_call(&call, Some(annotation), ctx, options, symbols) {
