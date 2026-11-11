@@ -870,11 +870,15 @@ fn cross_module_class_info_computed_once_and_cached() {
     assert_eq!(dog2.name, "Dog");
     // Traits: Animal is the hierarchy root, so Dog carries DogTrait (own)
     // plus AnimalTrait (its methods re-emit there), nearest first.
-    let traits =
-        python_ast::module_class_traits(&options, &["animals".to_string()]);
+    let traits = python_ast::module_class_traits(&options, &["animals".to_string()]);
     assert_eq!(
-        traits.get("Dog").map(Vec::as_slice),
-        Some(&["DogTrait".to_string(), "AnimalTrait".to_string()][..]),
+        traits.get("Dog").map(|items| {
+            items
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>()
+        }),
+        Some(vec!["DogTrait", "AnimalTrait"]),
         "Dog must import DogTrait (own) + AnimalTrait (methods re-emit there)"
     );
     // A class that does not exist resolves to None without poisoning the cache.
@@ -6512,6 +6516,80 @@ fn unittest_main_emits_a_test_runner() {
 }
 
 #[test]
+fn unittest_main_refuses_testcases_stored_in_unsupported_forms() {
+    for (store, source) in [
+        (
+            "list",
+            "cases = [T]\n",
+        ),
+        (
+            "unpacking",
+            "case, other = T, None\n",
+        ),
+        (
+            "walrus",
+            "cases = (case := T)\n",
+        ),
+    ] {
+        let error = compile_err_as_entry(
+            &format!(
+                "import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n        pass\n{source}if __name__ == '__main__':\n    unittest.main()\n"
+            ),
+            "tc_unfollowed.py",
+        );
+        assert!(
+            error.contains("binds a name to the TestCase `T` as a value")
+                && error.contains("line ")
+                && error.contains("bind the class with `class`, `from ... import`, or a plain `Name = Class` alias")
+                && error.contains("refuses to silently run or skip"),
+            "{store}: {error}"
+        );
+    }
+}
+
+#[test]
+fn unittest_main_refuses_uncertain_multi_module_star_imports() {
+    let cases = parse(
+        "import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n        pass\n__all__ = dynamic_exports()\n",
+        "cases.py",
+    )
+    .unwrap();
+    let entry = parse(
+        "from .cases import *\nimport unittest\nif __name__ == '__main__':\n    unittest.main()\n",
+        "cli.py",
+    )
+    .unwrap();
+    let module_defs = std::collections::HashMap::from([
+        (vec!["pkg".to_string(), "cases".to_string()], std::rc::Rc::new(cases)),
+        (vec!["pkg".to_string(), "cli".to_string()], std::rc::Rc::new(entry.clone())),
+    ]);
+    let options = PythonOptions::from(PythonOptionsData {
+        is_executable_entry: true,
+        module_defs: std::rc::Rc::new(module_defs),
+        module_path: vec!["pkg".to_string()],
+        python_namespace: "pkg".to_string(),
+        this_module_path: vec!["pkg".to_string(), "cli".to_string()],
+        ..Default::default()
+    });
+    let symbols = entry.clone().find_symbols(SymbolTableScopes::new());
+    let error = entry
+        .to_rust(
+            CodeGenContext::Module("cli".to_string()),
+            options,
+            symbols,
+        )
+        .expect_err("unknown star exports that may include a TestCase must be refused");
+    let error = error.to_string();
+    assert!(
+        error.contains("`from cases import *` at line 1 may bind the TestCase `T`")
+            && error.contains("which names it binds is not known at conversion")
+            && error.contains("import the TestCase classes by name")
+            && error.contains("refuses to silently run or skip"),
+        "{error}"
+    );
+}
+
+#[test]
 fn unittest_asserts_lower_to_runtime_assert_helpers() {
     // issue #334: `self.assertEqual(a, b)` / `self.assertTrue(x)` /
     // `self.assertFalse(x)` are inherited TestCase members — not methods or
@@ -6732,10 +6810,11 @@ fn unittest_assert_raises_with_statement_lowers() {
 }
 
 #[test]
-fn unittest_assert_raises_with_a_returning_body_stays_a_loud_drop() {
-    // A body whose `return` would have to escape the closure cannot use the
-    // closure lowering — it keeps the plain (loud-drop) with lowering.
-    let out = compile(
+fn unittest_assert_raises_with_a_returning_body_is_refused() {
+    // A return exits through __exit__ with no exception, so assertRaises
+    // raises "ValueError not raised". It cannot be represented by the
+    // closure lowering and must be refused rather than run unchecked.
+    let err = compile_err(
         concat!(
             "import unittest\n",
             "class T(unittest.TestCase):\n",
@@ -6746,9 +6825,8 @@ fn unittest_assert_raises_with_a_returning_body_stays_a_loud_drop() {
         "assert_raises_with_ret.py",
     );
     assert!(
-        !out.contains("assert_raises ("),
-        "a returning body must not use the closure lowering: {}",
-        out
+        err.contains("return") && err.contains("not supported yet"),
+        "a returning body must be loudly refused: {err}"
     );
 }
 
@@ -16387,14 +16465,11 @@ fn annotated_empty_dict_keeps_types_inside_loop() {
     );
 }
 
-/// Issue #137 round 20 (urllib3's RequestMethods): a plain-struct class
-/// subclassed ONLY cross-module emits an ACCESSOR-ONLY companion trait —
-/// the subclass modules' ancestor impls and supertrait bounds name
-/// `{Name}Trait`, so it must exist — while its methods stay INHERENT
-/// (trait-default methods would re-route the subclasses' inherited-call
-/// resolution).
+/// A base class used only by a cross-module subclass still emits its
+/// methods on the trait, so inherited calls dispatch through the subclass
+/// hierarchy instead of relying on the base struct's inherent methods.
 #[test]
-fn cross_module_only_base_emits_accessor_only_trait() {
+fn cross_module_only_base_emits_inherited_method_trait() {
     let mixin_src = "class Mixin:\n    def __init__(self):\n        self.headers = \"\"\n\n\
                      \x20   def ask(self) -> str:\n        return self.headers\n";
     // Convert the DEFINING module with the subclassing module visible in
@@ -16437,8 +16512,8 @@ fn cross_module_only_base_emits_accessor_only_trait() {
         .and_then(|rest| rest.split("impl MixinTrait for Mixin").next())
         .unwrap_or("");
     assert!(
-        !trait_block.contains("fn ask"),
-        "methods must NOT become trait defaults (accessor-only): {}",
+        trait_block.contains("fn ask"),
+        "the trait carries inherited methods: {}",
         out
     );
     assert!(
@@ -30055,6 +30130,195 @@ fn a_post_block_read_of_an_assert_raises_local_is_refused() {
         err.contains("UnboundLocalError") && err.contains("assertRaises"),
         "the post-block read must be a loud refusal naming the cause: {}",
         err
+    );
+}
+
+#[test]
+fn assert_raises_context_target_is_only_supported_through_exception() {
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(ValueError) as cm:\n",
+            "            raise ValueError(\"boom\")\n",
+            "        print(cm)\n",
+        ),
+        "assert_raises_context_target.py",
+    );
+    assert!(
+        err.contains("used as a value") && err.contains("cm.exception"),
+        "unsupported context-object use must be refused with the supported rewrite: {err}"
+    );
+}
+
+#[test]
+fn assert_raises_dynamic_exception_attribute_is_refused_at_source_location() {
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(self.failureException) as cm:\n",
+            "            raise AssertionError(\"boom\")\n",
+        ),
+        "assert_raises_dynamic_exception.py",
+    );
+    assert!(
+        err.contains("line 4")
+            && err.contains("failureException")
+            && err.contains("not statically known"),
+        "dynamic exception attributes must be refused with a location and rewrite: {err}"
+    );
+}
+
+#[test]
+fn assert_raises_unknown_module_exception_attribute_is_refused() {
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "import socket\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(socket.ValueError):\n",
+            "            raise ValueError(\"boom\")\n",
+        ),
+        "assert_raises_unknown_module_exception.py",
+    );
+    assert!(
+        err.contains("line 5")
+            && err.contains("socket.ValueError")
+            && err.contains("not statically known"),
+        "unknown module attributes must not be inferred to be builtin exceptions: {err}"
+    );
+}
+
+#[test]
+fn assert_raises_builtin_module_exception_is_supported() {
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "import builtins\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(builtins.ValueError):\n",
+            "            raise ValueError(\"boom\")\n",
+        ),
+        "assert_raises_builtins_exception.py",
+    );
+    assert!(
+        out.contains("assert_raises (\"ValueError\""),
+        "known builtin exception attributes must retain their canonical name: {out}"
+    );
+}
+
+#[test]
+fn assert_raises_socket_module_alias_is_canonicalized() {
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "import socket as s\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(s.timeout):\n",
+            "            raise s.timeout(\"timed out\")\n",
+        ),
+        "assert_raises_socket_alias.py",
+    );
+    assert!(
+        out.contains("assert_raises (\"TimeoutError\""),
+        "`socket.timeout` through alias `s` must use its canonical class name: {out}"
+    );
+}
+
+#[test]
+fn nested_function_parameter_does_not_rebind_assert_raises_target() {
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(ValueError) as cm:\n",
+            "            raise ValueError(\"boom\")\n",
+            "        def helper(cm: int) -> int:\n",
+            "            return cm\n",
+            "        print(str(cm.exception))\n",
+        ),
+        "assert_raises_nested_parameter.py",
+    );
+    assert!(
+        out.contains("helper") && out.contains("assert_raises_exception"),
+        "a nested parameter may shadow the outer context target: {out}"
+    );
+}
+
+#[test]
+fn assert_raises_context_target_is_not_promoted_across_branches() {
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        flag: bool = True\n",
+            "        if flag:\n",
+            "            with self.assertRaises(ValueError) as cm:\n",
+            "                raise ValueError(\"boom\")\n",
+            "        else:\n",
+            "            with self.assertRaises(ValueError) as cm:\n",
+            "                raise ValueError(\"boom\")\n",
+            "        print(str(cm.exception))\n",
+        ),
+        "assert_raises_context_target_branch.py",
+    );
+    assert!(
+        err.contains("assertRaises") || err.contains("cm"),
+        "a context target bound under control flow must be refused, not miscompiled: {err}"
+    );
+}
+
+#[test]
+fn arbitrary_assert_logs_attribute_uses_generic_with_lowering() {
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "class T:\n",
+            "    def t(self, obj: object) -> None:\n",
+            "        with obj.assertLogs(\"example\"):\n",
+            "            print(\"body\")\n",
+            "        with obj.assertWarns(Warning):\n",
+            "            print(\"body\")\n",
+            "        with obj.assertRaisesRegex(ValueError, \"example\"):\n",
+            "            print(\"body\")\n",
+        ),
+        "generic_assert_logs.py",
+    );
+    assert!(
+        out.contains("body") && !out.contains("assertLogs is not supported"),
+        "an arbitrary receiver must not enter TestCase-specific handling: {out}"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning.contains("dropped")),
+        "the generic path retains its existing loud-drop warning: {warnings:?}"
+    );
+}
+
+#[test]
+fn assert_raises_on_non_testcase_self_uses_generic_with_lowering() {
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "class T:\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(ValueError):\n",
+            "            print(\"body\")\n",
+        ),
+        "non_testcase_assert_raises.py",
+    );
+    assert!(
+        out.contains("body") && !out.contains("assert_raises ("),
+        "a non-TestCase self method must not receive unittest lowering: {out}"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning.contains("dropped")),
+        "the generic path retains its existing loud-drop warning: {warnings:?}"
     );
 }
 

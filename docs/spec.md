@@ -758,6 +758,12 @@ Consequences, all enforced loudly:
   spelling.
 - Imports of user modules within the converted package resolve to the
   generated Rust modules.
+- In package conversion, an unshadowed module-level `__name__` read is
+  the module's dotted Python import name (`MyPkg.helper` for
+  `MyPkg/helper.py`), preserving its import spelling independently of
+  sanitized Rust module identifiers; the separately generated executable
+  entry copy uses `__main__`. The package integration transcript pins both
+  against CPython (issue #534).
 - **Import guards are decided statically.** A module-level
   `try: import X … except ImportError:` (bare, or a tuple of
   ImportError/AttributeError) folds at conversion time, because
@@ -1901,7 +1907,15 @@ impl Point {
 - **TestCase method-created fields** (issues #480, #511): a direct or
   inherited `unittest.TestCase` subclass discovers `self.attr = ...`
   through the shared method-field analysis even without `__init__` or
-  `setUp`. The runner follows the MRO for tests, overrides, default
+  `setUp`. `unittest.main()` discovers TestCase classes bound in the
+  entry module, including supported `from ... import` bindings and
+  aliases; each bound name is loaded in name order, and report IDs retain
+  the class's defining module. Top-level classes selected by statically
+  resolved version guards remain discoverable after normalization.
+  Bindings the runner cannot track statically (including escaped,
+  unpacked, or walrus-bound TestCase values) are conversion errors rather
+  than silently omitted. The runner follows the MRO for tests,
+  overrides, default
   arguments, fixtures, and gates, and constructs a fresh instance for
   every test. Each ancestor's base resolves in the module that defines
   it, so `Child(Middle)` is a TestCase when `Middle` comes from another
@@ -1936,6 +1950,14 @@ impl Point {
   no successful exit, neither the test nor `tearDown` is reached.
   These restrictions prevent Rust construction defaults from becoming
   observable as Python values before assignment.
+- **`assertRaises` context managers** catch the expected exception and
+  propagate an unexpected one. The `as cm` form supports reads of
+  `cm.exception` after the block; other uses or bindings of the context
+  object, and reads before the block completes are refused. A later read is
+  also refused when control flow cannot prove the target was bound (for
+  example, when the `with` is conditional), as is control flow escaping the
+  block; these cases would silently change context-manager semantics
+  (issue #523).
 - **Construction**: `Point(1.0, 2.0)` lowers to `Point::new(…)?`. The
   synthesized `new` defaults the struct then runs `__init__`. A
   user-defined method named `new` is a loud error.
@@ -1943,12 +1965,18 @@ impl Point {
   method mutates through `self`, directly or transitively through its
   own calls (the analysis follows the call graph, including composed
   fields).
-- **Rejected, loudly**: inheritance from anything but `object`, class
+- **Rejected, loudly**: unknown or external inheritance bases, class
   attributes and any class-level statement besides methods/docstring/
   `pass`, nested classes, `async` methods, and `*args`/`**kwargs` in
-  `__init__`. (For other methods, the `*args`/`**kwargs` rejection
-  fires at each call site; a definition that is never called slips
-  through to rustc.)
+  `__init__`. A known base imported from another module in the generated
+  package is supported; its constructor, fields, and methods participate
+  in the derived class's MRO and the imported traits are brought into scope
+  at call sites. This includes a class declared in package `__main__.py`,
+  which is compiled at the binary crate root. Such entry classes are not
+  included in library-side hierarchy sum types, since the library has no
+  Rust `__main__` module to name. (For other methods, the `*args`/`**kwargs`
+  rejection fires at each call site; a definition that is never called
+  slips through to rustc.)
 - **Dunder protocols are mostly not modeled** — `__init__` has
   semantics, and the MAPPING trio is wired: a user class's own
   `__getitem__` receives `x[k]`, its `__setitem__` receives

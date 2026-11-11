@@ -2117,16 +2117,23 @@ fn convert_on_this_thread(
         &python_module_names,
         &module_defs,
         async_runtime_dep,
-        &package.name,
+        package,
+        &python_deps,
     );
     let mut transpiled: Vec<(&PyModule, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    let package_name_prefix = package_module_name_prefix(package);
     for (_name, dep) in &python_deps {
         for module in &dep.modules {
             if !reachable.contains(&module.path) {
                 continue;
             }
-            let code = transpile(module, &mut warnings, &base_options)?;
+            let code = transpile(
+                module,
+                &mut warnings,
+                &base_options,
+                &module.import_path.join("."),
+            )?;
             transpiled.push((module, code));
         }
     }
@@ -2170,13 +2177,23 @@ fn convert_on_this_thread(
         } else {
             &base_options
         };
-        let code = transpile(module, &mut warnings, options)?;
+        let code = transpile(
+            module,
+            &mut warnings,
+            options,
+            &package_module_name(module, package_name_prefix.as_deref()),
+        )?;
         // The cdylib (JIT) mode has no binary: the lib copy is the one
         // the boundary calls.
         if is_entry && opts.cdylib.is_none() {
             let mut bin_options = entry_options.clone();
             bin_options.bin_crate_root = true;
-            entry_bin_code = Some(transpile(module, &mut Vec::new(), &bin_options)?);
+            entry_bin_code = Some(transpile(
+                module,
+                &mut Vec::new(),
+                &bin_options,
+                "__main__",
+            )?);
         }
         transpiled.push((module, code));
     }
@@ -2700,9 +2717,16 @@ fn convert_driver(
         &python_module_names,
         &module_defs,
         package_uses_async,
-        &package.name,
+        package,
+        &python_deps,
     );
-    let code = transpile(module, &mut warnings, &base_options)?;
+    let package_name_prefix = package_module_name_prefix(package);
+    let code = transpile(
+        module,
+        &mut warnings,
+        &base_options,
+        &package_module_name(module, package_name_prefix.as_deref()),
+    )?;
 
     let mut dep_transpiled: Vec<(&PyModule, String)> = Vec::new();
     for (_name, dep) in &python_deps {
@@ -2710,7 +2734,12 @@ fn convert_driver(
             if !reachable.contains(&dep_module.path) {
                 continue;
             }
-            let dep_code = transpile(dep_module, &mut warnings, &base_options)?;
+            let dep_code = transpile(
+                dep_module,
+                &mut warnings,
+                &base_options,
+                &dep_module.import_path.join("."),
+            )?;
             dep_transpiled.push((dep_module, dep_code));
         }
     }
@@ -3181,6 +3210,7 @@ fn transpile(
     module: &PyModule,
     warnings: &mut Vec<String>,
     base_options: &PythonOptions,
+    python_module_name: &str,
 ) -> Result<String> {
     let ast = parse_enhanced(&module.source, parse_filename(module))
         .map_err(|e| anyhow::anyhow!("{} ({})", e, module.file.display()))?;
@@ -3205,6 +3235,7 @@ fn transpile(
         .cloned()
         .unwrap_or_else(|| "lib".to_string());
     let mut options = base_options.clone();
+    options.python_module_name = Some(python_module_name.to_string());
     // Relative imports resolve against the current module's package path;
     // empty at the crate root (the default when unset).
     options.module_path = module_package_path(module);
@@ -3239,6 +3270,33 @@ fn transpile(
         warnings.push(format!("{}: {}", parse_filename(module), w));
     }
     Ok(tokens.to_string())
+}
+
+/// A package discovered from a source root whose `__init__.py` has an
+/// empty relative path needs that root directory as the leading Python
+/// package name (`pkg/helper.py` → `pkg.helper`). Metadata-discovered
+/// packages already carry their import root in `module.import_path`.
+fn package_module_name_prefix(package: &crate::package::PyPackage) -> Option<String> {
+    let root_init = package
+        .modules
+        .iter()
+        .find(|module| module.is_init && module.import_path.is_empty())?;
+    root_init
+        .file
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+}
+
+fn package_module_name(module: &PyModule, prefix: Option<&str>) -> String {
+    let relative = module.import_path.join(".");
+    match (prefix, relative.is_empty()) {
+        (Some(prefix), true) => prefix.to_string(),
+        (Some(prefix), false) => format!("{prefix}.{relative}"),
+        (None, true) => "lib".to_string(),
+        (None, false) => relative,
+    }
 }
 
 /// Whether any module of the package contains async constructs (async def/
@@ -3367,8 +3425,10 @@ fn conversion_base_options(
     python_module_names: &std::collections::HashSet<String>,
     module_defs: &std::collections::HashMap<Vec<String>, std::rc::Rc<python_ast::Module>>,
     async_runtime_dep: bool,
-    package_name: &str,
+    package: &PyPackage,
+    python_deps: &[(String, PyPackage)],
 ) -> PythonOptions {
+    let package_name = package.name.as_str();
     PythonOptions::from(python_ast::PythonOptionsData {
         lossy_warnings: opts.warnings != WarningMode::Allow,
         no_std: opts.no_std,
@@ -3382,6 +3442,7 @@ fn conversion_base_options(
         rust_modules: std::rc::Rc::new(rust_modules.clone()),
         python_modules: std::rc::Rc::new(python_module_names.clone()),
         module_defs: std::rc::Rc::new(module_defs.clone()),
+        module_python_names: std::rc::Rc::new(module_python_names(package, python_deps)),
         async_runtime_dep,
         // The package's own name: root-qualified absolute self-imports
         // (`from urllib3.connection import ...`, pip's src-layout paths)
@@ -3390,6 +3451,38 @@ fn conversion_base_options(
         python_namespace: package_name.to_string(),
         ..Default::default()
     })
+}
+
+/// Each crate module's Python `__name__` by its module key (issue #522: a
+/// test's id names its class's defining module). A vendored dep's key
+/// already starts with its import name. The package's own keys are
+/// relative to its root package when it has one — the `__init__.py` with
+/// the empty key, named after its directory as `python3 -m impt` names
+/// `impt/cases.py` `impt.cases` — and are the whole name otherwise (a
+/// metadata-declared package's keys carry the package; a flat directory's
+/// modules are top-level).
+fn module_python_names(
+    package: &PyPackage,
+    python_deps: &[(String, PyPackage)],
+) -> HashMap<Vec<String>, String> {
+    let root = package
+        .modules
+        .iter()
+        .find(|m| m.is_init && m.path.is_empty())
+        .and_then(|m| m.file.parent()?.file_name()?.to_str().map(str::to_string));
+    let mut names = HashMap::new();
+    for module in &package.modules {
+        let name: Vec<&str> = root
+            .iter()
+            .map(String::as_str)
+            .chain(module.path.iter().map(String::as_str))
+            .collect();
+        names.insert(module.path.clone(), name.join("."));
+    }
+    for module in python_deps.iter().flat_map(|(_, dep)| dep.modules.iter()) {
+        names.insert(module.path.clone(), module.path.join("."));
+    }
+    names
 }
 
 /// The shim a crate root emits so the package root's init and bound
@@ -4325,6 +4418,7 @@ fn python_module_deps(
             let file = abs.clone();
             let module = PyModule {
                 path: vec![name.clone()],
+                import_path: import_name.split('.').map(str::to_string).collect(),
                 source,
                 file,
                 is_init: false,
@@ -4352,8 +4446,13 @@ fn python_module_deps(
                 format!("python-module `{import_name}`: discovering {}", abs.display())
             })?;
             let prefix = sanitize_name(import_name);
+            let import_prefix: Vec<String> =
+                import_name.split('.').map(str::to_string).collect();
             for module in &mut pkg.modules {
                 module.path.insert(0, prefix.clone());
+                module
+                    .import_path
+                    .splice(0..0, import_prefix.iter().cloned());
                 // The package's own __init__ was discovered as the root
                 // (empty path); after prefixing it IS the package init.
                 if module.path.len() == 1 && module.file.file_name() == Some("__init__.py".as_ref())
