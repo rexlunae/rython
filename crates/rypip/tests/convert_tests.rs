@@ -13777,6 +13777,37 @@ fn unittest_method_created_fields_match_cpython() {
 }
 
 #[test]
+fn unittest_direct_testcase_super_setup_matches_cpython() {
+    let (stdout, stderr, code) = unittest_run(
+        "ut_super_setup",
+        include_str!("fixtures/testcase_super_setup.py"),
+    );
+    // Verified against python3.
+    assert_eq!(stdout, "setup before\nsetup after\ntest ready True\n");
+    assert_eq!(
+        stderr,
+        ".\n----------------------------------------------------------------------\nRan 1 test in T\n\nOK"
+    );
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn unittest_super_resolves_user_method_and_propagates_fields() {
+    let (stdout, stderr, code) = unittest_run(
+        "ut_super_helper",
+        include_str!("fixtures/testcase_super_helper.py"),
+    );
+    // Verified against CPython 3.14.4: super().helper() assigns value
+    // before the test reads it.
+    assert_eq!(stdout, "helper 13\n");
+    assert_eq!(
+        stderr,
+        ".\n----------------------------------------------------------------------\nRan 1 test in T\n\nOK"
+    );
+    assert_eq!(code, 0);
+}
+
+#[test]
 fn unittest_helpers_class_defaults_and_static_members_match_cpython() {
     // #519 review regressions: a helper reached only from tests reads
     // setUp's fields, a helper setUp calls initializes its own reads, a
@@ -13915,6 +13946,70 @@ fn unittest_main_runs_the_selected_version_gated_testcase() {
     let (stdout, status) = run_package_status(&krate, "ut_version_gated_case");
     assert_eq!(stdout, ["selected version"]);
     assert_eq!(status, 0);
+}
+
+#[test]
+fn unittest_cross_module_super_setup_uses_descendant_testcase_mro() {
+    // Verified against CPython 3.14.4: calling Child.test_setup prints
+    // "middle before", "middle after", and "child test". The re-emitted
+    // Middle.setUp body must retain its own symbols for expressions while
+    // resolving super() against Child's full ancestry.
+    let scratch = Scratch::new("tcsetupchain");
+    let krate = package_crate(
+        &scratch,
+        "tcsetupchain",
+        &[
+            (
+                "root.py",
+                "import unittest\n\n\nclass Root(unittest.TestCase):\n    pass\n",
+            ),
+            (
+                "middle.py",
+                "from .root import Root\n\n\nclass Middle(Root):\n    def setUp(self):\n        print(\"middle before\")\n        super().setUp()\n        print(\"middle after\")\n",
+            ),
+            (
+                "cli.py",
+                "from .middle import Middle\n\n\nclass Child(Middle):\n    def test_setup(self):\n        self.setUp()\n        print(\"child test\")\n",
+            ),
+            (
+                "runner.py",
+                "from .cli import Child\n\n\nif __name__ == \"__main__\":\n    case = Child()\n    case.test_setup()\n",
+            ),
+        ],
+    );
+    assert_eq!(
+        run_package(&krate, "tcsetupchain"),
+        [
+            "middle before",
+            "middle after",
+            "child test",
+        ]
+    );
+}
+
+#[test]
+fn unittest_cross_module_super_default_argument_is_refused_with_line() {
+    let scratch = Scratch::new("tcsuperdefault");
+    let error = package_convert_err(
+        &scratch,
+        "tcsuperdefault",
+        &[
+            (
+                "root.py",
+                "import unittest\nDEFAULT = 42\n\n\nclass Root(unittest.TestCase):\n    def setUp(self, value=DEFAULT):\n        self.value = value\n",
+            ),
+            (
+                "middle.py",
+                "from .root import Root\n\n\nclass Middle(Root):\n    def setUp(self):\n        super().setUp()\n",
+            ),
+            (
+                "cli.py",
+                "import unittest\nfrom .middle import Middle\n\n\nclass Child(Middle):\n    def test_value(self):\n        print(self.value)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+            ),
+        ],
+    );
+    assert!(error.contains("default arguments are defined in another module"), "{error}");
+    assert!(error.contains("line 6:") && error.contains("refuses"), "{error}");
 }
 
 #[test]

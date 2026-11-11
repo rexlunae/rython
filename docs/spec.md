@@ -1928,8 +1928,11 @@ impl Point {
   assume a test completed its writes before raising. A helper method may
   read the fields every successful `setUp` exit assigns, unless `setUp`
   reaches it (directly or through other helpers): such a helper can run
-  before those stores, so it must initialize its own reads. Calls do not
-  establish field facts. `@staticmethod`/`@classmethod` members have no
+  before those stores, so it must initialize its own reads. Ordinary
+  calls do not establish field facts; a statically resolved
+  `super().method(...)` call is analyzed through its target body, so its
+  field reads and normal-exit stores participate in the proof.
+  `@staticmethod`/`@classmethod` members have no
   instance receiver and are not analyzed. A class data attribute that a
   field shadows (`value = 0`, then `self.value = 5` in `setUp`) follows
   the field rule, so a read before the instance store is refused rather
@@ -1945,9 +1948,20 @@ impl Point {
   since CPython's runner reads them and the emitted runner honors only
   the decorators (issue #512).
   Manual construction of cases with fields and explicit calls/captures
-  of lifecycle methods (including through `super()`) are refused: use
-  `unittest.main()` so the fixture-order proof applies. If `setUp` has
-  no successful exit, neither the test nor `tearDown` is reached.
+  of lifecycle methods on an instance are refused: use `unittest.main()`
+  so the fixture-order proof applies. In a fixture, `super().setUp()` and
+  `super().tearDown()` resolve along a statically modeled TestCase base
+  chain (including TestCase's no-op hook); an MRO or target the converter
+  cannot resolve is refused rather than lowered to a recursive self-call.
+  Other zero-argument `super().method(...)` calls in a TestCase body use
+  the same resolved chain, including user-defined helpers called from a
+  test or fixture. The nearest chain implementation is analyzed in place,
+  so its field reads and normal-exit stores participate in the caller's
+  proof; unsupported MROs, unsupported TestCase methods, or unsupported
+  targets are refused with the call's source line rather than falling
+  back to a possible recursive self-call.
+  If `setUp` has no successful exit, neither the test nor `tearDown` is
+  reached.
   These restrictions prevent Rust construction defaults from becoming
   observable as Python values before assignment.
 - **`assertRaises` context managers** catch the expected exception and
