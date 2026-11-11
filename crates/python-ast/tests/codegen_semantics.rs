@@ -31378,3 +31378,37 @@ fn pytest_operand_preflight_respects_the_stack_budget() {
     assert!(run(2000).unwrap_err().contains("nests too deeply"));
     assert_eq!(run(3), Ok(()));
 }
+
+#[test]
+fn unittest_skip_gate_rebinding_has_compiler_refusal_pins() {
+    // Verified against python3. Each of these four sources skips its test,
+    // including the helper defined before the decorated class and walrus RHS.
+    for source in [
+        include_str!("../../rypip/tests/fixtures/gate_rebind_helper.py"),
+        include_str!("../../rypip/tests/fixtures/gate_rebind_walrus.py"),
+        "import unittest\nFLAG = True\n@unittest.skipIf(FLAG, 'x')\nclass T(unittest.TestCase):\n    def test_a(self): pass\nFLAG = False\nif __name__ == '__main__':\n    unittest.main()\n",
+        "import unittest\nFLAG = False\nclass T(unittest.TestCase):\n    @unittest.skipUnless(FLAG, 'x')\n    def test_a(self): pass\nFLAG = True\nif __name__ == '__main__':\n    unittest.main()\n",
+    ] {
+        let error = compile_err(source, "gate_rebind.py");
+        assert!(error.contains("condition `FLAG`") && error.contains("rebound at line"), "{error}");
+        assert!(error.contains("decorator-time value") && error.contains("use an unchanged condition")
+            && error.contains("refuses to silently evaluate"), "{error}");
+    }
+}
+
+#[test]
+fn unittest_skip_gate_reads_exclude_walrus_targets_and_nested_locals() {
+    // Verified against python3. All three conditions are True and skip T.
+    for condition in ["(FLAG := True)", "(lambda FLAG: FLAG)(True)", "[FLAG for FLAG in [True]][0]"] {
+        let source = format!("import unittest\nFLAG = False\n@unittest.skipIf({condition}, 'x')\nclass T(unittest.TestCase):\n    def test_a(self): pass\nFLAG = True\nif __name__ == '__main__':\n    unittest.main()\n");
+        let rust = compile(&source, "gate_local.py");
+        assert!(rust.contains("TextTestResult :: new"), "{rust}");
+    }
+}
+
+#[test]
+fn unittest_skip_gate_post_runner_write_does_not_hoist_a_static_shadow() {
+    let rust = compile(include_str!("../../rypip/tests/fixtures/gate_postrun.py"), "gate_postrun.py");
+    assert!(rust.contains("py_global_write"), "{rust}");
+    assert!(!rust.contains("let FLAG") && !rust.contains("let mut FLAG"), "{rust}");
+}

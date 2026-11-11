@@ -201,6 +201,10 @@ def fibonacci(n):
 - **Advanced**: Lambda expressions, conditional expressions, subscripting
 
 #### ⚠️ Experimental/Limited Support
+- **unittest gates**: `skipIf`/`skipUnless` conditions that read module names
+  rebound between decoration and the runner call are refused, including
+  potential writes through functions declaring those names `global`. Only
+  effective method gates and inherited class gates are checked (#521).
 - **unittest fields**: `TestCase` methods can create instance fields without
   `__init__` or `setUp`. The runner follows the MRO for tests and fixtures
   and creates a fresh instance per test. Path-sensitive checks reject reads
