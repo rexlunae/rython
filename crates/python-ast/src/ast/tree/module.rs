@@ -8223,6 +8223,7 @@ fn emit_test_runner(
                     })),
                     args: vec![cond.clone()],
                     keywords: Vec::new(),
+                    lineno: None,
                 })
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())
                 .ok()

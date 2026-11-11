@@ -182,7 +182,10 @@ feature that `rypip` enables automatically), and more.
 
 `unittest.TestCase` fields may first be assigned in a test method, without
 `__init__` or `setUp`. The runner creates a fresh instance per test and
-discovers inherited tests and fixtures. Reads must follow an assignment on
+discovers inherited tests and fixtures. Zero-argument `super()` calls in a
+modeled TestCase chain resolve the nearest implementation, including
+TestCase's no-op `setUp`/`tearDown`; resolved bodies contribute to
+field-initialization checks (#524). Reads must follow an assignment on
 every path, or an unconditional `setUp` initialization; uncertain attribute
 presence, receiver escapes, and field reads relying on another test or an
 opaque helper are conversion errors. Manual construction of cases with

@@ -3636,11 +3636,13 @@ impl FunctionDef {
                 class,
                 generic,
                 super_target,
+                testcase_anchor,
                 force_mut_self,
             } => CodeGenContext::Trait {
                 class: class.clone(),
                 generic: *generic,
                 super_target: super_target.clone(),
+                testcase_anchor: testcase_anchor.clone(),
                 force_mut_self: *force_mut_self,
             },
             _ => CodeGenContext::Function {

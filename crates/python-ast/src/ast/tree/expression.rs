@@ -880,6 +880,12 @@ impl CodeGen for Expr {
         ) {
             return Ok(quote!());
         }
+        // `super().setUp()` reaching unittest.TestCase's own no-op fixture
+        // (issue #524): nothing runs.
+        if crate::ast::tree::testcase::is_noop_testcase_super(&self.value, &ctx, &symbols, &options)
+        {
+            return Ok(quote!());
+        }
         self.value.to_rust(ctx, options, symbols)
     }
 }
