@@ -174,7 +174,9 @@ every path, or an unconditional `setUp` initialization; uncertain attribute
 presence, receiver escapes, and field reads relying on another test or an
 opaque helper are conversion errors. Manual construction of cases with
 fields is refused; use `unittest.main()` to preserve fixture order
-(issues #480, #511).
+(issues #480, #511). `skipIf`/`skipUnless` conditions must stay unchanged
+between decoration and the runner call; direct rebinding and potential
+writes through `global` functions are conversion errors (#521).
 `with self.assertRaises(E) as cm:` catches the expected exception and
 supports reading `cm.exception` after the block; other uses of the context
 object are conversion errors (#523).

@@ -305,8 +305,9 @@ than replacing the whole construct with a boxed any-value:
   …) is a test-runner directive, not a runtime gate object. The generated
   runner carries out the supported gates; because `skipIf`/`skipUnless`
   conditions are currently read when the runner reaches a test, a
-  module-level rebinding after the decorated class is a loud conversion
-  error rather than a silent timing difference (#521).
+  module-level rebinding between the decorated class and the runner call
+  is a loud conversion error (#521). Potential writes through `global`
+  declarations in available functions are conservatively refused too.
 - **`csv.writer(lineterminator=...)` (#369)** — the writer stays a plain
   `struct Writer { file, lineterminator }` with `impl`s; the one dynamic
   knob Python's constructor accepts is threaded as a `String` value

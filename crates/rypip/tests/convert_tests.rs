@@ -25176,3 +25176,48 @@ fn pytest_module_value_aliases_are_refused_before_the_runner_is_lost() {
         assert!(message.contains("app.py") && message.contains("python -m pytest"), "{message}");
     }
 }
+
+#[test]
+fn unittest_skip_gate_helper_and_walrus_rebinding_are_refused() {
+    let scratch = Scratch::new("tcgate-indirect-rebind");
+    // Verified against python3. Each reports one skipped test, empty
+    // stdout and exit 0. Re-evaluating either condition would run the body.
+    for (name, source) in [
+        ("gatehelper", include_str!("fixtures/gate_rebind_helper.py")),
+        ("gatewalrus", include_str!("fixtures/gate_rebind_walrus.py")),
+    ] {
+        let error = package_convert_err(&scratch, name, &[("cli.py", source)]);
+        let python = Command::new("python3")
+            .arg(scratch.path().join(name).join("cli.py"))
+            .env("PYTHONHASHSEED", "0").env("PYTHONDONTWRITEBYTECODE", "1")
+            .output().unwrap();
+        assert_eq!(python.status.code(), Some(0), "{python:?}");
+        assert!(python.stdout.is_empty(), "{python:?}");
+        let report = String::from_utf8(python.stderr).unwrap();
+        assert!(report.starts_with("s\n----------------------------------------------------------------------\nRan 1 test in ")
+            && report.ends_with("\n\nOK (skipped=1)\n"), "{report:?}");
+        assert!(error.contains("condition `FLAG`") && error.contains("rebound at line")
+            && error.contains("refuses to silently evaluate"), "{error}");
+    }
+}
+
+#[test]
+fn unittest_skip_gate_on_overridden_ancestor_method_is_unused() {
+    let (stdout, stderr, code) = unittest_run("ut_gate_override",
+        include_str!("fixtures/gate_override.py"));
+    // Verified against python3. Base is removed from discovery; Child's
+    // override is the only selected test, so Base's method gate is unused.
+    assert_eq!(stdout, "child\n");
+    assert_eq!(stderr, ".\n----------------------------------------------------------------------\nRan 1 test in T\n\nOK");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn unittest_skip_gate_rebinding_after_exit_false_is_harmless() {
+    let (stdout, stderr, code) = unittest_run("ut_gate_postrun",
+        include_str!("fixtures/gate_postrun.py"));
+    // Verified against python3. The write runs after the completed test.
+    assert_eq!(stdout, "finished\n");
+    assert_eq!(stderr, "s\n----------------------------------------------------------------------\nRan 1 test in T\n\nOK (skipped=1)");
+    assert_eq!(code, 0);
+}
