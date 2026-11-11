@@ -9095,6 +9095,8 @@ pub use stdlib::bisect;
 pub use stdlib::copy;
 pub use stdlib::textwrap;
 pub use stdlib::hashlib;
+#[cfg(feature = "zlib")]
+pub use stdlib::zlib;
 pub use stdlib::csv;
 #[cfg(feature = "std")]
 pub use stdlib::unittest;
