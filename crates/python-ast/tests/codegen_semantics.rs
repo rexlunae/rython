@@ -31348,3 +31348,9 @@ fn pytest_operand_preflight_respects_the_stack_budget() {
     assert!(run(2000).unwrap_err().contains("nests too deeply"));
     assert_eq!(run(3), Ok(()));
 }
+
+#[test]
+fn only_known_unittest_fixture_names_allow_non_snake_case() {
+    let rust = compile("class C:\n    def calculateTotal(self) -> int:\n        return 1\n", "fixture_lints");
+    assert!(!rust.contains("#[allow(non_snake_case)]"), "{rust}");
+}

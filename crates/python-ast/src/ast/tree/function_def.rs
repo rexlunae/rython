@@ -4359,7 +4359,7 @@ impl FunctionDef {
         let method_name_lint = if matches!(
             &ctx,
             CodeGenContext::Class(_) | CodeGenContext::Trait { .. }
-        ) && matches!(self.name.as_str(), "setUpClass" | "tearDownClass" | "setUp" | "tearDown") {
+        ) && super::testcase::Fixture::from_name(&self.name).is_some() {
             // Compiler-known unittest hooks retain their Python spelling.
             quote!(#[allow(non_snake_case)])
         } else {

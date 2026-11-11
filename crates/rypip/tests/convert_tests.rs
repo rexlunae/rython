@@ -25323,3 +25323,23 @@ fn pytest_module_value_aliases_are_refused_before_the_runner_is_lost() {
         assert!(message.contains("app.py") && message.contains("python -m pytest"), "{message}");
     }
 }
+
+#[test]
+fn unittest_adjacent_class_aliases_share_fixture_interval() {
+    let (stdout, stderr, code) = unittest_run("ut_fixture_alias",
+        include_str!("fixtures/class_fixture_alias.py"));
+    // Verified against python3.
+    assert_eq!(stdout, "setup\ntest\ntest\nteardown\n");
+    assert_eq!(stderr, "..\n----------------------------------------------------------------------\nRan 2 tests in T\n\nOK");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn unittest_class_fixture_assertions_are_errors_and_failed_alias_setup_is_not_repeated() {
+    let (stdout, stderr, code) = unittest_run("ut_fixture_assertions",
+        include_str!("fixtures/class_fixture_assertions.py"));
+    // Verified against python3; source traceback frames are the §12 model boundary.
+    assert_eq!(stdout, "setup assertion\ntest\nteardown assertion\n");
+    assert_eq!(stderr, "E.E\n======================================================================\nERROR: setUpClass (__main__.A)\n----------------------------------------------------------------------\nTraceback (most recent call last):\nAssertionError: setup broken\n\n======================================================================\nERROR: tearDownClass (__main__.B)\n----------------------------------------------------------------------\nTraceback (most recent call last):\nAssertionError: teardown broken\n\n----------------------------------------------------------------------\nRan 1 test in T\n\nFAILED (errors=2)");
+    assert_eq!(code, 1);
+}

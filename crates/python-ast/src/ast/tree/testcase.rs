@@ -9,6 +9,27 @@ use super::{
 };
 use crate::{ClassDef, ExprType, FunctionDef, PythonOptions, StatementType, SymbolTableScopes};
 
+/// The Python-spelled unittest hooks emitted as Rust methods.
+#[derive(Clone, Copy)]
+pub(crate) enum Fixture {
+    Setup,
+    Teardown,
+    ClassSetup,
+    ClassTeardown,
+}
+
+impl Fixture {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "setUp" => Some(Self::Setup),
+            "tearDown" => Some(Self::Teardown),
+            "setUpClass" => Some(Self::ClassSetup),
+            "tearDownClass" => Some(Self::ClassTeardown),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Member {
     Constructor,

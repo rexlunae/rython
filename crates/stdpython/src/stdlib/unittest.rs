@@ -613,7 +613,7 @@ impl TextTestResult {
     /// include the error holder in the `Ran N tests` count.
     pub fn add_class_error(&mut self, description: &str, e: &PyException) {
         let traceback = alloc::format!(
-            "Traceback (most recent call last):\n{}",
+            "Traceback (most recent call last):\n{}\n",
             e.format_exception_only()
         );
         self.errors.push((description.into(), traceback));
