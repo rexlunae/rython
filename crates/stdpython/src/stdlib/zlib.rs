@@ -75,12 +75,26 @@ enum Framing {
     Either,
 }
 
+/// The framing `wbits` selects for compressing.
 fn framing(wbits: i64) -> Option<Framing> {
     Some(match wbits {
         9..=15 => Framing::Zlib,
         -15..=-9 => Framing::Raw,
         25..=31 => Framing::Gzip,
-        40..=47 => Framing::Either,
+        _ => return None,
+    })
+}
+
+/// The framing `wbits` selects for inflating, and the largest window a
+/// zlib header may declare (`None`: whatever it declares, for 0).
+fn inflate_framing(wbits: i64) -> Option<(Framing, Option<u8>)> {
+    Some(match wbits {
+        0 => (Framing::Zlib, None),
+        8..=15 => (Framing::Zlib, Some(wbits as u8)),
+        -15..=-8 => (Framing::Raw, None),
+        16 | 24..=31 => (Framing::Gzip, None),
+        32 => (Framing::Either, None),
+        40..=47 => (Framing::Either, Some((wbits - 32) as u8)),
         _ => return None,
     })
 }
@@ -104,9 +118,8 @@ pub fn compress(data: &[u8], level: i64, wbits: i64) -> Result<Vec<u8>, PyExcept
     }
     // zlib refuses the inflate-only framings and anything else with the
     // same message it gives a bad level.
-    let framing = match framing(wbits) {
-        Some(Framing::Either) | None => return Err(error("Bad compression level")),
-        Some(f) => f,
+    let Some(framing) = framing(wbits) else {
+        return Err(error("Bad compression level"));
     };
     let level = if level < 0 { 6 } else { level as u8 };
     let body = compress_to_vec(data, level);
@@ -154,7 +167,7 @@ pub fn decompress(data: &[u8], wbits: i64) -> Result<Vec<u8>, PyException> {
 /// The first stream of `data`, framed as `wbits` says, inflated and
 /// checked; and how many bytes of `data` it took, its trailer included.
 pub fn decompress_stream(data: &[u8], wbits: i64) -> Result<(Vec<u8>, usize), PyException> {
-    let Some(framing) = framing(wbits) else {
+    let Some((framing, window)) = inflate_framing(wbits) else {
         return Err(error(
             "Error -2 while preparing to decompress data: inconsistent stream state",
         ));
@@ -165,28 +178,9 @@ pub fn decompress_stream(data: &[u8], wbits: i64) -> Result<(Vec<u8>, usize), Py
         (Framing::Zlib, _) | (Framing::Either, false) => Some(false),
     };
     let start = match gzip {
-        None => Some(0),
-        Some(true) => {
-            if data.len() < 10 {
-                return Err(truncated());
-            }
-            gzip_body(data)
-        }
-        Some(false) => match data.get(..2) {
-            None => return Err(truncated()),
-            Some(&[cmf, flg])
-                if cmf & 0x0f == 8 && (u16::from(cmf) << 8 | u16::from(flg)) % 31 == 0 =>
-            {
-                if flg & 0x20 != 0 {
-                    return Err(error("Error 2 while decompressing data"));
-                }
-                Some(2)
-            }
-            _ => None,
-        },
-    };
-    let Some(start) = start else {
-        return Err(corrupt("incorrect header check"));
+        None => 0,
+        Some(true) => gzip_body(data)?,
+        Some(false) => zlib_body(data, window)?,
     };
     let (out, taken) = match inflate(&data[start..]) {
         Ok(inflated) => inflated,
@@ -218,27 +212,70 @@ pub fn decompress_stream(data: &[u8], wbits: i64) -> Result<(Vec<u8>, usize), Py
     Ok((out, start + taken + wanted))
 }
 
+/// Where the deflate stream of zlib-framed `data` starts, its header
+/// checked as zlib checks it: the check bits, the method, the window it
+/// declares against `window`, and no preset dictionary.
+fn zlib_body(data: &[u8], window: Option<u8>) -> Result<usize, PyException> {
+    let &[cmf, flg, ..] = data else {
+        return Err(truncated());
+    };
+    if (u16::from(cmf) << 8 | u16::from(flg)) % 31 != 0 {
+        return Err(corrupt("incorrect header check"));
+    }
+    if cmf & 0x0f != 8 {
+        return Err(corrupt("unknown compression method"));
+    }
+    let declared = (cmf >> 4) + 8;
+    if declared > 15 || declared > window.unwrap_or(15) {
+        return Err(corrupt("invalid window size"));
+    }
+    if flg & 0x20 != 0 {
+        // zlib's Z_NEED_DICT: no preset dictionary is given here.
+        return Err(error("Error 2 while decompressing data"));
+    }
+    Ok(2)
+}
+
 /// Where the deflate stream of gzip-framed `data` starts, past the
-/// optional extra field, name, comment and header CRC.
-fn gzip_body(data: &[u8]) -> Option<usize> {
+/// optional extra field, name, comment and header CRC, with the header
+/// checked as zlib checks it. A header cut short is a truncated stream.
+fn gzip_body(data: &[u8]) -> Result<usize, PyException> {
+    if data.len() >= 2 && data[..2] != [0x1f, 0x8b] {
+        return Err(corrupt("incorrect header check"));
+    }
+    if data.len() < 10 {
+        return Err(truncated());
+    }
     if data[2] != 8 {
-        return None;
+        return Err(corrupt("unknown compression method"));
     }
     let flags = data[3];
+    if flags & 0xe0 != 0 {
+        return Err(corrupt("unknown header flags set"));
+    }
     let mut at = 10;
     if flags & 4 != 0 {
-        let extra = usize::from(u16::from_le_bytes([*data.get(at)?, *data.get(at + 1)?]));
-        at += 2 + extra;
+        let length = data.get(at..at + 2).ok_or_else(truncated)?;
+        at += 2 + usize::from(u16::from_le_bytes([length[0], length[1]]));
+        if at > data.len() {
+            return Err(truncated());
+        }
     }
     for bit in [8, 16] {
         if flags & bit != 0 {
-            at += data.get(at..)?.iter().position(|&b| b == 0)? + 1;
+            let end = data[at..].iter().position(|&b| b == 0).ok_or_else(truncated)?;
+            at += end + 1;
         }
     }
     if flags & 2 != 0 {
+        let stored = data.get(at..at + 2).ok_or_else(truncated)?;
+        let wanted = (crc32(&data[..at], 0) & 0xffff) as u16;
+        if u16::from_le_bytes([stored[0], stored[1]]) != wanted {
+            return Err(corrupt("header crc mismatch"));
+        }
         at += 2;
     }
-    Some(at)
+    Ok(at)
 }
 
 /// The deflate stream at the start of `input` inflated, and how many
@@ -282,7 +319,7 @@ pub struct Decompress {
 
 /// `zlib.decompressobj(wbits)`.
 pub fn decompressobj(wbits: i64) -> Result<Decompress, PyException> {
-    if framing(wbits).is_none() {
+    if inflate_framing(wbits).is_none() {
         return Err(PyException::new("ValueError", "Invalid initialization option"));
     }
     Ok(Decompress {
@@ -400,6 +437,85 @@ mod tests {
         assert!(!d.eof);
         assert_eq!(d.decompress(&stream[4..]).unwrap(), b"abc");
         assert_eq!(d.unused_data, b"tail");
+        assert!(d.eof);
+    }
+
+    #[test]
+    fn headers_are_checked_as_zlib_checks_them() {
+        let message = |r: Result<Vec<u8>, PyException>| r.unwrap_err().message;
+        let gzip = compress(b"hello", 6, 31).unwrap();
+        let with = |at: usize, byte: u8| {
+            let mut d = gzip.clone();
+            d[at] = byte;
+            d
+        };
+        let corrupt = |what: &str| alloc::format!("Error -3 while decompressing data: {what}");
+        let short = "Error -5 while decompressing data: incomplete or truncated stream";
+        assert_eq!(message(decompress(&with(3, 0xe0), 31)), corrupt("unknown header flags set"));
+        assert_eq!(message(decompress(&with(1, 0x8c), 31)), corrupt("incorrect header check"));
+        assert_eq!(message(decompress(&with(2, 7), 31)), corrupt("unknown compression method"));
+        // A header CRC: the right one passes, a wrong one is refused.
+        let mut header = gzip[..10].to_vec();
+        header[3] |= 2;
+        let crc = (crc32(&header, 0) & 0xffff) as u16;
+        for (stored, ok) in [(crc, true), (crc ^ 1, false)] {
+            let mut d = header.clone();
+            d.extend(stored.to_le_bytes());
+            d.extend(&gzip[10..]);
+            match decompress(&d, 31) {
+                Ok(out) => assert!(ok && out == b"hello"),
+                Err(e) => assert!(!ok && e.message == corrupt("header crc mismatch")),
+            }
+        }
+        // Optional fields cut short are a truncated stream, not a panic.
+        let mut extra = with(3, 4)[..10].to_vec();
+        extra.extend([0xff, 0xff]);
+        assert_eq!(message(decompress(&extra, 31)), short);
+        let mut name = with(3, 8)[..10].to_vec();
+        name.extend(b"nam");
+        assert_eq!(message(decompress(&name, 31)), short);
+        // A zlib header declaring a larger window than wbits allows, or
+        // one larger than 32K.
+        let zlib = compress(b"hello", 6, 15).unwrap();
+        assert_eq!(message(decompress(&zlib, 9)), corrupt("invalid window size"));
+        let mut big = zlib.clone();
+        big[0] = 0x88;
+        big[1] = 0x98;
+        assert_eq!(message(decompress(&big, 0)), corrupt("invalid window size"));
+        // A preset dictionary is asked for.
+        assert_eq!(
+            message(decompress(&[0x78, 0x3f, 0, 0, 0, 1], 15)),
+            "Error 2 while decompressing data"
+        );
+    }
+
+    #[test]
+    fn every_inflate_window_mode() {
+        let zlib = compress(b"hello", 6, 15).unwrap();
+        let raw = compress(b"hello", 6, -15).unwrap();
+        let gzip = compress(b"hello", 6, 31).unwrap();
+        for (data, wbits) in [(&zlib, 0), (&raw, -8), (&gzip, 16), (&gzip, 24), (&zlib, 32), (&gzip, 32)] {
+            assert_eq!(decompress(data, wbits).unwrap(), b"hello", "wbits {wbits}");
+        }
+        for wbits in [7, -7, 17, 23, 33, 39, 48] {
+            assert_eq!(
+                decompress(&zlib, wbits).unwrap_err().message,
+                "Error -2 while preparing to decompress data: inconsistent stream state"
+            );
+        }
+        assert_eq!(decompressobj(99).unwrap_err().exception_type, "ValueError");
+    }
+
+    #[test]
+    fn decompressobj_waits_for_a_split_name() {
+        let gzip = compress(b"hello", 6, 31).unwrap();
+        let mut data = gzip[..10].to_vec();
+        data[3] = 8;
+        data.extend(b"name\0");
+        data.extend(&gzip[10..]);
+        let mut d = decompressobj(31).unwrap();
+        assert_eq!(d.decompress(&data[..12]).unwrap(), b"");
+        assert_eq!(d.decompress(&data[12..]).unwrap(), b"hello");
         assert!(d.eof);
     }
 
