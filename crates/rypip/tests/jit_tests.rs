@@ -458,6 +458,7 @@ fn an_untrusted_cache_entry_is_rebuilt_never_loaded() {
     let source = "def half(x: float) -> float:\n    return x / 2\n";
     let module = jit.compile("halves", source).expect("compiling halves");
     let entry = module.library_path().parent().unwrap().to_path_buf();
+    let pinned = fs::read(entry.join("crate/Cargo.lock")).unwrap();
     // A record whose size no longer matches its library.
     let record = entry.join("entry");
     let text = fs::read_to_string(&record).unwrap();
@@ -469,6 +470,7 @@ fn an_untrusted_cache_entry_is_rebuilt_never_loaded() {
     fs::write(&record, corrupted).unwrap();
     let rebuilt = jit.compile("halves", source).expect("rebuilding halves");
     assert_eq!(rebuilt.cache_outcome(), CacheOutcome::Built);
+    assert_eq!(fs::read(entry.join("crate/Cargo.lock")).unwrap(), pinned);
     assert_ne!(rebuilt.library_path(), module.library_path());
     assert_eq!(rebuilt.call_as::<f64>("half", &[Value::Float(3.0)]).unwrap(), 1.5);
     // And the rebuilt entry is trusted again.
@@ -491,6 +493,14 @@ fn an_untrusted_cache_entry_is_rebuilt_never_loaded() {
 fn cache_hits_cannot_bypass_incompatible_conversion_options() {
     let source = "def value() -> int:\n    return 1\n";
     jit().compile("option_validation", source).unwrap();
+    for options in [
+        ConvertOptions { no_deps: true, ..Default::default() },
+        ConvertOptions { cdylib: Some(rypip::convert::CdylibTarget { module_name: "overridden".into() }), ..Default::default() },
+    ] {
+        let equivalent = rypip::jit::new_jit(options, Some(&cache_dir())).unwrap();
+        assert_eq!(equivalent.compile("option_validation", source).unwrap().cache_outcome(), CacheOutcome::Hit);
+        assert_eq!(equivalent.builds(), 0);
+    }
     for options in [
         ConvertOptions { no_std: true, ..Default::default() },
         ConvertOptions { pyo3: true, ..Default::default() },

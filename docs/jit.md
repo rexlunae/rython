@@ -439,9 +439,11 @@ release profile. An entry is loaded only when its record's key text matches
 exactly, its artifact has the recorded size and SHA-256, and its generated
 Cargo.lock has the recorded SHA-256. The compiler build identity also
 includes the workspace lockfile and compiler/runtime manifests. Each entry
-pins the dependency versions Cargo resolved on its first build; a newly
+pins the dependency versions Cargo resolved on its first build, retaining
+the exact lockfile through artifact rebuilds; a newly
 published registry release does not update that entry. Use `--clear-cache`
-to resolve dependencies again. A changed or missing lockfile, a mismatch, or a library
+to resolve dependencies again. Explicitly editing or removing that lockfile
+invalidates those pins. A changed or missing lockfile, a mismatch, or a library
 that will not load or reports another boundary version, is reported on
 stderr ("cannot be trusted ... rebuilding it") and rebuilt — never loaded
 on trust. A hit runs neither the converter nor cargo (pinned with a

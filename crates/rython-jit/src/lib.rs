@@ -82,8 +82,9 @@ pub trait Compiler: Send + Sync {
     /// of the cache key.
     fn fingerprint(&self) -> Result<String, JitError>;
 
-    /// Convert `module` into a `cdylib` crate in the empty directory
-    /// `crate_dir` (the converter's cdylib mode). A refusal is
+    /// Convert `module` into a `cdylib` crate in `crate_dir`, which has no
+    /// sources but may retain a Cargo.lock from an earlier build. Preserve
+    /// that lockfile (the entry's dependency pins). A refusal is
     /// [`JitError::Conversion`] with the converter's message verbatim.
     fn convert(&self, module: &SourceModule<'_>, crate_dir: &Path) -> Result<Converted, JitError>;
 

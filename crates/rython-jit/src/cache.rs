@@ -444,8 +444,9 @@ pub fn install_artifact(entry: &Entry, built: &Path) -> Result<PathBuf, JitError
     Ok(dest)
 }
 
-/// Start an entry's build from nothing: remove the previous crate and any
-/// artifact no record names (a library loaded from one stays mapped).
+/// Regenerate an entry while retaining its dependency pins. Remove the
+/// previous source and artifacts (loaded libraries stay mapped), but keep
+/// Cargo.lock so artifact corruption cannot silently upgrade dependencies.
 pub fn reset_entry(entry: &Entry) -> Result<(), JitError> {
     #[cfg(unix)]
     {
@@ -457,9 +458,19 @@ pub fn reset_entry(entry: &Entry) -> Result<(), JitError> {
             .map_err(|e| JitError::Environment(format!("creating {}: {}", entry.dir.display(), e)))?;
     }
     let crate_dir = entry.crate_dir();
+    let pinned = match fs::read(crate_dir.join("Cargo.lock")) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(JitError::Environment(format!("reading dependency pins: {e}"))),
+    };
     if crate_dir.exists() {
         fs::remove_dir_all(&crate_dir)
             .map_err(|e| JitError::Environment(format!("removing {}: {}", crate_dir.display(), e)))?;
+    }
+    if let Some(pinned) = pinned {
+        fs::create_dir_all(&crate_dir)
+            .and_then(|_| fs::write(crate_dir.join("Cargo.lock"), pinned))
+            .map_err(|e| JitError::Environment(format!("retaining dependency pins: {e}")))?;
     }
     if let Ok(read) = fs::read_dir(&entry.dir) {
         for item in read.flatten() {
@@ -476,6 +487,14 @@ pub fn reset_entry(entry: &Entry) -> Result<(), JitError> {
 /// Remove the whole cache: every entry and the shared target directory
 /// (`rypip jit --clear-cache`). Libraries already loaded stay mapped.
 pub fn clear(root: &Path) -> Result<(), JitError> {
+    // A missing root is already empty. This is the operation's
+    // linearization point: a subsequent concurrent creator owns new work.
+    if let Err(e) = fs::symlink_metadata(root) {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(JitError::Environment(format!("checking the JIT cache: {e}")));
+    }
     #[cfg(unix)]
     let _guard = {
         ensure_private_dir(root)?;
@@ -571,5 +590,30 @@ mod tests {
         fs::write(&artifact, b"trusted").unwrap();
         fs::write(entry.crate_dir().join("Cargo.lock"), "different dependency graph").unwrap();
         assert!(read_record(&entry, &key).unwrap_err().contains("Cargo.lock"));
+    }
+
+    #[test]
+    fn regeneration_retains_the_exact_dependency_lockfile() {
+        let scratch = Scratch::new();
+        let key = Key::new("example", "", "compiler", "rustc");
+        let entry = Entry::new(&scratch.0, &key);
+        fs::create_dir_all(entry.crate_dir()).unwrap();
+        let pinned = b"# an existing exact dependency resolution\n";
+        fs::write(entry.crate_dir().join("Cargo.lock"), pinned).unwrap();
+        fs::write(entry.crate_dir().join("old-source.rs"), b"old").unwrap();
+        reset_entry(&entry).unwrap();
+        assert_eq!(fs::read(entry.crate_dir().join("Cargo.lock")).unwrap(), pinned);
+        assert!(!entry.crate_dir().join("old-source.rs").exists());
+    }
+
+    #[test]
+    fn clearing_an_absent_cache_under_a_read_only_parent_is_a_noop() {
+        let scratch = Scratch::new();
+        fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = clear(&scratch.0.join("missing/rython/jit"));
+        fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+        assert!(!scratch.0.join("missing").exists());
+        assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 }

@@ -34,6 +34,13 @@ impl RypipCompiler {
     pub fn new(options: ConvertOptions) -> RypipCompiler {
         RypipCompiler { options }
     }
+
+    fn effective_options(&self, module_name: &str) -> ConvertOptions {
+        let mut options = self.options.clone();
+        options.cdylib = Some(CdylibTarget { module_name: module_name.to_string() });
+        options.no_deps = true;
+        options
+    }
 }
 
 /// A JIT using rypip's compiler with `options`, caching in `cache_dir`
@@ -64,7 +71,7 @@ impl Compiler for RypipCompiler {
             CONVERTER_BUILD,
             python_ast::python_version().replace('\n', " "),
             stdpython,
-            self.options,
+            self.effective_options(""), // The actual module name is a separate key field.
         ))
     }
 
@@ -94,11 +101,7 @@ impl Compiler for RypipCompiler {
             }],
             dependencies: Vec::new(),
         };
-        let mut options = self.options.clone();
-        options.cdylib = Some(CdylibTarget {
-            module_name: module.name.to_string(),
-        });
-        options.no_deps = true;
+        let options = self.effective_options(module.name);
         let krate = convert(&package, crate_dir, &options).map_err(|e| JitError::Conversion(format!("{:#}", e)))?;
         Ok(Converted {
             crate_name: krate.name,
