@@ -169,15 +169,17 @@ feature that `rypip` enables automatically), and more.
 
 `unittest.TestCase` fields may first be assigned in a test method, without
 `__init__` or `setUp`. The runner creates a fresh instance per test and
-discovers inherited tests and fixtures. Reads must follow an assignment on
-every path, or an unconditional `setUp` initialization; uncertain attribute
-presence, receiver escapes, and field reads relying on another test or an
-opaque helper are conversion errors. Manual construction of cases with
-fields is refused; use `unittest.main()` to preserve fixture order
-(issues #480, #511).
+discovers inherited tests and per-test fixtures. Direct `setUpClass` and
+`tearDownClass` class fixtures run once around each class's tests. Inherited
+class fixtures and unsupported signatures are refused. Reads must follow an
+assignment on every path, or an unconditional `setUp` initialization;
+uncertain attribute presence, receiver escapes, and field reads relying on
+another test or an opaque helper are conversion errors. Manual construction
+of cases with fields is refused; use `unittest.main()` to preserve fixture
+order (issues #480, #511, #526).
 `with self.subTest(name=value):` records each failure with its named context
 and continues the test method. Positional messages, `msg=`, `**kwargs`,
-unmodeled context-value reprs, `as` targets, additional context managers,
+mutable or unmodeled context-value reprs, `as` targets, additional context managers,
 and control transfers out of a subtest body are refused (issue #525).
 `with self.assertRaises(E) as cm:` catches the expected exception and
 supports reading `cm.exception` after the block; other uses of the context

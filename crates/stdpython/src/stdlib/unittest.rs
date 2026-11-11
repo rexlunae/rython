@@ -66,12 +66,20 @@ where
     };
 
     let result = run();
+    let mut stop_method = false;
     SUBTEST_STATE.with(|state| {
         let mut state = state.borrow_mut();
         if let Some(active) = state.as_mut() {
             let context = format_subtest_context(&active.context);
             active.context = previous_context;
             if let Err(exception) = result {
+                // Nested contexts propagate unittest's private stop signal,
+                // without recording a second failure for the outer context.
+                if active.expecting_failure && exception.exception_type == "_ShouldStop" {
+                    stop_method = true;
+                    return;
+                }
+                stop_method = active.expecting_failure;
                 if !active.expecting_failure {
                     status_char(
                         if exception.matches_builtin(
@@ -87,7 +95,27 @@ where
             }
         }
     });
-    Ok(())
+    if stop_method {
+        // CPython uses _ShouldStop(Exception), not the user's AssertionError:
+        // finally runs, but an except AssertionError cannot resume the method.
+        Err(PyException::new("_ShouldStop", ""))
+    } else {
+        Ok(())
+    }
+}
+
+fn subtest_description(description: &str, context: &str) -> alloc::string::String {
+    let (identifier, doc) = description.split_once('\n').unwrap_or((description, ""));
+    let mut result = if context.is_empty() {
+        identifier.to_string()
+    } else {
+        alloc::format!("{identifier} {context}")
+    };
+    if !doc.is_empty() {
+        result.push('\n');
+        result.push_str(doc);
+    }
+    result
 }
 
 fn begin_subtests() -> Option<SubtestState> {
@@ -716,6 +744,18 @@ impl TextTestResult {
         status_char('s');
     }
 
+    /// Record a `setUpClass` or `tearDownClass` error as unittest's
+    /// synthetic class-fixture error. CPython prints its status but does not
+    /// include the error holder in the `Ran N tests` count.
+    pub fn add_class_error(&mut self, description: &str, e: &PyException) {
+        let traceback = alloc::format!(
+            "Traceback (most recent call last):\n{}\n",
+            e.format_exception_only()
+        );
+        self.errors.push((description.into(), traceback));
+        status_char('E');
+    }
+
     /// Run one test the way `TestCase.run` does: `setUp`, then the test
     /// (only when `setUp` succeeded), then `tearDown` (likewise). Every
     /// part's exception is reported — a failure when it is
@@ -737,11 +777,7 @@ impl TextTestResult {
         let setup_result = set_up(case);
         let setup_subtest_failures = take_subtest_failures();
         for (context, exception) in &setup_subtest_failures {
-            let subtest_description = if context.is_empty() {
-                description.to_string()
-            } else {
-                alloc::format!("{description} {context}")
-            };
+            let subtest_description = subtest_description(description, &context);
             self.record_exception(&subtest_description, exception);
         }
         if let Err(e) = setup_result {
@@ -749,7 +785,11 @@ impl TextTestResult {
             self.add_exception(description, &e);
             return;
         }
-        let mut success = setup_subtest_failures.is_empty();
+        if !setup_subtest_failures.is_empty() {
+            finish_subtests(previous_subtests);
+            return;
+        }
+        let mut success = true;
         let mut expected_failure = false;
         expect_subtest_failure(expecting_failure);
         let test_result = test(case);
@@ -761,11 +801,7 @@ impl TextTestResult {
             } else {
                 success = false;
                 for (context, exception) in subtest_failures {
-                    let subtest_description = if context.is_empty() {
-                        description.to_string()
-                    } else {
-                        alloc::format!("{description} {context}")
-                    };
+                    let subtest_description = subtest_description(description, &context);
                     self.record_exception(&subtest_description, &exception);
                 }
             }
@@ -780,11 +816,7 @@ impl TextTestResult {
         }
         let tear_down_result = tear_down(case);
         for (context, exception) in take_subtest_failures() {
-            let subtest_description = if context.is_empty() {
-                description.to_string()
-            } else {
-                alloc::format!("{description} {context}")
-            };
+            let subtest_description = subtest_description(description, &context);
             success = false;
             self.record_exception(&subtest_description, &exception);
         }

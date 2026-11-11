@@ -96,6 +96,15 @@ if __name__ == "__main__":
 `rypip convert` → `cargo build` → run: exit 0, matching `python3` exit 0.
 Adding a failing test (`self.assertEqual(1, 2)`) makes both exit 1.
 
+Direct `setUpClass` and `tearDownClass` fixtures run once
+around a class's tests. A class skip suppresses both fixtures; a setup
+exception is reported as unittest's synthetic class-fixture error and
+suppresses that class's tests and teardown; a teardown exception is
+reported after the tests. The supported class-fixture signatures are a
+single class parameter for `@classmethod`, or no parameters for
+`@staticmethod`. Inherited class fixtures and other signatures are
+conversion errors rather than silently omitted behavior (issue #526).
+
 Test methods may create fields directly (`self.total = 3` followed by
 `self.assertEqual(self.total, 3)`), including when the class has no
 `__init__` or `setUp` (issue #480). The runner follows the MRO for
@@ -133,6 +142,7 @@ the #457, #480 and #482 pins below update the affected rows:
 | `assertIn` (list) | yes | yes | yes | pass/fail outcome yes |
 | `assertTrue` | yes | yes | yes | pass/fail outcome yes |
 | `setUp` fixture | yes | yes | yes | yes |
+| `setUpClass` / `tearDownClass` | yes | yes | yes | yes (issue #526) |
 | `with self.assertRaises(E): f()` | yes | yes | yes | yes |
 | `with self.assertRaises(E): raise E(...)` | yes | yes | yes | yes (#457) |
 | `with self.assertRaises(E) as cm: raise E(...); cm.exception` | yes | yes | yes | yes (#523) |
@@ -169,8 +179,10 @@ so a block keeps the header and the final exception line (the model limit
 a thread's unhandled exception already has; `docs/spec.md` §12.3). The
 runtime half is `stdpython::unittest::TextTestResult`: status characters
 `.` `F` `E` `s` `x` `u`; `setUp`/`tearDown` exceptions reported against
-the test as `TestCase.run` reports them; an `AssertionError` is a FAIL and
-anything else an ERROR; a test's docstring's first line under its name;
+the test as `TestCase.run` reports them and class-fixture exceptions as
+synthetic class-fixture errors (their status is printed but they do not
+increment `Ran N`); an `AssertionError` is a FAIL and anything else an
+ERROR; a test's docstring's first line under its name;
 the exit status 1 for an unsuccessful run, 5 when no test ran, 0
 otherwise. `unittest.main(exit=False)` prints the report and returns to
 the caller; any other argument (`verbosity=`, `argv=`, ...) is refused at

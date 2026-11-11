@@ -31372,3 +31372,17 @@ fn pytest_operand_preflight_respects_the_stack_budget() {
     assert!(run(2000).unwrap_err().contains("nests too deeply"));
     assert_eq!(run(3), Ok(()));
 }
+
+#[test]
+fn only_known_unittest_fixture_names_allow_non_snake_case() {
+    let rust = compile("class C:\n    def calculateTotal(self) -> int:\n        return 1\n", "fixture_lints");
+    assert!(!rust.contains("#[allow(non_snake_case)]"), "{rust}");
+}
+
+#[test]
+fn unittest_subtest_mutable_context_is_refused() {
+    // Verified against python3: the failure reports (values=[7]), not [].
+    let error = compile_err("import unittest\nclass T(unittest.TestCase):\n    def test_a(self) -> None:\n        values = []\n        with self.subTest(values=values):\n            values.append(7)\n            self.assertEqual(1, 2)\n", "mutable_subtest.py");
+    assert!(error.contains("self.subTest(values=...)") && error.contains("immutable")
+        && error.contains("line 5"), "{error}");
+}

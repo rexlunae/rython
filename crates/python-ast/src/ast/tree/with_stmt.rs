@@ -576,24 +576,14 @@ fn nested_scope_read(name: &str, line: usize, scope: &str) -> String {
     )
 }
 
+/// Only immutable values can be rendered on entry. Containers and boxed
+/// values can change before failure reporting; copying their repr is wrong.
 fn has_subtest_repr(ty: &crate::TypeInfo) -> bool {
     match ty {
-        crate::TypeInfo::Int
-        | crate::TypeInfo::BigInt
-        | crate::TypeInfo::Float
-        | crate::TypeInfo::Bool
-        | crate::TypeInfo::StrRef
-        | crate::TypeInfo::String
-        | crate::TypeInfo::Complex
-        | crate::TypeInfo::PyValue => true,
-        crate::TypeInfo::Vec(inner)
-        | crate::TypeInfo::PyTuple(inner)
-        | crate::TypeInfo::Option(inner)
-        | crate::TypeInfo::PyValueMember(inner)
-        | crate::TypeInfo::Borrowed(inner) => has_subtest_repr(inner),
-        crate::TypeInfo::Dict(key, value) => {
-            has_subtest_repr(key) && has_subtest_repr(value)
-        }
+        crate::TypeInfo::Int | crate::TypeInfo::BigInt | crate::TypeInfo::Float
+        | crate::TypeInfo::Bool | crate::TypeInfo::StrRef | crate::TypeInfo::String
+        | crate::TypeInfo::Complex => true,
+        crate::TypeInfo::Option(inner) | crate::TypeInfo::Borrowed(inner) => has_subtest_repr(inner),
         crate::TypeInfo::Tuple(items) => {
             !items.is_empty() && items.len() <= 8 && items.iter().all(has_subtest_repr)
         }
@@ -783,7 +773,7 @@ impl CodeGen for With {
                 if !has_subtest_repr(&ty) {
                     return Err(format!(
                         "`self.subTest({name}=...)` at line {} has a value without a \
-                         supported Python repr; use a scalar or supported container; \
+                         supported immutable Python repr; use a scalar or immutable tuple; \
                          rython refuses to silently change subtest reporting",
                         keyword.lineno.or(self.lineno).unwrap_or(0)
                     )
