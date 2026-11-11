@@ -9,4 +9,5 @@ class T(unittest.TestCase):
     def test_one(self) -> None:
         print('test')
 Alias = T
-unittest.main()
+if __name__ == "__main__":
+    unittest.main()

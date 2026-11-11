@@ -14,4 +14,5 @@ class B(unittest.TestCase):
         raise AssertionError('teardown broken')
     def test_one(self) -> None:
         print('test')
-unittest.main()
+if __name__ == "__main__":
+    unittest.main()

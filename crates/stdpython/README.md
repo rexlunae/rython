@@ -302,3 +302,7 @@ cargo test test_pylist            # List type tests
 ## License
 
 This project is part of the Rython compiler ecosystem.
+
+The std-tier unittest runner records direct class-fixture exceptions as errors
+(including AssertionError). The compiler preserves one fixture interval across
+adjacent aliases of the same TestCase; inherited class fixtures remain refused.
