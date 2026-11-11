@@ -171,7 +171,9 @@ feature that `rypip` enables automatically), and more.
 `__init__` or `setUp`. The runner creates a fresh instance per test and
 discovers inherited tests and per-test fixtures. Direct `setUpClass` and
 `tearDownClass` class fixtures run once around each class's tests. Inherited
-class fixtures and unsupported signatures are refused. Reads must follow an
+class fixtures and unsupported signatures are refused. Zero-argument `super()`
+calls follow the modeled TestCase MRO, including TestCase's no-op instance
+fixtures; resolved bodies contribute to field-initialization checks (#524). Reads must follow an
 assignment on every path, or an unconditional `setUp` initialization;
 uncertain attribute presence, receiver escapes, and field reads relying on
 another test or an opaque helper are conversion errors. Manual construction
@@ -181,6 +183,9 @@ order (issues #480, #511, #526).
 and continues the test method. Positional messages, `msg=`, `**kwargs`,
 mutable or unmodeled context-value reprs, `as` targets, additional context managers,
 and control transfers out of a subtest body are refused (issue #525).
+`skipIf`/`skipUnless` conditions must stay unchanged between decoration and
+the runner call; direct rebinding and potential writes through `global`
+functions are conversion errors (#521).
 `with self.assertRaises(E) as cm:` catches the expected exception and
 supports reading `cm.exception` after the block; other uses of the context
 object are conversion errors (#523).

@@ -746,7 +746,7 @@ impl CodeGen for With {
                 .into());
             }
             let ExprType::Call(subtest_call) = &self.items[0].context_expr else {
-                unreachable!("is_subtest_cm only matches calls");
+                unreachable!("typed SubTest contexts only match calls");
             };
             if !subtest_call.args.is_empty()
                 || subtest_call

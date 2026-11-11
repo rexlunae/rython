@@ -30,6 +30,10 @@ pub enum CodeGenContext {
         /// ORIGINAL definer's base (not the derived class's base). `None`
         /// when the method belongs to the enclosing class itself.
         super_target: Option<String>,
+        /// TestCase MRO resolution anchor: the concrete class and module
+        /// whose full ancestry determines `super()` targets. The method body
+        /// still renders against its defining module's symbols.
+        testcase_anchor: Option<(String, Vec<String>)>,
         /// Force `&mut self` on the emitted method signature even when the
         /// method's own body does not mutate: the owning trait's signature
         /// widened because SOME definition in the hierarchy mutates, so
@@ -180,6 +184,37 @@ impl CodeGenContext {
             CodeGenContext::Loop { parent, .. }
             | CodeGenContext::TryBlock { parent }
             | CodeGenContext::ExceptHandler { parent } => parent.enclosing_class_name(),
+            _ => None,
+        }
+    }
+
+    /// The ORIGINAL definer of a re-emitted override (see
+    /// `Trait::super_target`), through any loop, try, handler, or async
+    /// context nested in its body: `super()` anywhere in that body
+    /// resolves against the definer's base.
+    pub fn super_target(&self) -> Option<&str> {
+        match self {
+            CodeGenContext::Trait { super_target, .. } => super_target.as_deref(),
+            CodeGenContext::Async(inner) => inner.super_target(),
+            CodeGenContext::Loop { parent, .. }
+            | CodeGenContext::TryBlock { parent }
+            | CodeGenContext::ExceptHandler { parent } => parent.super_target(),
+            _ => None,
+        }
+    }
+
+    /// The concrete TestCase class whose MRO governs `super()` in this body.
+    pub fn testcase_anchor(&self) -> Option<(&str, &[String])> {
+        match self {
+            CodeGenContext::Trait {
+                testcase_anchor, ..
+            } => testcase_anchor
+                .as_ref()
+                .map(|(name, path)| (name.as_str(), path.as_slice())),
+            CodeGenContext::Async(inner) => inner.testcase_anchor(),
+            CodeGenContext::Loop { parent, .. }
+            | CodeGenContext::TryBlock { parent }
+            | CodeGenContext::ExceptHandler { parent } => parent.testcase_anchor(),
             _ => None,
         }
     }
