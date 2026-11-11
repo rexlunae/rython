@@ -2941,6 +2941,9 @@ program entry (run as `__main__`), once per process, never both; packages,
 `rython.toml` manifests, `from rython import rust` path dependencies and
 async program entries are refused. The rest of the contract — the cache,
 its key, the stdout flush rule — is [`jit.md`](jit.md)'s "M1 as built".
+Cache entries pin Cargo's resolved dependency versions until cleared and
+verify both the library content and generated Cargo.lock on every hit.
+Incompatible conversion targets are refused before a cache lookup.
 
 ---
 

@@ -48,15 +48,23 @@ pub fn new_jit(options: ConvertOptions, cache_dir: Option<&Path>) -> Result<Jit,
 
 impl Compiler for RypipCompiler {
     fn fingerprint(&self) -> Result<String, JitError> {
+        if self.options.no_std || self.options.pyo3 || self.options.kernel_module
+            || self.options.driver || self.options.rust_for_linux
+        {
+            return Err(JitError::Unsupported(
+                "the JIT requires the host std cdylib target; no_std, pyo3, kernel_module, \
+                 driver and rust_for_linux options are not supported; use default conversion options".into()
+            ));
+        }
         let stdpython = stdpython_fingerprint(&self.options)
             .map_err(|e| JitError::Environment(format!("locating the stdpython runtime: {:#}", e)))?;
         Ok(format!(
-            "rypip {}\nconverter-build {}\npython {}\nstdpython {}\nwarnings {:?}\n",
+            "rypip {}\nconverter-build {}\npython {}\nstdpython {}\noptions {:?}\n",
             env!("CARGO_PKG_VERSION"),
             CONVERTER_BUILD,
             python_ast::python_version().replace('\n', " "),
             stdpython,
-            self.options.warnings,
+            self.options,
         ))
     }
 
@@ -79,6 +87,7 @@ impl Compiler for RypipCompiler {
             root: module.package_root.to_path_buf(),
             modules: vec![PyModule {
                 path: vec![rust_name],
+                import_path: vec![module.name.to_string()],
                 source: module.source.to_string(),
                 file: module.origin.to_path_buf(),
                 is_init: false,

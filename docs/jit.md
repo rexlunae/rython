@@ -430,19 +430,30 @@ the old one made), the parser's CPython version (`Py_GetVersion`, read
 without starting the interpreter), the stdpython dependency (a registry
 version, or a checkout's path plus every source file's size and mtime, as
 cargo's own freshness check reads them; the feature set follows from the
-source's imports) and the warning mode; `rustc -vV` (run in the cache root,
+source's imports) and every conversion option; `rustc -vV` (run in the cache root,
 so a rustup directory override resolves as it does for the build; it names
 the host triple); the build-affecting environment (`RUSTFLAGS`,
 `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS`, `RUSTC_WRAPPER`,
 `RUSTC_WORKSPACE_WRAPPER`, the `CARGO_PROFILE_RELEASE_*` knobs); and the
 release profile. An entry is loaded only when its record's key text matches
-exactly and its artifact has the recorded size; a mismatch, or a library
+exactly, its artifact has the recorded size and SHA-256, and its generated
+Cargo.lock has the recorded SHA-256. The compiler build identity also
+includes the workspace lockfile and compiler/runtime manifests. Each entry
+pins the dependency versions Cargo resolved on its first build; a newly
+published registry release does not update that entry. Use `--clear-cache`
+to resolve dependencies again. A changed or missing lockfile, a mismatch, or a library
 that will not load or reports another boundary version, is reported on
 stderr ("cannot be trusted ... rebuilding it") and rebuilt — never loaded
 on trust. A hit runs neither the converter nor cargo (pinned with a
 counting compiler); the converter's lossy-conversion warnings are stored
 with the entry and reported on every load, as `rypip run` reports them on
 every run.
+
+All cache ancestors must be directories controlled by this user or root,
+without group/world write access (root-owned sticky `/tmp` is allowed).
+Symlink ancestors are refused. Cache clearing takes an exclusive lock next
+to the root, while readers and builders hold it shared through loading;
+clearing waits for active work and never deletes that lock file.
 
 ### Deviations from the design
 
@@ -495,15 +506,22 @@ every run.
 
 ### Measured latency
 
-On the development machine (32 cores, `CARGO_BUILD_JOBS=6`, rustc 1.98.1,
+Measured on 2026-11-11 on the development machine (32 logical CPUs,
+`CARGO_BUILD_JOBS=2`, `CARGO_NET_OFFLINE=true`, rustc 1.98.1,
 release builds, debug `rypip`), for `rypip jit call calls.py add 2 40`
 (wall clock, median of 5 where repeated):
 
 | Case | Latency |
 |---|---|
-| Cold: empty cache, so `stdpython` (std tier) and its dependencies build | MEASURE_COLD |
-| Cold entry, warm target directory: a source not seen before | MEASURE_ENTRY |
-| Warm: cache hit (`rustc -vV`, key, `dlopen`, call) | MEASURE_WARM |
+| Cold: empty cache, so `stdpython` (std tier) and its dependencies build | 23.958 s (one sample) |
+| Cold entry, warm target directory: a source not seen before | 0.785 s |
+| Warm: cache hit (`rustc -vV`, key, `dlopen`, call) | 51.0 ms |
+
+Raw samples and the input source are in
+[`eval/jit/m1-latency-2026-11-11.json`](../eval/jit/m1-latency-2026-11-11.json).
+Registry downloads were already cached; other workspace test builds were
+active, so these are development-host observations rather than isolated
+performance benchmarks.
 
 The cold number is dominated by the shared target directory's first build
 and is paid once per (stdpython version, features, toolchain); a new source

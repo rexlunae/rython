@@ -151,6 +151,8 @@ impl Jit {
         };
         #[cfg(unix)]
         cache::ensure_private_dir(&root)?;
+        let root = std::fs::canonicalize(&root)
+            .map_err(|e| JitError::Environment(format!("resolving the JIT cache: {e}")))?;
         Ok(Jit {
             compiler: config.compiler,
             root,
@@ -184,6 +186,10 @@ impl Jit {
     }
 
     fn compile_from(&self, name: &str, source: &str, origin: &Path) -> Result<Module, JitError> {
+        #[cfg(unix)]
+        let _root = cache::root_lock(&self.root, false)?;
+        #[cfg(unix)]
+        cache::ensure_private_dir(&self.root)?;
         if name.is_empty() || name.contains(|c: char| c == '/' || c == '\\' || c.is_whitespace() || c == '\0') {
             return Err(JitError::Unsupported(format!(
                 "`{}` is not a module name the JIT can compile (it names the cache entry \

@@ -59,5 +59,17 @@ fn main() {
             hash.write(b"\0absent");
         }
     }
+    // Source-identical compiler builds with different dependency resolutions
+    // must not share generated libraries. Include manifests and lockfiles.
+    for file in ["Cargo.toml", "Cargo.lock", "../../Cargo.toml", "../../Cargo.lock",
+        "../python-ast/Cargo.toml", "../rython-jit/Cargo.toml", "../stdpython/Cargo.toml"]
+    {
+        let path = manifest_dir.join(file);
+        println!("cargo:rerun-if-changed={}", path.display());
+        hash.write(file.as_bytes());
+        if path.is_file() {
+            hash.write(&std::fs::read(&path).expect("reading a build manifest/lockfile"));
+        }
+    }
     println!("cargo:rustc-env=RYPIP_CONVERTER_BUILD={:016x}", hash.0);
 }

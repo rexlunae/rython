@@ -50,6 +50,7 @@ pub fn default_cache_dir() -> Result<PathBuf, JitError> {
 #[cfg(unix)]
 pub fn ensure_private_dir(dir: &Path) -> Result<(), JitError> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    check_ancestors(dir.parent().unwrap_or(dir))?;
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -87,6 +88,50 @@ pub fn ensure_private_dir(dir: &Path) -> Result<(), JitError> {
     Ok(())
 }
 
+/// Every ancestor must be controlled by this user or root. A private leaf
+/// inside somebody else's writable directory is still replaceable. The
+/// root-owned sticky temporary directory protects each user's child names.
+#[cfg(unix)]
+fn check_ancestors(dir: &Path) -> Result<(), JitError> {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::path::absolute(dir)
+        .map_err(|e| JitError::Environment(format!("resolving the cache path: {e}")))?;
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(JitError::Environment("the JIT cache path must not contain `..`".into()));
+    }
+    // SAFETY: geteuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    for ancestor in path.ancestors() {
+        let meta = match fs::symlink_metadata(ancestor) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(JitError::Environment(format!("checking {}: {e}", ancestor.display()))),
+        };
+        let sticky_root = meta.uid() == 0 && meta.mode() & 0o1000 != 0;
+        if !meta.is_dir() || (meta.uid() != me && meta.uid() != 0)
+            || (meta.mode() & 0o022 != 0 && !sticky_root)
+        {
+            return Err(JitError::Environment(format!(
+                "the JIT cache ancestor {} is replaceable by another user or is a symlink; \
+                 use a cache under your own directories with no group/world write permissions",
+                ancestor.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// This lock lives beside the cache, so clearing cannot unlink its inode.
+/// The shared side covers every read, build and dlopen; clearing is exclusive.
+#[cfg(unix)]
+pub fn root_lock(root: &Path, exclusive: bool) -> Result<FileLock, JitError> {
+    let parent = root.parent().ok_or_else(|| JitError::Environment("the cache needs a parent directory".into()))?;
+    check_ancestors(parent)?;
+    let name = root.file_name().ok_or_else(|| JitError::Environment("the filesystem root cannot be a JIT cache".into()))?;
+    let name = format!(".{}.rython-jit.lock", name.to_string_lossy());
+    lock(&parent.join(name), exclusive)
+}
+
 /// An advisory lock on a file, released when dropped (closing the file
 /// releases it too). The same mechanism `rypip run` uses for its work
 /// directories.
@@ -103,12 +148,28 @@ impl Drop for FileLock {
 /// Lock `path` (created if missing): exclusively for a build, shared for
 /// reading an entry.
 pub fn lock(path: &Path, exclusive: bool) -> Result<FileLock, JitError> {
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(path)
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true).truncate(false);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)
         .map_err(|e| JitError::Environment(format!("opening the lock {}: {}", path.display(), e)))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()
+            .map_err(|e| JitError::Environment(format!("checking lock {}: {e}", path.display())))?;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if !meta.is_file() || meta.uid() != me || meta.mode() & 0o022 != 0 {
+            return Err(JitError::Environment(format!(
+                "the JIT lock {} must be a regular file owned by you and not writable by others",
+                path.display()
+            )));
+        }
+    }
     let locked = if exclusive { file.lock() } else { file.lock_shared() };
     locked.map_err(|e| JitError::Environment(format!("locking {}: {}", path.display(), e)))?;
     Ok(FileLock { file })
@@ -228,12 +289,13 @@ impl Entry {
 /// What an `entry` record says: the artifact to load, its size, and the
 /// conversion's warnings (reported on every load, as `rypip run` reports
 /// them on every run).
+#[derive(Debug)]
 pub struct Record {
     pub artifact: PathBuf,
     pub warnings: Vec<String>,
 }
 
-const RECORD_HEADER: &str = "rython-jit entry 1";
+const RECORD_HEADER: &str = "rython-jit entry 2";
 
 /// Read and check an entry's record. `Ok(None)`: no complete entry (a
 /// miss). `Err`: a record that does not match — corrupt, or another key's
@@ -258,6 +320,8 @@ pub fn read_record(entry: &Entry, key: &Key) -> Result<Option<Record>, String> {
     let size: u64 = field(lines.next(), "size")?
         .parse()
         .map_err(|_| "its record has a malformed size".to_string())?;
+    let digest = field(lines.next(), "sha256")?;
+    let dependencies = field(lines.next(), "dependencies")?;
     let warning_count: usize = field(lines.next(), "warnings")?
         .parse()
         .map_err(|_| "its record has a malformed warning count".to_string())?;
@@ -276,9 +340,13 @@ pub fn read_record(entry: &Entry, key: &Key) -> Result<Option<Record>, String> {
         return Err("its record names an artifact outside the entry".to_string());
     }
     let artifact = entry.dir.join(&artifact_name);
-    let actual = fs::metadata(&artifact)
+    let metadata = fs::symlink_metadata(&artifact)
         .map_err(|e| format!("its library {}: {}", artifact.display(), e))?
-        .len();
+        ;
+    if !metadata.is_file() {
+        return Err("its library is not a regular file".into());
+    }
+    let actual = metadata.len();
     if actual != size {
         return Err(format!(
             "its library {} is {} bytes, not the {} recorded",
@@ -286,6 +354,13 @@ pub fn read_record(entry: &Entry, key: &Key) -> Result<Option<Record>, String> {
             actual,
             size
         ));
+    }
+    let bytes = fs::read(&artifact).map_err(|e| format!("reading its library: {e}"))?;
+    if sha256_hex(&bytes) != digest {
+        return Err("its library's SHA-256 does not match the record".into());
+    }
+    if dependency_identity(entry).map_err(|e| e.to_string())? != dependencies {
+        return Err("its pinned Cargo.lock has changed".into());
     }
     Ok(Some(Record { artifact, warnings }))
 }
@@ -308,12 +383,14 @@ pub fn write_record(
 ) -> Result<(), JitError> {
     let io = |e: std::io::Error| JitError::Environment(format!("writing the JIT cache entry {}: {}", entry.dir.display(), e));
     let size = fs::metadata(artifact).map_err(io)?.len();
+    let digest = sha256_hex(&fs::read(artifact).map_err(io)?);
+    let dependencies = dependency_identity(entry).map_err(io)?;
     let name = artifact
         .file_name()
         .ok_or_else(|| JitError::Environment(format!("{} has no file name", artifact.display())))?
         .to_string_lossy()
         .into_owned();
-    let mut text = format!("{}\nartifact {}\nsize {}\nwarnings {}\n", RECORD_HEADER, name, size, warnings.len());
+    let mut text = format!("{}\nartifact {}\nsize {}\nsha256 {}\ndependencies {}\nwarnings {}\n", RECORD_HEADER, name, size, digest, dependencies, warnings.len());
     for warning in warnings {
         text.push_str("warning ");
         text.push_str(&warning.replace(['\n', '\r'], " "));
@@ -327,6 +404,10 @@ pub fn write_record(
     file.sync_all().map_err(io)?;
     fs::rename(&tmp, entry.record()).map_err(io)?;
     Ok(())
+}
+
+fn dependency_identity(entry: &Entry) -> std::io::Result<String> {
+    fs::read(entry.crate_dir().join("Cargo.lock")).map(|bytes| sha256_hex(&bytes))
 }
 
 /// Copy a freshly built library into its entry under a name no earlier
@@ -395,6 +476,13 @@ pub fn reset_entry(entry: &Entry) -> Result<(), JitError> {
 /// Remove the whole cache: every entry and the shared target directory
 /// (`rypip jit --clear-cache`). Libraries already loaded stay mapped.
 pub fn clear(root: &Path) -> Result<(), JitError> {
+    #[cfg(unix)]
+    let _guard = {
+        ensure_private_dir(root)?;
+        let canonical = fs::canonicalize(root)
+            .map_err(|e| JitError::Environment(format!("resolving {}: {e}", root.display())))?;
+        root_lock(&canonical, true)?
+    };
     match fs::remove_dir_all(root) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -403,5 +491,85 @@ pub fn clear(root: &Path) -> Result<(), JitError> {
             root.display(),
             e
         ))),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!("jit-cache-pin-{}-{}",
+                std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
+    #[test]
+    fn private_leaf_under_writable_or_symlinked_parent_is_refused() {
+        let scratch = Scratch::new();
+        let parent = scratch.0.join("replaceable");
+        fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        let root = parent.join("cache");
+        ensure_private_dir(&root).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(ensure_private_dir(&root).unwrap_err().to_string().contains("ancestor"));
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&parent, scratch.0.join("alias")).unwrap();
+        assert!(ensure_private_dir(&scratch.0.join("alias/cache")).is_err());
+    }
+
+    #[test]
+    fn clearing_waits_for_readers_and_builders_without_unlinking_the_root_lock() {
+        let scratch = Scratch::new();
+        let root = scratch.0.join("cache");
+        ensure_private_dir(&root).unwrap();
+        fs::write(root.join("active-build"), b"working").unwrap();
+        let guard = root_lock(&root, false).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let clearing = root.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            clear(&clearing).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+        assert!(root.join("active-build").exists());
+        drop(guard);
+        done_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert!(!root.exists());
+        assert!(scratch.0.join(".cache.rython-jit.lock").is_file());
+        ensure_private_dir(&root).unwrap();
+        root_lock(&root, false).unwrap();
+    }
+
+    #[test]
+    fn equal_size_artifact_changes_and_changed_dependency_pins_are_rejected() {
+        let scratch = Scratch::new();
+        let key = Key::new("example", "", "compiler", "rustc");
+        let entry = Entry::new(&scratch.0, &key);
+        fs::create_dir_all(entry.crate_dir()).unwrap();
+        fs::write(entry.crate_dir().join("Cargo.lock"), "pinned dependency graph").unwrap();
+        let artifact = entry.dir.join("lib-test.so");
+        fs::write(&artifact, b"trusted").unwrap();
+        write_record(&entry, &key, &artifact, &[]).unwrap();
+        assert!(read_record(&entry, &key).unwrap().is_some());
+        fs::write(&artifact, b"changed").unwrap();
+        assert!(read_record(&entry, &key).unwrap_err().contains("SHA-256"));
+        fs::write(&artifact, b"trusted").unwrap();
+        fs::write(entry.crate_dir().join("Cargo.lock"), "different dependency graph").unwrap();
+        assert!(read_record(&entry, &key).unwrap_err().contains("Cargo.lock"));
     }
 }

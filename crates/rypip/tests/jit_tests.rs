@@ -3,7 +3,7 @@
 //! through rython-jit, the cache, and every loud failure.
 //!
 //! Every test shares one cache (and so one cargo target directory) under
-//! cargo's per-target scratch directory, so the runtime builds once for
+//! a private temporary directory, so the runtime builds once for
 //! the whole file; the cache's own locks serialize the builds of tests
 //! running in parallel.
 
@@ -36,7 +36,7 @@ fn setup() {
 
 /// XDG_CACHE_HOME for the CLI tests; the cache is `<this>/rython/jit`.
 fn xdg_cache_home() -> PathBuf {
-    Path::new(env!("CARGO_TARGET_TMPDIR")).join("jit-xdg")
+    std::env::temp_dir().join(format!("rython-jit-tests-{}", std::process::id()))
 }
 
 fn cache_dir() -> PathBuf {
@@ -473,6 +473,36 @@ fn an_untrusted_cache_entry_is_rebuilt_never_loaded() {
     assert_eq!(rebuilt.call_as::<f64>("half", &[Value::Float(3.0)]).unwrap(), 1.5);
     // And the rebuilt entry is trusted again.
     assert_eq!(jit.compile("halves", source).unwrap().cache_outcome(), CacheOutcome::Hit);
+
+    // Replacing a library with equal-length bytes must be caught BEFORE
+    // dlopen. Rename a replacement inode so an already mapped library is
+    // unaffected by this deliberate corruption.
+    let replacement = entry.join("corrupt.tmp");
+    let mut bytes = fs::read(rebuilt.library_path()).unwrap();
+    bytes[0] ^= 0xff;
+    fs::write(&replacement, &bytes).unwrap();
+    fs::rename(&replacement, rebuilt.library_path()).unwrap();
+    let verified = jit.compile("halves", source).unwrap();
+    assert_eq!(verified.cache_outcome(), CacheOutcome::Built);
+    assert_eq!(verified.call_as::<f64>("half", &[Value::Float(6.0)]).unwrap(), 3.0);
+}
+
+#[test]
+fn cache_hits_cannot_bypass_incompatible_conversion_options() {
+    let source = "def value() -> int:\n    return 1\n";
+    jit().compile("option_validation", source).unwrap();
+    for options in [
+        ConvertOptions { no_std: true, ..Default::default() },
+        ConvertOptions { pyo3: true, ..Default::default() },
+        ConvertOptions { kernel_module: true, ..Default::default() },
+        ConvertOptions { driver: true, ..Default::default() },
+        ConvertOptions { rust_for_linux: true, ..Default::default() },
+    ] {
+        let invalid = rypip::jit::new_jit(options, Some(&cache_dir())).unwrap();
+        let error = invalid.compile("option_validation", source).err().expect("incompatible options on warm cache");
+        assert!(matches!(error, JitError::Unsupported(_)), "{error}");
+        assert_eq!(invalid.builds(), 0);
+    }
 }
 
 #[test]
@@ -533,6 +563,11 @@ fn an_unsupported_construct_is_the_converters_error_verbatim() {
 #[test]
 fn the_command_line_refuses_what_m1_does_not_compile_and_clears_its_cache() {
     let scratch = Scratch::new("jit-cli");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(scratch.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
     // A package directory, a module beside a rython.toml, and a name
     // CPython cannot import are refused before anything is built.
     fs::create_dir_all(scratch.path().join("pkg")).unwrap();
@@ -555,7 +590,11 @@ fn the_command_line_refuses_what_m1_does_not_compile_and_clears_its_cache() {
     // so the shared cache stays warm for the other tests).
     let xdg = scratch.path().join("xdg");
     let cache = xdg.join("rython").join("jit");
-    fs::create_dir_all(cache.join("entries")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(cache.join("entries")).unwrap();
+    }
     fs::write(cache.join("entries").join("stale"), "x").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_rypip"))
         .args(["jit", "--clear-cache"])
@@ -572,6 +611,7 @@ fn a_cache_directory_others_can_write_is_refused() {
     use std::os::unix::fs::PermissionsExt;
     setup();
     let scratch = Scratch::new("jit-cache-mode");
+    fs::set_permissions(scratch.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let dir = scratch.path().join("cache");
     fs::create_dir_all(&dir).unwrap();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();

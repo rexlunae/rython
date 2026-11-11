@@ -14,6 +14,11 @@ interpreted: a source the converter refuses is `JitError::Conversion`
 with the converter's message, and every other failure is a typed, loud
 `JitError`.
 
+Cache hits verify the library's SHA-256 and its pinned Cargo.lock. Entries
+retain their resolved dependency versions until `--clear-cache`; clearing
+waits for active readers and builds. Cache ancestors must also be protected
+from replacement by other users; symlink ancestors are refused.
+
 ```rust
 use rython_jit::Value;
 

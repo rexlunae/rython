@@ -42,7 +42,7 @@ fn main() {
 /// print("done")
 /// ```
 fn host(module: &Path) {
-    let cache = Path::new(env!("CARGO_TARGET_TMPDIR")).join("jit-xdg").join("rython").join("jit");
+    let cache = module.parent().unwrap().join("jit-cache");
     let jit = rypip::jit::new_jit(ConvertOptions::default(), Some(&cache)).expect("setting up the JIT");
     let chatter = jit.compile_file("chatter", module).expect("compiling chatter.py");
     print!("host before ");
@@ -56,6 +56,11 @@ fn host(module: &Path) {
 
 fn parent() {
     let scratch = common::Scratch::new("jit-interleave");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(scratch.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let module = scratch.path().join("chatter.py");
     fs::write(&module, CHATTER).unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
