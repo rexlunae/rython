@@ -3293,109 +3293,81 @@ impl ClassDef {
             return Err(refusal(field, self.body.first().and_then(|s| s.lineno).unwrap_or(0)));
         };
 
-        let init_stores = |upto: usize| -> std::collections::BTreeSet<String> {
-            let mut out = std::collections::BTreeSet::new();
-            for stmt in init.body.iter().take(upto) {
-                if let StatementType::Assign(a) = &stmt.statement {
-                    for target in &a.targets {
-                        if let ExprType::Attribute(attr) = target
-                            && visit::is_self(&attr.value)
-                        {
-                            out.insert(attr.attr.clone());
+        let stored = self.instance_store_names();
+        let constants = class_constant_names(&self.body);
+        let watched = composed.iter().cloned().collect();
+        let initialized = constants.iter().filter(|name| !stored.contains(*name)).cloned().collect();
+
+        // Creating a closure does not read its body. A later use of a
+        // closure capturing self can, however, expose every absent field.
+        // Keep directly bound lambdas deferred until that binding is used;
+        // an unbound lambda escaping into other code must be checked now.
+        let mut deferred = std::collections::HashSet::new();
+        let mut bound_lambdas = std::collections::HashSet::new();
+        loop {
+            let before = deferred.len();
+            visit::walk_stmts(&init.body, Descend::OwnScope, &mut |stmt| {
+                let captures = |expr: &ExprType| visit::any_expr(expr, |e| {
+                    visit::is_self(e)
+                        || matches!(e, ExprType::Name(name) if deferred.contains(&name.id))
+                });
+                match &stmt.statement {
+                    StatementType::FunctionDef(def) | StatementType::AsyncFunctionDef(def) => {
+                        if visit::any_stmt(&def.body, Descend::All, |nested| {
+                            visit::stmt_all_exprs(nested).into_iter().any(captures)
+                        }) {
+                            deferred.insert(def.name.clone());
                         }
                     }
-                }
-            }
-            out
-        };
-
-        let instance_stores = self.instance_store_names();
-        let mut initialized = class_constant_names(&self.body);
-        initialized.retain(|name| !instance_stores.contains(name));
-
-        for stmt in &init.body {
-            let mut reads = Vec::new();
-            let mut can_return_early = false;
-            visit::walk_stmts(std::slice::from_ref(stmt), Descend::SkipDefs, &mut |nested| {
-                for expr in visit::stmt_exprs(nested) {
-                    visit::walk_expr(expr, &mut |e| {
-                        if let ExprType::Attribute(a) = e
-                            && visit::is_self(&a.value)
-                            && composed.contains(&a.attr)
-                            && !initialized.contains(&a.attr)
-                        {
-                            reads.push(a.attr.clone());
-                        }
-                    });
-                }
-                for target in visit::stmt_targets(nested) {
-                    let creates_field = matches!(nested.statement, StatementType::Assign(_))
-                        && matches!(target, ExprType::Attribute(a)
-                            if visit::is_self(&a.value) && composed.contains(&a.attr));
-                    if !creates_field {
-                        visit::walk_expr(target, &mut |e| {
-                            if let ExprType::Attribute(a) = e
-                                && visit::is_self(&a.value)
-                                && composed.contains(&a.attr)
-                                && !initialized.contains(&a.attr)
-                            {
-                                reads.push(a.attr.clone());
+                    StatementType::Assign(assign) if match &assign.value {
+                        ExprType::Lambda(_) => captures(&assign.value),
+                        ExprType::Name(name) => deferred.contains(&name.id),
+                        ExprType::Attribute(attr) if visit::is_self(&attr.value) => deferred.contains(&attr.attr),
+                        _ => false,
+                    } => {
+                        let mut simple_targets = true;
+                        for target in &assign.targets {
+                            match target {
+                                ExprType::Name(name) => { deferred.insert(name.id.clone()); }
+                                ExprType::Attribute(attr) if visit::is_self(&attr.value) => {
+                                    deferred.insert(attr.attr.clone());
+                                }
+                                _ => { simple_targets = false; }
                             }
-                        });
+                        }
+                        if simple_targets && matches!(assign.value, ExprType::Lambda(_)) {
+                            bound_lambdas.insert(&assign.value as *const ExprType as usize);
+                        }
                     }
-                }
-                if matches!(nested.statement, StatementType::Return(_)) {
-                    can_return_early = true;
+                    _ => {}
                 }
                 Flow::Continue
             });
-            if let Some(field) = reads.first() {
-                return Err(refusal(field, stmt.lineno.unwrap_or(0)));
-            }
-            if can_return_early {
-                if let Some(field) = composed.iter().find(|field| !initialized.contains(*field)) {
-                    return Err(refusal(field, stmt.lineno.unwrap_or(0)));
-                }
-            }
-            if let StatementType::Assign(a) = &stmt.statement {
-                for target in &a.targets {
-                    if let ExprType::Attribute(attr) = target
-                        && visit::is_self(&attr.value)
-                    {
-                        initialized.insert(attr.attr.clone());
-                    }
-                }
-            }
+            if deferred.len() == before { break; }
         }
-        if let Some(field) = composed.iter().find(|field| !initialized.contains(*field)) {
+        let escape = |expr: &ExprType| match expr {
+            ExprType::Name(name) => visit::is_self(expr) || deferred.contains(&name.id),
+            ExprType::Attribute(attr) if visit::is_self(&attr.value) => {
+                deferred.contains(&attr.attr)
+                    || (!stored.contains(&attr.attr) && !constants.contains(&attr.attr))
+            }
+            ExprType::Lambda(_) => {
+                !bound_lambdas.contains(&(expr as *const ExprType as usize))
+                    && visit::any_expr(expr, visit::is_self)
+            }
+            _ => crate::ast::tree::scope::is_super_call(expr),
+        };
+        let final_fields = super::binding_flow::receiver_field_bindings_with_escapes(
+            &init.body, &initialized, &watched, Some(&escape),
+        ).map_err(|(field, line)| refusal(&field, line))?;
+        // An initializer that always raises never exposes a constructed
+        // instance. Every normal exit must initialize every composed field.
+        if let Some(final_fields) = final_fields
+            && let Some(field) = composed.iter().find(|field| !final_fields.contains(*field))
+        {
             return Err(refusal(field, self.body.first().and_then(|s| s.lineno).unwrap_or(0)));
         }
 
-        // A method or an escaped `self` can expose the instance while
-        // `__init__` is still running. Only stores before the first such
-        // statement are safe to assume in other methods.
-        let stored = self.instance_store_names();
-        let constants = class_constant_names(&self.body);
-        let first_interruption = init.body.iter().position(|stmt| {
-            visit::any_stmt(std::slice::from_ref(stmt), Descend::SkipDefs, |s| {
-                matches!(s.statement, StatementType::Return(_))
-            }) || visit::any_stmt(std::slice::from_ref(stmt), Descend::All, |s| {
-                visit::stmt_all_exprs(s)
-                    .into_iter()
-                    .any(|e| runs_instance_code(e, &stored, &constants))
-            })
-        });
-        let safe_before_interruption = init_stores(first_interruption.unwrap_or(usize::MAX));
-        if let Some(field) = composed
-            .iter()
-            .find(|field| !safe_before_interruption.contains(*field))
-        {
-            let line = first_interruption
-                .and_then(|i| init.body.get(i))
-                .and_then(|s| s.lineno)
-                .unwrap_or(0);
-            return Err(refusal(field, line));
-        }
         Ok(())
     }
 

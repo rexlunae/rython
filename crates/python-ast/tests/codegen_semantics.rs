@@ -31417,3 +31417,37 @@ fn pytest_operand_preflight_respects_the_stack_budget() {
     assert!(run(2000).unwrap_err().contains("nests too deeply"));
     assert_eq!(run(3), Ok(()));
 }
+
+#[test]
+fn composed_fields_track_branch_stores_and_deferred_readers() {
+    // Verified against python3: Branch(True) prints 7, Branch(False)
+    // prints nothing; Deferred prints 7 after creating the reader first.
+    let inner = "class Inner:\n    def __init__(self):\n        self.value = 7\n";
+    compile(&format!("{inner}class Branch:\n    def __init__(self, flag: bool):\n        if flag:\n            self.inner = Inner()\n            print(self.inner.value)\n        self.inner = Inner()\n"), "composed_branch.py");
+    compile(&format!("{inner}class Deferred:\n    def __init__(self):\n        reader = lambda: self.inner.value\n        self.inner = Inner()\n        print(reader())\n"), "composed_deferred.py");
+    compile(&format!("{inner}class Joined:\n    def __init__(self, flag: bool):\n        if flag:\n            self.inner = Inner()\n        else:\n            self.inner = Inner()\n        print(self.inner.value)\n"), "composed_join.py");
+}
+
+#[test]
+fn composed_fields_refuse_reader_invocation_and_escape_before_assignment() {
+    // Verified against python3: Nested() raises AttributeError for inner.
+    let inner = "class Inner:\n    def __init__(self):\n        self.value = 7\n";
+    for body in [
+        "        def read() -> None:\n            print(self.inner.value)\n        read()\n        self.inner = Inner()\n",
+        "        reader = lambda: self.inner.value\n        print(reader())\n        self.inner = Inner()\n",
+        "        def read() -> None:\n            print(self.inner.value)\n        def wrapper() -> None:\n            read()\n        wrapper()\n        self.inner = Inner()\n",
+        "        consume(lambda: self.inner.value)\n        self.inner = Inner()\n",
+    ] {
+        let error = compile_err(&format!("{inner}class Nested:\n    def __init__(self):\n{body}"), "composed_reader.py");
+        assert!(error.contains("composed field `self.inner`") && error.contains("refuses"), "{error}");
+    }
+}
+
+#[test]
+fn method_only_composed_fields_require_constructor_initialization() {
+    // Verified against python3: create(); read() prints 7, but read()
+    // without create() raises AttributeError. §12 records this conservative
+    // model boundary: no whole-program proof of callers' method ordering.
+    let error = compile_err("class Inner:\n    def __init__(self):\n        self.value = 7\nclass Outer:\n    def __init__(self):\n        pass\n    def create(self):\n        self.inner = Inner()\n    def read(self) -> int:\n        return self.inner.value\n", "composed_method_only.py");
+    assert!(error.contains("composed field `self.inner`") && error.contains("__init__"), "{error}");
+}

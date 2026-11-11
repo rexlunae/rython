@@ -25098,3 +25098,13 @@ fn pytest_module_value_aliases_are_refused_before_the_runner_is_lost() {
         assert!(message.contains("app.py") && message.contains("python -m pytest"), "{message}");
     }
 }
+
+#[test]
+fn composed_branch_initialization_runs_in_source_order() {
+    let (stdout, stderr, code) = unittest_run("composed_branch",
+        include_str!("fixtures/composed_branch.py"));
+    // Verified against python3.
+    assert_eq!(stdout, "7\n7\n7\n7\n7\n");
+    assert_eq!(stderr, "");
+    assert_eq!(code, 0);
+}

@@ -499,3 +499,7 @@ cargo publish -p rypip
 ## License
 
 Apache-2.0
+
+Composed instance fields must be initialized on every normal constructor exit,
+before reads or receiver escapes. Fields first created by other methods are
+refused; move their initialization into `__init__` (spec §12, issue #517).

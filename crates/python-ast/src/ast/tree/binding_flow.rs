@@ -66,6 +66,9 @@ struct Analysis<'a> {
     reads: HashMap<String, usize>,
     subject: Subject,
     testcase: bool,
+    // Optional constructor policy: an opaque receiver use may read any
+    // watched field. Flow facts at this exact expression still apply.
+    receiver_escape: Option<&'a dyn Fn(&ExprType) -> bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -90,6 +93,12 @@ impl Analysis<'_> {
     }
 
     fn expr(&mut self, expr: &ExprType, bound: &mut Names, line: usize) {
+        if self.receiver_escape.is_some_and(|escape| escape(expr)) {
+            for field in self.watched.difference(bound) {
+                self.reads.entry(field.clone())
+                    .and_modify(|old| *old = (*old).min(line)).or_insert(line);
+            }
+        }
         if let Some(name) = self.name(expr)
             && self.watched.contains(name)
             && !bound.contains(name)
@@ -98,6 +107,13 @@ impl Analysis<'_> {
                 .entry(name.to_owned())
                 .and_modify(|old| *old = (*old).min(line))
                 .or_insert(line);
+        }
+        if self.receiver_escape.is_some()
+            && matches!(expr, ExprType::Attribute(attr) if visit::is_self(&attr.value))
+        {
+            // Accessing self.field does not also escape the bare self
+            // receiver. The field read and optional policy ran above.
+            return;
         }
         if let Some((elements, generators)) = visit::comprehension_parts(expr) {
             if let Some(first) = generators.first() {
@@ -405,6 +421,7 @@ pub(crate) fn first_unbound_read(
         reads: HashMap::new(),
         subject: Subject::Locals,
         testcase,
+        receiver_escape: None,
     };
     let initialized = initialized
         .iter()
@@ -427,11 +444,23 @@ pub(crate) fn receiver_field_bindings(
     initialized: &Names,
     watched: &Names,
 ) -> Result<Option<Names>, (String, usize)> {
+    receiver_field_bindings_with_escapes(body, initialized, watched, None)
+}
+
+/// Constructor field flow, with a policy for uses that can observe the
+/// whole receiver. Traversal and branch joins remain in this one analysis.
+pub(crate) fn receiver_field_bindings_with_escapes(
+    body: &[Statement],
+    initialized: &Names,
+    watched: &Names,
+    receiver_escape: Option<&dyn Fn(&ExprType) -> bool>,
+) -> Result<Option<Names>, (String, usize)> {
     let mut analysis = Analysis {
         watched,
         reads: HashMap::new(),
         subject: Subject::ReceiverFields,
         testcase: true,
+        receiver_escape,
     };
     let mut paths = analysis.block(body, initialized.clone());
     if let Some(read) = analysis
