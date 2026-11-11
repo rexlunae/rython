@@ -17,7 +17,9 @@ A Rust library for parsing Python code into Abstract Syntax Trees (AST) and expe
 ## 🚀 Quick Start
 
 `threading.Thread` retains its runtime handle type through local variables
-and initialized instance fields, including aliased imports. Field defaults
+and instance fields, including aliased imports. A field initialized to
+`None` and later assigned a Thread retains `Option<Thread>` rather than
+falling back to `PyValue`. Field defaults
 do not construct placeholder threads; arguments bind at the Python
 constructor point, and `start()` runs the target. Initialize thread fields
 unconditionally in `__init__` before reading them or exposing `self`.
@@ -84,6 +86,10 @@ Calls through an unresolved callable parameter fail conversion with a
 request for a concrete `typing.Callable` signature. They cannot silently
 skip the call or substitute `None`; typed and boxed callable paths keep
 their modeled runtime behavior.
+
+Calls from a base-class method to a method defined only by subclasses are
+also refused: declare a typed stub on the base class and override it in
+subclasses so the generated trait can dispatch the call.
 
 Pytest runner references (`pytest.main`, `console_main`, `cmdline.main`,
 including imported aliases and function values) are refused during

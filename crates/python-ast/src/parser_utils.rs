@@ -180,6 +180,41 @@ pub fn safe_ident(name: &str) -> proc_macro2::Ident {
     }
 }
 
+/// The identifier a crate module (a Python module or package name) takes
+/// in every rendering of its path: the `pub mod` declaration rypip
+/// writes, each `crate::a::b::...` path the codegen emits (`use` paths,
+/// `__module_init__` calls, cross-module class and trait references), and
+/// — through [`module_file_stem`] — the file rustc loads for it
+/// (issue #528). Every one of those sites goes through this function so
+/// the spellings cannot disagree.
+///
+/// It is [`safe_ident`] with one difference: `self` is not a legal path
+/// segment (`crate::self::f` does not parse), and unlike a method
+/// receiver a MODULE named `self` has no Rust meaning to keep, so it is
+/// renamed to `self_` like the other keywords that cannot be raw
+/// identifiers (`Self_`, `super_`, `crate_`; `_` →
+/// `__rython_underscore`). Two sibling modules whose names map to the same
+/// identifier (`self.py` beside `self_.py`) are refused by the converter
+/// rather than merged.
+pub fn module_ident(name: &str) -> proc_macro2::Ident {
+    match name {
+        "self" => quote::format_ident!("self_"),
+        _ => safe_ident(name),
+    }
+}
+
+/// The file (or directory) name rustc resolves a `pub mod` declaration of
+/// [`module_ident`]`(name)` to: the identifier without its raw prefix
+/// (`pub mod r#impl;` loads `impl.rs`; `pub mod self_;` loads
+/// `self_.rs`).
+pub fn module_file_stem(name: &str) -> String {
+    let ident = module_ident(name).to_string();
+    match ident.strip_prefix("r#") {
+        Some(bare) => bare.to_string(),
+        None => ident,
+    }
+}
+
 /// The MODULE-level static identifier for a class-level COMPUTED constant
 /// (`RequestMethods._encode_url_methods` →
 /// `RequestMethods__encode_url_methods`): associated statics are not

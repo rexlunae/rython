@@ -157,9 +157,9 @@ pub struct ModuleClassInfo {
     /// (`from .animals import Dog; Dog("Rex")` maps arguments against the
     /// defining module's `__init__`).
     pub classes: std::collections::HashMap<String, crate::ClassDef>,
-    /// Hierarchy classes → trait names (`{Name}Trait` plus ancestors'),
-    /// for the cross-module trait imports the import statement emits.
-    pub traits: std::collections::HashMap<String, Vec<String>>,
+    /// Hierarchy classes → (defining module path, trait name) for the
+    /// class's trait and its ancestors, used by cross-module imports.
+    pub traits: std::collections::HashMap<String, Vec<(Vec<String>, String)>>,
 }
 
 /// State of the one-time cross-module class-resolution cache (see
@@ -509,11 +509,12 @@ pub struct PythonOptionsData {
     /// invisible to other modules), so cross-module constants become
     /// importable `pub static`s.
     pub this_module_path: Vec<String>,
-    /// The converter-selected module running as `__main__`, if any.
-    pub executable_entry_module: Option<Vec<String>>,
-    /// Importable dotted names keyed by converter module paths, independent
-    /// of the distribution's Cargo name.
-    pub module_import_names: std::rc::Rc<std::collections::HashMap<Vec<String>, String>>,
+    /// The Python import name of the current module, such as
+    /// `pkg.submodule`. Package conversion sets this per module so an
+    /// unshadowed `__name__` read has the same value it would under CPython.
+    /// `None` preserves the runtime's `__main__` fallback for single-file
+    /// executable conversions.
+    pub python_module_name: Option<String>,
 
     /// Statically-known types of names in the CURRENT scope (parameter
     /// annotations and literal assignments), as canonical Python type
@@ -767,6 +768,13 @@ pub struct PythonOptionsData {
     pub module_defs:
         std::rc::Rc<std::collections::HashMap<Vec<String>, std::rc::Rc<crate::Module>>>,
 
+    /// Each crate module's Python `__name__` (`impt.cases`) by its
+    /// `module_defs` key, as the converter knows it from the package
+    /// layout. What CPython prints for a class of that module — a test's
+    /// id in a unittest report (issue #522). Empty in single-module
+    /// conversion; see `module::python_module_name` for a missing key.
+    pub module_python_names: std::rc::Rc<std::collections::HashMap<Vec<String>, String>>,
+
     /// True while a MODULE-LEVEL control-flow statement (an `if`, a
     /// `try`, a loop, a `with`) is lowered into `__module_init__`: an
     /// import nested in it has its `use` hoisted to module scope by the
@@ -938,8 +946,7 @@ impl Default for PythonOptionsData {
             statically_module_names: std::rc::Rc::new(std::collections::HashSet::new()),
             module_path: Vec::new(),
             this_module_path: Vec::new(),
-            executable_entry_module: None,
-            module_import_names: Default::default(),
+            python_module_name: None,
             local_types: std::rc::Rc::new(std::collections::HashMap::new()),
             no_std: false,
             big_integer_target: BigIntegerTarget::StdPython,
@@ -978,6 +985,7 @@ impl Default for PythonOptionsData {
             in_async_def: false,
             python_modules: std::rc::Rc::new(std::collections::HashSet::new()),
             module_defs: std::rc::Rc::new(std::collections::HashMap::new()),
+            module_python_names: std::rc::Rc::new(std::collections::HashMap::new()),
             in_module_init_body: false,
             init_binding_marks: std::rc::Rc::new(std::collections::HashMap::new()),
             stmt_binds: None,

@@ -721,52 +721,65 @@ fn dynamic_exception_value(
     }
 }
 
+/// The class a NAME or DOTTED NAME in an exception-catching position names
+/// (an `except` clause, `self.assertRaises(E)` — issue #523), canonicalized
+/// to the name the raise side records. `None` for any other expression;
+/// `Some(Err(..))` carries the refusal for an alias the module binds to
+/// more than one class.
+///
+/// A stdlib exception ALIAS (`except SocketTimeout:` under `from socket
+/// import timeout as SocketTimeout` — urllib3) canonicalizes to the
+/// builtin, matching the raise side (issue #137); `socket.timeout`, the
+/// dotted spelling, identically. A USER class named through an alias
+/// (`except R:` under `R = Root`, `import Root as R`) is its definition's
+/// name — the name the raise's ancestor chain records (Devin review on
+/// #330). One canonicalizer for both.
+pub(crate) fn caught_class_name(
+    exception_type: &ExprType,
+    symbols: &crate::SymbolTableScopes,
+    options: &crate::PythonOptions,
+) -> Option<Result<String, String>> {
+    match exception_type {
+        ExprType::Name(name) => {
+            if let Some(msg) =
+                crate::ast::tree::raise_stmt::ambiguous_alias_refusal(&name.id, options)
+            {
+                return Some(Err(msg));
+            }
+            Some(Ok(crate::ast::tree::raise_stmt::canonical_exception_class(
+                &name.id, symbols, options,
+            )
+            .map(|(n, _)| n)
+            .unwrap_or_else(|| name.id.clone())))
+        }
+        ExprType::Attribute(attr) => Some(Ok(match attr.value.as_ref() {
+            ExprType::Name(m) => crate::ast::tree::raise_stmt::stdlib_exception_canonical(
+                &m.id, &attr.attr,
+            )
+            .map(str::to_string)
+            .unwrap_or_else(|| attr.attr.clone()),
+            _ => attr.attr.clone(),
+        })),
+        _ => None,
+    }
+}
+
 fn exception_match_guard(
     exception_type: &ExprType,
     symbols: &crate::SymbolTableScopes,
     options: &crate::PythonOptions,
 ) -> Result<Option<TokenStream>, Box<dyn std::error::Error>> {
     match exception_type {
-        ExprType::Name(name) => {
-            // A stdlib exception ALIAS (`except SocketTimeout:` under
-            // `from socket import timeout as SocketTimeout` — urllib3):
-            // canonicalize to the builtin, matching the raise side
-            // (issue #137).
-            // A USER class named through an alias (`except R:` under
-            // `R = Root`, `import Root as R`) is its definition's name —
-            // the name the raise's ancestor chain records (Devin review
-            // on #330). One canonicalizer for both.
-            if let Some(msg) = crate::ast::tree::raise_stmt::ambiguous_alias_refusal(&name.id, options) {
-                return Ok(Some(quote!(compile_error!(#msg))));
-            }
-            let n = crate::ast::tree::raise_stmt::canonical_exception_class(
-                &name.id, symbols, options,
-            )
-            .map(|(n, _)| n)
-            .unwrap_or_else(|| name.id.clone());
+        ExprType::Name(_) | ExprType::Attribute(_) => {
+            let n = match caught_class_name(exception_type, symbols, options) {
+                Some(Ok(n)) => n,
+                Some(Err(msg)) => return Ok(Some(quote!(compile_error!(#msg)))),
+                None => unreachable!("a name or an attribute names a class"),
+            };
             // Round 52: a literal BUILTIN clause (`except ValueError:`)
             // lowers to the discriminant comparison — the class name is
             // a source literal and the runtime knows its variant and
             // ancestor slice statically. No string walk per clause.
-            if let Some(ident) = crate::ast::tree::raise_stmt::builtin_exception_variant(&n) {
-                let ident = crate::safe_ident(&ident);
-                return Ok(Some(quote!(__rython_exc.matches_builtin(BuiltinException::#ident))));
-            }
-            Ok(Some(quote!(__rython_exc.matches(#n))))
-        }
-        ExprType::Attribute(attr) => {
-            // `except socket.timeout:` — the dotted spelling of the same
-            // stdlib alias canonicalizes identically.
-            let n = match attr.value.as_ref() {
-                ExprType::Name(m) => {
-                    crate::ast::tree::raise_stmt::stdlib_exception_canonical(
-                        &m.id, &attr.attr,
-                    )
-                    .map(str::to_string)
-                    .unwrap_or_else(|| attr.attr.clone())
-                }
-                _ => attr.attr.clone(),
-            };
             if let Some(ident) = crate::ast::tree::raise_stmt::builtin_exception_variant(&n) {
                 let ident = crate::safe_ident(&ident);
                 return Ok(Some(quote!(__rython_exc.matches_builtin(BuiltinException::#ident))));

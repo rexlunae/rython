@@ -331,6 +331,54 @@ fn comprehension_imported_scalars_and_counter_items_match_cpython() {
 }
 
 #[test]
+fn imported_module_name_matches_cpython_and_executable_entry_stays_main() {
+    let scratch = Scratch::new("imported-module-name");
+    let package_dir = scratch.path().join("MyPkg");
+    fs::create_dir_all(&package_dir).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"pkg\"\nversion = \"0.1.0\"\n\n[tool.setuptools]\npackages = [\"MyPkg\"]\n",
+    )
+    .unwrap();
+    fs::write(package_dir.join("__init__.py"), "").unwrap();
+    fs::write(
+        package_dir.join("helper.py"),
+        "def module_name() -> str:\n    return __name__\n",
+    )
+    .unwrap();
+    fs::write(
+        package_dir.join("main.py"),
+        "from .helper import module_name\n\ndef main() -> None:\n    print(module_name())\n    print(__name__)\n\nif __name__ == '__main__':\n    main()\n",
+    )
+    .unwrap();
+
+    let cpython = Command::new("python3")
+        .args(["-m", "MyPkg.main"])
+        .current_dir(scratch.path())
+        .output()
+        .unwrap();
+    assert!(cpython.status.success(), "{:?}", cpython.stderr);
+    // Verified against python3.
+    assert_eq!(cpython.stdout, b"MyPkg.helper\n__main__\n");
+
+    let package = rypip::discover(scratch.path()).unwrap();
+    let krate = rypip::convert(
+        &package,
+        &scratch.path().join("crate"),
+        &ConvertOptions::default(),
+    )
+    .unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/pkg"))
+        .output()
+        .unwrap();
+    // Verified against python3.
+    assert_eq!(output.stdout, b"MyPkg.helper\n__main__\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn immediate_list_generator_consumption_matches_cpython() {
     let scratch = Scratch::new("list-generator");
     let file = scratch.path().join("app.py");
@@ -689,6 +737,152 @@ fn discovers_single_file_module() {
     let pkg = rypip::discover(&file).expect("discover single file");
     assert_eq!(pkg.name, "tool");
     assert_eq!(pkg.modules.len(), 1);
+}
+
+#[test]
+fn rust_keyword_module_names_match_python_at_runtime() {
+    let scratch = Scratch::new("keyword-modules");
+    let pkg_dir = scratch.path().join("app");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    fs::write(pkg_dir.join("__init__.py"), "").unwrap();
+    for (name, value) in [
+        ("impl", 1), ("type", 2), ("self", 3), ("Self", 4),
+        ("super", 5), ("crate", 6), ("_", 7), ("mod", 8),
+        ("outer/impl/self", 9), ("outer/mod/__init__", 10), ("outer/mod/impl", 11),
+    ] {
+        let file = pkg_dir.join(format!("{name}.py"));
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, format!("def number() -> int:\n    return {value}\n")).unwrap();
+    }
+    for dir in ["outer", "outer/impl"] {
+        fs::write(pkg_dir.join(dir).join("__init__.py"), "").unwrap();
+    }
+    fs::write(pkg_dir.join("cli.py"), concat!(
+        "from . import impl, type, self as self_module, Self, super, crate, _, mod\n",
+        "from .outer.impl.self import number as nested_number\n",
+        "from .outer import mod as nested_mod\n",
+        "from .outer.mod.impl import number as deepest_number\n",
+        "\n",
+        "def main() -> None:\n",
+        "    print(impl.number(), type.number(), self_module.number(), Self.number())\n",
+        "    print(super.number(), crate.number(), _.number(), mod.number())\n",
+        "    print(nested_number(), nested_mod.number())\n",
+        "    print(deepest_number())\n",
+        "\n",
+        "if __name__ == '__main__':\n",
+        "    main()\n",
+    )).unwrap();
+
+    let python = Command::new("python3")
+        .args(["-m", "app.cli"])
+        .env("PYTHONHASHSEED", "0")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .current_dir(scratch.path())
+        .output().unwrap();
+    // Verified against python3.
+    assert_eq!(python.stdout, b"1 2 3 4\n5 6 7 8\n9 10\n11\n");
+    assert!(python.status.success(), "{python:?}");
+    assert!(python.stderr.is_empty(), "{python:?}");
+
+    let package = rypip::discover(&pkg_dir).unwrap();
+    let krate = rypip::convert(
+        &package, &scratch.path().join("crate"),
+        &ConvertOptions { pyo3: true, ..Default::default() },
+    ).unwrap();
+    for file in ["src/lib.rs", "src/main.rs"] {
+        let source = fs::read_to_string(krate.root.join(file)).unwrap();
+        for declaration in [
+            "pub mod r#impl;", "pub mod r#type;", "pub mod self_;",
+            "pub mod Self_;", "pub mod super_;", "pub mod crate_;",
+            "pub mod __rython_underscore;", "pub mod r#mod;",
+        ] {
+            assert!(source.contains(declaration), "{file}: {source}");
+        }
+    }
+    for file in [
+        "src/impl.rs", "src/self_.rs", "src/Self_.rs", "src/mod/mod.rs",
+        "src/outer/impl/self_.rs", "src/outer/mod/mod.rs", "src/outer/mod/impl.rs",
+    ] {
+        assert!(krate.root.join(file).is_file(), "missing {file}");
+    }
+    let bindings = fs::read_to_string(krate.root.join("src/python_api.rs")).unwrap();
+    assert!(bindings.contains("crate::self_::number("), "{bindings}");
+    assert!(bindings.contains("crate::outer::r#impl::self_::number("), "{bindings}");
+    assert!(build_generated(&krate.root).success());
+    let rust = Command::new(krate.root.join("target/debug/app")).output().unwrap();
+    assert_eq!(rust.stdout, python.stdout);
+    assert_eq!(rust.stderr, python.stderr);
+    assert_eq!(rust.status.code(), python.status.code());
+}
+
+#[test]
+fn rust_keyword_module_name_collisions_are_refused() {
+    let scratch = Scratch::new("keyword-module-collisions");
+    for (keyword, renamed) in [
+        ("self", "self_"), ("Self", "Self_"), ("super", "super_"),
+        ("crate", "crate_"), ("_", "__rython_underscore"),
+    ] {
+        let pkg_dir = scratch.path().join(keyword);
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(pkg_dir.join("__init__.py"), "").unwrap();
+        for (name, value) in [(keyword, 1), (renamed, 2)] {
+            fs::write(
+                pkg_dir.join(format!("{name}.py")),
+                format!("def number() -> int:\n    return {value}\n"),
+            ).unwrap();
+        }
+        fs::write(pkg_dir.join("cli.py"), format!(
+            "from . import {keyword} as first_module\n\
+             from . import {renamed} as second_module\n\
+             if __name__ == '__main__':\n    print(first_module.number(), second_module.number())\n",
+        )).unwrap();
+        let python = Command::new("python3")
+            .args(["-m", &format!("{keyword}.cli")])
+            .env("PYTHONHASHSEED", "0")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .current_dir(scratch.path())
+            .output().unwrap();
+        // Verified against python3: these are distinct, case-sensitive modules.
+        assert_eq!(python.stdout, b"1 2\n");
+        assert!(python.status.success() && python.stderr.is_empty(), "{python:?}");
+        let package = rypip::discover(&pkg_dir).unwrap();
+        let error = rypip::convert(
+            &package, &scratch.path().join(format!("crate-{keyword}")), &ConvertOptions::default(),
+        ).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(keyword) && message.contains(renamed), "{message}");
+        assert!(message.contains("both become the Rust module") && message.contains("rename"), "{message}");
+    }
+}
+
+#[test]
+fn rust_keyword_module_self_binding_is_refused_instead_of_calling_the_importer() {
+    let scratch = Scratch::new("keyword-module-self-binding");
+    let pkg_dir = scratch.path().join("app");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    fs::write(pkg_dir.join("__init__.py"), "").unwrap();
+    fs::write(pkg_dir.join("self.py"), "def number() -> int:\n    return 12\n").unwrap();
+    fs::write(pkg_dir.join("cli.py"), concat!(
+        "from . import self\n",
+        "def number() -> int:\n    return 99\n",
+        "if __name__ == '__main__':\n    print(self.number())\n",
+    )).unwrap();
+    let python = Command::new("python3")
+        .args(["-m", "app.cli"])
+        .env("PYTHONHASHSEED", "0")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .current_dir(scratch.path())
+        .output().unwrap();
+    // Verified against python3: `self` is the imported module, not the importer.
+    assert_eq!(python.stdout, b"12\n");
+    assert!(python.status.success() && python.stderr.is_empty(), "{python:?}");
+    let package = rypip::discover(&pkg_dir).unwrap();
+    let error = rypip::convert(
+        &package, &scratch.path().join("crate"), &ConvertOptions::default(),
+    ).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("cli.py") && message.contains("binds the name `self`"), "{message}");
+    assert!(message.contains("from . import self as self_module"), "{message}");
 }
 
 #[test]
@@ -8328,6 +8522,146 @@ fn thread_instance_fields_match_python_at_runtime() {
 }
 
 #[test]
+fn a_lazily_created_thread_field_matches_python_at_runtime() {
+    // Issue #529: `self.t = None` in __init__, `self.t = Thread(...)` in a
+    // later method. The field is Option<threading::Thread> whose None is the
+    // Python value None: `if self.t is not None:` skips a stop before start,
+    // and a lifecycle call on None raises CPython's catchable AttributeError.
+    // Verified against python3 (3.14.4): stdout, and exit code 0 with empty
+    // stderr.
+    for (name, source, expected) in [
+        (
+            "lazy_thread_issue",
+            concat!(
+                "import threading\n\n\n",
+                "def work(n: int) -> None:\n",
+                "    print(\"work\", n, threading.current_thread().name)\n\n\n",
+                "class Pool:\n",
+                "    def __init__(self):\n",
+                "        self.t = None\n",
+                "        self.n = 3\n\n",
+                "    def start(self):\n",
+                "        self.t = threading.Thread(target=work, args=(self.n,))\n",
+                "        self.t.start()\n\n",
+                "    def stop(self):\n",
+                "        if self.t is not None:\n",
+                "            self.t.join()\n",
+                "            print(\"joined\", self.t.is_alive())\n\n\n",
+                "def main():\n",
+                "    p = Pool()\n",
+                "    p.stop()\n",
+                "    p.start()\n",
+                "    p.stop()\n\n\n",
+                "if __name__ == \"__main__\":\n",
+                "    main()\n",
+            ),
+            "work 3 Thread-1 (work)\njoined False\n",
+        ),
+        (
+            "thread_lazy_field",
+            include_str!("../../../eval/idioms/programs/thread_lazy_field.py"),
+            include_str!("../../../eval/idioms/programs/thread_lazy_field.expected"),
+        ),
+        (
+            "thread_lazy_field_none",
+            include_str!("fixtures/thread_lazy_field_none.py"),
+            "work 1 Thread-1 (work)\neager False\ncaught 'NoneType' object has no attribute 'join'\nwork 2 Thread-2 (work)\njoined False\nnone? False\nno thread\nwork 10 Thread-3 (work)\n",
+        ),
+    ] {
+        let scratch = Scratch::new(name);
+        let file = scratch.path().join(format!("{name}.py"));
+        fs::write(&file, source).unwrap();
+        let pkg = rypip::discover(&file).expect("discover");
+        let krate = rypip::convert(
+            &pkg,
+            &scratch.path().join("crate"),
+            &ConvertOptions::default(),
+        )
+        .expect("convert");
+        assert!(
+            !krate.warnings.iter().any(|w| w.contains("dropped")),
+            "{name}: {:?}",
+            krate.warnings
+        );
+        let status = Command::new("cargo")
+            .arg("build")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env("RUSTFLAGS", "-D warnings")
+            .current_dir(&krate.root)
+            .status()
+            .expect("build generated crate");
+        assert!(status.success(), "{name}: warning-clean build");
+        let output = Command::new(krate.root.join(format!("target/debug/{name}")))
+            .output()
+            .expect("run generated binary");
+        assert!(output.status.success(), "{name}: {:?}", output);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "{name}: stdout"
+        );
+        assert!(output.stderr.is_empty(), "{name}: {:?}", output);
+    }
+    // An uncaught start() on the None value. Verified against python3
+    // (3.14.4): stdout `before True`, exit 1, and stderr ending in
+    // `AttributeError: 'NoneType' object has no attribute 'start'`. rython's
+    // traceback has no frames (the §12.3 model limit), so the header and the
+    // exception line are the whole stderr.
+    let scratch = Scratch::new("lazy_thread_none_start");
+    let file = scratch.path().join("lazy_thread_none_start.py");
+    fs::write(
+        &file,
+        concat!(
+            "import threading\n\n\n",
+            "def work(n: int) -> None:\n",
+            "    print(\"work\", n)\n\n\n",
+            "class Pool:\n",
+            "    def __init__(self):\n",
+            "        self.t = None\n",
+            "        self.n = 3\n\n",
+            "    def make(self):\n",
+            "        self.t = threading.Thread(target=work, args=(self.n,))\n\n",
+            "    def run(self):\n",
+            "        print(\"before\", self.t is None)\n",
+            "        self.t.start()\n",
+            "        print(\"unreachable\")\n\n\n",
+            "def main():\n",
+            "    p = Pool()\n",
+            "    p.run()\n",
+            "    p.make()\n\n\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+    )
+    .unwrap();
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(
+        &pkg,
+        &scratch.path().join("crate"),
+        &ConvertOptions::default(),
+    )
+    .expect("convert");
+    let status = Command::new("cargo")
+        .arg("build")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env("RUSTFLAGS", "-D warnings")
+        .current_dir(&krate.root)
+        .status()
+        .expect("build generated crate");
+    assert!(status.success(), "warning-clean build");
+    let output = Command::new(krate.root.join("target/debug/lazy_thread_none_start"))
+        .output()
+        .expect("run generated binary");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "before True\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "Traceback (most recent call last):\nAttributeError: 'NoneType' object \
+         has no attribute 'start'\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
 fn a_thread_is_named_after_its_defining_function_and_binds_defined_arguments() {
     // Issue #514: `Thread-N (<target.__name__>)` uses the DEFINING function's
     // name, not the spelling of `target=`; `from .job import work as do_work`
@@ -13470,6 +13804,138 @@ fn run_package_status(
     )
 }
 
+#[test]
+fn package_main_inherits_from_a_sibling_module() {
+    let scratch = Scratch::new("main-cross-module-inheritance");
+    let krate = package_crate(
+        &scratch,
+        "maininherit",
+        &[
+            (
+                "base.py",
+                "class Base:\n    def __init__(self, value: int) -> None:\n        self.value = value\n    def get(self) -> int:\n        return self.value\n",
+            ),
+            (
+                "__main__.py",
+                "from .base import Base\nclass Child(Base):\n    def plus_one(self) -> int:\n        return self.get() + 1\ndef main() -> None:\n    child = Child(40)\n    print(child.value)\n    print(child.get())\n    print(child.plus_one())\nif __name__ == '__main__':\n    main()\n",
+            ),
+        ],
+    );
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated package failed to compile");
+    let output = Command::new(krate.root.join("target/debug/maininherit"))
+        .output()
+        .expect("running generated package");
+    // Verified against python3.
+    assert_eq!(output.stdout, b"40\n40\n41\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn imported_base_methods_and_fields_are_available_to_a_package_subclass() {
+    let scratch = Scratch::new("imported-base-inheritance");
+    let krate = package_crate(
+        &scratch,
+        "crossinherit",
+        &[
+            (
+                "base.py",
+                "class Base:\n    def __init__(self, value: int) -> None:\n        self.value = value\n    def get(self) -> int:\n        return self.value\n",
+            ),
+            (
+                "child.py",
+                "from .base import Base\nclass Child(Base):\n    def plus_one(self) -> int:\n        return self.get() + 1\n",
+            ),
+            (
+                "cli.py",
+                "from .child import Child\ndef main() -> None:\n    child = Child(40)\n    print(child.value)\n    print(child.get())\n    print(child.plus_one())\nif __name__ == '__main__':\n    main()\n",
+            ),
+        ],
+    );
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated package failed to compile");
+    let output = Command::new(krate.root.join("target/debug/crossinherit"))
+        .output()
+        .expect("running generated package");
+    // Verified against python3.
+    assert_eq!(output.stdout, b"40\n40\n41\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn cross_module_grandparent_constructor_runs() {
+    for entry in [true, false] {
+        let scratch = Scratch::new(if entry { "grandparent-entry" } else { "grandparent-module" });
+        let mut files = vec![
+            ("base.py", "class Grandparent:\n    def __init__(self, value: int) -> None:\n        print('grandparent', value)\n        self.value = value\n"),
+            ("middle.py", "from .base import Grandparent\nclass Parent(Grandparent):\n    pass\n"),
+        ];
+        let child = "from .middle import Parent\nclass Child(Parent):\n    pass\n";
+        let main = "def main() -> None:\n    child = Child(42)\n    print(child.value)\nif __name__ == '__main__':\n    main()\n";
+        let source = format!("{child}{main}");
+        if entry {
+            files.push(("__main__.py", &source));
+        } else {
+            files.push(("child.py", child));
+            files.push(("cli.py", "from .child import Child\ndef main() -> None:\n    child = Child(42)\n    print(child.value)\nif __name__ == '__main__':\n    main()\n"));
+        }
+        let krate = package_crate(&scratch, "grandinherit", &files);
+        let python = Command::new("python3")
+            .args(["-m", if entry { "grandinherit" } else { "grandinherit.cli" }])
+            .env("PYTHONHASHSEED", "0")
+            .current_dir(scratch.path())
+            .output()
+            .unwrap();
+        // Verified against python3.
+        assert_eq!(python.stdout, b"grandparent 42\n42\n");
+        assert!(python.stderr.is_empty());
+        assert_eq!(python.status.code(), Some(0));
+        assert!(build_generated(&krate.root).success());
+        let output = Command::new(krate.root.join("target/debug/grandinherit")).output().unwrap();
+        assert_eq!(output.stdout, python.stdout);
+        assert_eq!(output.stderr, python.stderr);
+        assert_eq!(output.status.code(), python.status.code());
+    }
+}
+
+#[test]
+fn cross_module_grandparent_constructor_argument_mismatches_are_loud() {
+    for (call, error) in [
+        ("Child()", "Grandparent.__init__() missing 1 required positional argument: 'value'"),
+        ("Child(1, 2)", "Grandparent.__init__() takes 2 positional arguments but 3 were given"),
+    ] {
+        let scratch = Scratch::new(if call == "Child()" { "grandparent-missing" } else { "grandparent-extra" });
+        let source = format!("from .middle import Parent\nclass Child(Parent):\n    pass\ndef main() -> None:\n    {call}\nif __name__ == '__main__':\n    main()\n");
+        let krate = package_crate(&scratch, "grandmismatch", &[
+            ("base.py", "class Grandparent:\n    def __init__(self, value: int) -> None:\n        print('constructor ran')\n        self.value = value\n"),
+            ("middle.py", "from .base import Grandparent\nclass Parent(Grandparent):\n    pass\n"),
+            ("__main__.py", &source),
+        ]);
+        let python = Command::new("python3")
+            .args(["-m", "grandmismatch"])
+            .env("PYTHONHASHSEED", "0")
+            .current_dir(scratch.path())
+            .output()
+            .unwrap();
+        // Verified against python3. Static constructor arity errors are
+        // loud build failures rather than CPython's runtime TypeError.
+        assert!(python.stdout.is_empty());
+        assert_eq!(python.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&python.stderr).ends_with(&format!("TypeError: {error}\n")));
+        let build = Command::new("cargo")
+            .arg("build")
+            .env_remove("RUSTFLAGS")
+            .current_dir(&krate.root)
+            .output()
+            .unwrap();
+        assert!(!build.status.success(), "invalid constructor call built successfully");
+        let stderr = String::from_utf8_lossy(&build.stderr);
+        assert!(stderr.contains("error[E0061]"), "{stderr}");
+    }
+}
+
 /// Convert, build and run a single-file program; its stderr with the
 /// `Ran N tests in T.TTTs` time normalized to `T`, and its exit code.
 fn unittest_report(name: &str, source: &str) -> (String, i32) {
@@ -13587,6 +14053,72 @@ fn unittest_finds_a_testcase_through_a_multi_module_base_chain() {
 }
 
 #[test]
+fn unittest_main_runs_a_testcase_imported_into_the_entry_module() {
+    let scratch = Scratch::new("ut_imported_case");
+    let krate = package_crate(
+        &scratch,
+        "ut_imported_case",
+        &[
+            (
+                "cases.py",
+                "import unittest\n\n\nclass Imported(unittest.TestCase):\n    def test_imported(self) -> None:\n        print(\"imported test\")\n        self.assertEqual(1, 2)\n",
+            ),
+            (
+                "cli.py",
+                "import unittest\nfrom .cases import Imported as Alias\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+            ),
+        ],
+    );
+    assert!(build_generated(&krate.root).success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/ut_imported_case"))
+        .output()
+        .expect("running generated binary");
+    // Verified against Python 3.14.4 with the imported class's
+    // `__module__` set to `ut_imported_case.cases`.
+    assert_eq!(output.stdout, b"imported test\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("FAIL: test_imported (ut_imported_case.cases.Imported.test_imported)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Ran 1 test in "), "{stderr}");
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn unittest_main_runs_the_selected_version_gated_testcase() {
+    let scratch = Scratch::new("ut_version_gated_case");
+    let krate = package_crate(
+        &scratch,
+        "ut_version_gated_case",
+        &[(
+            "cli.py",
+            concat!(
+                "import sys\n",
+                "import unittest\n",
+                "\n",
+                "if sys.version_info >= (3, 11):\n",
+                "    class Versioned(unittest.TestCase):\n",
+                "        def test_selected(self) -> None:\n",
+                "            print(\"selected version\")\n",
+                "else:\n",
+                "    class Versioned(unittest.TestCase):\n",
+                "        def test_other(self) -> None:\n",
+                "            print(\"other version\")\n",
+                "\n",
+                "if __name__ == \"__main__\":\n",
+                "    unittest.main()\n",
+            ),
+        )],
+    );
+    // Verified against python3 3.14.4: sys.version_info selects the first
+    // class, and unittest.main() runs test_selected exactly once.
+    let (stdout, status) = run_package_status(&krate, "ut_version_gated_case");
+    assert_eq!(stdout, ["selected version"]);
+    assert_eq!(status, 0);
+}
+
+#[test]
 fn unittest_cross_module_runner_inputs_and_qualified_construction_are_refused() {
     // A gate condition or test default inherited from another module would
     // be rendered against this module's names (#519 review): refused.
@@ -13605,8 +14137,14 @@ fn unittest_cross_module_runner_inputs_and_qualified_construction_are_refused() 
             ),
         ],
     );
-    assert!(error.contains("TestCase `Child` inherits `Base`'s skipIf/skipUnless condition from another module")
-        && error.contains("refuses"), "{error}");
+    // `Base` is itself imported into the entry module, so CPython's loader
+    // sees it as a separate test name as well as running the derived Child.
+    assert!(
+        error.contains(
+            "TestCase `Base` is imported with `Base`'s skipIf/skipUnless condition from another module"
+        ) && error.contains("refuses"),
+        "{error}"
+    );
     // A TestCase base spelled through its module is not followed by the
     // base chain. CPython runs Child's inherited and own tests (verified
     // with python3 3.14.4: `Ran 3 tests`); leaving them out is refused.
@@ -20419,6 +20957,63 @@ fn boxed_or_and_return_the_selected_operand() {
 }
 
 #[test]
+fn a_mixin_method_call_requires_a_base_stub_for_virtual_dispatch() {
+    let scratch = Scratch::new("mixin-dispatch");
+    let file = scratch.path().join("mixin_dispatch.py");
+    let source = concat!(
+        "class Mixin:\n",
+        "    def show(self):\n",
+        "        print('mixin', self.value())\n",
+        "\n",
+        "class T(Mixin):\n",
+        "    def value(self):\n",
+        "        return 42\n",
+        "\n",
+        "def main() -> None:\n",
+        "    T().show()\n",
+        "\n",
+        "if __name__ == '__main__':\n",
+        "    main()\n",
+    );
+    let with_stub = source.replacen(
+        "class Mixin:\n",
+        "class Mixin:\n    def value(self) -> int:\n        raise NotImplementedError\n\n",
+        1,
+    );
+    // Verified against python3: declaring the slot preserves the subclass call.
+    for python in [source, with_stub.as_str()] {
+        fs::write(&file, python).unwrap();
+        let output = Command::new("python3")
+            .arg("-B")
+            .arg(&file)
+            .env("PYTHONHASHSEED", "0")
+            .output()
+            .unwrap();
+        assert_eq!(output.stdout, b"mixin 42\n");
+        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    fs::write(&file, source).unwrap();
+    let pkg = rypip::discover(&file).unwrap();
+    let error = rypip::convert(&pkg, &scratch.path().join("refused"), &ConvertOptions::default())
+        .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("self.value(...)") && message.contains("Mixin"), "{message}");
+    assert!(message.contains("mixin_dispatch.py") && message.contains("method stub"), "{message}");
+    assert!(message.contains("refuses to drop the call or invent a None result"), "{message}");
+
+    fs::write(&file, with_stub).unwrap();
+    let pkg = rypip::discover(&file).unwrap();
+    let krate = rypip::convert(&pkg, &scratch.path().join("crate"), &ConvertOptions::default()).unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/mixin_dispatch")).output().unwrap();
+    assert_eq!(output.stdout, b"mixin 42\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn a_mixin_uses_an_attribute_its_subclasses_define() {
     // A mixin's methods read and store `self.max_redirects`, which only
     // its subclasses assign (requests' SessionRedirectMixin, issue #335):
@@ -23319,6 +23914,75 @@ fn unittest_assert_raises_with_a_raise_builds_and_runs() {
         output.status.code(),
         Some(0),
         "2 passing assertRaises tests exit 0 like python3: {combined}"
+    );
+}
+
+#[test]
+fn unittest_assert_raises_as_cm_builds_and_runs() {
+    // Issue #523: the `as cm` context manager must suppress the caught
+    // exception and expose it as `cm.exception` after the block.
+    // Verified against python3: four tests pass, exit 0.
+    let scratch = Scratch::new("assert-raises-as-cm");
+    let file = scratch.path().join("t.py");
+    fs::write(
+        &file,
+        concat!(
+            "import unittest\n",
+            "import socket as s\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    def test_caught_exception(self) -> None:\n",
+            "        with self.assertRaises(ValueError) as cm:\n",
+            "            raise ValueError(\"boom\")\n",
+            "        self.assertEqual(str(cm.exception), \"boom\")\n",
+            "        self.assertEqual(type(cm.exception).__name__, \"ValueError\")\n",
+            "\n",
+            "    def test_unread_target(self) -> None:\n",
+            "        with self.assertRaises(ZeroDivisionError) as cm:\n",
+            "            1 // 0\n",
+            "\n",
+            "    def test_without_target(self) -> None:\n",
+            "        with self.assertRaises(ZeroDivisionError):\n",
+            "            1 // 0\n",
+            "\n",
+            "    def test_socket_timeout_alias(self) -> None:\n",
+            "        with self.assertRaises(s.timeout) as cm:\n",
+            "            raise TimeoutError(\"timed out\")\n",
+            "        self.assertEqual(type(cm.exception).__name__, \"TimeoutError\")\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(
+        status.success(),
+        "the assertRaises-as-cm crate must COMPILE: {}",
+        status
+    );
+
+    let output = Command::new(krate.root.join("target/debug/t"))
+        .output()
+        .expect("running generated binary");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("not declared as mutable") && !combined.contains("error["),
+        "no compile/runtime error text expected: {combined}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "four passing assertRaises tests exit 0 like python3: {combined}"
     );
 }
 
