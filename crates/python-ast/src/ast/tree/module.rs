@@ -8114,7 +8114,8 @@ fn refuse_cross_module_runner_inputs(
             ))
         };
         let c = &case.class;
-        for fixture in ["setUpClass", "tearDownClass"] {
+        for hook in super::testcase::Fixture::CLASS {
+            let fixture = hook.name();
             let Some(declaration) = class_fixture_declaration(c, fixture) else {
                 if c.cross_module_chain(&case.symbols, &case.options)
                     .iter()
@@ -8438,12 +8439,12 @@ fn emit_test_runner(
             for _ in 0..method_count {
                 class_skipped_tests.extend(quote!(__rython_result.add_skip();));
             }
-            let setup_class = if c.methods().any(|method| method.name == "setUpClass") {
+            let setup_class = if c.methods().any(|method| super::testcase::Fixture::from_name(&method.name) == Some(super::testcase::Fixture::ClassSetup)) {
                 quote!(#cname::setUpClass())
             } else {
                 quote!(Ok(()))
             };
-            let teardown_class = if c.methods().any(|method| method.name == "tearDownClass") {
+            let teardown_class = if c.methods().any(|method| super::testcase::Fixture::from_name(&method.name) == Some(super::testcase::Fixture::ClassTeardown)) {
                 quote!(#cname::tearDownClass())
             } else {
                 quote!(Ok(()))

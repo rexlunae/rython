@@ -10,7 +10,7 @@ use super::{
 use crate::{ClassDef, ExprType, FunctionDef, PythonOptions, StatementType, SymbolTableScopes};
 
 /// The Python-spelled unittest hooks emitted as Rust methods.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fixture {
     Setup,
     Teardown,
@@ -19,6 +19,17 @@ pub(crate) enum Fixture {
 }
 
 impl Fixture {
+    pub(crate) const CLASS: [Self; 2] = [Self::ClassSetup, Self::ClassTeardown];
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Setup => "setUp",
+            Self::Teardown => "tearDown",
+            Self::ClassSetup => "setUpClass",
+            Self::ClassTeardown => "tearDownClass",
+        }
+    }
+
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         match name {
             "setUp" => Some(Self::Setup),
@@ -42,10 +53,15 @@ pub(crate) enum Member {
 
 impl Member {
     pub(crate) fn from_name(name: &str) -> Self {
+        if let Some(fixture) = Fixture::from_name(name) {
+            return match fixture {
+                Fixture::Setup => Self::Setup,
+                Fixture::Teardown => Self::Teardown,
+                Fixture::ClassSetup | Fixture::ClassTeardown => Self::Helper,
+            };
+        }
         match name {
             "__init__" | "__new__" => Self::Constructor,
-            "setUp" => Self::Setup,
-            "tearDown" => Self::Teardown,
             "__getattribute__" | "__getattr__" | "__setattr__" | "__delattr__" => {
                 Self::AttributeHook
             }
