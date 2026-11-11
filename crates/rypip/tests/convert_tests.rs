@@ -25326,3 +25326,13 @@ fn unittest_skip_gate_rebinding_after_exit_false_is_harmless() {
     assert_eq!(stderr, "s\n----------------------------------------------------------------------\nRan 1 test in T\n\nOK (skipped=1)");
     assert_eq!(code, 0);
 }
+
+#[test]
+fn unittest_composed_method_fields_use_the_lifecycle_presence_proof() {
+    let (stdout, stderr, code) = unittest_run("composed_testcase",
+        include_str!("fixtures/composed_testcase.py"));
+    // Verified against python3.
+    assert_eq!(stdout, "7\n");
+    assert_eq!(stderr, "..\n----------------------------------------------------------------------\nRan 2 tests in T\n\nOK");
+    assert_eq!(code, 0);
+}

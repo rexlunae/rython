@@ -31515,3 +31515,9 @@ fn unittest_skip_gate_post_runner_write_does_not_hoist_a_static_shadow() {
     assert!(rust.contains("py_global_write"), "{rust}");
     assert!(!rust.contains("let FLAG") && !rust.contains("let mut FLAG"), "{rust}");
 }
+
+#[test]
+fn composed_testcase_fields_use_the_separate_lifecycle_proof() {
+    // Verified against python3: both methods initialize inner before any read.
+    compile(include_str!("../../rypip/tests/fixtures/composed_testcase.py"), "composed_testcase.py");
+}

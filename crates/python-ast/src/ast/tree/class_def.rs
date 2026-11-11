@@ -4841,7 +4841,12 @@ StatementType::Assign(a)
         let fields = self.own_fields(&symbols, &options)?;
         self.validate_thread_field_initialization(&fields, &symbols, &options)?;
         self.validate_thread_constructor_arguments(&symbols)?;
-        self.validate_composed_field_initialization(&fields)?;
+        // TestCase's separate lifecycle proof includes every field type
+        // and refuses manual construction/receiver escapes. Its method
+        // stores must not be subjected to the ordinary constructor rule.
+        if !self.is_testcase(&symbols, &options) {
+            self.validate_composed_field_initialization(&fields)?;
+        }
         self.validate_testcase_fields(&symbols, &options)?;
 
         // The embedded base struct occupies `__rython_base`; a user field of
