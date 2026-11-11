@@ -75,6 +75,7 @@ struct Analysis<'a> {
     subject: Subject,
     see_through: Option<SeeThrough<'a>>,
     owner: usize,
+    testcase: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -359,10 +360,8 @@ impl Analysis<'_> {
                 }
                 let mut paths = self.block(bodies[0], bound);
                 if let StatementType::With(with) = &stmt.statement
-                    && with.items.len() == 1
-                    && with.items[0].optional_vars.is_none()
-                    && super::with_stmt::assert_raises_cm_name(&with.items[0].context_expr)
-                        .is_some()
+                    && self.testcase
+                    && super::with_stmt::is_assert_raises_with(&with.items)
                 {
                     // assertRaises can suppress a body exception, but
                     // never a return/break/continue.
@@ -432,6 +431,7 @@ pub(crate) fn first_unbound_read(
     body: &[Statement],
     initialized: &[String],
     watched: &Names,
+    testcase: bool,
 ) -> Option<(String, usize)> {
     if watched.is_empty() {
         return None;
@@ -442,6 +442,7 @@ pub(crate) fn first_unbound_read(
         subject: Subject::Locals,
         see_through: None,
         owner: 0,
+        testcase,
     };
     let initialized = initialized
         .iter()
@@ -474,6 +475,7 @@ pub(crate) fn receiver_field_bindings<'a>(
         subject: Subject::ReceiverFields,
         see_through: Some(see_through),
         owner,
+        testcase: true,
     };
     let mut paths = analysis.block(body, initialized.clone());
     if let Some(read) = analysis
