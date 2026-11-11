@@ -322,6 +322,7 @@ fn isinstance_call(axis: &str, ty: &str) -> ExprType {
         func: Box::new(name_expr("isinstance")),
         args: vec![name_expr(axis), name_expr(ty)],
         keywords: Vec::new(),
+        lineno: None,
     })
 }
 

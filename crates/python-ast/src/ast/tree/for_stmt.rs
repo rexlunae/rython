@@ -236,6 +236,7 @@ impl CodeGen for For {
                 func: Box::new(c.args[0].clone()),
                 args: Vec::new(),
                 keywords: Vec::new(),
+                lineno: c.lineno,
             });
             let call = call_expr.to_rust(body_ctx.clone(), options.clone(), symbols.clone())?;
             let sentinel = crate::render_reused(

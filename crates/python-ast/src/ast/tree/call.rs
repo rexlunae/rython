@@ -7,6 +7,7 @@ use crate::{
     CodeGen, CodeGenContext, ExprType, Keyword, PythonOptions, SymbolTableNode, SymbolTableScopes,
     extract_required_attr,
 };
+use crate::ast::node::Node;
 use crate::ast::tree::std_module::variant as rt_variant;
 use crate::ast::tree::MathFn;
 
@@ -537,6 +538,7 @@ fn lower_assert_raises(
     let inner = crate::Call {
         func: Box::new(call.args[1].clone()),
         args: call.args[2..].to_vec(),
+        lineno: call.lineno,
         keywords: call
             .keywords
             .iter()
@@ -1284,6 +1286,7 @@ pub struct Call {
     pub func: Box<ExprType>,
     pub args: Vec<ExprType>,
     pub keywords: Vec<Keyword>,
+    pub lineno: Option<usize>,
 }
 
 impl<'a, 'py> FromPyObject<'a, 'py> for Call {
@@ -1298,6 +1301,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Call {
             func: Box::new(func),
             args,
             keywords,
+            lineno: ob.lineno(),
         })
     }
 }
@@ -3812,6 +3816,7 @@ impl<'a> CodeGen for Call {
                                     })),
                                     args: vec![c.args[0].clone(), self.args[1].clone()],
                                     keywords: Vec::new(),
+                                    lineno: c.lineno,
                                 };
                                 return isinstance.to_rust(ctx.clone(), options.clone(), symbols.clone());
                             }
@@ -8144,14 +8149,78 @@ impl<'a> CodeGen for Call {
                 };
                 // The class whose base `super()` targets: the class whose
                 // override body we are emitting (the super_target for a
-                // re-emitted override), or the enclosing class itself.
-                let super_owner = match &ctx {
-                    CodeGenContext::Trait {
-                        super_target: Some(definer),
-                        ..
-                    } => definer.clone(),
-                    _ => enclosing.to_string(),
-                };
+                // re-emitted override, even inside a loop or try in that
+                // body), or the enclosing class itself.
+                let super_owner = ctx.super_target().unwrap_or(enclosing).to_string();
+                // A TestCase family states its method resolution order
+                // statically (issue #524): `super().m(...)` reaches a later
+                // chain class's `m`, or TestCase's own method — a no-op
+                // fixture, or a loud refusal. The concrete subclass's MRO
+                // anchor is separate from `symbols`: a re-emitted method
+                // keeps its defining-module scope for all body expressions.
+                if attr.attr != "__init__"
+                    && let Some(resolved) = crate::ast::tree::testcase::resolve_testcase_super(
+                        enclosing,
+                        &super_owner,
+                        &self,
+                        &symbols,
+                        &options,
+                        ctx.testcase_anchor(),
+                    )
+                {
+                    let (target, chain) = resolved?;
+                    let crate::ast::tree::testcase::SuperTarget::Defined(index) = target else {
+                        // TestCase's fixture hook does nothing and returns
+                        // None (a statement emits nothing: Expr::to_rust).
+                        return Ok(quote!(stdpython::PyValue::None_));
+                    };
+                    let (definer, _, _, definer_module) = &chain[index];
+                    let mut sig = definer
+                        .methods()
+                        .find(|m| m.name == attr.attr)
+                        .cloned()
+                        .expect("testcase_super_target found the method on this class");
+                    if definer_module.is_some()
+                        && (!sig.args.defaults.is_empty()
+                            || sig.args.kw_defaults.iter().any(Option::is_some))
+                    {
+                        return Err(format!(
+                            "line {}: super().{}(...) in TestCase class `{}` reaches `{}.{}`, whose \
+                             default arguments are defined in another module; this is not \
+                             supported yet; pass every argument explicitly or define the \
+                             method in this module; rython refuses to evaluate the defaults \
+                             against this module's names",
+                            self.lineno.unwrap_or(0), attr.attr, super_owner, definer.name, attr.attr
+                        )
+                        .into());
+                    }
+                    crate::strip_self(&mut sig.args);
+                    let MappedArguments { prelude, args } = map_call_arguments(
+                        &sig,
+                        &self.args,
+                        &self.keywords,
+                        &ctx,
+                        &options,
+                        &symbols,
+                    )?;
+                    // The definer's super trampoline, as for any other
+                    // class family below. A cross-module definer's trait
+                    // is named by its crate path (this module imports the
+                    // struct, not its trait), as the supertrait bound is.
+                    let trait_ident = crate::safe_ident(&format!("{}Trait", definer.name));
+                    let definer_trait = match definer_module {
+                        Some(path) => {
+                            let segs = path.iter().map(|p| crate::safe_ident(p));
+                            quote!(crate #(::#segs)* :: #trait_ident)
+                        }
+                        None => quote!(#trait_ident),
+                    };
+                    let helper = crate::safe_ident(&format!("__rython_super_{}", attr.attr));
+                    return Ok(with_prelude(
+                        prelude,
+                        quote!(<Self as #definer_trait>::#helper(self, #(#args),*)?),
+                    ));
+                }
                 let class = match symbols.get(&super_owner) {
                     Some(SymbolTableNode::ClassDef(c)) => c.clone(),
                     // A CROSS-MODULE definer (a re-emitted override whose
@@ -12024,6 +12093,7 @@ fn lower_str_format_runtime(
             })),
             args: vec![value.clone()],
             keywords: Vec::new(),
+            lineno: None,
         })
         .to_rust(ctx.clone(), options.clone(), symbols.clone())
     };
@@ -13542,6 +13612,7 @@ fn lower_threading_thread(
         func: Box::new(target_expr),
         args: bound_args,
         keywords: Vec::new(),
+        lineno: call.lineno,
     };
     let body = inner.to_rust(ctx.clone(), body_options, symbols.clone())?;
     let target_name = target_name.as_str();

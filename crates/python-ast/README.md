@@ -201,6 +201,10 @@ def fibonacci(n):
 - **Advanced**: Lambda expressions, conditional expressions, subscripting
 
 #### ⚠️ Experimental/Limited Support
+- **unittest gates**: `skipIf`/`skipUnless` conditions that read module names
+  rebound between decoration and the runner call are refused, including
+  potential writes through functions declaring those names `global`. Only
+  effective method gates and inherited class gates are checked (#521).
 - **unittest fields**: `TestCase` methods can create instance fields without
   `__init__` or `setUp`. The runner follows the MRO for tests and fixtures
   and creates a fresh instance per test. Path-sensitive checks reject reads
@@ -209,7 +213,10 @@ def fibonacci(n):
   shadowed by fields (or class values shadowing methods). Manual construction of field-bearing cases and
   explicit lifecycle calls are refused; use `unittest.main()`. Helpers
   must initialize their own field reads; a
-  helper call supplies no initialization facts (issues #480, #511).
+  ordinary helper call supplies no initialization facts (issues #480, #511).
+  Statically resolved zero-argument TestCase `super()` calls analyze the
+  nearest modeled implementation's field reads/stores in the caller's proof;
+  direct `super().setUp()`/`tearDown()` use TestCase's no-op fixtures (#524).
 - **Async/Await**: Parsing supported, code generation experimental
 - **Decorators**: Parsing supported, code generation limited
 - **Exception Handling**: Parsing supported, code generation experimental

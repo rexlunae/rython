@@ -6397,7 +6397,6 @@ fn unittest_method_fields_refuse_opaque_attribute_presence() {
         ("    def test_a(self):\n        read = lambda: self.total\n        print(read())\n        self.total = 3\n", "capture"),
         ("    def test_a(self):\n        def read():\n            return self.total\n        print(read())\n        self.total = 3\n", "capture"),
         ("    def setUp(self):\n        self.test_a()\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "lifecycle access"),
-        ("    def setUp(self):\n        super().setUp()\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "receiver escape"),
         // A class data attribute an instance field shadows is accepted
         // (#519 review); reading it before the instance store is not.
         ("    total = 9\n    def test_a(self):\n        print(self.total)\n        self.total = 3\n", "attribute `self.total` may be read before assignment"),
@@ -6412,6 +6411,37 @@ fn unittest_method_fields_refuse_opaque_attribute_presence() {
         let error = compile_err(&format!("import unittest\nclass T(unittest.TestCase):\n    def {hook}(self, name: str):\n        pass\n    def test_a(self):\n        self.total = 3\n        print(self.total)\n"), "tc_hook.py");
         assert!(error.contains(&format!("method `{hook}`")) && error.contains("line 3")
             && error.contains("use ordinary assignments"), "{error}");
+    }
+}
+
+#[test]
+fn testcase_super_refusals_name_call_lines() {
+    let cases = [
+        (
+            "import unittest\nclass Mixin:\n    def setUp(self):\n        pass\nclass Extra:\n    pass\nclass T(Mixin, unittest.TestCase, Extra):\n    def setUp(self):\n        super().setUp()\n",
+            "method resolution order",
+            9,
+        ),
+        (
+            "import unittest\nclass T(unittest.TestCase):\n    def setUp(self):\n        super().unknown()\n",
+            "unittest.TestCase.unknown",
+            4,
+        ),
+        (
+            "import unittest\nclass Base(unittest.TestCase):\n    @classmethod\n    def setUp(cls):\n        pass\nclass T(Base):\n    def setUp(self):\n        super().setUp()\n",
+            "classmethod or staticmethod",
+            8,
+        ),
+        (
+            "import unittest\nclass T(unittest.TestCase):\n    def setUp(self):\n        super().setUp(1)\n",
+            "passes arguments",
+            4,
+        ),
+    ];
+    for (source, message, line) in cases {
+        let error = compile_err(source, "tc_super_refusal.py");
+        assert!(error.contains(message) && error.contains(&format!("line {line}:")), "{error}");
+        assert!(error.contains("refuses"), "{error}");
     }
 }
 
@@ -31436,10 +31466,27 @@ fn composed_fields_refuse_reader_invocation_and_escape_before_assignment() {
         "        def read() -> None:\n            print(self.inner.value)\n        read()\n        self.inner = Inner()\n",
         "        reader = lambda: self.inner.value\n        print(reader())\n        self.inner = Inner()\n",
         "        def read() -> None:\n            print(self.inner.value)\n        def wrapper() -> None:\n            read()\n        wrapper()\n        self.inner = Inner()\n",
-        "        consume(lambda: self.inner.value)\n        self.inner = Inner()\n",
+        "        print(list(map(lambda unused: self.inner.value, [0])))\n        self.inner = Inner()\n",
     ] {
         let error = compile_err(&format!("{inner}class Nested:\n    def __init__(self):\n{body}"), "composed_reader.py");
         assert!(error.contains("composed field `self.inner`") && error.contains("refuses"), "{error}");
+    }
+}
+
+#[test]
+fn unittest_skip_gate_rebinding_has_compiler_refusal_pins() {
+    // Verified against python3. Each of these four sources skips its test,
+    // including the helper defined before the decorated class and walrus RHS.
+    for source in [
+        include_str!("../../rypip/tests/fixtures/gate_rebind_helper.py"),
+        include_str!("../../rypip/tests/fixtures/gate_rebind_walrus.py"),
+        "import unittest\nFLAG = True\n@unittest.skipIf(FLAG, 'x')\nclass T(unittest.TestCase):\n    def test_a(self): pass\nFLAG = False\nif __name__ == '__main__':\n    unittest.main()\n",
+        "import unittest\nFLAG = False\nclass T(unittest.TestCase):\n    @unittest.skipUnless(FLAG, 'x')\n    def test_a(self): pass\nFLAG = True\nif __name__ == '__main__':\n    unittest.main()\n",
+    ] {
+        let error = compile_err(source, "gate_rebind.py");
+        assert!(error.contains("condition `FLAG`") && error.contains("rebound at line"), "{error}");
+        assert!(error.contains("decorator-time value") && error.contains("use an unchanged condition")
+            && error.contains("refuses to silently evaluate"), "{error}");
     }
 }
 
@@ -31450,4 +31497,21 @@ fn method_only_composed_fields_require_constructor_initialization() {
     // model boundary: no whole-program proof of callers' method ordering.
     let error = compile_err("class Inner:\n    def __init__(self):\n        self.value = 7\nclass Outer:\n    def __init__(self):\n        pass\n    def create(self):\n        self.inner = Inner()\n    def read(self) -> int:\n        return self.inner.value\n", "composed_method_only.py");
     assert!(error.contains("composed field `self.inner`") && error.contains("__init__"), "{error}");
+}
+
+#[test]
+fn unittest_skip_gate_reads_exclude_walrus_targets_and_nested_locals() {
+    // Verified against python3. All three conditions are True and skip T.
+    for condition in ["(FLAG := True)", "(lambda FLAG: FLAG)(True)", "[FLAG for FLAG in [True]][0]"] {
+        let source = format!("import unittest\nFLAG = False\n@unittest.skipIf({condition}, 'x')\nclass T(unittest.TestCase):\n    def test_a(self): pass\nFLAG = True\nif __name__ == '__main__':\n    unittest.main()\n");
+        let rust = compile(&source, "gate_local.py");
+        assert!(rust.contains("TextTestResult :: new"), "{rust}");
+    }
+}
+
+#[test]
+fn unittest_skip_gate_post_runner_write_does_not_hoist_a_static_shadow() {
+    let rust = compile(include_str!("../../rypip/tests/fixtures/gate_postrun.py"), "gate_postrun.py");
+    assert!(rust.contains("py_global_write"), "{rust}");
+    assert!(!rust.contains("let FLAG") && !rust.contains("let mut FLAG"), "{rust}");
 }

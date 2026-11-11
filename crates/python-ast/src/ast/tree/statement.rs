@@ -835,6 +835,15 @@ impl CodeGen for StatementType {
                     Ok(return_tokens(&ctx, quote!(())))
                 }
             }
+            // `return super().setUp()` reaching unittest.TestCase's own
+            // no-op fixture returns its None: a bare return (issue #524).
+            StatementType::Return(Some(e))
+                if crate::ast::tree::testcase::is_noop_testcase_super(
+                    &e.value, &ctx, &symbols, &options,
+                ) =>
+            {
+                StatementType::Return(None).to_rust(ctx, options, symbols)
+            }
             StatementType::Return(Some(e)) => {
                 if let ExprType::Call(call) = &e.value
                     && crate::ast::tree::system_exit::ExitCall::of(&call.func, &options, &symbols)

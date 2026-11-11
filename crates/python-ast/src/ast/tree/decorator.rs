@@ -624,6 +624,7 @@ pub fn try_lru_cache_factory(
         })),
         args: call_args,
         keywords: Vec::new(),
+        lineno: None,
     });
     let body = vec![crate::Statement {
         statement: crate::StatementType::Return(Some(crate::ast::tree::expression::Expr {

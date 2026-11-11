@@ -61,10 +61,20 @@ impl Paths {
     }
 }
 
+/// A call the receiver-field analysis sees through, given the call and the
+/// chain index of the class whose body contains it: the body the call
+/// runs (receiver spelled `self`) and the index its own calls resolve
+/// against. TestCase's `super().setUp()` resolved to a base class's
+/// fixture (issue #524).
+pub(crate) type SeeThrough<'a> =
+    &'a dyn Fn(&crate::Call, usize) -> Option<(&'a [Statement], usize)>;
+
 struct Analysis<'a> {
     watched: &'a Names,
     reads: HashMap<String, usize>,
     subject: Subject,
+    see_through: Option<SeeThrough<'a>>,
+    owner: usize,
     testcase: bool,
     // Optional constructor policy: an opaque receiver use may read any
     // watched field. Flow facts at this exact expression still apply.
@@ -198,7 +208,33 @@ impl Analysis<'_> {
                 for child in children {
                     self.expr(child, bound, line);
                 }
+                // The arguments are evaluated; then the callee's body runs.
+                if let ExprType::Call(call) = expr {
+                    self.call(call, bound);
+                }
             }
+        }
+    }
+
+    /// A statically resolved call's body runs here with the caller's
+    /// facts: its reads are checked against them, and its normal exits
+    /// supply the facts after the call. A raising callee leaves the
+    /// enclosing statement through its raise path, which already assumes
+    /// only the facts from before the statement.
+    fn call(&mut self, call: &crate::Call, bound: &mut Names) {
+        let Some((body, owner)) = self
+            .see_through
+            .and_then(|resolve| resolve(call, self.owner))
+        else {
+            return;
+        };
+        let caller = std::mem::replace(&mut self.owner, owner);
+        let mut paths = self.block(body, bound.clone());
+        self.owner = caller;
+        let mut normal = paths.take(Exit::Next);
+        join(&mut normal, paths.take(Exit::Return));
+        if let Some(after) = normal {
+            *bound = after;
         }
     }
 
@@ -420,6 +456,8 @@ pub(crate) fn first_unbound_read(
         watched,
         reads: HashMap::new(),
         subject: Subject::Locals,
+        see_through: None,
+        owner: 0,
         testcase,
         receiver_escape: None,
     };
@@ -438,13 +476,17 @@ pub(crate) fn first_unbound_read(
 /// The same path-sensitive analysis for TestCase's statically stored
 /// attributes. A successful fixture supplies only fields initialized on
 /// EVERY normal exit; a raising fixture never reaches the test. Calls do
-/// not establish facts about fields (helpers are checked independently).
-pub(crate) fn receiver_field_bindings(
-    body: &[Statement],
+/// not establish facts about fields (helpers are checked independently),
+/// except the calls `see_through` resolves, whose bodies run in place
+/// (`owner` is the chain index of the class defining `body`).
+pub(crate) fn receiver_field_bindings<'a>(
+    body: &'a [Statement],
     initialized: &Names,
-    watched: &Names,
+    watched: &'a Names,
+    owner: usize,
+    see_through: SeeThrough<'a>,
 ) -> Result<Option<Names>, (String, usize)> {
-    receiver_field_bindings_with_escapes(body, initialized, watched, None)
+    receiver_field_bindings_with_policy(body, initialized, watched, Some(see_through), owner, None)
 }
 
 /// Constructor field flow, with a policy for uses that can observe the
@@ -455,10 +497,23 @@ pub(crate) fn receiver_field_bindings_with_escapes(
     watched: &Names,
     receiver_escape: Option<&dyn Fn(&ExprType) -> bool>,
 ) -> Result<Option<Names>, (String, usize)> {
+    receiver_field_bindings_with_policy(body, initialized, watched, None, 0, receiver_escape)
+}
+
+fn receiver_field_bindings_with_policy<'a>(
+    body: &'a [Statement],
+    initialized: &Names,
+    watched: &'a Names,
+    see_through: Option<SeeThrough<'a>>,
+    owner: usize,
+    receiver_escape: Option<&'a dyn Fn(&ExprType) -> bool>,
+) -> Result<Option<Names>, (String, usize)> {
     let mut analysis = Analysis {
         watched,
         reads: HashMap::new(),
         subject: Subject::ReceiverFields,
+        see_through,
+        owner,
         testcase: true,
         receiver_escape,
     };
