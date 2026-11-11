@@ -130,6 +130,54 @@ fn comprehension_imported_scalars_and_counter_items_match_cpython() {
 }
 
 #[test]
+fn imported_module_name_matches_cpython_and_executable_entry_stays_main() {
+    let scratch = Scratch::new("imported-module-name");
+    let package_dir = scratch.path().join("MyPkg");
+    fs::create_dir_all(&package_dir).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"pkg\"\nversion = \"0.1.0\"\n\n[tool.setuptools]\npackages = [\"MyPkg\"]\n",
+    )
+    .unwrap();
+    fs::write(package_dir.join("__init__.py"), "").unwrap();
+    fs::write(
+        package_dir.join("helper.py"),
+        "def module_name() -> str:\n    return __name__\n",
+    )
+    .unwrap();
+    fs::write(
+        package_dir.join("main.py"),
+        "from .helper import module_name\n\ndef main() -> None:\n    print(module_name())\n    print(__name__)\n\nif __name__ == '__main__':\n    main()\n",
+    )
+    .unwrap();
+
+    let cpython = Command::new("python3")
+        .args(["-m", "MyPkg.main"])
+        .current_dir(scratch.path())
+        .output()
+        .unwrap();
+    assert!(cpython.status.success(), "{:?}", cpython.stderr);
+    // Verified against python3.
+    assert_eq!(cpython.stdout, b"MyPkg.helper\n__main__\n");
+
+    let package = rypip::discover(scratch.path()).unwrap();
+    let krate = rypip::convert(
+        &package,
+        &scratch.path().join("crate"),
+        &ConvertOptions::default(),
+    )
+    .unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/pkg"))
+        .output()
+        .unwrap();
+    // Verified against python3.
+    assert_eq!(output.stdout, b"MyPkg.helper\n__main__\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn immediate_list_generator_consumption_matches_cpython() {
     let scratch = Scratch::new("list-generator");
     let file = scratch.path().join("app.py");
@@ -13555,6 +13603,138 @@ fn run_package_status(
     )
 }
 
+#[test]
+fn package_main_inherits_from_a_sibling_module() {
+    let scratch = Scratch::new("main-cross-module-inheritance");
+    let krate = package_crate(
+        &scratch,
+        "maininherit",
+        &[
+            (
+                "base.py",
+                "class Base:\n    def __init__(self, value: int) -> None:\n        self.value = value\n    def get(self) -> int:\n        return self.value\n",
+            ),
+            (
+                "__main__.py",
+                "from .base import Base\nclass Child(Base):\n    def plus_one(self) -> int:\n        return self.get() + 1\ndef main() -> None:\n    child = Child(40)\n    print(child.value)\n    print(child.get())\n    print(child.plus_one())\nif __name__ == '__main__':\n    main()\n",
+            ),
+        ],
+    );
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated package failed to compile");
+    let output = Command::new(krate.root.join("target/debug/maininherit"))
+        .output()
+        .expect("running generated package");
+    // Verified against python3.
+    assert_eq!(output.stdout, b"40\n40\n41\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn imported_base_methods_and_fields_are_available_to_a_package_subclass() {
+    let scratch = Scratch::new("imported-base-inheritance");
+    let krate = package_crate(
+        &scratch,
+        "crossinherit",
+        &[
+            (
+                "base.py",
+                "class Base:\n    def __init__(self, value: int) -> None:\n        self.value = value\n    def get(self) -> int:\n        return self.value\n",
+            ),
+            (
+                "child.py",
+                "from .base import Base\nclass Child(Base):\n    def plus_one(self) -> int:\n        return self.get() + 1\n",
+            ),
+            (
+                "cli.py",
+                "from .child import Child\ndef main() -> None:\n    child = Child(40)\n    print(child.value)\n    print(child.get())\n    print(child.plus_one())\nif __name__ == '__main__':\n    main()\n",
+            ),
+        ],
+    );
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated package failed to compile");
+    let output = Command::new(krate.root.join("target/debug/crossinherit"))
+        .output()
+        .expect("running generated package");
+    // Verified against python3.
+    assert_eq!(output.stdout, b"40\n40\n41\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn cross_module_grandparent_constructor_runs() {
+    for entry in [true, false] {
+        let scratch = Scratch::new(if entry { "grandparent-entry" } else { "grandparent-module" });
+        let mut files = vec![
+            ("base.py", "class Grandparent:\n    def __init__(self, value: int) -> None:\n        print('grandparent', value)\n        self.value = value\n"),
+            ("middle.py", "from .base import Grandparent\nclass Parent(Grandparent):\n    pass\n"),
+        ];
+        let child = "from .middle import Parent\nclass Child(Parent):\n    pass\n";
+        let main = "def main() -> None:\n    child = Child(42)\n    print(child.value)\nif __name__ == '__main__':\n    main()\n";
+        let source = format!("{child}{main}");
+        if entry {
+            files.push(("__main__.py", &source));
+        } else {
+            files.push(("child.py", child));
+            files.push(("cli.py", "from .child import Child\ndef main() -> None:\n    child = Child(42)\n    print(child.value)\nif __name__ == '__main__':\n    main()\n"));
+        }
+        let krate = package_crate(&scratch, "grandinherit", &files);
+        let python = Command::new("python3")
+            .args(["-m", if entry { "grandinherit" } else { "grandinherit.cli" }])
+            .env("PYTHONHASHSEED", "0")
+            .current_dir(scratch.path())
+            .output()
+            .unwrap();
+        // Verified against python3.
+        assert_eq!(python.stdout, b"grandparent 42\n42\n");
+        assert!(python.stderr.is_empty());
+        assert_eq!(python.status.code(), Some(0));
+        assert!(build_generated(&krate.root).success());
+        let output = Command::new(krate.root.join("target/debug/grandinherit")).output().unwrap();
+        assert_eq!(output.stdout, python.stdout);
+        assert_eq!(output.stderr, python.stderr);
+        assert_eq!(output.status.code(), python.status.code());
+    }
+}
+
+#[test]
+fn cross_module_grandparent_constructor_argument_mismatches_are_loud() {
+    for (call, error) in [
+        ("Child()", "Grandparent.__init__() missing 1 required positional argument: 'value'"),
+        ("Child(1, 2)", "Grandparent.__init__() takes 2 positional arguments but 3 were given"),
+    ] {
+        let scratch = Scratch::new(if call == "Child()" { "grandparent-missing" } else { "grandparent-extra" });
+        let source = format!("from .middle import Parent\nclass Child(Parent):\n    pass\ndef main() -> None:\n    {call}\nif __name__ == '__main__':\n    main()\n");
+        let krate = package_crate(&scratch, "grandmismatch", &[
+            ("base.py", "class Grandparent:\n    def __init__(self, value: int) -> None:\n        print('constructor ran')\n        self.value = value\n"),
+            ("middle.py", "from .base import Grandparent\nclass Parent(Grandparent):\n    pass\n"),
+            ("__main__.py", &source),
+        ]);
+        let python = Command::new("python3")
+            .args(["-m", "grandmismatch"])
+            .env("PYTHONHASHSEED", "0")
+            .current_dir(scratch.path())
+            .output()
+            .unwrap();
+        // Verified against python3. Static constructor arity errors are
+        // loud build failures rather than CPython's runtime TypeError.
+        assert!(python.stdout.is_empty());
+        assert_eq!(python.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&python.stderr).ends_with(&format!("TypeError: {error}\n")));
+        let build = Command::new("cargo")
+            .arg("build")
+            .env_remove("RUSTFLAGS")
+            .current_dir(&krate.root)
+            .output()
+            .unwrap();
+        assert!(!build.status.success(), "invalid constructor call built successfully");
+        let stderr = String::from_utf8_lossy(&build.stderr);
+        assert!(stderr.contains("error[E0061]"), "{stderr}");
+    }
+}
+
 /// Convert, build and run a single-file program; its stderr with the
 /// `Ran N tests in T.TTTs` time normalized to `T`, and its exit code.
 fn unittest_report(name: &str, source: &str) -> (String, i32) {
@@ -23611,6 +23791,75 @@ fn unittest_assert_raises_with_a_raise_builds_and_runs() {
         output.status.code(),
         Some(0),
         "2 passing assertRaises tests exit 0 like python3: {combined}"
+    );
+}
+
+#[test]
+fn unittest_assert_raises_as_cm_builds_and_runs() {
+    // Issue #523: the `as cm` context manager must suppress the caught
+    // exception and expose it as `cm.exception` after the block.
+    // Verified against python3: four tests pass, exit 0.
+    let scratch = Scratch::new("assert-raises-as-cm");
+    let file = scratch.path().join("t.py");
+    fs::write(
+        &file,
+        concat!(
+            "import unittest\n",
+            "import socket as s\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    def test_caught_exception(self) -> None:\n",
+            "        with self.assertRaises(ValueError) as cm:\n",
+            "            raise ValueError(\"boom\")\n",
+            "        self.assertEqual(str(cm.exception), \"boom\")\n",
+            "        self.assertEqual(type(cm.exception).__name__, \"ValueError\")\n",
+            "\n",
+            "    def test_unread_target(self) -> None:\n",
+            "        with self.assertRaises(ZeroDivisionError) as cm:\n",
+            "            1 // 0\n",
+            "\n",
+            "    def test_without_target(self) -> None:\n",
+            "        with self.assertRaises(ZeroDivisionError):\n",
+            "            1 // 0\n",
+            "\n",
+            "    def test_socket_timeout_alias(self) -> None:\n",
+            "        with self.assertRaises(s.timeout) as cm:\n",
+            "            raise TimeoutError(\"timed out\")\n",
+            "        self.assertEqual(type(cm.exception).__name__, \"TimeoutError\")\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(
+        status.success(),
+        "the assertRaises-as-cm crate must COMPILE: {}",
+        status
+    );
+
+    let output = Command::new(krate.root.join("target/debug/t"))
+        .output()
+        .expect("running generated binary");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("not declared as mutable") && !combined.contains("error["),
+        "no compile/runtime error text expected: {combined}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "four passing assertRaises tests exit 0 like python3: {combined}"
     );
 }
 

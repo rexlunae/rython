@@ -8388,9 +8388,28 @@ fn docstring_value(body: &[crate::Statement]) -> Option<String> {
 /// `name` through a from-import whose dotted module's LAST segment equals
 /// this module's — because resolving each sibling's relative imports here
 /// would repeat the whole chain machinery; a false positive only emits an
-/// unused accessor-only trait (dead code, never an error), while a miss
+/// unused trait (dead code, never an error), while a miss
 /// leaves an unresolved `{Name}Trait` (E0405).
 pub(crate) fn class_subclassed_crate_wide(name: &str, options: &crate::PythonOptions) -> bool {
+    class_subclassed_in_modules(name, options, false)
+}
+
+/// Whether a class is subclassed by an import-reachable `__main__.py`
+/// module. Such a base needs its methods on a public trait for the entry
+/// module's inheritance implementation, even though entry classes cannot
+/// participate in the library's shared hierarchy enum (#530).
+pub(crate) fn class_subclassed_by_entry_module(
+    name: &str,
+    options: &crate::PythonOptions,
+) -> bool {
+    class_subclassed_in_modules(name, options, true)
+}
+
+fn class_subclassed_in_modules(
+    name: &str,
+    options: &crate::PythonOptions,
+    entry_only: bool,
+) -> bool {
     let Some(this_leaf) = options.this_module_path.last() else {
         return false;
     };
@@ -8410,6 +8429,9 @@ pub(crate) fn class_subclassed_crate_wide(name: &str, options: &crate::PythonOpt
     }
     for (path, module) in options.module_defs.iter() {
         if path[..] == options.this_module_path[..] {
+            continue;
+        }
+        if entry_only && path.last().is_none_or(|part| part != "__main__") {
             continue;
         }
         let mut classes = Vec::new();
@@ -8440,7 +8462,7 @@ pub(crate) fn class_subclassed_crate_wide(name: &str, options: &crate::PythonOpt
 pub fn module_class_traits(
     options: &PythonOptions,
     path: &[String],
-) -> std::collections::HashMap<String, Vec<String>> {
+) -> std::collections::HashMap<String, Vec<(Vec<String>, String)>> {
     module_class_info(options, path)
         .map(|info| info.traits.clone())
         .unwrap_or_default()
@@ -8950,24 +8972,82 @@ fn module_class_info(
             return table.get(path).cloned();
         }
     }
-    // First use: build the table for every module in one pass (the build
-    // consults only the module's own AST and symbols, so it cannot re-enter
-    // this cache).
+    // First build per-module symbols and class facts without following
+    // imported bases. The second pass follows those chains after publishing
+    // the table, so cross-module imports resolve without recursively
+    // rebuilding the cache.
     let mut table = std::collections::HashMap::new();
     // The call-site-inferred method parameters (method_params.rs), when
     // computed: every module's classes carry them as annotations, exactly
     // as the module's own conversion does.
     let inferred = crate::ast::tree::method_params::computed(options);
     for (module_path, module) in options.module_defs.iter() {
+        let mut module_options = options.clone();
+        let is_package = options
+            .module_defs
+            .keys()
+            .any(|k| k.len() > module_path.len() && k[..module_path.len()] == module_path[..]);
+        module_options.module_path = if is_package {
+            module_path.clone()
+        } else {
+            module_path[..module_path.len().saturating_sub(1)].to_vec()
+        };
+        module_options.this_module_path = module_path.clone();
         let info = match &inferred {
             Some(map) if !map.is_empty() => {
                 let mut annotated: crate::Module = (**module).clone();
                 crate::ast::tree::method_params::annotate(&mut annotated.raw.body, map);
-                module_class_info_for(&annotated)
+                module_class_info_for(&annotated, &module_options)
             }
-            _ => module_class_info_for(module),
+            _ => module_class_info_for(module, &module_options),
         };
         table.insert(module_path.clone(), std::rc::Rc::new(info));
+    }
+    // Publish the class/symbol facts before following imported base chains:
+    // `base_chain_with_options` resolves through this cache, so classifying
+    // every trait in one pass would recursively rebuild it.
+    *options.cross_module_classes.borrow_mut() =
+        CrossModuleClasses::Computed(std::rc::Rc::new(table.clone()));
+    let mut trait_updates = std::collections::HashMap::new();
+    for (module_path, _) in options.module_defs.iter() {
+        let Some(info) = table.get(module_path) else {
+            continue;
+        };
+        let mut module_options = options.clone();
+        let is_package = options
+            .module_defs
+            .keys()
+            .any(|k| k.len() > module_path.len() && k[..module_path.len()] == module_path[..]);
+        module_options.module_path = if is_package {
+            module_path.clone()
+        } else {
+            module_path[..module_path.len().saturating_sub(1)].to_vec()
+        };
+        module_options.this_module_path = module_path.clone();
+        let mut traits = info.traits.clone();
+        for class in info.classes.values() {
+            if traits.contains_key(&class.name) {
+                traits.insert(
+                    class.name.clone(),
+                    class
+                        .cross_module_chain(&info.symbols, &module_options)
+                        .iter()
+                        .map(|(ancestor, _, _, path)| {
+                            (
+                                path.clone().unwrap_or_else(|| module_path.clone()),
+                                format!("{}Trait", ancestor.name),
+                            )
+                        })
+                        .collect(),
+                );
+            }
+        }
+        trait_updates.insert(module_path.clone(), traits);
+    }
+    for (module_path, traits) in trait_updates {
+        if let Some(info) = table.get_mut(&module_path) {
+            std::rc::Rc::make_mut(info).traits = traits;
+        }
     }
     *options.cross_module_classes.borrow_mut() =
         CrossModuleClasses::Computed(std::rc::Rc::new(table));
@@ -8992,8 +9072,8 @@ impl CrossModuleClasses {
 }
 
 /// Build the class facts for one module: its symbol table, top-level
-/// classes by name, and hierarchy-class → trait names.
-fn module_class_info_for(module: &crate::Module) -> ModuleClassInfo {
+/// classes by name, and the set of classes that need trait imports.
+fn module_class_info_for(module: &crate::Module, options: &PythonOptions) -> ModuleClassInfo {
     let symbols = module.clone().find_symbols(SymbolTableScopes::new());
     let mut classes = std::collections::HashMap::new();
     // Classes come from the SYMBOL TABLE, not the raw body: find_symbols
@@ -9008,6 +9088,13 @@ fn module_class_info_for(module: &crate::Module) -> ModuleClassInfo {
     collect_class_defs(&module.raw.body, &mut class_list);
     let mut hierarchy = std::collections::HashSet::new();
     for c in &class_list {
+        // A class that is a base only in another module still emits a trait
+        // there for inherited dispatch. Include that trait in the import
+        // registry as well, so `from .base import Base` brings `BaseTrait`
+        // into scope with the class (#531).
+        if class_subclassed_crate_wide(&c.name, options) {
+            hierarchy.insert(c.name.clone());
+        }
         let has_real_base = c
             .bases
             .iter()
@@ -9042,12 +9129,7 @@ fn module_class_info_for(module: &crate::Module) -> ModuleClassInfo {
         {
             continue;
         }
-        let t: Vec<String> = c
-            .base_chain(&symbols)
-            .iter()
-            .map(|cc| format!("{}Trait", cc.name))
-            .collect();
-        traits.insert(c.name.clone(), t);
+        traits.insert(c.name.clone(), Vec::new());
     }
     ModuleClassInfo {
         symbols,

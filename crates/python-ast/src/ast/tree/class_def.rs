@@ -12,8 +12,8 @@
 //!   `&mut self` when the method stores through `self` (directly or by
 //!   calling another method of the class that does).
 //!
-//! Single inheritance (bases defined in the same module) lowers to a
-//! trait-per-class scheme:
+//! Single inheritance (including a known base imported from another module
+//! in the generated crate) lowers to a trait-per-class scheme:
 //!
 //! - A class that has a base, or is used as a base, emits `trait {Name}Trait`
 //!   with accessors for its fields (`fn f(&self) -> T`, `fn f_mut(&mut self)
@@ -32,7 +32,7 @@
 //!   own `__init__` synthesizes a forwarder so construction still runs the
 //!   first `__init__` on the MRO.
 //!
-//! Unsupported class constructs — multiple inheritance, unknown/imported
+//! Unsupported class constructs — multiple inheritance, unknown or external
 //! bases, class-level statements, attributes whose types can't be inferred —
 //! are conversion-time errors, never silently dropped: lowering that
 //! diverges from Python must fail loudly.
@@ -1497,20 +1497,9 @@ impl ClassDef {
         symbols: &SymbolTableScopes,
         options: &crate::PythonOptions,
     ) -> Option<FunctionDef> {
-        let mut chain = vec![self.clone()];
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        seen.insert(self.name.clone());
-        while let Some(base) = chain.last().and_then(|c| {
-            c.base_class_with_options(symbols, options)
-        }) {
-            if !seen.insert(base.name.clone()) {
-                break;
-            }
-            chain.push(base);
-        }
-        chain
+        self.cross_module_chain(symbols, options)
             .into_iter()
-            .find_map(|c| c.methods().find(|m| m.name == name).cloned())
+            .find_map(|(c, _, _, _)| c.methods().find(|m| m.name == name).cloned())
     }
 
     /// The class itself followed by every ancestor, nearest base first.
@@ -1613,19 +1602,17 @@ impl ClassDef {
         self.base_chain_impl(symbols, |c, s| c.base_class(s))
     }
 
-    /// An options-aware base chain: the plain chain cannot follow IMPORTED
-    /// bases (no options to resolve the module), so a chain that crosses a
-    /// module boundary (`PoolManager(RequestMethods)` with the field
-    /// stored in the imported base — the field-walk, the property check,
-    /// and the Option-ness resolution need it) stops at the boundary and
-    /// misses the ancestor's fields (E0615/E0609 in generic trait
-    /// defaults). The two share one walk so their shapes cannot drift.
+    /// Follow imported bases in their defining scopes, using the same
+    /// chain as MRO method lookup and ancestor trait generation.
     pub(crate) fn base_chain_with_options(
         &self,
         symbols: &SymbolTableScopes,
         options: &crate::PythonOptions,
     ) -> Vec<ClassDef> {
-        self.base_chain_impl(symbols, |c, s| c.base_class_with_options(s, options))
+        self.cross_module_chain(symbols, options)
+            .into_iter()
+            .map(|(class, _, _, _)| class)
+            .collect()
     }
 
     fn base_chain_impl(
@@ -4405,7 +4392,11 @@ impl CodeGen for ClassDef {
                 }
             },
         };
-        let in_hierarchy = base.is_some() || options.hierarchy_classes.contains(&self.name);
+        let in_hierarchy = base.is_some()
+            || options.hierarchy_classes.contains(&self.name)
+            || (options.hierarchy_roots.contains_key(&self.name)
+                && crate::ast::tree::module::class_subclassed_crate_wide(&self.name, &options))
+            || crate::ast::tree::module::class_subclassed_by_entry_module(&self.name, &options);
 
         // Only methods (plus a docstring, `pass`, and — for a @dataclass —
         // the annotated field declarations) are supported in class bodies.
@@ -4904,7 +4895,7 @@ StatementType::Assign(a)
         // Python constructs with `ClassName(args)`: default-initialize the
         // struct and run the first __init__ on the MRO. Call sites lower to
         // `ClassName::new(args)?` (see Call::to_rust).
-        let mro_init = self.method_on_mro("__init__", &symbols);
+        let mro_init = self.method_on_mro_with_options("__init__", &symbols, &options);
         let constructor = match mro_init.as_ref() {
             Some(init) => {
                 let mut params = init.args.clone();
@@ -4972,18 +4963,6 @@ StatementType::Assign(a)
         // ---- Trait machinery (inheritance hierarchies only) ----
         let trait_stream = if in_hierarchy {
             self.emit_trait(&base, &fields, &methods, &options, &symbols)?
-        } else if options.with_std_python
-            && crate::ast::tree::module::class_subclassed_crate_wide(&self.name, &options)
-        {
-            // A plain-struct class subclassed only CROSS-MODULE
-            // (urllib3's RequestMethods): the subclass modules' ancestor
-            // impls and supertrait bounds name `{Name}Trait`, so the
-            // trait must exist — but ACCESSOR-ONLY. Flipping the full
-            // machinery on (methods as trait defaults) re-routes the
-            // subclasses' inherited-call inference, measured at ~2,700
-            // errors in issue #137 round 18; the class's methods stay
-            // inherent and dispatch exactly as before.
-            self.emit_accessor_trait(&fields)
         } else {
             quote!()
         };
@@ -5473,44 +5452,6 @@ impl ClassDef {
     ///   ancestor's field accessors (walking the embedded `__rython_base`
     ///   chain) and the class's overrides of the ancestor's methods, written
     ///   against the concrete struct.
-    /// The accessor-only trait for a class subclassed only cross-module
-    /// (see the call site): field accessors, no method defaults, no base
-    /// accessors (a class with a base is `in_hierarchy` and takes the
-    /// full machinery instead). The declarations mirror the subclass-side
-    /// ancestor impls, which iterate the same `own_fields` in this
-    /// module's scope — the two sides cannot drift.
-    fn emit_accessor_trait(&self, fields: &[(String, crate::TypeInfo)]) -> TokenStream {
-        let class_name = crate::safe_ident(&self.name);
-        let trait_name = format_ident!("{}Trait", self.name);
-        let mut decls = TokenStream::new();
-        let mut impls = TokenStream::new();
-        for (fname, fti) in fields {
-            let f = crate::safe_ident(fname);
-            let f_mut = format_ident!("{}_mut", fname);
-            let fty = fti.to_rust_type();
-            decls.extend(quote! {
-                fn #f(&self) -> #fty;
-                fn #f_mut(&mut self) -> &mut #fty;
-            });
-            impls.extend(quote! {
-                fn #f(&self) -> #fty {
-                    self.#f.clone()
-                }
-                fn #f_mut(&mut self) -> &mut #fty {
-                    &mut self.#f
-                }
-            });
-        }
-        quote! {
-            pub trait #trait_name {
-                #decls
-            }
-            impl #trait_name for #class_name {
-                #impls
-            }
-        }
-    }
-
     fn emit_trait(
         &self,
         base: &Option<ClassDef>,
@@ -5594,9 +5535,10 @@ impl ClassDef {
             .iter()
             .filter(|m| {
                 m.name != "__init__"
-                    && base
-                        .as_ref()
-                        .map_or(true, |b| b.method_on_mro(&m.name, symbols).is_none())
+                    && base.as_ref().map_or(true, |b| {
+                        b.method_on_mro_with_options(&m.name, symbols, options)
+                            .is_none()
+                    })
             })
             .collect();
         let mut own_method_defaults = TokenStream::new();
