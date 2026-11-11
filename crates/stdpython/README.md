@@ -306,3 +306,8 @@ This project is part of the Rython compiler ecosystem.
 The std-tier unittest runner records direct class-fixture exceptions as errors
 (including AssertionError). The compiler preserves one fixture interval across
 adjacent aliases of the same TestCase; inherited class fixtures remain refused.
+
+The std-tier subtest runner continues ordinary tests after subtest failures,
+ends expected-failure methods at the first failure, and skips the test and
+teardown after unsuccessful setup subtests. Named context values must be
+immutable scalars or immutable tuples; mutable/boxed values are refused.

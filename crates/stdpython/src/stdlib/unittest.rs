@@ -27,7 +27,7 @@ fn format_subtest_context(
     params: &[(alloc::string::String, alloc::string::String)],
 ) -> alloc::string::String {
     if params.is_empty() {
-        return alloc::string::String::new();
+        return "(<subtest>)".into();
     }
     let values = params
         .iter()

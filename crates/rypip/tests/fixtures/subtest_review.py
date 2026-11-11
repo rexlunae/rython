@@ -27,4 +27,9 @@ class C(unittest.TestCase):
         """Documented test."""
         with self.subTest(n=4):
             self.assertEqual(1, 2)
-unittest.main()
+class D(unittest.TestCase):
+    def test_empty(self) -> None:
+        with self.subTest():
+            self.assertEqual(1, 2)
+if __name__ == "__main__":
+    unittest.main()
