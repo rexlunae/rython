@@ -35,8 +35,22 @@ pub fn assert_raises<T, F>(expected: &str, run: F) -> Result<(), PyException>
 where
     F: FnOnce() -> Result<T, PyException>,
 {
+    assert_raises_exception(expected, run).map(|_| ())
+}
+
+/// `with self.assertRaises(Exc) as cm:` — the context-manager form with a
+/// target (issue #523): run the body and hand back the CAUGHT exception,
+/// which CPython's `_AssertRaisesContext.__exit__` stores as
+/// `cm.exception`. A raised `Exc` (or subclass) is caught; a different
+/// exception propagates unchanged; no exception is CPython's
+/// `AssertionError: Exc not raised`. `expected` is the class's `__name__`
+/// (the conversion canonicalizes aliases: `IOError` is `OSError`).
+pub fn assert_raises_exception<T, F>(expected: &str, run: F) -> Result<PyException, PyException>
+where
+    F: FnOnce() -> Result<T, PyException>,
+{
     match run() {
-        Err(e) if e.matches(expected) => Ok(()),
+        Err(e) if e.matches(expected) => Ok(e),
         // A DIFFERENT exception propagates, exactly as CPython lets it out of
         // assertRaises (the test then errors rather than failing an
         // assertion) — the unexpected exception surfaces, not a rewrite.
@@ -598,7 +612,12 @@ impl TextTestResult {
     /// synthetic class-fixture error. CPython prints its status but does not
     /// include the error holder in the `Ran N tests` count.
     pub fn add_class_error(&mut self, description: &str, e: &PyException) {
-        self.add_exception(description, e);
+        let traceback = alloc::format!(
+            "Traceback (most recent call last):\n{}",
+            e.format_exception_only()
+        );
+        self.errors.push((description.into(), traceback));
+        status_char('E');
     }
 
     /// Run one test the way `TestCase.run` does: `setUp`, then the test
