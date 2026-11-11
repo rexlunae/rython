@@ -6856,7 +6856,7 @@ fn unittest_subtest_refuses_unmodeled_context_values() {
     );
     assert!(
         error.contains("`self.subTest(value=...)`")
-            && error.contains("without a supported Python repr")
+            && error.contains("without a supported immutable Python repr")
             && error.contains("refuses"),
         "{error}"
     );
