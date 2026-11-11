@@ -309,6 +309,14 @@ fn is_builtin_alias_name(name: &str) -> bool {
     matches!(name, "EnvironmentError" | "IOError")
 }
 
+/// The class `__name__` a builtin exception name binds: an alias
+/// (`IOError`, `EnvironmentError`) is `OSError`, any other name is itself
+/// — CPython's `assertRaises(IOError)` fails with `OSError not raised`
+/// (issue #523).
+pub(crate) fn builtin_class_dunder_name(name: &str) -> &str {
+    if is_builtin_alias_name(name) { "OSError" } else { name }
+}
+
 /// The `BuiltinException` variant ident for a NON-ALIAS builtin name
 /// (`ValueError` → `ValueError`): the round-52 fast path for a literal
 /// `except ValueError:` clause — the runtime compares the raised
@@ -793,10 +801,12 @@ pub(crate) fn classify_exception_init<'a>(
             StatementType::Expr(e) => match &e.value {
                 ExprType::Call(sc) => {
                     let is_super_init = match sc.func.as_ref() {
+                        // `super().__init__(...)` — the call, never a bare
+                        // `super` name (a module bound to `super` is not the
+                        // base class; issue #528).
                         ExprType::Attribute(attr) if attr.attr == "__init__" => {
-                            matches!(attr.value.as_ref(), ExprType::Name(n) if n.id == "super")
-                                || matches!(attr.value.as_ref(), ExprType::Call(c2)
-                                    if matches!(c2.func.as_ref(), ExprType::Name(n) if n.id == "super"))
+                            matches!(attr.value.as_ref(), ExprType::Call(c2)
+                                if matches!(c2.func.as_ref(), ExprType::Name(n) if n.id == "super"))
                         }
                         _ => false,
                     };

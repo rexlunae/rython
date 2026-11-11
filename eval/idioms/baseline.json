@@ -189,6 +189,9 @@
     "thread_instance_field": {
       "status": "pass"
     },
+    "thread_lazy_field": {
+      "status": "pass"
+    },
     "thread_nested_target": {
       "status": "pass"
     },

@@ -732,7 +732,7 @@ fn resolve_constant_name(
                     && crate::ast::tree::module::module_promoted_static_names(options, path)
                         .contains(&current)
                 {
-                    let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+                    let segs: Vec<_> = path.iter().map(|p| crate::module_ident(p)).collect();
                     let ident = crate::safe_ident(&current);
                     return Some(quote!((*crate #(::#segs)* :: #ident).clone()));
                 }
@@ -2885,9 +2885,15 @@ impl<'a> CodeGen for Call {
                     ).into());
                 }
                 let receiver = attr.value.clone().to_rust(ctx, options, symbols)?;
+                // An Option-typed receiver's None is the Python value None
+                // (the thread-field guard proves the absent state before
+                // the first store is never read): CPython raises a
+                // catchable AttributeError naming the method (issue #529).
                 let receiver = if matches!(ty, crate::TypeInfo::Option(_)) {
-                    let message = format!("AttributeError: 'NoneType' object has no attribute '{}'", attr.attr);
-                    quote!((#receiver).as_ref().unwrap_or_else(|| panic!(#message)))
+                    let message = format!("'NoneType' object has no attribute '{}'", attr.attr);
+                    quote!((#receiver).as_ref().ok_or_else(|| {
+                        PyException::new("AttributeError", #message)
+                    })?)
                 } else {
                     receiver
                 };
@@ -8003,7 +8009,7 @@ impl<'a> CodeGen for Call {
                 // class itself, which it may not (`from . import
                 // sessions` binds the MODULE, requests' api.py).
                 let cname = crate::safe_ident(&attr.attr);
-                let path_parts = mod_path.iter().map(|p| crate::safe_ident(p));
+                let path_parts = mod_path.iter().map(|p| crate::module_ident(p));
                 let mut args = Vec::new();
                 for arg in &self.args {
                     args.push(arg.clone().to_rust(
@@ -8127,16 +8133,11 @@ impl<'a> CodeGen for Call {
             // (inherent context) or `self.base().m(args)` (generic trait
             // default). Argument mapping uses the base's signature, exactly
             // like any other user-class method call. The receiver is
-            // `super()` — a bare call — not a bare name.
-            let is_super = match attr.value.as_ref() {
-                ExprType::Name(n) => n.id == "super",
-                ExprType::Call(c) => {
-                    matches!(c.func.as_ref(), ExprType::Name(n) if n.id == "super")
-                        && c.args.is_empty()
-                        && c.keywords.is_empty()
-                }
-                _ => false,
-            };
+            // `super()` — a bare call — never a bare name: `super.m()`
+            // reads an attribute of whatever the NAME `super` binds (a
+            // module named `super` — issue #528 — whose call is the
+            // module function's, not the base class method's).
+            let is_super = is_super_reference(attr.value.as_ref());
             if is_super {
                 let Some(enclosing) = ctx.enclosing_class_name() else {
                     return Err("super() used outside a method".to_string().into());
@@ -11092,6 +11093,22 @@ let mutating_self_field = boxed_self_ref_receiver
                     },
                 ))
         {
+            // A subclassed receiver can dispatch to a method defined only
+            // by a subclass (issue #520). A typed base stub gives the trait
+            // machinery that slot; the fallback must not erase the call.
+            if options.hierarchy_roots.contains_key(&class.name) {
+                return Err(format!(
+                    "call to `{}.{}(...)` on subclassed class `{}` cannot be \
+                     resolved as a supported method or callable field yet; \
+                     declare a method stub with concrete argument/return types \
+                     on `{}` and override it in subclasses; \
+                     rython refuses to drop the call or invent a None result",
+                    crate::ast::tree::call::expr_chain_spelling(&attr.value),
+                    attr.attr,
+                    class.name,
+                    class.name
+                ).into());
+            }
             options.definition_warnings.borrow_mut().push(format!(
                 "call to `{}.{}(...)` is dropped: the member is neither a \
                  method nor a field of `{}` (the member is an unmodeled \
@@ -12531,12 +12548,14 @@ fn is_docstring_notimpl_stub(f: &crate::FunctionDef) -> bool {
 /// receivers return None and fall through to the generic lowering — where
 /// a genuine user-method call fails to compile (loud), never silently
 /// drops exception propagation.
-/// Whether `expr` is a `super` reference: the bare Name (defensive; Python
-/// has no `super.foo` form) or the real shape, a `super()` Call. The
-/// receiver of `super().m(...)`.
+/// Whether `expr` is a `super` reference: a zero-argument `super()` Call,
+/// the receiver of `super().m(...)`. A bare `super` NAME is not one:
+/// Python has no `super.m` sugar, so `super.m()` reads an attribute of
+/// whatever the name binds — a module named `super` (`from . import
+/// super`, issue #528) calls the module's function, and treating it as
+/// `super().m()` silently called the base class's method instead.
 fn is_super_reference(expr: &ExprType) -> bool {
     match expr {
-        ExprType::Name(n) => n.id == "super",
         ExprType::Call(c) => {
             c.args.is_empty()
                 && c.keywords.is_empty()

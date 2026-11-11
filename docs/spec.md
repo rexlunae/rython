@@ -720,6 +720,16 @@ Python's with-lock discipline. `with lock as x:` (CPython binds
 
 ### 5.4 Imports
 
+Package submodule names retain their Python case. Rust keywords are
+escaped consistently in module declarations and references (`impl.py`
+becomes `pub mod r#impl;`). Names that cannot be raw identifiers are
+renamed (`self` → `self_`, `Self` → `Self_`, `super` → `super_`,
+`crate` → `crate_`, `_` → `__rython_underscore`); sibling names that
+collide after renaming are conversion errors. An import binding the local
+name `self` is refused: use an alias such as `from . import self as
+self_module`. A module named `mod` uses an explicit file path to avoid
+overwriting its package's `mod.rs` (issue #528).
+
 Runtime stdlib modules are already in scope in generated code (each
 module emits `use stdpython::*;`), so `import math` lowers to nothing.
 Consequences, all enforced loudly:
@@ -748,6 +758,12 @@ Consequences, all enforced loudly:
   spelling.
 - Imports of user modules within the converted package resolve to the
   generated Rust modules.
+- In package conversion, an unshadowed module-level `__name__` read is
+  the module's dotted Python import name (`MyPkg.helper` for
+  `MyPkg/helper.py`), preserving its import spelling independently of
+  sanitized Rust module identifiers; the separately generated executable
+  entry copy uses `__main__`. The package integration transcript pins both
+  against CPython (issue #534).
 - **Import guards are decided statically.** A module-level
   `try: import X … except ImportError:` (bare, or a tuple of
   ImportError/AttributeError) folds at conversion time, because
@@ -1891,7 +1907,15 @@ impl Point {
 - **TestCase method-created fields** (issues #480, #511): a direct or
   inherited `unittest.TestCase` subclass discovers `self.attr = ...`
   through the shared method-field analysis even without `__init__` or
-  `setUp`. The runner follows the MRO for tests, overrides, default
+  `setUp`. `unittest.main()` discovers TestCase classes bound in the
+  entry module, including supported `from ... import` bindings and
+  aliases; each bound name is loaded in name order, and report IDs retain
+  the class's defining module. Top-level classes selected by statically
+  resolved version guards remain discoverable after normalization.
+  Bindings the runner cannot track statically (including escaped,
+  unpacked, or walrus-bound TestCase values) are conversion errors rather
+  than silently omitted. The runner follows the MRO for tests,
+  overrides, default
   arguments, fixtures, and gates, and constructs a fresh instance for
   every test. Each ancestor's base resolves in the module that defines
   it, so `Child(Middle)` is a TestCase when `Middle` comes from another
@@ -1926,6 +1950,14 @@ impl Point {
   no successful exit, neither the test nor `tearDown` is reached.
   These restrictions prevent Rust construction defaults from becoming
   observable as Python values before assignment.
+- **`assertRaises` context managers** catch the expected exception and
+  propagate an unexpected one. The `as cm` form supports reads of
+  `cm.exception` after the block; other uses or bindings of the context
+  object, and reads before the block completes are refused. A later read is
+  also refused when control flow cannot prove the target was bound (for
+  example, when the `with` is conditional), as is control flow escaping the
+  block; these cases would silently change context-manager semantics
+  (issue #523).
 - **Construction**: `Point(1.0, 2.0)` lowers to `Point::new(…)?`. The
   synthesized `new` defaults the struct then runs `__init__`. A
   user-defined method named `new` is a loud error.
@@ -1933,12 +1965,18 @@ impl Point {
   method mutates through `self`, directly or transitively through its
   own calls (the analysis follows the call graph, including composed
   fields).
-- **Rejected, loudly**: inheritance from anything but `object`, class
+- **Rejected, loudly**: unknown or external inheritance bases, class
   attributes and any class-level statement besides methods/docstring/
   `pass`, nested classes, `async` methods, and `*args`/`**kwargs` in
-  `__init__`. (For other methods, the `*args`/`**kwargs` rejection
-  fires at each call site; a definition that is never called slips
-  through to rustc.)
+  `__init__`. A known base imported from another module in the generated
+  package is supported; its constructor, fields, and methods participate
+  in the derived class's MRO and the imported traits are brought into scope
+  at call sites. This includes a class declared in package `__main__.py`,
+  which is compiled at the binary crate root. Such entry classes are not
+  included in library-side hierarchy sum types, since the library has no
+  Rust `__main__` module to name. (For other methods, the `*args`/`**kwargs`
+  rejection fires at each call site; a definition that is never called
+  slips through to rustc.)
 - **Dunder protocols are mostly not modeled** — `__init__` has
   semantics, and the MAPPING trio is wired: a user class's own
   `__getitem__` receives `x[k]`, its `__setitem__` receives
@@ -1971,7 +2009,12 @@ impl Point {
   `AttributeError: 'C' object has no attribute 'f'` at the access
   (§12.2). The attribute needs one type across the subclasses that
   assign it, and the class's whole subtree must live in one module;
-  otherwise the read stays the loud unknown field. `type(self)` and
+  otherwise the read stays the loud unknown field. A call such as
+  `self.value()` to a method defined only by subclasses is a conversion
+  error (issue #520), not a dropped call returning `None`. Declare a
+  base method stub with concrete argument/return types (for example,
+  `def value(self) -> int: raise NotImplementedError`) and override it
+  in subclasses to use virtual dispatch. `type(self)` and
   `type(self).__name__` in an inherited method name the INSTANCE's
   class (the trait default's implementor, issue #411), as in CPython.
   Rust structs have no subtyping, so a slot
@@ -2615,8 +2658,10 @@ instance fields, including `import threading as th` and
 `Option<threading::Thread>` as initially absent storage: struct defaults do
 not construct threads, consume thread names, or run targets. The real
 assignment evaluates `args` once at construction, then stores the handle;
-`start` alone runs the target. A thread field must be initialized by an
-unconditional top-level assignment in `__init__` before it is read or
+`start` alone runs the target. A field initialized to `None` in `__init__`
+may later receive a Thread and remains an `Option<threading::Thread>`
+(issue #529). A thread field must be initialized by an unconditional
+top-level assignment in `__init__` before it is read or
 `self` escapes/is called. Fields read by constructor arguments also need
 preceding unconditional stores: this holds for EVERY Thread constructor in
 the class. In `__init__`, the store must come earlier in its top-level
@@ -3021,6 +3066,7 @@ accepted as permanent spec:
 | Immediate `list(... for ...)` construction reuses list-comprehension lowering. Comprehensions refuse borrowed mutable container outputs, mutable walrus results, identity casts, and unresolved outputs without an ownership proof rather than silently detach them from their source; immutable values and fresh container literals remain supported (§4.4) | Correct-or-loud (issues #506, #507) |
 | Static subclass-registry comprehensions construct fresh instances from the converted hierarchy. Filters and iterator/constructor arguments are refused instead of discarded (§4.4); live runtime class discovery is not modeled | Correct-or-loud (issue #509); static discovery remains a model limit |
 | Calls through unresolved callable parameters fail conversion, naming the parameter and requesting concrete `typing.Callable` argument/return types. The old fallback skipped the invocation and returned `None`, including when a same-named scalar module function made a comprehension output appear immutable | Loud (issue #510); typed and boxed callable paths remain modeled |
+| An unresolved method call on a polymorphic base class, including `self.m()` where only a subclass defines `m`, fails conversion rather than skipping the call and returning `None`. Declare a typed method stub on the base to give virtual dispatch a slot | Loud (issue #520); declared base methods and subclass overrides remain modeled |
 | `with` does not call `__enter__`/`__exit__` (Drop approximates cleanup) | Model limit; correct for the supported file objects |
 | `is`/`is not` on non-`None` operands lower to `==`/`!=` | Model limit (no identity model) |
 | `raise X from Y` folds the cause into the message; no `__cause__` | Model limit |

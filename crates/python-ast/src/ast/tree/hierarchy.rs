@@ -237,7 +237,29 @@ pub fn compute_roots(
     // and its classes lower as before the index existed (concrete
     // structs) rather than joining the wrong subtree.
     let mut defined_in: BTreeMap<String, usize> = BTreeMap::new();
-    let per_module = crate_emitted_classes(this_body, this_classes, options);
+    let mut per_module = crate_emitted_classes(this_body, this_classes, options);
+    // `__main__.py` is compiled as the binary crate root, not as the
+    // `crate::<package>::__main__` module. Its classes cannot be variants
+    // in the library's shared hierarchy enum, where that Rust module does
+    // not exist.
+    per_module.retain(|(path, _, _, _)| {
+        path.as_ref()
+            .and_then(|path| path.last())
+            .is_none_or(|part| part != "__main__")
+    });
+    // A package's `__main__.py` is compiled at the binary crate root. Its
+    // classes cannot participate in hierarchy enums emitted by sibling
+    // modules: those enums are shared with the library crate, where the
+    // entry class does not exist. Keep hierarchies wholly local to that
+    // entry module; ordinary sibling-module inheritance is still available
+    // through the generated base traits.
+    if options
+        .this_module_path
+        .last()
+        .is_some_and(|part| part == "__main__")
+    {
+        per_module.truncate(1);
+    }
     for (_, defs, _, _) in &per_module {
         for c in defs {
             *defined_in.entry(c.name.clone()).or_insert(0) += 1;
@@ -343,7 +365,7 @@ pub fn variant_path(v: &Variant) -> proc_macro2::TokenStream {
     match &v.module_path {
         None => quote::quote!(#ident),
         Some(path) => {
-            let segs: Vec<_> = path.iter().map(|p| crate::safe_ident(p)).collect();
+            let segs: Vec<_> = path.iter().map(|p| crate::module_ident(p)).collect();
             quote::quote!(crate #(::#segs)* :: #ident)
         }
     }

@@ -411,6 +411,7 @@ fn rename_statement(
                 } else {
                     rename_in_body(&w.body, from, to, mode)?
                 },
+                assert_raises_target: w.assert_raises_target,
                 lineno: w.lineno,
                 col_offset: w.col_offset,
                 end_lineno: w.end_lineno,
