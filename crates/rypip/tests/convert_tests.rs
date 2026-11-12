@@ -13821,6 +13821,136 @@ fn unittest_helpers_class_defaults_and_static_members_match_cpython() {
     assert_eq!(code, 0);
 }
 
+#[test]
+fn unittest_class_fixtures_match_cpython() {
+    let (stdout, stderr, code) = unittest_run(
+        "ut_class_fixtures",
+        concat!(
+            "import unittest\n",
+            "\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    @classmethod\n",
+            "    def setUpClass(cls) -> None:\n",
+            "        print(\"class setup\")\n",
+            "\n",
+            "    @classmethod\n",
+            "    def tearDownClass(cls) -> None:\n",
+            "        print(\"class teardown\")\n",
+            "\n",
+            "    def test_a(self) -> None:\n",
+            "        print(\"test a\")\n",
+            "\n",
+            "    def test_b(self) -> None:\n",
+            "        print(\"test b\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+    );
+    // Verified against python3 (3.14.4): stdout and default TextTestRunner
+    // report, with the elapsed time normalized by unittest_run.
+    assert_eq!(
+        stdout,
+        "class setup\ntest a\ntest b\nclass teardown\n"
+    );
+    assert_eq!(
+        stderr,
+        "..\n----------------------------------------------------------------------\nRan 2 tests in T\n\nOK"
+    );
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn unittest_class_fixture_errors_and_skips_match_cpython() {
+    let (stdout, stderr, code) = unittest_run(
+        "ut_class_fixture_errors",
+        concat!(
+            "import unittest\n",
+            "\n",
+            "\n",
+            "class A(unittest.TestCase):\n",
+            "    @classmethod\n",
+            "    def setUpClass(cls) -> None:\n",
+            "        print(\"bad setup\")\n",
+            "        raise RuntimeError(\"setup broke\")\n",
+            "\n",
+            "    @classmethod\n",
+            "    def tearDownClass(cls) -> None:\n",
+            "        print(\"bad teardown\")\n",
+            "\n",
+            "    def test_never(self) -> None:\n",
+            "        print(\"unreachable test\")\n",
+            "\n",
+            "\n",
+            "@unittest.skip(\"skip class\")\n",
+            "class B(unittest.TestCase):\n",
+            "    @classmethod\n",
+            "    def setUpClass(cls) -> None:\n",
+            "        print(\"skipped setup\")\n",
+            "\n",
+            "    @classmethod\n",
+            "    def tearDownClass(cls) -> None:\n",
+            "        print(\"skipped teardown\")\n",
+            "\n",
+            "    def test_skip(self) -> None:\n",
+            "        print(\"unreachable skipped test\")\n",
+            "\n",
+            "\n",
+            "class C(unittest.TestCase):\n",
+            "    @classmethod\n",
+            "    def setUpClass(cls) -> None:\n",
+            "        print(\"good setup\")\n",
+            "\n",
+            "    @classmethod\n",
+            "    def tearDownClass(cls) -> None:\n",
+            "        print(\"good teardown\")\n",
+            "\n",
+            "    def test_run(self) -> None:\n",
+            "        print(\"good test\")\n",
+            "\n",
+            "\n",
+            "class D(unittest.TestCase):\n",
+            "    def test_run(self) -> None:\n",
+            "        print(\"last test\")\n",
+            "\n",
+            "    @classmethod\n",
+            "    def tearDownClass(cls) -> None:\n",
+            "        print(\"bad cleanup\")\n",
+            "        raise RuntimeError(\"cleanup broke\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+    );
+    // Verified against python3 (3.14.4). CPython's class-fixture traceback
+    // frames are omitted under the existing no-frames ledger entry.
+    assert_eq!(
+        stdout,
+        "bad setup\ngood setup\ngood test\ngood teardown\nlast test\nbad cleanup\n"
+    );
+    assert_eq!(
+        stderr,
+        concat!(
+            "Es..E\n",
+            "======================================================================\n",
+            "ERROR: setUpClass (__main__.A)\n",
+            "----------------------------------------------------------------------\n",
+            "Traceback (most recent call last):\nRuntimeError: setup broke\n\n",
+            "======================================================================\n",
+            "ERROR: tearDownClass (__main__.D)\n",
+            "----------------------------------------------------------------------\n",
+            "Traceback (most recent call last):\nRuntimeError: cleanup broke\n\n",
+            "----------------------------------------------------------------------\n",
+            "Ran 3 tests in T\n\n",
+            "FAILED (errors=2, skipped=1)",
+        )
+    );
+    assert_eq!(code, 1);
+}
+
 /// Convert a package whose conversion must fail; the error text.
 fn package_convert_err(scratch: &Scratch, pkg_name: &str, files: &[(&str, &str)]) -> String {
     fs::write(
@@ -13912,6 +14042,52 @@ fn unittest_main_runs_a_testcase_imported_into_the_entry_module() {
         "{stderr}"
     );
     assert!(stderr.contains("Ran 1 test in "), "{stderr}");
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn unittest_imported_class_fixtures_match_cpython() {
+    let scratch = Scratch::new("ut_imported_class_fixtures");
+    let krate = package_crate(
+        &scratch,
+        "ut_imported_case",
+        &[
+            (
+                "cases.py",
+                concat!(
+                    "import unittest\n\n\n",
+                    "class Imported(unittest.TestCase):\n",
+                    "    @classmethod\n",
+                    "    def setUpClass(cls) -> None:\n",
+                    "        print(\"imported setup\")\n\n",
+                    "    @classmethod\n",
+                    "    def tearDownClass(cls) -> None:\n",
+                    "        print(\"imported teardown\")\n",
+                    "        raise RuntimeError(\"cleanup broke\")\n\n",
+                    "    def test_imported(self) -> None:\n",
+                    "        print(\"imported test\")\n",
+                    "        self.assertEqual(1, 2)\n",
+                ),
+            ),
+            (
+                "cli.py",
+                "import unittest\nfrom .cases import Imported as Alias\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+            ),
+        ],
+    );
+    assert!(build_generated(&krate.root).success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/ut_imported_case"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3: the class's defining module names both
+    // its tests and its class-fixture error, even through an import alias.
+    assert_eq!(output.stdout, b"imported setup\nimported test\nimported teardown\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("FE\n"), "{stderr}");
+    assert!(stderr.contains("ERROR: tearDownClass (ut_imported_case.cases.Imported)"), "{stderr}");
+    assert!(stderr.contains("FAIL: test_imported (ut_imported_case.cases.Imported.test_imported)"), "{stderr}");
+    assert!(stderr.contains("Ran 1 test in "), "{stderr}");
+    assert!(stderr.contains("FAILED (failures=1, errors=1)"), "{stderr}");
     assert_eq!(output.status.code(), Some(1));
 }
 
@@ -14080,6 +14256,55 @@ fn unittest_cross_module_runner_inputs_and_qualified_construction_are_refused() 
     );
     assert!(error.contains("manual construction of TestCase `T` with instance fields")
         && error.contains("cli.py") && error.contains("refuses"), "{error}");
+}
+
+#[test]
+fn unittest_unsupported_class_fixture_shapes_are_refused() {
+    let scratch = Scratch::new("ut_bad_class_fixture");
+    let error = package_convert_err(
+        &scratch,
+        "ut_bad_class_fixture",
+        &[(
+            "test_bad.py",
+            "import unittest\n\n\nclass T(unittest.TestCase):\n    def setUpClass(self) -> None:\n        pass\n\n    def test_a(self) -> None:\n        pass\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+        )],
+    );
+    assert!(
+        error.contains("`setUpClass` at line 5 must be a `@classmethod`")
+            && error.contains("refuses"),
+        "{error}"
+    );
+
+    let scratch = Scratch::new("ut_inherited_class_fixture");
+    let error = package_convert_err(
+        &scratch,
+        "ut_inherited_class_fixture",
+        &[(
+            "test_bad.py",
+            "import unittest\n\n\nclass Base(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls) -> None:\n        pass\n\n\nclass Child(Base):\n    def test_a(self) -> None:\n        pass\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+        )],
+    );
+    assert!(
+        error.contains("TestCase `Child` inherits `setUpClass` from another class")
+            && error.contains("refuses"),
+        "{error}"
+    );
+
+    let scratch = Scratch::new("ut_rebound_class_fixture");
+    let error = package_convert_err(
+        &scratch,
+        "ut_rebound_class_fixture",
+        &[(
+            "test_bad.py",
+            "import unittest\n\n\nclass T(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls) -> None:\n        pass\n\n    setUpClass = None\n\n    def test_a(self) -> None:\n        pass\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+        )],
+    );
+    assert!(
+        error.contains("class member `setUpClass`")
+            && error.contains("not supported yet")
+            && error.contains("refuses"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -14261,6 +14486,62 @@ fn unittest_main_prints_cpythons_report() {
         )
     );
     assert_eq!(code, 5);
+}
+
+#[test]
+fn unittest_subtests_record_failures_and_continue() {
+    let (stdout, stderr, code) = unittest_run(
+        "ut_subtests",
+        concat!(
+            "import unittest\n",
+            "\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    @unittest.expectedFailure\n",
+            "    def test_expected_subtest(self):\n",
+            "        with self.subTest(step=10):\n",
+            "            self.assertEqual(1, 2)\n",
+            "\n",
+            "    def test_subtests(self):\n",
+            "        for i in range(3):\n",
+            "            with self.subTest(group=\"all\"):\n",
+            "                with self.subTest(step=i):\n",
+            "                    print(\"ran\", i)\n",
+            "                    self.assertEqual(i, 1)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+    );
+    // Verified against python3: stdout is `ran 0/1/2`; stderr has two
+    // subtest-specific failures plus one expected-failure status, while
+    // `Ran` counts methods, not subtests.
+    // The traceback frame lines are omitted per the no-frames entry in §12.
+    assert_eq!(stdout, "ran 0\nran 1\nran 2\n");
+    assert_eq!(
+        stderr,
+        concat!(
+            "xFF\n",
+            "======================================================================\n",
+            "FAIL: test_subtests (__main__.T.test_subtests) (step=0, group='all')\n",
+            "----------------------------------------------------------------------\n",
+            "Traceback (most recent call last):\n",
+            "AssertionError: 0 != 1\n",
+            "\n",
+            "======================================================================\n",
+            "FAIL: test_subtests (__main__.T.test_subtests) (step=2, group='all')\n",
+            "----------------------------------------------------------------------\n",
+            "Traceback (most recent call last):\n",
+            "AssertionError: 2 != 1\n",
+            "\n",
+            "----------------------------------------------------------------------\n",
+            "Ran 2 tests in T\n",
+            "\n",
+            "FAILED (failures=2, expected failures=1)",
+        )
+    );
+    assert_eq!(code, 1);
 }
 
 #[test]
@@ -25283,6 +25564,16 @@ fn composed_branch_initialization_runs_in_source_order() {
 }
 
 #[test]
+fn unittest_adjacent_class_aliases_share_fixture_interval() {
+    let (stdout, stderr, code) = unittest_run("ut_fixture_alias",
+        include_str!("fixtures/class_fixture_alias.py"));
+    // Verified against python3.
+    assert_eq!(stdout, "setup\ntest\ntest\nteardown\n");
+    assert_eq!(stderr, "..\n----------------------------------------------------------------------\nRan 2 tests in T\n\nOK");
+    assert_eq!(code, 0);
+}
+
+#[test]
 fn unittest_skip_gate_helper_and_walrus_rebinding_are_refused() {
     let scratch = Scratch::new("tcgate-indirect-rebind");
     // Verified against python3. Each reports one skipped test, empty
@@ -25318,6 +25609,26 @@ fn unittest_skip_gate_on_overridden_ancestor_method_is_unused() {
 }
 
 #[test]
+fn unittest_class_fixture_assertions_are_errors_and_failed_alias_setup_is_not_repeated() {
+    let (stdout, stderr, code) = unittest_run("ut_fixture_assertions",
+        include_str!("fixtures/class_fixture_assertions.py"));
+    // Verified against python3; source traceback frames are the §12 model boundary.
+    assert_eq!(stdout, "setup assertion\ntest\nteardown assertion\n");
+    assert_eq!(stderr, "E.E\n======================================================================\nERROR: setUpClass (__main__.A)\n----------------------------------------------------------------------\nTraceback (most recent call last):\nAssertionError: setup broken\n\n======================================================================\nERROR: tearDownClass (__main__.B)\n----------------------------------------------------------------------\nTraceback (most recent call last):\nAssertionError: teardown broken\n\n----------------------------------------------------------------------\nRan 1 test in T\n\nFAILED (errors=2)");
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn unittest_subtest_expected_abort_setup_failure_and_docstring_match_cpython() {
+    let (stdout, stderr, code) = unittest_run("ut_subtest_review",
+        include_str!("fixtures/subtest_review.py"));
+    // Verified against python3. Traceback source frames are the §12 model boundary.
+    assert_eq!(stdout, "finally expected\nexpected teardown\nafter setup\n");
+    assert_eq!(stderr, "xFFF\n======================================================================\nFAIL: test_never (__main__.B.test_never) (n=3)\n----------------------------------------------------------------------\nTraceback (most recent call last):\nAssertionError: 1 != 2\n\n======================================================================\nFAIL: test_documented (__main__.C.test_documented) (n=4)\nDocumented test.\n----------------------------------------------------------------------\nTraceback (most recent call last):\nAssertionError: 1 != 2\n\n======================================================================\nFAIL: test_empty (__main__.D.test_empty) (<subtest>)\n----------------------------------------------------------------------\nTraceback (most recent call last):\nAssertionError: 1 != 2\n\n----------------------------------------------------------------------\nRan 4 tests in T\n\nFAILED (failures=3, expected failures=1)");
+    assert_eq!(code, 1);
+}
+
+#[test]
 fn unittest_skip_gate_rebinding_after_exit_false_is_harmless() {
     let (stdout, stderr, code) = unittest_run("ut_gate_postrun",
         include_str!("fixtures/gate_postrun.py"));
@@ -25335,4 +25646,18 @@ fn unittest_composed_method_fields_use_the_lifecycle_presence_proof() {
     assert_eq!(stdout, "7\n");
     assert_eq!(stderr, "..\n----------------------------------------------------------------------\nRan 2 tests in T\n\nOK");
     assert_eq!(code, 0);
+}
+
+#[test]
+fn unittest_class_fixture_system_exit_preserves_cleanup_status_and_stops_later_suites() {
+    for (name, source, expected_stdout, expected_stderr, expected_code) in [
+        ("ut_setup_exit", include_str!("fixtures/class_fixture_setup_exit.py"), "setup exit\nfinally\n", "", 3),
+        ("ut_teardown_exit", include_str!("fixtures/class_fixture_teardown_exit.py"), "setup\ntest\nteardown exit\nfinally\n", ".", 4),
+    ] {
+        let (stdout, stderr, code) = unittest_run(name, source);
+        // Verified against python3: no unittest report and no later suite.
+        assert_eq!(stdout, expected_stdout);
+        assert_eq!(stderr, expected_stderr);
+        assert_eq!(code, expected_code);
+    }
 }
