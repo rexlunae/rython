@@ -2,8 +2,11 @@ import unittest
 class A(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        print('setup exit')
-        raise SystemExit(3)
+        try:
+            print('setup exit')
+            raise SystemExit(3)
+        finally:
+            print('finally')
     @classmethod
     def tearDownClass(cls) -> None:
         print('unexpected teardown')
@@ -13,7 +16,4 @@ class Z(unittest.TestCase):
     def test_later(self) -> None:
         print('unexpected later suite')
 if __name__ == '__main__':
-    try:
-        unittest.main(exit=False)
-    finally:
-        print('finally')
+    unittest.main()

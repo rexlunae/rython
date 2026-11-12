@@ -1,0 +1,71 @@
+{
+  "source": "def add(a: int, b: int) -> int:\n    return a + b\n",
+  "command": "rypip jit call calls.py add 2 40",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "jobs": 2,
+  "offline": true,
+  "cold": {
+    "seconds": 23.957938059999947,
+    "stdout": "42\n",
+    "stderr": ""
+  },
+  "new_entries": [
+    {
+      "seconds": 0.8148888810000017,
+      "stdout": "42\n",
+      "stderr": ""
+    },
+    {
+      "seconds": 0.6997143459999506,
+      "stdout": "42\n",
+      "stderr": ""
+    },
+    {
+      "seconds": 0.7849832990000323,
+      "stdout": "42\n",
+      "stderr": ""
+    },
+    {
+      "seconds": 0.9518089800000098,
+      "stdout": "42\n",
+      "stderr": ""
+    },
+    {
+      "seconds": 0.6466289689999485,
+      "stdout": "42\n",
+      "stderr": ""
+    }
+  ],
+  "warm": [
+    {
+      "seconds": 0.05100391199994192,
+      "stdout": "42\n",
+      "stderr": ""
+    },
+    {
+      "seconds": 0.055080355000086456,
+      "stdout": "42\n",
+      "stderr": ""
+    },
+    {
+      "seconds": 0.04700991599997906,
+      "stdout": "42\n",
+      "stderr": ""
+    },
+    {
+      "seconds": 0.05304454800000258,
+      "stdout": "42\n",
+      "stderr": ""
+    },
+    {
+      "seconds": 0.04948337400003311,
+      "stdout": "42\n",
+      "stderr": ""
+    }
+  ],
+  "entry_median": 0.7849832990000323,
+  "warm_median": 0.05100391199994192,
+  "measured_at_utc": "2026-11-11T23:25:57.628409+00:00",
+  "binary_sha256": "259f8a7c7a1a5754f0586e2097531d0c582e27fcad9013556fc130b051269d5e",
+  "notes": "Development host, 32 logical CPUs; other workspace test builds were active. Registry downloads were already cached. Cold is one sample; new-entry and hit are five samples each. Each new entry adds a distinct comment to the included source."
+}
