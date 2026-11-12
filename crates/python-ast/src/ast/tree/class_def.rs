@@ -3252,6 +3252,125 @@ impl ClassDef {
         Ok(())
     }
 
+    /// A composed instance field is represented by its Rust value type, so
+    /// the struct's `Default` placeholder can look like a real Python
+    /// instance before `__init__` assigns the field. Require every such
+    /// field to be initialized unconditionally before the instance can be
+    /// read or escape; this also protects reads outside the defining class.
+    fn validate_composed_field_initialization(
+        &self,
+        fields: &[(String, crate::TypeInfo)],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let composed: std::collections::BTreeSet<String> = fields
+            .iter()
+            .filter_map(|(name, ty)| match ty {
+                crate::TypeInfo::Class(_) => Some(name.clone()),
+                crate::TypeInfo::Option(inner)
+                    if matches!(**inner, crate::TypeInfo::Class(_)) =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        if composed.is_empty() {
+            return Ok(());
+        }
+
+        let refusal = |field: &str, line: usize| -> Box<dyn std::error::Error> {
+            format!(
+                "composed field `self.{field}` in class `{}` at line {line} can expose \
+                 the generated struct's default value where CPython raises \
+                 AttributeError; initialize it unconditionally in `__init__` before \
+                 reading it or allowing the instance to escape; rython refuses to \
+                 silently expose an absent instance field",
+                self.name,
+            )
+            .into()
+        };
+        let Some(init) = self.init_method() else {
+            let field = composed.iter().next().expect("non-empty");
+            return Err(refusal(field, self.body.first().and_then(|s| s.lineno).unwrap_or(0)));
+        };
+
+        let stored = self.instance_store_names();
+        let constants = class_constant_names(&self.body);
+        let watched = composed.iter().cloned().collect();
+        let initialized = constants.iter().filter(|name| !stored.contains(*name)).cloned().collect();
+
+        // Creating a closure does not read its body. A later use of a
+        // closure capturing self can, however, expose every absent field.
+        // Keep directly bound lambdas deferred until that binding is used;
+        // an unbound lambda escaping into other code must be checked now.
+        let mut deferred = std::collections::HashSet::new();
+        let mut bound_lambdas = std::collections::HashSet::new();
+        loop {
+            let before = deferred.len();
+            visit::walk_stmts(&init.body, Descend::OwnScope, &mut |stmt| {
+                let captures = |expr: &ExprType| visit::any_expr(expr, |e| {
+                    visit::is_self(e)
+                        || matches!(e, ExprType::Name(name) if deferred.contains(&name.id))
+                });
+                match &stmt.statement {
+                    StatementType::FunctionDef(def) | StatementType::AsyncFunctionDef(def) => {
+                        if visit::any_stmt(&def.body, Descend::All, |nested| {
+                            visit::stmt_all_exprs(nested).into_iter().any(captures)
+                        }) {
+                            deferred.insert(def.name.clone());
+                        }
+                    }
+                    StatementType::Assign(assign) if match &assign.value {
+                        ExprType::Lambda(_) => captures(&assign.value),
+                        ExprType::Name(name) => deferred.contains(&name.id),
+                        ExprType::Attribute(attr) if visit::is_self(&attr.value) => deferred.contains(&attr.attr),
+                        _ => false,
+                    } => {
+                        let mut simple_targets = true;
+                        for target in &assign.targets {
+                            match target {
+                                ExprType::Name(name) => { deferred.insert(name.id.clone()); }
+                                ExprType::Attribute(attr) if visit::is_self(&attr.value) => {
+                                    deferred.insert(attr.attr.clone());
+                                }
+                                _ => { simple_targets = false; }
+                            }
+                        }
+                        if simple_targets && matches!(assign.value, ExprType::Lambda(_)) {
+                            bound_lambdas.insert(&assign.value as *const ExprType as usize);
+                        }
+                    }
+                    _ => {}
+                }
+                Flow::Continue
+            });
+            if deferred.len() == before { break; }
+        }
+        let escape = |expr: &ExprType| match expr {
+            ExprType::Name(name) => visit::is_self(expr) || deferred.contains(&name.id),
+            ExprType::Attribute(attr) if visit::is_self(&attr.value) => {
+                deferred.contains(&attr.attr)
+                    || (!stored.contains(&attr.attr) && !constants.contains(&attr.attr))
+            }
+            ExprType::Lambda(_) => {
+                !bound_lambdas.contains(&(expr as *const ExprType as usize))
+                    && visit::any_expr(expr, visit::is_self)
+            }
+            _ => crate::ast::tree::scope::is_super_call(expr),
+        };
+        let final_fields = super::binding_flow::receiver_field_bindings_with_escapes(
+            &init.body, &initialized, &watched, Some(&escape),
+        ).map_err(|(field, line)| refusal(&field, line))?;
+        // An initializer that always raises never exposes a constructed
+        // instance. Every normal exit must initialize every composed field.
+        if let Some(final_fields) = final_fields
+            && let Some(field) = composed.iter().find(|field| !final_fields.contains(*field))
+        {
+            return Err(refusal(field, self.body.first().and_then(|s| s.lineno).unwrap_or(0)));
+        }
+
+        Ok(())
+    }
+
     fn validate_thread_field_initialization(
         &self,
         fields: &[(String, crate::TypeInfo)],
@@ -4714,6 +4833,12 @@ StatementType::Assign(a)
         let fields = self.own_fields(&symbols, &options)?;
         self.validate_thread_field_initialization(&fields, &symbols, &options)?;
         self.validate_thread_constructor_arguments(&symbols)?;
+        // TestCase's separate lifecycle proof includes every field type
+        // and refuses manual construction/receiver escapes. Its method
+        // stores must not be subjected to the ordinary constructor rule.
+        if !self.is_testcase(&symbols, &options) {
+            self.validate_composed_field_initialization(&fields)?;
+        }
         self.validate_testcase_fields(&symbols, &options)?;
 
         // The embedded base struct occupies `__rython_base`; a user field of

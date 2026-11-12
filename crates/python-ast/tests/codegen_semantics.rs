@@ -4796,7 +4796,7 @@ fn python_exception_attributes_do_not_expose_rust_payload_fields() {
         let error = compile_err(&source, "exception_payload.py");
         assert!(error.contains("exception attribute") && error.contains("refuses"), "{statement}: {error}");
     }
-    for field in ["message", "exception_type", "attrs", "args_repr", "discriminant", "user_ancestors"] {
+    for field in ["message", "exception_type", "exception_module", "attrs", "args_repr", "discriminant", "user_ancestors"] {
         let source = format!("def f():\n    error = SystemExit(3)\n    print(error.{field})\n");
         let error = compile_err(&source, "exception_payload.py");
         assert!(error.contains("exception attribute") && error.contains("refuses"), "{field}: {error}");
@@ -5166,6 +5166,75 @@ fn composed_fields_type_and_resolve_through_chains() {
         out.contains("((self . p) . borrow_mut ()) . shift (__rython_sarg0) ?"),
         "field-chain method calls propagate exceptions: {}",
         out
+    );
+}
+
+#[test]
+fn composed_field_reads_refuse_uninitialized_default_placeholders() {
+    // Verified against python3 3.14.4: Outer.__init__ raises
+    // `AttributeError: 'Outer' object has no attribute 'inner'` before the
+    // assignment. A default Inner struct would instead expose its `value`.
+    let before_assignment = concat!(
+        "class Inner:\n",
+        "    def __init__(self):\n",
+        "        self.value = 7\n",
+        "\n",
+        "class Outer:\n",
+        "    def __init__(self):\n",
+        "        print(self.inner.value)\n",
+        "        self.inner = Inner()\n",
+    );
+    let error = compile_err(before_assignment, "compose_uninitialized.py");
+    assert!(
+        error.contains("composed field `self.inner`")
+            && error.contains("CPython raises AttributeError")
+            && error.contains("refuses to silently expose"),
+        "{error}"
+    );
+
+    // Verified against python3 3.14.4 with `Outer(False)`: a conditionally
+    // absent composed field raises AttributeError when read by `value`.
+    let conditional = concat!(
+        "class Inner:\n",
+        "    def __init__(self):\n",
+        "        self.value = 7\n",
+        "\n",
+        "class Outer:\n",
+        "    def __init__(self, flag: bool):\n",
+        "        if flag:\n",
+        "            self.inner = Inner()\n",
+        "\n",
+        "    def value(self) -> int:\n",
+        "        return self.inner.value\n",
+    );
+    let error = compile_err(conditional, "compose_conditional.py");
+    assert!(
+        error.contains("composed field `self.inner`")
+            && error.contains("CPython raises AttributeError"),
+        "{error}"
+    );
+
+    // Verified against python3 3.14.4 with `Outer(True)`: the early return
+    // leaves `inner` absent even though a later top-level store exists.
+    let early_return = concat!(
+        "class Inner:\n",
+        "    def __init__(self):\n",
+        "        self.value = 7\n",
+        "\n",
+        "class Outer:\n",
+        "    def __init__(self, flag: bool):\n",
+        "        if flag:\n",
+        "            return\n",
+        "        self.inner = Inner()\n",
+        "\n",
+        "    def value(self) -> int:\n",
+        "        return self.inner.value\n",
+    );
+    let error = compile_err(early_return, "compose_early_return.py");
+    assert!(
+        error.contains("composed field `self.inner`")
+            && error.contains("CPython raises AttributeError"),
+        "{error}"
     );
 }
 
@@ -6861,40 +6930,36 @@ fn unittest_assert_raises_with_a_returning_body_is_refused() {
 }
 
 #[test]
-fn unittest_subtest_context_manager_runs_body_directly() {
-    // `with self.subTest(**kw): body` — the unittest reporting CM. It only
-    // reframes per-iteration reporting (no exception suppression, no control
-    // flow change), so the body runs directly: a passing subTest passes and a
-    // failing one fails, exactly the observable test outcome. No closure is
-    // allowed (a subTest body may legitimately return/break/continue).
+fn unittest_subtest_context_manager_carries_a_failure_boundary() {
+    // `with self.subTest(**kw): body` records an exception and resumes after
+    // the context manager; generated code must contain that boundary.
     let out = compile(
         concat!(
             "import unittest\n",
             "class T(unittest.TestCase):\n",
             "    def t(self):\n",
             "        with self.subTest(step=1):\n",
-            "            if 1 == 2:\n",
-            "                return\n",
             "            self.assertEqual(1, 1)\n",
         ),
         "subtest.py",
     );
     assert!(
-        out.contains("unittest :: assert_eq (") && out.contains("return Ok (())"),
-        "the subTest body must run directly (real asserts, real return): {}",
+        out.contains("unittest :: assert_eq (")
+            && out.contains("unittest :: run_subtest")
+            && out.contains("PyRepr :: py_repr"),
+        "the subTest body must be wrapped with its context (real asserts): {}",
         out
     );
     assert!(
-        !out.contains("subTest") && !out.contains("assert_raises ("),
-        "subTest must not become a closure/assertRaises lowering: {}",
+        !out.contains("assert_raises ("),
+        "subTest must not become an assertRaises lowering: {}",
         out
     );
 }
 
 #[test]
-fn unittest_subtest_does_not_suppress_a_failing_body() {
-    // A body that raises keeps raising (subTest does not suppress) — the
-    // lowering must NOT wrap it in a closure that turns the error into a pass.
+fn unittest_subtest_records_a_failing_body() {
+    // The subTest boundary records a raising body rather than losing it.
     let out = compile(
         concat!(
             "import unittest\n",
@@ -6906,9 +6971,37 @@ fn unittest_subtest_does_not_suppress_a_failing_body() {
         "subtest_raise.py",
     );
     assert!(
-        out.contains("Err (") && !out.contains("assert_raises ("),
-        "a failing subTest body must keep its failure: {}",
+        out.contains("run_subtest") && out.contains("Err (") && !out.contains("assert_raises ("),
+        "a failing subTest body must keep its failure inside the boundary: {}",
         out
+    );
+}
+
+#[test]
+fn unittest_subtest_refuses_control_flow_that_would_escape_its_boundary() {
+    let error = compile_err(
+        "import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n        with self.subTest(step=1):\n            return\n",
+        "subtest_return.py",
+    );
+    assert!(
+        error.contains("`with self.subTest(...)`")
+            && error.contains("`return`, `break`, or `continue`")
+            && error.contains("refuses"),
+        "{error}"
+    );
+}
+
+#[test]
+fn unittest_subtest_refuses_unmodeled_context_values() {
+    let error = compile_err(
+        "import unittest\nclass Value:\n    pass\nclass T(unittest.TestCase):\n    def test_a(self):\n        with self.subTest(value=Value()):\n            pass\n",
+        "subtest_context_value.py",
+    );
+    assert!(
+        error.contains("`self.subTest(value=...)`")
+            && error.contains("without a supported immutable Python repr")
+            && error.contains("refuses"),
+        "{error}"
     );
 }
 
@@ -31450,6 +31543,49 @@ fn pytest_operand_preflight_respects_the_stack_budget() {
 }
 
 #[test]
+fn composed_fields_track_branch_stores_and_deferred_readers() {
+    // Verified against python3: Branch(True) prints 7, Branch(False)
+    // prints nothing; Deferred prints 7 after creating the reader first.
+    let inner = "class Inner:\n    def __init__(self):\n        self.value = 7\n";
+    compile(&format!("{inner}class Branch:\n    def __init__(self, flag: bool):\n        if flag:\n            self.inner = Inner()\n            print(self.inner.value)\n        self.inner = Inner()\n"), "composed_branch.py");
+    compile(&format!("{inner}class Deferred:\n    def __init__(self):\n        reader = lambda: self.inner.value\n        self.inner = Inner()\n        print(reader())\n"), "composed_deferred.py");
+    compile(&format!("{inner}class Joined:\n    def __init__(self, flag: bool):\n        if flag:\n            self.inner = Inner()\n        else:\n            self.inner = Inner()\n        print(self.inner.value)\n"), "composed_join.py");
+}
+
+#[test]
+fn composed_fields_refuse_reader_invocation_and_escape_before_assignment() {
+    // Verified against python3: Nested() raises AttributeError for inner.
+    let inner = "class Inner:\n    def __init__(self):\n        self.value = 7\n";
+    for body in [
+        "        def read() -> None:\n            print(self.inner.value)\n        read()\n        self.inner = Inner()\n",
+        "        reader = lambda: self.inner.value\n        print(reader())\n        self.inner = Inner()\n",
+        "        def read() -> None:\n            print(self.inner.value)\n        def wrapper() -> None:\n            read()\n        wrapper()\n        self.inner = Inner()\n",
+        "        print(list(map(lambda unused: self.inner.value, [0])))\n        self.inner = Inner()\n",
+    ] {
+        let error = compile_err(&format!("{inner}class Nested:\n    def __init__(self):\n{body}"), "composed_reader.py");
+        assert!(error.contains("composed field `self.inner`") && error.contains("refuses"), "{error}");
+    }
+}
+
+#[test]
+fn only_known_unittest_fixture_names_allow_non_snake_case() {
+    let rust = compile("class C:\n    def calculateTotal(self) -> int:\n        return 1\n", "fixture_lints");
+    let compact: String = rust.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(!compact.contains("#[allow(non_snake_case)]"), "{rust}");
+    let fixture = compile("import unittest\nclass T(unittest.TestCase):\n    def setUp(self) -> None:\n        pass\n    def test_ok(self) -> None:\n        pass\n", "known_fixture_lint");
+    let compact: String = fixture.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("#[allow(non_snake_case)]"), "{fixture}");
+}
+
+#[test]
+fn unittest_subtest_mutable_context_is_refused() {
+    // Verified against python3: the failure reports (values=[7]), not [].
+    let error = compile_err("import unittest\nclass T(unittest.TestCase):\n    def test_a(self) -> None:\n        values = []\n        with self.subTest(values=values):\n            values.append(7)\n            self.assertEqual(1, 2)\n", "mutable_subtest.py");
+    assert!(error.contains("self.subTest(values=...)") && error.contains("immutable")
+        && error.contains("line 5"), "{error}");
+}
+
+#[test]
 fn unittest_skip_gate_rebinding_has_compiler_refusal_pins() {
     // Verified against python3. Each of these four sources skips its test,
     // including the helper defined before the decorated class and walrus RHS.
@@ -31464,6 +31600,15 @@ fn unittest_skip_gate_rebinding_has_compiler_refusal_pins() {
         assert!(error.contains("decorator-time value") && error.contains("use an unchanged condition")
             && error.contains("refuses to silently evaluate"), "{error}");
     }
+}
+
+#[test]
+fn method_only_composed_fields_require_constructor_initialization() {
+    // Verified against python3: create(); read() prints 7, but read()
+    // without create() raises AttributeError. §12 records this conservative
+    // model boundary: no whole-program proof of callers' method ordering.
+    let error = compile_err("class Inner:\n    def __init__(self):\n        self.value = 7\nclass Outer:\n    def __init__(self):\n        pass\n    def create(self):\n        self.inner = Inner()\n    def read(self) -> int:\n        return self.inner.value\n", "composed_method_only.py");
+    assert!(error.contains("composed field `self.inner`") && error.contains("__init__"), "{error}");
 }
 
 #[test]
@@ -31505,4 +31650,10 @@ fn vendored_relative_function_reexports_remain_callable_module_items() {
     let out = compile_with_options(source, "app.py", options).unwrap();
     assert!(out.contains("crate :: textlib :: double"), "{out}");
     assert!(out.contains("crate :: textlib :: twice"), "{out}");
+}
+
+#[test]
+fn composed_testcase_fields_use_the_separate_lifecycle_proof() {
+    // Verified against python3: both methods initialize inner before any read.
+    compile(include_str!("../../rypip/tests/fixtures/composed_testcase.py"), "composed_testcase.py");
 }

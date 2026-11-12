@@ -53,6 +53,17 @@ pub(crate) enum Fixture {
 }
 
 impl Fixture {
+    pub(crate) const CLASS: [Self; 2] = [Self::SetUpClass, Self::TearDownClass];
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::SetUp => "setUp",
+            Self::TearDown => "tearDown",
+            Self::SetUpClass => "setUpClass",
+            Self::TearDownClass => "tearDownClass",
+        }
+    }
+
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         match name {
             "setUp" => Some(Self::SetUp),

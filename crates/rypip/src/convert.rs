@@ -3467,19 +3467,13 @@ fn module_python_names(
     package: &PyPackage,
     python_deps: &[(String, PyPackage)],
 ) -> HashMap<Vec<String>, String> {
-    let root = package
-        .modules
-        .iter()
-        .find(|m| m.is_init && m.path.is_empty())
-        .and_then(|m| m.file.parent()?.file_name()?.to_str().map(str::to_string));
+    let prefix = package_module_name_prefix(package);
     let mut names = HashMap::new();
     for module in &package.modules {
-        let name: Vec<&str> = root
-            .iter()
-            .map(String::as_str)
-            .chain(module.path.iter().map(String::as_str))
-            .collect();
-        names.insert(module.path.clone(), name.join("."));
+        names.insert(
+            module.path.clone(),
+            package_module_name(module, prefix.as_deref()),
+        );
     }
     for module in python_deps.iter().flat_map(|(_, dep)| dep.modules.iter()) {
         names.insert(module.path.clone(), module.path.join("."));

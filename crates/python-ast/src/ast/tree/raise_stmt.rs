@@ -449,7 +449,7 @@ pub(crate) enum Callee {
 }
 
 enum ExceptionClass {
-    Crate(crate::ClassDef, SymbolTableScopes),
+    Crate(crate::ClassDef, SymbolTableScopes, Vec<String>),
     Builtin(String),
     Unseen(String),
 }
@@ -513,10 +513,10 @@ fn exception_call_class(
             if options.name_types.contains_key(&name.id) || options.local_types.contains_key(&name.id) {
                 return None;
             }
-            if let Some((class, class_symbols)) = crate::ast::tree::call::resolve_construction_class(&name.id, symbols, options)
+            if let Some((class, class_symbols, module)) = crate::ast::tree::call::resolve_construction_class_with_path(&name.id, symbols, options)
                 && crate::is_exception_class(&class)
             {
-                return Some(ExceptionClass::Crate(class, class_symbols));
+                return Some(ExceptionClass::Crate(class, class_symbols, module));
             }
             let mut bound = name.id.clone();
             let mut followed = std::collections::HashSet::new();
@@ -586,8 +586,8 @@ pub(crate) fn exception_call_construction(
     }
     match class {
         None => Ok(None),
-        Some(ExceptionClass::Crate(class, class_symbols)) => {
-            exception_construction(&class, &class_symbols, call, ctx, options, symbols).map(Some)
+        Some(ExceptionClass::Crate(class, class_symbols, module)) => {
+            exception_construction(&class, &class_symbols, &module, call, ctx, options, symbols).map(Some)
         }
         Some(ExceptionClass::Builtin(kind)) => {
             let kind = builtin_exception_mro(&kind)?.and_then(|mro| mro.first().cloned()).unwrap_or(kind);
@@ -667,17 +667,18 @@ fn exception_value(
             if crate::ast::tree::call::resolve_construction_class(&name.id, &symbols, &options)
                 .is_some_and(|(c, _)| crate::is_exception_class(&c)) =>
         {
-            let (cls, class_symbols) = crate::ast::tree::call::resolve_construction_class(
+            let (cls, class_symbols, module) = crate::ast::tree::call::resolve_construction_class_with_path(
                 &name.id, &symbols, &options,
             )
             .expect("checked by the guard");
             // The class's own name (`raise R` under `R = Root` raises a
             // Root — Devin review on #330).
             let kind = &cls.name;
+            let module = exception_module_name(&module, &options);
             let ancestors = exception_ancestor_tokens(&cls, &class_symbols, &options)?;
             Ok(quote!(PyException::new_with_attrs_and_ancestors(
                 #kind, String::new(), vec![], vec![#(#ancestors),*]
-            )))
+            ).with_module(#module)))
         }
         ExprType::Name(name)
             if is_exception_class_name(&name.id)
@@ -909,11 +910,13 @@ pub(crate) fn classify_exception_init<'a>(
 pub(crate) fn exception_construction(
     cls: &crate::ClassDef,
     class_symbols: &SymbolTableScopes,
+    module: &[String],
     call: &crate::Call,
     ctx: CodeGenContext,
     options: PythonOptions,
     symbols: SymbolTableScopes,
 ) -> Result<TokenStream, Box<dyn std::error::Error>> {
+    let module = exception_module_name(module, &options);
     if let Some(tokens) = exception_class_raise(
         cls,
         call,
@@ -922,7 +925,7 @@ pub(crate) fn exception_construction(
         symbols.clone(),
         class_symbols,
     )? {
-        return Ok(tokens);
+        return Ok(quote!((#tokens).with_module(#module)));
     }
     // No initializer chain to model: the arguments are `args` — the same
     // once-evaluation and rendering as a chain's end.
@@ -950,7 +953,20 @@ pub(crate) fn exception_construction(
         runs_code: false,
     };
     st.runs_code = call.args.iter().any(|a| st.may_run_code(a));
-    finish_construction(st, cls, class_symbols, call.args.clone(), Vec::new())
+    let tokens = finish_construction(st, cls, class_symbols, call.args.clone(), Vec::new())?;
+    Ok(quote!((#tokens).with_module(#module)))
+}
+
+fn exception_module_name(path: &[String], options: &PythonOptions) -> String {
+    let path = crate::ast::tree::module::module_defs_key(options, path).unwrap_or(path);
+    if (options.bin_crate_root
+        && options.this_module_path == path)
+        || options.module_defs.is_empty()
+    {
+        "__main__".to_string()
+    } else {
+        crate::ast::tree::module::python_module_name(options, path)
+    }
 }
 
 /// The ancestor chain of an in-crate exception class, base-most last

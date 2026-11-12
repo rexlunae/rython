@@ -182,17 +182,23 @@ feature that `rypip` enables automatically), and more.
 
 `unittest.TestCase` fields may first be assigned in a test method, without
 `__init__` or `setUp`. The runner creates a fresh instance per test and
-discovers inherited tests and fixtures. Zero-argument `super()` calls in a
-modeled TestCase chain resolve the nearest implementation, including
-TestCase's no-op `setUp`/`tearDown`; resolved bodies contribute to
-field-initialization checks (#524). Reads must follow an assignment on
-every path, or an unconditional `setUp` initialization; uncertain attribute
-presence, receiver escapes, and field reads relying on another test or an
-opaque helper are conversion errors. Manual construction of cases with
-fields is refused; use `unittest.main()` to preserve fixture order
-(issues #480, #511). `skipIf`/`skipUnless` conditions must stay unchanged
-between decoration and the runner call; direct rebinding and potential
-writes through `global` functions are conversion errors (#521).
+discovers inherited tests and per-test fixtures. Direct `setUpClass` and
+`tearDownClass` class fixtures run once around each class's tests. Inherited
+class fixtures and unsupported signatures are refused. Zero-argument `super()`
+calls follow the modeled TestCase MRO, including TestCase's no-op instance
+fixtures; resolved bodies contribute to field-initialization checks (#524). Reads must follow an
+assignment on every path, or an unconditional `setUp` initialization;
+uncertain attribute presence, receiver escapes, and field reads relying on
+another test or an opaque helper are conversion errors. Manual construction
+of cases with fields is refused; use `unittest.main()` to preserve fixture
+order (issues #480, #511, #526).
+`with self.subTest(name=value):` records each failure with its named context
+and continues the test method. Positional messages, `msg=`, `**kwargs`,
+mutable or unmodeled context-value reprs, `as` targets, additional context managers,
+and control transfers out of a subtest body are refused (issue #525).
+`skipIf`/`skipUnless` conditions must stay unchanged between decoration and
+the runner call; direct rebinding and potential writes through `global`
+functions are conversion errors (#521).
 `with self.assertRaises(E) as cm:` catches the expected exception and
 supports reading `cm.exception` after the block; other uses of the context
 object are conversion errors (#523).
@@ -220,6 +226,9 @@ forms, including the args tuple for multi-argument messages. Mutable or
 unknown arguments and unsupported specialized constructors are conversion
 errors; see [the exception specification](docs/spec.md#8-exceptions).
 `socket.gaierror` and `herror` keep their distinct OSError subtype matching.
+Uncaught imported user exceptions display their defining module
+(`excpkg.errors.BadInput: boom`); builtins and `__main__` classes stay
+unqualified, without changing exception matching or Python str/repr.
 
 Absolute imports of a package's own modules (`from pkg import helper`,
 `from pkg.helper import f`, `import pkg.helper`, including aliases) resolve
@@ -525,3 +534,8 @@ cargo publish -p rypip
 ## License
 
 Apache-2.0
+
+Outside unittest’s separately checked lifecycle, composed instance fields
+must be initialized on every normal constructor exit,
+before reads or receiver escapes. Fields first created by other methods are
+refused; move their initialization into `__init__` (spec §12, issue #517).

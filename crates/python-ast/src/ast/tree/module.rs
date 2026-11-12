@@ -8063,6 +8063,49 @@ fn runner_cases(
     Ok(cases)
 }
 
+enum ClassFixtureDeclaration<'a> {
+    Method(&'a crate::FunctionDef, usize),
+    Async(usize),
+    Other(usize),
+}
+
+fn class_fixture_declaration<'a>(
+    class: &'a crate::ClassDef,
+    name: &str,
+) -> Option<ClassFixtureDeclaration<'a>> {
+    let mut declaration = None;
+    for stmt in &class.body {
+        let current = match &stmt.statement {
+            StatementType::FunctionDef(method) if method.name == name => {
+                Some(ClassFixtureDeclaration::Method(
+                    method,
+                    stmt.lineno.unwrap_or(0),
+                ))
+            }
+            StatementType::AsyncFunctionDef(method) if method.name == name => {
+                Some(ClassFixtureDeclaration::Async(stmt.lineno.unwrap_or(0)))
+            }
+            StatementType::FunctionDef(_) | StatementType::AsyncFunctionDef(_) => None,
+            _ if crate::ast::tree::visit::stmt_bound_names(
+                stmt,
+                crate::ast::tree::visit::Bindings::Scope,
+            )
+            .iter()
+            .any(|bound| bound == name) => Some(ClassFixtureDeclaration::Other(
+                stmt.lineno.unwrap_or(0),
+            )),
+            _ => None,
+        };
+        if let Some(current) = current {
+            if declaration.is_some() {
+                return Some(ClassFixtureDeclaration::Other(stmt.lineno.unwrap_or(0)));
+            }
+            declaration = Some(current);
+        }
+    }
+    declaration
+}
+
 /// Module names read by a gate. Use the shared expression enumeration,
 /// excluding store targets and names local to lambdas/comprehensions.
 fn gate_module_reads(expr: &crate::ExprType) -> std::collections::HashSet<String> {
@@ -8294,6 +8337,67 @@ fn refuse_cross_module_runner_inputs(
                  silently evaluate it in the wrong scope"
             ))
         };
+        let c = &case.class;
+        for hook in super::testcase::Fixture::CLASS {
+            let fixture = hook.name();
+            let Some(declaration) = class_fixture_declaration(c, fixture) else {
+                if c.cross_module_chain(&case.symbols, &case.options)
+                    .iter()
+                    .skip(1)
+                    .any(|(ancestor, ..)| {
+                        class_fixture_declaration(ancestor, fixture).is_some()
+                    })
+                {
+                    return Err(format!(
+                        "unittest.main(): TestCase `{}` inherits `{fixture}` from another class; \
+                         inherited class fixtures are not supported yet; define `{fixture}` directly \
+                         on each TestCase or remove it; rython refuses to silently omit the fixture",
+                        c.name
+                    ));
+                }
+                continue;
+            };
+            let (def, line) = match declaration {
+                ClassFixtureDeclaration::Method(method, line) => (method, line),
+                ClassFixtureDeclaration::Async(line) => {
+                    return Err(format!(
+                        "unittest.main(): TestCase `{}` async `{fixture}` at line {line} is not \
+                         supported; class fixtures must be synchronous; rython refuses to silently \
+                         omit the fixture",
+                        c.name
+                    ));
+                }
+                ClassFixtureDeclaration::Other(line) => {
+                    return Err(format!(
+                        "unittest.main(): TestCase `{}` binds `{fixture}` at line {line} without \
+                         a supported fixture method; use a direct `@classmethod` or \
+                         `@staticmethod`; rython refuses to silently omit the fixture",
+                        c.name
+                    ));
+                }
+            };
+            let method_shape = match crate::ast::tree::decorator::parse_decorator(&def.decorator_list) {
+                Ok(Some(crate::ast::tree::decorator::Decorator::ClassMethod)) => {
+                    def.args.posonlyargs.len() + def.args.args.len() == 1
+                }
+                Ok(Some(crate::ast::tree::decorator::Decorator::StaticMethod)) => {
+                    def.args.posonlyargs.is_empty() && def.args.args.is_empty()
+                }
+                _ => false,
+            } && def.args.defaults.is_empty()
+                && def.args.kwonlyargs.is_empty()
+                && def.args.vararg.is_none()
+                && def.args.kwarg.is_none();
+            if !method_shape {
+                return Err(format!(
+                    "unittest.main(): TestCase `{}` `{fixture}` at line {line} must be a \
+                     `@classmethod` with only its class parameter, or a zero-argument \
+                     `@staticmethod`; other class-fixture signatures are not supported yet; \
+                     rython refuses to silently omit the fixture",
+                    c.name
+                ));
+            }
+        }
         for (ancestor, _, _, path) in case.class.cross_module_chain(&case.symbols, &case.options) {
             if (imported || path.is_some()) && conditional(&ancestor.decorator_list) {
                 return refuse(format!("`{}`'s skipIf/skipUnless condition", ancestor.name));
@@ -8364,12 +8468,63 @@ fn emit_test_runner(
         return None;
     }
     let mut stmts = TokenStream::new();
+    let truth = |cond: &crate::ExprType| -> Option<TokenStream> {
+        crate::ExprType::Call(crate::Call {
+            func: Box::new(crate::ExprType::Name(crate::ast::tree::name::Name {
+                id: "bool".to_string(),
+            })),
+            args: vec![cond.clone()],
+            keywords: Vec::new(),
+            lineno: None,
+        })
+        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+        .ok()
+    };
+    // Empty suites do not end CPython's active-class interval. Adjacent
+    // aliases still load separate copies of the tests, sharing fixtures.
+    let mut intervals: Vec<(&RunnerCase, usize)> = Vec::new();
     for (_, case) in cases {
+        if test_method_names(&case.class, &case.symbols, &case.options).is_empty() {
+            continue;
+        }
+        if let Some((previous, count)) = intervals.last_mut()
+            && previous.class_id(&options) == case.class_id(&options)
+        {
+            *count += 1;
+        } else {
+            intervals.push((case, 1));
+        }
+    }
+    for (case, suite_count) in intervals {
         let c = &case.class;
         // The class's own scope answers for its MRO: an imported class's
         // bases, fixtures and tests are its defining module's.
         let (class_symbols, class_options) = (&case.symbols, &case.options);
         let cname = quote::format_ident!("{}", case.rust_name);
+        let method_names = test_method_names(c, class_symbols, class_options);
+        if method_names.is_empty() {
+            continue;
+        }
+        let class_gates: Vec<RunGate> = c.cross_module_chain(class_symbols, class_options)
+            .iter()
+            .flat_map(|(class, ..)| run_gates(&class.decorator_list))
+            .collect();
+        let mut class_skip_terms: Vec<TokenStream> = Vec::new();
+        let mut class_expected_failure = false;
+        for gate in &class_gates {
+            match gate {
+                RunGate::Skip | RunGate::CpythonOnly => class_skip_terms.push(quote!(true)),
+                RunGate::SkipIf(cond) => {
+                    let condition = truth(cond)?;
+                    class_skip_terms.push(quote!((#condition)));
+                }
+                RunGate::SkipUnless(cond) => {
+                    let condition = truth(cond)?;
+                    class_skip_terms.push(quote!(!(#condition)));
+                }
+                RunGate::ExpectedFailure => class_expected_failure = true,
+            }
+        }
         // `setUp`/`tearDown` are per-test fixtures (CPython runs setUp before
         // and tearDown after every test method); an exception in either is
         // reported against the test, as `TestCase.run` reports it.
@@ -8384,7 +8539,9 @@ fn emit_test_runner(
             quote!(|_: &mut #cname| Ok(()))
         };
         let class_id = case.class_id(&options);
-        for m in test_method_names(c, class_symbols, class_options) {
+        let method_count = method_names.len() * suite_count;
+        let mut class_tests = TokenStream::new();
+        for m in method_names {
             let mident = quote::format_ident!("{}", m);
             // A test method with DEFAULTED parameters (`def test_encode(self,
             // encode=None, skip_bytes=False)` — idna's tests, issue #334):
@@ -8436,25 +8593,9 @@ fn emit_test_runner(
             // skipIf/skipUnless is an identity decorator, so an ancestor's
             // active skip still applies; combining their active gates
             // preserves that behavior.
-            let mut gates: Vec<RunGate> = c.cross_module_chain(class_symbols, class_options)
-                .iter()
-                .flat_map(|(class, ..)| run_gates(&class.decorator_list))
-                .collect();
-            gates.extend(run_gates(&method_decorators));
-            let truth = |cond: &crate::ExprType| -> Option<TokenStream> {
-                crate::ExprType::Call(crate::Call {
-                    func: Box::new(crate::ExprType::Name(crate::ast::tree::name::Name {
-                        id: "bool".to_string(),
-                    })),
-                    args: vec![cond.clone()],
-                    keywords: Vec::new(),
-                    lineno: None,
-                })
-                .to_rust(ctx.clone(), options.clone(), symbols.clone())
-                .ok()
-            };
+            let gates = run_gates(&method_decorators);
             let mut skip_terms: Vec<TokenStream> = Vec::new();
-            let mut expected_failure = false;
+            let mut expected_failure = class_expected_failure;
             for g in &gates {
                 match g {
                     RunGate::Skip | RunGate::CpythonOnly => skip_terms.push(quote!(true)),
@@ -8499,9 +8640,9 @@ fn emit_test_runner(
                 );
             }};
             if skip_terms.is_empty() {
-                stmts.extend(run);
+                class_tests.extend(run);
             } else {
-                stmts.extend(quote! {
+                class_tests.extend(quote! {
                     if #(#skip_terms)||* {
                         __rython_result.add_skip();
                     } else {
@@ -8509,6 +8650,58 @@ fn emit_test_runner(
                     }
                 });
             }
+        }
+        let suite = class_tests.clone();
+        for _ in 1..suite_count {
+            class_tests.extend(suite.clone());
+        }
+        if !class_tests.is_empty() {
+            let class_skip = if class_skip_terms.is_empty() {
+                quote!(false)
+            } else {
+                quote!(#(#class_skip_terms)||*)
+            };
+            let mut class_skipped_tests = TokenStream::new();
+            for _ in 0..method_count {
+                class_skipped_tests.extend(quote!(__rython_result.add_skip();));
+            }
+            let setup_class = if c.methods().any(|method| super::testcase::Fixture::from_name(&method.name) == Some(super::testcase::Fixture::SetUpClass)) {
+                quote!(#cname::setUpClass())
+            } else {
+                quote!(Ok::<(), stdpython::PyException>(()))
+            };
+            let teardown_class = if c.methods().any(|method| super::testcase::Fixture::from_name(&method.name) == Some(super::testcase::Fixture::TearDownClass)) {
+                quote!(#cname::tearDownClass())
+            } else {
+                quote!(Ok::<(), stdpython::PyException>(()))
+            };
+            let setup_description = format!("setUpClass ({class_id})");
+            let teardown_description = format!("tearDownClass ({class_id})");
+            stmts.extend(quote! {
+                let __rython_class_skipped = #class_skip;
+                if __rython_class_skipped {
+                    #class_skipped_tests
+                } else if let Err(__rython_class_error) = #setup_class {
+                    if !__rython_class_error.matches_builtin(stdpython::BuiltinException::Exception) {
+                        return Err(__rython_class_error);
+                    }
+                    __rython_result.add_class_error(
+                        #setup_description,
+                        &__rython_class_error,
+                    );
+                } else {
+                    #class_tests
+                    if let Err(__rython_class_error) = #teardown_class {
+                        if !__rython_class_error.matches_builtin(stdpython::BuiltinException::Exception) {
+                            return Err(__rython_class_error);
+                        }
+                        __rython_result.add_class_error(
+                            #teardown_description,
+                            &__rython_class_error,
+                        );
+                    }
+                }
+            });
         }
     }
     // `unittest.main()` prints the report and exits with the run's status;
