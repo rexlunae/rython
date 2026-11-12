@@ -8628,12 +8628,12 @@ fn emit_test_runner(
             let setup_class = if c.methods().any(|method| super::testcase::Fixture::from_name(&method.name) == Some(super::testcase::Fixture::SetUpClass)) {
                 quote!(#cname::setUpClass())
             } else {
-                quote!(Ok(()))
+                quote!(Ok::<(), stdpython::PyException>(()))
             };
             let teardown_class = if c.methods().any(|method| super::testcase::Fixture::from_name(&method.name) == Some(super::testcase::Fixture::TearDownClass)) {
                 quote!(#cname::tearDownClass())
             } else {
-                quote!(Ok(()))
+                quote!(Ok::<(), stdpython::PyException>(()))
             };
             let setup_description = format!("setUpClass ({class_id})");
             let teardown_description = format!("tearDownClass ({class_id})");
@@ -8642,6 +8642,9 @@ fn emit_test_runner(
                 if __rython_class_skipped {
                     #class_skipped_tests
                 } else if let Err(__rython_class_error) = #setup_class {
+                    if !__rython_class_error.matches_builtin(stdpython::BuiltinException::Exception) {
+                        return Err(__rython_class_error);
+                    }
                     __rython_result.add_class_error(
                         #setup_description,
                         &__rython_class_error,
@@ -8649,6 +8652,9 @@ fn emit_test_runner(
                 } else {
                     #class_tests
                     if let Err(__rython_class_error) = #teardown_class {
+                        if !__rython_class_error.matches_builtin(stdpython::BuiltinException::Exception) {
+                            return Err(__rython_class_error);
+                        }
                         __rython_result.add_class_error(
                             #teardown_description,
                             &__rython_class_error,
