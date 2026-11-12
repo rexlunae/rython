@@ -105,3 +105,6 @@ as an improvement over any recorded error count.
 | `thread_nested_target` | a nested `def` as a Thread target, a field argument bound at construction, a Thread field returned from a method (#519 review) |
 | `thread_lazy_field` | a Thread field declared `None` in `__init__` and created in a later method, stopped before it starts, reset to `None`, refilled from a local handle (issue #529) |
 | `testcase_setup_helpers` | a TestCase helper reading setUp's fields, a helper setUp calls, a class default setUp overrides, `@staticmethod`/`@classmethod` members (#519 review) |
+| `tuple_field_stores` | tuple-unpacked instance field declarations, string coercion, and a tuple store in a mutating method (#527) |
+| `tuple_field_setter_order` | CPython's all-values-before-stores tuple rule: a property setter rebinding a global must not change a later RHS value (#542; conversion is deliberately refused until temporaries are modeled) |
+| `thread_tuple_local_field` | a tuple-bound Thread stored in a None-initialized field, then started and joined with its state visible in stdout (#542 review; CPython pin shared with codegen and package tests) |

@@ -780,9 +780,74 @@ fn tuple_destructuring_stores_through_mut_accessors() {
     );
     let out = compile(src, "tuple_target.py");
     assert!(
-        out.contains("* self . x_mut () , * self . y_mut ()"),
+        (out.contains("* self . x_mut () = 1") && out.contains("* self . y_mut () = 2"))
+            || out.contains("* self . x_mut () , * self . y_mut ()"),
         "tuple targets must destructure through the mut accessors: {}",
         out
+    );
+}
+
+#[test]
+fn tuple_field_stores_infer_each_field_type() {
+    let out = compile(
+        "class Pair:\n\
+         \x20   def __init__(self):\n\
+         \x20       self.number, self.label = 1, \"first\"\n",
+        "tuple_fields.py",
+    );
+    assert!(
+        out.contains("pub number : i64"),
+        "tuple assignment must declare the numeric field: {}",
+        out
+    );
+    assert!(
+        out.contains("pub label : String"),
+        "tuple assignment must infer an owned String field: {}",
+        out
+    );
+}
+
+#[test]
+fn tuple_field_store_refuses_rhs_reads_after_setter_effects() {
+    let error = compile_err(
+        "x = \"before\"\n\
+         class Pair:\n\
+         \x20   @property\n\
+         \x20   def a(self):\n\
+         \x20       return 0\n\
+         \x20   @a.setter\n\
+         \x20   def a(self, value):\n\
+         \x20       global x\n\
+         \x20       x = \"after\"\n\
+         \x20   def update(self):\n\
+         \x20       self.a, self.b = 1, x\n",
+        "tuple_field_order.py",
+    );
+    assert!(
+        error.contains("later non-literal RHS values")
+            && error.contains("unpack into local names before assigning attributes separately")
+            && error.contains("refuses to evaluate an RHS expression after an earlier target store"),
+        "effectful unpacking must fail conversion with a semantics-preserving rewrite: {error}"
+    );
+}
+
+#[test]
+fn starred_tuple_field_store_refusal_has_location_and_rewrite() {
+    let error = compile_err(
+        "class Pair:\n\
+         \x20   def __init__(self, values):\n\
+         \x20       self.first, *self.rest = values\n",
+        "starred_fields.py",
+    );
+    assert!(
+        error.contains("self.rest") && error.contains("line 3"),
+        "starred field-store refusal must identify the target and source line: {error}"
+    );
+    assert!(
+        error.contains("index the value instead")
+            && error.contains("assign each attribute separately")
+            && error.contains("rython refuses to silently store an element where Python stores a list"),
+        "starred field-store refusal must include its rewrite and semantic reason: {error}"
     );
 }
 
@@ -31650,6 +31715,104 @@ fn vendored_relative_function_reexports_remain_callable_module_items() {
     let out = compile_with_options(source, "app.py", options).unwrap();
     assert!(out.contains("crate :: textlib :: double"), "{out}");
     assert!(out.contains("crate :: textlib :: twice"), "{out}");
+}
+
+#[test]
+fn starred_attribute_unpacking_refusals_keep_location_and_rewrite() {
+    // Verified against python3: each pattern stores first=1 and rest=[2, 3].
+    for (target, place) in [
+        ("self.first, *self.rest", "self.rest"),
+        ("self.first, *rest", "self.first"),
+        ("(self.first, *rest), n", "self.first"),
+    ] {
+        let source =
+            format!("class Pair:\n    def __init__(self, values):\n        {target} = values\n");
+        let error = compile_err(&source, "starred_fields.py");
+        for fragment in [
+            "starred target",
+            place,
+            "line 3",
+            "index the value instead",
+            "assign each attribute separately",
+            "refuses to silently",
+        ] {
+            assert!(error.contains(fragment), "missing {fragment}: {error}");
+        }
+    }
+    // This free-function store bypasses class field inference and must
+    // still carry the assignment's own line to the same refusal.
+    let error = compile_err(
+        "def store(p, values):\n    p.first, *p.rest = values\n",
+        "starred_store.py",
+    );
+    for fragment in [
+        "starred target",
+        "p.rest",
+        "line 2",
+        "index the value instead",
+        "assign each attribute separately",
+    ] {
+        assert!(error.contains(fragment), "missing {fragment}: {error}");
+    }
+}
+
+#[test]
+fn tuple_bound_thread_locals_type_lazy_fields_and_cannot_hide_absent_fields() {
+    // Verified against python3: count 0, work 7, alive False (exit 0).
+    let source = include_str!("../../../eval/idioms/programs/thread_tuple_local_field.py");
+    let out = compile(source, "tuple_thread.py");
+    assert!(out.contains("t : Option < threading :: Thread >"), "{out}");
+    assert!(out.contains(". start ()"), "{out}");
+    assert!(out.contains(". join ()"), "{out}");
+
+    let error = compile_err(
+        "import threading\ndef work() -> None:\n    pass\nclass Runner:\n    def configure(self) -> None:\n        t, n = threading.Thread(target=work), 0\n        self.t = t\n    def run(self) -> None:\n        self.t.start()\n",
+        "absent_tuple_thread.py",
+    );
+    assert!(
+        error.contains("thread field") && error.contains("self.t"),
+        "{error}"
+    );
+    assert!(
+        error.contains("initialize each field unconditionally in __init__"),
+        "{error}"
+    );
+}
+
+#[test]
+fn overwritten_tuple_local_does_not_misclassify_an_integer_field_as_a_thread() {
+    // Verified against python3: the last target binding wins, prints 0,
+    // and the discarded Thread is constructed but never started.
+    // This pins conversion classification, not dynamic local typing:
+    // heterogeneous rebindings remain loud in rustc (spec §12.1).
+    let source = include_str!("../../rypip/tests/fixtures/thread_tuple_repeated_local.py");
+    for pattern in [
+        "t, t = threading.Thread(target=work), 0",
+        "t, (t, n) = threading.Thread(target=work), (0, 1)",
+    ] {
+        let source = source.replace("t, t = threading.Thread(target=work), 0", pattern);
+        let out = compile(&source, "repeated_thread_local.py");
+        assert!(out.contains("value : i64"), "{out}");
+        assert!(!out.contains("value : Option < threading :: Thread >"), "{out}");
+    }
+    let error = compile_err(
+        "import threading\ndef work() -> None:\n    pass\nclass Runner:\n    def __init__(self):\n        self.value = 0\n    def configure(self, other):\n        t, t = threading.Thread(target=work), other\n        self.value = t\n",
+        "unknown_repeated_thread_local.py",
+    );
+    assert!(error.contains("thread field `self.value`") && error.contains("refuses"), "{error}");
+}
+
+#[test]
+fn unpacking_initializes_locals_without_spurious_mut_but_restores_still_need_it() {
+    // Verified against python3: once prints 6, twice prints 7.
+    let out = compile(
+        "def once() -> None:\n    a, (b, c) = 1, (2, 3)\n    print(a + b + c)\ndef twice() -> None:\n    x, y = 1, 2\n    x, y = 3, 4\n    print(x + y)\n",
+        "unpack_mut.py",
+    );
+    for name in ["a", "b", "c"] {
+        assert!(!out.contains(&format!("let mut {name}")), "{out}");
+    }
+    assert!(out.contains("let mut x") && out.contains("let mut y"), "{out}");
 }
 
 #[test]

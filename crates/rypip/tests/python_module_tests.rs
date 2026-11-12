@@ -647,6 +647,15 @@ fn composition_stores_and_tuple_targets_persist_through_mut_accessors() {
         ),
     )
     .unwrap();
+    let python = Command::new("python3")
+        .arg(scratch.path().join("app.py"))
+        .env("PYTHONHASHSEED", "0")
+        .output()
+        .unwrap();
+    // Verified against python3: both composition and unpacked field writes persist.
+    assert_eq!(python.stdout, b"6\n3\n");
+    assert!(python.stderr.is_empty());
+    assert_eq!(python.status.code(), Some(0));
     let out = scratch.path().join("crate");
 
     let pkg = rypip::discover(&scratch.path().join("app.py")).expect("discover");
@@ -662,11 +671,8 @@ fn composition_stores_and_tuple_targets_persist_through_mut_accessors() {
         "chain store must go through inner_mut and the root's accessor: {}",
         app_rs
     );
-    assert!(
-        app_rs.contains("*self.x_mut(), *self.y_mut()"),
-        "tuple targets must destructure through the mut accessors: {}",
-        app_rs
-    );
+    // A literal RHS may become separate stores. Compare behavior below
+    // rather than requiring a particular Rust destructuring expression.
 
     let status = build_generated(&krate.root);
     assert!(status.success(), "generated crate failed to compile");
@@ -674,13 +680,9 @@ fn composition_stores_and_tuple_targets_persist_through_mut_accessors() {
     let output = Command::new(krate.root.join("target/debug/app"))
         .output()
         .expect("running generated binary");
-    assert!(output.status.success(), "binary exited nonzero");
-    // Python: 5 + 1 = 6, and 1 + 2 = 3 — the writes must persist.
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "6\n3",
-        "mutations must land on the real fields"
-    );
+    assert_eq!(output.stdout, python.stdout, "mutations must land on the real fields");
+    assert_eq!(output.stderr, python.stderr);
+    assert_eq!(output.status.code(), python.status.code());
 }
 
 /// A package-directory dependency with a relative import inside it:

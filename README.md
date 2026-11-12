@@ -172,7 +172,7 @@ lookup, normalize),
 `collections` (partial — issue #427; `deque`, `defaultdict`, `OrderedDict`
 and `Counter` construct, `ChainMap`/`namedtuple` do not), `pathlib`, `glob`,
 `subprocess`, `tempfile`,
-`threading` (Thread with static targets, including initialized instance fields
+`threading` (Thread with static targets, including tuple-bound locals, initialized instance fields
 and aliased imports; Lock/RLock/Event/Semaphore
 with a real `with lock:` acquire/release lowering, `local()` as a
 per-thread bag of run-time attributes), `socket` (TCP/UDP
@@ -237,6 +237,11 @@ distribution name. Ambiguous root-relative layouts with an inner module
 also named `pkg` reject absolute self-imports; use relative imports.
 Function re-exports in converted packages remain callable through module
 attributes, including aliased and multi-hop relative re-exports.
+
+Tuple/list unpacking infers instance field types from the stored elements
+and applies the fields' normal assignment coercions. Starred attribute
+patterns and later non-literal RHS elements require unpacking into locals
+and separate field stores.
 
 Known gaps:
 

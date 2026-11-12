@@ -183,7 +183,12 @@ impl CodeGen for Statement {
             .map(|guard| (crate::ast::tree::module::import_spelling(&self.statement), guard));
         let result = visit::stmt_exprs(&self).into_iter()
             .try_for_each(|expr| crate::ast::tree::pytest::reject_in_expr(expr, &options, &symbols))
-            .and_then(|()| self.statement.clone().to_rust(ctx, options, symbols))
+            .and_then(|()| {
+                if let StatementType::Assign(assign) = &self.statement {
+                    assign.refuse_starred_attribute_store(lineno)?;
+                }
+                self.statement.clone().to_rust(ctx, options, symbols)
+            })
             .map(|tokens| match &spelling {
                 Some((spelling, guard)) => {
                     crate::ast::tree::import::folded_guard_site(tokens, spelling, *guard)

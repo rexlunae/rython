@@ -703,7 +703,19 @@ CPython's `TypeError: cannot unpack non-iterable int object` and its
 in fields` with `fields` boxed) unpacks each row the same way. Any
 other destructure is the plain Rust tuple pattern (a method result
 such as `m.groups()`, a class instance: loud in rustc when the shapes
-disagree).
+disagree). Tuple/list assignment targets may include instance attributes:
+each `self.attr` leaf contributes a field, and a paired literal element
+determines its field type (`self.count, self.label = 1, "first"` declares
+an integer and an owned string field). A starred unpacking target that
+stores an attribute is rejected rather than guessing whether the field
+stores one element or the remaining list. When a later RHS element is a
+non-literal expression, attribute unpacking is also rejected: an earlier
+property setter could mutate a global or captured value that the later
+element reads, whereas Python evaluates the entire RHS before any store.
+Unpack into locals first, then assign the attributes separately. The
+starred-store refusal reports the assignment line and indexing/separate-store
+rewrite even when the attribute is a
+non-starred leaf (`self.first, *rest = values`).
 
 ### 5.3 `with`
 
@@ -2692,7 +2704,9 @@ not construct threads, consume thread names, or run targets. The real
 assignment evaluates `args` once at construction, then stores the handle;
 `start` alone runs the target. A field initialized to `None` in `__init__`
 may later receive a Thread and remains an `Option<threading::Thread>`
-(issue #529). A thread field must be initialized by an unconditional
+(issue #529). This includes a constructor bound by
+`t, n = threading.Thread(...), 0` and later stored with `self.t = t`.
+A thread field must be initialized by an unconditional
 top-level assignment in `__init__` before it is read or
 `self` escapes/is called. Fields read by constructor arguments also need
 preceding unconditional stores: this holds for EVERY Thread constructor in
@@ -3002,7 +3016,10 @@ in generated code rather than a conversion-time message:
 - Reading a non-constant module global from inside a function fails in
   rustc (the global lives in `__module_init__`'s scope).
 - Rebinding a local name to a different type fails as a rustc type
-  error against the hoisted declaration.
+  error against the hoisted declaration. This includes repeated tuple
+  targets with heterogeneous values (`t, t = threading.Thread(...), 0`):
+  the last value determines a subsequent field's Python type, but the
+  Rust local itself cannot change types. Unpack into distinct local names.
 - A typo'd or unsupported plain-name annotation (`x: itn`) renders
   verbatim (the mechanism that admits user classes) and fails in rustc.
 - Dunder-protocol *uses* (printing an object, `==`, `len()`, operator

@@ -195,10 +195,19 @@
     "thread_nested_target": {
       "status": "pass"
     },
+    "thread_tuple_local_field": {
+      "status": "pass"
+    },
     "tokenizer": {
       "status": "pass"
     },
     "tree": {
+      "status": "pass"
+    },
+    "tuple_field_setter_order": {
+      "status": "convert-failed"
+    },
+    "tuple_field_stores": {
       "status": "pass"
     },
     "untyped_method_args": {

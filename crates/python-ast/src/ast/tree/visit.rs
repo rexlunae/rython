@@ -252,13 +252,56 @@ pub fn stmt_all_exprs_mut(s: &mut Statement) -> Vec<&mut ExprType> {
 /// The names a binding target binds: a name, every element of a tuple or
 /// list pattern, a starred element's name.
 pub fn target_names(target: &ExprType) -> Vec<&str> {
+    target_leaves(target).into_iter().filter_map(|leaf| match leaf {
+        ExprType::Name(n) => Some(n.id.as_str()),
+        _ => None,
+    }).collect()
+}
+
+/// Walk a binding pattern, excluding expressions evaluated to locate a
+/// leaf (attribute receivers and subscript indices are not patterns).
+pub fn walk_target<'a>(target: &'a ExprType, f: &mut impl FnMut(&'a ExprType)) {
+    f(target);
     match target {
-        ExprType::Name(n) => vec![n.id.as_str()],
-        ExprType::Tuple(t) => t.elts.iter().flat_map(target_names).collect(),
-        ExprType::List(items) => items.iter().flat_map(target_names).collect(),
-        ExprType::Starred(st) => target_names(&st.value),
-        _ => Vec::new(),
+        ExprType::Tuple(t) => t.elts.iter().for_each(|e| walk_target(e, f)),
+        ExprType::List(items) => items.iter().for_each(|e| walk_target(e, f)),
+        ExprType::Starred(st) => walk_target(&st.value, f),
+        _ => {},
     }
+}
+
+pub fn target_has_starred(target: &ExprType) -> bool {
+    let mut found = false;
+    walk_target(target, &mut |e| found |= matches!(e, ExprType::Starred(_)));
+    found
+}
+
+/// The places a binding target stores into, in store order: the target
+/// itself, or every element of a tuple / list pattern (nested patterns
+/// flattened, a starred element's inner place). Where [`target_names`]
+/// answers which NAMES a store binds, this answers where every store
+/// LANDS — `self.a, (self.b, x) = ...` stores the fields `a` and `b` and
+/// the local `x` (issue #527).
+pub fn target_leaves(target: &ExprType) -> Vec<&ExprType> {
+    let mut leaves = Vec::new();
+    walk_target(target, &mut |e| {
+        if !matches!(e, ExprType::Tuple(_) | ExprType::List(_) | ExprType::Starred(_)) {
+            leaves.push(e);
+        }
+    });
+    leaves
+}
+
+/// The receiver attributes (`self.x`) a binding target stores, in store
+/// order — the field stores of an assignment, whatever its pattern.
+pub fn self_attr_leaves(target: &ExprType) -> Vec<&str> {
+    target_leaves(target)
+        .into_iter()
+        .filter_map(|leaf| match leaf {
+            ExprType::Attribute(a) if is_self(&a.value) => Some(a.attr.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The prefix of every temporary the conversion emits into the generated

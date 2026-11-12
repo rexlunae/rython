@@ -26107,3 +26107,54 @@ fn unittest_class_fixture_system_exit_preserves_cleanup_status_and_stops_later_s
         assert_eq!(code, expected_code);
     }
 }
+
+#[test]
+fn tuple_bound_thread_local_stored_in_a_lazy_field_runs_and_joins() {
+    let scratch = Scratch::new("thread-tuple-local-field");
+    let file = scratch.path().join("thread_tuple_local_field.py");
+    let source = include_str!("../../../eval/idioms/programs/thread_tuple_local_field.py");
+    fs::write(&file, source).unwrap();
+    let python = Command::new("python3")
+        .arg(&file)
+        .env("PYTHONHASHSEED", "0")
+        .output()
+        .unwrap();
+    // Verified against python3.
+    assert_eq!(python.stdout, b"count 0\nwork 7\nalive False\n");
+    assert!(python.stderr.is_empty());
+    assert_eq!(python.status.code(), Some(0));
+    let package = rypip::discover(&file).unwrap();
+    let krate = rypip::convert(
+        &package,
+        &scratch.path().join("crate"),
+        &ConvertOptions::default(),
+    )
+    .unwrap();
+    let status = Command::new("cargo")
+        .arg("build")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env("RUSTFLAGS", "-D warnings")
+        .current_dir(&krate.root)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let output = Command::new(krate.root.join("target/debug/thread_tuple_local_field"))
+        .output()
+        .unwrap();
+    assert_eq!(output.stdout, python.stdout);
+    assert_eq!(output.stderr, python.stderr);
+    assert_eq!(output.status.code(), python.status.code());
+}
+
+#[test]
+fn distinct_tuple_locals_keep_an_integer_field_integer() {
+    let source = include_str!("fixtures/thread_tuple_repeated_local.py")
+        .replace("t, t = threading.Thread(target=work), 0",
+            "_discarded, t = threading.Thread(target=work), 0");
+    let (stdout, stderr, code) = unittest_run("distinct_tuple_local", &source);
+    // Verified against python3. Distinct names avoid heterogeneous
+    // rebinding of one Rust local; constructing a Thread does not start it.
+    assert_eq!(stdout, "0\n");
+    assert_eq!(stderr, "");
+    assert_eq!(code, 0);
+}
