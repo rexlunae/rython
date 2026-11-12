@@ -122,27 +122,15 @@ impl ParsedValue {
     /// parse-time open produced (see [`OpenedFile`]).
     pub fn into_file(self) -> crate::PyFile {
         match self {
-            ParsedValue::File(OpenedFile {
-                handle: FileHandle::Text(file),
-                ..
-            }) => file,
-            other => panic!(
-                "argparse internal error: expected text file, got {:?}",
-                other
-            ),
+            ParsedValue::File(OpenedFile { handle: FileHandle::Text(file), .. }) => file,
+            other => panic!("argparse internal error: expected text file, got {:?}", other),
         }
     }
     /// The opened binary file of a FileType argument (a 'b' mode).
     pub fn into_binary_file(self) -> crate::stdlib::io::PyBytesIO {
         match self {
-            ParsedValue::File(OpenedFile {
-                handle: FileHandle::Binary(file),
-                ..
-            }) => file,
-            other => panic!(
-                "argparse internal error: expected binary file, got {:?}",
-                other
-            ),
+            ParsedValue::File(OpenedFile { handle: FileHandle::Binary(file), .. }) => file,
+            other => panic!("argparse internal error: expected binary file, got {:?}", other),
         }
     }
     /// The values of a variadic (`nargs`) argument.
@@ -366,27 +354,26 @@ fn usage_line(prog: &str, specs: &[ArgSpec]) -> String {
         }
         lines
     };
-    let lines: Vec<String> =
-        if (char_len(prefix) + char_len(prog)) as f64 <= 0.75 * text_width as f64 {
-            let indent = " ".repeat(char_len(prefix) + char_len(prog) + 1);
-            let mut head: Vec<String> = vec![prog.to_string()];
-            head.extend(opt_parts.iter().cloned());
-            let mut lines = get_lines(&head, &indent, true);
+    let lines: Vec<String> = if (char_len(prefix) + char_len(prog)) as f64 <= 0.75 * text_width as f64 {
+        let indent = " ".repeat(char_len(prefix) + char_len(prog) + 1);
+        let mut head: Vec<String> = vec![prog.to_string()];
+        head.extend(opt_parts.iter().cloned());
+        let mut lines = get_lines(&head, &indent, true);
+        lines.extend(get_lines(&pos_parts, &indent, false));
+        lines
+    } else {
+        let indent = " ".repeat(char_len(prefix));
+        let mut all: Vec<String> = opt_parts.clone();
+        all.extend(pos_parts.iter().cloned());
+        let mut lines = get_lines(&all, &indent, false);
+        if lines.len() > 1 {
+            lines = get_lines(&opt_parts, &indent, false);
             lines.extend(get_lines(&pos_parts, &indent, false));
-            lines
-        } else {
-            let indent = " ".repeat(char_len(prefix));
-            let mut all: Vec<String> = opt_parts.clone();
-            all.extend(pos_parts.iter().cloned());
-            let mut lines = get_lines(&all, &indent, false);
-            if lines.len() > 1 {
-                lines = get_lines(&opt_parts, &indent, false);
-                lines.extend(get_lines(&pos_parts, &indent, false));
-            }
-            let mut with_prog = vec![prog.to_string()];
-            with_prog.extend(lines);
-            with_prog
-        };
+        }
+        let mut with_prog = vec![prog.to_string()];
+        with_prog.extend(lines);
+        with_prog
+    };
     format!("{}{}", prefix, lines.join("\n"))
 }
 
@@ -454,19 +441,11 @@ fn help_text(prog: &str, description: Option<&str>, specs: &[ArgSpec]) -> String
     if specs.iter().any(|s| s.is_positional()) {
         out.push_str("\npositional arguments:\n");
         for s in specs.iter().filter(|s| s.is_positional()) {
-            entry(
-                &mut out,
-                &s.invocation(),
-                s.help.map(|h| expand_help(h, prog, s)).as_deref(),
-            );
+            entry(&mut out, &s.invocation(), s.help.map(|h| expand_help(h, prog, s)).as_deref());
         }
     }
     out.push_str("\noptions:\n");
-    entry(
-        &mut out,
-        &help_spec,
-        Some("show this help message and exit"),
-    );
+    entry(&mut out, &help_spec, Some("show this help message and exit"));
     for s in specs.iter().filter(|s| !s.is_positional()) {
         // Python's default help for action="version".
         let help = match (s.kind, s.help) {
@@ -508,9 +487,7 @@ fn percent_format(text: &str, params: &[(&str, String)]) -> Result<String, PyExc
                 if conversion != Some('s') {
                     return Err(crate::value_error(&format!(
                         "unsupported format character {} in argparse text",
-                        conversion
-                            .map(|c| py_repr(&c.to_string()))
-                            .unwrap_or_else(|| "'(end)'".to_string())
+                        conversion.map(|c| py_repr(&c.to_string())).unwrap_or_else(|| "'(end)'".to_string())
                     )));
                 }
                 match params.iter().find(|(k, _)| *k == name) {
@@ -639,7 +616,12 @@ fn py_repr(s: &str) -> String {
     crate::py_str_repr(s)
 }
 
-fn convert(prog: &str, specs: &[ArgSpec], spec: &ArgSpec, raw: &str) -> ParsedValue {
+fn convert(
+    prog: &str,
+    specs: &[ArgSpec],
+    spec: &ArgSpec,
+    raw: &str,
+) -> ParsedValue {
     match spec.kind {
         ArgKind::Untyped | ArgKind::Str => ParsedValue::Str(raw.to_string()),
         // `type=int` / `type=float` are the builtins: Python's numeric-string
@@ -649,30 +631,18 @@ fn convert(prog: &str, specs: &[ArgSpec], spec: &ArgSpec, raw: &str) -> ParsedVa
             crate::PyNumberParse::Invalid => exit_error(
                 prog,
                 specs,
-                &format!(
-                    "argument {}: invalid int value: {}",
-                    spec.action_name(),
-                    py_repr(raw)
-                ),
+                &format!("argument {}: invalid int value: {}", spec.action_name(), py_repr(raw)),
             ),
-            crate::PyNumberParse::Unsupported(why) => {
-                loud_exit(&crate::unsupported_number("int", raw, why))
-            }
+            crate::PyNumberParse::Unsupported(why) => loud_exit(&crate::unsupported_number("int", raw, why)),
         },
         ArgKind::Float => match crate::python_float_of(raw) {
             crate::PyNumberParse::Value(f) => ParsedValue::Float(f),
             crate::PyNumberParse::Invalid => exit_error(
                 prog,
                 specs,
-                &format!(
-                    "argument {}: invalid float value: {}",
-                    spec.action_name(),
-                    py_repr(raw)
-                ),
+                &format!("argument {}: invalid float value: {}", spec.action_name(), py_repr(raw)),
             ),
-            crate::PyNumberParse::Unsupported(why) => {
-                loud_exit(&crate::unsupported_number("float", raw, why))
-            }
+            crate::PyNumberParse::Unsupported(why) => loud_exit(&crate::unsupported_number("float", raw, why)),
         },
         ArgKind::StoreTrue | ArgKind::Version => ParsedValue::Flag(true),
         // Python opens the file at parse time and reports a failure as an
@@ -838,10 +808,7 @@ fn match_groups(groups: &[Vec<Atom>], pattern: &[char]) -> Option<Vec<usize>> {
                 pattern.get(pos) == Some(c) && go(groups, gi, ai + 1, pos + 1, pattern, ends)
             }
             Atom::Many(set) => {
-                let run = pattern[pos..]
-                    .iter()
-                    .take_while(|c| set.contains(c))
-                    .count();
+                let run = pattern[pos..].iter().take_while(|c| set.contains(c)).count();
                 (0..=run)
                     .rev()
                     .any(|n| go(groups, gi, ai + 1, pos + n, pattern, ends))
@@ -863,11 +830,7 @@ fn match_groups(groups: &[Vec<Atom>], pattern: &[char]) -> Option<Vec<usize>> {
 
 /// `_match_arguments_partial`: the longest prefix of the remaining
 /// positionals whose combined pattern matches, and each one's count.
-fn match_arguments_partial(
-    specs: &[ArgSpec],
-    positionals: &[usize],
-    pattern: &[char],
-) -> Vec<usize> {
+fn match_arguments_partial(specs: &[ArgSpec], positionals: &[usize], pattern: &[char]) -> Vec<usize> {
     for take in (1..=positionals.len()).rev() {
         let groups: Vec<Vec<Atom>> = positionals[..take]
             .iter()
@@ -908,10 +871,7 @@ struct Parse<'a> {
 
 impl<'a> Parse<'a> {
     fn lookup(&self, s: &str) -> Option<OptAction> {
-        self.options
-            .iter()
-            .find(|(name, _)| *name == s)
-            .map(|(_, a)| *a)
+        self.options.iter().find(|(name, _)| *name == s).map(|(_, a)| *a)
     }
 
     fn error(&self, message: &str) -> ! {
@@ -1081,9 +1041,7 @@ impl<'a> Parse<'a> {
     /// following argument, and — for a single-dash flag with more
     /// letters attached (`-vn 3`) — the flags packed after it.
     fn consume_optional(&mut self, start_index: usize) -> usize {
-        let tuple = self.option_at[start_index]
-            .as_ref()
-            .expect("an option index");
+        let tuple = self.option_at[start_index].as_ref().expect("an option index");
         let mut action = tuple.action;
         let mut option_string = tuple.option_string.clone();
         let mut sep = tuple.sep.clone();
@@ -1295,10 +1253,7 @@ pub fn run_parser(
         ));
     }
     if !parse.extras.is_empty() {
-        parse.error(&format!(
-            "unrecognized arguments: {}",
-            parse.extras.join(" ")
-        ));
+        parse.error(&format!("unrecognized arguments: {}", parse.extras.join(" ")));
     }
 
     Ok(parse

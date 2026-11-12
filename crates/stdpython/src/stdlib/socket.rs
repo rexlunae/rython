@@ -87,9 +87,7 @@ fn addr_tuple(addr: SocketAddr) -> (String, i64) {
 #[derive(Debug)]
 enum SockState {
     /// socket() was called; nothing bound or connected yet.
-    Fresh {
-        kind: i64,
-    },
+    Fresh { kind: i64 },
     /// A bound-and-listening TCP socket (bind() creates it — see the
     /// module divergence note).
     Listener(TcpListener),
@@ -147,7 +145,12 @@ impl Socket {
         let kind = match &*state {
             SockState::Fresh { kind } => *kind,
             SockState::Closed => return Err(bad_fd()),
-            _ => return Err(PyException::new("OSError", "[Errno 22] Invalid argument")),
+            _ => {
+                return Err(PyException::new(
+                    "OSError",
+                    "[Errno 22] Invalid argument",
+                ))
+            }
         };
         let target = (addr.0.as_ref(), addr.1 as u16);
         *state = if kind == SOCK_DGRAM {
@@ -183,10 +186,7 @@ impl Socket {
             _ => return Err(bad_fd()),
         };
         let (stream, peer) = listener.accept().map_err(|e| net_error(&e))?;
-        Ok((
-            Socket::from_state(SockState::Stream(stream)),
-            addr_tuple(peer),
-        ))
+        Ok((Socket::from_state(SockState::Stream(stream)), addr_tuple(peer)))
     }
 
     /// Python `socket.connect((host, port))`.
@@ -206,7 +206,7 @@ impl Socket {
                 return Err(PyException::new(
                     "OSError",
                     "[Errno 106] Transport endpoint is already connected",
-                ));
+                ))
             }
         };
         if kind == SOCK_DGRAM {
@@ -229,16 +229,11 @@ impl Socket {
                     })?;
                 TcpStream::connect_timeout(&resolved, t).map_err(|e| net_error(&e))?
             }
-            None => {
-                TcpStream::connect((addr.0.as_ref(), addr.1 as u16)).map_err(|e| net_error(&e))?
-            }
+            None => TcpStream::connect((addr.0.as_ref(), addr.1 as u16))
+                .map_err(|e| net_error(&e))?,
         };
-        stream
-            .set_read_timeout(timeout)
-            .map_err(|e| net_error(&e))?;
-        stream
-            .set_write_timeout(timeout)
-            .map_err(|e| net_error(&e))?;
+        stream.set_read_timeout(timeout).map_err(|e| net_error(&e))?;
+        stream.set_write_timeout(timeout).map_err(|e| net_error(&e))?;
         *state = SockState::Stream(stream);
         Ok(())
     }
@@ -325,11 +320,7 @@ impl Socket {
     }
 
     /// Python `socket.sendto(bytes, (host, port))` (UDP) -> count sent.
-    pub fn sendto<S: AsRef<str>, B: AsRef<[u8]>>(
-        &self,
-        data: B,
-        addr: (S, i64),
-    ) -> Result<i64, PyException> {
+    pub fn sendto<S: AsRef<str>, B: AsRef<[u8]>>(&self, data: B, addr: (S, i64)) -> Result<i64, PyException> {
         let data = data.as_ref();
         // Auto-bind (CPython binds an unbound UDP socket on first sendto)
         // and clone the handle out; the blocking send runs unlocked.
@@ -348,7 +339,7 @@ impl Socket {
                     return Err(PyException::new(
                         "OSError",
                         "sendto() requires a SOCK_DGRAM socket",
-                    ));
+                    ))
                 }
             }
         };
@@ -369,7 +360,7 @@ impl Socket {
                 return Err(PyException::new(
                     "OSError",
                     "recvfrom() requires a SOCK_DGRAM socket",
-                ));
+                ))
             }
         };
         let mut buf = vec![0u8; bufsize as usize];
@@ -457,16 +448,12 @@ static DEFAULT_TIMEOUT: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(No
 
 /// Python `socket.getdefaulttimeout()`.
 pub fn getdefaulttimeout() -> Option<f64> {
-    *DEFAULT_TIMEOUT
-        .lock()
-        .expect("default-timeout lock poisoned")
+    *DEFAULT_TIMEOUT.lock().expect("default-timeout lock poisoned")
 }
 
 /// Python `socket.setdefaulttimeout(timeout)`.
 pub fn setdefaulttimeout(timeout: Option<f64>) {
-    *DEFAULT_TIMEOUT
-        .lock()
-        .expect("default-timeout lock poisoned") = timeout;
+    *DEFAULT_TIMEOUT.lock().expect("default-timeout lock poisoned") = timeout;
 }
 
 /// Python `socket.socket(family, type, proto)` — the 3-argument spelling
@@ -504,15 +491,16 @@ pub fn getaddrinfo<S: AsRef<str>>(
 ) -> Result<Vec<(i64, i64, i64, String, (String, i64))>, PyException> {
     // Verified against python3: an unresolvable host raises
     // gaierror('[Errno -2] Name or service not known'), IS-A OSError.
-    let gaierror = || PyException::new("OSError", "[Errno -2] Name or service not known");
+    let gaierror = || {
+        PyException::new(
+            "OSError",
+            "[Errno -2] Name or service not known",
+        )
+    };
     let addrs = (host.as_ref(), port as u16)
         .to_socket_addrs()
         .map_err(|_| gaierror())?;
-    let proto = if kind == SOCK_DGRAM {
-        IPPROTO_UDP
-    } else {
-        IPPROTO_TCP
-    };
+    let proto = if kind == SOCK_DGRAM { IPPROTO_UDP } else { IPPROTO_TCP };
     let mut out = Vec::new();
     for a in addrs {
         let af = match a {
@@ -522,13 +510,7 @@ pub fn getaddrinfo<S: AsRef<str>>(
         if family != AF_UNSPEC && family != af {
             continue;
         }
-        out.push((
-            af,
-            kind,
-            proto,
-            String::new(),
-            (a.ip().to_string(), a.port() as i64),
-        ));
+        out.push((af, kind, proto, String::new(), (a.ip().to_string(), a.port() as i64)));
     }
     if out.is_empty() {
         return Err(gaierror());

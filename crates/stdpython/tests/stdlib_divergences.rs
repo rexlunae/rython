@@ -8,9 +8,9 @@
 
 mod common;
 
+use stdpython::*;
 use stdpython::stdlib::datetime::{date, datetime, time};
 use stdpython::stdlib::string::Template;
-use stdpython::*;
 
 // ---------------------------------------------------------------------------
 // json: insertion order, big integers, strict whitespace
@@ -43,7 +43,8 @@ fn json_rejects_form_feed_whitespace() {
     // than silently accept the input.
     let err = json::loads("[1,\x0c2]").expect_err("form feed must be rejected");
     assert!(
-        err.message.contains("Unexpected character") || err.message.contains("Expected"),
+        err.message.contains("Unexpected character")
+            || err.message.contains("Expected"),
         "{}",
         err.message
     );
@@ -59,10 +60,7 @@ fn defaultdict_preserves_insertion_order() {
     dd.insert("b".to_string(), 1);
     dd.insert("a".to_string(), 2);
     dd.insert("c".to_string(), 3);
-    assert_eq!(
-        dd.keys(),
-        vec!["b".to_string(), "a".to_string(), "c".to_string()]
-    );
+    assert_eq!(dd.keys(), vec!["b".to_string(), "a".to_string(), "c".to_string()]);
     // Removal keeps the remaining order intact (dict.pop semantics).
     dd.remove(&"a".to_string());
     assert_eq!(dd.keys(), vec!["b".to_string(), "c".to_string()]);
@@ -83,9 +81,7 @@ fn deque_insert_at_maxlen_raises_index_error() {
 #[test]
 fn deque_index_names_the_missing_value() {
     let d = collections::deque::from_iter(vec![1i64, 2, 3], None);
-    let err = d
-        .index(&9, None, None)
-        .expect_err("missing value must raise");
+    let err = d.index(&9, None, None).expect_err("missing value must raise");
     assert_eq!(err.message, "9 is not in deque");
 }
 
@@ -101,7 +97,10 @@ fn math_remainder_matches_ieee_exactly() {
         math::remainder(123456789.0, 0.1).unwrap(),
         -6.853228484704488e-09
     );
-    assert_eq!(math::remainder(10.0, 0.1).unwrap(), -5.551115123125783e-16);
+    assert_eq!(
+        math::remainder(10.0, 0.1).unwrap(),
+        -5.551115123125783e-16
+    );
     // inf / zero domain errors, y infinite returns x.
     let err = math::remainder(f64::INFINITY, 1.0).expect_err("inf dividend");
     assert_eq!(err.message, "math domain error");
@@ -164,20 +163,9 @@ fn datetime_strftime_is_a_single_pass() {
     // Unknown directives stay literal, like CPython.
     assert_eq!(dt.strftime("%q"), "%q");
     // date-only receivers fill time with zeros; time-only fill 1900-01-01.
-    assert_eq!(
-        date::new(2024, 3, 5).unwrap().strftime("%H:%M:%S"),
-        "00:00:00"
-    );
-    assert_eq!(
-        time::new(13, 7, Some(9), Some(0))
-            .unwrap()
-            .strftime("%Y-%m-%d"),
-        "1900-01-01"
-    );
-    assert_eq!(
-        time::new(0, 0, Some(0), Some(0)).unwrap().strftime("%I %p"),
-        "12 AM"
-    );
+    assert_eq!(date::new(2024, 3, 5).unwrap().strftime("%H:%M:%S"), "00:00:00");
+    assert_eq!(time::new(13, 7, Some(9), Some(0)).unwrap().strftime("%Y-%m-%d"), "1900-01-01");
+    assert_eq!(time::new(0, 0, Some(0), Some(0)).unwrap().strftime("%I %p"), "12 AM");
 }
 
 #[test]
@@ -187,10 +175,7 @@ fn date_validates_the_year() {
     let err = date::new(10000, 1, 1).expect_err("year 10000");
     assert_eq!(err.message, "year must be in 1..9999, not 10000");
     // Ordinals map through the same range check.
-    assert_eq!(
-        date::fromordinal(3652059).unwrap().isoformat(),
-        "9999-12-31"
-    );
+    assert_eq!(date::fromordinal(3652059).unwrap().isoformat(), "9999-12-31");
     let err = date::fromordinal(3652060).expect_err("ordinal past 9999-12-31");
     assert_eq!(err.message, "year must be in 1..9999, not 10000");
     let err = date::fromordinal(0).expect_err("ordinal 0");
@@ -216,9 +201,11 @@ fn date_isocalendar_handles_boundary_years() {
 
 #[test]
 fn textwrap_keeps_trailing_whitespace_chunk() {
-    let lines =
-        stdpython::stdlib::textwrap::wrap("hello world supercalifragilisticexpialidocious", 12)
-            .unwrap();
+    let lines = stdpython::stdlib::textwrap::wrap(
+        "hello world supercalifragilisticexpialidocious",
+        12,
+    )
+    .unwrap();
     // CPython: ['hello world ', 'supercalifra', 'gilisticexpi', 'alidocious']
     assert_eq!(
         lines,
@@ -243,11 +230,7 @@ fn purepath_parent_matches_cpython() {
     assert_eq!(PurePath::new("a/b").parent().to_string(), "a");
     assert_eq!(PurePath::new("/a").parent().to_string(), "/");
     assert_eq!(PurePath::new("/").parent().to_string(), "/");
-    let parents: Vec<String> = PurePath::new("a/b")
-        .parents()
-        .iter()
-        .map(|p| p.to_string())
-        .collect();
+    let parents: Vec<String> = PurePath::new("a/b").parents().iter().map(|p| p.to_string()).collect();
     assert_eq!(parents, vec!["a".to_string(), ".".to_string()]);
     assert!(PurePath::new("/").parents().is_empty());
 }
@@ -267,10 +250,7 @@ fn purepath_suffixes_match_cpython() {
 fn purepath_with_suffix_validates() {
     use stdpython::stdlib::pathlib::PurePath;
     assert_eq!(
-        PurePath::new("a.txt")
-            .with_suffix(".md")
-            .unwrap()
-            .to_string(),
+        PurePath::new("a.txt").with_suffix(".md").unwrap().to_string(),
         "a.md"
     );
     assert_eq!(
@@ -303,23 +283,17 @@ fn template_substitution_matches_cpython() {
     // $$ is an escaped delimiter; the identifier after it is untouched.
     assert_eq!(Template::new("$$").substitute(none).unwrap(), "$");
     assert_eq!(
-        Template::new("$$name")
-            .substitute(&[("name", "A")])
-            .unwrap(),
+        Template::new("$$name").substitute(&[("name", "A")]).unwrap(),
         "$name"
     );
     // Longest-identifier match: '$ab' with {'a': 'X', 'ab': 'Y'} -> 'Y'.
     assert_eq!(
-        Template::new("$ab")
-            .substitute(&[("a", "X"), ("ab", "Y")])
-            .unwrap(),
+        Template::new("$ab").substitute(&[("a", "X"), ("ab", "Y")]).unwrap(),
         "Y"
     );
     // Substituted values are not re-scanned.
     assert_eq!(
-        Template::new("$name")
-            .substitute(&[("name", "$x")])
-            .unwrap(),
+        Template::new("$name").substitute(&[("name", "$x")]).unwrap(),
         "$x"
     );
     // Braced forms and key errors with CPython's message shape.
@@ -332,17 +306,9 @@ fn template_substitution_matches_cpython() {
     assert_eq!(err.message, "'x'");
     // Invalid placeholders are ValueErrors with CPython's message.
     let err = Template::new("a$").substitute(none).unwrap_err();
-    assert!(
-        err.message.starts_with("Invalid placeholder in string"),
-        "{}",
-        err.message
-    );
+    assert!(err.message.starts_with("Invalid placeholder in string"), "{}", err.message);
     let err = Template::new("$1").substitute(none).unwrap_err();
-    assert!(
-        err.message.starts_with("Invalid placeholder in string"),
-        "{}",
-        err.message
-    );
+    assert!(err.message.starts_with("Invalid placeholder in string"), "{}", err.message);
 }
 
 #[test]
@@ -384,14 +350,7 @@ fn glob_escape_uses_bracket_escapes() {
 #[test]
 fn spooled_tempfile_negative_seek_raises() {
     let mut f = stdpython::stdlib::tempfile::SpooledTemporaryFile::new(
-        Some(1024),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        Some(1024), None, None, None, None, None, None, None,
     );
     f.write(b"hello").unwrap();
     let err = f.seek(-1, 0).expect_err("negative absolute seek");
@@ -447,11 +406,7 @@ fn glob_relative_patterns_yield_relative_paths_and_starstar_is_not_recursive_by_
     );
     // {a,b} is NOT brace expansion in CPython's glob.
     let braces = glob::glob("{a,b}.txt").unwrap();
-    assert!(
-        braces.is_empty(),
-        "brace expansion must not exist: {:?}",
-        braces
-    );
+    assert!(braces.is_empty(), "brace expansion must not exist: {:?}", braces);
     let _ = std::env::set_current_dir(cwd);
     std::fs::remove_dir_all(&scratch).unwrap();
 }

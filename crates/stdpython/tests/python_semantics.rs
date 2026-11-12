@@ -8,40 +8,17 @@ use stdpython::*;
 fn py_integer_promotes_and_uses_python_floor_division() {
     // Python: a = 2**63 - 1; (a+1, -a-2, a*a, (-2**70)//3, (-2**70)%3)
     let a = PyInteger::from(i64::MAX);
-    assert_eq!(
-        a.py_add(&PyInteger::from(1)).to_string(),
-        "9223372036854775808"
-    );
-    assert_eq!(
-        PyInteger::from(i64::MIN)
-            .py_sub(&PyInteger::from(1))
-            .to_string(),
-        "-9223372036854775809"
-    );
-    assert_eq!(
-        a.py_mul(&a).to_string(),
-        "85070591730234615847396907784232501249"
-    );
+    assert_eq!(a.py_add(&PyInteger::from(1)).to_string(), "9223372036854775808");
+    assert_eq!(PyInteger::from(i64::MIN).py_sub(&PyInteger::from(1)).to_string(), "-9223372036854775809");
+    assert_eq!(a.py_mul(&a).to_string(), "85070591730234615847396907784232501249");
     let n = PyInteger::from_decimal("-1180591620717411303424").unwrap();
-    assert_eq!(
-        n.py_floordiv(&PyInteger::from(3)).unwrap().to_string(),
-        "-393530540239137101142"
-    );
+    assert_eq!(n.py_floordiv(&PyInteger::from(3)).unwrap().to_string(), "-393530540239137101142");
     assert_eq!(n.py_mod(&PyInteger::from(3)).unwrap().to_string(), "2");
     assert!(n < PyInteger::from(0));
     assert!(PyInteger::from(0) < a.py_add(&PyInteger::from(1)));
     assert_eq!(a.py_add(&PyInteger::from(1)).py_sub(&PyInteger::from(1)), a);
-    assert_eq!(
-        PyInteger::from(i64::MIN)
-            .py_floordiv(&PyInteger::from(-1))
-            .unwrap()
-            .to_string(),
-        "9223372036854775808"
-    );
-    assert_eq!(
-        n.py_mod(&PyInteger::from(0)).unwrap_err().message,
-        "integer modulo by zero"
-    );
+    assert_eq!(PyInteger::from(i64::MIN).py_floordiv(&PyInteger::from(-1)).unwrap().to_string(), "9223372036854775808");
+    assert_eq!(n.py_mod(&PyInteger::from(0)).unwrap_err().message, "integer modulo by zero");
 }
 
 #[test]
@@ -59,9 +36,7 @@ fn py_integer_comparisons_and_hashes_are_exact() {
     assert_eq!(a.py_hash(), 8);
     assert_eq!((-&a).py_hash(), -8);
     // Python: hash(2**200 + 1) == 131073; hash(-1) == -2.
-    let huge =
-        PyInteger::from_decimal("1606938044258990275541962092341162602522202993782792835301377")
-            .unwrap();
+    let huge = PyInteger::from_decimal("1606938044258990275541962092341162602522202993782792835301377").unwrap();
     assert_eq!(huge.py_hash(), 131073);
     assert_eq!((-huge).py_hash(), -131073);
     assert_eq!(PyInteger::from(-1).py_hash(), -2);
@@ -76,10 +51,7 @@ fn py_integer_comparisons_and_hashes_are_exact() {
     // Python: float(2**64 + 2048) rounds to 2**64 (ties to even);
     // float(2**64 + 6144) rounds up to 2**64 + 8192.
     assert_eq!((&a.py_add(&2048i64)).py_float().unwrap(), f);
-    assert_eq!(
-        (&a.py_add(&6144i64)).py_float().unwrap().to_bits(),
-        f.to_bits() + 2
-    );
+    assert_eq!((&a.py_add(&6144i64)).py_float().unwrap().to_bits(), f.to_bits() + 2);
     // Python: float(10**600) raises OverflowError with this message.
     let enormous = PyInteger::from_decimal(&format!("1{}", "0".repeat(600))).unwrap();
     let error = (&enormous).py_float().unwrap_err();
@@ -96,10 +68,7 @@ fn py_integer_decimal_limit_applies_at_conversion() {
     let product = a.py_mul(&a);
     let error = product.checked_decimal().unwrap_err();
     assert_eq!(error.exception_type, "ValueError");
-    assert_eq!(
-        error.message,
-        "Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"
-    );
+    assert_eq!(error.message, "Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit");
 }
 
 #[test]
@@ -165,20 +134,14 @@ fn floordiv_and_mod_follow_divisor_sign() {
         py_floordiv(1i64, 0).unwrap_err().exception_type,
         "ZeroDivisionError"
     );
-    assert_eq!(
-        py_mod(1.0f64, 0.0).unwrap_err().exception_type,
-        "ZeroDivisionError"
-    );
+    assert_eq!(py_mod(1.0f64, 0.0).unwrap_err().exception_type, "ZeroDivisionError");
 }
 
 #[test]
 fn divmod_matches_python() {
     assert_eq!(divmod(-7i64, 2).unwrap(), (-4, 1));
     assert_eq!(divmod(7i64, 2).unwrap(), (3, 1));
-    assert_eq!(
-        divmod(1i64, 0).unwrap_err().exception_type,
-        "ZeroDivisionError"
-    );
+    assert_eq!(divmod(1i64, 0).unwrap_err().exception_type, "ZeroDivisionError");
 }
 
 #[test]
@@ -278,6 +241,7 @@ fn counter_keeps_zero_and_negative_counts() {
     assert_eq!(c.most_common(None).len(), 1);
 }
 
+
 /// The random tests share one global generator; parallel test threads
 /// would interleave draws and break seeded sequences, so every test that
 /// touches the RNG serializes on this lock.
@@ -295,11 +259,7 @@ fn randrange_reaches_last_step_value() {
     let mut seen_max = 0;
     for _ in 0..2000 {
         let v = stdpython::random::randrange(0, Some(10), Some(3)).unwrap();
-        assert!(
-            v == 0 || v == 3 || v == 6 || v == 9,
-            "unexpected value {}",
-            v
-        );
+        assert!(v == 0 || v == 3 || v == 6 || v == 9, "unexpected value {}", v);
         seen_max = seen_max.max(v);
     }
     assert_eq!(seen_max, 9);
@@ -377,10 +337,7 @@ fn math_sumprod_preserves_int_and_float_types() {
     assert_eq!(sumprod_f64(&[-1.0], &[1.0]).unwrap(), -1.0);
     // Unequal lengths raise ValueError (python3: `Inputs are not the same length`).
     let e = sumprod_i64(&[1, 2, 3], &[1, 2]).unwrap_err();
-    assert_eq!(
-        format!("{}", e),
-        "ValueError: Inputs are not the same length"
-    );
+    assert_eq!(format!("{}", e), "ValueError: Inputs are not the same length");
 }
 
 #[test]
@@ -395,10 +352,7 @@ fn math_comb_perm_match_cpython() {
     // k > n → 0 (CPython), k < 0 → ValueError.
     assert_eq!(comb(5, 6).unwrap(), 0);
     let e = comb(5, -1).unwrap_err();
-    assert_eq!(
-        format!("{}", e),
-        "ValueError: k must be a non-negative integer"
-    );
+    assert_eq!(format!("{}", e), "ValueError: k must be a non-negative integer");
     // Negative n → ValueError.
     let e = comb(-1, 2).unwrap_err();
     assert_eq!(
@@ -416,14 +370,8 @@ fn math_comb_perm_match_cpython() {
     assert_eq!(perm(0, 0).unwrap(), 1);
     assert_eq!(perm(5, 6).unwrap(), 0);
     let e = perm(5, -1).unwrap_err();
-    assert_eq!(
-        format!("{}", e),
-        "ValueError: k must be a non-negative integer"
-    );
-    assert_eq!(
-        format!("{}", perm(-1, 2).unwrap_err()),
-        "ValueError: n must be a non-negative integer"
-    );
+    assert_eq!(format!("{}", e), "ValueError: k must be a non-negative integer");
+    assert_eq!(format!("{}", perm(-1, 2).unwrap_err()), "ValueError: n must be a non-negative integer");
 }
 
 #[test]
@@ -443,10 +391,7 @@ fn math_isqrt_cbrt_fma_hypot_nextafter_match_cpython() {
     }
     // Python: math.isqrt(-1) raises ValueError("isqrt() argument must be nonnegative")
     let e = isqrt(-1).unwrap_err();
-    assert_eq!(
-        format!("{}", e),
-        "ValueError: isqrt() argument must be nonnegative"
-    );
+    assert_eq!(format!("{}", e), "ValueError: isqrt() argument must be nonnegative");
     // cbrt routes through the Rust `libm` crate, a fixed correctly-rounded
     // software cube root (deterministic on every ABI): it returns the exact
     // root for perfect cubes (cbrt(-8.0) == -2.0, cbrt(0.0) == 0.0). CPython
@@ -459,11 +404,7 @@ fn math_isqrt_cbrt_fma_hypot_nextafter_match_cpython() {
     assert_eq!(cbrt(-8.0), -2.0);
     assert_eq!(cbrt(0.0), 0.0);
     // Python: abs(math.cbrt(27.0) - 3.0) < 1e-15
-    assert!(
-        (cbrt(27.0) - 3.0).abs() < 1e-15,
-        "cbrt(27.0) = {}",
-        cbrt(27.0)
-    );
+    assert!((cbrt(27.0) - 3.0).abs() < 1e-15, "cbrt(27.0) = {}", cbrt(27.0));
     // fma(x, y, z) = x*y + z with a single rounding; finite operands whose
     // exact product+sum overflows raise OverflowError, and a 0*inf/inf*0
     // (NaN from non-NaN inputs) raises ValueError — byte-identical to
@@ -471,20 +412,14 @@ fn math_isqrt_cbrt_fma_hypot_nextafter_match_cpython() {
     // Python: math.fma(3.0, 4.0, 5.0) == 17.0
     assert_eq!(fma(3.0, 4.0, 5.0).unwrap(), 17.0);
     // Python: math.fma(1e308, 1e308, 0.0) raises OverflowError("overflow in fma")
-    assert_eq!(
-        fma(1e308, 1e308, 0.0).unwrap_err().to_string(),
-        "OverflowError: overflow in fma"
-    );
+    assert_eq!(fma(1e308, 1e308, 0.0).unwrap_err().to_string(),
+               "OverflowError: overflow in fma");
     // Python: math.fma(1e308, -1e308, 0.0) raises OverflowError("overflow in fma")
-    assert_eq!(
-        fma(1e308, -1e308, 0.0).unwrap_err().to_string(),
-        "OverflowError: overflow in fma"
-    );
+    assert_eq!(fma(1e308, -1e308, 0.0).unwrap_err().to_string(),
+               "OverflowError: overflow in fma");
     // Python: math.fma(0.0, inf, 0.0) raises ValueError("invalid operation in fma")
-    assert_eq!(
-        fma(0.0, f64::INFINITY, 0.0).unwrap_err().to_string(),
-        "ValueError: invalid operation in fma"
-    );
+    assert_eq!(fma(0.0, f64::INFINITY, 0.0).unwrap_err().to_string(),
+               "ValueError: invalid operation in fma");
     // Python: math.fma(inf, 1.0, 0.0) == inf (no raise; infinite operand)
     assert_eq!(fma(f64::INFINITY, 1.0, 0.0).unwrap(), f64::INFINITY);
     // Python: math.fma(nan, 1.0, 0.0) is nan (no raise; NaN operand)
@@ -525,14 +460,8 @@ fn math_log_one_and_two_arg_match_python() {
     assert_eq!(log(2.718281828459045, None).unwrap(), 1.0);
     assert_eq!(log(8.0, Some(2.0)).unwrap(), 3.0);
     assert_eq!(log(100.0, Some(10.0)).unwrap(), 2.0);
-    assert_eq!(
-        format!("{}", log(-1.0, None).unwrap_err()),
-        "ValueError: math domain error"
-    );
-    assert_eq!(
-        format!("{}", log(8.0, Some(1.0)).unwrap_err()),
-        "ValueError: math domain error"
-    );
+    assert_eq!(format!("{}", log(-1.0, None).unwrap_err()), "ValueError: math domain error");
+    assert_eq!(format!("{}", log(8.0, Some(1.0)).unwrap_err()), "ValueError: math domain error");
 }
 
 #[test]
@@ -549,14 +478,8 @@ fn math_gamma_matches_python_values_and_pole() {
     // 1 ulp off across libms (macOS vs glibc), so pin it within tolerance.
     assert!((gamma(0.5).unwrap() - 1.7724538509055159).abs() < 1e-12);
     assert!((gamma(-2.5).unwrap() - (-0.9453087204829418)).abs() < 1e-12);
-    assert_eq!(
-        format!("{}", gamma(0.0).unwrap_err()),
-        "ValueError: math domain error"
-    );
-    assert_eq!(
-        format!("{}", gamma(-3.0).unwrap_err()),
-        "ValueError: math domain error"
-    );
+    assert_eq!(format!("{}", gamma(0.0).unwrap_err()), "ValueError: math domain error");
+    assert_eq!(format!("{}", gamma(-3.0).unwrap_err()), "ValueError: math domain error");
     assert_eq!(
         format!("{}", gamma(171.7).unwrap_err()),
         "OverflowError: math range error"
@@ -566,10 +489,7 @@ fn math_gamma_matches_python_values_and_pole() {
     // OverflowError("math range error") (lgamma(1e308)).
     assert!((lgamma(0.5).unwrap() - 0.5723649429247004).abs() < 1e-12);
     assert_eq!(lgamma(f64::NEG_INFINITY).unwrap(), f64::INFINITY);
-    assert_eq!(
-        format!("{}", lgamma(1e308).unwrap_err()),
-        "OverflowError: math range error"
-    );
+    assert_eq!(format!("{}", lgamma(1e308).unwrap_err()), "OverflowError: math range error");
 }
 
 #[test]
@@ -720,10 +640,7 @@ fn py_exception_type_name_is_the_raised_class() {
     // type(IOError()).__name__ -> 'OSError' (the alias IS the class);
     // likewise EnvironmentError
     assert_eq!(PyException::new("IOError", "").type_name(), "OSError");
-    assert_eq!(
-        PyException::new("EnvironmentError", "").type_name(),
-        "OSError"
-    );
+    assert_eq!(PyException::new("EnvironmentError", "").type_name(), "OSError");
     // A user class (class IDNAError(UnicodeError)) keeps its own name.
     assert_eq!(PyException::new("IDNAError", "").type_name(), "IDNAError");
 }
@@ -864,8 +781,12 @@ fn issue81_round_and_pow_match_cpython() {
 fn issue81_negative_index_overflow_does_not_panic() {
     // i64::MIN + len used to overflow in normalize_index; Python answers
     // IndexError because |index| > len.
-    assert!(vec![1i64, 2].py_index(-9223372036854775808i64).is_err());
-    assert!(vec![1i64, 2].py_pop(-9223372036854775808i64).is_err());
+    assert!(vec![1i64, 2]
+        .py_index(-9223372036854775808i64)
+        .is_err());
+    assert!(vec![1i64, 2]
+        .py_pop(-9223372036854775808i64)
+        .is_err());
     // insert prepends, like Python (insert(-huge, x) == insert(0, x)).
     let mut v = vec![1i64, 2];
     let _ = v.py_insert(-9223372036854775808i64, 9);
@@ -976,11 +897,7 @@ fn py_index_mut_writes_land_in_place() {
     );
     // Dicts: KeyError on missing key, mutation in place otherwise.
     let mut table = std::collections::HashMap::from([("row", vec![5i64, 6])]);
-    table
-        .py_index_mut("row")
-        .unwrap()
-        .py_set_index(1, 7)
-        .unwrap();
+    table.py_index_mut("row").unwrap().py_set_index(1, 7).unwrap();
     assert_eq!(table["row"][1], 7);
     assert_eq!(
         table.py_index_mut("nope").unwrap_err().exception_type,
@@ -1135,7 +1052,12 @@ fn seeded_distributions_match_cpython_arithmetic() {
     // Same algorithms as CPython; transcendental libm calls may differ in
     // the last ulp, so compare with a tight relative tolerance.
     fn close(a: f64, b: f64) {
-        assert!(((a - b) / b).abs() < 1e-12, "expected {}, got {}", b, a);
+        assert!(
+            ((a - b) / b).abs() < 1e-12,
+            "expected {}, got {}",
+            b,
+            a
+        );
     }
     random::seed(Some(1i64));
     close(random::normalvariate(0.0, 1.0), 0.6074558576437062);
@@ -1159,10 +1081,7 @@ fn seeded_distributions_match_cpython_arithmetic() {
     random::seed(Some(9i64));
     close(random::vonmisesvariate(0.0, 4.0), 5.846117145872649);
     random::seed(Some(9i64));
-    close(
-        random::weibullvariate(1.0, 1.5).unwrap(),
-        0.7284843985495473,
-    );
+    close(random::weibullvariate(1.0, 1.5).unwrap(), 0.7284843985495473);
 }
 
 #[test]
@@ -1175,11 +1094,7 @@ fn random_state_round_trips_and_seed_resets_gauss() {
     let a = random::gauss(0.0, 1.0);
     let b = random::random();
     random::setstate(&state).unwrap();
-    assert_eq!(
-        random::gauss(0.0, 1.0),
-        a,
-        "state must include the gauss cache"
-    );
+    assert_eq!(random::gauss(0.0, 1.0), a, "state must include the gauss cache");
     assert_eq!(random::random(), b);
 
     // Reseeding clears the cached deviate (CPython behavior): two fresh
@@ -1260,10 +1175,7 @@ fn environ_is_a_live_view() {
     // Mutations after first access must be visible (the old snapshot
     // silently disagreed with os.getenv).
     stdpython::os::setenv(key, "second");
-    assert_eq!(
-        stdpython::os::environ.py_get(key).as_deref(),
-        Some("second")
-    );
+    assert_eq!(stdpython::os::environ.py_get(key).as_deref(), Some("second"));
     assert_eq!(stdpython::os::environ.py_index(key).unwrap(), "second");
     assert!(stdpython::os::environ.py_contains(key));
     // Missing keys raise KeyError like Python's os.environ[...].
@@ -1285,13 +1197,9 @@ fn glob_wildcards_skip_hidden_files() {
     assert_eq!(star.len(), 1, "hidden file must not match *: {:?}", star);
     assert!(star[0].ends_with("visible.txt"));
 
-    let dotted = stdpython::glob::glob(format!("{}/.*.txt", dir.to_string_lossy())).unwrap();
-    assert_eq!(
-        dotted.len(),
-        1,
-        "literal-dot pattern must match: {:?}",
-        dotted
-    );
+    let dotted =
+        stdpython::glob::glob(format!("{}/.*.txt", dir.to_string_lossy())).unwrap();
+    assert_eq!(dotted.len(), 1, "literal-dot pattern must match: {:?}", dotted);
     assert!(dotted[0].ends_with(".hidden.txt"));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -1307,8 +1215,12 @@ fn tempfile_gettempdir_picks_first_usable_cpython_candidate() {
     // TMPDIR=/nonexistent-xyz still yields '/tmp'.
     let dir = stdpython::stdlib::tempfile::gettempdir();
     assert!(dir.is_absolute(), "gettempdir must be absolute: {:?}", dir);
-    let probe = dir.join(format!("rython-tempfile-pin-{}", std::process::id()));
-    std::fs::write(&probe, b"x").expect("gettempdir must return a directory that accepts writes");
+    let probe = dir.join(format!(
+        "rython-tempfile-pin-{}",
+        std::process::id()
+    ));
+    std::fs::write(&probe, b"x")
+        .expect("gettempdir must return a directory that accepts writes");
     let _ = std::fs::remove_file(&probe);
 }
 
@@ -1322,11 +1234,16 @@ fn heterogeneous_union_values_str_repr_and_display() {
     //   \xNN lowercase; str(7)=='7'; str(True)=='True'; str(3.5)=='3.5';
     //   str(None)=='None'; str((1,'a'))=="(1, 'a')"; str((1,))=='(1,)';
     //   repr('s')=="'s'".
-    use stdpython::{PyValue, StrOrBytes, py_bytes_repr, py_value_repr, py_value_str};
+    use stdpython::{
+        py_bytes_repr, py_value_repr, py_value_str, PyValue, StrOrBytes,
+    };
     let sb = |v: StrOrBytes| v.py_str();
     assert_eq!(sb(StrOrBytes::from("s")), "s");
     assert_eq!(sb(StrOrBytes::from(b"raw".as_slice())), "b'raw'");
-    assert_eq!(sb(StrOrBytes::Bytes(vec![b'a', b'\'', b'b'])), "b\"a'b\"");
+    assert_eq!(
+        sb(StrOrBytes::Bytes(vec![b'a', b'\'', b'b'])),
+        "b\"a'b\""
+    );
     assert_eq!(
         py_bytes_repr(&[0x00, 0x7f, 0x80, 0xff]),
         "b'\\x00\\x7f\\x80\\xff'"
@@ -1338,7 +1255,10 @@ fn heterogeneous_union_values_str_repr_and_display() {
     assert_eq!(pv(&PyValue::Bool(true)), "True");
     assert_eq!(pv(&PyValue::Bool(false)), "False");
     assert_eq!(pv(&PyValue::Str("s".into())), "s");
-    assert_eq!(pv(&PyValue::Bytes(vec![b'r', b'a', b'w'])), "b'raw'");
+    assert_eq!(
+        pv(&PyValue::Bytes(vec![b'r', b'a', b'w'])),
+        "b'raw'"
+    );
     assert_eq!(pv(&PyValue::None_), "None");
     assert_eq!(
         pv(&PyValue::Tuple(std::sync::Arc::new(vec![
@@ -1426,7 +1346,9 @@ fn exception_matching_walks_the_cpython_hierarchy() {
         PyException::new("TabError", "tabs").matches("SyntaxError"),
         "three-hop ancestry"
     );
-    assert!(PyException::new("ZeroDivisionError", "/0").matches("ArithmeticError"));
+    assert!(
+        PyException::new("ZeroDivisionError", "/0").matches("ArithmeticError")
+    );
 
     for base_only in ["SystemExit", "KeyboardInterrupt", "GeneratorExit"] {
         assert!(
@@ -1474,10 +1396,7 @@ fn builtin_discriminant_matching_walks_the_same_cpython_hierarchy() {
     assert!(file_nf.matches_builtin(B::OSError));
     assert!(file_nf.matches_builtin(B::Exception));
     assert!(file_nf.matches_builtin(B::BaseException));
-    assert!(
-        !file_nf.matches_builtin(B::KeyError),
-        "siblings do not catch"
-    );
+    assert!(!file_nf.matches_builtin(B::KeyError), "siblings do not catch");
 
     let key_err = PyException::new("KeyError", "k");
     assert!(key_err.matches_builtin(B::LookupError));
@@ -1547,6 +1466,7 @@ fn ascii_escapes_outside_printable_ascii_like_python() {
     assert_eq!(ascii(&3.5f64), "3.5");
 }
 
+
 // ---- str operations: code points and the Python method surface ----
 
 #[test]
@@ -1569,10 +1489,7 @@ fn str_count_is_nonoverlapping() {
 fn split_variants_match_python() {
     // Values verified against python3.
     assert_eq!("x-y-z".py_split_maxsplit("-", 1).unwrap(), vec!["x", "y-z"]);
-    assert_eq!(
-        "a-b-c-d".py_rsplit_maxsplit("-", 2).unwrap(),
-        vec!["a-b", "c", "d"]
-    );
+    assert_eq!("a-b-c-d".py_rsplit_maxsplit("-", 2).unwrap(), vec!["a-b", "c", "d"]);
     assert_eq!("café".py_rsplit("a").unwrap(), vec!["c", "fé"]);
     // Python: "ab".split("") raises ValueError: empty separator.
     let err = "ab".py_split("").unwrap_err();
@@ -1648,46 +1565,16 @@ fn whitespace_maxsplit_matches_python() {
 fn int_radix_format_matches_python_sign_magnitude() {
     // Values verified against python3: format(-255, 'x') == "-ff" — sign
     // and magnitude, never the two's-complement bit pattern.
-    assert_eq!(
-        py_int_radix_format(-255, ' ', '\0', false, false, false, 0, 'x'),
-        "-ff"
-    );
-    assert_eq!(
-        py_int_radix_format(-255, ' ', '\0', false, true, false, 0, 'x'),
-        "-0xff"
-    );
-    assert_eq!(
-        py_int_radix_format(-255, ' ', '\0', false, true, true, 6, 'x'),
-        "-0x0ff"
-    );
-    assert_eq!(
-        py_int_radix_format(-255, ' ', '\0', false, false, true, 6, 'x'),
-        "-000ff"
-    );
-    assert_eq!(
-        py_int_radix_format(255, ' ', '>', false, false, false, 6, 'x'),
-        "    ff"
-    );
-    assert_eq!(
-        py_int_radix_format(255, '*', '^', false, false, false, 8, 'x'),
-        "***ff***"
-    );
-    assert_eq!(
-        py_int_radix_format(-5, ' ', '\0', false, false, false, 0, 'b'),
-        "-101"
-    );
-    assert_eq!(
-        py_int_radix_format(-8, ' ', '\0', false, false, false, 0, 'o'),
-        "-10"
-    );
-    assert_eq!(
-        py_int_radix_format(255, ' ', '\0', false, false, true, 8, 'X'),
-        "000000FF"
-    );
-    assert_eq!(
-        py_int_radix_format(5, ' ', '\0', true, false, false, 0, 'x'),
-        "+5"
-    );
+    assert_eq!(py_int_radix_format(-255, ' ', '\0', false, false, false, 0, 'x'), "-ff");
+    assert_eq!(py_int_radix_format(-255, ' ', '\0', false, true, false, 0, 'x'), "-0xff");
+    assert_eq!(py_int_radix_format(-255, ' ', '\0', false, true, true, 6, 'x'), "-0x0ff");
+    assert_eq!(py_int_radix_format(-255, ' ', '\0', false, false, true, 6, 'x'), "-000ff");
+    assert_eq!(py_int_radix_format(255, ' ', '>', false, false, false, 6, 'x'), "    ff");
+    assert_eq!(py_int_radix_format(255, '*', '^', false, false, false, 8, 'x'), "***ff***");
+    assert_eq!(py_int_radix_format(-5, ' ', '\0', false, false, false, 0, 'b'), "-101");
+    assert_eq!(py_int_radix_format(-8, ' ', '\0', false, false, false, 0, 'o'), "-10");
+    assert_eq!(py_int_radix_format(255, ' ', '\0', false, false, true, 8, 'X'), "000000FF");
+    assert_eq!(py_int_radix_format(5, ' ', '\0', true, false, false, 0, 'x'), "+5");
 }
 
 // ---- Issue 23: lazy range, frexp, Counter ties, datetime ----
@@ -1756,10 +1643,7 @@ fn counter_most_common_breaks_ties_by_insertion_order() {
 fn abs_of_i64_min_fails_loudly_not_silently() {
     assert_eq!(abs(-5i64), 5);
     let result = std::panic::catch_unwind(|| abs(i64::MIN));
-    assert!(
-        result.is_err(),
-        "abs(i64::MIN) must be a defined, loud failure"
-    );
+    assert!(result.is_err(), "abs(i64::MIN) must be a defined, loud failure");
 }
 
 #[test]
@@ -1771,11 +1655,9 @@ fn range_len_survives_extreme_endpoints() {
     );
     assert_eq!(range_start_stop_step(0, 100, i64::MAX).unwrap().py_len(), 1);
     assert_eq!(range_start_stop_step(100, 0, i64::MIN).unwrap().py_len(), 1);
-    assert!(
-        range_start_stop_step(i64::MIN, i64::MAX, 1)
-            .unwrap()
-            .py_contains(&i64::MAX.wrapping_sub(1))
-    );
+    assert!(range_start_stop_step(i64::MIN, i64::MAX, 1)
+        .unwrap()
+        .py_contains(&i64::MAX.wrapping_sub(1)));
 }
 
 // ---------------------------------------------------------------------------
@@ -1789,15 +1671,9 @@ mod builtin_min_max {
     #[test]
     fn empty_iterables_raise_value_error_with_pythons_message() {
         let e = min(&Vec::<i64>::new()).unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: min() arg is an empty sequence"
-        );
+        assert_eq!(format!("{}", e), "ValueError: min() arg is an empty sequence");
         let e = max(&Vec::<i64>::new()).unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: max() arg is an empty sequence"
-        );
+        assert_eq!(format!("{}", e), "ValueError: max() arg is an empty sequence");
     }
 
     #[test]
@@ -1830,12 +1706,12 @@ mod builtin_min_max {
         let pairs = [(1i64, "a"), (1i64, "b")];
         assert_eq!(max_key(&pairs, |t| t.0).unwrap(), (1, "a"));
         assert_eq!(min_key(&[3i64, 1, 2], |x| -x).unwrap(), 3);
-        assert_eq!(min_key_default(&Vec::<i64>::new(), |x| -x, 42), 42);
-        let e = min_key(&Vec::<i64>::new(), |x| *x).unwrap_err();
         assert_eq!(
-            format!("{}", e),
-            "ValueError: min() arg is an empty sequence"
+            min_key_default(&Vec::<i64>::new(), |x| -x, 42),
+            42
         );
+        let e = min_key(&Vec::<i64>::new(), |x| *x).unwrap_err();
+        assert_eq!(format!("{}", e), "ValueError: min() arg is an empty sequence");
     }
 }
 
@@ -1911,10 +1787,7 @@ mod builtin_enumerate_pow {
         assert_eq!(pow_mod(2, 0, 5).unwrap(), 1);
 
         let e = pow_mod(2, 3, 0).unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: pow() 3rd argument cannot be 0"
-        );
+        assert_eq!(format!("{}", e), "ValueError: pow() 3rd argument cannot be 0");
         let e = pow_mod(2, -1, 4).unwrap_err();
         assert_eq!(
             format!("{}", e),
@@ -1943,10 +1816,7 @@ mod builtin_repr {
         assert_eq!(py_float_repr(9999999999999998.0), "9999999999999998.0");
         assert_eq!(py_float_repr(1e16), "1e+16");
         assert_eq!(py_float_repr(-1e16), "-1e+16");
-        assert_eq!(
-            py_float_repr(123456789012345680.0),
-            "1.2345678901234568e+17"
-        );
+        assert_eq!(py_float_repr(123456789012345680.0), "1.2345678901234568e+17");
         assert_eq!(py_float_repr(1e100), "1e+100");
         assert_eq!(py_float_repr(0.0001), "0.0001");
         assert_eq!(py_float_repr(0.00001), "1e-05");
@@ -2022,15 +1892,7 @@ mod datetime_arithmetic {
     use stdpython::datetime::{date, datetime, timedelta};
 
     fn td(days: i64, hours: i64, minutes: i64) -> timedelta {
-        timedelta::new(
-            Some(days),
-            None,
-            None,
-            None,
-            Some(minutes),
-            Some(hours),
-            None,
-        )
+        timedelta::new(Some(days), None, None, None, Some(minutes), Some(hours), None)
     }
 
     #[test]
@@ -2055,7 +1917,8 @@ mod datetime_arithmetic {
     #[test]
     fn datetime_arithmetic_keeps_microseconds_exact() {
         let dt1 = datetime::new(2024, 3, 1, Some(10), Some(30), Some(0), None).unwrap();
-        let dt2 = datetime::new(2024, 2, 28, Some(23), Some(45), Some(30), Some(500_000)).unwrap();
+        let dt2 =
+            datetime::new(2024, 2, 28, Some(23), Some(45), Some(30), Some(500_000)).unwrap();
         let diff = dt1 - dt2;
         assert_eq!(format!("{}", diff), "1 day, 10:44:29.500000");
         assert_eq!(diff.total_seconds(), 125069.5);
@@ -2078,10 +1941,7 @@ mod datetime_arithmetic {
         assert_eq!(format!("{}", neg), "-1 day, 1:00:00");
         assert_eq!(format!("{}", td(2, 0, 0)), "2 days, 0:00:00");
         assert_eq!(
-            format!(
-                "{}",
-                timedelta::new(None, None, None, None, None, None, None)
-            ),
+            format!("{}", timedelta::new(None, None, None, None, None, None, None)),
             "0:00:00"
         );
     }
@@ -2132,10 +1992,7 @@ mod datetime_strptime {
             "ValueError: time data 'abc' does not match format '%Y'"
         );
         let e = datetime::strptime("2024 rest", "%Y").unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: unconverted data remains:  rest"
-        );
+        assert_eq!(format!("{}", e), "ValueError: unconverted data remains:  rest");
         let e = datetime::strptime("2024", "%Q").unwrap_err();
         assert_eq!(
             format!("{}", e),
@@ -2151,10 +2008,7 @@ mod time_module {
         // A sane wall clock: after 2020, before 2100.
         assert!(t > 1_577_836_800.0 && t < 4_102_444_800.0, "time(): {}", t);
         let ns = stdpython::time::time_ns();
-        assert!(
-            (ns as f64 / 1e9 - t).abs() < 5.0,
-            "time_ns disagrees with time()"
-        );
+        assert!((ns as f64 / 1e9 - t).abs() < 5.0, "time_ns disagrees with time()");
 
         let a = stdpython::time::monotonic();
         stdpython::time::sleep(0.01);
@@ -2182,10 +2036,7 @@ mod itertools_gaps {
     #[test]
     fn accumulate_variants_match_python() {
         assert_eq!(accumulate_sum(&[1i64, 2, 3, 4]), vec![1, 3, 6, 10]);
-        assert_eq!(
-            accumulate_sum_initial(&[1i64, 2, 3], 100),
-            vec![100, 101, 103, 106]
-        );
+        assert_eq!(accumulate_sum_initial(&[1i64, 2, 3], 100), vec![100, 101, 103, 106]);
         assert_eq!(
             accumulate_func(&[1i64, 2, 3, 4], |a, b| a * b),
             vec![1, 2, 6, 24]
@@ -2209,15 +2060,9 @@ mod itertools_gaps {
             product_repeat2(&[0i64, 1]),
             vec![(0, 0), (0, 1), (1, 0), (1, 1)]
         );
-        assert_eq!(
-            product3(&[1i64], &[2i64], &[3i64, 4]),
-            vec![(1, 2, 3), (1, 2, 4)]
-        );
+        assert_eq!(product3(&[1i64], &[2i64], &[3i64, 4]), vec![(1, 2, 3), (1, 2, 4)]);
         assert_eq!(product_repeat3(&[0i64, 1]).len(), 8);
-        assert_eq!(
-            product2(&Vec::<i64>::new(), &[1i64]),
-            Vec::<(i64, i64)>::new()
-        );
+        assert_eq!(product2(&Vec::<i64>::new(), &[1i64]), Vec::<(i64, i64)>::new());
     }
 
     #[test]
@@ -2233,10 +2078,7 @@ mod itertools_gaps {
                 vec![3, 3]
             ]
         );
-        assert_eq!(
-            combinations_with_replacement(&[1i64], 0).unwrap(),
-            vec![Vec::<i64>::new()]
-        );
+        assert_eq!(combinations_with_replacement(&[1i64], 0).unwrap(), vec![Vec::<i64>::new()]);
         assert_eq!(
             combinations_with_replacement(&Vec::<i64>::new(), 2).unwrap(),
             Vec::<Vec<i64>>::new()
@@ -2256,7 +2098,11 @@ mod itertools_gaps {
         assert_eq!(pairwise(&[1i64]), Vec::<(i64, i64)>::new());
         assert_eq!(
             zip_longest(&[1i64, 2, 3], &["a"]),
-            vec![(Some(1), Some("a")), (Some(2), None), (Some(3), None)]
+            vec![
+                (Some(1), Some("a")),
+                (Some(2), None),
+                (Some(3), None)
+            ]
         );
         assert_eq!(
             zip_longest_fill(&[1i64], &[10i64, 20, 30], 0),
@@ -2289,10 +2135,7 @@ mod itertools_gaps {
 
     #[test]
     fn starmap_splats_tuples_of_two_and_three() {
-        assert_eq!(
-            starmap(|a: i64, b: i64| a * b, &[(2, 3), (4, 5)]),
-            vec![6, 20]
-        );
+        assert_eq!(starmap(|a: i64, b: i64| a * b, &[(2, 3), (4, 5)]), vec![6, 20]);
         assert_eq!(
             starmap(|a: i64, b: i64, c: i64| a + b + c, &[(1, 2, 3)]),
             vec![6]
@@ -2358,11 +2201,7 @@ mod functools_module {
         assert_eq!(reduce_initial(|a: i64, b: i64| a + b, &[], 42), 42);
         // The accumulator type may differ from the element type.
         assert_eq!(
-            reduce_initial(
-                |acc: String, n: i64| format!("{}{}", acc, n),
-                &[1, 2, 3],
-                String::new()
-            ),
+            reduce_initial(|acc: String, n: i64| format!("{}{}", acc, n), &[1, 2, 3], String::new()),
             "123"
         );
         let e = reduce(|a: i64, b: i64| a + b, &[]).unwrap_err();
@@ -2454,10 +2293,7 @@ mod re_module {
         // Two-plus groups yield tuples in Python: loud, not wrong-shaped.
         assert!(re::findall(r"(a)(b)", "ab", "").is_err());
 
-        assert_eq!(
-            re::sub(r"(\d+)", r"<\1>", "a1 b22", 0, "").unwrap(),
-            "a<1> b<22>"
-        );
+        assert_eq!(re::sub(r"(\d+)", r"<\1>", "a1 b22", 0, "").unwrap(), "a<1> b<22>");
         assert_eq!(re::sub("cat", "dog", "cat cat", 0, "").unwrap(), "dog dog");
 
         assert_eq!(
@@ -2467,10 +2303,7 @@ mod re_module {
         assert_eq!(re::split(r"\d", "abc", 0, "").unwrap(), vec!["abc"]);
         // Capturing groups interleave the delimiters, as in Python:
         // re.split(r"(\d)", "a1b") == ['a', '1', 'b'].
-        assert_eq!(
-            re::split(r"(\d)", "a1b", 0, "").unwrap(),
-            vec!["a", "1", "b"]
-        );
+        assert_eq!(re::split(r"(\d)", "a1b", 0, "").unwrap(), vec!["a", "1", "b"]);
         assert_eq!(re::split(r"(\d)", "1", 0, "").unwrap(), vec!["", "1", ""]);
         assert_eq!(
             re::split(r"([,;])\s*", "a, b;c", 0, "").unwrap(),
@@ -2541,7 +2374,10 @@ mod re_module {
             re::split(r"(\d)", "a1b2c", 1, "").unwrap(),
             vec!["a", "1", "b2c"]
         );
-        assert_eq!(re::split("x", "AxBxC", 1, "i").unwrap(), vec!["A", "BxC"]);
+        assert_eq!(
+            re::split("x", "AxBxC", 1, "i").unwrap(),
+            vec!["A", "BxC"]
+        );
 
         let spans: Vec<(i64, i64)> = re::finditer(r"\d+", "a1 b22", "")
             .unwrap()
@@ -2607,7 +2443,8 @@ mod map_filter_list {
         )
         .unwrap_err();
         assert_eq!(format!("{}", err), "ValueError: bad");
-        let kept = filter_fallible(|x: i64| Ok(x % 2 == 0), vec![1, 2, 3, 4]).unwrap();
+        let kept =
+            filter_fallible(|x: i64| Ok(x % 2 == 0), vec![1, 2, 3, 4]).unwrap();
         assert_eq!(kept, vec![2, 4]);
     }
 
@@ -2638,11 +2475,9 @@ mod hashlib_module {
             sha256("hello").hexdigest(),
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
-        assert!(
-            sha512("hello")
-                .hexdigest()
-                .starts_with("9b71d224bd62f3785d96d46ad3ea3d73")
-        );
+        assert!(sha512("hello")
+            .hexdigest()
+            .starts_with("9b71d224bd62f3785d96d46ad3ea3d73"));
         // Non-ASCII hashes its UTF-8 bytes: hashlib.md5("café".encode()).
         assert_eq!(md5("café").hexdigest(), "07117fe4a1ebd544965dc19573183da2");
         assert_eq!(
@@ -2692,10 +2527,7 @@ mod textwrap_wrap {
             wrap("word wrap-ping is--neat", 6).unwrap(),
             vec!["word", "wrap-", "ping", "is--", "neat"]
         );
-        assert_eq!(
-            fill("one two three four", 9).unwrap(),
-            "one two\nthree\nfour"
-        );
+        assert_eq!(fill("one two three four", 9).unwrap(), "one two\nthree\nfour");
     }
 
     #[test]
@@ -2731,15 +2563,9 @@ mod textwrap_wrap {
     #[test]
     fn invalid_width_raises_pythons_value_error() {
         let e = wrap("x", 0).unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: invalid width 0 (must be > 0)"
-        );
+        assert_eq!(format!("{}", e), "ValueError: invalid width 0 (must be > 0)");
         let e = fill("x", -3).unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: invalid width -3 (must be > 0)"
-        );
+        assert_eq!(format!("{}", e), "ValueError: invalid width -3 (must be > 0)");
     }
 }
 
@@ -2887,18 +2713,8 @@ mod csv_dialect_registry {
         assert!(csv::list_dialects().contains(&"excel".to_string()));
         assert!(csv::list_dialects().contains(&"excel-tab".to_string()));
         // register_dialect(name, delimiter=...) then the delimiter resolves.
-        csv::register_dialect(
-            "semi_reg",
-            Some(b';'),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        csv::register_dialect("semi_reg", Some(b';'), None, None, None, None, None, None, None)
+            .unwrap();
         assert_eq!(csv::dialect_delimiter("semi_reg").unwrap(), b';');
         // An unknown dialect name is csv.Error, not a silent default
         // (verified against python3: `csv.reader(['a;b'], 'nonesuch')`
@@ -2918,18 +2734,8 @@ mod csv_dialect_registry {
     fn named_dialect_drives_the_reader_like_python() {
         // python3: csv.register_dialect('semi', delimiter=';');
         // list(csv.reader(['X;Y;Z'], 'semi')) == [['X','Y','Z']]
-        csv::register_dialect(
-            "semi_named",
-            Some(b';'),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        csv::register_dialect("semi_named", Some(b';'), None, None, None, None, None, None, None)
+            .unwrap();
         let delim = csv::dialect_delimiter("semi_named").unwrap();
         let r = csv::reader(&["X;Y;Z"], delim, false, None).unwrap();
         assert_eq!(r[0], vec!["X", "Y", "Z"]);
@@ -3027,7 +2833,10 @@ mod list_sort {
             xs.py_sort();
         }))
         .unwrap_err();
-        let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
         assert!(msg.contains("NaN"), "panic message: {}", msg);
     }
 }
@@ -3112,15 +2921,7 @@ mod datetime_fields_and_directives {
     fn datetime_fields_are_flat_like_python() {
         let d = datetime::new(2024, 2, 29, Some(13), Some(5), Some(7), Some(123456)).unwrap();
         assert_eq!(
-            (
-                d.year,
-                d.month,
-                d.day,
-                d.hour,
-                d.minute,
-                d.second,
-                d.microsecond
-            ),
+            (d.year, d.month, d.day, d.hour, d.minute, d.second, d.microsecond),
             (2024, 2, 29, 13, 5, 7, 123456)
         );
         // dt.date() / dt.time() are methods, as in Python.
@@ -3178,7 +2979,7 @@ mod datetime_fields_and_directives {
 }
 
 mod replace_keywords {
-    use stdpython::datetime::{PyReplace, ReplaceArgs, date, datetime, time};
+    use stdpython::datetime::{date, datetime, time, PyReplace, ReplaceArgs};
 
     #[test]
     fn replace_maps_fields_per_receiver_type() {
@@ -3244,22 +3045,20 @@ mod replace_keywords {
         let d = datetime::new(2024, 1, 15, None, None, None, None).unwrap();
         // python3: d.replace(month=2, day=30) -> ValueError: day is out of
         // range for month
-        assert!(
-            d.py_replace(ReplaceArgs {
+        assert!(d
+            .py_replace(ReplaceArgs {
                 month: Some(2),
                 day: Some(30),
                 ..ReplaceArgs::default()
             })
-            .is_err()
-        );
+            .is_err());
         // A negative field cannot narrow to u32: ValueError, not a wrap.
-        assert!(
-            d.py_replace(ReplaceArgs {
+        assert!(d
+            .py_replace(ReplaceArgs {
                 hour: Some(-1),
                 ..ReplaceArgs::default()
             })
-            .is_err()
-        );
+            .is_err());
     }
 }
 
@@ -3315,10 +3114,7 @@ mod file_objects {
         let b = io::StringIO();
         b.close().unwrap();
         let e = b.read().unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: I/O operation on closed file."
-        );
+        assert_eq!(format!("{}", e), "ValueError: I/O operation on closed file.");
         // getvalue on a closed buffer is closed too.
         assert!(b.getvalue().is_err());
     }
@@ -3392,7 +3188,7 @@ mod lru_cache_store {
 }
 
 mod dict_and_exception_display {
-    use stdpython::{PyDict, PyException, PyRepr, py_display};
+    use stdpython::{py_display, PyDict, PyException, PyRepr};
 
     #[test]
     fn dict_repr_matches_python_including_order() {
@@ -3434,17 +3230,14 @@ mod dict_and_exception_display {
 }
 
 mod cpython_numeric_and_stdlib_fixes {
-    use stdpython::{PyFloat, PyInt, PyMul, datetime::date, math, py_pow, py_str_repr};
+    use stdpython::{datetime::date, math, py_pow, py_str_repr, PyFloat, PyInt, PyMul};
 
     #[test]
     fn float_power_uses_libm_pow_not_repeated_squaring() {
         // python3: 0.1 ** 4 == 0.00010000000000000002 (powi's repeated
         // squaring gives ...05), and 1.05 ** 10 == 1.628894626777442.
         assert_eq!(py_pow(0.1f64, 4i64), 0.1f64.powf(4.0));
-        assert_eq!(
-            format!("{:?}", py_pow(0.1f64, 4i64)),
-            "0.00010000000000000002"
-        );
+        assert_eq!(format!("{:?}", py_pow(0.1f64, 4i64)), "0.00010000000000000002");
         assert_eq!(format!("{:?}", py_pow(1.05f64, 10i64)), "1.628894626777442");
     }
 
@@ -3491,26 +3284,15 @@ mod cpython_numeric_and_stdlib_fixes {
             ("1_0j", None, None),
             // i64::MIN, whose magnitude is not an i64, reads as CPython
             // reads it (round 11).
-            (
-                "-9223372036854775808",
-                Some(i64::MIN),
-                Some(-9223372036854775808.0),
-            ),
-            (
-                "9223372036854775807",
-                Some(i64::MAX),
-                Some(9223372036854775807.0),
-            ),
+            ("-9223372036854775808", Some(i64::MIN), Some(-9223372036854775808.0)),
+            ("9223372036854775807", Some(i64::MAX), Some(9223372036854775807.0)),
         ];
         for (text, int, float) in table {
             match (text.py_int(), int) {
                 (Ok(v), Some(want)) => assert_eq!(v, *want, "int({:?})", text),
                 (Err(e), None) => assert_eq!(
                     e.to_string(),
-                    format!(
-                        "ValueError: invalid literal for int() with base 10: {}",
-                        py_str_repr(text)
-                    ),
+                    format!("ValueError: invalid literal for int() with base 10: {}", py_str_repr(text)),
                     "int({:?})",
                     text
                 ),
@@ -3520,10 +3302,7 @@ mod cpython_numeric_and_stdlib_fixes {
                 (Ok(v), Some(want)) => assert_eq!(v, *want, "float({:?})", text),
                 (Err(e), None) => assert_eq!(
                     e.to_string(),
-                    format!(
-                        "ValueError: could not convert string to float: {}",
-                        py_str_repr(text)
-                    ),
+                    format!("ValueError: could not convert string to float: {}", py_str_repr(text)),
                     "float({:?})",
                     text
                 ),
@@ -3549,10 +3328,7 @@ mod cpython_numeric_and_stdlib_fixes {
         // never a different value: non-ASCII decimal digits (python3:
         // int("٣") == 3) and an int outside i64.
         let e = "٣".py_int().unwrap_err();
-        assert_eq!(
-            e.to_string(),
-            "NotImplementedError: int('٣'): non-ASCII digits are not supported yet"
-        );
+        assert_eq!(e.to_string(), "NotImplementedError: int('٣'): non-ASCII digits are not supported yet");
         let e = "99999999999999999999".py_int().unwrap_err();
         assert_eq!(
             e.to_string(),
@@ -3578,10 +3354,7 @@ mod cpython_numeric_and_stdlib_fixes {
         assert_eq!(2i64.py_mul(&"ab".to_string()), "abab");
         // NaN and infinity raise instead of silently becoming 0/i64::MAX.
         let e = f64::NAN.py_int().unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: cannot convert float NaN to integer"
-        );
+        assert_eq!(format!("{}", e), "ValueError: cannot convert float NaN to integer");
         let e = f64::INFINITY.py_int().unwrap_err();
         assert_eq!(
             format!("{}", e),
@@ -4003,10 +3776,7 @@ mod bytesio {
         let b = io::BytesIO();
         b.close().unwrap();
         let e = b.read().unwrap_err();
-        assert_eq!(
-            format!("{}", e),
-            "ValueError: I/O operation on closed file."
-        );
+        assert_eq!(format!("{}", e), "ValueError: I/O operation on closed file.");
     }
 }
 
@@ -4027,10 +3797,7 @@ fn pyvalue_add_dispatches_like_cpython() {
         PyValue::from("abcd")
     );
     assert_eq!(
-        v(
-            PyValue::Bytes(b"ab".to_vec()),
-            PyValue::Bytes(b"c".to_vec())
-        ),
+        v(PyValue::Bytes(b"ab".to_vec()), PyValue::Bytes(b"c".to_vec())),
         PyValue::Bytes(b"abc".to_vec())
     );
     let t = |vals: Vec<PyValue>| PyValue::Tuple(std::sync::Arc::new(vals));
@@ -4063,7 +3830,7 @@ fn range_replace_mechanics_match_python() {
     //   del xs[1:3]                     -> removes range
     //   strided: ys[::2]=[9,9] on [0,1,2] -> [9,1,9]
     //   mismatched stride length raises ValueError
-    use stdpython::{PySliceReplace, PyValue, py_value_str};
+    use stdpython::{py_value_str, PySliceReplace, PyValue};
     let mut v = vec![
         PyValue::Int(0),
         PyValue::Int(1),
@@ -4120,128 +3887,103 @@ fn range_replace_mechanics_match_python() {
 mod urllib_parse_pins {
     use stdpython::*;
 
-    #[test]
-    fn urllib_parse_matches_cpython() {
-        use stdpython::urllib::parse::*;
-        // Verified against python3 (urllib.parse, CPython 3.11):
-        let p = urlparse("https://user:pass@example.com:8080/path/to?a=1&b=2#frag").unwrap();
-        assert_eq!(p.scheme, "https");
-        assert_eq!(p.netloc, "user:pass@example.com:8080");
-        assert_eq!(p.path, "/path/to");
-        assert_eq!(p.params, "");
-        assert_eq!(p.query, "a=1&b=2");
-        assert_eq!(p.fragment, "frag");
-        assert_eq!(p.hostname(), Some("example.com".to_string()));
-        assert_eq!(p.port().unwrap(), Some(8080));
-        assert_eq!(p.username(), Some("user".to_string()));
-        assert_eq!(p.password(), Some("pass".to_string()));
-        assert_eq!(
-            p.geturl(),
-            "https://user:pass@example.com:8080/path/to?a=1&b=2#frag"
-        );
-        // urlsplit: params empty.
-        let s = urlsplit("https://example.com/a?x=1").unwrap();
-        assert_eq!(
-            (
-                s.scheme.as_str(),
-                s.netloc.as_str(),
-                s.path.as_str(),
-                s.query.as_str(),
-                s.fragment.as_str()
-            ),
-            ("https", "example.com", "/a", "x=1", "")
-        );
-        // urlunparse: six components.
-        assert_eq!(
-            urlunparse(("https", "example.com", "/p", "", "q=1", "f")).unwrap(),
-            "https://example.com/p?q=1#f"
-        );
-        // urljoin: relative resolution and absolute-target precedence.
-        assert_eq!(
-            urljoin("http://example.com/a/b/c", "../../d").unwrap(),
-            "http://example.com/d"
-        );
-        assert_eq!(
-            urljoin("http://example.com/a", "https://other.com/x").unwrap(),
-            "https://other.com/x"
-        );
-        // quote: unreserved pass, everything else %XX.
-        assert_eq!(quote("a b&c=d", None).unwrap(), "a%20b%26c%3Dd");
-        assert_eq!(quote("a b&c=d", Some("&")).unwrap(), "a%20b&c%3Dd");
-        assert_eq!(quote_plus("a b&c").unwrap(), "a+b%26c");
-        // unquote: %XX decodes.
-        assert_eq!(unquote("a%20b%26c").unwrap(), "a b&c");
-        assert_eq!(unquote_plus("a+b%20c").unwrap(), "a b c");
-        // urldefrag: split at the first #.
-        assert_eq!(
-            urldefrag("http://x.com/a#frag").unwrap(),
-            ("http://x.com/a".to_string(), "frag".to_string())
-        );
-        assert_eq!(
-            urldefrag("http://x.com/a").unwrap(),
-            ("http://x.com/a".to_string(), String::new())
-        );
-        // The retrospective's R6 findings on #260, each verified against
-        // python3 (CPython 3.11):
-        //   urlsplit("http://example.com/p;q?x=1").path  == "/p;q" (params
-        //   NOT split out; the round-55 version deleted ";q").
-        let sp = urlsplit("http://example.com/p;q?x=1").unwrap();
-        assert_eq!((sp.path.as_str(), sp.params.as_str()), ("/p;q", ""));
-        //   urlparse("http://[::1]:8080/a").hostname() == "::1" (IPv6
-        //   brackets stripped).
-        let ipv6 = urlparse("http://[::1]:8080/a").unwrap();
-        assert_eq!(ipv6.hostname(), Some("::1".to_string()));
-        //   urlparse("http://user@name:pass@example.com/").username() ==
-        //   "user@name" (the LAST @ splits userinfo from host).
-        let ui = urlparse("http://user@name:pass@example.com/").unwrap();
-        assert_eq!(ui.username(), Some("user@name".to_string()));
-        assert_eq!(ui.password(), Some("pass".to_string()));
-        // `.port` (CPython 3.11): urlparse succeeds, the read raises.
-        //   urlparse("http://h:0080/").port == 80
-        //   urlparse("http://h:/").port is None; urlparse("http://h/").port is None
-        //   urlparse("http://[::1]:8/").port == 8
-        //   urlparse("http://h:abc/").port  -> ValueError: Port could not be cast to integer value as 'abc'
-        //   urlparse("http://h:-1/").port   -> ValueError: Port could not be cast to integer value as '-1'
-        //   urlparse("http://h:70000/").port -> ValueError: Port out of range 0-65535
-        let port = |u: &str| urlparse(u).unwrap().port().map_err(|e| e.to_string());
-        assert_eq!(port("http://h:0080/"), Ok(Some(80)));
-        assert_eq!(port("http://h:/"), Ok(None));
-        assert_eq!(port("http://h/"), Ok(None));
-        assert_eq!(port("http://[::1]:8/"), Ok(Some(8)));
-        assert_eq!(
-            port("http://h:abc/"),
-            Err("ValueError: Port could not be cast to integer value as 'abc'".to_string())
-        );
-        assert_eq!(
-            port("http://h:-1/"),
-            Err("ValueError: Port could not be cast to integer value as '-1'".to_string())
-        );
-        assert_eq!(
-            port("http://h:70000/"),
-            Err("ValueError: Port out of range 0-65535".to_string())
-        );
-        assert_eq!(ui.hostname(), Some("example.com".to_string()));
-        //   urlparse("HTTP://EXAMPLE.COM/").scheme == "http" (lowercased).
-        assert_eq!(urlparse("HTTP://EXAMPLE.COM/").unwrap().scheme, "http");
-    }
+#[test]
+fn urllib_parse_matches_cpython() {
+    use stdpython::urllib::parse::*;
+    // Verified against python3 (urllib.parse, CPython 3.11):
+    let p = urlparse("https://user:pass@example.com:8080/path/to?a=1&b=2#frag").unwrap();
+    assert_eq!(p.scheme, "https");
+    assert_eq!(p.netloc, "user:pass@example.com:8080");
+    assert_eq!(p.path, "/path/to");
+    assert_eq!(p.params, "");
+    assert_eq!(p.query, "a=1&b=2");
+    assert_eq!(p.fragment, "frag");
+    assert_eq!(p.hostname(), Some("example.com".to_string()));
+    assert_eq!(p.port().unwrap(), Some(8080));
+    assert_eq!(p.username(), Some("user".to_string()));
+    assert_eq!(p.password(), Some("pass".to_string()));
+    assert_eq!(p.geturl(), "https://user:pass@example.com:8080/path/to?a=1&b=2#frag");
+    // urlsplit: params empty.
+    let s = urlsplit("https://example.com/a?x=1").unwrap();
+    assert_eq!((s.scheme.as_str(), s.netloc.as_str(), s.path.as_str(), s.query.as_str(), s.fragment.as_str()),
+               ("https", "example.com", "/a", "x=1", ""));
+    // urlunparse: six components.
+    assert_eq!(
+        urlunparse(("https", "example.com", "/p", "", "q=1", "f")).unwrap(),
+        "https://example.com/p?q=1#f"
+    );
+    // urljoin: relative resolution and absolute-target precedence.
+    assert_eq!(urljoin("http://example.com/a/b/c", "../../d").unwrap(), "http://example.com/d");
+    assert_eq!(urljoin("http://example.com/a", "https://other.com/x").unwrap(), "https://other.com/x");
+    // quote: unreserved pass, everything else %XX.
+    assert_eq!(quote("a b&c=d", None).unwrap(), "a%20b%26c%3Dd");
+    assert_eq!(quote("a b&c=d", Some("&")).unwrap(), "a%20b&c%3Dd");
+    assert_eq!(quote_plus("a b&c").unwrap(), "a+b%26c");
+    // unquote: %XX decodes.
+    assert_eq!(unquote("a%20b%26c").unwrap(), "a b&c");
+    assert_eq!(unquote_plus("a+b%20c").unwrap(), "a b c");
+    // urldefrag: split at the first #.
+    assert_eq!(urldefrag("http://x.com/a#frag").unwrap(), ("http://x.com/a".to_string(), "frag".to_string()));
+    assert_eq!(urldefrag("http://x.com/a").unwrap(), ("http://x.com/a".to_string(), String::new()));
+    // The retrospective's R6 findings on #260, each verified against
+    // python3 (CPython 3.11):
+    //   urlsplit("http://example.com/p;q?x=1").path  == "/p;q" (params
+    //   NOT split out; the round-55 version deleted ";q").
+    let sp = urlsplit("http://example.com/p;q?x=1").unwrap();
+    assert_eq!((sp.path.as_str(), sp.params.as_str()), ("/p;q", ""));
+    //   urlparse("http://[::1]:8080/a").hostname() == "::1" (IPv6
+    //   brackets stripped).
+    let ipv6 = urlparse("http://[::1]:8080/a").unwrap();
+    assert_eq!(ipv6.hostname(), Some("::1".to_string()));
+    //   urlparse("http://user@name:pass@example.com/").username() ==
+    //   "user@name" (the LAST @ splits userinfo from host).
+    let ui = urlparse("http://user@name:pass@example.com/").unwrap();
+    assert_eq!(ui.username(), Some("user@name".to_string()));
+    assert_eq!(ui.password(), Some("pass".to_string()));
+    // `.port` (CPython 3.11): urlparse succeeds, the read raises.
+    //   urlparse("http://h:0080/").port == 80
+    //   urlparse("http://h:/").port is None; urlparse("http://h/").port is None
+    //   urlparse("http://[::1]:8/").port == 8
+    //   urlparse("http://h:abc/").port  -> ValueError: Port could not be cast to integer value as 'abc'
+    //   urlparse("http://h:-1/").port   -> ValueError: Port could not be cast to integer value as '-1'
+    //   urlparse("http://h:70000/").port -> ValueError: Port out of range 0-65535
+    let port = |u: &str| urlparse(u).unwrap().port().map_err(|e| e.to_string());
+    assert_eq!(port("http://h:0080/"), Ok(Some(80)));
+    assert_eq!(port("http://h:/"), Ok(None));
+    assert_eq!(port("http://h/"), Ok(None));
+    assert_eq!(port("http://[::1]:8/"), Ok(Some(8)));
+    assert_eq!(
+        port("http://h:abc/"),
+        Err("ValueError: Port could not be cast to integer value as 'abc'".to_string())
+    );
+    assert_eq!(
+        port("http://h:-1/"),
+        Err("ValueError: Port could not be cast to integer value as '-1'".to_string())
+    );
+    assert_eq!(port("http://h:70000/"), Err("ValueError: Port out of range 0-65535".to_string()));
+    assert_eq!(ui.hostname(), Some("example.com".to_string()));
+    //   urlparse("HTTP://EXAMPLE.COM/").scheme == "http" (lowercased).
+    assert_eq!(urlparse("HTTP://EXAMPLE.COM/").unwrap().scheme, "http");
+}
 
-    #[test]
-    fn urllib_urlencode_matches_cpython() {
-        use stdpython::PyValue;
-        use stdpython::urllib::parse::urlencode;
-        // Verified against python3:
-        //   urlencode({"a": 1, "b": "x y"}) == "a=1&b=x+y"
-        let mut d = PyDict::new();
-        d.insert("a".to_string(), PyValue::Int(1));
-        d.insert("b".to_string(), PyValue::Str("x y".to_string()));
-        assert_eq!(urlencode(&PyValue::from(d), false).unwrap(), "a=1&b=x+y");
-        //   urlencode([("a", 1), ("a", 2)], doseq=True) == "a=1&a=2"
-        let pairs = PyValue::from(vec![
-            PyValue::from(vec![PyValue::Str("a".to_string()), PyValue::Int(1)]),
-            PyValue::from(vec![PyValue::Str("a".to_string()), PyValue::Int(2)]),
-        ]);
-        assert_eq!(urlencode(&pairs, true).unwrap(), "a=1&a=2");
-    }
+#[test]
+fn urllib_urlencode_matches_cpython() {
+    use stdpython::urllib::parse::urlencode;
+    use stdpython::PyValue;
+    // Verified against python3:
+    //   urlencode({"a": 1, "b": "x y"}) == "a=1&b=x+y"
+    let mut d = PyDict::new();
+    d.insert("a".to_string(), PyValue::Int(1));
+    d.insert("b".to_string(), PyValue::Str("x y".to_string()));
+    assert_eq!(urlencode(&PyValue::from(d), false).unwrap(), "a=1&b=x+y");
+    //   urlencode([("a", 1), ("a", 2)], doseq=True) == "a=1&a=2"
+    let pairs = PyValue::from(vec![
+        PyValue::from(vec![PyValue::Str("a".to_string()), PyValue::Int(1)]),
+        PyValue::from(vec![PyValue::Str("a".to_string()), PyValue::Int(2)]),
+    ]);
+    assert_eq!(urlencode(&pairs, true).unwrap(), "a=1&a=2");
+}
+
 }
 
 // A Python TUPLE value boxes as Tuple members (round 56): `PyValue::from(
@@ -4298,10 +4040,7 @@ fn boxed_list_py_contains_matches_str_members_by_value() {
     ];
     assert!(list.py_contains(&"ascii"), "a Str member matches");
     assert!(list.py_contains(&"utf_8"), "a later Str member matches");
-    assert!(
-        !list.py_contains(&"latin1"),
-        "an absent member does not match"
-    );
+    assert!(!list.py_contains(&"latin1"), "an absent member does not match");
     // The String operand spelling the renderers emit for an owned name.
     let needle = "utf_8".to_string();
     assert!(list.py_contains(&needle), "an owned String operand matches");
@@ -4330,35 +4069,20 @@ fn boxed_index_by_int_projects_unpack_elements() {
     //   "ab"[5] -> IndexError('string index out of range')
     assert_eq!(b.py_index(-1i64).unwrap(), PyValue::from(73));
     let err = b.py_index(4i64).unwrap_err();
-    assert_eq!(
-        (err.exception_type.as_str(), err.message.as_str()),
-        ("IndexError", "index out of range")
-    );
+    assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("IndexError", "index out of range"));
     let t: PyValue = (1, 2).into();
     assert_eq!(t.py_index(-1i64).unwrap(), PyValue::from(2));
     let err = t.py_index(5i64).unwrap_err();
-    assert_eq!(
-        (err.exception_type.as_str(), err.message.as_str()),
-        ("IndexError", "tuple index out of range")
-    );
+    assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("IndexError", "tuple index out of range"));
     let st: PyValue = "ab".into();
     assert_eq!(st.py_index(-1i64).unwrap(), PyValue::from("b"));
     let err = st.py_index(5i64).unwrap_err();
-    assert_eq!(
-        (err.exception_type.as_str(), err.message.as_str()),
-        ("IndexError", "string index out of range")
-    );
+    assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("IndexError", "string index out of range"));
     // Not-subscriptable values raise CPython's per-type TypeError text.
     let err = PyValue::from(5i64).py_index(0i64).unwrap_err();
-    assert_eq!(
-        (err.exception_type.as_str(), err.message.as_str()),
-        ("TypeError", "'int' object is not subscriptable")
-    );
+    assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("TypeError", "'int' object is not subscriptable"));
     let err = stdpython::PyValue::None_.py_index(0i64).unwrap_err();
-    assert_eq!(
-        (err.exception_type.as_str(), err.message.as_str()),
-        ("TypeError", "'NoneType' object is not subscriptable")
-    );
+    assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("TypeError", "'NoneType' object is not subscriptable"));
 }
 
 // A literal set's membership against an owned String operand (round 60):
@@ -4369,15 +4093,10 @@ fn boxed_index_by_int_projects_unpack_elements() {
 #[test]
 fn literal_set_py_contains_owned_string() {
     use stdpython::*;
-    let s: std::collections::HashSet<&str> = std::collections::HashSet::from(["utf_16", "utf_32"]);
-    assert!(
-        s.py_contains(&"utf_16".to_string()),
-        "a member String matches"
-    );
-    assert!(
-        !s.py_contains(&"latin1".to_string()),
-        "an absent String does not"
-    );
+    let s: std::collections::HashSet<&str> =
+        std::collections::HashSet::from(["utf_16", "utf_32"]);
+    assert!(s.py_contains(&"utf_16".to_string()), "a member String matches");
+    assert!(!s.py_contains(&"latin1".to_string()), "an absent String does not");
     assert!(s.py_contains(&"utf_32"), "the &str spelling still matches");
 }
 
@@ -4388,14 +4107,8 @@ fn literal_set_py_contains_owned_string() {
 fn literal_list_py_contains_owned_string() {
     use stdpython::*;
     let l: Vec<&str> = vec!["gzip", "deflate"];
-    assert!(
-        l.py_contains(&"gzip".to_string()),
-        "a member String matches"
-    );
-    assert!(
-        !l.py_contains(&"br".to_string()),
-        "an absent String does not"
-    );
+    assert!(l.py_contains(&"gzip".to_string()), "a member String matches");
+    assert!(!l.py_contains(&"br".to_string()), "an absent String does not");
     assert!(l.py_contains(&"deflate"), "the &str spelling still matches");
 }
 
@@ -4406,14 +4119,8 @@ fn literal_list_py_contains_boxed_str() {
     use stdpython::*;
     let l: Vec<&str> = vec!["R", "AL", "AN"];
     assert!(l.py_contains(&PyValue::from("R")), "a Str member matches");
-    assert!(
-        !l.py_contains(&PyValue::from("L")),
-        "an absent Str does not"
-    );
-    assert!(
-        !l.py_contains(&PyValue::from(5)),
-        "a non-Str boxed value never matches"
-    );
+    assert!(!l.py_contains(&PyValue::from("L")), "an absent Str does not");
+    assert!(!l.py_contains(&PyValue::from(5)), "a non-Str boxed value never matches");
 }
 
 #[test]
@@ -4442,10 +4149,7 @@ fn compiled_regex_matches_with_python_anchoring() {
     assert!(re.py_match("ba").is_none(), "match anchors at the start");
     assert_eq!(re.py_match("aaa").unwrap().groups(), Vec::<String>::new());
     assert_eq!(re.py_search("ba").unwrap().groups(), Vec::<String>::new());
-    assert!(
-        re.py_fullmatch("ba").is_none(),
-        "fullmatch requires the whole text"
-    );
+    assert!(re.py_fullmatch("ba").is_none(), "fullmatch requires the whole text");
     assert!(re.py_fullmatch("aaa").is_some());
     // A capturing pattern's groups() carries the groups.
     let re2 = Regex::new("^([^?#]*)(?:\\?([^#]*))?.*$").unwrap();
@@ -4473,10 +4177,7 @@ fn compiled_regex_matches_with_python_anchoring() {
     );
     // python3: re.fullmatch("a|ab", "AB", re.IGNORECASE) matches "AB".
     let ci = stdpython::stdlib::re::compile("a|ab", "i").unwrap();
-    assert!(
-        ci.py_fullmatch("AB").is_some(),
-        "flags carry into fullmatch"
-    );
+    assert!(ci.py_fullmatch("AB").is_some(), "flags carry into fullmatch");
     // Groups are preserved through the anchored engine: python3
     // re.fullmatch("(a)|(ab)", "ab") gives group(0)="ab", group(1)=None
     // (a non-participating group — a loud ValueError in rython's typed
@@ -4489,11 +4190,7 @@ fn compiled_regex_matches_with_python_anchoring() {
     // non-participating group's span is the sentinel pair, not an error.
     let opt = Regex::new("a(b)?").unwrap();
     let om = opt.py_match("a").unwrap();
-    assert_eq!(
-        om.span_group(1),
-        (-1, -1),
-        "span of an absent group is (-1, -1)"
-    );
+    assert_eq!(om.span_group(1), (-1, -1), "span of an absent group is (-1, -1)");
     assert_eq!(om.span_group(0), (0, 1));
 }
 
@@ -4506,48 +4203,17 @@ fn string_is_family_matches_python() {
     // "Hello World" istitle=True; "HELLO" istitle=False.
     use stdpython::PyStrOps;
     let cases: [(&str, bool, bool, bool, bool, bool, bool, bool, bool, bool); 11] = [
-        (
-            "ABC", true, false, true, false, false, true, false, true, false,
-        ),
-        (
-            "abc", false, true, true, false, false, true, false, true, false,
-        ),
-        (
-            "A1", true, false, false, false, false, true, false, true, true,
-        ),
-        (
-            "123", false, false, false, true, true, true, false, true, false,
-        ),
-        (
-            "", false, false, false, false, false, false, false, true, false,
-        ),
-        (
-            "  ", false, false, false, false, false, false, true, true, false,
-        ),
-        (
-            "Hello World",
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            true,
-            true,
-        ),
-        (
-            "HELLO", true, false, true, false, false, true, false, true, false,
-        ),
-        (
-            "abc123", false, true, false, false, false, true, false, true, false,
-        ),
-        (
-            "a b", false, true, false, false, false, false, false, true, false,
-        ),
-        (
-            "3rd", false, true, false, false, false, true, false, true, false,
-        ),
+        ("ABC", true, false, true, false, false, true, false, true, false),
+        ("abc", false, true, true, false, false, true, false, true, false),
+        ("A1", true, false, false, false, false, true, false, true, true),
+        ("123", false, false, false, true, true, true, false, true, false),
+        ("", false, false, false, false, false, false, false, true, false),
+        ("  ", false, false, false, false, false, false, true, true, false),
+        ("Hello World", false, false, false, false, false, false, false, true, true),
+        ("HELLO", true, false, true, false, false, true, false, true, false),
+        ("abc123", false, true, false, false, false, true, false, true, false),
+        ("a b", false, true, false, false, false, false, false, true, false),
+        ("3rd", false, true, false, false, false, true, false, true, false),
     ];
     for (s, up, lo, al, di, de, an, sp, pr, ti) in cases {
         assert_eq!(s.isupper(), up, "isupper({s:?})");
@@ -4613,10 +4279,7 @@ fn boxed_values_convert_back_to_typed_members() {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _: String = v.into();
     }));
-    assert!(
-        r.is_err(),
-        "a non-str boxed value into a String slot must panic"
-    );
+    assert!(r.is_err(), "a non-str boxed value into a String slot must panic");
 }
 
 #[test]
@@ -4655,24 +4318,18 @@ fn exception_attrs_and_key_repr_match_python() {
     );
     assert_eq!(e.attr_i64("needed").unwrap(), 100);
     assert_eq!(e.attr_i64("available").unwrap(), 30);
-    assert!(
-        e.attr_i64("other").is_err(),
-        "an absent field raises AttributeError"
+    assert!(e.attr_i64("other").is_err(), "an absent field raises AttributeError");
+    assert!(e.matches("BankError"), "the ancestor chain reaches the base class");
+    assert_eq!(
+        stdpython::key_repr(&"carol".to_string()),
+        "'carol'"
     );
-    assert!(
-        e.matches("BankError"),
-        "the ancestor chain reaches the base class"
-    );
-    assert_eq!(stdpython::key_repr(&"carol".to_string()), "'carol'");
     assert_eq!(stdpython::key_repr(&7i64), "7");
     let k: String = "carol".into();
     let err = stdpython::PyDict::<String, i64>::new()
         .py_index(k)
         .unwrap_err();
-    assert_eq!(
-        err.message, "'carol'",
-        "KeyError quotes a str key like CPython"
-    );
+    assert_eq!(err.message, "'carol'", "KeyError quotes a str key like CPython");
 }
 
 /// A raised USER class derived from a builtin (`class MyError(ValueError)`)
@@ -4751,9 +4408,7 @@ fn file_errors_quote_paths_as_python_does_and_wrong_direction_io_is_unsupported_
     // `not writable`/`not readable` for a text file); the standard
     // streams are one shared object each, so closing one alias closes
     // the other.
-    let err = stdpython::open("/nonexistent/dir/it's.txt", Some("r"))
-        .err()
-        .expect("missing");
+    let err = stdpython::open("/nonexistent/dir/it's.txt", Some("r")).err().expect("missing");
     assert!(err.matches("FileNotFoundError"), "{:?}", err);
     assert_eq!(
         err.message,
@@ -4764,36 +4419,16 @@ fn file_errors_quote_paths_as_python_does_and_wrong_direction_io_is_unsupported_
     let path = dir.join("x.bin");
     std::fs::write(&path, b"abc").unwrap();
     let p = path.to_str().unwrap();
-    let err = stdpython::open_binary(p, "rb")
-        .unwrap()
-        .write(b"x")
-        .err()
-        .expect("read-only");
-    assert!(
-        err.matches("UnsupportedOperation") && err.matches("OSError") && err.matches("ValueError"),
-        "{:?}",
-        err
-    );
+    let err = stdpython::open_binary(p, "rb").unwrap().write(b"x").err().expect("read-only");
+    assert!(err.matches("UnsupportedOperation") && err.matches("OSError") && err.matches("ValueError"), "{:?}", err);
     assert_eq!(err.message, "write");
-    let err = stdpython::open_binary(p, "wb")
-        .unwrap()
-        .read()
-        .err()
-        .expect("write-only");
+    let err = stdpython::open_binary(p, "wb").unwrap().read().err().expect("write-only");
     assert!(err.matches("OSError"), "{:?}", err);
     assert_eq!(err.message, "read");
-    let err = stdpython::open(p, Some("r"))
-        .unwrap()
-        .write("x")
-        .err()
-        .expect("read-only text");
+    let err = stdpython::open(p, Some("r")).unwrap().write("x").err().expect("read-only text");
     assert!(err.matches("UnsupportedOperation"), "{:?}", err);
     assert_eq!(err.message, "not writable");
-    let err = stdpython::open(p, Some("w"))
-        .unwrap()
-        .read()
-        .err()
-        .expect("write-only text");
+    let err = stdpython::open(p, Some("w")).unwrap().read().err().expect("write-only text");
     assert_eq!(err.message, "not readable");
     // A post-open I/O failure is the OSError CPython raises (round 8):
     // /dev/full accepts the buffered write and fails the flush with
@@ -4812,34 +4447,13 @@ fn file_errors_quote_paths_as_python_does_and_wrong_direction_io_is_unsupported_
     }
     // getvalue() on a disk handle is CPython's AttributeError, naming the
     // receiver's class (round 5).
-    let err = stdpython::open_binary(p, "rb")
-        .unwrap()
-        .getvalue()
-        .err()
-        .expect("no getvalue");
+    let err = stdpython::open_binary(p, "rb").unwrap().getvalue().err().expect("no getvalue");
     assert!(err.matches("AttributeError"), "{:?}", err);
-    assert_eq!(
-        err.message,
-        "'_io.BufferedReader' object has no attribute 'getvalue'"
-    );
-    let err = stdpython::open_binary(p, "wb")
-        .unwrap()
-        .getvalue()
-        .err()
-        .expect("no getvalue");
-    assert_eq!(
-        err.message,
-        "'_io.BufferedWriter' object has no attribute 'getvalue'"
-    );
-    let err = stdpython::open(p, Some("r"))
-        .unwrap()
-        .getvalue()
-        .err()
-        .expect("no getvalue");
-    assert_eq!(
-        err.message,
-        "'_io.TextIOWrapper' object has no attribute 'getvalue'"
-    );
+    assert_eq!(err.message, "'_io.BufferedReader' object has no attribute 'getvalue'");
+    let err = stdpython::open_binary(p, "wb").unwrap().getvalue().err().expect("no getvalue");
+    assert_eq!(err.message, "'_io.BufferedWriter' object has no attribute 'getvalue'");
+    let err = stdpython::open(p, Some("r")).unwrap().getvalue().err().expect("no getvalue");
+    assert_eq!(err.message, "'_io.TextIOWrapper' object has no attribute 'getvalue'");
     std::fs::remove_dir_all(&dir).unwrap();
     // ONE stdin and ONE stdout object, process-wide (round 5): the text
     // and the binary handles are aliases of the same stream, and a close
@@ -4849,31 +4463,19 @@ fn file_errors_quote_paths_as_python_does_and_wrong_direction_io_is_unsupported_
     assert!(!text_in.closed());
     stdpython::io::PyBytesIO::stdin().close().unwrap();
     assert!(text_in.closed(), "the binary alias closed the one stdin");
-    assert_eq!(
-        text_in.read().err().expect("closed").message,
-        "I/O operation on closed file."
-    );
+    assert_eq!(text_in.read().err().expect("closed").message, "I/O operation on closed file.");
     let a = stdpython::PyFile::stdout();
     let b = stdpython::io::PyBytesIO::stdout();
     assert!(!a.closed() && !b.closed());
     std::thread::spawn(|| stdpython::PyFile::stdout().close().unwrap())
         .join()
         .unwrap();
-    assert!(
-        a.closed() && b.closed(),
-        "a close on another thread closes every alias"
-    );
-    assert_eq!(
-        b.write(b"x").err().expect("closed").message,
-        "I/O operation on closed file."
-    );
+    assert!(a.closed() && b.closed(), "a close on another thread closes every alias");
+    assert_eq!(b.write(b"x").err().expect("closed").message, "I/O operation on closed file.");
     // print() sees the same closed stdout; the embedder's reset reopens
     // both streams for the next program (round 7).
     assert_eq!(
-        stdpython::print_parts(&["x"], " ", "\n")
-            .err()
-            .expect("closed stdout")
-            .message,
+        stdpython::print_parts(&["x"], " ", "\n").err().expect("closed stdout").message,
         "I/O operation on closed file."
     );
     stdpython::reopen_standard_streams();
@@ -4896,53 +4498,20 @@ fn invalid_utf8_in_a_text_file_is_cpythons_unicode_decode_error() {
     let path = dir.join("bad.txt");
     let p = path.to_str().unwrap();
     let cases: &[(&[u8], &str)] = &[
-        (
-            b"\xff",
-            "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte",
-        ),
-        (
-            b"ab\xffcd",
-            "'utf-8' codec can't decode byte 0xff in position 2: invalid start byte",
-        ),
-        (
-            b"\xe2\x82",
-            "'utf-8' codec can't decode bytes in position 0-1: unexpected end of data",
-        ),
-        (
-            b"\xe2\x82x",
-            "'utf-8' codec can't decode bytes in position 0-1: invalid continuation byte",
-        ),
-        (
-            b"ab\xc0\xafz",
-            "'utf-8' codec can't decode byte 0xc0 in position 2: invalid start byte",
-        ),
-        (
-            b"\xed\xa0\x80",
-            "'utf-8' codec can't decode byte 0xed in position 0: invalid continuation byte",
-        ),
-        (
-            b"ok\n\xffbad\n",
-            "'utf-8' codec can't decode byte 0xff in position 3: invalid start byte",
-        ),
+        (b"\xff", "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"),
+        (b"ab\xffcd", "'utf-8' codec can't decode byte 0xff in position 2: invalid start byte"),
+        (b"\xe2\x82", "'utf-8' codec can't decode bytes in position 0-1: unexpected end of data"),
+        (b"\xe2\x82x", "'utf-8' codec can't decode bytes in position 0-1: invalid continuation byte"),
+        (b"ab\xc0\xafz", "'utf-8' codec can't decode byte 0xc0 in position 2: invalid start byte"),
+        (b"\xed\xa0\x80", "'utf-8' codec can't decode byte 0xed in position 0: invalid continuation byte"),
+        (b"ok\n\xffbad\n", "'utf-8' codec can't decode byte 0xff in position 3: invalid start byte"),
     ];
     for (bytes, expected) in cases {
         std::fs::write(&path, bytes).unwrap();
-        let err = stdpython::open(p, Some("r"))
-            .unwrap()
-            .read()
-            .err()
-            .expect("read fails");
-        assert!(
-            err.matches("UnicodeDecodeError") && !err.matches("OSError"),
-            "{:?}",
-            err
-        );
+        let err = stdpython::open(p, Some("r")).unwrap().read().err().expect("read fails");
+        assert!(err.matches("UnicodeDecodeError") && !err.matches("OSError"), "{:?}", err);
         assert_eq!(err.message, *expected, "read of {:?}", bytes);
-        let err = stdpython::open(p, Some("r"))
-            .unwrap()
-            .readline()
-            .err()
-            .expect("readline fails");
+        let err = stdpython::open(p, Some("r")).unwrap().readline().err().expect("readline fails");
         assert!(err.matches("UnicodeDecodeError"), "{:?}", err);
         assert_eq!(err.message, *expected, "readline of {:?}", bytes);
     }
@@ -4975,36 +4544,19 @@ fn open_binary_validates_the_mode_before_touching_the_path() {
         ("bbr", "invalid mode: 'bbr'"),
         ("rbq", "invalid mode: 'rbq'"),
         ("rbt", "can't have text and binary mode at once"),
-        (
-            "rwb",
-            "must have exactly one of create/read/write/append mode",
-        ),
-        (
-            "b",
-            "Must have exactly one of create/read/write/append mode and at most one plus",
-        ),
+        ("rwb", "must have exactly one of create/read/write/append mode"),
+        ("b", "Must have exactly one of create/read/write/append mode and at most one plus"),
         ("rb+", "file mode 'rb+' is not supported yet (update modes)"),
     ] {
-        let err = stdpython::open_binary(missing, mode)
-            .err()
-            .expect("refused");
+        let err = stdpython::open_binary(missing, mode).err().expect("refused");
         assert!(err.matches("ValueError"), "{}: {:?}", mode, err);
         assert_eq!(err.message, expected, "{}", mode);
     }
     for (mode, expected) in [
-        (
-            "rt",
-            "[Errno 2] No such file or directory: '/nonexistent/dir/for/rython/x.bin'",
-        ),
+        ("rt", "[Errno 2] No such file or directory: '/nonexistent/dir/for/rython/x.bin'"),
         ("rr", "invalid mode: 'rr'"),
-        (
-            "rw",
-            "must have exactly one of create/read/write/append mode",
-        ),
-        (
-            "t",
-            "Must have exactly one of create/read/write/append mode and at most one plus",
-        ),
+        ("rw", "must have exactly one of create/read/write/append mode"),
+        ("t", "Must have exactly one of create/read/write/append mode and at most one plus"),
         ("r+", "file mode 'r+' is not supported yet (update modes)"),
     ] {
         let err = stdpython::open(missing, Some(mode)).err().expect("refused");
@@ -5024,15 +4576,9 @@ fn open_binary_validates_the_mode_before_touching_the_path() {
     f.write(b"new").unwrap();
     f.close().unwrap();
     assert_eq!(std::fs::read(&fresh).unwrap(), b"new");
-    let err = stdpython::open_binary(fresh.to_str().unwrap(), "xb")
-        .err()
-        .expect("exists");
+    let err = stdpython::open_binary(fresh.to_str().unwrap(), "xb").err().expect("exists");
     assert!(err.matches("FileExistsError"), "{:?}", err);
-    assert!(
-        err.message.starts_with("[Errno 17] File exists: "),
-        "{:?}",
-        err
-    );
+    assert!(err.message.starts_with("[Errno 17] File exists: "), "{:?}", err);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -5042,8 +4588,8 @@ fn open_binary_validates_the_mode_before_touching_the_path() {
 
 #[test]
 fn complex_repr_matches_cpython() {
-    use stdpython::PyRepr;
     use stdpython::PyToString;
+    use stdpython::PyRepr;
     // Verified against python3 3.14.1 (repr is str for complex).
     let c = |re, im| Complex::new(re, im);
     assert_eq!(c(1.0, 2.0).py_repr(), "(1+2j)");
@@ -5082,7 +4628,7 @@ fn complex_bool_and_eq_matches_cpython() {
 
 #[test]
 fn complex_arithmetic_matches_cpython() {
-    use stdpython::{PyAdd, PyMul, PySub};
+    use stdpython::{PyAdd, PySub, PyMul};
     // (1+2j) + (3+4j) = (4+6j)
     assert_eq!(
         Complex::new(1.0, 2.0).py_add(&Complex::new(3.0, 4.0)),
@@ -5116,29 +4662,19 @@ fn complex_accessors() {
 fn complex_division_matches_cpython() {
     use stdpython::PyDiv;
     // (1+2j)/(3+4j) = 0.44+0.08j
-    let q = Complex::new(1.0, 2.0)
-        .py_div(&Complex::new(3.0, 4.0))
-        .unwrap();
+    let q = Complex::new(1.0, 2.0).py_div(&Complex::new(3.0, 4.0)).unwrap();
     assert_eq!(q.re(), 0.44);
     assert_eq!(q.im(), 0.08);
     // (1+2j)/2 == (0.5+1j)
-    let q2 = Complex::new(1.0, 2.0)
-        .py_div(&Complex::new(2.0, 0.0))
-        .unwrap();
+    let q2 = Complex::new(1.0, 2.0).py_div(&Complex::new(2.0, 0.0)).unwrap();
     assert_eq!(q2.re(), 0.5);
     assert_eq!(q2.im(), 1.0);
     // 1j/0 == ZeroDivisionError: division by zero
-    let err = Complex::new(0.0, 1.0)
-        .py_div(&Complex::new(0.0, 0.0))
-        .err()
-        .unwrap();
+    let err = Complex::new(0.0, 1.0).py_div(&Complex::new(0.0, 0.0)).err().unwrap();
     assert!(err.matches("ZeroDivisionError"), "{:?}", err);
     assert_eq!(err.message, "division by zero");
     // 1j/0j also raises (0j IS complex(0,0))
-    let err2 = Complex::new(0.0, 1.0)
-        .py_div(&Complex::new(0.0, 0.0))
-        .err()
-        .unwrap();
+    let err2 = Complex::new(0.0, 1.0).py_div(&Complex::new(0.0, 0.0)).err().unwrap();
     assert!(err2.matches("ZeroDivisionError"), "{:?}", err2);
 }
 
@@ -5153,7 +4689,7 @@ fn complex_abs_matches_cpython() {
 
 #[test]
 fn complex_cross_type_arithmetic_matches_cpython() {
-    use stdpython::{PyAdd, PyMul, PySub};
+    use stdpython::{PyAdd, PySub, PyMul};
     // 1 - 3.5j == (1-3.5j)   (i64 receiver, Complex rhs)
     let r1 = (1i64).py_sub(&Complex::new(0.0, 3.5));
     assert_eq!(r1, Complex::new(1.0, -3.5));
@@ -5214,23 +4750,11 @@ fn str_format_runtime_matches_cpython() {
             .collect::<Vec<_>>()
     };
     // "{}={}".format("k", 7) == 'k=7'; "{1}:{0}".format("k", 7) == '7:k'
-    assert_eq!(
-        str_format_runtime("{}={}", &args(&["k", "7"]), &[]).unwrap(),
-        "k=7"
-    );
-    assert_eq!(
-        str_format_runtime("{1}:{0}", &args(&["k", "7"]), &[]).unwrap(),
-        "7:k"
-    );
+    assert_eq!(str_format_runtime("{}={}", &args(&["k", "7"]), &[]).unwrap(), "k=7");
+    assert_eq!(str_format_runtime("{1}:{0}", &args(&["k", "7"]), &[]).unwrap(), "7:k");
     // "{0}{0}".format("x") == 'xx'; "{{}}{}".format(3) == '{}3'
-    assert_eq!(
-        str_format_runtime("{0}{0}", &args(&["x"]), &[]).unwrap(),
-        "xx"
-    );
-    assert_eq!(
-        str_format_runtime("{{}}{}", &args(&["3"]), &[]).unwrap(),
-        "{}3"
-    );
+    assert_eq!(str_format_runtime("{0}{0}", &args(&["x"]), &[]).unwrap(), "xx");
+    assert_eq!(str_format_runtime("{{}}{}", &args(&["3"]), &[]).unwrap(), "{}3");
     // "{!s}".format(4) == '4'; "{who} has {n}".format(who="ann", n=3)
     assert_eq!(str_format_runtime("{!s}", &args(&["4"]), &[]).unwrap(), "4");
     assert_eq!(
@@ -5244,10 +4768,7 @@ fn str_format_runtime_matches_cpython() {
     // '{} {}'.format(1) -> IndexError
     assert_eq!(
         err("{} {}", &["1"], &[]),
-        (
-            "IndexError".into(),
-            "Replacement index 1 out of range for positional args tuple".into()
-        )
+        ("IndexError".into(), "Replacement index 1 out of range for positional args tuple".into())
     );
     // "{a}".format() -> KeyError: 'a'
     assert_eq!(err("{a}", &[], &[]), ("KeyError".into(), "'a'".into()));
@@ -5261,18 +4782,9 @@ fn str_format_runtime_matches_cpython() {
         "cannot switch from manual field specification to automatic field numbering"
     );
     // "}" / "a{" / "{x" -> ValueError, three different messages
-    assert_eq!(
-        err("}", &[], &[]).1,
-        "Single '}' encountered in format string"
-    );
-    assert_eq!(
-        err("a{", &[], &[]).1,
-        "Single '{' encountered in format string"
-    );
-    assert_eq!(
-        err("{x", &[], &[("x", "1")]).1,
-        "expected '}' before end of string"
-    );
+    assert_eq!(err("}", &[], &[]).1, "Single '}' encountered in format string");
+    assert_eq!(err("a{", &[], &[]).1, "Single '{' encountered in format string");
+    assert_eq!(err("{x", &[], &[("x", "1")]).1, "expected '}' before end of string");
     // "{a}".format(**{"a": 1}, a=2) -> TypeError
     assert_eq!(
         err("{a}", &[], &[("a", "1"), ("a", "2")]),
@@ -5295,8 +4807,10 @@ fn a_forwarded_kwargs_bag_is_empty_or_refused() {
     // being ignored.
     let empty = PyDict::<String, PyValue>::from([]);
     assert!(refuse_forwarded_kwargs("wrap", &empty).is_ok());
-    let bag =
-        PyDict::<String, PyValue>::from([("initial_indent".to_string(), PyValue::from("> "))]);
+    let bag = PyDict::<String, PyValue>::from([(
+        "initial_indent".to_string(),
+        PyValue::from("> "),
+    )]);
     let err = refuse_forwarded_kwargs("wrap", &bag).err().unwrap();
     assert_eq!(err.exception_type, "NotImplementedError");
     assert!(err.message.contains("'initial_indent'"), "{}", err.message);
@@ -5322,18 +4836,11 @@ fn unittest_assert_almost_eq_matches_cpython() {
     // Verified against CPython 3.14.1 (`assertAlmostEqual`/`assertNotAlmostEqual`).
     // `PyValue` boxes ints/floats; `places` is an i64 (default 7), `delta` an
     // `Option<PyValue>` (runtime coerces to float).
-    use stdpython::PyValue;
     use stdpython::stdlib::unittest::{assert_almost_eq, assert_not_almost_eq};
+    use stdpython::PyValue;
 
     // Equal values pass regardless of places.
-    assert_almost_eq(
-        &PyValue::from(1.0),
-        &PyValue::from(1.0),
-        7,
-        &None,
-        "".to_string(),
-    )
-    .unwrap();
+    assert_almost_eq(&PyValue::from(1.0), &PyValue::from(1.0), 7, &None, "".to_string()).unwrap();
     // A tiny diff passes at the default 7 places.
     assert_almost_eq(
         &PyValue::from(1.0),
@@ -5344,24 +4851,12 @@ fn unittest_assert_almost_eq_matches_cpython() {
     )
     .unwrap();
     // `0.0000001` is NOT within 7 places: round(1e-7, 7) == 1e-7 != 0 -> fail.
-    assert_almost_eq(
-        &PyValue::from(1.0),
-        &PyValue::from(1.0000001),
-        7,
-        &None,
-        "".to_string(),
-    )
-    .err()
-    .unwrap();
+    assert_almost_eq(&PyValue::from(1.0), &PyValue::from(1.0000001), 7, &None, "".to_string())
+        .err()
+        .unwrap();
     // At 5 places the same diff passes (round(1e-7, 5) == 0).
-    assert_almost_eq(
-        &PyValue::from(1.0),
-        &PyValue::from(1.0000001),
-        5,
-        &None,
-        "".to_string(),
-    )
-    .unwrap();
+    assert_almost_eq(&PyValue::from(1.0), &PyValue::from(1.0000001), 5, &None, "".to_string())
+        .unwrap();
     // `delta=` tolerance: abs(1.01 - 1.0) == 0.01 <= 0.1 -> pass.
     assert_almost_eq(
         &PyValue::from(1.0),
@@ -5381,15 +4876,9 @@ fn unittest_assert_almost_eq_matches_cpython() {
     )
     .unwrap();
     // 1 vs 5 differs well beyond 7 places -> fail.
-    assert_almost_eq(
-        &PyValue::from(1i64),
-        &PyValue::from(5i64),
-        7,
-        &None,
-        "".to_string(),
-    )
-    .err()
-    .unwrap();
+    assert_almost_eq(&PyValue::from(1i64), &PyValue::from(5i64), 7, &None, "".to_string())
+        .err()
+        .unwrap();
     // assertNotAlmostEqual is the negation.
     assert_not_almost_eq(
         &PyValue::from(1.0),
@@ -5399,15 +4888,9 @@ fn unittest_assert_almost_eq_matches_cpython() {
         "".to_string(),
     )
     .unwrap();
-    assert_not_almost_eq(
-        &PyValue::from(1.0),
-        &PyValue::from(1.0),
-        7,
-        &None,
-        "".to_string(),
-    )
-    .err()
-    .unwrap();
+    assert_not_almost_eq(&PyValue::from(1.0), &PyValue::from(1.0), 7, &None, "".to_string())
+        .err()
+        .unwrap();
 }
 
 #[test]
@@ -5415,10 +4898,13 @@ fn unittest_assert_order_comparisons_match_cpython() {
     // Verified against CPython 3.14.1 (`assertGreater`/`assertGreaterEqual`/
     // `assertLess`/`assertLessEqual`) for int/float/bool numeric ordering and
     // str lexicographic ordering.
-    use stdpython::PyValue;
     use stdpython::stdlib::unittest::{
-        assert_greater, assert_greater_equal, assert_less, assert_less_equal,
+        assert_greater,
+        assert_greater_equal,
+        assert_less,
+        assert_less_equal,
     };
+    use stdpython::PyValue;
 
     assert_greater(&PyValue::from(2i64), &PyValue::from(1i64), "".to_string()).unwrap();
     assert_greater(&PyValue::from(2.5), &PyValue::from(2), "".to_string()).unwrap();
@@ -5426,12 +4912,8 @@ fn unittest_assert_order_comparisons_match_cpython() {
     assert_greater(&PyValue::from(2i64), &PyValue::from(true), "".to_string()).unwrap();
     assert_greater_equal(&PyValue::from(2i64), &PyValue::from(2i64), "".to_string()).unwrap();
     assert_less(&PyValue::from(1i64), &PyValue::from(2i64), "".to_string()).unwrap();
-    assert_less(
-        &PyValue::from("a".to_string()),
-        &PyValue::from("b".to_string()),
-        "".to_string(),
-    )
-    .unwrap();
+    assert_less(&PyValue::from("a".to_string()), &PyValue::from("b".to_string()), "".to_string())
+        .unwrap();
     assert_less_equal(&PyValue::from(1i64), &PyValue::from(1i64), "".to_string()).unwrap();
 
     // Failures carry the ordering phrase.
@@ -5458,26 +4940,18 @@ fn unittest_assert_order_comparisons_match_cpython() {
     );
     // The msg= context prefixes the message.
     assert_eq!(
-        assert_less_equal(
-            &PyValue::from(2i64),
-            &PyValue::from(1i64),
-            "ctx".to_string()
-        )
-        .err()
-        .unwrap()
-        .message,
+        assert_less_equal(&PyValue::from(2i64), &PyValue::from(1i64), "ctx".to_string())
+            .err()
+            .unwrap()
+            .message,
         "ctx: 2 not less than or equal to 1"
     );
     // Incomparable operands fail loudly rather than silently guessing.
     assert!(
-        assert_greater(
-            &PyValue::from("a".to_string()),
-            &PyValue::from(1i64),
-            "".to_string()
-        )
-        .err()
-        .unwrap()
-        .matches("AssertionError")
+        assert_greater(&PyValue::from("a".to_string()), &PyValue::from(1i64), "".to_string())
+            .err()
+            .unwrap()
+            .matches("AssertionError")
     );
 }
 
@@ -5495,32 +4969,10 @@ fn a_boxed_complex_behaves_like_cpythons_complex() {
     // 1j * 1j == -1 (a complex with zero imaginary part equals the real);
     // 1 + 1j != 1; 2j != 3j
     let minus_one = PyValue::from(Complex::new(-1.0, 0.0));
-    assert!(
-        stdpython::stdlib::unittest::assert_eq(&minus_one, &PyValue::from(-1i64), String::new())
-            .is_ok()
-    );
-    assert!(
-        stdpython::stdlib::unittest::assert_eq(
-            &PyValue::from(Complex::new(2.5, 0.0)),
-            &PyValue::from(2.5f64),
-            String::new()
-        )
-        .is_ok()
-    );
-    assert!(
-        stdpython::stdlib::unittest::assert_not_eq(
-            &PyValue::from(Complex::new(1.0, 1.0)),
-            &PyValue::from(1i64),
-            String::new()
-        )
-        .is_ok()
-    );
-    let err = stdpython::stdlib::unittest::assert_eq(
-        &PyValue::from(Complex::new(0.0, 1.0)),
-        &PyValue::from(1i64),
-        String::new(),
-    )
-    .unwrap_err();
+    assert!(stdpython::stdlib::unittest::assert_eq(&minus_one, &PyValue::from(-1i64), String::new()).is_ok());
+    assert!(stdpython::stdlib::unittest::assert_eq(&PyValue::from(Complex::new(2.5, 0.0)), &PyValue::from(2.5f64), String::new()).is_ok());
+    assert!(stdpython::stdlib::unittest::assert_not_eq(&PyValue::from(Complex::new(1.0, 1.0)), &PyValue::from(1i64), String::new()).is_ok());
+    let err = stdpython::stdlib::unittest::assert_eq(&PyValue::from(Complex::new(0.0, 1.0)), &PyValue::from(1i64), String::new()).unwrap_err();
     // AssertionError: 1j != 1
     assert_eq!(err.message, "1j != 1");
 }
@@ -5532,16 +4984,10 @@ fn boxed_values_subtract_multiply_and_compare_like_cpython() {
     // 3.5 - 1 == 2.5 ; 2 * 2.5 == 5.0 ; 1j * 2 == 2j
     assert_eq!(PyValue::Float(3.5).py_sub(&1i64), PyValue::Float(2.5));
     assert_eq!(PyValue::Int(2).py_mul(&2.5f64), PyValue::Float(5.0));
-    assert_eq!(
-        py_display(&PyValue::from(Complex::new(0.0, 1.0)).py_mul(&2i64)),
-        "2j"
-    );
+    assert_eq!(py_display(&PyValue::from(Complex::new(0.0, 1.0)).py_mul(&2i64)), "2j");
     // 'ab' * 2 == 'abab' ; b'x' * 3 == b'xxx' ; (1, 2) * 2 == (1, 2, 1, 2)
     assert_eq!(PyValue::from("ab").py_mul(&2i64), PyValue::from("abab"));
-    assert_eq!(
-        py_display(&PyValue::Bytes(b"x".to_vec()).py_mul(&3i64)),
-        "b'xxx'"
-    );
+    assert_eq!(py_display(&PyValue::Bytes(b"x".to_vec()).py_mul(&3i64)), "b'xxx'");
     assert_eq!(
         py_display(&PyValue::from(vec![PyValue::Int(1), PyValue::Int(2)]).py_mul(&2i64)),
         "(1, 2, 1, 2)"
@@ -5553,10 +4999,7 @@ fn boxed_values_subtract_multiply_and_compare_like_cpython() {
     assert_eq!(py_value_format_int(&PyValue::Int(7), 'x').unwrap(), 7);
     assert_eq!(py_value_format_int(&PyValue::Bool(true), 'x').unwrap(), 1);
     let err = py_value_format_int(&PyValue::from("s"), 'x').unwrap_err();
-    assert_eq!(
-        err.message,
-        "Unknown format code 'x' for object of type 'str'"
-    );
+    assert_eq!(err.message, "Unknown format code 'x' for object of type 'str'");
 }
 
 #[test]
@@ -5584,10 +5027,7 @@ fn a_boxed_range_is_still_a_range() {
     // repr(range(3, 6)) == 'range(3, 6)'; range(0, 10, 2) keeps its step
     assert_eq!(py_display(&r), "range(3, 6)");
     assert_eq!(py_display(&PyValue::from(range(2))), "range(0, 2)");
-    assert_eq!(
-        py_display(&PyValue::from(range_start_stop_step(0, 10, 2).unwrap())),
-        "range(0, 10, 2)"
-    );
+    assert_eq!(py_display(&PyValue::from(range_start_stop_step(0, 10, 2).unwrap())), "range(0, 10, 2)");
     // len(range(0, 10, 3)) == 4; range(0, 10, 3)[2] == 6; 3 in range(0, 10, 3)
     let r3 = PyValue::from(range_start_stop_step(0, 10, 3).unwrap());
     assert_eq!(r3.len(), 4);
@@ -5603,22 +5043,18 @@ fn a_boxed_range_is_still_a_range() {
     let v: Vec<i64> = r.clone().into();
     assert_eq!(v, vec![3, 4, 5]);
     // range(0, 3, 2) == range(0, 4, 2); range(0) == range(2, 2)
-    assert!(
-        stdpython::stdlib::unittest::assert_eq(
-            &PyValue::from(range_start_stop_step(0, 3, 2).unwrap()),
-            &PyValue::from(range_start_stop_step(0, 4, 2).unwrap()),
-            String::new()
-        )
-        .is_ok()
-    );
-    assert!(
-        stdpython::stdlib::unittest::assert_eq(
-            &PyValue::from(range(0)),
-            &PyValue::from(range_start_stop(2, 2)),
-            String::new()
-        )
-        .is_ok()
-    );
+    assert!(stdpython::stdlib::unittest::assert_eq(
+        &PyValue::from(range_start_stop_step(0, 3, 2).unwrap()),
+        &PyValue::from(range_start_stop_step(0, 4, 2).unwrap()),
+        String::new()
+    )
+    .is_ok());
+    assert!(stdpython::stdlib::unittest::assert_eq(
+        &PyValue::from(range(0)),
+        &PyValue::from(range_start_stop(2, 2)),
+        String::new()
+    )
+    .is_ok());
 }
 
 #[test]
@@ -5637,20 +5073,14 @@ fn a_variable_length_tuple_prints_as_a_tuple() {
     // (3, 4)[1:] == (4,); (3, 4) + (5,) == (3, 4, 5); (1, 2) * 2 == (1, 2, 1, 2)
     assert_eq!(py_display(&t.py_slice(Some(1), None, None)), "(4,)");
     assert_eq!(py_display(&t.py_add(&PyTuple(vec![5]))), "(3, 4, 5)");
-    assert_eq!(
-        py_display(&PyTuple(vec![1i64, 2]).py_mul(&2)),
-        "(1, 2, 1, 2)"
-    );
+    assert_eq!(py_display(&PyTuple(vec![1i64, 2]).py_mul(&2)), "(1, 2, 1, 2)");
     // 3 in (3, 4); len(()) == 0; bool(()) is False; sum((1, 2, 3)) == 6
     assert!(t.py_contains(&3));
     assert_eq!(PyTuple::<i64>(vec![]).len(), 0);
     assert!(!PyTuple::<i64>(vec![]).is_truthy());
     assert_eq!(sum(PyTuple(vec![1i64, 2, 3])), 6);
     // (3, 4)[5] -> IndexError: tuple index out of range
-    assert_eq!(
-        t.py_index(5i64).unwrap_err().message,
-        "tuple index out of range"
-    );
+    assert_eq!(t.py_index(5i64).unwrap_err().message, "tuple index out of range");
     // (3, 4)[-1] == 4; list((3, 4)) == [3, 4]
     assert_eq!(t.py_index(-1i64).unwrap(), 4);
     assert_eq!(list(t.clone()), vec![3, 4]);
@@ -5674,10 +5104,7 @@ fn enumerate_takes_strings_and_boxed_values() {
     // list(enumerate('ab')) == [(0, 'a'), (1, 'b')]
     assert_eq!(py_display(&enumerate("ab")), "[(0, 'a'), (1, 'b')]");
     // list(enumerate('xy', 1)) == [(1, 'x'), (2, 'y')]
-    assert_eq!(
-        py_display(&enumerate_start("xy".to_string(), 1)),
-        "[(1, 'x'), (2, 'y')]"
-    );
+    assert_eq!(py_display(&enumerate_start("xy".to_string(), 1)), "[(1, 'x'), (2, 'y')]");
     // list(enumerate(b'ab')) == [(0, 97), (1, 98)]
     assert_eq!(
         py_display(&enumerate(PyValue::from(b"ab".to_vec()))),
@@ -5693,34 +5120,17 @@ fn boxed_values_order_like_cpython() {
     let t = |v: Vec<PyValue>| PyValue::from(PyTuple(v));
     let (i, s) = (|x: i64| PyValue::from(x), |x: &str| PyValue::from(x));
     // (1, 'a') < (1, 'b'); (1,) < (1, 'a'); (2, 'Z') < (10, '3')
-    assert!(
-        t(vec![i(1), s("a")])
-            .py_lt_boxed(&t(vec![i(1), s("b")]))
-            .unwrap()
-    );
+    assert!(t(vec![i(1), s("a")]).py_lt_boxed(&t(vec![i(1), s("b")])).unwrap());
     assert!(t(vec![i(1)]).py_lt_boxed(&t(vec![i(1), s("a")])).unwrap());
-    assert!(
-        t(vec![i(2), s("Z")])
-            .py_lt_boxed(&t(vec![i(10), s("3")]))
-            .unwrap()
-    );
+    assert!(t(vec![i(2), s("Z")]).py_lt_boxed(&t(vec![i(10), s("3")])).unwrap());
     // 1 < 2.5; True < 2; float('nan') < 1 is False; b'a' < b'b'
     assert!(i(1).py_lt_boxed(&PyValue::from(2.5)).unwrap());
     assert!(PyValue::from(true).py_lt_boxed(&i(2)).unwrap());
     assert!(!PyValue::from(f64::NAN).py_lt_boxed(&i(1)).unwrap());
-    assert!(
-        PyValue::from(b"a".to_vec())
-            .py_lt_boxed(&PyValue::from(b"b".to_vec()))
-            .unwrap()
-    );
+    assert!(PyValue::from(b"a".to_vec()).py_lt_boxed(&PyValue::from(b"b".to_vec())).unwrap());
     // (1, 'a') < ('x',) -> TypeError: '<' not supported between instances of 'int' and 'str'
-    let err = t(vec![i(1), s("a")])
-        .py_lt_boxed(&t(vec![s("x")]))
-        .unwrap_err();
-    assert_eq!(
-        err.message,
-        "'<' not supported between instances of 'int' and 'str'"
-    );
+    let err = t(vec![i(1), s("a")]).py_lt_boxed(&t(vec![s("x")])).unwrap_err();
+    assert_eq!(err.message, "'<' not supported between instances of 'int' and 'str'");
     // bisect.bisect_left(((0, '3'), (65, 'M', 'a'), (91, 'V')), (66, 'Z')) == 2
     let table = t(vec![
         t(vec![i(0), s("3")]),
@@ -5728,16 +5138,10 @@ fn boxed_values_order_like_cpython() {
         t(vec![i(91), s("V")]),
     ]);
     let probe = t(vec![i(66), s("Z")]);
-    assert_eq!(
-        stdpython::stdlib::bisect::bisect_left(&table, &probe, 0, None).unwrap(),
-        2
-    );
+    assert_eq!(stdpython::stdlib::bisect::bisect_left(&table, &probe, 0, None).unwrap(), 2);
     // bisect.bisect_right(table, (91, 'V')) == 3
     let probe = t(vec![i(91), s("V")]);
-    assert_eq!(
-        stdpython::stdlib::bisect::bisect_right(&table, &probe, 0, None).unwrap(),
-        3
-    );
+    assert_eq!(stdpython::stdlib::bisect::bisect_right(&table, &probe, 0, None).unwrap(), 3);
 }
 
 #[test]
@@ -5746,16 +5150,12 @@ fn unpacking_a_sequence_checks_its_length() {
     assert_eq!(unpack_sequence::<i64, 2>(vec![1, 2]).unwrap(), [1, 2]);
     // a, b = [1, 2, 3] -> ValueError: too many values to unpack (expected 2)
     assert_eq!(
-        unpack_sequence::<i64, 2>(vec![1, 2, 3])
-            .unwrap_err()
-            .message,
+        unpack_sequence::<i64, 2>(vec![1, 2, 3]).unwrap_err().message,
         "too many values to unpack (expected 2)"
     );
     // a, b = [1] -> ValueError: not enough values to unpack (expected 2, got 1)
     assert_eq!(
-        unpack_sequence::<i64, 2>(PyTuple(vec![1]))
-            .unwrap_err()
-            .message,
+        unpack_sequence::<i64, 2>(PyTuple(vec![1])).unwrap_err().message,
         "not enough values to unpack (expected 2, got 1)"
     );
 }
@@ -5766,9 +5166,7 @@ fn boxed_argument_binding_raises_cpythons_type_errors() {
     let s = || PyValue::from("a");
     // def enc(s, upper=False): enc() -> missing 1 required positional argument: 's'
     assert_eq!(
-        bind_boxed_args("enc", &params, 1, (vec![], vec![]))
-            .unwrap_err()
-            .message,
+        bind_boxed_args("enc", &params, 1, (vec![], vec![])).unwrap_err().message,
         "enc() missing 1 required positional argument: 's'"
     );
     // enc("a", True, 3) -> takes from 1 to 2 positional arguments but 3 were given
@@ -5793,13 +5191,9 @@ fn boxed_argument_binding_raises_cpythons_type_errors() {
         "enc() got multiple values for argument 's'"
     );
     // enc(upper=True, s="a") binds both by name
-    let bound = bind_boxed_args(
-        "enc",
-        &params,
-        1,
-        (vec![], vec![("upper".into(), s()), ("s".into(), s())]),
-    )
-    .unwrap();
+    let bound =
+        bind_boxed_args("enc", &params, 1, (vec![], vec![("upper".into(), s()), ("s".into(), s())]))
+            .unwrap();
     assert!(bound.iter().all(Option::is_some));
     // None(1) -> TypeError: 'NoneType' object is not callable
     assert_eq!(
@@ -5818,38 +5212,31 @@ fn boxed_call_spreads_raise_cpythons_type_errors() {
     ));
     let mut args = vec![PyValue::Int(1)];
     // f(1, *(2, 3)) -> the members append in order
-    f.extend_spread_args(&mut args, PyValue::from((2i64, 3i64)))
-        .unwrap();
+    f.extend_spread_args(&mut args, PyValue::from((2i64, 3i64))).unwrap();
     assert_eq!(args.len(), 3);
     // f(*5) -> __main__.f() argument after * must be an iterable, not int
     assert_eq!(
-        f.extend_spread_args(&mut args, PyValue::Int(5))
-            .unwrap_err()
-            .message,
+        f.extend_spread_args(&mut args, PyValue::Int(5)).unwrap_err().message,
         "__main__.f() argument after * must be an iterable, not int"
     );
     // f(**5) -> __main__.f() argument after ** must be a mapping, not int
     let mut kw: Vec<(String, PyValue)> = vec![("a".to_string(), PyValue::Int(1))];
     assert_eq!(
-        f.extend_spread_kwargs(&mut kw, PyValue::Int(5))
-            .unwrap_err()
-            .message,
+        f.extend_spread_kwargs(&mut kw, PyValue::Int(5)).unwrap_err().message,
         "__main__.f() argument after ** must be a mapping, not int"
     );
     // f(a=1, **{"a": 2}) -> __main__.f() got multiple values for keyword argument 'a'
     let mut d: stdpython::PyDict<String, PyValue> = stdpython::PyDict::new();
     d.insert("a".to_string(), PyValue::Int(2));
     assert_eq!(
-        f.extend_spread_kwargs(&mut kw, PyValue::from(d))
-            .unwrap_err()
-            .message,
+        f.extend_spread_kwargs(&mut kw, PyValue::from(d)).unwrap_err().message,
         "__main__.f() got multiple values for keyword argument 'a'"
     );
 }
 
 #[test]
 fn boxed_and_list_unpacking_raise_cpythons_errors() {
-    use stdpython::{PyUnpack, unpack_boxed};
+    use stdpython::{unpack_boxed, PyUnpack};
     // a, b = ("x", 1) boxed -> 'x', 1
     let [a, b] = unpack_boxed::<2>(PyValue::from(("x", 1i64))).unwrap();
     assert_eq!((a, b), (PyValue::from("x"), PyValue::Int(1)));
@@ -5858,19 +5245,13 @@ fn boxed_and_list_unpacking_raise_cpythons_errors() {
     assert_eq!((a, b), (PyValue::from("a"), PyValue::from("b")));
     // a, b = 5 -> TypeError: cannot unpack non-iterable int object
     let e = unpack_boxed::<2>(PyValue::Int(5)).unwrap_err();
-    assert_eq!(
-        (e.exception_type.as_str(), e.message.as_str()),
-        ("TypeError", "cannot unpack non-iterable int object")
-    );
+    assert_eq!((e.exception_type.as_str(), e.message.as_str()), ("TypeError", "cannot unpack non-iterable int object"));
     // a, b = None -> TypeError: cannot unpack non-iterable NoneType object
     let e = unpack_boxed::<2>(PyValue::None_).unwrap_err();
     assert_eq!(e.message, "cannot unpack non-iterable NoneType object");
     // a, b = "abc" -> ValueError: too many values to unpack (expected 2)
     let e = unpack_boxed::<2>(PyValue::from("abc")).unwrap_err();
-    assert_eq!(
-        (e.exception_type.as_str(), e.message.as_str()),
-        ("ValueError", "too many values to unpack (expected 2)")
-    );
+    assert_eq!((e.exception_type.as_str(), e.message.as_str()), ("ValueError", "too many values to unpack (expected 2)"));
     // a, b = (1, 2) -> the tuple itself
     assert_eq!(PyUnpack::<2>::py_unpack((1i64, "s")).unwrap(), (1, "s"));
     // a, b = [7] -> ValueError: not enough values to unpack (expected 2, got 1)
@@ -5918,7 +5299,7 @@ fn str_of_an_optional_value_matches_cpython() {
 // under python3.12.
 // ---------------------------------------------------------------------------
 mod collections_containers {
-    use stdpython::collections::{OrderedDict, defaultdict, deque};
+    use stdpython::collections::{defaultdict, deque, OrderedDict};
     use stdpython::*;
 
     fn items<T: Clone>(d: &deque<T>) -> Vec<T> {
@@ -6091,10 +5472,7 @@ mod collections_containers {
         // defaultdict()["k"] / defaultdict(None)["k"] -> KeyError: 'k'
         let plain: defaultdict<String, i64> = defaultdict::without_factory();
         let err = plain.py_index("k").unwrap_err();
-        assert_eq!(
-            (err.exception_type.as_str(), err.message.as_str()),
-            ("KeyError", "'k'")
-        );
+        assert_eq!((err.exception_type.as_str(), err.message.as_str()), ("KeyError", "'k'"));
         // repr(defaultdict(list)) -> "defaultdict(<class 'list'>, {})"
         let l: defaultdict<String, Vec<i64>> = defaultdict::with_class(|| Vec::new(), "list");
         assert_eq!(l.py_repr(), "defaultdict(<class 'list'>, {})");
@@ -6103,10 +5481,7 @@ mod collections_containers {
         l.py_index_mut("k").unwrap().push(1);
         l.py_index_mut("k").unwrap().push(2);
         let _ = l.py_index("j").unwrap();
-        assert_eq!(
-            l.py_repr(),
-            "defaultdict(<class 'list'>, {'k': [1, 2], 'j': []})"
-        );
+        assert_eq!(l.py_repr(), "defaultdict(<class 'list'>, {'k': [1, 2], 'j': []})");
         // defaultdict(float, {"x": 1.5}) -> defaultdict(<class 'float'>, {'x': 1.5})
         let mut start = PyDict::default();
         start.insert("x".to_string(), 1.5f64);
@@ -6217,10 +5592,7 @@ mod collections_containers {
             ("KeyError", "'dictionary is empty'")
         );
         // OrderedDict().move_to_end("x") / ["x"] / .pop("x") -> KeyError: 'x'
-        assert_eq!(
-            od.move_to_end(&"x".to_string(), true).unwrap_err().message,
-            "'x'"
-        );
+        assert_eq!(od.move_to_end(&"x".to_string(), true).unwrap_err().message, "'x'");
         assert_eq!(od.py_index("x").unwrap_err().message, "'x'");
         assert_eq!(od.py_pop("x".to_string()).unwrap_err().message, "'x'");
     }
@@ -6303,31 +5675,19 @@ mod boxed_ordereddict {
         //   -> OrderedDict({'a': OrderedDict({'b': None})})
         let inner = build(tup(vec![tup(vec![s("b"), PyValue::None_])]));
         let outer = build(tup(vec![tup(vec![s("a"), inner])]));
-        assert_eq!(
-            outer.py_repr(),
-            "OrderedDict({'a': OrderedDict({'b': None})})"
-        );
+        assert_eq!(outer.py_repr(), "OrderedDict({'a': OrderedDict({'b': None})})");
     }
 
     #[test]
     fn constructs_from_a_dict_and_from_pairs() {
         // OrderedDict({"x": 1, "y": 2}) -> OrderedDict({'x': 1, 'y': 2})
-        let from_dict = build(PyValue::Dict(std::sync::Arc::new(dict(&[
-            ("x", 1),
-            ("y", 2),
-        ]))));
+        let from_dict = build(PyValue::Dict(std::sync::Arc::new(dict(&[("x", 1), ("y", 2)]))));
         assert_eq!(from_dict.py_repr(), "OrderedDict({'x': 1, 'y': 2})");
         // OrderedDict([("a", 1), ("a", 2)]) -> OrderedDict({'a': 2}); a repeated key
         // keeps its first position and takes the last value.
-        assert_eq!(
-            build(pairs(&[("a", 1), ("a", 2)])).py_repr(),
-            "OrderedDict({'a': 2})"
-        );
+        assert_eq!(build(pairs(&[("a", 1), ("a", 2)])).py_repr(), "OrderedDict({'a': 2})");
         // OrderedDict(["ab"]) -> OrderedDict({'a': 'b'}): a 2-character str is a pair.
-        assert_eq!(
-            build(tup(vec![s("ab")])).py_repr(),
-            "OrderedDict({'a': 'b'})"
-        );
+        assert_eq!(build(tup(vec![s("ab")])).py_repr(), "OrderedDict({'a': 'b'})");
         // OrderedDict(OrderedDict([("a", 1)])) -> OrderedDict({'a': 1}), a copy.
         let first = build(pairs(&[("a", 1)]));
         assert_eq!(build(first).py_repr(), "OrderedDict({'a': 1})");
@@ -6338,10 +5698,7 @@ mod boxed_ordereddict {
         // OrderedDict(5) -> TypeError: 'int' object is not iterable
         assert_eq!(
             err(PyValue::Int(5)),
-            (
-                "TypeError".to_string(),
-                "'int' object is not iterable".to_string()
-            )
+            ("TypeError".to_string(), "'int' object is not iterable".to_string())
         );
         // OrderedDict(5.5) -> TypeError: 'float' object is not iterable
         assert_eq!(err(PyValue::Float(5.5)).1, "'float' object is not iterable");
@@ -6352,17 +5709,10 @@ mod boxed_ordereddict {
         // OrderedDict([1]) -> TypeError: 'int' object is not iterable
         assert_eq!(
             err(tup(vec![PyValue::Int(1)])),
-            (
-                "TypeError".to_string(),
-                "'int' object is not iterable".to_string()
-            )
+            ("TypeError".to_string(), "'int' object is not iterable".to_string())
         );
         // OrderedDict([(1, 2, 3)]) -> ValueError: too many values to unpack (expected 2)
-        let three = tup(vec![tup(vec![
-            PyValue::Int(1),
-            PyValue::Int(2),
-            PyValue::Int(3),
-        ])]);
+        let three = tup(vec![tup(vec![PyValue::Int(1), PyValue::Int(2), PyValue::Int(3)])]);
         assert_eq!(
             err(three),
             (
@@ -6379,10 +5729,7 @@ mod boxed_ordereddict {
             )
         );
         // OrderedDict([()]) -> ValueError: need more than 0 values to unpack
-        assert_eq!(
-            err(tup(vec![tup(vec![])])).1,
-            "need more than 0 values to unpack"
-        );
+        assert_eq!(err(tup(vec![tup(vec![])])).1, "need more than 0 values to unpack");
         // OrderedDict("ab") -> ValueError: need more than 1 value to unpack
         assert_eq!(err(s("ab")).1, "need more than 1 value to unpack");
         // OrderedDict([("a", 1), 5]) -> TypeError: 'int' object is not iterable
@@ -6397,10 +5744,7 @@ mod boxed_ordereddict {
         ])]);
         assert_eq!(
             err(unhashable),
-            (
-                "TypeError".to_string(),
-                "unhashable type: 'dict'".to_string()
-            )
+            ("TypeError".to_string(), "unhashable type: 'dict'".to_string())
         );
     }
 
@@ -6505,12 +5849,10 @@ mod boxed_ordereddict {
         );
         // urllib.parse.urlencode(OrderedDict([("b", 1), ("a", 2)])) -> b=1&a=2
         let q = build(pairs(&[("b", 1), ("a", 2)]));
-        assert_eq!(
-            stdpython::urllib::parse::urlencode(&q, false).unwrap(),
-            "b=1&a=2"
-        );
+        assert_eq!(stdpython::urllib::parse::urlencode(&q, false).unwrap(), "b=1&a=2");
     }
 }
+
 
 // ── Container operations on a boxed value (issue #137 frontier) ─────────────
 //
@@ -6538,10 +5880,7 @@ mod boxed_container_ops {
         // d = {"a": "1", "b": "2"}; d.get("a") == "1"; d.get("zz") is None;
         // d.get("zz", "D") == "D"
         let d = boxed_dict(&[("a", "1"), ("b", "2")]);
-        assert_eq!(
-            PyDictOps::py_get(&d, &"a".to_string()),
-            Some(PyValue::Str("1".into()))
-        );
+        assert_eq!(PyDictOps::py_get(&d, &"a".to_string()), Some(PyValue::Str("1".into())));
         assert_eq!(PyDictOps::py_get(&d, &"zz".to_string()), None);
         assert_eq!(
             PyDictOps::py_get_default(&d, &"zz".to_string(), PyValue::Str("D".into())),
@@ -6553,17 +5892,11 @@ mod boxed_container_ops {
     fn items_keys_and_values_keep_insertion_order() {
         // dict({"b": "2", "a": "1"}).items() == [("b","2"), ("a","1")]
         let d = boxed_dict(&[("b", "2"), ("a", "1")]);
-        assert_eq!(
-            PyDictOps::py_items(&d),
-            vec![
-                ("b".to_string(), PyValue::Str("2".into())),
-                ("a".to_string(), PyValue::Str("1".into())),
-            ]
-        );
-        assert_eq!(
-            PyDictOps::py_keys(&d),
-            vec!["b".to_string(), "a".to_string()]
-        );
+        assert_eq!(PyDictOps::py_items(&d), vec![
+            ("b".to_string(), PyValue::Str("2".into())),
+            ("a".to_string(), PyValue::Str("1".into())),
+        ]);
+        assert_eq!(PyDictOps::py_keys(&d), vec!["b".to_string(), "a".to_string()]);
         assert_eq!(
             PyDictOps::py_values(&d),
             vec![PyValue::Str("2".into()), PyValue::Str("1".into())]
@@ -6575,17 +5908,15 @@ mod boxed_container_ops {
         // d = {"a": "1", "b": "2"}; d.pop("a") == "1", leaving {"b": "2"};
         // d.pop("zz") raises KeyError: 'zz'
         let mut d = boxed_dict(&[("a", "1"), ("b", "2")]);
-        assert_eq!(
-            PyPop::py_pop(&mut d, "a".to_string()).unwrap(),
-            PyValue::Str("1".into())
-        );
-        assert_eq!(
-            PyDictOps::py_items(&d),
-            vec![("b".to_string(), PyValue::Str("2".into()))]
-        );
+        assert_eq!(PyPop::py_pop(&mut d, "a".to_string()).unwrap(), PyValue::Str("1".into()));
+        assert_eq!(PyDictOps::py_items(&d), vec![("b".to_string(), PyValue::Str("2".into()))]);
         let err = PyPop::py_pop(&mut d, "zz".to_string()).unwrap_err();
         assert_eq!(err.exception_type, "KeyError");
-        assert!(err.message.contains("zz"), "message was {:?}", err.message);
+        assert!(
+            err.message.contains("zz"),
+            "message was {:?}",
+            err.message
+        );
     }
 
     #[test]
@@ -6597,10 +5928,7 @@ mod boxed_container_ops {
             PyDictOps::py_setdefault(&mut d, "n".to_string(), PyValue::Str("N".into())),
             PyValue::Str("N".into())
         );
-        assert_eq!(
-            PyDictOps::py_get(&d, &"n".to_string()),
-            Some(PyValue::Str("N".into()))
-        );
+        assert_eq!(PyDictOps::py_get(&d, &"n".to_string()), Some(PyValue::Str("N".into())));
         assert_eq!(
             PyDictOps::py_setdefault(&mut d, "a".to_string(), PyValue::Str("OTHER".into())),
             PyValue::Str("1".into())
@@ -6612,10 +5940,7 @@ mod boxed_container_ops {
         // d = {}; d["k"] = "v"; "k" in d is True; "z" in d is False
         let mut d = boxed_dict(&[]);
         PySetIndex::py_set_index(&mut d, "k".to_string(), PyValue::Str("v".into())).unwrap();
-        assert_eq!(
-            PyDictOps::py_get(&d, &"k".to_string()),
-            Some(PyValue::Str("v".into()))
-        );
+        assert_eq!(PyDictOps::py_get(&d, &"k".to_string()), Some(PyValue::Str("v".into())));
         assert!(PyContains::py_contains(&d, "k"));
         assert!(!PyContains::py_contains(&d, "z"));
     }
@@ -6625,23 +5950,14 @@ mod boxed_container_ops {
         // "abcdef"[1:3] == "bc"; [::2] == "ace"; [::-1] == "fedcba";
         // [9:99] == "" (bounds clamp, never raise); [-2:] == "ef"
         let s = PyValue::Str("abcdef".into());
-        assert_eq!(
-            s.py_slice(Some(1), Some(3), None),
-            PyValue::Str("bc".into())
-        );
+        assert_eq!(s.py_slice(Some(1), Some(3), None), PyValue::Str("bc".into()));
         assert_eq!(s.py_slice(None, None, Some(2)), PyValue::Str("ace".into()));
-        assert_eq!(
-            s.py_slice(None, None, Some(-1)),
-            PyValue::Str("fedcba".into())
-        );
+        assert_eq!(s.py_slice(None, None, Some(-1)), PyValue::Str("fedcba".into()));
         assert_eq!(s.py_slice(Some(9), Some(99), None), PyValue::Str("".into()));
         assert_eq!(s.py_slice(Some(-2), None, None), PyValue::Str("ef".into()));
         // b"abcdef"[1:3] == b"bc" — bytes slice by OCTET, the line len draws.
         let b = PyValue::Bytes(b"abcdef".to_vec());
-        assert_eq!(
-            b.py_slice(Some(1), Some(3), None),
-            PyValue::Bytes(b"bc".to_vec())
-        );
+        assert_eq!(b.py_slice(Some(1), Some(3), None), PyValue::Bytes(b"bc".to_vec()));
     }
 
     #[test]
@@ -6684,21 +6000,17 @@ mod boxed_container_ops {
         assert!(std::panic::catch_unwind(|| PyDictOps::py_keys(&PyValue::Int(5))).is_err());
         assert!(std::panic::catch_unwind(|| PyDictOps::py_values(&PyValue::Int(5))).is_err());
         // setdefault and update must refuse too, never silently no-op.
-        assert!(
-            std::panic::catch_unwind(|| {
-                let mut s = PyValue::Str("x".into());
-                let key = k.clone();
-                PyDictOps::py_setdefault(&mut s, key, PyValue::Int(1))
-            })
-            .is_err()
-        );
-        assert!(
-            std::panic::catch_unwind(|| {
-                let mut n2 = PyValue::Int(5);
-                PyDictOps::update(&mut n2, PyDict::new())
-            })
-            .is_err()
-        );
+        assert!(std::panic::catch_unwind(|| {
+            let mut s = PyValue::Str("x".into());
+            let key = k.clone();
+            PyDictOps::py_setdefault(&mut s, key, PyValue::Int(1))
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            let mut n2 = PyValue::Int(5);
+            PyDictOps::update(&mut n2, PyDict::new())
+        })
+        .is_err());
         // The fallible entry point carries CPython's TypeError by name.
         let err = n.not_a_container("items()");
         assert_eq!(err.exception_type, "TypeError");
@@ -6710,7 +6022,10 @@ mod boxed_container_ops {
         // t = (1, 2); t[0:1] = [9] raises TypeError: 'tuple' object does not
         // support item assignment — a boxed tuple must NOT be edited in place,
         // and del t[0:1] raises TypeError the same way.
-        let mut t = PyValue::Tuple(std::sync::Arc::new(vec![PyValue::Int(1), PyValue::Int(2)]));
+        let mut t = PyValue::Tuple(std::sync::Arc::new(vec![
+            PyValue::Int(1),
+            PyValue::Int(2),
+        ]));
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 PySliceReplace::py_slice_assign(&mut t, Some(0), Some(1), vec![PyValue::Int(9)]);
@@ -6720,18 +6035,21 @@ mod boxed_container_ops {
         );
         // The stepped (fallible) arm reports the same refusal as an exception.
         let mut t2 = PyValue::Tuple(std::sync::Arc::new(vec![PyValue::Int(1)]));
-        let err =
-            PySliceReplace::py_slice_assign_step(&mut t2, None, None, 2, vec![PyValue::Int(9)])
-                .unwrap_err();
+        let err = PySliceReplace::py_slice_assign_step(
+            &mut t2,
+            None,
+            None,
+            2,
+            vec![PyValue::Int(9)],
+        )
+        .unwrap_err();
         assert_eq!(err.exception_type, "TypeError");
         // Deletion refuses too.
         let mut t3 = PyValue::Tuple(std::sync::Arc::new(vec![PyValue::Int(1)]));
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                PySliceReplace::py_slice_delete(&mut t3, None, None);
-            }))
-            .is_err()
-        );
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            PySliceReplace::py_slice_delete(&mut t3, None, None);
+        }))
+        .is_err());
     }
 
     #[test]
@@ -6739,10 +6057,7 @@ mod boxed_container_ops {
         // range(6)[1:4] == range(1, 4); [::2] == range(0, 6, 2);
         // [::-1] == range(5, -1, -1); [9:99] == range(6, 6)
         let r = PyValue::from(stdpython::range(6));
-        assert_eq!(
-            stdpython::py_value_repr(&r.py_slice(Some(1), Some(4), None)),
-            "range(1, 4)"
-        );
+        assert_eq!(stdpython::py_value_repr(&r.py_slice(Some(1), Some(4), None)), "range(1, 4)");
         assert_eq!(
             stdpython::py_value_repr(&r.py_slice(None, None, Some(2))),
             "range(0, 6, 2)"
@@ -6834,11 +6149,7 @@ mod boxed_container_ops {
         let mut t = PyValue::Tuple(std::sync::Arc::new(vec![PyValue::Int(1)]));
         let err = PySliceReplace::py_slice_assign_step(&mut t, None, None, 0, vec![]).unwrap_err();
         assert_eq!(err.exception_type, "ValueError");
-        assert!(
-            err.message.contains("step"),
-            "message was {:?}",
-            err.message
-        );
+        assert!(err.message.contains("step"), "message was {:?}", err.message);
         let err = PySliceReplace::py_slice_delete_step(&mut t, None, None, 0).unwrap_err();
         assert_eq!(err.exception_type, "ValueError");
     }
@@ -6920,18 +6231,12 @@ mod boxed_numeric_equality {
         // (1, (2, "a")) == (1.0, (2.0, "a")) -> True
         assert!(
             tup(vec![PyValue::Int(1), tup(vec![PyValue::Int(2), s("a")])])
-                == tup(vec![
-                    PyValue::Float(1.0),
-                    tup(vec![PyValue::Float(2.0), s("a")])
-                ])
+                == tup(vec![PyValue::Float(1.0), tup(vec![PyValue::Float(2.0), s("a")])])
         );
         // {"k": (1, 2)} == {"k": (1.0, 2.0)} -> True
         assert!(
             dict(vec![("k", tup(vec![PyValue::Int(1), PyValue::Int(2)]))])
-                == dict(vec![(
-                    "k",
-                    tup(vec![PyValue::Float(1.0), PyValue::Float(2.0)])
-                )])
+                == dict(vec![("k", tup(vec![PyValue::Float(1.0), PyValue::Float(2.0)]))])
         );
         // {"k": {"j": 1}} == {"k": {"j": True}} -> True
         assert!(
@@ -7019,12 +6324,7 @@ mod boxed_numeric_equality {
         // l = [1, "x", 2.0, True]
         // 1.0 in l -> True; l.index(2) -> 2; l.count(1) -> 2; l.count(1.0) -> 2
         // l.index(True) -> 0; 2 in l -> True; (2.0,) in [(2,)] -> True
-        let l = vec![
-            PyValue::Int(1),
-            s("x"),
-            PyValue::Float(2.0),
-            PyValue::Bool(true),
-        ];
+        let l = vec![PyValue::Int(1), s("x"), PyValue::Float(2.0), PyValue::Bool(true)];
         assert!(l.py_contains(&PyValue::Float(1.0)));
         assert_eq!(l.py_index_of(&PyValue::Int(2)).unwrap(), 2);
         assert_eq!(l.count(&PyValue::Int(1)), 2);
@@ -7385,47 +6685,12 @@ fn system_exit_records_python_arguments_and_code() {
     use stdpython::{PyDisplay, PyException, PyRepr, PyValue};
     for (args, message, repr, code_repr, status, stderr) in [
         (vec![], "", "SystemExit()", "None", 0, None),
-        (
-            vec![PyValue::None_],
-            "None",
-            "SystemExit(None)",
-            "None",
-            0,
-            None,
-        ),
+        (vec![PyValue::None_], "None", "SystemExit(None)", "None", 0, None),
         (vec![PyValue::Int(3)], "3", "SystemExit(3)", "3", 3, None),
-        (
-            vec![PyValue::Bool(true)],
-            "True",
-            "SystemExit(True)",
-            "True",
-            1,
-            None,
-        ),
-        (
-            vec![PyValue::Str("bad".into())],
-            "bad",
-            "SystemExit('bad')",
-            "'bad'",
-            1,
-            Some("bad"),
-        ),
-        (
-            vec![PyValue::Float(1.25)],
-            "1.25",
-            "SystemExit(1.25)",
-            "1.25",
-            1,
-            Some("1.25"),
-        ),
-        (
-            vec![PyValue::Str("a".into()), PyValue::Int(2)],
-            "('a', 2)",
-            "SystemExit('a', 2)",
-            "('a', 2)",
-            1,
-            Some("('a', 2)"),
-        ),
+        (vec![PyValue::Bool(true)], "True", "SystemExit(True)", "True", 1, None),
+        (vec![PyValue::Str("bad".into())], "bad", "SystemExit('bad')", "'bad'", 1, Some("bad")),
+        (vec![PyValue::Float(1.25)], "1.25", "SystemExit(1.25)", "1.25", 1, Some("1.25")),
+        (vec![PyValue::Str("a".into()), PyValue::Int(2)], "('a', 2)", "SystemExit('a', 2)", "('a', 2)", 1, Some("('a', 2)")),
     ] {
         let error = PyException::system_exit(args);
         assert_eq!(error.py_display(), message);
@@ -7457,19 +6722,11 @@ fn sys_exit_returns_a_catchable_exception_without_ending_the_process() {
 fn system_exit_keeps_its_code_and_args_in_pyo3() {
     // Verified against python3 in system_exit_records_python_arguments_and_code.
     use pyo3::prelude::*;
-    for args in [
-        vec![],
-        vec![PyValue::None_],
-        vec![PyValue::Int(3)],
-        vec![PyValue::Bool(true)],
-        vec![PyValue::Str("bad".into())],
-        vec![PyValue::Float(1.25)],
-        vec![PyValue::Bytes(b"bye".to_vec())],
-        vec![PyValue::Tuple(
-            vec![PyValue::Str("bad".into()), PyValue::Int(3), PyValue::None_].into(),
-        )],
-        vec![PyValue::Str("a".into()), PyValue::Int(2)],
-    ] {
+    for args in [vec![], vec![PyValue::None_], vec![PyValue::Int(3)],
+        vec![PyValue::Bool(true)], vec![PyValue::Str("bad".into())],
+        vec![PyValue::Float(1.25)], vec![PyValue::Bytes(b"bye".to_vec())],
+        vec![PyValue::Tuple(vec![PyValue::Str("bad".into()), PyValue::Int(3), PyValue::None_].into())],
+        vec![PyValue::Str("a".into()), PyValue::Int(2)]] {
         let original = PyException::system_exit(args);
         let repr = original.py_repr();
         let code = original.attr_value("code").unwrap().py_repr();
@@ -7477,17 +6734,7 @@ fn system_exit_keeps_its_code_and_args_in_pyo3() {
         Python::attach(|py| {
             assert!(error.is_instance_of::<pyo3::exceptions::PySystemExit>(py));
             assert_eq!(error.value(py).repr().unwrap().to_str().unwrap(), repr);
-            assert_eq!(
-                error
-                    .value(py)
-                    .getattr("code")
-                    .unwrap()
-                    .repr()
-                    .unwrap()
-                    .to_str()
-                    .unwrap(),
-                code
-            );
+            assert_eq!(error.value(py).getattr("code").unwrap().repr().unwrap().to_str().unwrap(), code);
         });
     }
 }

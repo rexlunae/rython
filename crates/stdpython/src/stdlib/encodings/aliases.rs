@@ -174,10 +174,7 @@ pub static aliases: std::sync::LazyLock<crate::PyDict<String, String>> =
         m.insert("iso_2022_jp_1".to_string(), "iso2022_jp_1".to_string());
         m.insert("iso2022jp_2".to_string(), "iso2022_jp_2".to_string());
         m.insert("iso_2022_jp_2".to_string(), "iso2022_jp_2".to_string());
-        m.insert(
-            "iso_2022_jp_2004".to_string(),
-            "iso2022_jp_2004".to_string(),
-        );
+        m.insert("iso_2022_jp_2004".to_string(), "iso2022_jp_2004".to_string());
         m.insert("iso2022jp_2004".to_string(), "iso2022_jp_2004".to_string());
         m.insert("iso2022jp_3".to_string(), "iso2022_jp_3".to_string());
         m.insert("iso_2022_jp_3".to_string(), "iso2022_jp_3".to_string());

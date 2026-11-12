@@ -279,15 +279,8 @@ macro_rules! binary_num {
                 BinOp::Pow => bin_vec(a, b, $pow),
                 BinOp::Max => bin_vec(a, b, $max),
                 BinOp::Min => bin_vec(a, b, $min),
-                BinOp::Lt
-                | BinOp::Le
-                | BinOp::Gt
-                | BinOp::Ge
-                | BinOp::Eq
-                | BinOp::Ne
-                | BinOp::BitAnd
-                | BinOp::BitOr
-                | BinOp::BitXor => {
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
+                | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
                     panic!(
                         "{}",
                         crate::PyException::new(
@@ -312,15 +305,8 @@ macro_rules! binary_num {
                 BinOp::Pow => bin_vec_scalar(a, s, s_left, $pow),
                 BinOp::Max => bin_vec_scalar(a, s, s_left, $max),
                 BinOp::Min => bin_vec_scalar(a, s, s_left, $min),
-                BinOp::Lt
-                | BinOp::Le
-                | BinOp::Gt
-                | BinOp::Ge
-                | BinOp::Eq
-                | BinOp::Ne
-                | BinOp::BitAnd
-                | BinOp::BitOr
-                | BinOp::BitXor => {
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
+                | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
                     panic!(
                         "{}",
                         crate::PyException::new(
@@ -335,48 +321,24 @@ macro_rules! binary_num {
 }
 
 binary_num!(
-    binary_f64,
-    binary_f64_scalar,
-    f64,
-    "float64",
-    np_max_f64,
-    np_min_f64,
-    |x: f64, y: f64| x / y,
-    np_floor_div_f64,
-    np_mod_f64,
+    binary_f64, binary_f64_scalar, f64, "float64", np_max_f64, np_min_f64,
+    |x: f64, y: f64| x / y, np_floor_div_f64, np_mod_f64,
     |a: f64, b: f64| a.powf(b)
 );
 binary_num!(
-    binary_f32,
-    binary_f32_scalar,
-    f32,
-    "float32",
-    np_max_f32,
-    np_min_f32,
-    |x: f32, y: f32| x / y,
-    np_floor_div_f32,
-    np_mod_f32,
+    binary_f32, binary_f32_scalar, f32, "float32", np_max_f32, np_min_f32,
+    |x: f32, y: f32| x / y, np_floor_div_f32, np_mod_f32,
     |a: f32, b: f32| a.powf(b)
 );
 binary_num!(
-    binary_i64,
-    binary_i64_scalar,
-    i64,
-    "int64",
-    |a: i64, b: i64| a.max(b),
-    |a: i64, b: i64| a.min(b),
+    binary_i64, binary_i64_scalar, i64, "int64", |a: i64, b: i64| a.max(b), |a: i64, b: i64| a.min(b),
     int_div_unreachable,
     np_int_floor_div,
     np_int_mod,
     np_int_pow
 );
 binary_num!(
-    binary_i32,
-    binary_i32_scalar,
-    i32,
-    "int32",
-    |a: i32, b: i32| a.max(b),
-    |a: i32, b: i32| a.min(b),
+    binary_i32, binary_i32_scalar, i32, "int32", |a: i32, b: i32| a.max(b), |a: i32, b: i32| a.min(b),
     int_div_unreachable,
     np_int32_floor_div,
     np_int32_mod,
@@ -399,7 +361,10 @@ pub(crate) fn binary_bool(op: BinOp, a: &[bool], b: &[bool]) -> Vec<bool> {
         BinOp::Div | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow => {
             panic!(
                 "{}",
-                crate::PyException::new("TypeError", "unsupported numpy operation on bool arrays")
+                crate::PyException::new(
+                    "TypeError",
+                    "unsupported numpy operation on bool arrays"
+                )
             )
         }
     }
@@ -419,7 +384,10 @@ pub(crate) fn binary_bool_scalar(op: BinOp, a: &[bool], s: bool, s_left: bool) -
         BinOp::Div | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow => {
             panic!(
                 "{}",
-                crate::PyException::new("TypeError", "unsupported numpy operation on bool arrays")
+                crate::PyException::new(
+                    "TypeError",
+                    "unsupported numpy operation on bool arrays"
+                )
             )
         }
     }
@@ -490,23 +458,10 @@ macro_rules! unary_int {
                 }),
                 UnOp::Square => unary_vec(a, |x| x.wrapping_mul(x)),
                 UnOp::Floor | UnOp::Ceil => unary_vec(a, |x| x),
-                UnOp::Sqrt
-                | UnOp::Exp
-                | UnOp::Log
-                | UnOp::Log2
-                | UnOp::Log10
-                | UnOp::Sin
-                | UnOp::Cos
-                | UnOp::Tan
-                | UnOp::Asin
-                | UnOp::Acos
-                | UnOp::Atan
-                | UnOp::Sinh
-                | UnOp::Cosh
-                | UnOp::Tanh
-                | UnOp::Reciprocal
-                | UnOp::ExpM1
-                | UnOp::Log1P => {
+                UnOp::Sqrt | UnOp::Exp | UnOp::Log | UnOp::Log2 | UnOp::Log10
+                | UnOp::Sin | UnOp::Cos | UnOp::Tan | UnOp::Asin | UnOp::Acos
+                | UnOp::Atan | UnOp::Sinh | UnOp::Cosh | UnOp::Tanh | UnOp::Reciprocal
+                | UnOp::ExpM1 | UnOp::Log1P => {
                     panic!(
                         "{}",
                         crate::PyException::new(

@@ -9,8 +9,8 @@
 //! mutable view.
 
 use crate::{
-    Len, PyAdd, PyContains, PyDisplay, PyException, PyIndex, PyListFrom, PyMul, PyRepr, PySlice,
-    PySum, PyToString, Truthy,
+    Len, PyAdd, PyContains, PyListFrom, PySum, PyDisplay, PyException, PyIndex, PyMul, PyRepr, PySlice, PyToString,
+    Truthy,
 };
 use alloc::format;
 use alloc::string::String;
@@ -230,21 +230,13 @@ mod tests {
         assert_eq!(PyTuple(vec![3i64]).py_display(), "(3,)");
         assert_eq!(PyTuple::<i64>(vec![]).py_display(), "()");
         // repr(('b', 'c')) == "('b', 'c')"
-        assert_eq!(
-            PyTuple(vec!["b".to_string(), "c".to_string()]).py_repr(),
-            "('b', 'c')"
-        );
+        assert_eq!(PyTuple(vec!["b".to_string(), "c".to_string()]).py_repr(), "('b', 'c')");
         // (1, 2)[5] -> IndexError: tuple index out of range
         assert_eq!(
             PyTuple(vec![1i64, 2]).py_index(5).unwrap_err().message,
             "tuple index out of range"
         );
         // (1, 2, 3)[1:] == (2, 3)
-        assert_eq!(
-            PyTuple(vec![1i64, 2, 3])
-                .py_slice(Some(1), None, None)
-                .py_display(),
-            "(2, 3)"
-        );
+        assert_eq!(PyTuple(vec![1i64, 2, 3]).py_slice(Some(1), None, None).py_display(), "(2, 3)");
     }
 }

@@ -225,7 +225,8 @@ pub fn default_dialects() -> alloc::collections::BTreeMap<String, Dialect> {
 use std::collections::BTreeMap;
 
 #[cfg(feature = "std")]
-static DIALECTS: std::sync::Mutex<Option<BTreeMap<String, Dialect>>> = std::sync::Mutex::new(None);
+static DIALECTS: std::sync::Mutex<Option<BTreeMap<String, Dialect>>> =
+    std::sync::Mutex::new(None);
 
 /// Lazy-init the registry on first use (so the static can be const).
 #[cfg(feature = "std")]
@@ -288,12 +289,9 @@ pub fn register_dialect(
 /// references) of the named dialect, or csv.Error if unregistered.
 #[cfg(feature = "std")]
 pub fn get_dialect(name: &str) -> Result<Dialect, PyException> {
-    registry()
-        .as_ref()
-        .unwrap()
-        .get(name)
-        .cloned()
-        .ok_or_else(|| PyException::new("csv.Error", "unknown dialect"))
+    registry().as_ref().unwrap().get(name).cloned().ok_or_else(|| {
+        PyException::new("csv.Error", "unknown dialect")
+    })
 }
 
 /// csv.get_dialect(name).delimiter — the byte the reader/writer split/join
@@ -351,13 +349,7 @@ pub fn writer(
     all_quote: bool,
     escapechar: Option<u8>,
 ) -> Writer<'_> {
-    Writer {
-        file,
-        lineterminator,
-        delimiter,
-        all_quote,
-        escapechar,
-    }
+    Writer { file, lineterminator, delimiter, all_quote, escapechar }
 }
 
 #[cfg(feature = "std")]

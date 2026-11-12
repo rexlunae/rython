@@ -1,5 +1,5 @@
 //! Standard Python Runtime Library for Rython
-//!
+//! 
 //! This library provides all the built-in functions, types, and methods
 //! that are available in Python without any imports. It serves as the
 //! runtime foundation for Python code compiled to Rust using python-ast-rs.
@@ -40,15 +40,15 @@ extern crate alloc;
 #[cfg(feature = "alloc")]
 use alloc::{format, string::String, string::ToString, vec::Vec};
 
-#[cfg(all(feature = "alloc", not(feature = "std")))]
-use hashbrown::{HashMap, HashSet};
 #[cfg(feature = "std")]
 use std::collections::{HashMap, HashSet};
-
 #[cfg(all(feature = "alloc", not(feature = "std")))]
-use alloc::sync::Arc;
+use hashbrown::{HashMap, HashSet};
+
 #[cfg(feature = "std")]
 use std::sync::Arc;
+#[cfg(all(feature = "alloc", not(feature = "std")))]
+use alloc::sync::Arc;
 
 use core::fmt::{Debug, Display};
 use core::hash::Hash;
@@ -62,101 +62,57 @@ mod system_exit;
 /// these delegate to libm; the two agree on every case we rely on.
 pub(crate) mod flt {
     #[cfg(feature = "std")]
-    pub(crate) fn floor(x: f64) -> f64 {
-        x.floor()
-    }
+    pub(crate) fn floor(x: f64) -> f64 { x.floor() }
     #[cfg(not(feature = "std"))]
-    pub(crate) fn floor(x: f64) -> f64 {
-        libm::floor(x)
-    }
+    pub(crate) fn floor(x: f64) -> f64 { libm::floor(x) }
 
     #[cfg(feature = "std")]
-    pub(crate) fn trunc(x: f64) -> f64 {
-        x.trunc()
-    }
+    pub(crate) fn trunc(x: f64) -> f64 { x.trunc() }
     #[cfg(not(feature = "std"))]
-    pub(crate) fn trunc(x: f64) -> f64 {
-        libm::trunc(x)
-    }
+    pub(crate) fn trunc(x: f64) -> f64 { libm::trunc(x) }
 
     /// Rounds half away from zero, like f64::round and libm::round both do.
     #[cfg(feature = "std")]
-    pub(crate) fn round(x: f64) -> f64 {
-        x.round()
-    }
+    pub(crate) fn round(x: f64) -> f64 { x.round() }
     #[cfg(not(feature = "std"))]
-    pub(crate) fn round(x: f64) -> f64 {
-        libm::round(x)
-    }
+    pub(crate) fn round(x: f64) -> f64 { libm::round(x) }
 
     #[cfg(feature = "std")]
-    pub(crate) fn fract(x: f64) -> f64 {
-        x.fract()
-    }
+    pub(crate) fn fract(x: f64) -> f64 { x.fract() }
     #[cfg(not(feature = "std"))]
-    pub(crate) fn fract(x: f64) -> f64 {
-        x - libm::trunc(x)
-    }
+    pub(crate) fn fract(x: f64) -> f64 { x - libm::trunc(x) }
 
     #[cfg(feature = "std")]
-    pub(crate) fn abs(x: f64) -> f64 {
-        x.abs()
-    }
+    pub(crate) fn abs(x: f64) -> f64 { x.abs() }
     #[cfg(not(feature = "std"))]
-    pub(crate) fn abs(x: f64) -> f64 {
-        libm::fabs(x)
-    }
+    pub(crate) fn abs(x: f64) -> f64 { libm::fabs(x) }
 
     #[cfg(feature = "std")]
-    pub(crate) fn log10(x: f64) -> f64 {
-        x.log10()
-    }
+    pub(crate) fn log10(x: f64) -> f64 { x.log10() }
     #[cfg(not(feature = "std"))]
-    pub(crate) fn log10(x: f64) -> f64 {
-        libm::log10(x)
-    }
+    pub(crate) fn log10(x: f64) -> f64 { libm::log10(x) }
 
     #[cfg(feature = "std")]
-    pub(crate) fn signum(x: f64) -> f64 {
-        x.signum()
-    }
+    pub(crate) fn signum(x: f64) -> f64 { x.signum() }
     #[cfg(not(feature = "std"))]
     pub(crate) fn signum(x: f64) -> f64 {
-        if x.is_nan() {
-            f64::NAN
-        } else if x.is_sign_negative() {
-            -1.0
-        } else {
-            1.0
-        }
+        if x.is_nan() { f64::NAN } else if x.is_sign_negative() { -1.0 } else { 1.0 }
     }
 
     #[cfg(feature = "std")]
-    pub(crate) fn powf(x: f64, y: f64) -> f64 {
-        x.powf(y)
-    }
+    pub(crate) fn powf(x: f64, y: f64) -> f64 { x.powf(y) }
     #[cfg(not(feature = "std"))]
-    pub(crate) fn powf(x: f64, y: f64) -> f64 {
-        libm::pow(x, y)
-    }
+    pub(crate) fn powf(x: f64, y: f64) -> f64 { libm::pow(x, y) }
 
     #[cfg(feature = "std")]
-    pub(crate) fn powi(x: f64, n: i32) -> f64 {
-        x.powi(n)
-    }
+    pub(crate) fn powi(x: f64, n: i32) -> f64 { x.powi(n) }
     #[cfg(not(feature = "std"))]
-    pub(crate) fn powi(x: f64, n: i32) -> f64 {
-        libm::pow(x, n as f64)
-    }
+    pub(crate) fn powi(x: f64, n: i32) -> f64 { libm::pow(x, n as f64) }
 
     #[cfg(feature = "std")]
-    pub(crate) fn copysign(x: f64, y: f64) -> f64 {
-        x.copysign(y)
-    }
+    pub(crate) fn copysign(x: f64, y: f64) -> f64 { x.copysign(y) }
     #[cfg(not(feature = "std"))]
-    pub(crate) fn copysign(x: f64, y: f64) -> f64 {
-        libm::copysign(x, y)
-    }
+    pub(crate) fn copysign(x: f64, y: f64) -> f64 { libm::copysign(x, y) }
 }
 
 // PyO3 lives behind its own surface feature (which implies std): only
@@ -172,7 +128,7 @@ pub type PyObject = pyo3::Py<pyo3::PyAny>;
 // ============================================================================
 
 /// Trait for types that can be used as string-like parameters
-///
+/// 
 /// This allows functions to accept both &str and String seamlessly
 pub trait AsStrLike {
     fn as_str_like(&self) -> &str;
@@ -203,7 +159,7 @@ impl AsStrLike for &String {
 }
 
 /// Trait for types that can be converted to owned strings
-///
+/// 
 /// This is useful for return values that need to be owned
 pub trait IntoOwnedString {
     fn into_owned_string(self) -> String;
@@ -222,7 +178,7 @@ impl IntoOwnedString for String {
 }
 
 /// Trait for types that can be used as path-like parameters
-///
+/// 
 /// This allows path functions to work with various string types
 pub trait AsPathLike {
     fn as_path_like(&self) -> &str;
@@ -235,13 +191,13 @@ impl<T: AsStrLike> AsPathLike for T {
 }
 
 /// Trait for collections that can be used as argument lists
-///
+/// 
 /// This allows subprocess functions to accept various collection types
 pub trait AsArgList<T> {
     fn as_arg_list(&self) -> Vec<&str>;
 }
 
-impl<T> AsArgList<T> for Vec<T>
+impl<T> AsArgList<T> for Vec<T> 
 where
     T: AsRef<str>,
 {
@@ -250,7 +206,7 @@ where
     }
 }
 
-impl<T> AsArgList<T> for &[T]
+impl<T> AsArgList<T> for &[T] 
 where
     T: AsRef<str>,
 {
@@ -270,7 +226,9 @@ where
     V: AsRef<str>,
 {
     fn as_env_like(&self) -> HashMap<&str, &str> {
-        self.iter().map(|(k, v)| (k.as_ref(), v.as_ref())).collect()
+        self.iter()
+            .map(|(k, v)| (k.as_ref(), v.as_ref()))
+            .collect()
     }
 }
 
@@ -300,9 +258,7 @@ macro_rules! py_display_int {
         }
     )*};
 }
-py_display_int!(
-    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize
-);
+py_display_int!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
 
 impl PyDisplay for f64 {
     fn py_display(&self) -> String {
@@ -434,13 +390,8 @@ pub fn print_to_string<T: PyDisplay>(object: T) -> String {
 
 /// No-std version of print with multiple arguments
 #[cfg(not(feature = "std"))]
-pub fn print_args_to_string<T: PyDisplay, S: AsRef<str>, E: AsRef<str>>(
-    objects: &[T],
-    sep: S,
-    end: E,
-) -> String {
-    let output = objects
-        .iter()
+pub fn print_args_to_string<T: PyDisplay, S: AsRef<str>, E: AsRef<str>>(objects: &[T], sep: S, end: E) -> String {
+    let output = objects.iter()
         .map(|obj| obj.py_display())
         .collect::<Vec<_>>()
         .join(sep.as_ref());
@@ -457,13 +408,13 @@ where
 }
 
 /// Python dict() function - creates a new dictionary (generic version)
-///
+/// 
 /// # Arguments
 /// * `pairs` - Key-value pairs to initialize the dictionary with
-///
+/// 
 /// # Returns
 /// A new HashMap containing the provided key-value pairs
-pub fn dict<K, V>(pairs: HashMap<K, V>) -> HashMap<K, V>
+pub fn dict<K, V>(pairs: HashMap<K, V>) -> HashMap<K, V> 
 where
     K: Hash + Eq,
 {
@@ -471,7 +422,7 @@ where
 }
 
 /// Python dict() function with environment merging (generic version)
-///
+/// 
 /// This merges environment-like collections with additional key-value pairs
 pub fn dict_with_env<E, K, V>(env: E, additional: HashMap<K, V>) -> HashMap<K, V>
 where
@@ -480,8 +431,7 @@ where
     V: for<'a> From<&'a str>,
 {
     let env_map = env.as_env_like();
-    let mut result: HashMap<K, V> = env_map
-        .into_iter()
+    let mut result: HashMap<K, V> = env_map.into_iter()
         .map(|(k, v)| (K::from(k), V::from(v)))
         .collect();
     result.extend(additional);
@@ -890,10 +840,7 @@ impl PyMod<i64> for i64 {
         if *rhs == 0 {
             // CPython 3.11: `10 % 0` is "integer modulo by zero" (the
             // floor division keeps "integer division or modulo by zero").
-            return Err(PyException::new(
-                "ZeroDivisionError",
-                "integer modulo by zero",
-            ));
+            return Err(PyException::new("ZeroDivisionError", "integer modulo by zero"));
         }
         let r = *self % *rhs;
         if r != 0 && (r < 0) != (*rhs < 0) {
@@ -1035,7 +982,10 @@ impl PyDiv<bool> for bool {
     type Output = f64;
     fn py_div(&self, rhs: &bool) -> Result<f64, PyException> {
         if rhs.is_zero() {
-            return Err(PyException::new("ZeroDivisionError", "division by zero"));
+            return Err(PyException::new(
+                "ZeroDivisionError",
+                "division by zero",
+            ));
         }
         Ok((if *self { 1.0 } else { 0.0 }) / if *rhs { 1.0 } else { 0.0 })
     }
@@ -1059,6 +1009,8 @@ pub fn py_mod<L: PyMod<R>, R>(a: L, b: R) -> Result<L::Output, PyException> {
 pub fn py_div<L: PyDiv<R>, R>(a: L, b: R) -> Result<L::Output, PyException> {
     a.py_div(&b)
 }
+
+
 
 /// Python `@` (matrix multiplication): routes to the numpy linalg backend
 /// for arrays.
@@ -1508,7 +1460,10 @@ pub fn map_fallible<T, U, F: FnMut(T) -> Result<U, PyException>>(
 
 /// Python map(f, a, b): pairs up to the shortest, like zip.
 pub fn map2<A, B, U, F: FnMut(A, B) -> U>(mut f: F, a: Vec<A>, b: Vec<B>) -> Vec<U> {
-    a.into_iter().zip(b).map(|(x, y)| f(x, y)).collect()
+    a.into_iter()
+        .zip(b)
+        .map(|(x, y)| f(x, y))
+        .collect()
 }
 
 /// Python filter(f, iterable), materialized. The predicate receives each
@@ -1658,16 +1613,16 @@ pub fn bind_boxed_args(
 /// Unpacking a sequence into `N` targets (`for a, b in rows` where each
 /// row is a list): the members as an array, or CPython's ValueError when
 /// the length is not `N`.
-pub fn unpack_sequence<T, const N: usize>(seq: impl Into<Vec<T>>) -> Result<[T; N], PyException> {
+pub fn unpack_sequence<T, const N: usize>(
+    seq: impl Into<Vec<T>>,
+) -> Result<[T; N], PyException> {
     let items: Vec<T> = seq.into();
     let got = items.len();
     <[T; N]>::try_from(items).map_err(|_| {
         if got > N {
             value_error(&format!("too many values to unpack (expected {N})"))
         } else {
-            value_error(&format!(
-                "not enough values to unpack (expected {N}, got {got})"
-            ))
+            value_error(&format!("not enough values to unpack (expected {N}, got {got})"))
         }
     })
 }
@@ -1809,9 +1764,15 @@ impl PyRange {
     /// step == i64::MIN) can never overflow.
     pub fn py_len(&self) -> usize {
         let (span, step) = if self.step > 0 {
-            (self.stop as i128 - self.next as i128, self.step as i128)
+            (
+                self.stop as i128 - self.next as i128,
+                self.step as i128,
+            )
         } else {
-            (self.next as i128 - self.stop as i128, -(self.step as i128))
+            (
+                self.next as i128 - self.stop as i128,
+                -(self.step as i128),
+            )
         };
         if span <= 0 {
             0
@@ -1843,7 +1804,12 @@ impl PyRange {
     /// CPython references, run under python3 3.14.1:
     ///   range(6)[1:4] -> range(1, 4)      range(6)[::2] -> range(0, 6, 2)
     ///   range(6)[::-1] -> range(5, -1, -1) range(6)[9:99] -> range(6, 6)
-    pub fn py_slice(&self, start: Option<i64>, stop: Option<i64>, step: Option<i64>) -> PyRange {
+    pub fn py_slice(
+        &self,
+        start: Option<i64>,
+        stop: Option<i64>,
+        step: Option<i64>,
+    ) -> PyRange {
         let step = step.unwrap_or(1);
         if step == 0 {
             // CPython: xs[::0] raises ValueError: slice step cannot be zero,
@@ -1862,18 +1828,10 @@ impl PyRange {
         // slice.indices(len, step): wrap negatives, then clamp. The exclusive
         // end wraps into [-1, len-1] and the inclusive start into [0, len-1].
         let wrap_start = |i: i128| -> i128 {
-            if i < 0 {
-                (i + len).max(0)
-            } else {
-                i.min(len - 1)
-            }
+            if i < 0 { (i + len).max(0) } else { i.min(len - 1) }
         };
         let wrap_end = |i: i128| -> i128 {
-            if i < 0 {
-                (i + len).max(-1)
-            } else {
-                i.min(len - 1)
-            }
+            if i < 0 { (i + len).max(-1) } else { i.min(len - 1) }
         };
         let (begin, end) = if step > 0 {
             let lo = start.map(|s| s as i128).unwrap_or(0);
@@ -1902,6 +1860,7 @@ impl PyRange {
         }
     }
 }
+
 
 /// Narrow an i128 range endpoint back into `PyRange`'s i64 fields. A value
 /// that cannot be represented is a loud refusal, never a silent wrap: a
@@ -1949,34 +1908,19 @@ impl Len for PyRange {
 
 /// Python range() function - a lazy range of numbers.
 pub fn range(stop: i64) -> PyRange {
-    PyRange {
-        next: 0,
-        stop,
-        step: 1,
-    }
+    PyRange { next: 0, stop, step: 1 }
 }
 
 pub fn range_start_stop(start: i64, stop: i64) -> PyRange {
-    PyRange {
-        next: start,
-        stop,
-        step: 1,
-    }
+    PyRange { next: start, stop, step: 1 }
 }
 
 /// range(start, stop, step): a zero step raises ValueError, as in Python.
 pub fn range_start_stop_step(start: i64, stop: i64, step: i64) -> Result<PyRange, PyException> {
     if step == 0 {
-        return Err(PyException::new(
-            "ValueError",
-            "range() arg 3 must not be zero",
-        ));
+        return Err(PyException::new("ValueError", "range() arg 3 must not be zero"));
     }
-    Ok(PyRange {
-        next: start,
-        stop,
-        step,
-    })
+    Ok(PyRange { next: start, stop, step })
 }
 
 // ============================================================================
@@ -2071,7 +2015,7 @@ impl<T> PyBool for &PyList<T> {
     }
 }
 
-impl<K, V> PyBool for &PyDictionary<K, V>
+impl<K, V> PyBool for &PyDictionary<K, V> 
 where
     K: Eq + Hash,
 {
@@ -2112,10 +2056,7 @@ fn python_digitpart(s: &str) -> Option<(String, &str)> {
         if b.is_ascii_digit() {
             digits.push(b as char);
             i += 1;
-        } else if b == b'_'
-            && !digits.is_empty()
-            && bytes.get(i + 1).is_some_and(|n| n.is_ascii_digit())
-        {
+        } else if b == b'_' && !digits.is_empty() && bytes.get(i + 1).is_some_and(|n| n.is_ascii_digit()) {
             i += 1;
         } else {
             break;
@@ -2143,11 +2084,7 @@ pub fn python_int_of(s: &str) -> PyNumberParse<i64> {
     }
     // Parsed with its sign, so i64::MIN (whose magnitude is not an i64)
     // is read as CPython reads it (Devin review on #339, round 11).
-    let signed = if negative {
-        alloc::format!("-{}", digits)
-    } else {
-        digits
-    };
+    let signed = if negative { alloc::format!("-{}", digits) } else { digits };
     match signed.parse::<i64>() {
         Ok(v) => PyNumberParse::Value(v),
         Err(_) => PyNumberParse::Unsupported("an int outside i64"),
@@ -2169,11 +2106,7 @@ pub fn python_float_of(s: &str) -> PyNumberParse<f64> {
     };
     match body.to_ascii_lowercase().as_str() {
         "inf" | "infinity" => {
-            return PyNumberParse::Value(if sign == "-" {
-                f64::NEG_INFINITY
-            } else {
-                f64::INFINITY
-            });
+            return PyNumberParse::Value(if sign == "-" { f64::NEG_INFINITY } else { f64::INFINITY })
         }
         // The sign survives on a nan as it does in CPython (`float("-nan")`
         // has its sign bit set; `math.copysign(1.0, x)` is -1.0).
@@ -2229,12 +2162,7 @@ pub fn python_float_of(s: &str) -> PyNumberParse<f64> {
 pub fn unsupported_number(callee: &str, s: &str, why: &str) -> PyException {
     PyException::new(
         "NotImplementedError",
-        &format!(
-            "{}({}): {} are not supported yet",
-            callee,
-            py_str_repr(s),
-            why
-        ),
+        &format!("{}({}): {} are not supported yet", callee, py_str_repr(s), why),
     )
 }
 
@@ -2403,13 +2331,7 @@ pub fn py_float_repr(x: f64) -> String {
     } else {
         digits.to_string()
     };
-    format!(
-        "{}{}e{}{:02}",
-        sign,
-        mantissa,
-        if exp < 0 { "-" } else { "+" },
-        exp.abs()
-    )
+    format!("{}{}e{}{:02}", sign, mantissa, if exp < 0 { "-" } else { "+" }, exp.abs())
 }
 
 /// Python's repr() for the types generated code produces. str gets
@@ -2432,9 +2354,7 @@ macro_rules! py_repr_int {
         }
     )*};
 }
-py_repr_int!(
-    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize
-);
+py_repr_int!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
 
 impl PyRepr for f64 {
     fn py_repr(&self) -> String {
@@ -2552,11 +2472,7 @@ impl<T: PyRepr> PyRepr for Option<T> {
 /// separators, and non-ASCII spaces (so repr("\xa0") is '\xa0', not a
 /// literal NBSP).
 pub fn py_str_repr(s: &str) -> String {
-    let quote = if s.contains('\'') && !s.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
+    let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
     let mut out = String::with_capacity(s.len() + 2);
     out.push(quote);
     for c in s.chars() {
@@ -2698,11 +2614,7 @@ impl PyHash for f64 {
                 x -= p;
             }
         }
-        let e = if e >= 0 {
-            e % 61
-        } else {
-            61 - 1 - ((-1 - e) % 61)
-        } as u32;
+        let e = if e >= 0 { e % 61 } else { 61 - 1 - ((-1 - e) % 61) } as u32;
         x = ((x << e) & p) | (x >> (61 - e));
         fixup_minus_one(x as i64 * sign)
     }
@@ -2803,11 +2715,7 @@ pub fn hash<T: PyHash + ?Sized>(x: &T) -> i64 {
 
 impl PyToString for bool {
     fn py_str(self) -> String {
-        if self {
-            "True".to_string()
-        } else {
-            "False".to_string()
-        }
+        if self { "True".to_string() } else { "False".to_string() }
     }
 }
 
@@ -2876,56 +2784,56 @@ impl PyStr {
     pub fn new(s: impl Into<String>) -> Self {
         Self { inner: s.into() }
     }
-
+    
     /// Python str.split() method
     pub fn split(&self, sep: Option<&str>) -> Vec<PyStr> {
         match sep {
-            Some(separator) => self.inner.split(separator).map(|s| PyStr::new(s)).collect(),
-            None => self
-                .inner
-                .split(py_is_whitespace)
+            Some(separator) => self.inner.split(separator)
+                .map(|s| PyStr::new(s))
+                .collect(),
+            None => self.inner.split(py_is_whitespace)
                 .filter(|s| !s.is_empty())
                 .map(|s| PyStr::new(s))
                 .collect(),
         }
     }
-
+    
     /// Python str.join() method
     pub fn join(&self, iterable: &[PyStr]) -> PyStr {
         let strings: Vec<&str> = iterable.iter().map(|s| s.inner.as_str()).collect();
         PyStr::new(strings.join(&self.inner))
     }
-
+    
     /// Python str.strip() method
     pub fn strip(&self) -> PyStr {
         PyStr::new(self.inner.trim_matches(py_is_whitespace).to_string())
     }
-
+    
     /// Python str.lower() method
     pub fn lower(&self) -> PyStr {
         PyStr::new(self.inner.to_lowercase())
     }
-
+    
     /// Python str.upper() method
     pub fn upper(&self) -> PyStr {
         PyStr::new(self.inner.to_uppercase())
     }
-
+    
     /// Python str.replace() method
     pub fn replace<O: AsRef<str>, N: AsRef<str>>(&self, old: O, new: N) -> PyStr {
         PyStr::new(self.inner.replace(old.as_ref(), new.as_ref()))
     }
-
+    
     /// Python str.startswith() method
     pub fn startswith<P: AsRef<str>>(&self, prefix: P) -> bool {
         self.inner.starts_with(prefix.as_ref())
     }
-
+    
     /// Python str.endswith() method
     pub fn endswith<S: AsRef<str>>(&self, suffix: S) -> bool {
         self.inner.ends_with(suffix.as_ref())
     }
-
+    
     /// Python str.find() method: CHARACTER index (consistent with len and
     /// with PyStrOps::py_find), not a byte offset.
     pub fn find<S: AsRef<str>>(&self, sub: S) -> i64 {
@@ -2934,12 +2842,12 @@ impl PyStr {
             None => -1,
         }
     }
-
+    
     /// Python str.count() method
     pub fn count<S: AsRef<str>>(&self, sub: S) -> usize {
         self.inner.matches(sub.as_ref()).count()
     }
-
+    
     /// Python str.format() method (basic implementation)
     pub fn format(&self, args: &[&str]) -> PyStr {
         let mut result = self.inner.clone();
@@ -2948,7 +2856,7 @@ impl PyStr {
         }
         PyStr::new(result)
     }
-
+    
     /// Access inner string
     pub fn as_str(&self) -> &str {
         &self.inner
@@ -3305,7 +3213,10 @@ impl IntoIterator for PyValue {
             PyValue::Tuple(t) => t.iter().cloned().collect(),
             PyValue::Range(r) => r.map(PyValue::Int).collect(),
             PyValue::Function(_) => panic!("TypeError: 'function' object is not iterable"),
-            PyValue::Str(s) => s.chars().map(|c| PyValue::Str(c.to_string())).collect(),
+            PyValue::Str(s) => s
+                .chars()
+                .map(|c| PyValue::Str(c.to_string()))
+                .collect(),
             PyValue::Bytes(b) => b.iter().map(|&o| PyValue::Int(o as i64)).collect(),
             // Python iterates a dict's KEYS.
             PyValue::Dict(d) => d.keys().map(|k| PyValue::Str(k.clone())).collect(),
@@ -3442,11 +3353,7 @@ impl PyValue {
     pub fn not_a_container(&self, op: &str) -> PyException {
         PyException::new(
             "TypeError",
-            format!(
-                "'{}' object does not support {}",
-                py_value_type_name(self),
-                op
-            ),
+            format!("'{}' object does not support {}", py_value_type_name(self), op),
         )
     }
 
@@ -3495,8 +3402,7 @@ impl PyDictOps<String, PyValue> for PyValue {
         // Option, so that error cannot travel through it — propagate it as a
         // panic rather than letting `None` read as an absent key (CPython
         // raises AttributeError for `5.get("a")`).
-        self.boxed_get(key)
-            .unwrap_or_else(|e| panic!("{}", e.message))
+        self.boxed_get(key).unwrap_or_else(|e| panic!("{}", e.message))
     }
     fn py_get_default(&self, key: &String, default: PyValue) -> PyValue {
         self.boxed_get(key)
@@ -3587,10 +3493,7 @@ impl PySlice for PyValue {
             // The str surface is infallible by construction, so there is no
             // Result to carry CPython's TypeError through; panic with its
             // message rather than return a wrong value.
-            other => panic!(
-                "'{}' object is not subscriptable",
-                py_value_type_name(other)
-            ),
+            other => panic!("'{}' object is not subscriptable", py_value_type_name(other)),
         }
     }
 }
@@ -3703,7 +3606,10 @@ impl PyValue {
                 "{}",
                 PyException::new(
                     "TypeError",
-                    format!("bad operand type for unary -: '{}'", type_name(other))
+                    format!(
+                        "bad operand type for unary -: '{}'",
+                        type_name(other)
+                    )
                 )
             ),
         }
@@ -3822,17 +3728,13 @@ impl From<PyValue> for i64 {
 
 impl From<PyValue> for f64 {
     fn from(value: PyValue) -> f64 {
-        value
-            .as_float()
-            .unwrap_or_else(|| value_member_panic("float"))
+        value.as_float().unwrap_or_else(|| value_member_panic("float"))
     }
 }
 
 impl From<PyValue> for bool {
     fn from(value: PyValue) -> bool {
-        value
-            .as_bool()
-            .unwrap_or_else(|| value_member_panic("bool"))
+        value.as_bool().unwrap_or_else(|| value_member_panic("bool"))
     }
 }
 
@@ -3935,7 +3837,9 @@ where
 {
     fn from(d: PyDict<K, V>) -> Self {
         PyValue::Dict(Arc::new(
-            d.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+            d.into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
         ))
     }
 }
@@ -4369,7 +4273,10 @@ pub fn py_global_write<T>(cell: &std::sync::Mutex<T>, value: T) {
 /// what CPython leaves behind too, and poisoning every later access would
 /// turn one loud failure into an unrelated cascade.
 #[cfg(feature = "std")]
-pub fn py_global_mutate<T, R>(cell: &std::sync::Mutex<T>, f: impl FnOnce(&mut T) -> R) -> R {
+pub fn py_global_mutate<T, R>(
+    cell: &std::sync::Mutex<T>,
+    f: impl FnOnce(&mut T) -> R,
+) -> R {
     let mut guard = cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     f(&mut guard)
 }
@@ -4488,13 +4395,7 @@ impl core::hash::Hash for PyValue {
                     PyNum::Complex(re, im) => {
                         core::hash::Hash::hash(&2u8, state);
                         // Signed zeros compare equal, so they hash alike.
-                        let bits = |f: f64| {
-                            if f == 0.0 {
-                                0f64.to_bits()
-                            } else {
-                                f.to_bits()
-                            }
-                        };
+                        let bits = |f: f64| if f == 0.0 { 0f64.to_bits() } else { f.to_bits() };
                         core::hash::Hash::hash(&bits(re), state);
                         core::hash::Hash::hash(&bits(im), state);
                     }
@@ -4603,7 +4504,9 @@ impl PyDecode for [u8] {
         errors: R,
     ) -> Result<String, PyException> {
         let enc = encoding.as_ref();
-        if errors.as_ref() == "replace" && matches!(enc, "utf-8" | "utf8") {
+        if errors.as_ref() == "replace"
+            && matches!(enc, "utf-8" | "utf8")
+        {
             return Ok(String::from_utf8_lossy(self).into_owned());
         }
         stdlib::codec::decode_by_name(self, enc)
@@ -4776,31 +4679,31 @@ impl<T> PyList<T> {
     pub fn new() -> Self {
         Self { inner: Vec::new() }
     }
-
+    
     pub fn from_vec(vec: Vec<T>) -> Self {
         Self { inner: vec }
     }
-
+    
     /// Python list.append() method
     pub fn append(&mut self, item: T) {
         self.inner.push(item);
     }
-
+    
     /// Python list.extend() method
     pub fn extend(&mut self, items: Vec<T>) {
         self.inner.extend(items);
     }
-
+    
     /// Python list.insert() method
     pub fn insert(&mut self, index: usize, item: T) {
         if index <= self.inner.len() {
             self.inner.insert(index, item);
         }
     }
-
+    
     /// Python list.remove() method
-    pub fn remove(&mut self, item: &T) -> bool
-    where
+    pub fn remove(&mut self, item: &T) -> bool 
+    where 
         T: PartialEq,
     {
         if let Some(pos) = self.inner.iter().position(|x| x == item) {
@@ -4810,7 +4713,7 @@ impl<T> PyList<T> {
             false
         }
     }
-
+    
     /// Python list.pop() method
     pub fn pop(&mut self, index: Option<usize>) -> Option<T> {
         match index {
@@ -4819,7 +4722,7 @@ impl<T> PyList<T> {
             _ => None,
         }
     }
-
+    
     /// Python list.index() method
     pub fn index(&self, item: &T) -> Option<usize>
     where
@@ -4827,7 +4730,7 @@ impl<T> PyList<T> {
     {
         self.inner.iter().position(|x| x == item)
     }
-
+    
     /// Python list.count() method
     pub fn count(&self, item: &T) -> usize
     where
@@ -4835,7 +4738,7 @@ impl<T> PyList<T> {
     {
         self.inner.iter().filter(|&x| x == item).count()
     }
-
+    
     /// Python list.sort() method
     pub fn sort(&mut self)
     where
@@ -4843,32 +4746,30 @@ impl<T> PyList<T> {
     {
         self.inner.sort();
     }
-
+    
     /// Python list.reverse() method
     pub fn reverse(&mut self) {
         self.inner.reverse();
     }
-
+    
     /// Python list.clear() method
     pub fn clear(&mut self) {
         self.inner.clear();
     }
-
+    
     /// Python list.copy() method
     pub fn copy(&self) -> Self
     where
         T: Clone,
     {
-        Self {
-            inner: self.inner.clone(),
-        }
+        Self { inner: self.inner.clone() }
     }
-
+    
     /// Get item by index
     pub fn get(&self, index: usize) -> Option<&T> {
         self.inner.get(index)
     }
-
+    
     /// Set item by index
     pub fn set(&mut self, index: usize, item: T) -> bool {
         if index < self.inner.len() {
@@ -4878,7 +4779,7 @@ impl<T> PyList<T> {
             false
         }
     }
-
+    
     /// Access inner vector
     pub fn as_vec(&self) -> &Vec<T> {
         &self.inner
@@ -4924,16 +4825,14 @@ where
     K: Eq + Hash,
 {
     pub fn new() -> Self {
-        Self {
-            inner: HashMap::new(),
-        }
+        Self { inner: HashMap::new() }
     }
-
+    
     /// Python dict.get() method
     pub fn get(&self, key: &K) -> Option<&V> {
         self.inner.get(key)
     }
-
+    
     /// Python dict.get() method with default
     pub fn get_or_default(&self, key: &K, default: V) -> V
     where
@@ -4941,50 +4840,50 @@ where
     {
         self.inner.get(key).cloned().unwrap_or(default)
     }
-
+    
     /// Set key-value pair
     pub fn set(&mut self, key: K, value: V) {
         self.inner.insert(key, value);
     }
-
+    
     /// Python dict.keys() method
     pub fn keys(&self) -> Vec<&K> {
         self.inner.keys().collect()
     }
-
+    
     /// Python dict.values() method
     pub fn values(&self) -> Vec<&V> {
         self.inner.values().collect()
     }
-
+    
     /// Python dict.items() method
     pub fn items(&self) -> Vec<(&K, &V)> {
         self.inner.iter().collect()
     }
-
+    
     /// Python dict.update() method
     pub fn update(&mut self, other: PyDictionary<K, V>) {
         self.inner.extend(other.inner);
     }
-
+    
     /// Python dict.pop() method
     pub fn pop(&mut self, key: &K) -> Option<V> {
         self.inner.remove(key)
     }
-
+    
     /// Python dict.clear() method
     pub fn clear(&mut self) {
         self.inner.clear();
     }
-
+    
     /// Check if key exists
     pub fn contains_key(&self, key: &K) -> bool {
         self.inner.contains_key(key)
     }
 }
 
-impl<K, V> Len for PyDictionary<K, V>
-where
+impl<K, V> Len for PyDictionary<K, V> 
+where 
     K: Eq + Hash,
 {
     fn len(&self) -> usize {
@@ -4992,8 +4891,8 @@ where
     }
 }
 
-impl<K, V> Truthy for PyDictionary<K, V>
-where
+impl<K, V> Truthy for PyDictionary<K, V> 
+where 
     K: Eq + Hash,
 {
     fn is_truthy(&self) -> bool {
@@ -5015,26 +4914,24 @@ where
     T: Eq + Hash,
 {
     pub fn new() -> Self {
-        Self {
-            inner: HashSet::new(),
-        }
+        Self { inner: HashSet::new() }
     }
-
+    
     /// Python set.add() method
     pub fn add(&mut self, item: T) {
         self.inner.insert(item);
     }
-
+    
     /// Python set.remove() method
     pub fn remove(&mut self, item: &T) -> bool {
         self.inner.remove(item)
     }
-
+    
     /// Python set.discard() method
     pub fn discard(&mut self, item: &T) {
         self.inner.remove(item);
     }
-
+    
     /// Python set.union() method
     pub fn union(&self, other: &PySet<T>) -> PySet<T>
     where
@@ -5044,7 +4941,7 @@ where
         result.inner.extend(other.inner.iter().cloned());
         result
     }
-
+    
     /// Python set.intersection() method
     pub fn intersection(&self, other: &PySet<T>) -> PySet<T>
     where
@@ -5054,7 +4951,7 @@ where
             inner: self.inner.intersection(&other.inner).cloned().collect(),
         }
     }
-
+    
     /// Python set.difference() method
     pub fn difference(&self, other: &PySet<T>) -> PySet<T>
     where
@@ -5064,20 +4961,20 @@ where
             inner: self.inner.difference(&other.inner).cloned().collect(),
         }
     }
-
+    
     /// Check if item is in set
     pub fn contains(&self, item: &T) -> bool {
         self.inner.contains(item)
     }
-
+    
     /// Python set.clear() method
     pub fn clear(&mut self) {
         self.inner.clear();
     }
 }
 
-impl<T> Len for PySet<T>
-where
+impl<T> Len for PySet<T> 
+where 
     T: Eq + Hash,
 {
     fn len(&self) -> usize {
@@ -5395,6 +5292,8 @@ impl<T: Truthy + ?Sized> Truthy for &T {
     }
 }
 
+
+
 impl<T> Truthy for Vec<T> {
     fn is_truthy(&self) -> bool {
         !self.is_empty()
@@ -5671,11 +5570,7 @@ mod thread_bound_tests {
             .cloned()
             .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
             .unwrap_or_default();
-        assert!(
-            msg.contains("from a thread other than the one that created it"),
-            "{}",
-            msg
-        );
+        assert!(msg.contains("from a thread other than the one that created it"), "{}", msg);
     }
 
     // Issue #422: a REBOUND / mutated-in-place global holding a shared
@@ -5720,11 +5615,7 @@ mod thread_bound_tests {
                 .cloned()
                 .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
                 .unwrap_or_default();
-            assert!(
-                msg.contains("from a thread other than the one that created it"),
-                "{}",
-                msg
-            );
+            assert!(msg.contains("from a thread other than the one that created it"), "{}", msg);
         }
         // The owner is unaffected.
         assert_eq!(*py_global_read(&**G).unwrap().borrow(), 1);
@@ -5816,26 +5707,7 @@ macro_rules! never_none {
     };
 }
 
-never_none!(
-    bool,
-    i8,
-    i16,
-    i32,
-    i64,
-    i128,
-    u8,
-    u16,
-    u32,
-    u64,
-    usize,
-    f32,
-    f64,
-    char,
-    String,
-    str,
-    &str,
-    PyException
-);
+never_none!(bool, i8, i16, i32, i64, i128, u8, u16, u32, u64, usize, f32, f64, char, String, str, &str, PyException);
 
 impl<T> PyIsNone for Vec<T> {
     fn py_is_none(&self) -> bool {
@@ -5868,8 +5740,13 @@ pub fn py_is_whitespace(c: char) -> bool {
 fn is_py_line_boundary(c: char) -> bool {
     matches!(
         c,
-        '\n' | '\r' | '\u{0b}' | '\u{0c}' | '\u{1c}'
-            ..='\u{1e}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+        '\n' | '\r'
+            | '\u{0b}'
+            | '\u{0c}'
+            | '\u{1c}'..='\u{1e}'
+            | '\u{85}'
+            | '\u{2028}'
+            | '\u{2029}'
     )
 }
 
@@ -5914,7 +5791,7 @@ fn repr_escapes(c: char) -> bool {
 /// ffi/ffl/ſt ligatures); everything else titlecases as uppercase.
 fn py_to_titlecase(c: char) -> String {
     const TITLE_SPECIALS: &[(char, &str)] = &[
-        ('\u{00df}', "Ss"),       // ß
+        ('\u{00df}', "Ss"), // ß
         ('\u{01c4}', "\u{01c5}"), // Ǆ -> ǅ
         ('\u{01c5}', "\u{01c5}"),
         ('\u{01c6}', "\u{01c5}"),
@@ -5927,13 +5804,13 @@ fn py_to_titlecase(c: char) -> String {
         ('\u{01f1}', "\u{01f2}"), // Ǳ -> ǲ
         ('\u{01f2}', "\u{01f2}"),
         ('\u{01f3}', "\u{01f2}"),
-        ('\u{fb00}', "Ff"),  // ﬀ
-        ('\u{fb01}', "Fi"),  // ﬁ
-        ('\u{fb02}', "Fl"),  // ﬂ
+        ('\u{fb00}', "Ff"), // ﬀ
+        ('\u{fb01}', "Fi"), // ﬁ
+        ('\u{fb02}', "Fl"), // ﬂ
         ('\u{fb03}', "Ffi"), // ﬃ
         ('\u{fb04}', "Ffl"), // ﬄ
-        ('\u{fb05}', "St"),  // ﬅ
-        ('\u{fb06}', "St"),  // ﬆ
+        ('\u{fb05}', "St"), // ﬅ
+        ('\u{fb06}', "St"), // ﬆ
     ];
     match TITLE_SPECIALS.iter().find(|(ch, _)| *ch == c) {
         Some((_, s)) => (*s).to_string(),
@@ -6083,12 +5960,7 @@ pub fn py_int_radix_format(
         '<' => format!("{}{}", body, filler.repeat(pad)),
         '^' => {
             let left = pad / 2;
-            format!(
-                "{}{}{}",
-                filler.repeat(left),
-                body,
-                filler.repeat(pad - left)
-            )
+            format!("{}{}{}", filler.repeat(left), body, filler.repeat(pad - left))
         }
         // '>' and the default: numbers right-align.
         _ => format!("{}{}", filler.repeat(pad), body),
@@ -6338,9 +6210,7 @@ impl<T: AsRef<str> + ?Sized> PyStrOps for T {
         self.as_ref().trim_matches(py_is_whitespace).to_string()
     }
     fn lstrip(&self) -> String {
-        self.as_ref()
-            .trim_start_matches(py_is_whitespace)
-            .to_string()
+        self.as_ref().trim_start_matches(py_is_whitespace).to_string()
     }
     fn rstrip(&self) -> String {
         self.as_ref().trim_end_matches(py_is_whitespace).to_string()
@@ -6399,15 +6269,13 @@ impl<T: AsRef<str> + ?Sized> PyStrOps for T {
         if maxsplit < 0 {
             return self.as_ref().py_split(sep);
         }
-        Ok(self
-            .as_ref()
+        Ok(self.as_ref()
             .splitn(maxsplit as usize + 1, sep)
             .map(str::to_string)
             .collect())
     }
     fn py_split_whitespace(&self) -> Vec<String> {
-        self.as_ref()
-            .split(py_is_whitespace)
+        self.as_ref().split(py_is_whitespace)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect()
@@ -6475,8 +6343,7 @@ impl<T: AsRef<str> + ?Sized> PyStrOps for T {
         if maxsplit < 0 {
             return self.as_ref().py_split(sep);
         }
-        let mut parts: Vec<String> = self
-            .as_ref()
+        let mut parts: Vec<String> = self.as_ref()
             .rsplitn(maxsplit as usize + 1, sep)
             .map(str::to_string)
             .collect();
@@ -6515,15 +6382,11 @@ impl<T: AsRef<str> + ?Sized> PyStrOps for T {
     }
     fn py_lstrip_chars(&self, chars: &str) -> String {
         let set: Vec<char> = chars.chars().collect();
-        self.as_ref()
-            .trim_start_matches(|c| set.contains(&c))
-            .to_string()
+        self.as_ref().trim_start_matches(|c| set.contains(&c)).to_string()
     }
     fn py_rstrip_chars(&self, chars: &str) -> String {
         let set: Vec<char> = chars.chars().collect();
-        self.as_ref()
-            .trim_end_matches(|c| set.contains(&c))
-            .to_string()
+        self.as_ref().trim_end_matches(|c| set.contains(&c)).to_string()
     }
     fn title(&self) -> String {
         // Python: the first letter after any non-alphabetic character is
@@ -6705,11 +6568,7 @@ impl<T: AsRef<str> + ?Sized> PyStrOps for T {
         if count >= width {
             return Ok(self.as_ref().to_string());
         }
-        Ok(format!(
-            "{}{}",
-            self.as_ref(),
-            fill_char.to_string().repeat(width - count)
-        ))
+        Ok(format!("{}{}", self.as_ref(), fill_char.to_string().repeat(width - count)))
     }
     fn py_rjust(&self, width: i64, fill: &str) -> Result<String, PyException> {
         let fill_char = single_fill_char(fill)?;
@@ -6718,11 +6577,7 @@ impl<T: AsRef<str> + ?Sized> PyStrOps for T {
         if count >= width {
             return Ok(self.as_ref().to_string());
         }
-        Ok(format!(
-            "{}{}",
-            fill_char.to_string().repeat(width - count),
-            self.as_ref()
-        ))
+        Ok(format!("{}{}", fill_char.to_string().repeat(width - count), self.as_ref()))
     }
     fn splitlines(&self) -> Vec<String> {
         // Python's boundary set, not just \n/\r\n: classic-Mac \r,
@@ -6944,7 +6799,12 @@ fn py_range_bounds(len: usize, start: Option<i64>, stop: Option<i64>) -> (usize,
 /// `xs[a:b] = replacement` (issue #153): replace the range IN PLACE — a
 /// different-length replacement inserts or removes elements, exactly
 /// CPython. `None` bounds are the open ends (`xs[:b]`, `xs[a:]`, `xs[:]`).
-pub fn py_splice<T>(xs: &mut Vec<T>, start: Option<i64>, stop: Option<i64>, replacement: Vec<T>) {
+pub fn py_splice<T>(
+    xs: &mut Vec<T>,
+    start: Option<i64>,
+    stop: Option<i64>,
+    replacement: Vec<T>,
+) {
     let (a, b) = py_range_bounds(xs.len(), start, stop);
     xs.splice(a..b, replacement);
 }
@@ -7442,6 +7302,7 @@ impl<L: PartialOrd<R>, R: ?Sized> PyGe<R> for L {
     }
 }
 
+
 // ============================================================================
 // `-` and `*` (PySub / PyMul)
 // ============================================================================
@@ -7498,7 +7359,10 @@ where
             Some(l) => l.py_sub(rhs),
             None => panic!(
                 "{}",
-                PyException::new("TypeError", "unsupported operand type(s) for -: 'NoneType'")
+                PyException::new(
+                    "TypeError",
+                    "unsupported operand type(s) for -: 'NoneType'"
+                )
             ),
         }
     }
@@ -7513,7 +7377,10 @@ where
             Some(l) => l.py_mul(rhs),
             None => panic!(
                 "{}",
-                PyException::new("TypeError", "unsupported operand type(s) for *: 'NoneType'")
+                PyException::new(
+                    "TypeError",
+                    "unsupported operand type(s) for *: 'NoneType'"
+                )
             ),
         }
     }
@@ -7596,8 +7463,15 @@ macro_rules! string_add {
 }
 
 string_add!(
-    String, String, String, &str, &str, String, &str, &str, str, String, str, &str, String, str,
-    &str, str, str, str,
+    String, String,
+    String, &str,
+    &str, String,
+    &str, &str,
+    str, String,
+    str, &str,
+    String, str,
+    &str, str,
+    str, str,
 );
 
 /// `str + boxed` (idna's uts46_remap: `output += replacement` where the
@@ -7641,7 +7515,10 @@ where
             Some(l) => l.py_add(rhs),
             None => panic!(
                 "{}",
-                PyException::new("TypeError", "unsupported operand type(s) for +: 'NoneType'")
+                PyException::new(
+                    "TypeError",
+                    "unsupported operand type(s) for +: 'NoneType'"
+                )
             ),
         }
     }
@@ -7954,7 +7831,9 @@ fn extended_slice_indices(
         let s = start
             .map(|v| if v < 0 { v + len } else { v })
             .unwrap_or(len - 1);
-        let e = stop.map(|v| if v < 0 { v + len } else { v }).unwrap_or(-1);
+        let e = stop
+            .map(|v| if v < 0 { v + len } else { v })
+            .unwrap_or(-1);
         (clamp(s, -1, len - 1), clamp(e, -1, len))
     };
     let mut idxs = Vec::new();
@@ -8389,10 +8268,7 @@ impl PyException {
             .ok_or_else(|| {
                 PyException::new(
                     "AttributeError",
-                    format!(
-                        "'{}' object has no attribute '{}'",
-                        self.exception_type, name
-                    ),
+                    format!("'{}' object has no attribute '{}'", self.exception_type, name),
                 )
             })
     }
@@ -8409,10 +8285,7 @@ impl PyException {
             .ok_or_else(|| {
                 PyException::new(
                     "AttributeError",
-                    format!(
-                        "'{}' object has no attribute '{}'",
-                        self.exception_type, name
-                    ),
+                    format!("'{}' object has no attribute '{}'", self.exception_type, name),
                 )
             })
     }
@@ -8609,10 +8482,7 @@ pub fn exit_uncaught(e: &PyException) -> ! {
         }
         Ok(None) => {}
         Err(error) => {
-            eprintln!(
-                "rython: an uncaught SystemExit has no recorded code: {}",
-                error
-            );
+            eprintln!("rython: an uncaught SystemExit has no recorded code: {}", error);
             std::process::exit(1);
         }
     }
@@ -8956,12 +8826,7 @@ pub fn complex_repr(re: f64, im: f64) -> String {
     } else {
         "+"
     };
-    format!(
-        "({}{}{}j)",
-        complex_component_repr(re),
-        sign,
-        complex_component_repr(im.abs())
-    )
+    format!("({}{}{}j)", complex_component_repr(re), sign, complex_component_repr(im.abs()))
 }
 
 impl From<Complex> for PyValue {
@@ -9127,11 +8992,11 @@ complex_mul_scalar!(i64, f64);
 mod callable;
 /// Variable-length tuples (issue #399).
 mod pytuple;
+pub use pytuple::PyTuple;
 /// Callables as VALUES (issue #122): the runtime type of a
 /// `Callable[[A], R]` annotation, a `lambda` and a nested `def`.
 #[cfg(feature = "alloc")]
 pub use callable::{PyCallable, PyCell};
-pub use pytuple::PyTuple;
 
 mod builtin_exceptions;
 /// The built-in exception discriminant, re-exported so generated code's
@@ -9143,6 +9008,7 @@ mod percent_format;
 /// Python Standard Library modules
 pub mod stdlib;
 
+
 /// Custom Python signature system that preserves generic parameters
 pub mod python_signature;
 
@@ -9150,54 +9016,56 @@ pub mod python_signature;
 
 // Re-export stdlib modules at the top level for convenience
 #[cfg(feature = "std")]
-pub use stdlib::datetime;
-#[cfg(feature = "std")]
 pub use stdlib::encodings;
-#[cfg(feature = "std")]
-pub use stdlib::math;
-#[cfg(feature = "std")]
-pub use stdlib::os;
-#[cfg(feature = "std")]
-pub use stdlib::random;
-#[cfg(feature = "std")]
-pub use stdlib::subprocess;
 #[cfg(feature = "std")]
 pub use stdlib::sys;
 #[cfg(feature = "std")]
+pub use stdlib::os; 
+#[cfg(feature = "std")]
+pub use stdlib::subprocess;
+#[cfg(feature = "std")]
 pub use stdlib::sysconfig;
 #[cfg(feature = "std")]
-pub use stdlib::sysconfig::{is_python_build_py, is_python_build_wrapper};
+pub use stdlib::sysconfig::{
+    is_python_build_py, is_python_build_wrapper,
+};
 #[cfg(feature = "std")]
 pub use stdlib::venv;
+#[cfg(feature = "std")]
+pub use stdlib::math;
+#[cfg(feature = "std")]
+pub use stdlib::random;
+#[cfg(feature = "std")]
+pub use stdlib::datetime;
 // The keyword-replace trait and its args struct must be in scope for
 // dt.replace(hour=...) to resolve in generated code.
+#[cfg(feature = "std")]
+pub use stdlib::datetime::{PyReplace, ReplaceArgs};
 /// Python asyncio module (tokio-backed; gated on the async-tokio feature,
 /// which implies std).
 #[cfg(feature = "async-tokio")]
 pub use stdlib::asyncio;
 #[cfg(feature = "std")]
-pub use stdlib::datetime::{PyReplace, ReplaceArgs};
+pub use stdlib::time;
 #[cfg(feature = "re-regex")]
 pub use stdlib::re;
-#[cfg(feature = "std")]
-pub use stdlib::time;
 #[cfg(feature = "unicodedata-ucd")]
 pub use stdlib::unicodedata;
 // io is in-memory buffers (StringIO/BytesIO) — pure alloc, every tier;
 // the disk-backed PyFile constructors and open() stay std-only.
-#[cfg(feature = "std")]
-pub use stdlib::argparse;
 pub use stdlib::io;
 #[cfg(feature = "std")]
+pub use stdlib::argparse;
+#[cfg(feature = "std")]
 pub use stdlib::module_init::{ModuleInitEntry, ModuleInitGuard, ModuleInitLock};
+#[cfg(feature = "std")]
+pub use stdlib::threading;
 #[cfg(feature = "std")]
 pub use stdlib::socket;
 /// Python ssl (rustls-backed; gated on the ssl-rustls feature, which
 /// implies std — on by default).
 #[cfg(feature = "ssl-rustls")]
 pub use stdlib::ssl;
-#[cfg(feature = "std")]
-pub use stdlib::threading;
 /// Python urllib: the `parse` submodule (urlparse/urlsplit/urljoin/
 /// urlencode/quote/unquote/...) is pure string handling, available under
 /// plain std; the `request` submodule (urlopen) is ureq-backed and keeps
@@ -9213,135 +9081,94 @@ pub use stdlib::re::PyMatchOps;
 // The compiled-pattern matching trait must be in scope for
 // `_TARGET_RE.match(x)`-style calls on a compiled-regex static in
 // generated code.
-pub use stdlib::collections;
-pub use stdlib::functools;
-pub use stdlib::itertools;
-pub use stdlib::json;
 #[cfg(feature = "re-regex")]
 pub use stdlib::re::PyRegexOps;
 pub use stdlib::string;
+pub use stdlib::json;
+pub use stdlib::collections;
+pub use stdlib::itertools;
+pub use stdlib::functools;
 // The lru_cache backing store must be nameable in generated statics.
+pub use stdlib::functools::PyLruCache;
+pub use stdlib::heapq;
 pub use stdlib::bisect;
 pub use stdlib::copy;
-pub use stdlib::csv;
-pub use stdlib::functools::PyLruCache;
-#[cfg(feature = "std")]
-pub use stdlib::glob;
+pub use stdlib::textwrap;
 pub use stdlib::hashlib;
-pub use stdlib::heapq;
+#[cfg(feature = "zlib")]
+pub use stdlib::zlib;
+pub use stdlib::csv;
 #[cfg(feature = "std")]
-pub use stdlib::numpy;
+pub use stdlib::unittest;
 #[cfg(feature = "std")]
 pub use stdlib::pathlib;
 #[cfg(feature = "std")]
 pub use stdlib::tempfile;
-pub use stdlib::textwrap;
 #[cfg(feature = "std")]
-pub use stdlib::unittest;
+pub use stdlib::glob;
 pub use stdlib::warnings;
-#[cfg(feature = "zlib")]
-pub use stdlib::zlib;
+#[cfg(feature = "std")]
+pub use stdlib::numpy;
 
 // Re-export custom macro-generated wrapper functions for generated code
 #[cfg(feature = "std")]
 pub use math::{
-    acos_py,
-    acos_wrapper,
-    acosh_py,
-    acosh_wrapper,
-    asin_py,
-    asin_wrapper,
-    asinh_py,
-    asinh_wrapper,
-    atan_py,
-    atan_wrapper,
-    atan2_py,
-    atan2_wrapper,
-
-    atanh_py,
-    atanh_wrapper,
-
     // Basic math functions
-    ceil_py,
-    ceil_wrapper,
-    // Utility functions
-    copysign_py,
-    copysign_wrapper,
-    cos_py,
-    cos_wrapper,
-    cosh_py,
-    cosh_wrapper,
-    // Angular conversion
-    degrees_py,
-    degrees_wrapper,
+    ceil_py, ceil_wrapper,
+    floor_py, floor_wrapper,
+    trunc_py, trunc_wrapper,
+    fabs_py, fabs_wrapper,
+    sqrt_py, sqrt_wrapper,
+    pow_py, pow_wrapper,
+    
     // Exponential and logarithmic functions
-    exp_py,
-    exp_wrapper,
-    exp2_py,
-    exp2_wrapper,
-    expm1_py,
-    expm1_wrapper,
-    fabs_py,
-    fabs_wrapper,
-    // Special functions
-    factorial_py,
-    factorial_wrapper,
-    floor_py,
-    floor_wrapper,
-    fmod_py,
-    fmod_wrapper,
-    frexp_py,
-    frexp_wrapper,
-    gcd_py,
-    gcd_wrapper,
-    isclose_py,
-    isclose_wrapper,
-
-    // Classification functions
-    isfinite_py,
-    isfinite_wrapper,
-    isinf_py,
-    isinf_wrapper,
-    isnan_py,
-    isnan_wrapper,
-    lcm_py,
-    lcm_wrapper,
-
-    ldexp_py,
-    ldexp_wrapper,
-    log_py,
-    log_wrapper,
-    log1p_py,
-    log1p_wrapper,
-
-    log2_py,
-    log2_wrapper,
-    log10_py,
-    log10_wrapper,
-    modf_py,
-    modf_wrapper,
-    pow_py,
-    pow_wrapper,
-
-    radians_py,
-    radians_wrapper,
-
-    remainder_py,
-    remainder_wrapper,
+    exp_py, exp_wrapper,
+    exp2_py, exp2_wrapper,
+    expm1_py, expm1_wrapper,
+    log_py, log_wrapper,
+    log2_py, log2_wrapper,
+    log10_py, log10_wrapper,
+    log1p_py, log1p_wrapper,
+    
     // Trigonometric functions
-    sin_py,
-    sin_wrapper,
+    sin_py, sin_wrapper,
+    cos_py, cos_wrapper,
+    tan_py, tan_wrapper,
+    asin_py, asin_wrapper,
+    acos_py, acos_wrapper,
+    atan_py, atan_wrapper,
+    atan2_py, atan2_wrapper,
+    
     // Hyperbolic functions
-    sinh_py,
-    sinh_wrapper,
-    sqrt_py,
-    sqrt_wrapper,
-    tan_py,
-    tan_wrapper,
-    tanh_py,
-    tanh_wrapper,
-    trunc_py,
-    trunc_wrapper,
+    sinh_py, sinh_wrapper,
+    cosh_py, cosh_wrapper,
+    tanh_py, tanh_wrapper,
+    asinh_py, asinh_wrapper,
+    acosh_py, acosh_wrapper,
+    atanh_py, atanh_wrapper,
+    
+    // Angular conversion
+    degrees_py, degrees_wrapper,
+    radians_py, radians_wrapper,
+    
+    // Special functions
+    factorial_py, factorial_wrapper,
+    gcd_py, gcd_wrapper,
+    lcm_py, lcm_wrapper,
+    
+    // Classification functions
+    isfinite_py, isfinite_wrapper,
+    isinf_py, isinf_wrapper,
+    isnan_py, isnan_wrapper,
+    isclose_py, isclose_wrapper,
+    
+    // Utility functions
+    copysign_py, copysign_wrapper,
+    frexp_py, frexp_wrapper,
+    ldexp_py, ldexp_wrapper,
+    modf_py, modf_wrapper,
+    fmod_py, fmod_wrapper,
+    remainder_py, remainder_wrapper,
 };
 
 // Re-export random module functions
@@ -9351,72 +9178,47 @@ pub use random::{getstate, random, seed, triangular, uniform};
 // Re-export JSON module wrapper functions
 #[cfg(feature = "std")]
 pub use json::{
-    dump_py,
-    dump_wrapper,
-    dumps_py,
-    dumps_wrapper,
-    load_py,
-    load_wrapper,
     // JSON serialization/deserialization
-    loads_py,
-    loads_wrapper,
+    loads_py, loads_wrapper,
+    dumps_py, dumps_wrapper,
+    load_py, load_wrapper,
+    dump_py, dump_wrapper,
 };
 
 #[cfg(feature = "std")]
 pub use os::{
-    chdir_py,
-    chdir_wrapper,
     // OS functions
-    execv_mixed_py,
-    execv_mixed_wrapper,
-    getcwd_py,
-    getcwd_wrapper,
-    getenv_py,
-    getenv_wrapper,
-    setenv_py,
-    setenv_wrapper,
+    execv_mixed_py, execv_mixed_wrapper,
+    getenv_py, getenv_wrapper,
+    setenv_py, setenv_wrapper,
+    getcwd_py, getcwd_wrapper,
+    chdir_py, chdir_wrapper,
 };
 
 #[cfg(feature = "std")]
 pub use os::path::{
-    abspath_py,
-    abspath_wrapper,
-    basename_py,
-    basename_wrapper,
     // OS path functions
-    dirname_py,
-    dirname_wrapper,
-    exists_py,
-    exists_wrapper,
-    isdir_py,
-    isdir_wrapper,
-    isfile_py,
-    isfile_wrapper,
-    join_many_py,
-    join_many_wrapper,
-    join_py,
-    join_wrapper,
-    join3_py,
-    join3_wrapper,
-    relpath_py,
-    relpath_wrapper,
+    dirname_py, dirname_wrapper,
+    basename_py, basename_wrapper,
+    join_py, join_wrapper,
+    join3_py, join3_wrapper,
+    join_many_py, join_many_wrapper,
+    exists_py, exists_wrapper,
+    isfile_py, isfile_wrapper,
+    isdir_py, isdir_wrapper,
+    abspath_py, abspath_wrapper,
+    relpath_py, relpath_wrapper,
 };
 
 #[cfg(feature = "std")]
 pub use sys::{
     // Sys functions
-    exit_py,
-    exit_wrapper,
-    get_argv_py,
-    get_argv_wrapper,
-    get_executable_py,
-    get_executable_wrapper,
-    get_platform_py,
-    get_platform_wrapper,
-    platform_py,
-    platform_wrapper,
-    version_py,
-    version_wrapper,
+    exit_py, exit_wrapper,
+    platform_py, platform_wrapper,
+    version_py, version_wrapper,
+    get_executable_py, get_executable_wrapper,
+    get_argv_py, get_argv_wrapper,
+    get_platform_py, get_platform_wrapper,
 };
 
 // The `_py` wrappers only exist with std (they're the pyo3-facing shapes);
@@ -9433,16 +9235,13 @@ pub use collections::{
 
 #[cfg(feature = "std")]
 pub use subprocess::{
-    call_py,
-    call_wrapper,
-    check_call_py,
-    check_call_wrapper,
-    check_output_py,
-    check_output_wrapper,
     // Subprocess functions
-    run_py,
-    run_wrapper,
+    run_py, run_wrapper,
+    call_py, call_wrapper,
+    check_call_py, check_call_wrapper,
+    check_output_py, check_output_wrapper,
 };
+
 
 /// Python special variables
 pub const __file__: &str = "script.py";
@@ -9453,7 +9252,7 @@ pub const __name__: &str = "__main__";
 // ============================================================================
 
 /// Python input() function - reads input from user
-///
+/// 
 /// Note: Only available with `std` feature - requires OS I/O capabilities
 #[cfg(feature = "std")]
 pub fn input<P: AsRef<str>>(prompt: Option<P>) -> Result<String, PyException> {
@@ -9475,10 +9274,9 @@ pub fn input<P: AsRef<str>>(prompt: Option<P>) -> Result<String, PyException> {
             .and_then(|_| out.flush())
             .map_err(|e| stream_error(&e))?;
     }
-
+    
     let mut input = String::new();
-    let n = io::stdin()
-        .read_line(&mut input)
+    let n = io::stdin().read_line(&mut input)
         .map_err(|e| runtime_error(&format!("I/O error: {}", e)))?;
     if n == 0 {
         // CPython raises EOFError at end of input; returning "" would make
@@ -9486,7 +9284,7 @@ pub fn input<P: AsRef<str>>(prompt: Option<P>) -> Result<String, PyException> {
         // line is also "", so `if not line: break` is not a workaround).
         return Err(PyException::new("EOFError", "EOF when reading a line"));
     }
-
+    
     // Remove trailing newline
     if input.ends_with('\n') {
         input.pop();
@@ -9494,7 +9292,7 @@ pub fn input<P: AsRef<str>>(prompt: Option<P>) -> Result<String, PyException> {
             input.pop();
         }
     }
-
+    
     Ok(input)
 }
 
@@ -9628,12 +9426,12 @@ pub fn parse_open_mode(mode: &str) -> Result<OpenMode, PyException> {
         [] => {
             return Err(value_error(
                 "Must have exactly one of create/read/write/append mode and at most one plus",
-            ));
+            ))
         }
         _ => {
             return Err(value_error(
                 "must have exactly one of create/read/write/append mode",
-            ));
+            ))
         }
     };
     if seen.contains(&'+') {
@@ -9690,10 +9488,7 @@ fn open_disk(path: &str, access: OpenAccess) -> Result<DiskHandle, PyException> 
 ///
 /// Note: Only available with `std` feature - requires OS I/O capabilities
 #[cfg(feature = "std")]
-pub fn open<F: AsRef<str>, M: AsRef<str>>(
-    filename: F,
-    mode: Option<M>,
-) -> Result<PyFile, PyException> {
+pub fn open<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: Option<M>) -> Result<PyFile, PyException> {
     let path = filename.as_ref();
     let mode = mode.as_ref().map(|m| m.as_ref()).unwrap_or("r");
     let parsed = parse_open_mode(mode)?;
@@ -9719,10 +9514,7 @@ pub fn open<F: AsRef<str>, M: AsRef<str>>(
 ///
 /// Note: Only available with `std` feature - requires OS I/O capabilities
 #[cfg(feature = "std")]
-pub fn open_binary<F: AsRef<str>, M: AsRef<str>>(
-    filename: F,
-    mode: M,
-) -> Result<stdlib::io::PyBytesIO, PyException> {
+pub fn open_binary<F: AsRef<str>, M: AsRef<str>>(filename: F, mode: M) -> Result<stdlib::io::PyBytesIO, PyException> {
     open_binary_with(filename, mode, false, false)
 }
 
@@ -9850,9 +9642,7 @@ impl TextReader {
     fn read_all(&mut self) -> Result<String, PyException> {
         use std::io::Read;
         let mut rest = core::mem::take(&mut self.pending);
-        self.inner
-            .read_to_end(&mut rest)
-            .map_err(|e| stream_error(&e))?;
+        self.inner.read_to_end(&mut rest).map_err(|e| stream_error(&e))?;
         self.eof = true;
         let text = decode_utf8_final(&rest)?;
         let mut out = core::mem::take(&mut self.decoded);
@@ -9953,9 +9743,7 @@ fn decode_utf8_partial(data: &[u8]) -> Result<(String, alloc::vec::Vec<u8>), PyE
         Err(e) if e.error_len().is_none() => {
             let valid = e.valid_up_to();
             Ok((
-                core::str::from_utf8(&data[..valid])
-                    .expect("valid prefix")
-                    .to_string(),
+                core::str::from_utf8(&data[..valid]).expect("valid prefix").to_string(),
                 data[valid..].to_vec(),
             ))
         }
@@ -9988,10 +9776,7 @@ enum PyFileBackend {
     /// counts positions in code points). write() OVERWRITES at the
     /// cursor, as in Python — StringIO("seeded").write("!") yields
     /// "!eeded", not "seeded!".
-    Buffer {
-        data: String,
-        pos: usize,
-    },
+    Buffer { data: String, pos: usize },
     Closed,
 }
 
@@ -10018,10 +9803,7 @@ impl PyFile {
 
     #[cfg(feature = "std")]
     fn new_write(writer: impl std::io::Write + 'static, name: &str) -> Self {
-        Self::from_backend(
-            PyFileBackend::DiskWrite(alloc::boxed::Box::new(writer)),
-            name,
-        )
+        Self::from_backend(PyFileBackend::DiskWrite(alloc::boxed::Box::new(writer)), name)
     }
 
     /// The live standard input as a text file (`sys.stdin`; argparse's
@@ -10147,10 +9929,7 @@ impl PyFile {
     /// decode error, a closed file) is the exception at THAT turn, after
     /// the earlier lines were seen, as CPython's iteration raises it.
     pub fn py_lines(&self) -> PyFileLines {
-        PyFileLines {
-            file: self.clone(),
-            done: false,
-        }
+        PyFileLines { file: self.clone(), done: false }
     }
 
     /// Python file.readlines() method. Lines KEEP their terminators
@@ -10195,8 +9974,7 @@ impl PyFile {
             #[cfg(feature = "std")]
             PyFileBackend::DiskWrite(writer) => {
                 use std::io::Write;
-                writer
-                    .write_all(text.as_bytes())
+                writer.write_all(text.as_bytes())
                     .map_err(|e| stream_error(&e))?;
                 Ok(text.chars().count() as i64)
             }
@@ -10276,7 +10054,9 @@ impl PyFile {
             PyFileBackend::Stdout => {
                 use std::io::Write;
                 if !stdout_closed() {
-                    std::io::stdout().flush().map_err(|e| stream_error(&e))?;
+                    std::io::stdout()
+                        .flush()
+                        .map_err(|e| stream_error(&e))?;
                     STDOUT_CLOSED.store(true, core::sync::atomic::Ordering::SeqCst);
                 }
                 return Ok(());
@@ -10287,7 +10067,8 @@ impl PyFile {
         #[cfg(feature = "std")]
         if let PyFileBackend::DiskWrite(mut writer) = old {
             use std::io::Write;
-            writer.flush().map_err(|e| stream_error(&e))?;
+            writer.flush()
+                .map_err(|e| stream_error(&e))?;
         }
         #[cfg(not(feature = "std"))]
         let _ = old;
@@ -10339,7 +10120,7 @@ pub fn py_list<T>(items: Vec<T>) -> PyList<T> {
 }
 
 /// Helper function for dictionary creation (common in compiled code)
-pub fn py_dict<K, V>() -> PyDictionary<K, V>
+pub fn py_dict<K, V>() -> PyDictionary<K, V> 
 where
     K: Clone + Eq + Hash,
     V: Clone,
@@ -10348,7 +10129,7 @@ where
 }
 
 /// Helper function for set creation (common in compiled code)
-pub fn py_set<T>() -> PySet<T>
+pub fn py_set<T>() -> PySet<T> 
 where
     T: Clone + Eq + Hash,
 {
@@ -10375,7 +10156,8 @@ pub fn set_of_strings<S: AsRef<str>>(iterable: &[S]) -> crate::HashSet<String> {
 /// members the same way).
 impl From<crate::HashSet<String>> for PyValue {
     fn from(value: crate::HashSet<String>) -> Self {
-        let mut members: Vec<PyValue> = value.into_iter().map(PyValue::Str).collect();
+        let mut members: Vec<PyValue> =
+            value.into_iter().map(PyValue::Str).collect();
         // HashSet iteration order is nondeterministic — sort for a stable
         // boxed form.
         members.sort_by(|a, b| match (a, b) {
@@ -10385,6 +10167,8 @@ impl From<crate::HashSet<String>> for PyValue {
         PyValue::Tuple(Arc::new(members))
     }
 }
+
+
 
 /// Helper function for tuple creation (common in compiled code)
 pub fn py_tuple<T>(items: Vec<T>) -> PyTuple<T> {
@@ -10429,10 +10213,7 @@ pub fn str_format_runtime<T: AsRef<str>>(
         if kwargs[..i].iter().any(|(prev, _)| prev == k) {
             return Err(PyException::new(
                 "TypeError",
-                format!(
-                    "str.format() got multiple values for keyword argument '{}'",
-                    k
-                ),
+                format!("str.format() got multiple values for keyword argument '{}'", k),
             ));
         }
     }
@@ -10576,9 +10357,7 @@ pub fn refuse_forwarded_kwargs<V>(call: &str, bag: &PyDict<String, V>) -> Result
 /// A `**bag` spread's entries as `str.format` keywords, each value
 /// rendered through Python's `str()` (see [`str_format_runtime`]).
 pub fn str_format_bag<V: Clone + PyToString>(bag: &PyDict<String, V>) -> Vec<(String, String)> {
-    bag.iter()
-        .map(|(k, v)| (k.clone(), v.clone().py_str()))
-        .collect()
+    bag.iter().map(|(k, v)| (k.clone(), v.clone().py_str())).collect()
 }
 
 /// `template.format(**kwargs)` over a runtime keyword bag (issue #368):
@@ -10591,11 +10370,7 @@ pub fn str_format_kwargs<T: AsRef<str>, V: Clone + PyToString>(
 }
 
 /// Helper for range() function with optional parameters - more flexible than the basic range
-pub fn range_flexible(
-    start: i64,
-    stop: Option<i64>,
-    step: Option<i64>,
-) -> Result<PyRange, PyException> {
+pub fn range_flexible(start: i64, stop: Option<i64>, step: Option<i64>) -> Result<PyRange, PyException> {
     let (start, stop, step) = match (stop, step) {
         (None, None) => (0, start, 1),
         (Some(stop), None) => (start, stop, 1),
@@ -10618,7 +10393,7 @@ pub fn zip_slices<'a, T, U>(iterable1: &'a [T], iterable2: &'a [U]) -> Vec<(&'a 
 }
 
 /// Helper for Python-style slicing
-pub fn slice<T>(items: &[T], start: Option<i64>, stop: Option<i64>, step: Option<i64>) -> Vec<T>
+pub fn slice<T>(items: &[T], start: Option<i64>, stop: Option<i64>, step: Option<i64>) -> Vec<T> 
 where
     T: Clone,
 {
@@ -10626,10 +10401,7 @@ where
     let step = step.unwrap_or(1);
 
     if step == 0 {
-        panic!(
-            "{}",
-            PyException::new("ValueError", "slice step cannot be zero")
-        );
+        panic!("{}", PyException::new("ValueError", "slice step cannot be zero"));
     }
 
     // Resolve an index the way Python does: negative values count from the
@@ -10677,19 +10449,14 @@ pub fn multiply_string<S: AsRef<str>>(s: S, count: i64) -> String {
 }
 
 /// Helper for Python-style list multiplication
-pub fn multiply_list<T>(items: &[T], count: i64) -> Vec<T>
+pub fn multiply_list<T>(items: &[T], count: i64) -> Vec<T> 
 where
     T: Clone,
 {
     if count <= 0 {
         Vec::new()
     } else {
-        items
-            .iter()
-            .cycle()
-            .take(items.len() * count as usize)
-            .cloned()
-            .collect()
+        items.iter().cycle().take(items.len() * count as usize).cloned().collect()
     }
 }
 
@@ -10699,7 +10466,7 @@ pub fn string_contains<H: AsRef<str>, N: AsRef<str>>(haystack: H, needle: N) -> 
 }
 
 /// Helper for in/not in operations on lists
-pub fn list_contains<T>(items: &[T], item: &T) -> bool
+pub fn list_contains<T>(items: &[T], item: &T) -> bool 
 where
     T: PartialEq,
 {
@@ -10757,7 +10524,7 @@ mod tests {
         assert_eq!(abs(-3.14f64), 3.14);
         assert_eq!(abs(-42i32), 42);
         assert_eq!(abs(-2.5f32), 2.5);
-
+        
         // Test generic sum function (i64/f64 only — an i32 impl would
         // leave integer-literal lists ambiguous, issue #133): owned,
         // borrowed, and slice forms all sum.
@@ -10775,17 +10542,17 @@ mod tests {
         // Test with PyList
         let pylist = PyList::from_vec(vec![1i64, 2, 3]);
         assert_eq!(sum(&pylist), 6);
-
+        
         // Test min/max
         assert_eq!(min(&nums_i64).unwrap(), 1);
         assert_eq!(max(&nums_i64).unwrap(), 5);
-
+        
         // Test all/any
         let bools = vec![true, true, false];
         assert_eq!(any(&bools), true);
         assert_eq!(all(&bools), false);
     }
-
+    
     #[test]
     fn test_generic_type_conversions() {
         // Test generic bool conversion
@@ -10795,17 +10562,17 @@ mod tests {
         assert_eq!(bool(0.0f64), false);
         assert_eq!(bool("hello"), true);
         assert_eq!(bool(""), false);
-
+        
         // Test generic int conversion
         assert_eq!(int("123").unwrap(), 123);
         assert_eq!(int(45.7f64).unwrap(), 45);
         assert_eq!(int(true).unwrap(), 1);
         assert_eq!(int(false).unwrap(), 0);
-
+        
         // Test generic float conversion
         assert_eq!(float("3.14").unwrap(), 3.14);
         assert_eq!(float(42i64).unwrap(), 42.0);
-
+        
         // Test generic str conversion
         assert_eq!(str(123i64), "123");
         assert_eq!(str(3.14f64), "3.14");
@@ -10813,7 +10580,7 @@ mod tests {
         assert_eq!(str(false), "False");
         assert_eq!(str("hello"), "hello");
     }
-
+    
     #[test]
     fn test_pystr() {
         let s = PyStr::new("hello world");
@@ -10823,43 +10590,43 @@ mod tests {
         assert_eq!(s.find("world"), 6);
         assert_eq!(s.count("l"), 3);
     }
-
+    
     #[test]
     fn test_pylist() {
         let mut list = PyList::new();
         list.append(1);
         list.append(2);
         list.append(3);
-
+        
         assert_eq!(list.len(), 3);
         assert_eq!(list.get(1), Some(&2));
         assert_eq!(list.pop(None), Some(3));
         assert_eq!(list.len(), 2);
     }
-
+    
     #[test]
     fn test_pydict() {
         let mut dict = PyDictionary::new();
         dict.set("key1".to_string(), 42);
         dict.set("key2".to_string(), 100);
-
+        
         assert_eq!(dict.len(), 2);
         assert_eq!(dict.get(&"key1".to_string()), Some(&42));
         assert_eq!(dict.keys().len(), 2);
     }
-
+    
     #[test]
     fn test_pyset() {
         let mut set = PySet::new();
         set.add(1);
         set.add(2);
         set.add(1); // duplicate
-
+        
         assert_eq!(set.len(), 2);
         assert!(set.contains(&1));
         assert!(!set.contains(&3));
     }
-
+    
     #[test]
     fn test_compiler_helpers() {
         // Test range function
@@ -10868,69 +10635,65 @@ mod tests {
             vec![0, 1, 2]
         );
         assert_eq!(
-            range_flexible(1, Some(4), None)
-                .unwrap()
-                .collect::<Vec<_>>(),
+            range_flexible(1, Some(4), None).unwrap().collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
         assert_eq!(
-            range_flexible(0, Some(10), Some(2))
-                .unwrap()
-                .collect::<Vec<_>>(),
+            range_flexible(0, Some(10), Some(2)).unwrap().collect::<Vec<_>>(),
             vec![0, 2, 4, 6, 8]
         );
-
+        
         // Test enumerate
         let items = vec!["a", "b", "c"];
         let enumerated = enumerate_slice(&items);
         assert_eq!(enumerated, vec![(0, &"a"), (1, &"b"), (2, &"c")]);
-
+        
         // Test zip
         let nums = vec![1, 2, 3];
         let chars = vec!['a', 'b', 'c'];
         let zipped = zip_slices(&nums, &chars);
         assert_eq!(zipped, vec![(&1, &'a'), (&2, &'b'), (&3, &'c')]);
-
+        
         // Test string multiplication
         assert_eq!(multiply_string("abc", 3), "abcabcabc");
         assert_eq!(multiply_string("x", 0), "");
-
+        
         // Test list multiplication
         let list = vec![1, 2];
         assert_eq!(multiply_list(&list, 3), vec![1, 2, 1, 2, 1, 2]);
-
+        
         // Test contains operations
         assert!(string_contains("hello world", "world"));
         assert!(!string_contains("hello", "xyz"));
-
+        
         let list = vec![1, 2, 3, 4, 5];
         assert!(list_contains(&list, &3));
         assert!(!list_contains(&list, &10));
-
+        
         // Test slicing
         let items = vec![0, 1, 2, 3, 4, 5];
         assert_eq!(slice(&items, Some(1), Some(4), None), vec![1, 2, 3]);
         assert_eq!(slice(&items, None, Some(3), None), vec![0, 1, 2]);
         assert_eq!(slice(&items, Some(0), None, Some(2)), vec![0, 2, 4]);
     }
-
+    
     #[test]
     fn test_helper_constructors() {
         // Test py_list
         let list = py_list(vec![1, 2, 3]);
         assert_eq!(list.len(), 3);
-
+        
         // Test py_dict
         let mut dict: PyDictionary<String, i32> = py_dict();
         dict.set("key".to_string(), 42);
         assert_eq!(dict.len(), 1);
-
+        
         // Test py_set
         let mut set: PySet<i32> = py_set();
         set.add(1);
         set.add(2);
         assert_eq!(set.len(), 2);
-
+        
         // Test py_tuple
         let tuple = py_tuple(vec![1, 2, 3]);
         assert_eq!(tuple.len(), 3);
@@ -11039,7 +10802,7 @@ pub fn py_extend_strings(out: &mut Vec<String>, value: &PyValue) -> Result<(), P
                                 "TypeError: a bytes-like object is required, not '{}'",
                                 other.py_type_name()
                             ),
-                        ));
+                        ))
                     }
                 }
             }
@@ -11168,11 +10931,7 @@ mod percent_format_tests {
             assert_eq!(e.message, "missing");
             let e = "%(a)s".to_string().py_mod(&(1i64,)).unwrap_err();
             assert_eq!(e.exception_type, "TypeError");
-            assert!(
-                e.message.contains("format requires a mapping"),
-                "{}",
-                e.message
-            );
+            assert!(e.message.contains("format requires a mapping"), "{}", e.message);
         }
 
         assert_eq!(b(b"%x", 255), b"ff");
@@ -11215,8 +10974,7 @@ mod percent_format_tests {
         let e = "%s".to_string().py_mod(&(1i64, 2i64)).unwrap_err();
         assert_eq!(e.exception_type, "TypeError");
         assert!(
-            e.message
-                .contains("not all arguments converted during string formatting"),
+            e.message.contains("not all arguments converted during string formatting"),
             "{}",
             e.message
         );

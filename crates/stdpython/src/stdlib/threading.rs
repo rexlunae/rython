@@ -577,11 +577,7 @@ impl Local {
 
     /// `hasattr(tl, "name")` — in this thread.
     pub fn py_hasattr(&self, name: &str) -> bool {
-        LOCAL_ATTRS.with(|m| {
-            m.borrow()
-                .get(&self.id.0)
-                .is_some_and(|bag| bag.contains_key(name))
-        })
+        LOCAL_ATTRS.with(|m| m.borrow().get(&self.id.0).is_some_and(|bag| bag.contains_key(name)))
     }
 
     /// `del tl.name` — this thread's binding, or CPython's AttributeError.
@@ -598,11 +594,7 @@ impl Local {
 
 impl core::fmt::Debug for Local {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "<_thread._local object at 0x{:012x}>",
-            Arc::as_ptr(&self.id) as usize
-        )
+        write!(f, "<_thread._local object at 0x{:012x}>", Arc::as_ptr(&self.id) as usize)
     }
 }
 

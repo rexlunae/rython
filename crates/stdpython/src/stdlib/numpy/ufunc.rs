@@ -444,7 +444,10 @@ fn binary_array_scalar(
         _ => {
             panic!(
                 "{}",
-                PyException::new("TypeError", "unsupported array/scalar dtype combination")
+                PyException::new(
+                    "TypeError",
+                    "unsupported array/scalar dtype combination"
+                )
             )
         }
     };
@@ -518,10 +521,7 @@ binary_ufunc!(
 );
 
 /// `np.remainder(a, b)` — alias of np.mod.
-pub fn remainder<'a, L: Into<BinaryOperand<'a>>, R: Into<BinaryOperand<'a>>>(
-    a: L,
-    b: R,
-) -> NdArray {
+pub fn remainder<'a, L: Into<BinaryOperand<'a>>, R: Into<BinaryOperand<'a>>>(a: L, b: R) -> NdArray {
     binary(BinOp::Mod, a, b)
 }
 
@@ -559,8 +559,12 @@ fn logical<'a, L: Into<BinaryOperand<'a>>, R: Into<BinaryOperand<'a>>>(
                 Cow::Owned(broadcast_to(b, &shape)),
             )
         }
-        (BinaryOperand::Array(a), scalar) => (Cow::Borrowed(a), Cow::Owned(bool_of_scalar(scalar))),
-        (scalar, BinaryOperand::Array(b)) => (Cow::Owned(bool_of_scalar(scalar)), Cow::Borrowed(b)),
+        (BinaryOperand::Array(a), scalar) => {
+            (Cow::Borrowed(a), Cow::Owned(bool_of_scalar(scalar)))
+        }
+        (scalar, BinaryOperand::Array(b)) => {
+            (Cow::Owned(bool_of_scalar(scalar)), Cow::Borrowed(b))
+        }
         _ => panic!(
             "{}",
             PyException::new("TypeError", "logical ops need at least one array")

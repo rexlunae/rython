@@ -130,11 +130,7 @@ fn make_match(re: &regex::Regex, text: &str, caps: &regex::Captures) -> PyMatch 
         .capture_names()
         .map(|n| n.map(|n| n.to_string()))
         .collect();
-    PyMatch {
-        groups,
-        names,
-        string: text.to_string(),
-    }
+    PyMatch { groups, names, string: text.to_string() }
 }
 
 impl PyMatch {
@@ -215,6 +211,7 @@ impl PyMatch {
             .map(|i| self.group_entry(i).0.clone())
             .collect()
     }
+
 
     /// m.start(), in character offsets.
     pub fn start(&self) -> i64 {
@@ -417,7 +414,10 @@ pub fn compile(pattern: &str, flags: &str) -> Result<Regex, PyException> {
     let full = regex::Regex::new(&full_source).map_err(|e| {
         PyException::new(
             "re.error",
-            format!("cannot compile whole-text pattern {:?}: {}", full_source, e),
+            format!(
+                "cannot compile whole-text pattern {:?}: {}",
+                full_source, e
+            ),
         )
     })?;
     Ok(Regex { re, full })
@@ -468,7 +468,10 @@ pub fn findall<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
     let re = compile(pattern.as_ref(), flags)?;
     let text = string.as_ref();
     match re.captures_len() {
-        1 => Ok(re.find_iter(text).map(|m| m.as_str().to_string()).collect()),
+        1 => Ok(re
+            .find_iter(text)
+            .map(|m| m.as_str().to_string())
+            .collect()),
         2 => Ok(re
             .captures_iter(text)
             .map(|caps| {
@@ -525,9 +528,7 @@ pub fn findall3<P: AsRef<str> + ?Sized, S: AsRef<str> + ?Sized>(
 }
 
 fn cap_or_empty(caps: &regex::Captures, i: usize) -> String {
-    caps.get(i)
-        .map(|g| g.as_str().to_string())
-        .unwrap_or_default()
+    caps.get(i).map(|g| g.as_str().to_string()).unwrap_or_default()
 }
 
 /// The tuple arity is part of findall2/findall3's TYPE; a pattern with a
@@ -722,7 +723,12 @@ pub fn sub_re_callable(
 /// re.sub(COMPILED_PATTERN, string_repl, string, count): the string
 /// replacement form over an already-compiled pattern (the Python
 /// replacement syntax translates like the str-pattern sub's does).
-pub fn sub_re_str(re: &Regex, repl: &str, text: &str, count: i64) -> Result<String, PyException> {
+pub fn sub_re_str(
+    re: &Regex,
+    repl: &str,
+    text: &str,
+    count: i64,
+) -> Result<String, PyException> {
     if count < 0 {
         return Ok(text.to_string());
     }

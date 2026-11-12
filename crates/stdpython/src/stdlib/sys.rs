@@ -1,16 +1,17 @@
 //! Python sys module implementation
-//!
+//! 
 //! This module provides Python's sys module functionality including
 //! system-specific parameters and functions. Uses generic traits for
 //! maximum flexibility and reusability.
 
 use crate::python_function;
 
+
 /// sys.executable - path to the Python executable (property)
-///
+/// 
 /// In a real Python environment, this would be the path to the Python interpreter.
 /// For Rust-compiled Python code, we use the current executable path.
-///
+/// 
 /// Note: This uses lazy evaluation to get the actual executable path at runtime.
 pub static executable: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     std::env::current_exe()
@@ -19,15 +20,15 @@ pub static executable: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
 });
 
 /// sys.version_info - version information as a tuple-like structure
-///
+/// 
 /// Python's version_info is a named tuple with major, minor, micro, etc.
 /// For compiled code, we simulate Python version information.
 pub static version_info: std::sync::LazyLock<Vec<i32>> = std::sync::LazyLock::new(|| {
-    vec![3, 11, 0] // Simulate Python 3.11.0
+    vec![3, 11, 0]  // Simulate Python 3.11.0
 });
 
 /// sys.prefix - installation prefix
-///
+/// 
 /// In Python, this is the directory prefix where Python is installed.
 /// For compiled code, we use the executable's directory.
 pub static prefix: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
@@ -38,16 +39,18 @@ pub static prefix: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
 });
 
 /// sys.base_prefix - base installation prefix
-///
+/// 
 /// In Python, this is the base installation prefix (before virtual environments).
 /// For simplicity, we make it the same as prefix.
-pub static base_prefix: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| prefix.clone());
+pub static base_prefix: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    prefix.clone()
+});
 
 /// sys.argv - command line arguments (property)
-///
+/// 
 /// Returns the command line arguments passed to the program.
 /// This reflects the actual command line arguments, just like Python's sys.argv.
-///
+/// 
 /// Note: This uses lazy evaluation to get the actual command line arguments at runtime.
 pub static argv: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
     std::env::args_os()
@@ -61,9 +64,7 @@ pub static argv: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| 
 /// `prog` needs argv[0] only, and must not trip over an unrelated
 /// argument the program never reads (Devin review on #340, round 4).
 pub fn argv_at(index: usize) -> Option<String> {
-    std::env::args_os()
-        .nth(index)
-        .map(|arg| decode_argument(index, arg))
+    std::env::args_os().nth(index).map(|arg| decode_argument(index, arg))
 }
 
 /// The runtime's one policy for a process argument: CPython decodes a
@@ -210,7 +211,7 @@ python_function! {
     [signature: ()]
     [concrete_types: () -> String]
     {
-        format!("Python-to-Rust compiled code (rustc {})",
+        format!("Python-to-Rust compiled code (rustc {})", 
             option_env!("RUSTC_VERSION").unwrap_or("unknown"))
     }
 }

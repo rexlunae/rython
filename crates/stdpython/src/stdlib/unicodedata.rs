@@ -59,9 +59,7 @@ pub fn bidirectional<S: AsRef<str>>(ch: S) -> Result<String, PyException> {
 /// `unicodedata.combining(ch)`: the canonical combining class.
 pub fn combining<S: AsRef<str>>(ch: S) -> Result<i64, PyException> {
     let c = one_char("combining", ch.as_ref())?;
-    Ok(i64::from(
-        unicode_normalization::char::canonical_combining_class(c),
-    ))
+    Ok(i64::from(unicode_normalization::char::canonical_combining_class(c)))
 }
 
 /// `unicodedata.name(ch)`: the character's name — the algorithmic ones

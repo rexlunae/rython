@@ -37,8 +37,8 @@ impl BuiltinException {
     /// CPython's tree) and none of the stdlib-module exceptions
     /// (OSErrors); each surfaces through that ancestor.
     pub(crate) fn pyo3_err(self, msg: String) -> pyo3::PyErr {
-        use BuiltinException::*;
         use pyo3::exceptions::*;
+        use BuiltinException::*;
         match self {
             BaseException => PyBaseException::new_err(msg),
             Exception => PyException::new_err(msg),
@@ -92,18 +92,9 @@ impl BuiltinException {
             PermissionError => PyPermissionError::new_err(msg),
             ProcessLookupError => PyProcessLookupError::new_err(msg),
             TimeoutError => PyTimeoutError::new_err(msg),
-            URLError
-            | HTTPError
-            | ContentTooShortError
-            | Gaierror
-            | Herror
-            | SSLError
-            | SSLZeroReturnError
-            | SSLWantReadError
-            | SSLWantWriteError
-            | SSLSyscallError
-            | SSLEOFError
-            | SSLCertVerificationError => PyOSError::new_err(msg),
+            URLError | HTTPError | ContentTooShortError | Gaierror | Herror | SSLError
+            | SSLZeroReturnError | SSLWantReadError | SSLWantWriteError | SSLSyscallError
+            | SSLEOFError | SSLCertVerificationError => PyOSError::new_err(msg),
             NotImplementedError => PyNotImplementedError::new_err(msg),
             RecursionError => PyRecursionError::new_err(msg),
             PythonFinalizationError => PyRuntimeError::new_err(msg),

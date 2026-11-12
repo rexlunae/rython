@@ -95,11 +95,7 @@ macro_rules! boxed_bisect_seq {
         })*
     };
 }
-boxed_bisect_seq!(
-    crate::PyValue,
-    Vec<crate::PyValue>,
-    crate::PyTuple<crate::PyValue>
-);
+boxed_bisect_seq!(crate::PyValue, Vec<crate::PyValue>, crate::PyTuple<crate::PyValue>);
 
 /// bisect.bisect_left(a, x, lo=0, hi=len(a)): the first position where
 /// `x` could be inserted keeping `a` sorted (before any equal items).
@@ -187,10 +183,7 @@ mod tests {
         assert_eq!(bisect_left(&a, &2, 2, None).unwrap(), 2);
         assert_eq!(bisect_left(&a, &2, 0, Some(1)).unwrap(), 1);
         // lo=-1: ValueError: lo must be non-negative
-        assert_eq!(
-            bisect_left(&a, &2, -1, None).unwrap_err().message,
-            "lo must be non-negative"
-        );
+        assert_eq!(bisect_left(&a, &2, -1, None).unwrap_err().message, "lo must be non-negative");
         // hi past the end: IndexError: list index out of range
         assert_eq!(
             bisect_left(&a, &2, 0, Some(100)).unwrap_err().message,
@@ -233,3 +226,4 @@ impl BoxedSeq for crate::PyTuple<crate::PyValue> {
         Ok(self)
     }
 }
+

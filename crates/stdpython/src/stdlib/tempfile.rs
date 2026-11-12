@@ -1,5 +1,5 @@
 //! Python tempfile module implementation
-//!
+//! 
 //! This module provides facilities for creating temporary files and directories.
 //! Implementation matches Python's tempfile module API.
 
@@ -139,32 +139,27 @@ pub fn mktemp(suffix: Option<&str>, prefix: Option<&str>, dir: Option<&str>) -> 
     } else {
         gettempdir()
     };
-
+    
     let prefix = prefix.unwrap_or("tmp");
     let suffix = suffix.unwrap_or("");
-
+    
     // Generate random component
     let random_part = generate_random_string(8);
     let filename = format!("{}{}{}", prefix, random_part, suffix);
-
+    
     path.push(filename);
     path.to_string_lossy().to_string()
 }
 
 /// Create and open temporary file
 #[cfg(feature = "std")]
-pub fn mkstemp(
-    suffix: Option<&str>,
-    prefix: Option<&str>,
-    dir: Option<&str>,
-    _text: bool,
-) -> Result<(i32, String), PyException> {
+pub fn mkstemp(suffix: Option<&str>, prefix: Option<&str>, dir: Option<&str>, _text: bool) -> Result<(i32, String), PyException> {
     use std::fs::OpenOptions;
     #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-    #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
-
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    
     let mut attempts = 0;
     let max_attempts = 1000;
 
@@ -177,13 +172,13 @@ pub fn mkstemp(
 
     while attempts < max_attempts {
         let filename = mktemp(suffix, prefix, resolved_dir.as_deref());
-
+        
         let mut open_options = OpenOptions::new();
         open_options.read(true).write(true).create_new(true);
-
+        
         #[cfg(unix)]
         open_options.mode(0o600);
-
+        
         match open_options.open(&filename) {
             Ok(file) => {
                 #[cfg(unix)]
@@ -192,7 +187,7 @@ pub fn mkstemp(
                 let fd = 0; // Placeholder for Windows - would need proper implementation
                 #[cfg(not(any(unix, windows)))]
                 let fd = -1; // Fallback for other platforms
-
+                
                 std::mem::forget(file); // Don't close the file
                 return Ok((fd, filename));
             }
@@ -201,26 +196,17 @@ pub fn mkstemp(
                 continue;
             }
             Err(e) => {
-                return Err(crate::runtime_error(format!(
-                    "Failed to create temporary file: {}",
-                    e
-                )));
+                return Err(crate::runtime_error(format!("Failed to create temporary file: {}", e)));
             }
         }
     }
-
-    Err(crate::runtime_error(
-        "Failed to create temporary file after maximum attempts",
-    ))
+    
+    Err(crate::runtime_error("Failed to create temporary file after maximum attempts"))
 }
 
 /// Create temporary directory
 #[cfg(feature = "std")]
-pub fn mkdtemp(
-    suffix: Option<&str>,
-    prefix: Option<&str>,
-    dir: Option<&str>,
-) -> Result<String, PyException> {
+pub fn mkdtemp(suffix: Option<&str>, prefix: Option<&str>, dir: Option<&str>) -> Result<String, PyException> {
     let mut attempts = 0;
     let max_attempts = 1000;
 
@@ -233,14 +219,14 @@ pub fn mkdtemp(
 
     while attempts < max_attempts {
         let mut path = base.clone();
-
+        
         let prefix = prefix.unwrap_or("tmp");
         let suffix = suffix.unwrap_or("");
         let random_part = generate_random_string(8);
         let dirname = format!("{}{}{}", prefix, random_part, suffix);
-
+        
         path.push(dirname);
-
+        
         match std::fs::create_dir(&path) {
             Ok(_) => return Ok(path.to_string_lossy().to_string()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -248,17 +234,12 @@ pub fn mkdtemp(
                 continue;
             }
             Err(e) => {
-                return Err(crate::runtime_error(format!(
-                    "Failed to create temporary directory: {}",
-                    e
-                )));
+                return Err(crate::runtime_error(format!("Failed to create temporary directory: {}", e)));
             }
         }
     }
-
-    Err(crate::runtime_error(
-        "Failed to create temporary directory after maximum attempts",
-    ))
+    
+    Err(crate::runtime_error("Failed to create temporary directory after maximum attempts"))
 }
 
 /// Temporary file context manager
@@ -285,65 +266,62 @@ impl NamedTemporaryFile {
     ) -> Result<Self, PyException> {
         let (_, path_str) = mkstemp(suffix, prefix, dir, encoding.is_some())?;
         let path = PathBuf::from(&path_str);
-
+        
         let file = std::fs::File::options()
             .read(true)
             .write(true)
             .open(&path)
             .map_err(|e| crate::runtime_error(format!("Failed to open temporary file: {}", e)))?;
-
+            
         Ok(Self {
             file: Some(file),
             path,
             delete_on_drop: delete,
         })
     }
-
+    
     /// Get file name
     pub fn name(&self) -> String {
         self.path.to_string_lossy().to_string()
     }
-
+    
     /// Read from file
     pub fn read(&mut self, size: Option<usize>) -> Result<Vec<u8>, PyException> {
         use std::io::Read;
-
+        
         if let Some(ref mut file) = self.file {
             let mut buffer = Vec::new();
             if let Some(size) = size {
                 buffer.resize(size, 0);
-                let bytes_read = file.read(&mut buffer).map_err(|e| {
-                    crate::runtime_error(format!("Failed to read from temporary file: {}", e))
-                })?;
+                let bytes_read = file.read(&mut buffer)
+                    .map_err(|e| crate::runtime_error(format!("Failed to read from temporary file: {}", e)))?;
                 buffer.truncate(bytes_read);
             } else {
-                file.read_to_end(&mut buffer).map_err(|e| {
-                    crate::runtime_error(format!("Failed to read from temporary file: {}", e))
-                })?;
+                file.read_to_end(&mut buffer)
+                    .map_err(|e| crate::runtime_error(format!("Failed to read from temporary file: {}", e)))?;
             }
             Ok(buffer)
         } else {
             Err(crate::value_error("File is closed"))
         }
     }
-
+    
     /// Write to file
     pub fn write(&mut self, data: &[u8]) -> Result<usize, PyException> {
         use std::io::Write;
-
+        
         if let Some(ref mut file) = self.file {
-            file.write(data).map_err(|e| {
-                crate::runtime_error(format!("Failed to write to temporary file: {}", e))
-            })
+            file.write(data)
+                .map_err(|e| crate::runtime_error(format!("Failed to write to temporary file: {}", e)))
         } else {
             Err(crate::value_error("File is closed"))
         }
     }
-
+    
     /// Flush file
     pub fn flush(&mut self) -> Result<(), PyException> {
         use std::io::Write;
-
+        
         if let Some(ref mut file) = self.file {
             file.flush()
                 .map_err(|e| crate::runtime_error(format!("Failed to flush temporary file: {}", e)))
@@ -351,7 +329,7 @@ impl NamedTemporaryFile {
             Err(crate::value_error("File is closed"))
         }
     }
-
+    
     /// Close file
     pub fn close(&mut self) -> Result<(), PyException> {
         if self.file.is_some() {
@@ -361,11 +339,11 @@ impl NamedTemporaryFile {
             Err(crate::value_error("File already closed"))
         }
     }
-
+    
     /// Seek in file
     pub fn seek(&mut self, offset: i64, whence: i32) -> Result<u64, PyException> {
         use std::io::{Seek, SeekFrom};
-
+        
         if let Some(ref mut file) = self.file {
             let seek_from = match whence {
                 0 => SeekFrom::Start(offset as u64),
@@ -373,10 +351,9 @@ impl NamedTemporaryFile {
                 2 => SeekFrom::End(offset),
                 _ => return Err(crate::value_error("Invalid whence value")),
             };
-
-            file.seek(seek_from).map_err(|e| {
-                crate::runtime_error(format!("Failed to seek in temporary file: {}", e))
-            })
+            
+            file.seek(seek_from)
+                .map_err(|e| crate::runtime_error(format!("Failed to seek in temporary file: {}", e)))
         } else {
             Err(crate::value_error("File is closed"))
         }
@@ -412,18 +389,17 @@ impl TemporaryDirectory {
             path: Some(PathBuf::from(path_str)),
         })
     }
-
+    
     /// Get directory name
     pub fn name(&self) -> Option<String> {
         self.path.as_ref().map(|p| p.to_string_lossy().to_string())
     }
-
+    
     /// Cleanup directory
     pub fn cleanup(&mut self) -> Result<(), PyException> {
         if let Some(path) = self.path.take() {
-            std::fs::remove_dir_all(&path).map_err(|e| {
-                crate::runtime_error(format!("Failed to remove temporary directory: {}", e))
-            })?;
+            std::fs::remove_dir_all(&path)
+                .map_err(|e| crate::runtime_error(format!("Failed to remove temporary directory: {}", e)))?;
         }
         Ok(())
     }
@@ -466,47 +442,47 @@ impl SpooledTemporaryFile {
             file: None,
         }
     }
-
+    
     /// Write data
     pub fn write(&mut self, data: &[u8]) -> Result<usize, PyException> {
         if self.file.is_some() {
             return self.file.as_mut().unwrap().write(data);
         }
-
+        
         // Check if we need to roll over to file
         if self.data.len() + data.len() > self.max_size {
             self.rollover()?;
             return self.file.as_mut().unwrap().write(data);
         }
-
+        
         self.data.extend_from_slice(data);
         Ok(data.len())
     }
-
+    
     /// Read data
     pub fn read(&mut self, size: Option<usize>) -> Result<Vec<u8>, PyException> {
         if let Some(ref mut file) = self.file {
             return file.read(size);
         }
-
+        
         let available = self.data.len().saturating_sub(self.position);
         let to_read = size.map(|s| s.min(available)).unwrap_or(available);
-
+        
         if to_read == 0 {
             return Ok(Vec::new());
         }
-
+        
         let result = self.data[self.position..self.position + to_read].to_vec();
         self.position += to_read;
         Ok(result)
     }
-
+    
     /// Seek in file
     pub fn seek(&mut self, offset: i64, whence: i32) -> Result<u64, PyException> {
         if let Some(ref mut file) = self.file {
             return file.seek(offset, whence);
         }
-
+        
         // A negative absolute offset must raise ValueError, not clamp to 0
         // via an `as usize` wrap (issue #82).
         let new_position = match whence {
@@ -535,27 +511,28 @@ impl SpooledTemporaryFile {
             }
             _ => return Err(crate::value_error("Invalid whence value")),
         };
-
+        
         self.position = new_position.min(self.data.len());
         Ok(self.position as u64)
     }
-
+    
     /// Roll over to file
     fn rollover(&mut self) -> Result<(), PyException> {
         if self.file.is_some() {
             return Ok(());
         }
-
-        let mut temp_file =
-            NamedTemporaryFile::new(None, None, None, None, None, None, None, true)?;
-
+        
+        let mut temp_file = NamedTemporaryFile::new(
+            None, None, None, None, None, None, None, true
+        )?;
+        
         temp_file.write(&self.data)?;
         temp_file.seek(self.position as i64, 0)?;
-
+        
         self.file = Some(temp_file);
         self.data.clear();
         self.position = 0;
-
+        
         Ok(())
     }
 }
@@ -600,14 +577,14 @@ pub const TMP_MAX: usize = 10000;
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    
     #[cfg(feature = "std")]
     #[test]
     fn test_gettempdir() {
         let temp_dir = gettempdir();
         assert!(temp_dir.exists());
     }
-
+    
     #[cfg(feature = "std")]
     #[test]
     fn test_mktemp() {
@@ -615,7 +592,7 @@ mod tests {
         assert!(temp_file.contains("test_"));
         assert!(temp_file.ends_with(".txt"));
     }
-
+    
     #[cfg(feature = "std")]
     #[test]
     fn test_mkdtemp() {
@@ -656,7 +633,11 @@ mod tests {
         let env_names = ["TMPDIR", "TEMP", "TMP"];
         let env_count = env_names
             .iter()
-            .filter(|n| std::env::var_os(n).map(|v| !v.is_empty()).unwrap_or(false))
+            .filter(|n| {
+                std::env::var_os(n)
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+            })
             .count();
         for (index, name) in env_names.iter().enumerate().take(env_count) {
             let expected = std::env::var_os(name).unwrap();
@@ -678,7 +659,7 @@ mod tests {
             "the cwd is the last-resort candidate"
         );
     }
-
+    
     #[test]
     fn test_generate_random_string() {
         let s1 = generate_random_string(10);
