@@ -5864,6 +5864,23 @@ pub(crate) fn module_def_has_path_item(
     path: &[String],
     name: &str,
 ) -> bool {
+    module_def_has_own_path_item(options, path, name)
+        || reexport_origin(options, path, name, &mut std::collections::HashSet::new())
+            .is_some_and(|(origin, defining)| {
+                // The origin resolver follows the import chain to a
+                // direct definition. Check only that leaf's emitted path
+                // items, rather than starting another re-export walk:
+                // an init-local value is not a static, and cycles must
+                // not recurse through a fresh visited set (issue #557).
+                module_def_has_own_path_item(options, &origin, &defining)
+            })
+}
+
+fn module_def_has_own_path_item(
+    options: &crate::PythonOptions,
+    path: &[String],
+    name: &str,
+) -> bool {
     let Some(module) = options.module_defs.get(path) else {
         return false;
     };
@@ -9125,6 +9142,18 @@ pub fn module_defs_contains(options: &PythonOptions, path: &[String]) -> bool {
 /// its signature. Returns None when the module or the function is not
 /// found (an import of a builtin/stdlib name, a vendored non-module, ...).
 pub fn module_function_def(
+    options: &PythonOptions,
+    path: &[String],
+    name: &str,
+) -> Option<(crate::FunctionDef, SymbolTableScopes)> {
+    module_own_function_def(options, path, name).or_else(|| {
+        let (origin, defining) =
+            reexport_origin(options, path, name, &mut std::collections::HashSet::new())?;
+        module_own_function_def(options, &origin, &defining)
+    })
+}
+
+fn module_own_function_def(
     options: &PythonOptions,
     path: &[String],
     name: &str,

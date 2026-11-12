@@ -213,6 +213,8 @@ Absolute imports of a package's own modules (`from pkg import helper`,
 like relative imports, using the Python import name rather than the
 distribution name. Ambiguous root-relative layouts with an inner module
 also named `pkg` reject absolute self-imports; use relative imports.
+Function re-exports in converted packages remain callable through module
+attributes, including aliased and multi-hop relative re-exports.
 
 Known gaps:
 

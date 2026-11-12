@@ -203,7 +203,8 @@ print(pylev.wfi_levenshtein("a", "b"))  # -> crate::pylev::wfi_levenshtein(...)?
 Relative imports inside a vendored package resolve against the package path
 (`from .core import double` in `textlib/__init__.py` becomes
 `pub use crate::textlib::core::double;`, so `textlib.double` is a
-re-exported attribute exactly as in Python). Kernel modules (`--kernel-module`)
+re-exported attribute exactly as in Python). Aliased and multi-hop function
+re-exports remain callable through the package attribute too. Kernel modules (`--kernel-module`)
 compile a single entry file with no module tree and reject `[python-modules]`
 loudly.
 
