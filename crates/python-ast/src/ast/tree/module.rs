@@ -1676,6 +1676,7 @@ impl CodeGen for Module {
                                 .map_err(|e| wrap_module_error(&module_filename, e.into()))?;
                                 refuse_cross_module_runner_inputs(
                                     &module_raw_body,
+                                    &before,
                                     &cases,
                                     &symbols,
                                     &options,
@@ -2887,8 +2888,11 @@ impl CodeGen for Module {
         if !init_decls.is_empty() {
             module_init_stmts.insert(0, init_decls);
         }
+        // The __main__ block writes the same module statics as init;
+        // hoisting a local with that spelling would shadow their storage.
+        let main_hoist_skip = global_mutables.keys().cloned().collect();
         let main_decls =
-            hoisted_declarations(&main_body_raw, &ctx, &symbols, &options, &Default::default());
+            hoisted_declarations(&main_body_raw, &ctx, &symbols, &options, &main_hoist_skip);
         if !main_decls.is_empty() {
             main_body_stmts.insert(0, main_decls);
         }
@@ -3158,19 +3162,10 @@ impl CodeGen for Module {
                     let renamed_stream_str = Self::rename_main_function_and_references(&stream_str);
                     stream = renamed_stream_str.parse::<proc_macro2::TokenStream>()
                         .unwrap_or_else(|_| stream);
-                    stream.extend(quote! {
-                        #[allow(dead_code)]
-                        fn main() {
-                            let __rython_result = (|| -> Result<(), PyException> {
-                                #startup_init
-                                python_main()?;
-                                Ok(())
-                            })();
-                            if let Err(e) = __rython_result {
-                                stdpython::exit_uncaught(&e);
-                            }
-                        }
-                    });
+                    stream.extend(sync_program_entry(quote! {
+                        #startup_init
+                        python_main()?;
+                    }));
                 }
             } else {
                 // Complex main block - use existing behavior (rename user's main)
@@ -3244,19 +3239,10 @@ impl CodeGen for Module {
                     });
                 } else {
                     let init_call = &startup_init;
-                    stream.extend(quote! {
-                        #[allow(dead_code)]
-                        fn main() {
-                            let __rython_result = (|| -> Result<(), PyException> {
-                                #init_call
-                                #(#main_body_stmts;)*
-                                Ok(())
-                            })();
-                            if let Err(e) = __rython_result {
-                                stdpython::exit_uncaught(&e);
-                            }
-                        }
-                    });
+                    stream.extend(sync_program_entry(quote! {
+                        #init_call
+                        #(#main_body_stmts;)*
+                    }));
                 }
             }
         } else if needs_init_wrapper {
@@ -3274,18 +3260,7 @@ impl CodeGen for Module {
                 let renamed = Self::rename_main_function_and_references(&stream.to_string());
                 stream = renamed.parse::<proc_macro2::TokenStream>().unwrap_or(stream);
             }
-            stream.extend(quote! {
-                #[allow(dead_code)]
-                fn main() {
-                    let __rython_result = (|| -> Result<(), PyException> {
-                        #startup_init
-                        Ok(())
-                    })();
-                    if let Err(e) = __rython_result {
-                        stdpython::exit_uncaught(&e);
-                    }
-                }
-            });
+            stream.extend(sync_program_entry(startup_init));
         }
         // Module-level generated items collected during codegen (issue
         // #109, M3: duck-typing traits like HasSpeak and their per-class
@@ -3300,6 +3275,35 @@ impl CodeGen for Module {
             stream = prefix;
         }
         Ok(stream)
+    }
+}
+
+/// The name of a synchronous program's body as a function: what the
+/// binary's `fn main` runs, and what the JIT's `ry_entry` shim (rypip's
+/// cdylib mode, issue #166) calls without ending the host process.
+pub const PROGRAM_BODY_FN: &str = "__rython_main__";
+
+/// A synchronous program entry: the startup sequence and the program body
+/// as [`PROGRAM_BODY_FN`], returning an escaping exception, and `fn main`,
+/// which reports one as CPython does (`exit_uncaught`). Splitting the two
+/// gives an embedding host the exact body the binary runs, by
+/// construction. Both carry `#[allow(dead_code)]`: in the lib copy of an
+/// entry module nothing calls them (see the comment above the entry
+/// emission).
+fn sync_program_entry(body: TokenStream) -> TokenStream {
+    let body_fn = format_ident!("{}", PROGRAM_BODY_FN);
+    quote! {
+        #[allow(dead_code)]
+        pub(crate) fn #body_fn() -> Result<(), PyException> {
+            #body
+            Ok(())
+        }
+        #[allow(dead_code)]
+        fn main() {
+            if let Err(e) = #body_fn() {
+                stdpython::exit_uncaught(&e);
+            }
+        }
     }
 }
 
@@ -8019,12 +8023,149 @@ fn runner_cases(
     Ok(cases)
 }
 
+enum ClassFixtureDeclaration<'a> {
+    Method(&'a crate::FunctionDef, usize),
+    Async(usize),
+    Other(usize),
+}
+
+fn class_fixture_declaration<'a>(
+    class: &'a crate::ClassDef,
+    name: &str,
+) -> Option<ClassFixtureDeclaration<'a>> {
+    let mut declaration = None;
+    for stmt in &class.body {
+        let current = match &stmt.statement {
+            StatementType::FunctionDef(method) if method.name == name => {
+                Some(ClassFixtureDeclaration::Method(
+                    method,
+                    stmt.lineno.unwrap_or(0),
+                ))
+            }
+            StatementType::AsyncFunctionDef(method) if method.name == name => {
+                Some(ClassFixtureDeclaration::Async(stmt.lineno.unwrap_or(0)))
+            }
+            StatementType::FunctionDef(_) | StatementType::AsyncFunctionDef(_) => None,
+            _ if crate::ast::tree::visit::stmt_bound_names(
+                stmt,
+                crate::ast::tree::visit::Bindings::Scope,
+            )
+            .iter()
+            .any(|bound| bound == name) => Some(ClassFixtureDeclaration::Other(
+                stmt.lineno.unwrap_or(0),
+            )),
+            _ => None,
+        };
+        if let Some(current) = current {
+            if declaration.is_some() {
+                return Some(ClassFixtureDeclaration::Other(stmt.lineno.unwrap_or(0)));
+            }
+            declaration = Some(current);
+        }
+    }
+    declaration
+}
+
+/// Module names read by a gate. Use the shared expression enumeration,
+/// excluding store targets and names local to lambdas/comprehensions.
+fn gate_module_reads(expr: &crate::ExprType) -> std::collections::HashSet<String> {
+    use super::visit;
+    use std::collections::HashSet;
+    fn read(expr: &crate::ExprType, shadowed: &HashSet<String>, out: &mut HashSet<String>) {
+        match expr {
+            crate::ExprType::Name(n) if !shadowed.contains(&n.id) => {
+                out.insert(n.id.clone());
+            }
+            crate::ExprType::NamedExpr(ne) => {
+                // The walrus target stores; only its RHS reads a name.
+                read(&ne.right, shadowed, out);
+                return;
+            }
+            crate::ExprType::Lambda(lambda) => {
+                for default in lambda.args.defaults.iter().map(|d| d.as_ref())
+                    .chain(lambda.args.kw_defaults.iter().flatten().map(|d| d.as_ref()))
+                {
+                    read(default, shadowed, out);
+                }
+                let mut inner = shadowed.clone();
+                inner.extend(lambda.args.posonlyargs.iter().chain(lambda.args.args.iter())
+                    .chain(lambda.args.kwonlyargs.iter()).chain(lambda.args.vararg.iter())
+                    .chain(lambda.args.kwarg.iter()).map(|p| p.arg.clone()));
+                // A walrus in the body also declares a lambda-local name.
+                visit::any_expr_for(&lambda.body, Descend::OwnScope, |e| {
+                    if let crate::ExprType::NamedExpr(ne) = e {
+                        inner.extend(visit::target_names(&ne.left).into_iter().map(str::to_owned));
+                    }
+                    false
+                });
+                read(&lambda.body, &inner, out);
+                return;
+            }
+            _ => {}
+        }
+        if let Some((elements, generators)) = visit::comprehension_parts(expr) {
+            if let Some(first) = generators.first() {
+                read(&first.iter, shadowed, out);
+            }
+            let mut inner = shadowed.clone();
+            for generator in generators {
+                inner.extend(visit::target_names(&generator.target).into_iter().map(str::to_owned));
+            }
+            for (index, generator) in generators.iter().enumerate() {
+                if index > 0 { read(&generator.iter, &inner, out); }
+                for filter in &generator.ifs { read(filter, &inner, out); }
+            }
+            for element in elements { read(element, &inner, out); }
+            return;
+        }
+        for sub in visit::subexprs_for(expr, Descend::OwnScope) {
+            read(sub, shadowed, out);
+        }
+    }
+    let mut out = HashSet::new();
+    read(expr, &HashSet::new(), &mut out);
+    out
+}
+
+/// Potential function stores to explicitly declared module globals, keeping
+/// each function's declarations separate from its nested function scopes.
+fn gate_global_writes(stmts: &[crate::Statement]) -> Vec<(String, usize)> {
+    use super::visit::{self, Bindings};
+    let mut writes = Vec::new();
+    walk_stmts(stmts, Descend::All, &mut |s| {
+        let (crate::StatementType::FunctionDef(def) | crate::StatementType::AsyncFunctionDef(def)) =
+            &s.statement else { return Flow::Continue; };
+        let mut globals = std::collections::HashSet::new();
+        let mut stores = Vec::new();
+        walk_stmts(&def.body, Descend::OwnScope, &mut |s| {
+            if let crate::StatementType::Global(names) = &s.statement {
+                globals.extend(names.iter().cloned());
+            }
+            for name in visit::stmt_bound_names(s, Bindings::Scope) {
+                stores.push((name, s.lineno.unwrap_or(0)));
+            }
+            if let crate::StatementType::Delete(targets) = &s.statement {
+                for target in targets {
+                    for name in visit::target_names(target) {
+                        stores.push((name.to_owned(), s.lineno.unwrap_or(0)));
+                    }
+                }
+            }
+            Flow::Continue
+        });
+        writes.extend(stores.into_iter().filter(|(name, _)| globals.contains(name)));
+        Flow::Continue
+    });
+    writes
+}
+
 /// The runner renders gate conditions and test-method defaults in THIS
 /// module. If a class takes one from another module (its own, imported, or
 /// an ancestor's), it would be evaluated against the wrong names, so it is
 /// refused.
 fn refuse_cross_module_runner_inputs(
     module_stmts: &[crate::Statement],
+    before_runner: &[crate::Statement],
     cases: &[(String, RunnerCase)],
     symbols: &crate::SymbolTableScopes,
     options: &crate::PythonOptions,
@@ -8036,6 +8177,66 @@ fn refuse_cross_module_runner_inputs(
     };
     let mut classes: Vec<crate::ClassDef> = Vec::new();
     collect_class_defs(module_stmts, &mut classes);
+    let mut class_positions = std::collections::HashMap::new();
+    let mut module_stores = Vec::new();
+    // Hoisted nested classes may be absent from the runner's binding
+    // prefix; their original definition positions are still relevant.
+    walk_stmts(module_stmts, Descend::SkipDefs, &mut |s| {
+        if let crate::StatementType::ClassDef(c) = &s.statement
+            && let Some(pos) = s.lineno.zip(s.col_offset)
+        {
+            class_positions.insert(c.name.clone(), pos);
+        }
+        Flow::Continue
+    });
+    // Restrict direct stores to the prefix that has executed at THIS
+    // runner call, including earlier __main__ blocks (#521).
+    walk_stmts(before_runner, Descend::SkipDefs, &mut |s| {
+        if let Some(pos) = s.lineno.zip(s.col_offset) {
+            for name in crate::ast::tree::visit::stmt_bound_names(
+                s,
+                crate::ast::tree::visit::Bindings::Scope,
+            ) {
+                module_stores.push((name, pos));
+            }
+        }
+        Flow::Continue
+    });
+    // A helper (or test method) may rebind a global even if its definition
+    // precedes the class. Without call-effect analysis, conservatively
+    // refuse potential global writes in functions available to this runner.
+    let global_writes = gate_global_writes(before_runner);
+    let refuse_rebound_gate = |class_name: &str,
+                               class_pos: (usize, usize),
+                               decorators: &[crate::ExprType]|
+     -> Result<(), String> {
+        for gate in run_gates(decorators) {
+            let (gate_name, condition) = match gate {
+                RunGate::SkipIf(condition) => ("skipIf", condition),
+                RunGate::SkipUnless(condition) => ("skipUnless", condition),
+                _ => continue,
+            };
+            let mut reads: Vec<_> = gate_module_reads(&condition).into_iter().collect();
+            reads.sort();
+            for name in reads {
+                let write = module_stores.iter()
+                    .find(|(stored, pos)| stored == &name && *pos > class_pos)
+                    .map(|(_, (line, _))| (*line, "after its class definition"))
+                    .or_else(|| global_writes.iter().find(|(stored, _)| stored == &name)
+                        .map(|(_, line)| (*line, "by a function declaring it global")));
+                if let Some((line, how)) = write {
+                    return Err(format!(
+                        "unittest.main(): `{gate_name}` condition `{name}` on TestCase \
+                         `{class_name}` may be rebound at line {line} {how}; \
+                         rython cannot preserve the decorator-time value yet; \
+                         move the rebinding before the class or use an unchanged condition; \
+                         rython refuses to silently evaluate it later"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    };
     // A base spelled through its module (`class Child(cases.Base)`) is not
     // followed by the base chain, so a TestCase reached that way would be
     // silently left out of the run.
@@ -8061,6 +8262,32 @@ fn refuse_cross_module_runner_inputs(
     }
     for (name, case) in cases {
         let imported = case.module.is_some();
+        if !imported {
+            let test_names = test_method_names(&case.class, &case.symbols, &case.options);
+            for (ancestor, _, _, path) in
+                case.class.cross_module_chain(&case.symbols, &case.options)
+            {
+                if path.is_none()
+                    && let Some(&class_pos) = class_positions.get(&ancestor.name)
+                {
+                    refuse_rebound_gate(&ancestor.name, class_pos, &ancestor.decorator_list)?;
+                }
+            }
+            // Match the runner's MRO lookup: an overridden ancestor method's
+            // gate is never evaluated for this descendant.
+            for method in &test_names {
+                if let Some((def, other_module)) =
+                    testcase_method(&case.class, method, &case.symbols, &case.options)
+                    && !other_module
+                    && let Some((owner, ..)) = case.class
+                        .cross_module_chain(&case.symbols, &case.options)
+                        .into_iter().find(|(c, ..)| c.methods().any(|m| m.name == *method))
+                    && let Some(&class_pos) = class_positions.get(&owner.name)
+                {
+                    refuse_rebound_gate(&owner.name, class_pos, &def.decorator_list)?;
+                }
+            }
+        }
         let refuse = |what: String| {
             let how = if imported { "is imported with" } else { "inherits" };
             Err(format!(
@@ -8070,6 +8297,67 @@ fn refuse_cross_module_runner_inputs(
                  silently evaluate it in the wrong scope"
             ))
         };
+        let c = &case.class;
+        for hook in super::testcase::Fixture::CLASS {
+            let fixture = hook.name();
+            let Some(declaration) = class_fixture_declaration(c, fixture) else {
+                if c.cross_module_chain(&case.symbols, &case.options)
+                    .iter()
+                    .skip(1)
+                    .any(|(ancestor, ..)| {
+                        class_fixture_declaration(ancestor, fixture).is_some()
+                    })
+                {
+                    return Err(format!(
+                        "unittest.main(): TestCase `{}` inherits `{fixture}` from another class; \
+                         inherited class fixtures are not supported yet; define `{fixture}` directly \
+                         on each TestCase or remove it; rython refuses to silently omit the fixture",
+                        c.name
+                    ));
+                }
+                continue;
+            };
+            let (def, line) = match declaration {
+                ClassFixtureDeclaration::Method(method, line) => (method, line),
+                ClassFixtureDeclaration::Async(line) => {
+                    return Err(format!(
+                        "unittest.main(): TestCase `{}` async `{fixture}` at line {line} is not \
+                         supported; class fixtures must be synchronous; rython refuses to silently \
+                         omit the fixture",
+                        c.name
+                    ));
+                }
+                ClassFixtureDeclaration::Other(line) => {
+                    return Err(format!(
+                        "unittest.main(): TestCase `{}` binds `{fixture}` at line {line} without \
+                         a supported fixture method; use a direct `@classmethod` or \
+                         `@staticmethod`; rython refuses to silently omit the fixture",
+                        c.name
+                    ));
+                }
+            };
+            let method_shape = match crate::ast::tree::decorator::parse_decorator(&def.decorator_list) {
+                Ok(Some(crate::ast::tree::decorator::Decorator::ClassMethod)) => {
+                    def.args.posonlyargs.len() + def.args.args.len() == 1
+                }
+                Ok(Some(crate::ast::tree::decorator::Decorator::StaticMethod)) => {
+                    def.args.posonlyargs.is_empty() && def.args.args.is_empty()
+                }
+                _ => false,
+            } && def.args.defaults.is_empty()
+                && def.args.kwonlyargs.is_empty()
+                && def.args.vararg.is_none()
+                && def.args.kwarg.is_none();
+            if !method_shape {
+                return Err(format!(
+                    "unittest.main(): TestCase `{}` `{fixture}` at line {line} must be a \
+                     `@classmethod` with only its class parameter, or a zero-argument \
+                     `@staticmethod`; other class-fixture signatures are not supported yet; \
+                     rython refuses to silently omit the fixture",
+                    c.name
+                ));
+            }
+        }
         for (ancestor, _, _, path) in case.class.cross_module_chain(&case.symbols, &case.options) {
             if (imported || path.is_some()) && conditional(&ancestor.decorator_list) {
                 return refuse(format!("`{}`'s skipIf/skipUnless condition", ancestor.name));
@@ -8140,12 +8428,63 @@ fn emit_test_runner(
         return None;
     }
     let mut stmts = TokenStream::new();
+    let truth = |cond: &crate::ExprType| -> Option<TokenStream> {
+        crate::ExprType::Call(crate::Call {
+            func: Box::new(crate::ExprType::Name(crate::ast::tree::name::Name {
+                id: "bool".to_string(),
+            })),
+            args: vec![cond.clone()],
+            keywords: Vec::new(),
+            lineno: None,
+        })
+        .to_rust(ctx.clone(), options.clone(), symbols.clone())
+        .ok()
+    };
+    // Empty suites do not end CPython's active-class interval. Adjacent
+    // aliases still load separate copies of the tests, sharing fixtures.
+    let mut intervals: Vec<(&RunnerCase, usize)> = Vec::new();
     for (_, case) in cases {
+        if test_method_names(&case.class, &case.symbols, &case.options).is_empty() {
+            continue;
+        }
+        if let Some((previous, count)) = intervals.last_mut()
+            && previous.class_id(&options) == case.class_id(&options)
+        {
+            *count += 1;
+        } else {
+            intervals.push((case, 1));
+        }
+    }
+    for (case, suite_count) in intervals {
         let c = &case.class;
         // The class's own scope answers for its MRO: an imported class's
         // bases, fixtures and tests are its defining module's.
         let (class_symbols, class_options) = (&case.symbols, &case.options);
         let cname = quote::format_ident!("{}", case.rust_name);
+        let method_names = test_method_names(c, class_symbols, class_options);
+        if method_names.is_empty() {
+            continue;
+        }
+        let class_gates: Vec<RunGate> = c.cross_module_chain(class_symbols, class_options)
+            .iter()
+            .flat_map(|(class, ..)| run_gates(&class.decorator_list))
+            .collect();
+        let mut class_skip_terms: Vec<TokenStream> = Vec::new();
+        let mut class_expected_failure = false;
+        for gate in &class_gates {
+            match gate {
+                RunGate::Skip | RunGate::CpythonOnly => class_skip_terms.push(quote!(true)),
+                RunGate::SkipIf(cond) => {
+                    let condition = truth(cond)?;
+                    class_skip_terms.push(quote!((#condition)));
+                }
+                RunGate::SkipUnless(cond) => {
+                    let condition = truth(cond)?;
+                    class_skip_terms.push(quote!(!(#condition)));
+                }
+                RunGate::ExpectedFailure => class_expected_failure = true,
+            }
+        }
         // `setUp`/`tearDown` are per-test fixtures (CPython runs setUp before
         // and tearDown after every test method); an exception in either is
         // reported against the test, as `TestCase.run` reports it.
@@ -8160,7 +8499,9 @@ fn emit_test_runner(
             quote!(|_: &mut #cname| Ok(()))
         };
         let class_id = case.class_id(&options);
-        for m in test_method_names(c, class_symbols, class_options) {
+        let method_count = method_names.len() * suite_count;
+        let mut class_tests = TokenStream::new();
+        for m in method_names {
             let mident = quote::format_ident!("{}", m);
             // A test method with DEFAULTED parameters (`def test_encode(self,
             // encode=None, skip_bytes=False)` — idna's tests, issue #334):
@@ -8200,9 +8541,10 @@ fn emit_test_runner(
             // The class's gates, then the method's (issue #371). A skipped
             // test is never constructed, set up, or run — CPython decides
             // the skip before setUp. Each condition is evaluated when the
-            // runner reaches the test; CPython evaluates it when the
-            // decorator runs at import, which differs only for a condition
-            // the module rebinds after defining the class.
+            // runner reaches the test, not when its decorator executes.
+            // The preflight refuses a referenced module name rebound after
+            // the class definition (#521); other expressions with observable
+            // evaluation effects remain a documented timing limit.
             let method_decorators = test_def
                 .as_ref()
                 .map(|f| f.decorator_list.clone())
@@ -8211,24 +8553,9 @@ fn emit_test_runner(
             // skipIf/skipUnless is an identity decorator, so an ancestor's
             // active skip still applies; combining their active gates
             // preserves that behavior.
-            let mut gates: Vec<RunGate> = c.cross_module_chain(class_symbols, class_options)
-                .iter()
-                .flat_map(|(class, ..)| run_gates(&class.decorator_list))
-                .collect();
-            gates.extend(run_gates(&method_decorators));
-            let truth = |cond: &crate::ExprType| -> Option<TokenStream> {
-                crate::ExprType::Call(crate::Call {
-                    func: Box::new(crate::ExprType::Name(crate::ast::tree::name::Name {
-                        id: "bool".to_string(),
-                    })),
-                    args: vec![cond.clone()],
-                    keywords: Vec::new(),
-                })
-                .to_rust(ctx.clone(), options.clone(), symbols.clone())
-                .ok()
-            };
+            let gates = run_gates(&method_decorators);
             let mut skip_terms: Vec<TokenStream> = Vec::new();
-            let mut expected_failure = false;
+            let mut expected_failure = class_expected_failure;
             for g in &gates {
                 match g {
                     RunGate::Skip | RunGate::CpythonOnly => skip_terms.push(quote!(true)),
@@ -8273,9 +8600,9 @@ fn emit_test_runner(
                 );
             }};
             if skip_terms.is_empty() {
-                stmts.extend(run);
+                class_tests.extend(run);
             } else {
-                stmts.extend(quote! {
+                class_tests.extend(quote! {
                     if #(#skip_terms)||* {
                         __rython_result.add_skip();
                     } else {
@@ -8283,6 +8610,58 @@ fn emit_test_runner(
                     }
                 });
             }
+        }
+        let suite = class_tests.clone();
+        for _ in 1..suite_count {
+            class_tests.extend(suite.clone());
+        }
+        if !class_tests.is_empty() {
+            let class_skip = if class_skip_terms.is_empty() {
+                quote!(false)
+            } else {
+                quote!(#(#class_skip_terms)||*)
+            };
+            let mut class_skipped_tests = TokenStream::new();
+            for _ in 0..method_count {
+                class_skipped_tests.extend(quote!(__rython_result.add_skip();));
+            }
+            let setup_class = if c.methods().any(|method| super::testcase::Fixture::from_name(&method.name) == Some(super::testcase::Fixture::SetUpClass)) {
+                quote!(#cname::setUpClass())
+            } else {
+                quote!(Ok::<(), stdpython::PyException>(()))
+            };
+            let teardown_class = if c.methods().any(|method| super::testcase::Fixture::from_name(&method.name) == Some(super::testcase::Fixture::TearDownClass)) {
+                quote!(#cname::tearDownClass())
+            } else {
+                quote!(Ok::<(), stdpython::PyException>(()))
+            };
+            let setup_description = format!("setUpClass ({class_id})");
+            let teardown_description = format!("tearDownClass ({class_id})");
+            stmts.extend(quote! {
+                let __rython_class_skipped = #class_skip;
+                if __rython_class_skipped {
+                    #class_skipped_tests
+                } else if let Err(__rython_class_error) = #setup_class {
+                    if !__rython_class_error.matches_builtin(stdpython::BuiltinException::Exception) {
+                        return Err(__rython_class_error);
+                    }
+                    __rython_result.add_class_error(
+                        #setup_description,
+                        &__rython_class_error,
+                    );
+                } else {
+                    #class_tests
+                    if let Err(__rython_class_error) = #teardown_class {
+                        if !__rython_class_error.matches_builtin(stdpython::BuiltinException::Exception) {
+                            return Err(__rython_class_error);
+                        }
+                        __rython_result.add_class_error(
+                            #teardown_description,
+                            &__rython_class_error,
+                        );
+                    }
+                }
+            });
         }
     }
     // `unittest.main()` prints the report and exits with the run's status;
@@ -8324,9 +8703,28 @@ fn docstring_value(body: &[crate::Statement]) -> Option<String> {
 /// `name` through a from-import whose dotted module's LAST segment equals
 /// this module's — because resolving each sibling's relative imports here
 /// would repeat the whole chain machinery; a false positive only emits an
-/// unused accessor-only trait (dead code, never an error), while a miss
+/// unused trait (dead code, never an error), while a miss
 /// leaves an unresolved `{Name}Trait` (E0405).
 pub(crate) fn class_subclassed_crate_wide(name: &str, options: &crate::PythonOptions) -> bool {
+    class_subclassed_in_modules(name, options, false)
+}
+
+/// Whether a class is subclassed by an import-reachable `__main__.py`
+/// module. Such a base needs its methods on a public trait for the entry
+/// module's inheritance implementation, even though entry classes cannot
+/// participate in the library's shared hierarchy enum (#530).
+pub(crate) fn class_subclassed_by_entry_module(
+    name: &str,
+    options: &crate::PythonOptions,
+) -> bool {
+    class_subclassed_in_modules(name, options, true)
+}
+
+fn class_subclassed_in_modules(
+    name: &str,
+    options: &crate::PythonOptions,
+    entry_only: bool,
+) -> bool {
     let Some(this_leaf) = options.this_module_path.last() else {
         return false;
     };
@@ -8346,6 +8744,9 @@ pub(crate) fn class_subclassed_crate_wide(name: &str, options: &crate::PythonOpt
     }
     for (path, module) in options.module_defs.iter() {
         if path[..] == options.this_module_path[..] {
+            continue;
+        }
+        if entry_only && path.last().is_none_or(|part| part != "__main__") {
             continue;
         }
         let mut classes = Vec::new();
@@ -8376,7 +8777,7 @@ pub(crate) fn class_subclassed_crate_wide(name: &str, options: &crate::PythonOpt
 pub fn module_class_traits(
     options: &PythonOptions,
     path: &[String],
-) -> std::collections::HashMap<String, Vec<String>> {
+) -> std::collections::HashMap<String, Vec<(Vec<String>, String)>> {
     module_class_info(options, path)
         .map(|info| info.traits.clone())
         .unwrap_or_default()
@@ -8886,24 +9287,82 @@ fn module_class_info(
             return table.get(path).cloned();
         }
     }
-    // First use: build the table for every module in one pass (the build
-    // consults only the module's own AST and symbols, so it cannot re-enter
-    // this cache).
+    // First build per-module symbols and class facts without following
+    // imported bases. The second pass follows those chains after publishing
+    // the table, so cross-module imports resolve without recursively
+    // rebuilding the cache.
     let mut table = std::collections::HashMap::new();
     // The call-site-inferred method parameters (method_params.rs), when
     // computed: every module's classes carry them as annotations, exactly
     // as the module's own conversion does.
     let inferred = crate::ast::tree::method_params::computed(options);
     for (module_path, module) in options.module_defs.iter() {
+        let mut module_options = options.clone();
+        let is_package = options
+            .module_defs
+            .keys()
+            .any(|k| k.len() > module_path.len() && k[..module_path.len()] == module_path[..]);
+        module_options.module_path = if is_package {
+            module_path.clone()
+        } else {
+            module_path[..module_path.len().saturating_sub(1)].to_vec()
+        };
+        module_options.this_module_path = module_path.clone();
         let info = match &inferred {
             Some(map) if !map.is_empty() => {
                 let mut annotated: crate::Module = (**module).clone();
                 crate::ast::tree::method_params::annotate(&mut annotated.raw.body, map);
-                module_class_info_for(&annotated)
+                module_class_info_for(&annotated, &module_options)
             }
-            _ => module_class_info_for(module),
+            _ => module_class_info_for(module, &module_options),
         };
         table.insert(module_path.clone(), std::rc::Rc::new(info));
+    }
+    // Publish the class/symbol facts before following imported base chains:
+    // `base_chain_with_options` resolves through this cache, so classifying
+    // every trait in one pass would recursively rebuild it.
+    *options.cross_module_classes.borrow_mut() =
+        CrossModuleClasses::Computed(std::rc::Rc::new(table.clone()));
+    let mut trait_updates = std::collections::HashMap::new();
+    for (module_path, _) in options.module_defs.iter() {
+        let Some(info) = table.get(module_path) else {
+            continue;
+        };
+        let mut module_options = options.clone();
+        let is_package = options
+            .module_defs
+            .keys()
+            .any(|k| k.len() > module_path.len() && k[..module_path.len()] == module_path[..]);
+        module_options.module_path = if is_package {
+            module_path.clone()
+        } else {
+            module_path[..module_path.len().saturating_sub(1)].to_vec()
+        };
+        module_options.this_module_path = module_path.clone();
+        let mut traits = info.traits.clone();
+        for class in info.classes.values() {
+            if traits.contains_key(&class.name) {
+                traits.insert(
+                    class.name.clone(),
+                    class
+                        .cross_module_chain(&info.symbols, &module_options)
+                        .iter()
+                        .map(|(ancestor, _, _, path)| {
+                            (
+                                path.clone().unwrap_or_else(|| module_path.clone()),
+                                format!("{}Trait", ancestor.name),
+                            )
+                        })
+                        .collect(),
+                );
+            }
+        }
+        trait_updates.insert(module_path.clone(), traits);
+    }
+    for (module_path, traits) in trait_updates {
+        if let Some(info) = table.get_mut(&module_path) {
+            std::rc::Rc::make_mut(info).traits = traits;
+        }
     }
     *options.cross_module_classes.borrow_mut() =
         CrossModuleClasses::Computed(std::rc::Rc::new(table));
@@ -8928,8 +9387,8 @@ impl CrossModuleClasses {
 }
 
 /// Build the class facts for one module: its symbol table, top-level
-/// classes by name, and hierarchy-class → trait names.
-fn module_class_info_for(module: &crate::Module) -> ModuleClassInfo {
+/// classes by name, and the set of classes that need trait imports.
+fn module_class_info_for(module: &crate::Module, options: &PythonOptions) -> ModuleClassInfo {
     let symbols = module.clone().find_symbols(SymbolTableScopes::new());
     let mut classes = std::collections::HashMap::new();
     // Classes come from the SYMBOL TABLE, not the raw body: find_symbols
@@ -8944,6 +9403,13 @@ fn module_class_info_for(module: &crate::Module) -> ModuleClassInfo {
     collect_class_defs(&module.raw.body, &mut class_list);
     let mut hierarchy = std::collections::HashSet::new();
     for c in &class_list {
+        // A class that is a base only in another module still emits a trait
+        // there for inherited dispatch. Include that trait in the import
+        // registry as well, so `from .base import Base` brings `BaseTrait`
+        // into scope with the class (#531).
+        if class_subclassed_crate_wide(&c.name, options) {
+            hierarchy.insert(c.name.clone());
+        }
         let has_real_base = c
             .bases
             .iter()
@@ -8978,12 +9444,7 @@ fn module_class_info_for(module: &crate::Module) -> ModuleClassInfo {
         {
             continue;
         }
-        let t: Vec<String> = c
-            .base_chain(&symbols)
-            .iter()
-            .map(|cc| format!("{}Trait", cc.name))
-            .collect();
-        traits.insert(c.name.clone(), t);
+        traits.insert(c.name.clone(), Vec::new());
     }
     ModuleClassInfo {
         symbols,

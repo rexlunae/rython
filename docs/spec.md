@@ -712,7 +712,9 @@ stores one element or the remaining list. When a later RHS element is a
 non-literal expression, attribute unpacking is also rejected: an earlier
 property setter could mutate a global or captured value that the later
 element reads, whereas Python evaluates the entire RHS before any store.
-Unpack into locals first, then assign the attributes separately.
+Unpack into locals first, then assign the attributes separately. The starred-store refusal reports the assignment line
+and indexing/separate-store rewrite even when the attribute is a
+non-starred leaf (`self.first, *rest = values`).
 
 ### 5.3 `with`
 
@@ -767,6 +769,12 @@ Consequences, all enforced loudly:
   spelling.
 - Imports of user modules within the converted package resolve to the
   generated Rust modules.
+- In package conversion, an unshadowed module-level `__name__` read is
+  the module's dotted Python import name (`MyPkg.helper` for
+  `MyPkg/helper.py`), preserving its import spelling independently of
+  sanitized Rust module identifiers; the separately generated executable
+  entry copy uses `__main__`. The package integration transcript pins both
+  against CPython (issue #534).
 - **Import guards are decided statically.** A module-level
   `try: import X … except ImportError:` (bare, or a tuple of
   ImportError/AttributeError) folds at conversion time, because
@@ -1931,8 +1939,11 @@ impl Point {
   assume a test completed its writes before raising. A helper method may
   read the fields every successful `setUp` exit assigns, unless `setUp`
   reaches it (directly or through other helpers): such a helper can run
-  before those stores, so it must initialize its own reads. Calls do not
-  establish field facts. `@staticmethod`/`@classmethod` members have no
+  before those stores, so it must initialize its own reads. Ordinary
+  calls do not establish field facts; a statically resolved
+  `super().method(...)` call is analyzed through its target body, so its
+  field reads and normal-exit stores participate in the proof.
+  `@staticmethod`/`@classmethod` members have no
   instance receiver and are not analyzed. A class data attribute that a
   field shadows (`value = 0`, then `self.value = 5` in `setUp`) follows
   the field rule, so a read before the instance store is refused rather
@@ -1947,12 +1958,39 @@ impl Point {
   `test_b.__unittest_skip__ = True`) are refused for every TestCase,
   since CPython's runner reads them and the emitted runner honors only
   the decorators (issue #512).
+  Direct `setUpClass`/`tearDownClass` fixtures run once per class around
+  its tests; a skipped class runs neither, a setup error is reported as
+  unittest's synthetic class-fixture error and suppresses that class's
+  tests and teardown, and a teardown error is reported after its tests.
+  Class fixtures must be directly defined as a one-parameter
+  `@classmethod` or zero-parameter `@staticmethod`. Inherited class
+  fixtures and other signatures are refused at conversion rather than
+  omitted or called with the wrong class.
   Manual construction of cases with fields and explicit calls/captures
-  of lifecycle methods (including through `super()`) are refused: use
-  `unittest.main()` so the fixture-order proof applies. If `setUp` has
-  no successful exit, neither the test nor `tearDown` is reached.
+  of lifecycle methods on an instance are refused: use `unittest.main()`
+  so the fixture-order proof applies. In a fixture, `super().setUp()` and
+  `super().tearDown()` resolve along a statically modeled TestCase base
+  chain (including TestCase's no-op hook); an MRO or target the converter
+  cannot resolve is refused rather than lowered to a recursive self-call.
+  Other zero-argument `super().method(...)` calls in a TestCase body use
+  the same resolved chain, including user-defined helpers called from a
+  test or fixture. The nearest chain implementation is analyzed in place,
+  so its field reads and normal-exit stores participate in the caller's
+  proof; unsupported MROs, unsupported TestCase methods, or unsupported
+  targets are refused with the call's source line rather than falling
+  back to a possible recursive self-call.
+  If `setUp` has no successful exit, neither the test nor `tearDown` is
+  reached.
   These restrictions prevent Rust construction defaults from becoming
   observable as Python values before assignment.
+- **`assertRaises` context managers** catch the expected exception and
+  propagate an unexpected one. The `as cm` form supports reads of
+  `cm.exception` after the block; other uses or bindings of the context
+  object, and reads before the block completes are refused. A later read is
+  also refused when control flow cannot prove the target was bound (for
+  example, when the `with` is conditional), as is control flow escaping the
+  block; these cases would silently change context-manager semantics
+  (issue #523).
 - **Construction**: `Point(1.0, 2.0)` lowers to `Point::new(…)?`. The
   synthesized `new` defaults the struct then runs `__init__`. A
   user-defined method named `new` is a loud error.
@@ -1960,12 +1998,18 @@ impl Point {
   method mutates through `self`, directly or transitively through its
   own calls (the analysis follows the call graph, including composed
   fields).
-- **Rejected, loudly**: inheritance from anything but `object`, class
+- **Rejected, loudly**: unknown or external inheritance bases, class
   attributes and any class-level statement besides methods/docstring/
   `pass`, nested classes, `async` methods, and `*args`/`**kwargs` in
-  `__init__`. (For other methods, the `*args`/`**kwargs` rejection
-  fires at each call site; a definition that is never called slips
-  through to rustc.)
+  `__init__`. A known base imported from another module in the generated
+  package is supported; its constructor, fields, and methods participate
+  in the derived class's MRO and the imported traits are brought into scope
+  at call sites. This includes a class declared in package `__main__.py`,
+  which is compiled at the binary crate root. Such entry classes are not
+  included in library-side hierarchy sum types, since the library has no
+  Rust `__main__` module to name. (For other methods, the `*args`/`**kwargs`
+  rejection fires at each call site; a definition that is never called
+  slips through to rustc.)
 - **Dunder protocols are mostly not modeled** — `__init__` has
   semantics, and the MAPPING trio is wired: a user class's own
   `__getitem__` receives `x[k]`, its `__setitem__` receives
@@ -2237,7 +2281,10 @@ exception escaping a lambda (§4.5).
   module-level code) and the body — the user's `main`, renamed
   `python_main`, when the block is just `main()` — and reports an
   uncaught exception as CPython does (the traceback header and final
-  line, no frames), exiting 1 (issue #479). A dedicated `__main__.py` is
+  line, no frames), exiting 1 (issue #479). For a synchronous program the
+  startup and body are a function, `__rython_main__`, returning the
+  escaping exception, and `fn main` only reports it — the body the JIT's
+  `ry_entry` runs without ending its host (§11.5). A dedicated `__main__.py` is
   bin-only; any other entry module appears in both the library and the
   binary.
 - A bare module-level `main()` is only the entry point as the module
@@ -2649,7 +2696,9 @@ not construct threads, consume thread names, or run targets. The real
 assignment evaluates `args` once at construction, then stores the handle;
 `start` alone runs the target. A field initialized to `None` in `__init__`
 may later receive a Thread and remains an `Option<threading::Thread>`
-(issue #529). A thread field must be initialized by an unconditional
+(issue #529). This includes a constructor bound by
+`t, n = threading.Thread(...), 0` and later stored with `self.t = t`.
+A thread field must be initialized by an unconditional
 top-level assignment in `__init__` before it is read or
 `self` escapes/is called. Fields read by constructor arguments also need
 preceding unconditional stores: this holds for EVERY Thread constructor in
@@ -2902,6 +2951,35 @@ transpiler into an ordinary std crate (plus `libc`). It cannot be
 combined with `--kernel-module`, `--no-std`, or `--pyo3`, and none of
 this section's kernel restrictions apply to it.
 
+### 11.5 The JIT (`rypip jit`, `rython-jit`)
+
+Milestone M1 of [`jit.md`](jit.md) (issue #166), `std` tier and Unix only.
+The JIT compiles exactly what `rypip convert` compiles — the converter's
+cdylib mode is the plain conversion plus a generated C-ABI boundary module
+— and refuses exactly what it refuses (the converter's message, verbatim).
+`rypip jit run FILE ARG...` runs a single-file program in-process with
+`sys.argv` = `[FILE, ARG...]` (installed through the runtime's one
+program-arguments seam before anything reads it), its output and exit
+status the binary's; `rypip jit call FILE FUNCTION ARG...` is
+`python3 -c 'import M; print(repr(M.FUNCTION(ARG, ...)))'` with
+`sys.argv == ['-c']`, ARGs read by CPython's `ast.literal_eval`. Only
+`int` (64-bit), `float`, `bool`, `str` and `None` cross the boundary in M1,
+by a function's annotations: any other parameter or result type, defaults,
+`*args`/`**kwargs`, keyword- or positional-only parameters, decorators,
+generators and `async def` are a loud error naming the type or construct
+when called, and an argument of another type than its annotation is never
+converted. An escaping exception comes back as a `PyException` (type,
+message, argument reprs, ancestry), `SystemExit` as an exit code and
+message, a panic as a panic; the library never ends the process for any of
+them. A loaded library serves either calls (the module imported) or its
+program entry (run as `__main__`), once per process, never both; packages,
+`rython.toml` manifests, `from rython import rust` path dependencies and
+async program entries are refused. The rest of the contract — the cache,
+its key, the stdout flush rule — is [`jit.md`](jit.md)'s "M1 as built".
+Cache entries pin Cargo's resolved dependency versions until cleared and
+verify both the library content and generated Cargo.lock on every hit.
+Incompatible conversion targets are refused before a cache lookup.
+
 ---
 
 
@@ -3034,6 +3112,7 @@ accepted as permanent spec:
 | Divergence | Status |
 |---|---|
 | Reading an instance attribute before its first assignment (`print(self.x)` ahead of `self.x = 1`, or `self.inner.n` ahead of `self.inner = Inner()`) yields the struct's default value (`0`, `''`, a default instance) where CPython raises `AttributeError`. Thread fields, TestCase fields and Thread constructor arguments are guarded (they refuse the shape loudly); every other class field is not | Open defect (issue #517) |
+| `unittest.skipIf` / `skipUnless` conditions are read by the emitted runner when each test is reached, instead of when the decorator executes. A module name read by an effective method or inherited class gate (including a walrus RHS) and rebound between its class definition and this runner call is refused at conversion. Potential writes by functions declaring that name `global` are conservatively refused, without proving whether the function is called; unused overridden method gates and direct writes after the runner call do not trigger this check. Other condition expressions still have runner-time evaluation | Loud for direct and potential global rebinding (issue #521); snapshotting arbitrary decorator expressions remains open |
 | `deque.index(x)` lowers through the shared list-ops arm and raises `ValueError: deque.index(x): x not in deque` (the 3.14 wording the list arm pinned), where CPython 3.12/3.13 say `9 is not in deque` — the wording `deque.remove` and the inherent `deque::index(x, start, stop)` already use. The exception TYPE agrees | Documented version choice, pinned in `python_semantics.rs`; the list arm's wording is the project-wide pin |
 | `unicodedata` answers from the Unicode 16.0.0 database — CPython 3.14's `unidata_version` — for every CPython: an older CPython carries an older database (3.12: 15.0.0, 3.13: 15.1.0), so a code point assigned or re-classified since answers differently there (`category`, `bidirectional`, `combining`, `name`, `normalize`). Code points assigned before 15.0 agree | Model limit (issue #334); a per-CPython database would need one table set per version |
 | Unpacking's ValueError text is CPython 3.11–3.13's: `too many values to unpack (expected 2)`. CPython 3.14 appends the length for a sized sequence (`(expected 2, got 3)` for a tuple, list or dict; not for a str). `not enough values to unpack (expected 2, got 1)` and `cannot unpack non-iterable int object` agree across versions | Model limit; one message set, pinned to the 3.11 transcripts |
@@ -3046,6 +3125,7 @@ accepted as permanent spec:
 | A one-argument builtin `KeyError` records the original key's repr separately from its quoted display message. `repr(error)` preserves the original key type and quoting, and the key expression is evaluated once | Correct (issue #500); the old repr fallback quoted the display as another string |
 | Builtin exception calls share their construction/type in value and raise positions. Argument evaluation is once and ordered; str/repr preserve Python scalar spelling and original argument structure, including multi-argument tuple messages. Unsupported mutable/unknown representations and specialized forms, and potentially-unbound exception locals, are refused (§8.2). Comprehension bindings are checked in their own scope and generator order; a read before a later target's assignment is refused rather than using an outer value | Correct-or-loud (issues #477, #478, #502, #505) |
 | Socket exception canonicalization keeps `gaierror` and `herror` as distinct OSError subclasses; they do not catch each other or FileNotFoundError. Only `socket.error` aliases OSError | Correct (issue #503); the old alias map broadened their handlers |
+| `stdpython::zlib` (runtime module, not yet reachable from conversion): `compress` emits miniz_oxide's deflate encoding, which inflates to the same bytes but is not byte-identical to zlib's body (headers, FLEVEL/XFL bits and trailers are zlib's); with `wbits` below 15 (or -15, 31) and more data than that window holds, the body is stored rather than deflated, since miniz_oxide always searches a 32 KiB window; a corrupt deflate body raises `zlib.error: Error -3 while decompressing data: invalid data` where zlib names the exact fault (`invalid block type`, …); `Decompress.decompress` returns a stream's output in one piece once the stream is complete rather than incrementally (the concatenation agrees), and until then re-inflates the input it holds on each call, so a stream fed in many small chunks costs quadratic time. Header, check, truncation and option errors are CPython's text | Model limit (miniz_oxide backend) |
 | True division by zero (`x / 0`, `1.0 / 0.0`) silently yields `inf`/`nan` instead of raising `ZeroDivisionError` (`//`, `%`, `divmod` raise correctly) | Defect, issue #107 |
 | Exception message shapes: `int()`'s message carries "with base 10" and `float()`'s quotes the string as Python's repr (#339, round 10); `open` and stream errors are CPython's `[Errno N] text: 'path'` form (#339); the `KeyError` key quoting is single-quoted like CPython (round 99) | Correct (was a defect class in issue #82's family) |
 | An uncaught exception prints CPython's traceback header and final line but no traceback frames | Model limit (no frames) — the thread-exception entry's family (issue #479) |
@@ -3067,8 +3147,10 @@ accepted as permanent spec:
 | A non-daemon thread never joined is joined when its LAST handle drops (at latest, end of `main`) — CPython joins at interpreter exit, so a fire-and-forget thread can block a scope exit earlier than CPython would | Model limit; the common create/start/join shape is identical |
 | A thread's unhandled exception prints CPython's header and final exception line but no traceback frames | Model limit (no frames) — same family as §8's messages |
 | External `pytest.main` runner calls and values (`console_main` and `cmdline.main`, import aliases and crate re-exports included; the pytest module or its cmdline namespace used as a value — compared, passed, stored or returned — is also refused, while a member read such as `pytest.mark.slow` or `pytest.raises(...)` keeps the external-module warning) are refused at conversion with the Python location and a rewrite to CPython's `python -m pytest` or the supported unittest subset. There is no automatic collection: a module defining only `test_*` functions remains a library, and `import pytest` alone retains the external-module warning (#456). Ordinary shadowing parameters and crate siblings keep their behavior | Loud (issue #482); a requested runner call could previously be dropped with a warning in multi-module conversion |
+| Preserved Python method identifiers that are not Rust snake_case (for example `calculateTotal`) can produce Rust source-style diagnostics while building the generated crate. Automatic `non_snake_case` allowances are limited to compiler-known unittest fixture hooks; arbitrary user method spellings are preserved, with their ordinary Rust naming warnings. These are build diagnostics, not program stdout/stderr | Documented source-lint policy; fixture-only allowances and preserved method names are pinned in `codegen_semantics.rs` (review waiver for #551) |
 | `unittest.main()`'s report is CPython's `TextTestRunner` output at the default verbosity, except that an ERROR or FAIL block's traceback prints CPython's header and final exception line but no traceback frames | Model limit (no frames) — the thread-exception entry's family (issue #334, Phase 3) |
-| A `TestCase` field first assigned in a test method is discovered without requiring `__init__` or `setUp`. Each test gets a new instance; inherited tests, fixtures, default arguments and gates follow the MRO, each ancestor resolved in its defining module. Binding-flow checks reject uncertain reads (including cross-test state, teardown reads relying on a test completing, and helpers `setUp` reaches), receiver escapes/captures, deletion, methods shadowed by fields or class values, custom constructors and attribute hooks before a Rust default can be observed. Manual construction of field-bearing cases (including `t = T(); t.setUp()`, which CPython runs) and explicit lifecycle calls/captures are refused; use `unittest.main()` | Correct-or-loud (issues #480, #511, #512, #513); pinned against CPython 3.12 and 3.14 |
+| Direct `setUpClass`/`tearDownClass` fixtures run once around a class's tests, with class-level skip, setup failure, and teardown failure ordering and reporting; `SystemExit` propagates through cleanup without a unittest report; the runner accepts only directly defined one-parameter `@classmethod` or zero-parameter `@staticmethod` fixtures. Inherited class fixtures and unsupported signatures are conversion errors | Correct-or-loud (issue #526); success, error, and skip transcripts pinned against CPython 3.14.4 |
+| A `TestCase` field first assigned in a test method is discovered without requiring `__init__` or `setUp`. Each test gets a new instance; inherited tests, per-test fixtures, default arguments and gates follow the MRO, each ancestor resolved in its defining module. Binding-flow checks reject uncertain reads (including cross-test state, teardown reads relying on a test completing, and helpers `setUp` reaches), receiver escapes/captures, deletion, methods shadowed by fields or class values, custom constructors and attribute hooks before a Rust default can be observed. Manual construction of field-bearing cases (including `t = T(); t.setUp()`, which CPython runs) and explicit lifecycle calls/captures are refused; use `unittest.main()` | Correct-or-loud (issues #480, #511, #512, #513); pinned against CPython 3.12 and 3.14 |
 | TCP `socket.bind()` binds AND starts listening (std::net has no half-bound TCP socket); a connection can be accepted by the OS before `listen()` runs, and binding a client socket before `connect()` is a loud error | Model limit of the std::net backend |
 | `URLError`'s reason text inside CPython's `<urlopen error …>` shape is the HTTP backend's wording, not CPython's | Model limit of the wrapped-crate convention (§10.2.1) |
 | `HTTPError` carries CPython's message but not the error response's body/headers (exceptions are string-tagged values) | Model limit; §8.1 representation |

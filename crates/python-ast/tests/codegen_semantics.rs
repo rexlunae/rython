@@ -935,11 +935,15 @@ fn cross_module_class_info_computed_once_and_cached() {
     assert_eq!(dog2.name, "Dog");
     // Traits: Animal is the hierarchy root, so Dog carries DogTrait (own)
     // plus AnimalTrait (its methods re-emit there), nearest first.
-    let traits =
-        python_ast::module_class_traits(&options, &["animals".to_string()]);
+    let traits = python_ast::module_class_traits(&options, &["animals".to_string()]);
     assert_eq!(
-        traits.get("Dog").map(Vec::as_slice),
-        Some(&["DogTrait".to_string(), "AnimalTrait".to_string()][..]),
+        traits.get("Dog").map(|items| {
+            items
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>()
+        }),
+        Some(vec!["DogTrait", "AnimalTrait"]),
         "Dog must import DogTrait (own) + AnimalTrait (methods re-emit there)"
     );
     // A class that does not exist resolves to None without poisoning the cache.
@@ -6024,6 +6028,50 @@ fn value_returning_main_gets_a_wrapper_entry_point() {
 }
 
 #[test]
+fn a_sync_program_body_is_a_function_main_reports_from() {
+    // Issue #166: the program body is `__rython_main__`, returning the
+    // escaping exception, and `fn main` only reports it — so the JIT's
+    // `ry_entry` runs exactly the body the binary runs, without the
+    // process exit. All three sync entry shapes take it: a guarded
+    // `main()`, a guarded block of statements, and module-level code
+    // with no guard.
+    let guarded_call = compile(
+        concat!(
+            "def main() -> None:\n",
+            "    print(\"hi\")\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    main()\n",
+        ),
+        "guarded.py",
+    );
+    let guarded_block = compile(
+        concat!(
+            "if __name__ == \"__main__\":\n",
+            "    x = 1\n",
+            "    print(x)\n",
+        ),
+        "block.py",
+    );
+    let module_code = compile("print(\"top\")\n", "toplevel.py");
+    for out in [&guarded_call, &guarded_block, &module_code] {
+        assert!(
+            out.contains("pub (crate) fn __rython_main__ () -> Result < () , PyException >"),
+            "the program body is a function: {}",
+            out
+        );
+        assert!(
+            out.contains(
+                "fn main () { if let Err (e) = __rython_main__ () { stdpython :: exit_uncaught (& e) ; } }"
+            ),
+            "main runs the body and reports an escaping exception: {}",
+            out
+        );
+    }
+    assert!(guarded_call.contains("python_main () ?"), "{}", guarded_call);
+}
+
+#[test]
 fn module_scope_upper_case_locals_allow_non_snake_case() {
     // A module global used only at module level lowers to a local of the
     // init body (`let REG;`), and a `__main__` block's names to locals of
@@ -6389,7 +6437,6 @@ fn unittest_method_fields_refuse_opaque_attribute_presence() {
         ("    def test_a(self):\n        read = lambda: self.total\n        print(read())\n        self.total = 3\n", "capture"),
         ("    def test_a(self):\n        def read():\n            return self.total\n        print(read())\n        self.total = 3\n", "capture"),
         ("    def setUp(self):\n        self.test_a()\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "lifecycle access"),
-        ("    def setUp(self):\n        super().setUp()\n        self.total = 3\n    def test_a(self):\n        print(self.total)\n", "receiver escape"),
         // A class data attribute an instance field shadows is accepted
         // (#519 review); reading it before the instance store is not.
         ("    total = 9\n    def test_a(self):\n        print(self.total)\n        self.total = 3\n", "attribute `self.total` may be read before assignment"),
@@ -6404,6 +6451,37 @@ fn unittest_method_fields_refuse_opaque_attribute_presence() {
         let error = compile_err(&format!("import unittest\nclass T(unittest.TestCase):\n    def {hook}(self, name: str):\n        pass\n    def test_a(self):\n        self.total = 3\n        print(self.total)\n"), "tc_hook.py");
         assert!(error.contains(&format!("method `{hook}`")) && error.contains("line 3")
             && error.contains("use ordinary assignments"), "{error}");
+    }
+}
+
+#[test]
+fn testcase_super_refusals_name_call_lines() {
+    let cases = [
+        (
+            "import unittest\nclass Mixin:\n    def setUp(self):\n        pass\nclass Extra:\n    pass\nclass T(Mixin, unittest.TestCase, Extra):\n    def setUp(self):\n        super().setUp()\n",
+            "method resolution order",
+            9,
+        ),
+        (
+            "import unittest\nclass T(unittest.TestCase):\n    def setUp(self):\n        super().unknown()\n",
+            "unittest.TestCase.unknown",
+            4,
+        ),
+        (
+            "import unittest\nclass Base(unittest.TestCase):\n    @classmethod\n    def setUp(cls):\n        pass\nclass T(Base):\n    def setUp(self):\n        super().setUp()\n",
+            "classmethod or staticmethod",
+            8,
+        ),
+        (
+            "import unittest\nclass T(unittest.TestCase):\n    def setUp(self):\n        super().setUp(1)\n",
+            "passes arguments",
+            4,
+        ),
+    ];
+    for (source, message, line) in cases {
+        let error = compile_err(source, "tc_super_refusal.py");
+        assert!(error.contains(message) && error.contains(&format!("line {line}:")), "{error}");
+        assert!(error.contains("refuses"), "{error}");
     }
 }
 
@@ -6827,10 +6905,11 @@ fn unittest_assert_raises_with_statement_lowers() {
 }
 
 #[test]
-fn unittest_assert_raises_with_a_returning_body_stays_a_loud_drop() {
-    // A body whose `return` would have to escape the closure cannot use the
-    // closure lowering — it keeps the plain (loud-drop) with lowering.
-    let out = compile(
+fn unittest_assert_raises_with_a_returning_body_is_refused() {
+    // A return exits through __exit__ with no exception, so assertRaises
+    // raises "ValueError not raised". It cannot be represented by the
+    // closure lowering and must be refused rather than run unchecked.
+    let err = compile_err(
         concat!(
             "import unittest\n",
             "class T(unittest.TestCase):\n",
@@ -6841,9 +6920,8 @@ fn unittest_assert_raises_with_a_returning_body_stays_a_loud_drop() {
         "assert_raises_with_ret.py",
     );
     assert!(
-        !out.contains("assert_raises ("),
-        "a returning body must not use the closure lowering: {}",
-        out
+        err.contains("return") && err.contains("not supported yet"),
+        "a returning body must be loudly refused: {err}"
     );
 }
 
@@ -16482,14 +16560,11 @@ fn annotated_empty_dict_keeps_types_inside_loop() {
     );
 }
 
-/// Issue #137 round 20 (urllib3's RequestMethods): a plain-struct class
-/// subclassed ONLY cross-module emits an ACCESSOR-ONLY companion trait —
-/// the subclass modules' ancestor impls and supertrait bounds name
-/// `{Name}Trait`, so it must exist — while its methods stay INHERENT
-/// (trait-default methods would re-route the subclasses' inherited-call
-/// resolution).
+/// A base class used only by a cross-module subclass still emits its
+/// methods on the trait, so inherited calls dispatch through the subclass
+/// hierarchy instead of relying on the base struct's inherent methods.
 #[test]
-fn cross_module_only_base_emits_accessor_only_trait() {
+fn cross_module_only_base_emits_inherited_method_trait() {
     let mixin_src = "class Mixin:\n    def __init__(self):\n        self.headers = \"\"\n\n\
                      \x20   def ask(self) -> str:\n        return self.headers\n";
     // Convert the DEFINING module with the subclassing module visible in
@@ -16532,8 +16607,8 @@ fn cross_module_only_base_emits_accessor_only_trait() {
         .and_then(|rest| rest.split("impl MixinTrait for Mixin").next())
         .unwrap_or("");
     assert!(
-        !trait_block.contains("fn ask"),
-        "methods must NOT become trait defaults (accessor-only): {}",
+        trait_block.contains("fn ask"),
+        "the trait carries inherited methods: {}",
         out
     );
     assert!(
@@ -30154,6 +30229,195 @@ fn a_post_block_read_of_an_assert_raises_local_is_refused() {
 }
 
 #[test]
+fn assert_raises_context_target_is_only_supported_through_exception() {
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(ValueError) as cm:\n",
+            "            raise ValueError(\"boom\")\n",
+            "        print(cm)\n",
+        ),
+        "assert_raises_context_target.py",
+    );
+    assert!(
+        err.contains("used as a value") && err.contains("cm.exception"),
+        "unsupported context-object use must be refused with the supported rewrite: {err}"
+    );
+}
+
+#[test]
+fn assert_raises_dynamic_exception_attribute_is_refused_at_source_location() {
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(self.failureException) as cm:\n",
+            "            raise AssertionError(\"boom\")\n",
+        ),
+        "assert_raises_dynamic_exception.py",
+    );
+    assert!(
+        err.contains("line 4")
+            && err.contains("failureException")
+            && err.contains("not statically known"),
+        "dynamic exception attributes must be refused with a location and rewrite: {err}"
+    );
+}
+
+#[test]
+fn assert_raises_unknown_module_exception_attribute_is_refused() {
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "import socket\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(socket.ValueError):\n",
+            "            raise ValueError(\"boom\")\n",
+        ),
+        "assert_raises_unknown_module_exception.py",
+    );
+    assert!(
+        err.contains("line 5")
+            && err.contains("socket.ValueError")
+            && err.contains("not statically known"),
+        "unknown module attributes must not be inferred to be builtin exceptions: {err}"
+    );
+}
+
+#[test]
+fn assert_raises_builtin_module_exception_is_supported() {
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "import builtins\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(builtins.ValueError):\n",
+            "            raise ValueError(\"boom\")\n",
+        ),
+        "assert_raises_builtins_exception.py",
+    );
+    assert!(
+        out.contains("assert_raises (\"ValueError\""),
+        "known builtin exception attributes must retain their canonical name: {out}"
+    );
+}
+
+#[test]
+fn assert_raises_socket_module_alias_is_canonicalized() {
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "import socket as s\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(s.timeout):\n",
+            "            raise s.timeout(\"timed out\")\n",
+        ),
+        "assert_raises_socket_alias.py",
+    );
+    assert!(
+        out.contains("assert_raises (\"TimeoutError\""),
+        "`socket.timeout` through alias `s` must use its canonical class name: {out}"
+    );
+}
+
+#[test]
+fn nested_function_parameter_does_not_rebind_assert_raises_target() {
+    let out = compile(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(ValueError) as cm:\n",
+            "            raise ValueError(\"boom\")\n",
+            "        def helper(cm: int) -> int:\n",
+            "            return cm\n",
+            "        print(str(cm.exception))\n",
+        ),
+        "assert_raises_nested_parameter.py",
+    );
+    assert!(
+        out.contains("helper") && out.contains("assert_raises_exception"),
+        "a nested parameter may shadow the outer context target: {out}"
+    );
+}
+
+#[test]
+fn assert_raises_context_target_is_not_promoted_across_branches() {
+    let err = compile_err(
+        concat!(
+            "import unittest\n",
+            "class T(unittest.TestCase):\n",
+            "    def t(self) -> None:\n",
+            "        flag: bool = True\n",
+            "        if flag:\n",
+            "            with self.assertRaises(ValueError) as cm:\n",
+            "                raise ValueError(\"boom\")\n",
+            "        else:\n",
+            "            with self.assertRaises(ValueError) as cm:\n",
+            "                raise ValueError(\"boom\")\n",
+            "        print(str(cm.exception))\n",
+        ),
+        "assert_raises_context_target_branch.py",
+    );
+    assert!(
+        err.contains("assertRaises") || err.contains("cm"),
+        "a context target bound under control flow must be refused, not miscompiled: {err}"
+    );
+}
+
+#[test]
+fn arbitrary_assert_logs_attribute_uses_generic_with_lowering() {
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "class T:\n",
+            "    def t(self, obj: object) -> None:\n",
+            "        with obj.assertLogs(\"example\"):\n",
+            "            print(\"body\")\n",
+            "        with obj.assertWarns(Warning):\n",
+            "            print(\"body\")\n",
+            "        with obj.assertRaisesRegex(ValueError, \"example\"):\n",
+            "            print(\"body\")\n",
+        ),
+        "generic_assert_logs.py",
+    );
+    assert!(
+        out.contains("body") && !out.contains("assertLogs is not supported"),
+        "an arbitrary receiver must not enter TestCase-specific handling: {out}"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning.contains("dropped")),
+        "the generic path retains its existing loud-drop warning: {warnings:?}"
+    );
+}
+
+#[test]
+fn assert_raises_on_non_testcase_self_uses_generic_with_lowering() {
+    let (out, warnings) = compile_with_warnings(
+        concat!(
+            "class T:\n",
+            "    def t(self) -> None:\n",
+            "        with self.assertRaises(ValueError):\n",
+            "            print(\"body\")\n",
+        ),
+        "non_testcase_assert_raises.py",
+    );
+    assert!(
+        out.contains("body") && !out.contains("assert_raises ("),
+        "a non-TestCase self method must not receive unittest lowering: {out}"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning.contains("dropped")),
+        "the generic path retains its existing loud-drop warning: {warnings:?}"
+    );
+}
+
+#[test]
 fn an_assert_raises_body_that_only_assigns_locally_still_converts() {
     // No read after the block: the closure's locals are fine, and the crate
     // must still convert (the refusal above is narrowly about the read).
@@ -31222,4 +31486,110 @@ fn pytest_operand_preflight_respects_the_stack_budget() {
     };
     assert!(run(2000).unwrap_err().contains("nests too deeply"));
     assert_eq!(run(3), Ok(()));
+}
+
+#[test]
+fn only_known_unittest_fixture_names_allow_non_snake_case() {
+    let rust = compile("class C:\n    def calculateTotal(self) -> int:\n        return 1\n", "fixture_lints");
+    let compact: String = rust.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(!compact.contains("#[allow(non_snake_case)]"), "{rust}");
+    let fixture = compile("import unittest\nclass T(unittest.TestCase):\n    def setUp(self) -> None:\n        pass\n    def test_ok(self) -> None:\n        pass\n", "known_fixture_lint");
+    let compact: String = fixture.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("#[allow(non_snake_case)]"), "{fixture}");
+}
+
+#[test]
+fn unittest_skip_gate_rebinding_has_compiler_refusal_pins() {
+    // Verified against python3. Each of these four sources skips its test,
+    // including the helper defined before the decorated class and walrus RHS.
+    for source in [
+        include_str!("../../rypip/tests/fixtures/gate_rebind_helper.py"),
+        include_str!("../../rypip/tests/fixtures/gate_rebind_walrus.py"),
+        "import unittest\nFLAG = True\n@unittest.skipIf(FLAG, 'x')\nclass T(unittest.TestCase):\n    def test_a(self): pass\nFLAG = False\nif __name__ == '__main__':\n    unittest.main()\n",
+        "import unittest\nFLAG = False\nclass T(unittest.TestCase):\n    @unittest.skipUnless(FLAG, 'x')\n    def test_a(self): pass\nFLAG = True\nif __name__ == '__main__':\n    unittest.main()\n",
+    ] {
+        let error = compile_err(source, "gate_rebind.py");
+        assert!(error.contains("condition `FLAG`") && error.contains("rebound at line"), "{error}");
+        assert!(error.contains("decorator-time value") && error.contains("use an unchanged condition")
+            && error.contains("refuses to silently evaluate"), "{error}");
+    }
+}
+
+#[test]
+fn unittest_skip_gate_reads_exclude_walrus_targets_and_nested_locals() {
+    // Verified against python3. All three conditions are True and skip T.
+    for condition in ["(FLAG := True)", "(lambda FLAG: FLAG)(True)", "[FLAG for FLAG in [True]][0]"] {
+        let source = format!("import unittest\nFLAG = False\n@unittest.skipIf({condition}, 'x')\nclass T(unittest.TestCase):\n    def test_a(self): pass\nFLAG = True\nif __name__ == '__main__':\n    unittest.main()\n");
+        let rust = compile(&source, "gate_local.py");
+        assert!(rust.contains("TextTestResult :: new"), "{rust}");
+    }
+}
+
+#[test]
+fn unittest_skip_gate_post_runner_write_does_not_hoist_a_static_shadow() {
+    let rust = compile(include_str!("../../rypip/tests/fixtures/gate_postrun.py"), "gate_postrun.py");
+    assert!(rust.contains("py_global_write"), "{rust}");
+    assert!(!rust.contains("let FLAG") && !rust.contains("let mut FLAG"), "{rust}");
+}
+
+#[test]
+fn starred_attribute_unpacking_refusals_keep_location_and_rewrite() {
+    // Verified against python3: each pattern stores first=1 and rest=[2, 3].
+    for target in [
+        "self.first, *self.rest",
+        "self.first, *rest",
+        "(self.first, *rest), n",
+    ] {
+        let source =
+            format!("class Pair:\n    def __init__(self, values):\n        {target} = values\n");
+        let error = compile_err(&source, "starred_fields.py");
+        for fragment in [
+            "starred target",
+            "self.first",
+            "line 3",
+            "index the value instead",
+            "assign each attribute separately",
+            "refuses to silently",
+        ] {
+            assert!(error.contains(fragment), "missing {fragment}: {error}");
+        }
+    }
+    // This free-function store bypasses class field inference and must
+    // still carry the assignment's own line to the same refusal.
+    let error = compile_err(
+        "def store(p, values):\n    p.first, *p.rest = values\n",
+        "starred_store.py",
+    );
+    for fragment in [
+        "starred target",
+        "p.first",
+        "line 2",
+        "index the value instead",
+        "assign each attribute separately",
+    ] {
+        assert!(error.contains(fragment), "missing {fragment}: {error}");
+    }
+}
+
+#[test]
+fn tuple_bound_thread_locals_type_lazy_fields_and_cannot_hide_absent_fields() {
+    // Verified against python3: count 0, work 7, alive False (exit 0).
+    let source = include_str!("../../../eval/idioms/programs/thread_tuple_local_field.py");
+    let out = compile(source, "tuple_thread.py");
+    assert!(out.contains("t : Option < threading :: Thread >"), "{out}");
+    assert!(out.contains(". start ()"), "{out}");
+    assert!(out.contains(". join ()"), "{out}");
+
+    let error = compile_err(
+        "import threading\ndef work() -> None:\n    pass\nclass Runner:\n    def configure(self) -> None:\n        t, n = threading.Thread(target=work), 0\n        self.t = t\n    def run(self) -> None:\n        self.t.start()\n",
+        "absent_tuple_thread.py",
+    );
+    assert!(
+        error.contains("thread field") && error.contains("self.t"),
+        "{error}"
+    );
+    assert!(
+        error.contains("initialize each field unconditionally in __init__"),
+        "{error}"
+    );
 }

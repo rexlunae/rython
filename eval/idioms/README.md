@@ -107,3 +107,7 @@ as an improvement over any recorded error count.
 | `testcase_setup_helpers` | a TestCase helper reading setUp's fields, a helper setUp calls, a class default setUp overrides, `@staticmethod`/`@classmethod` members (#519 review) |
 | `tuple_field_stores` | tuple-unpacked instance field declarations, string coercion, and a tuple store in a mutating method (#527) |
 | `tuple_field_setter_order` | CPython's all-values-before-stores tuple rule: a property setter rebinding a global must not change a later RHS value (#542; conversion is deliberately refused until temporaries are modeled) |
+
+`thread_tuple_local_field` pins a tuple-bound Thread later stored in a
+None-initialized field: the work must run and join, with its state visible
+in stdout. Its CPython pin is shared with codegen and package tests.

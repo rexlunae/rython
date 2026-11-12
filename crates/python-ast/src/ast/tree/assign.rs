@@ -20,6 +20,33 @@ pub struct Assign {
     pub annotation: Option<ExprType>,
 }
 
+impl Assign {
+    /// Validate the whole target before rendering any store. Source
+    /// statements supply their line; synthesized assignments have none.
+    pub(crate) fn refuse_starred_attribute_store(
+        &self,
+        line: Option<usize>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for target in &self.targets {
+            if pattern_has_starred(target)
+                && let Some(ExprType::Attribute(attr)) =
+                    crate::ast::tree::visit::target_leaves(target)
+                        .into_iter()
+                        .find(|leaf| matches!(leaf, ExprType::Attribute(_)))
+            {
+                let place = match attr.value.as_ref() {
+                    ExprType::Name(n) => format!("{}.{}", n.id, attr.attr),
+                    _ => attr.attr.clone(),
+                };
+                return Err(crate::ast::tree::class_def::starred_attribute_store_refusal(
+                    &place, line,
+                ).into());
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<'a, 'py> FromPyObject<'a, 'py> for Assign {
     type Error = pyo3::PyErr;
     fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
@@ -204,6 +231,9 @@ impl<'a> CodeGen for Assign {
             crate::ast::tree::interpreter_state::check_target(target, &options, &symbols)?;
             crate::ast::tree::system_exit::check_mutation(target, &options, &symbols)?;
         }
+        // Real source statements validate with their own line in
+        // Statement::to_rust; keep direct/synthetic Assign callers loud.
+        self.refuse_starred_attribute_store(None)?;
         let value_type = crate::infer_type(Some(&ctx), &self.value, &options, &symbols);
         if self.targets.iter().filter(|t| !matches!(t, ExprType::Name(_))).any(|target| {
             use crate::ast::tree::visit;
@@ -249,19 +279,7 @@ impl<'a> CodeGen for Assign {
             && pattern_elts(target).is_some()
         {
             let leaves = crate::ast::tree::visit::target_leaves(target);
-            if let Some(ExprType::Attribute(attr)) =
-                leaves.iter().find(|leaf| matches!(leaf, ExprType::Attribute(_)))
-            {
-                if pattern_has_starred(target) {
-                    let place = match attr.value.as_ref() {
-                        ExprType::Name(n) => format!("{}.{}", n.id, attr.attr),
-                        _ => attr.attr.clone(),
-                    };
-                    return Err(crate::ast::tree::class_def::starred_attribute_store_refusal(
-                        &place, None,
-                    )
-                    .into());
-                }
+            if leaves.iter().any(|leaf| matches!(leaf, ExprType::Attribute(_))) {
                 // Paired with a same-arity literal whose later elements
                 // cannot observe an earlier store, the unpacking IS the
                 // element stores in order: Python evaluates every element,

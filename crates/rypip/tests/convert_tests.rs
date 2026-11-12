@@ -130,6 +130,54 @@ fn comprehension_imported_scalars_and_counter_items_match_cpython() {
 }
 
 #[test]
+fn imported_module_name_matches_cpython_and_executable_entry_stays_main() {
+    let scratch = Scratch::new("imported-module-name");
+    let package_dir = scratch.path().join("MyPkg");
+    fs::create_dir_all(&package_dir).unwrap();
+    fs::write(
+        scratch.path().join("pyproject.toml"),
+        "[project]\nname = \"pkg\"\nversion = \"0.1.0\"\n\n[tool.setuptools]\npackages = [\"MyPkg\"]\n",
+    )
+    .unwrap();
+    fs::write(package_dir.join("__init__.py"), "").unwrap();
+    fs::write(
+        package_dir.join("helper.py"),
+        "def module_name() -> str:\n    return __name__\n",
+    )
+    .unwrap();
+    fs::write(
+        package_dir.join("main.py"),
+        "from .helper import module_name\n\ndef main() -> None:\n    print(module_name())\n    print(__name__)\n\nif __name__ == '__main__':\n    main()\n",
+    )
+    .unwrap();
+
+    let cpython = Command::new("python3")
+        .args(["-m", "MyPkg.main"])
+        .current_dir(scratch.path())
+        .output()
+        .unwrap();
+    assert!(cpython.status.success(), "{:?}", cpython.stderr);
+    // Verified against python3.
+    assert_eq!(cpython.stdout, b"MyPkg.helper\n__main__\n");
+
+    let package = rypip::discover(scratch.path()).unwrap();
+    let krate = rypip::convert(
+        &package,
+        &scratch.path().join("crate"),
+        &ConvertOptions::default(),
+    )
+    .unwrap();
+    assert!(build_generated(&krate.root).success());
+    let output = Command::new(krate.root.join("target/debug/pkg"))
+        .output()
+        .unwrap();
+    // Verified against python3.
+    assert_eq!(output.stdout, b"MyPkg.helper\n__main__\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn immediate_list_generator_consumption_matches_cpython() {
     let scratch = Scratch::new("list-generator");
     let file = scratch.path().join("app.py");
@@ -13555,6 +13603,138 @@ fn run_package_status(
     )
 }
 
+#[test]
+fn package_main_inherits_from_a_sibling_module() {
+    let scratch = Scratch::new("main-cross-module-inheritance");
+    let krate = package_crate(
+        &scratch,
+        "maininherit",
+        &[
+            (
+                "base.py",
+                "class Base:\n    def __init__(self, value: int) -> None:\n        self.value = value\n    def get(self) -> int:\n        return self.value\n",
+            ),
+            (
+                "__main__.py",
+                "from .base import Base\nclass Child(Base):\n    def plus_one(self) -> int:\n        return self.get() + 1\ndef main() -> None:\n    child = Child(40)\n    print(child.value)\n    print(child.get())\n    print(child.plus_one())\nif __name__ == '__main__':\n    main()\n",
+            ),
+        ],
+    );
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated package failed to compile");
+    let output = Command::new(krate.root.join("target/debug/maininherit"))
+        .output()
+        .expect("running generated package");
+    // Verified against python3.
+    assert_eq!(output.stdout, b"40\n40\n41\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn imported_base_methods_and_fields_are_available_to_a_package_subclass() {
+    let scratch = Scratch::new("imported-base-inheritance");
+    let krate = package_crate(
+        &scratch,
+        "crossinherit",
+        &[
+            (
+                "base.py",
+                "class Base:\n    def __init__(self, value: int) -> None:\n        self.value = value\n    def get(self) -> int:\n        return self.value\n",
+            ),
+            (
+                "child.py",
+                "from .base import Base\nclass Child(Base):\n    def plus_one(self) -> int:\n        return self.get() + 1\n",
+            ),
+            (
+                "cli.py",
+                "from .child import Child\ndef main() -> None:\n    child = Child(40)\n    print(child.value)\n    print(child.get())\n    print(child.plus_one())\nif __name__ == '__main__':\n    main()\n",
+            ),
+        ],
+    );
+    let status = build_generated(&krate.root);
+    assert!(status.success(), "generated package failed to compile");
+    let output = Command::new(krate.root.join("target/debug/crossinherit"))
+        .output()
+        .expect("running generated package");
+    // Verified against python3.
+    assert_eq!(output.stdout, b"40\n40\n41\n");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn cross_module_grandparent_constructor_runs() {
+    for entry in [true, false] {
+        let scratch = Scratch::new(if entry { "grandparent-entry" } else { "grandparent-module" });
+        let mut files = vec![
+            ("base.py", "class Grandparent:\n    def __init__(self, value: int) -> None:\n        print('grandparent', value)\n        self.value = value\n"),
+            ("middle.py", "from .base import Grandparent\nclass Parent(Grandparent):\n    pass\n"),
+        ];
+        let child = "from .middle import Parent\nclass Child(Parent):\n    pass\n";
+        let main = "def main() -> None:\n    child = Child(42)\n    print(child.value)\nif __name__ == '__main__':\n    main()\n";
+        let source = format!("{child}{main}");
+        if entry {
+            files.push(("__main__.py", &source));
+        } else {
+            files.push(("child.py", child));
+            files.push(("cli.py", "from .child import Child\ndef main() -> None:\n    child = Child(42)\n    print(child.value)\nif __name__ == '__main__':\n    main()\n"));
+        }
+        let krate = package_crate(&scratch, "grandinherit", &files);
+        let python = Command::new("python3")
+            .args(["-m", if entry { "grandinherit" } else { "grandinherit.cli" }])
+            .env("PYTHONHASHSEED", "0")
+            .current_dir(scratch.path())
+            .output()
+            .unwrap();
+        // Verified against python3.
+        assert_eq!(python.stdout, b"grandparent 42\n42\n");
+        assert!(python.stderr.is_empty());
+        assert_eq!(python.status.code(), Some(0));
+        assert!(build_generated(&krate.root).success());
+        let output = Command::new(krate.root.join("target/debug/grandinherit")).output().unwrap();
+        assert_eq!(output.stdout, python.stdout);
+        assert_eq!(output.stderr, python.stderr);
+        assert_eq!(output.status.code(), python.status.code());
+    }
+}
+
+#[test]
+fn cross_module_grandparent_constructor_argument_mismatches_are_loud() {
+    for (call, error) in [
+        ("Child()", "Grandparent.__init__() missing 1 required positional argument: 'value'"),
+        ("Child(1, 2)", "Grandparent.__init__() takes 2 positional arguments but 3 were given"),
+    ] {
+        let scratch = Scratch::new(if call == "Child()" { "grandparent-missing" } else { "grandparent-extra" });
+        let source = format!("from .middle import Parent\nclass Child(Parent):\n    pass\ndef main() -> None:\n    {call}\nif __name__ == '__main__':\n    main()\n");
+        let krate = package_crate(&scratch, "grandmismatch", &[
+            ("base.py", "class Grandparent:\n    def __init__(self, value: int) -> None:\n        print('constructor ran')\n        self.value = value\n"),
+            ("middle.py", "from .base import Grandparent\nclass Parent(Grandparent):\n    pass\n"),
+            ("__main__.py", &source),
+        ]);
+        let python = Command::new("python3")
+            .args(["-m", "grandmismatch"])
+            .env("PYTHONHASHSEED", "0")
+            .current_dir(scratch.path())
+            .output()
+            .unwrap();
+        // Verified against python3. Static constructor arity errors are
+        // loud build failures rather than CPython's runtime TypeError.
+        assert!(python.stdout.is_empty());
+        assert_eq!(python.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&python.stderr).ends_with(&format!("TypeError: {error}\n")));
+        let build = Command::new("cargo")
+            .arg("build")
+            .env_remove("RUSTFLAGS")
+            .current_dir(&krate.root)
+            .output()
+            .unwrap();
+        assert!(!build.status.success(), "invalid constructor call built successfully");
+        let stderr = String::from_utf8_lossy(&build.stderr);
+        assert!(stderr.contains("error[E0061]"), "{stderr}");
+    }
+}
+
 /// Convert, build and run a single-file program; its stderr with the
 /// `Ran N tests in T.TTTs` time normalized to `T`, and its exit code.
 fn unittest_report(name: &str, source: &str) -> (String, i32) {
@@ -13597,6 +13777,37 @@ fn unittest_method_created_fields_match_cpython() {
 }
 
 #[test]
+fn unittest_direct_testcase_super_setup_matches_cpython() {
+    let (stdout, stderr, code) = unittest_run(
+        "ut_super_setup",
+        include_str!("fixtures/testcase_super_setup.py"),
+    );
+    // Verified against python3.
+    assert_eq!(stdout, "setup before\nsetup after\ntest ready True\n");
+    assert_eq!(
+        stderr,
+        ".\n----------------------------------------------------------------------\nRan 1 test in T\n\nOK"
+    );
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn unittest_super_resolves_user_method_and_propagates_fields() {
+    let (stdout, stderr, code) = unittest_run(
+        "ut_super_helper",
+        include_str!("fixtures/testcase_super_helper.py"),
+    );
+    // Verified against CPython 3.14.4: super().helper() assigns value
+    // before the test reads it.
+    assert_eq!(stdout, "helper 13\n");
+    assert_eq!(
+        stderr,
+        ".\n----------------------------------------------------------------------\nRan 1 test in T\n\nOK"
+    );
+    assert_eq!(code, 0);
+}
+
+#[test]
 fn unittest_helpers_class_defaults_and_static_members_match_cpython() {
     // #519 review regressions: a helper reached only from tests reads
     // setUp's fields, a helper setUp calls initializes its own reads, a
@@ -13608,6 +13819,136 @@ fn unittest_helpers_class_defaults_and_static_members_match_cpython() {
     assert_eq!(stdout, "offset 1\nscaled 7\ncount=2 label 1\n");
     assert_eq!(stderr, "...\n----------------------------------------------------------------------\nRan 3 tests in T\n\nOK");
     assert_eq!(code, 0);
+}
+
+#[test]
+fn unittest_class_fixtures_match_cpython() {
+    let (stdout, stderr, code) = unittest_run(
+        "ut_class_fixtures",
+        concat!(
+            "import unittest\n",
+            "\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    @classmethod\n",
+            "    def setUpClass(cls) -> None:\n",
+            "        print(\"class setup\")\n",
+            "\n",
+            "    @classmethod\n",
+            "    def tearDownClass(cls) -> None:\n",
+            "        print(\"class teardown\")\n",
+            "\n",
+            "    def test_a(self) -> None:\n",
+            "        print(\"test a\")\n",
+            "\n",
+            "    def test_b(self) -> None:\n",
+            "        print(\"test b\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+    );
+    // Verified against python3 (3.14.4): stdout and default TextTestRunner
+    // report, with the elapsed time normalized by unittest_run.
+    assert_eq!(
+        stdout,
+        "class setup\ntest a\ntest b\nclass teardown\n"
+    );
+    assert_eq!(
+        stderr,
+        "..\n----------------------------------------------------------------------\nRan 2 tests in T\n\nOK"
+    );
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn unittest_class_fixture_errors_and_skips_match_cpython() {
+    let (stdout, stderr, code) = unittest_run(
+        "ut_class_fixture_errors",
+        concat!(
+            "import unittest\n",
+            "\n",
+            "\n",
+            "class A(unittest.TestCase):\n",
+            "    @classmethod\n",
+            "    def setUpClass(cls) -> None:\n",
+            "        print(\"bad setup\")\n",
+            "        raise RuntimeError(\"setup broke\")\n",
+            "\n",
+            "    @classmethod\n",
+            "    def tearDownClass(cls) -> None:\n",
+            "        print(\"bad teardown\")\n",
+            "\n",
+            "    def test_never(self) -> None:\n",
+            "        print(\"unreachable test\")\n",
+            "\n",
+            "\n",
+            "@unittest.skip(\"skip class\")\n",
+            "class B(unittest.TestCase):\n",
+            "    @classmethod\n",
+            "    def setUpClass(cls) -> None:\n",
+            "        print(\"skipped setup\")\n",
+            "\n",
+            "    @classmethod\n",
+            "    def tearDownClass(cls) -> None:\n",
+            "        print(\"skipped teardown\")\n",
+            "\n",
+            "    def test_skip(self) -> None:\n",
+            "        print(\"unreachable skipped test\")\n",
+            "\n",
+            "\n",
+            "class C(unittest.TestCase):\n",
+            "    @classmethod\n",
+            "    def setUpClass(cls) -> None:\n",
+            "        print(\"good setup\")\n",
+            "\n",
+            "    @classmethod\n",
+            "    def tearDownClass(cls) -> None:\n",
+            "        print(\"good teardown\")\n",
+            "\n",
+            "    def test_run(self) -> None:\n",
+            "        print(\"good test\")\n",
+            "\n",
+            "\n",
+            "class D(unittest.TestCase):\n",
+            "    def test_run(self) -> None:\n",
+            "        print(\"last test\")\n",
+            "\n",
+            "    @classmethod\n",
+            "    def tearDownClass(cls) -> None:\n",
+            "        print(\"bad cleanup\")\n",
+            "        raise RuntimeError(\"cleanup broke\")\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+    );
+    // Verified against python3 (3.14.4). CPython's class-fixture traceback
+    // frames are omitted under the existing no-frames ledger entry.
+    assert_eq!(
+        stdout,
+        "bad setup\ngood setup\ngood test\ngood teardown\nlast test\nbad cleanup\n"
+    );
+    assert_eq!(
+        stderr,
+        concat!(
+            "Es..E\n",
+            "======================================================================\n",
+            "ERROR: setUpClass (__main__.A)\n",
+            "----------------------------------------------------------------------\n",
+            "Traceback (most recent call last):\nRuntimeError: setup broke\n\n",
+            "======================================================================\n",
+            "ERROR: tearDownClass (__main__.D)\n",
+            "----------------------------------------------------------------------\n",
+            "Traceback (most recent call last):\nRuntimeError: cleanup broke\n\n",
+            "----------------------------------------------------------------------\n",
+            "Ran 3 tests in T\n\n",
+            "FAILED (errors=2, skipped=1)",
+        )
+    );
+    assert_eq!(code, 1);
 }
 
 /// Convert a package whose conversion must fail; the error text.
@@ -13705,6 +14046,52 @@ fn unittest_main_runs_a_testcase_imported_into_the_entry_module() {
 }
 
 #[test]
+fn unittest_imported_class_fixtures_match_cpython() {
+    let scratch = Scratch::new("ut_imported_class_fixtures");
+    let krate = package_crate(
+        &scratch,
+        "ut_imported_case",
+        &[
+            (
+                "cases.py",
+                concat!(
+                    "import unittest\n\n\n",
+                    "class Imported(unittest.TestCase):\n",
+                    "    @classmethod\n",
+                    "    def setUpClass(cls) -> None:\n",
+                    "        print(\"imported setup\")\n\n",
+                    "    @classmethod\n",
+                    "    def tearDownClass(cls) -> None:\n",
+                    "        print(\"imported teardown\")\n",
+                    "        raise RuntimeError(\"cleanup broke\")\n\n",
+                    "    def test_imported(self) -> None:\n",
+                    "        print(\"imported test\")\n",
+                    "        self.assertEqual(1, 2)\n",
+                ),
+            ),
+            (
+                "cli.py",
+                "import unittest\nfrom .cases import Imported as Alias\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+            ),
+        ],
+    );
+    assert!(build_generated(&krate.root).success(), "generated crate failed to compile");
+    let output = Command::new(krate.root.join("target/debug/ut_imported_case"))
+        .output()
+        .expect("running generated binary");
+    // Verified against python3: the class's defining module names both
+    // its tests and its class-fixture error, even through an import alias.
+    assert_eq!(output.stdout, b"imported setup\nimported test\nimported teardown\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("FE\n"), "{stderr}");
+    assert!(stderr.contains("ERROR: tearDownClass (ut_imported_case.cases.Imported)"), "{stderr}");
+    assert!(stderr.contains("FAIL: test_imported (ut_imported_case.cases.Imported.test_imported)"), "{stderr}");
+    assert!(stderr.contains("Ran 1 test in "), "{stderr}");
+    assert!(stderr.contains("FAILED (failures=1, errors=1)"), "{stderr}");
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
 fn unittest_main_runs_the_selected_version_gated_testcase() {
     let scratch = Scratch::new("ut_version_gated_case");
     let krate = package_crate(
@@ -13735,6 +14122,70 @@ fn unittest_main_runs_the_selected_version_gated_testcase() {
     let (stdout, status) = run_package_status(&krate, "ut_version_gated_case");
     assert_eq!(stdout, ["selected version"]);
     assert_eq!(status, 0);
+}
+
+#[test]
+fn unittest_cross_module_super_setup_uses_descendant_testcase_mro() {
+    // Verified against CPython 3.14.4: calling Child.test_setup prints
+    // "middle before", "middle after", and "child test". The re-emitted
+    // Middle.setUp body must retain its own symbols for expressions while
+    // resolving super() against Child's full ancestry.
+    let scratch = Scratch::new("tcsetupchain");
+    let krate = package_crate(
+        &scratch,
+        "tcsetupchain",
+        &[
+            (
+                "root.py",
+                "import unittest\n\n\nclass Root(unittest.TestCase):\n    pass\n",
+            ),
+            (
+                "middle.py",
+                "from .root import Root\n\n\nclass Middle(Root):\n    def setUp(self):\n        print(\"middle before\")\n        super().setUp()\n        print(\"middle after\")\n",
+            ),
+            (
+                "cli.py",
+                "from .middle import Middle\n\n\nclass Child(Middle):\n    def test_setup(self):\n        self.setUp()\n        print(\"child test\")\n",
+            ),
+            (
+                "runner.py",
+                "from .cli import Child\n\n\nif __name__ == \"__main__\":\n    case = Child()\n    case.test_setup()\n",
+            ),
+        ],
+    );
+    assert_eq!(
+        run_package(&krate, "tcsetupchain"),
+        [
+            "middle before",
+            "middle after",
+            "child test",
+        ]
+    );
+}
+
+#[test]
+fn unittest_cross_module_super_default_argument_is_refused_with_line() {
+    let scratch = Scratch::new("tcsuperdefault");
+    let error = package_convert_err(
+        &scratch,
+        "tcsuperdefault",
+        &[
+            (
+                "root.py",
+                "import unittest\nDEFAULT = 42\n\n\nclass Root(unittest.TestCase):\n    def setUp(self, value=DEFAULT):\n        self.value = value\n",
+            ),
+            (
+                "middle.py",
+                "from .root import Root\n\n\nclass Middle(Root):\n    def setUp(self):\n        super().setUp()\n",
+            ),
+            (
+                "cli.py",
+                "import unittest\nfrom .middle import Middle\n\n\nclass Child(Middle):\n    def test_value(self):\n        print(self.value)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+            ),
+        ],
+    );
+    assert!(error.contains("default arguments are defined in another module"), "{error}");
+    assert!(error.contains("line 6:") && error.contains("refuses"), "{error}");
 }
 
 #[test]
@@ -13805,6 +14256,55 @@ fn unittest_cross_module_runner_inputs_and_qualified_construction_are_refused() 
     );
     assert!(error.contains("manual construction of TestCase `T` with instance fields")
         && error.contains("cli.py") && error.contains("refuses"), "{error}");
+}
+
+#[test]
+fn unittest_unsupported_class_fixture_shapes_are_refused() {
+    let scratch = Scratch::new("ut_bad_class_fixture");
+    let error = package_convert_err(
+        &scratch,
+        "ut_bad_class_fixture",
+        &[(
+            "test_bad.py",
+            "import unittest\n\n\nclass T(unittest.TestCase):\n    def setUpClass(self) -> None:\n        pass\n\n    def test_a(self) -> None:\n        pass\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+        )],
+    );
+    assert!(
+        error.contains("`setUpClass` at line 5 must be a `@classmethod`")
+            && error.contains("refuses"),
+        "{error}"
+    );
+
+    let scratch = Scratch::new("ut_inherited_class_fixture");
+    let error = package_convert_err(
+        &scratch,
+        "ut_inherited_class_fixture",
+        &[(
+            "test_bad.py",
+            "import unittest\n\n\nclass Base(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls) -> None:\n        pass\n\n\nclass Child(Base):\n    def test_a(self) -> None:\n        pass\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+        )],
+    );
+    assert!(
+        error.contains("TestCase `Child` inherits `setUpClass` from another class")
+            && error.contains("refuses"),
+        "{error}"
+    );
+
+    let scratch = Scratch::new("ut_rebound_class_fixture");
+    let error = package_convert_err(
+        &scratch,
+        "ut_rebound_class_fixture",
+        &[(
+            "test_bad.py",
+            "import unittest\n\n\nclass T(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls) -> None:\n        pass\n\n    setUpClass = None\n\n    def test_a(self) -> None:\n        pass\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+        )],
+    );
+    assert!(
+        error.contains("class member `setUpClass`")
+            && error.contains("not supported yet")
+            && error.contains("refuses"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -14219,6 +14719,84 @@ fn a_one_argument_key_error_prints_its_argument_repr() {
         String::from_utf8_lossy(&output.stdout),
         "'td'\n5\n[]\n'k'\nplain\n'zz'\n"
     );
+}
+
+#[test]
+fn unittest_skip_gate_rebinding_after_definition_is_refused() {
+    let scratch = Scratch::new("tcgate-rebind");
+    // Verified against python3 3.14.4: the class case prints no stdout and
+    // stderr ends `Ran 3 tests ... OK (skipped=3)`; the method case prints no
+    // stdout and ends `Ran 1 test ... OK (skipped=1)`. CPython snapshots the
+    // condition when each decorator runs, so a later module store cannot
+    // change the gate. Rython refuses these cases rather than evaluate them
+    // at test-runner time.
+    for (name, source, expected_name, progress, ran, summary) in [
+        (
+            "tcgate-class-rebind",
+            concat!(
+                "import unittest\n",
+                "\n",
+                "SLOW = True\n",
+                "@unittest.skipIf(SLOW, 'slow')\n",
+                "class Base(unittest.TestCase):\n",
+                "    def test_one(self): pass\n",
+                "class Child(Base):\n",
+                "    def test_two(self): pass\n",
+                "SLOW = False\n",
+                "if __name__ == '__main__':\n",
+                "    unittest.main()\n",
+            ),
+            "SLOW",
+            "sss",
+            "Ran 3 tests in ",
+            "OK (skipped=3)",
+        ),
+        (
+            "tcgate-method-rebind",
+            concat!(
+                "import unittest\n",
+                "\n",
+                "FAST = False\n",
+                "class T(unittest.TestCase):\n",
+                "    @unittest.skipUnless(FAST, 'slow machine')\n",
+                "    def test_one(self): pass\n",
+                "FAST = True\n",
+                "if __name__ == '__main__':\n",
+                "    unittest.main()\n",
+            ),
+            "FAST",
+            "s",
+            "Ran 1 test in ",
+            "OK (skipped=1)",
+        ),
+    ] {
+        let error = package_convert_err(&scratch, name, &[("cli.py", source)]);
+        let python = Command::new("python3")
+            .arg(scratch.path().join(name).join("cli.py"))
+            .env("PYTHONHASHSEED", "0")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .output()
+            .unwrap();
+        assert!(python.status.success(), "{python:?}");
+        assert!(python.stdout.is_empty(), "{:?}", python.stdout);
+        let report = String::from_utf8(python.stderr).unwrap();
+        let lines: Vec<_> = report.lines().collect();
+        assert_eq!(lines.len(), 5, "{report:?}");
+        assert_eq!(lines[0], progress, "{report:?}");
+        assert_eq!(lines[1], "----------------------------------------------------------------------", "{report:?}");
+        assert!(lines[2].starts_with(ran), "{report:?}");
+        assert_eq!(lines[3], "", "{report:?}");
+        assert_eq!(lines[4], summary, "{report:?}");
+        assert!(
+            error.contains("skipIf` condition") || error.contains("skipUnless` condition"),
+            "{error}"
+        );
+        assert!(error.contains(expected_name), "{error}");
+        assert!(
+            error.contains("rebound at line") && error.contains("refuses to silently evaluate"),
+            "{error}"
+        );
+    }
 }
 
 #[test]
@@ -23537,6 +24115,75 @@ fn unittest_assert_raises_with_a_raise_builds_and_runs() {
 }
 
 #[test]
+fn unittest_assert_raises_as_cm_builds_and_runs() {
+    // Issue #523: the `as cm` context manager must suppress the caught
+    // exception and expose it as `cm.exception` after the block.
+    // Verified against python3: four tests pass, exit 0.
+    let scratch = Scratch::new("assert-raises-as-cm");
+    let file = scratch.path().join("t.py");
+    fs::write(
+        &file,
+        concat!(
+            "import unittest\n",
+            "import socket as s\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    def test_caught_exception(self) -> None:\n",
+            "        with self.assertRaises(ValueError) as cm:\n",
+            "            raise ValueError(\"boom\")\n",
+            "        self.assertEqual(str(cm.exception), \"boom\")\n",
+            "        self.assertEqual(type(cm.exception).__name__, \"ValueError\")\n",
+            "\n",
+            "    def test_unread_target(self) -> None:\n",
+            "        with self.assertRaises(ZeroDivisionError) as cm:\n",
+            "            1 // 0\n",
+            "\n",
+            "    def test_without_target(self) -> None:\n",
+            "        with self.assertRaises(ZeroDivisionError):\n",
+            "            1 // 0\n",
+            "\n",
+            "    def test_socket_timeout_alias(self) -> None:\n",
+            "        with self.assertRaises(s.timeout) as cm:\n",
+            "            raise TimeoutError(\"timed out\")\n",
+            "        self.assertEqual(type(cm.exception).__name__, \"TimeoutError\")\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+    )
+    .unwrap();
+    let out = scratch.path().join("crate");
+
+    let pkg = rypip::discover(&file).expect("discover");
+    let krate = rypip::convert(&pkg, &out, &ConvertOptions::default()).expect("convert");
+
+    let status = build_generated(&krate.root);
+    assert!(
+        status.success(),
+        "the assertRaises-as-cm crate must COMPILE: {}",
+        status
+    );
+
+    let output = Command::new(krate.root.join("target/debug/t"))
+        .output()
+        .expect("running generated binary");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("not declared as mutable") && !combined.contains("error["),
+        "no compile/runtime error text expected: {combined}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "four passing assertRaises tests exit 0 like python3: {combined}"
+    );
+}
+
+#[test]
 fn a_pytest_import_is_a_warning_not_a_broken_crate() {
     // Issue #456: `import pytest` used to convert with NO warning and emit
     // `use crate::pytest;` for a module the crate does not contain, so the
@@ -24848,4 +25495,121 @@ fn pytest_module_value_aliases_are_refused_before_the_runner_is_lost() {
             || message.contains("pytest.main() test execution is not supported yet"), "{source}: {message}");
         assert!(message.contains("app.py") && message.contains("python -m pytest"), "{message}");
     }
+}
+
+#[test]
+fn unittest_adjacent_class_aliases_share_fixture_interval() {
+    let (stdout, stderr, code) = unittest_run("ut_fixture_alias",
+        include_str!("fixtures/class_fixture_alias.py"));
+    // Verified against python3.
+    assert_eq!(stdout, "setup\ntest\ntest\nteardown\n");
+    assert_eq!(stderr, "..\n----------------------------------------------------------------------\nRan 2 tests in T\n\nOK");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn unittest_skip_gate_helper_and_walrus_rebinding_are_refused() {
+    let scratch = Scratch::new("tcgate-indirect-rebind");
+    // Verified against python3. Each reports one skipped test, empty
+    // stdout and exit 0. Re-evaluating either condition would run the body.
+    for (name, source) in [
+        ("gatehelper", include_str!("fixtures/gate_rebind_helper.py")),
+        ("gatewalrus", include_str!("fixtures/gate_rebind_walrus.py")),
+    ] {
+        let error = package_convert_err(&scratch, name, &[("cli.py", source)]);
+        let python = Command::new("python3")
+            .arg(scratch.path().join(name).join("cli.py"))
+            .env("PYTHONHASHSEED", "0").env("PYTHONDONTWRITEBYTECODE", "1")
+            .output().unwrap();
+        assert_eq!(python.status.code(), Some(0), "{python:?}");
+        assert!(python.stdout.is_empty(), "{python:?}");
+        let report = String::from_utf8(python.stderr).unwrap();
+        assert!(report.starts_with("s\n----------------------------------------------------------------------\nRan 1 test in ")
+            && report.ends_with("\n\nOK (skipped=1)\n"), "{report:?}");
+        assert!(error.contains("condition `FLAG`") && error.contains("rebound at line")
+            && error.contains("refuses to silently evaluate"), "{error}");
+    }
+}
+
+#[test]
+fn unittest_skip_gate_on_overridden_ancestor_method_is_unused() {
+    let (stdout, stderr, code) = unittest_run("ut_gate_override",
+        include_str!("fixtures/gate_override.py"));
+    // Verified against python3. Base is removed from discovery; Child's
+    // override is the only selected test, so Base's method gate is unused.
+    assert_eq!(stdout, "child\n");
+    assert_eq!(stderr, ".\n----------------------------------------------------------------------\nRan 1 test in T\n\nOK");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn unittest_class_fixture_assertions_are_errors_and_failed_alias_setup_is_not_repeated() {
+    let (stdout, stderr, code) = unittest_run("ut_fixture_assertions",
+        include_str!("fixtures/class_fixture_assertions.py"));
+    // Verified against python3; source traceback frames are the §12 model boundary.
+    assert_eq!(stdout, "setup assertion\ntest\nteardown assertion\n");
+    assert_eq!(stderr, "E.E\n======================================================================\nERROR: setUpClass (__main__.A)\n----------------------------------------------------------------------\nTraceback (most recent call last):\nAssertionError: setup broken\n\n======================================================================\nERROR: tearDownClass (__main__.B)\n----------------------------------------------------------------------\nTraceback (most recent call last):\nAssertionError: teardown broken\n\n----------------------------------------------------------------------\nRan 1 test in T\n\nFAILED (errors=2)");
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn unittest_skip_gate_rebinding_after_exit_false_is_harmless() {
+    let (stdout, stderr, code) = unittest_run("ut_gate_postrun",
+        include_str!("fixtures/gate_postrun.py"));
+    // Verified against python3. The write runs after the completed test.
+    assert_eq!(stdout, "finished\n");
+    assert_eq!(stderr, "s\n----------------------------------------------------------------------\nRan 1 test in T\n\nOK (skipped=1)");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn unittest_class_fixture_system_exit_preserves_cleanup_status_and_stops_later_suites() {
+    for (name, source, expected_stdout, expected_stderr, expected_code) in [
+        ("ut_setup_exit", include_str!("fixtures/class_fixture_setup_exit.py"), "setup exit\nfinally\n", "", 3),
+        ("ut_teardown_exit", include_str!("fixtures/class_fixture_teardown_exit.py"), "setup\ntest\nteardown exit\nfinally\n", ".", 4),
+    ] {
+        let (stdout, stderr, code) = unittest_run(name, source);
+        // Verified against python3: no unittest report and no later suite.
+        assert_eq!(stdout, expected_stdout);
+        assert_eq!(stderr, expected_stderr);
+        assert_eq!(code, expected_code);
+    }
+}
+
+#[test]
+fn tuple_bound_thread_local_stored_in_a_lazy_field_runs_and_joins() {
+    let scratch = Scratch::new("thread-tuple-local-field");
+    let file = scratch.path().join("thread_tuple_local_field.py");
+    let source = include_str!("../../../eval/idioms/programs/thread_tuple_local_field.py");
+    fs::write(&file, source).unwrap();
+    let python = Command::new("python3")
+        .arg(&file)
+        .env("PYTHONHASHSEED", "0")
+        .output()
+        .unwrap();
+    // Verified against python3.
+    assert_eq!(python.stdout, b"count 0\nwork 7\nalive False\n");
+    assert!(python.stderr.is_empty());
+    assert_eq!(python.status.code(), Some(0));
+    let package = rypip::discover(&file).unwrap();
+    let krate = rypip::convert(
+        &package,
+        &scratch.path().join("crate"),
+        &ConvertOptions::default(),
+    )
+    .unwrap();
+    let status = Command::new("cargo")
+        .arg("build")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env("RUSTFLAGS", "-D warnings")
+        .current_dir(&krate.root)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let output = Command::new(krate.root.join("target/debug/thread_tuple_local_field"))
+        .output()
+        .unwrap();
+    assert_eq!(output.stdout, python.stdout);
+    assert_eq!(output.stderr, python.stderr);
+    assert_eq!(output.status.code(), python.status.code());
 }

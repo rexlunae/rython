@@ -17,7 +17,7 @@ A Rust library for parsing Python code into Abstract Syntax Trees (AST) and expe
 ## 🚀 Quick Start
 
 `threading.Thread` retains its runtime handle type through local variables
-and instance fields, including aliased imports. A field initialized to
+and instance fields, including tuple-bound constructor results and aliased imports. A field initialized to
 `None` and later assigned a Thread retains `Option<Thread>` rather than
 falling back to `PyValue`. Field defaults
 do not construct placeholder threads; arguments bind at the Python
@@ -201,6 +201,14 @@ def fibonacci(n):
 - **Advanced**: Lambda expressions, conditional expressions, subscripting
 
 #### ⚠️ Experimental/Limited Support
+- **Tuple/list field stores**: Unpacking infers each stored element's field
+  type and applies its coercions. Starred attribute targets and later
+  non-literal RHS elements are refused with a rewrite to local unpacking
+  and separate attribute stores.
+- **unittest gates**: `skipIf`/`skipUnless` conditions that read module names
+  rebound between decoration and the runner call are refused, including
+  potential writes through functions declaring those names `global`. Only
+  effective method gates and inherited class gates are checked (#521).
 - **unittest fields**: `TestCase` methods can create instance fields without
   `__init__` or `setUp`. The runner follows the MRO for tests and fixtures
   and creates a fresh instance per test. Path-sensitive checks reject reads
@@ -209,7 +217,10 @@ def fibonacci(n):
   shadowed by fields (or class values shadowing methods). Manual construction of field-bearing cases and
   explicit lifecycle calls are refused; use `unittest.main()`. Helpers
   must initialize their own field reads; a
-  helper call supplies no initialization facts (issues #480, #511).
+  ordinary helper call supplies no initialization facts (issues #480, #511).
+  Statically resolved zero-argument TestCase `super()` calls analyze the
+  nearest modeled implementation's field reads/stores in the caller's proof;
+  direct `super().setUp()`/`tearDown()` use TestCase's no-op fixtures (#524).
 - **Async/Await**: Parsing supported, code generation experimental
 - **Decorators**: Parsing supported, code generation limited
 - **Exception Handling**: Parsing supported, code generation experimental

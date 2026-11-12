@@ -880,6 +880,12 @@ impl CodeGen for Expr {
         ) {
             return Ok(quote!());
         }
+        // `super().setUp()` reaching unittest.TestCase's own no-op fixture
+        // (issue #524): nothing runs.
+        if crate::ast::tree::testcase::is_noop_testcase_super(&self.value, &ctx, &symbols, &options)
+        {
+            return Ok(quote!());
+        }
         self.value.to_rust(ctx, options, symbols)
     }
 }
@@ -985,7 +991,8 @@ mod tests {
         let out = tokens.to_string();
         assert!(out.contains("pub (crate) fn __module_init__ () -> Result < () , PyException >"), "{}", out);
         assert!(out.contains("test () ;"), "{}", out);
-        assert!(out.contains("fn main () { let __rython_result = (|| -> Result < () , PyException > { __module_init__ () ? ; Ok (()) }) () ;"), "{}", out);
+        assert!(out.contains("fn __rython_main__ () -> Result < () , PyException > { __module_init__ () ? ; Ok (()) }"), "{}", out);
+        assert!(out.contains("fn main () { if let Err (e) = __rython_main__ () { stdpython :: exit_uncaught (& e) ; } }"), "{}", out);
     }
 }
 

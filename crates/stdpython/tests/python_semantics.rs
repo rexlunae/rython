@@ -6738,3 +6738,23 @@ fn system_exit_keeps_its_code_and_args_in_pyo3() {
         });
     }
 }
+
+#[test]
+#[cfg(feature = "zlib")]
+fn zlib_compress_declares_the_window_wbits_asks_for() {
+    use stdpython::stdlib::zlib::{compress, decompress};
+    // python3: d = b'hello world ' * 50
+    //   [zlib.compress(d, 6, w)[:2].hex() for w in range(9, 16)]
+    //   -> ['1895', '2891', '388d', '4889', '5885', '6881', '789c']
+    //   all(zlib.decompress(zlib.compress(d, 6, w), w) == d
+    //       for w in (*range(9, 16), -9, -15, 25, 31)) -> True
+    let d = b"hello world ".repeat(50);
+    let heads = ["1895", "2891", "388d", "4889", "5885", "6881", "789c"];
+    for (w, head) in (9..=15).zip(heads) {
+        let c = compress(&d, 6, w).unwrap();
+        assert_eq!(format!("{:02x}{:02x}", c[0], c[1]), head);
+    }
+    for w in [9, 10, 11, 12, 13, 14, 15, -9, -15, 25, 31] {
+        assert_eq!(decompress(&compress(&d, 6, w).unwrap(), w).unwrap(), d);
+    }
+}

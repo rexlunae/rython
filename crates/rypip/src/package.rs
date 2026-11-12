@@ -12,6 +12,10 @@ pub struct PyModule {
     /// Module path relative to the package root, e.g. `["utils", "text"]`
     /// for `utils/text.py`. Empty for `__init__.py` at the package root.
     pub path: Vec<String>,
+    /// Python import path before Rust-identifier sanitization. Unlike
+    /// `path`, this retains the source package/module spelling used for
+    /// observable metadata such as `__name__`.
+    pub import_path: Vec<String>,
     /// The module's Python source.
     pub source: String,
     /// The source file it came from (for error messages).
@@ -138,7 +142,7 @@ fn module_runs_top_level_code(source: &str) -> bool {
 /// lines, a docstring and an indented (nested) `main()` are all classified
 /// as CPython classifies them. A parse failure is `false`: the conversion
 /// itself reports it with its own message.
-fn module_level_main_call_is_entry(source: &str) -> bool {
+pub(crate) fn module_level_main_call_is_entry(source: &str) -> bool {
     let Ok(module) = python_ast::parse(source, "entry_probe.py") else {
         return false;
     };
@@ -246,6 +250,7 @@ pub fn discover(path: &Path) -> Result<PyPackage> {
                 .to_path_buf(),
             modules: vec![PyModule {
                 path: vec![sanitize_name(stem)],
+                import_path: vec![stem.to_string()],
                 source,
                 file: path,
                 is_init: false,
@@ -272,7 +277,8 @@ pub fn discover(path: &Path) -> Result<PyPackage> {
         for dir in top_level {
             let abs = path.join(&dir);
             let prefix = dotted_prefix(&dir);
-            collect_modules(&abs, &prefix, &mut modules)?;
+            let import_prefix = dotted_import_prefix(&dir);
+            collect_modules(&abs, &prefix, &import_prefix, &mut modules)?;
         }
         for py_module in &meta.py_modules {
             // py-modules are single files; try the project root and src/.
@@ -291,6 +297,7 @@ pub fn discover(path: &Path) -> Result<PyPackage> {
                 .with_context(|| format!("reading {}", file.display()))?;
             modules.push(PyModule {
                 path: vec![sanitize_name(py_module)],
+                import_path: vec![py_module.clone()],
                 source,
                 file,
                 is_init: false,
@@ -308,7 +315,7 @@ pub fn discover(path: &Path) -> Result<PyPackage> {
                 .and_then(|s| s.to_str())
                 .map(str::to_string);
         }
-        collect_modules(&source_root, &[], &mut modules)?;
+        collect_modules(&source_root, &[], &[], &mut modules)?;
     }
 
     if modules.is_empty() {
@@ -330,6 +337,15 @@ pub fn discover(path: &Path) -> Result<PyPackage> {
 /// `pkg` → `["pkg"]`, `src/pkg` → `["pkg"]` (src/ is a layout container,
 /// not part of the import path), `a.b` → `["a", "b"]`.
 fn dotted_prefix(dir: &std::path::Path) -> Vec<String> {
+    dotted_import_prefix(dir)
+        .iter()
+        .map(|part| sanitize_name(part))
+        .collect()
+}
+
+/// The package import path represented by a metadata package directory,
+/// retaining the source spelling rather than the sanitized Rust path.
+fn dotted_import_prefix(dir: &std::path::Path) -> Vec<String> {
     let mut parts: Vec<String> = dir
         .components()
         .filter_map(|c| match c {
@@ -341,7 +357,7 @@ fn dotted_prefix(dir: &std::path::Path) -> Vec<String> {
     if parts.first().is_some_and(|p| p == "src" || p == "lib") && parts.len() > 1 {
         parts.remove(0);
     }
-    parts.iter().map(|p| sanitize_name(p)).collect()
+    parts
 }
 
 /// Keep only the packages that are not nested inside another package in the
@@ -430,7 +446,12 @@ fn submodule_name(stem: &str) -> String {
 }
 
 /// Recursively collect `.py` modules under `dir`.
-fn collect_modules(dir: &Path, prefix: &[String], out: &mut Vec<PyModule>) -> Result<()> {
+fn collect_modules(
+    dir: &Path,
+    prefix: &[String],
+    import_prefix: &[String],
+    out: &mut Vec<PyModule>,
+) -> Result<()> {
     let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.file_name());
 
@@ -446,7 +467,14 @@ fn collect_modules(dir: &Path, prefix: &[String], out: &mut Vec<PyModule>) -> Re
                 );
                 let mut nested_prefix = prefix.to_vec();
                 nested_prefix.push(sub);
-                collect_modules(&path, &nested_prefix, out)?;
+                let mut nested_import_prefix = import_prefix.to_vec();
+                nested_import_prefix.push(
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .context("invalid directory name")?
+                        .to_string(),
+                );
+                collect_modules(&path, &nested_prefix, &nested_import_prefix, out)?;
             }
             continue;
         }
@@ -461,11 +489,14 @@ fn collect_modules(dir: &Path, prefix: &[String], out: &mut Vec<PyModule>) -> Re
             fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         let is_init = stem == "__init__";
         let mut module_path = prefix.to_vec();
+        let mut module_import_path = import_prefix.to_vec();
         if !is_init {
             module_path.push(submodule_name(stem));
+            module_import_path.push(stem.to_string());
         }
         out.push(PyModule {
             path: module_path,
+            import_path: module_import_path,
             source,
             file: path,
             is_init,

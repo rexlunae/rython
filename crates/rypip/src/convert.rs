@@ -111,6 +111,20 @@ pub struct ConvertOptions {
     /// dependencies` / install_requires) against PyPI. Vendored
     /// `[python-modules]` entries always win either way.
     pub no_deps: bool,
+    /// The JIT's library form (issue #166, docs/jit.md): a `cdylib` crate
+    /// with no binary, plus the generated C-ABI boundary module
+    /// (`src/__rython_jit.rs`, see [`crate::cdylib`]). Everything else is
+    /// what the plain conversion emits. Single-module packages only (M1).
+    pub cdylib: Option<CdylibTarget>,
+}
+
+/// The cdylib mode's settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CdylibTarget {
+    /// The module's Python name (`MyMod` for `MyMod.py`), which the
+    /// manifest records — the crate and Rust module take the sanitized
+    /// package name.
+    pub module_name: String,
 }
 
 /// The first line of every Cargo.toml rypip writes: how `rypip run` tells a
@@ -1906,6 +1920,22 @@ fn convert_on_this_thread(
     if opts.driver && (opts.kernel_module || opts.pyo3 || opts.no_std) {
         bail!("--driver cannot be combined with --kernel-module, --pyo3, or --no-std");
     }
+    if opts.cdylib.is_some() {
+        if opts.pyo3 || opts.no_std || opts.kernel_module || opts.driver || opts.rust_for_linux {
+            bail!(
+                "the JIT's cdylib mode cannot be combined with --pyo3, --no-std, \
+                 --kernel-module, --driver or --rust-for-linux"
+            );
+        }
+        if package.modules.len() != 1 {
+            bail!(
+                "the JIT's cdylib mode converts a single module (M1), but `{}` has {} \
+                 modules; run a package with `rypip run`",
+                package.name,
+                package.modules.len()
+            );
+        }
+    }
     let entry_file = package.entry_module().map(|m| m.file.clone());
 
     // Async usage across the package: any async construct (async def/await/
@@ -1938,6 +1968,29 @@ fn convert_on_this_thread(
             "[python-modules] cannot be used with --kernel-module: kernel modules \
              compile a single entry file with no module tree"
         );
+    }
+    // The JIT compiles one module's source and keys its cache on it alone:
+    // a manifest pulling in other files, or a Rust path dependency
+    // (relative to a crate in the JIT's cache), would change the library
+    // without changing the key.
+    if opts.cdylib.is_some() {
+        if !python_manifest.is_empty() || !read_rust_module_manifest(package)?.is_empty() {
+            bail!(
+                "the JIT compiles a module alone (M1): a rython.toml [python-modules] or \
+                 [rust-modules] manifest is not supported; run the package with `rypip run`"
+            );
+        }
+        if let Some((name, _, _)) = rust_bind_dependencies(package)
+            .into_iter()
+            .find(|(_, path, _)| path.is_some())
+        {
+            bail!(
+                "the JIT compiles a module alone (M1): the `from rython import rust` binding \
+                 of crate `{}` names a path dependency, which the JIT's cache cannot \
+                 resolve or key; give it a `version=` instead, or use `rypip run`",
+                name
+            );
+        }
     }
 
     // The packaging metadata's own dependencies ([project] dependencies,
@@ -2069,12 +2122,18 @@ fn convert_on_this_thread(
     );
     let mut transpiled: Vec<(&PyModule, String)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    let package_name_prefix = package_module_name_prefix(package);
     for (_name, dep) in &python_deps {
         for module in &dep.modules {
             if !reachable.contains(&module.path) {
                 continue;
             }
-            let code = transpile(module, &mut warnings, &base_options)?;
+            let code = transpile(
+                module,
+                &mut warnings,
+                &base_options,
+                &module.import_path.join("."),
+            )?;
             transpiled.push((module, code));
         }
     }
@@ -2118,11 +2177,23 @@ fn convert_on_this_thread(
         } else {
             &base_options
         };
-        let code = transpile(module, &mut warnings, options)?;
-        if is_entry {
+        let code = transpile(
+            module,
+            &mut warnings,
+            options,
+            &package_module_name(module, package_name_prefix.as_deref()),
+        )?;
+        // The cdylib (JIT) mode has no binary: the lib copy is the one
+        // the boundary calls.
+        if is_entry && opts.cdylib.is_none() {
             let mut bin_options = entry_options.clone();
             bin_options.bin_crate_root = true;
-            entry_bin_code = Some(transpile(module, &mut Vec::new(), &bin_options)?);
+            entry_bin_code = Some(transpile(
+                module,
+                &mut Vec::new(),
+                &bin_options,
+                "__main__",
+            )?);
         }
         transpiled.push((module, code));
     }
@@ -2134,15 +2205,19 @@ fn convert_on_this_thread(
     // PyO3 bindings live in the lib and must not reference them). An entry
     // module under any OTHER name keeps its lib-side module (src/<name>.rs
     // coexists with the src/main.rs bin).
-    let entry_is_bin_only = entry_file
-        .as_ref()
-        .map(|f| {
-            transpiled
-                .iter()
-                .find(|(m, _)| &m.file == f)
-                .is_some_and(|(m, _)| m.path == ["main"])
-        })
-        .unwrap_or(false);
+    // The cdylib (JIT) mode has no bin: an entry named `main` stays the
+    // lib module `crate::main` (the manifest turns off bin
+    // auto-discovery of its src/main.rs).
+    let entry_is_bin_only = opts.cdylib.is_none()
+        && entry_file
+            .as_ref()
+            .map(|f| {
+                transpiled
+                    .iter()
+                    .find(|(m, _)| &m.file == f)
+                    .is_some_and(|(m, _)| m.path == ["main"])
+            })
+            .unwrap_or(false);
     // Bindings are generated before files are written so their warnings
     // (e.g. forced Python-side renames) participate in the warning mode.
     // Bindings describe the PACKAGE's public API only: vendored
@@ -2304,9 +2379,38 @@ fn convert_on_this_thread(
         write_file(&lib_rs, format_rust(&lib))?;
     }
 
+    // The JIT's boundary module (cdylib mode), in place of a binary.
+    if let Some(target) = &opts.cdylib {
+        let module = &package.modules[0];
+        let (_, code) = transpiled
+            .iter()
+            .find(|(m, _)| m.path == module.path)
+            .expect("the cdylib module was transpiled");
+        let ast = parse_enhanced(&module.source, parse_filename(module))
+            .map_err(|e| anyhow::anyhow!("{} ({})", e, module.file.display()))?;
+        let (boundary, _manifest) = crate::cdylib::generate(&crate::cdylib::CdylibModule {
+            python_name: &target.module_name,
+            rust_path: &module.path,
+            source: &module.source,
+            ast: &ast,
+            code,
+            is_entry: entry_file.is_some(),
+            entry_is_bare_main_call: entry_file.is_some()
+                && crate::package::module_level_main_call_is_entry(&module.source),
+            uses_async: package_uses_async,
+        });
+        write_file(
+            src_dir.join(format!("{}.rs", crate::cdylib::BOUNDARY_MODULE)),
+            format_rust(&boundary),
+        )?;
+        let mut lib = fs::read_to_string(&lib_rs)?;
+        lib.push_str(&format!("\nmod {};\n", crate::cdylib::BOUNDARY_MODULE));
+        write_file(&lib_rs, format_rust(&lib))?;
+    }
+
     // Binary entry point.
     let mut has_binary = false;
-    if let Some(entry_file) = &entry_file {
+    if let Some(entry_file) = entry_file.as_ref().filter(|_| opts.cdylib.is_none()) {
         let (entry, _) = transpiled
             .iter()
             .find(|(m, _)| &m.file == entry_file)
@@ -2365,13 +2469,17 @@ fn convert_on_this_thread(
         has_binary = true;
     }
 
+    // A cdylib's entry module carries the program entry too (its lib copy
+    // always did), so an async one needs the runtime feature the binary
+    // would declare.
+    let crate_runs_program = has_binary || (opts.cdylib.is_some() && entry_file.is_some());
     write_cargo_toml(
         package,
         &python_deps,
         &reachable,
         out_dir,
         opts,
-        has_binary,
+        crate_runs_program,
         &DeviceManifest::default(),
         false,
     )?;
@@ -2612,7 +2720,13 @@ fn convert_driver(
         package,
         &python_deps,
     );
-    let code = transpile(module, &mut warnings, &base_options)?;
+    let package_name_prefix = package_module_name_prefix(package);
+    let code = transpile(
+        module,
+        &mut warnings,
+        &base_options,
+        &package_module_name(module, package_name_prefix.as_deref()),
+    )?;
 
     let mut dep_transpiled: Vec<(&PyModule, String)> = Vec::new();
     for (_name, dep) in &python_deps {
@@ -2620,7 +2734,12 @@ fn convert_driver(
             if !reachable.contains(&dep_module.path) {
                 continue;
             }
-            let dep_code = transpile(dep_module, &mut warnings, &base_options)?;
+            let dep_code = transpile(
+                dep_module,
+                &mut warnings,
+                &base_options,
+                &dep_module.import_path.join("."),
+            )?;
             dep_transpiled.push((dep_module, dep_code));
         }
     }
@@ -3091,6 +3210,7 @@ fn transpile(
     module: &PyModule,
     warnings: &mut Vec<String>,
     base_options: &PythonOptions,
+    python_module_name: &str,
 ) -> Result<String> {
     let ast = parse_enhanced(&module.source, parse_filename(module))
         .map_err(|e| anyhow::anyhow!("{} ({})", e, module.file.display()))?;
@@ -3115,6 +3235,7 @@ fn transpile(
         .cloned()
         .unwrap_or_else(|| "lib".to_string());
     let mut options = base_options.clone();
+    options.python_module_name = Some(python_module_name.to_string());
     // Relative imports resolve against the current module's package path;
     // empty at the crate root (the default when unset).
     options.module_path = module_package_path(module);
@@ -3149,6 +3270,33 @@ fn transpile(
         warnings.push(format!("{}: {}", parse_filename(module), w));
     }
     Ok(tokens.to_string())
+}
+
+/// A package discovered from a source root whose `__init__.py` has an
+/// empty relative path needs that root directory as the leading Python
+/// package name (`pkg/helper.py` → `pkg.helper`). Metadata-discovered
+/// packages already carry their import root in `module.import_path`.
+fn package_module_name_prefix(package: &crate::package::PyPackage) -> Option<String> {
+    let root_init = package
+        .modules
+        .iter()
+        .find(|module| module.is_init && module.import_path.is_empty())?;
+    root_init
+        .file
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+}
+
+fn package_module_name(module: &PyModule, prefix: Option<&str>) -> String {
+    let relative = module.import_path.join(".");
+    match (prefix, relative.is_empty()) {
+        (Some(prefix), true) => prefix.to_string(),
+        (Some(prefix), false) => format!("{prefix}.{relative}"),
+        (None, true) => "lib".to_string(),
+        (None, false) => relative,
+    }
 }
 
 /// Whether any module of the package contains async constructs (async def/
@@ -3793,12 +3941,21 @@ fn write_cargo_toml(
             }
         }
     };
+    // The cdylib (JIT) mode has no binary target: bin auto-discovery is
+    // off, so an entry module named `main` (src/main.rs) stays a lib
+    // module.
+    let autobins = if opts.cdylib.is_some() {
+        "autobins = false\n"
+    } else {
+        ""
+    };
     let mut toml = format!(
         "{header}\n\
          [package]\n\
          name = \"{name}\"\n\
          version = \"{version}\"\n\
-         edition = \"2021\"\n\n\
+         edition = \"2021\"\n\
+         {autobins}\n\
          [dependencies]\n\
          {stdpython_dep}\n",
         header = GENERATED_MANIFEST_HEADER,
@@ -3871,6 +4028,12 @@ fn write_cargo_toml(
              default = [\"async-tokio\"]\n\
              async-tokio = [\"dep:tokio\"]\n\n",
         );
+    }
+    // The JIT loads the library in-process (docs/jit.md): a cdylib, with
+    // the default unwinding panics its shims catch. Last, after every
+    // dependency line above.
+    if opts.cdylib.is_some() {
+        toml.push_str("\n[lib]\ncrate-type = [\"cdylib\"]\n");
     }
     write_file(out_dir.join("Cargo.toml"), toml)?;
     // PyO3 bindings need a build script: pyo3 requires the downstream
@@ -4255,6 +4418,7 @@ fn python_module_deps(
             let file = abs.clone();
             let module = PyModule {
                 path: vec![name.clone()],
+                import_path: import_name.split('.').map(str::to_string).collect(),
                 source,
                 file,
                 is_init: false,
@@ -4282,8 +4446,13 @@ fn python_module_deps(
                 format!("python-module `{import_name}`: discovering {}", abs.display())
             })?;
             let prefix = sanitize_name(import_name);
+            let import_prefix: Vec<String> =
+                import_name.split('.').map(str::to_string).collect();
             for module in &mut pkg.modules {
                 module.path.insert(0, prefix.clone());
+                module
+                    .import_path
+                    .splice(0..0, import_prefix.iter().cloned());
                 // The package's own __init__ was discovered as the root
                 // (empty path); after prefixing it IS the package init.
                 if module.path.len() == 1 && module.file.file_name() == Some("__init__.py".as_ref())
@@ -4469,6 +4638,65 @@ fn resolve_stdpython_source(opts: &ConvertOptions) -> Result<StdpythonSource> {
     Ok(StdpythonSource::Registry(
         env!("CARGO_PKG_VERSION").to_string(),
     ))
+}
+
+/// The generated crate's stdpython dependency as the JIT's cache key sees
+/// it (issue #166): a registry release by its version (immutable); a
+/// checkout by its path and every source file's path, size and
+/// modification time — what cargo's own freshness check reads for a path
+/// dependency — so a library built against an edited runtime is never
+/// served for the new one. (The feature set follows from the source's
+/// imports, which the key covers.)
+pub fn stdpython_fingerprint(opts: &ConvertOptions) -> Result<String> {
+    let root = match resolve_stdpython_source(opts)? {
+        StdpythonSource::Registry(version) => return Ok(format!("registry {}", version)),
+        StdpythonSource::Path(path) => path,
+    };
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) -> Result<()> {
+        let mut entries: Vec<_> = fs::read_dir(dir)
+            .with_context(|| format!("reading {}", dir.display()))?
+            .filter_map(|e| e.ok())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                walk(&path, root, out)?;
+            } else {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                out.push(format!("{} {} {}", relative.display(), meta.len(), mtime));
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    for item in ["Cargo.toml", "build.rs"] {
+        let path = root.join(item);
+        if path.is_file() {
+            let meta = fs::metadata(&path)?;
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            files.push(format!("{} {} {}", item, meta.len(), mtime));
+        }
+    }
+    walk(&root.join("src"), &root, &mut files)?;
+    use sha2::{Digest, Sha256};
+    let digest: String = Sha256::digest(files.join("\n").as_bytes())
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    Ok(format!("path {}\nsources {} files {}", root.display(), files.len(), digest))
 }
 
 /// Locate the rykernel-shim crate that generated device modules link: an

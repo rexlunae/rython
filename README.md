@@ -17,12 +17,19 @@ calls it as its last top-level statement, that call (what `python
 file.py` runs) — becomes `fn main`, and the generated code
 depends only on the `stdpython` runtime. The output is a starting point for
 a permanent port — readable Rust you can refactor, not an opaque bundle.
+Package modules retain their dotted Python `__name__` (including original
+capitalization); the executable entry still sees `__main__`.
 `rypip run program.py -- args` is the same pipeline behind CPython's
 command-line shape: it converts into a scratch crate (reused across runs),
 builds it quietly, and executes the binary with your arguments, streams
 and working directory, exiting with the program's status — no new
 semantics, just `python program.py` without the interpreter (Unix only for
-now: `sys.argv[0]` is set through the exec).
+now: `sys.argv[0]` is set through the exec). `rypip jit run program.py
+args` is the same conversion through the [JIT](docs/jit.md): the program
+is built into a shared library, cached by content (an unchanged file
+costs a `dlopen` on the next run) and run inside rypip's process, and
+`rypip jit call module.py function args` calls one function, printing
+the `repr` of its result.
 
 **2. Using Python inside Rust projects.**
 The `python-mod` proc-macros (`python_module!`, `python_module_nostd!`)
@@ -76,8 +83,9 @@ and [`rypip install`](examples/05-rypip-install) turning a
 - [Testing under rython](docs/testing-under-rython.md) — bounded unittest
   support, the explicit pytest runner boundary, and ways to test a
   converted library (#334, #482)
-- [The JIT](docs/jit.md) — the design for on-demand compilation: convert,
-  build with `rustc`, cache, load in-process (issue #166)
+- [The JIT](docs/jit.md) — on-demand compilation: convert, build with
+  `rustc`, cache, load in-process (issue #166); milestone M1 (`rython-jit`,
+  `rypip jit run`/`call`) is implemented, its measured latency recorded
 - [Evaluating a JIT](docs/jit-eval.md) — the earlier evaluation, superseded
   by the design above and kept for the objections it had to answer
 
@@ -87,7 +95,8 @@ and [`rypip install`](examples/05-rypip-install) turning a
 |---|---|
 | [`python-ast`](crates/python-ast) | Core library — parses Python AST and transpiles to Rust |
 | [`python-mod`](crates/python-mod) | Proc-macro for including Python modules in Rust source |
-| [`rypip`](crates/rypip) | pip-like tool — converts/builds/installs Python packages as Rust crates |
+| [`rypip`](crates/rypip) | pip-like tool — converts/builds/installs Python packages as Rust crates; `rypip jit` |
+| [`rython-jit`](crates/rython-jit) | JIT host — compiles Python on demand into a cached shared library, loads it, calls into it |
 | [`rythonc`](crates/rythonc) | CLI compiler — `rythonc input.py → output.rs` |
 | [`stdpython`](crates/stdpython) | Python standard library runtime implemented in Rust |
 
@@ -105,6 +114,12 @@ cargo run -p rypip -- install path/to/package
 
 # Convert for embedded/wasm targets (core+alloc only, no OS)
 cargo run -p rypip -- convert path/to/package --out my-crate --no-std
+
+# Run a program in-process through the JIT (cached under ~/.cache/rython/jit)
+cargo run -p rypip -- jit run program.py arg1 arg2
+
+# Call one function of a module through the JIT; prints repr(result)
+cargo run -p rypip -- jit call module.py add 2 40
 
 # Compile a single Python file to Rust source
 cargo run -p rythonc -- input.py -o output.rs
@@ -131,8 +146,9 @@ signatures derived from how the parameter is used — `def add(a, b): return
 a + b` works for ints, floats, strings, and lists; `for x in p` infers
 `IntoIterator` with element propagation; unannotated parameters either
 infer or fail loudly at conversion time),
-classes (struct-based), control flow including `try`/`except`/`finally` and
-loop `else`, comprehensions (including immediate `list(... for ...)`
+classes (struct-based, with single inheritance including imported sibling
+package bases), control flow including `try`/`except`/`finally` and loop
+`else`, comprehensions (including immediate `list(... for ...)`
 consumption, with conversion errors for mutable or unresolved outputs
 whose sharing cannot be preserved), f-strings and `str.format` on literal
 templates, keyword arguments and defaults for user functions (plus
@@ -156,7 +172,7 @@ lookup, normalize),
 `collections` (partial — issue #427; `deque`, `defaultdict`, `OrderedDict`
 and `Counter` construct, `ChainMap`/`namedtuple` do not), `pathlib`, `glob`,
 `subprocess`, `tempfile`,
-`threading` (Thread with static targets, including initialized instance fields
+`threading` (Thread with static targets, including tuple-bound locals, initialized instance fields
 and aliased imports; Lock/RLock/Event/Semaphore
 with a real `with lock:` acquire/release lowering, `local()` as a
 per-thread bag of run-time attributes), `socket` (TCP/UDP
@@ -166,12 +182,22 @@ feature that `rypip` enables automatically), and more.
 
 `unittest.TestCase` fields may first be assigned in a test method, without
 `__init__` or `setUp`. The runner creates a fresh instance per test and
-discovers inherited tests and fixtures. Reads must follow an assignment on
-every path, or an unconditional `setUp` initialization; uncertain attribute
-presence, receiver escapes, and field reads relying on another test or an
-opaque helper are conversion errors. Manual construction of cases with
-fields is refused; use `unittest.main()` to preserve fixture order
-(issues #480, #511).
+discovers inherited tests and per-test fixtures. Direct `setUpClass` and
+`tearDownClass` class fixtures run once around each class's tests. Inherited
+class fixtures and unsupported signatures are refused. Zero-argument `super()`
+calls follow the modeled TestCase MRO, including TestCase's no-op instance
+fixtures; resolved bodies contribute to field-initialization checks (#524). Reads must follow an
+assignment on every path, or an unconditional `setUp` initialization;
+uncertain attribute presence, receiver escapes, and field reads relying on
+another test or an opaque helper are conversion errors. Manual construction
+of cases with fields is refused; use `unittest.main()` to preserve fixture
+order (issues #480, #511, #526).
+`skipIf`/`skipUnless` conditions must stay unchanged between decoration and
+the runner call; direct rebinding and potential writes through `global`
+functions are conversion errors (#521).
+`with self.assertRaises(E) as cm:` catches the expected exception and
+supports reading `cm.exception` after the block; other uses of the context
+object are conversion errors (#523).
 
 Comprehension outputs that borrow existing mutable containers by name,
 attribute, or index are refused when value copies would lose sharing.
@@ -196,6 +222,11 @@ forms, including the args tuple for multi-argument messages. Mutable or
 unknown arguments and unsupported specialized constructors are conversion
 errors; see [the exception specification](docs/spec.md#8-exceptions).
 `socket.gaierror` and `herror` keep their distinct OSError subtype matching.
+
+Tuple/list unpacking infers instance field types from the stored elements
+and applies the fields' normal assignment coercions. Starred attribute
+patterns and later non-literal RHS elements require unpacking into locals
+and separate field stores.
 
 Known gaps:
 
@@ -465,8 +496,7 @@ is complete. What's ahead:
 - Generalized decorator support (unblocks `dataclasses`, `property`,
   user-defined wrappers)
 - Generators and `yield` (likely as iterator-struct lowering)
-- Richer class model: inheritance (single, then multiple), common
-  dunder protocols
+- Richer class model: multiple inheritance and common dunder protocols
 - Automatic arbitrary-precision integer promotion, which will retire the
   current integer overflow limitation
 - An opt-in dynamic-typing escape hatch (boxed values) for multi-type

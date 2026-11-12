@@ -3059,14 +3059,18 @@ impl CodeGen for ImportFrom {
             if let Some(key) = crate::module_defs_key(&options, &import_module_path)
                 && let Some(traits) = crate::module_class_traits(&options, key).get(&alias.name)
             {
-                for trait_name in traits {
+                for (trait_module_path, trait_name) in traits {
                     if !seen_traits.insert(trait_name.clone()) {
                         continue;
                     }
                     let t = crate::safe_ident(trait_name);
+                    let trait_parts: Vec<_> = trait_module_path
+                        .iter()
+                        .map(|part| crate::safe_ident(part))
+                        .collect();
                     tokens.extend(quote! {
                         #[allow(unused_imports)]
-                        use #root #(::#base_parts)* #(::#module_path)*::#t;
+                        use crate #(::#trait_parts)*::#t;
                     });
                 }
             }

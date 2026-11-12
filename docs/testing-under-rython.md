@@ -13,9 +13,24 @@ Deviation ledger: [`spec.md`](spec.md) §12.
 
 - **`unittest` suites work today, for a bounded subset.** A `unittest`
   module converts, builds, and runs; assertions, fixtures and gates are
-  lowered; exit status matches CPython (0 on pass, 1 on failure).
+  lowered; exit status matches CPython (0 on pass, 1 on failure). A
+  `skipIf`/`skipUnless` condition that reads a module name rebound after
+  its decorated class and before this runner call is refused, because
+  CPython snapshots it at decoration time and the current runner evaluates
+  it at test time (#521). The check includes walrus RHS reads and potential
+  writes by functions declaring the name `global` (conservatively, without
+  call-effect analysis). It checks effective methods and inherited class
+  gates; overridden method gates and direct writes after the runner returns
+  do not affect that run.
 - **`with self.assertRaises(...): raise ...` works** since #457. The
   former build failure and its cause are recorded below as history.
+- **`with self.assertRaises(E) as cm:` works** since #523: the matching
+  exception is suppressed, and `cm.exception` can be read after the block.
+  Uses of the context object other than `.exception` are refused. `E` must
+  be statically known; dynamic attributes such as
+  `self.failureException` are refused with a source-located error. Aliased
+  imports of known stdlib exception classes (for example
+  `import socket as s; s.timeout`) resolve to their canonical class.
 - **There is no pytest runner or automatic collection.** A module with
   only `test_*` functions remains a library. An unresolved `import pytest`
   warns through the external-module channel (#456); attempts to use
@@ -89,6 +104,15 @@ if __name__ == "__main__":
 `rypip convert` → `cargo build` → run: exit 0, matching `python3` exit 0.
 Adding a failing test (`self.assertEqual(1, 2)`) makes both exit 1.
 
+Direct `setUpClass` and `tearDownClass` fixtures run once
+around a class's tests. A class skip suppresses both fixtures; a setup
+exception is reported as unittest's synthetic class-fixture error and
+suppresses that class's tests and teardown; a teardown exception is
+reported after the tests. The supported class-fixture signatures are a
+single class parameter for `@classmethod`, or no parameters for
+`@staticmethod`. Inherited class fixtures and other signatures are
+conversion errors rather than silently omitted behavior (issue #526).
+
 Test methods may create fields directly (`self.total = 3` followed by
 `self.assertEqual(self.total, 3)`), including when the class has no
 `__init__` or `setUp` (issue #480). The runner follows the MRO for
@@ -126,9 +150,11 @@ the #457, #480 and #482 pins below update the affected rows:
 | `assertIn` (list) | yes | yes | yes | pass/fail outcome yes |
 | `assertTrue` | yes | yes | yes | pass/fail outcome yes |
 | `setUp` fixture | yes | yes | yes | yes |
+| `setUpClass` / `tearDownClass` | yes | yes | yes | yes (issue #526) |
 | `with self.assertRaises(E): f()` | yes | yes | yes | yes |
 | `with self.assertRaises(E): raise E(...)` | yes | yes | yes | yes (#457) |
-| `@unittest.skip` / `skipIf` / `skipUnless` | yes | yes | yes | yes (gates honoured) |
+| `with self.assertRaises(E) as cm: raise E(...); cm.exception` | yes | yes | yes | yes (#523) |
+| `@unittest.skip` / `skipIf` / `skipUnless` | yes | yes | yes | yes for stable conditions; rebinding between definition and runner is refused (#521) |
 | `@expectedFailure` | yes | yes | yes | yes |
 | Function-only `test_*` module | yes | yes (library) | no binary | no implicit collection, as with `python file.py` |
 | External `pytest.main(...)` / imported alias | **conversion error** | — | — | no runner; run under CPython or port to unittest |
@@ -161,8 +187,10 @@ so a block keeps the header and the final exception line (the model limit
 a thread's unhandled exception already has; `docs/spec.md` §12.3). The
 runtime half is `stdpython::unittest::TextTestResult`: status characters
 `.` `F` `E` `s` `x` `u`; `setUp`/`tearDown` exceptions reported against
-the test as `TestCase.run` reports them; an `AssertionError` is a FAIL and
-anything else an ERROR; a test's docstring's first line under its name;
+the test as `TestCase.run` reports them and class-fixture exceptions as
+synthetic class-fixture errors (their status is printed but they do not
+increment `Ran N`); an `AssertionError` is a FAIL and anything else an
+ERROR; a test's docstring's first line under its name;
 the exit status 1 for an unsuccessful run, 5 when no test ran, 0
 otherwise. `unittest.main(exit=False)` prints the report and returns to
 the caller; any other argument (`verbosity=`, `argv=`, ...) is refused at
