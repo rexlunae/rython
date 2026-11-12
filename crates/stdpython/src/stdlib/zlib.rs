@@ -122,7 +122,16 @@ pub fn compress(data: &[u8], level: i64, wbits: i64) -> Result<Vec<u8>, PyExcept
         return Err(error("Bad compression level"));
     };
     let level = if level < 0 { 6 } else { level as u8 };
-    let body = compress_to_vec(data, level);
+    // The window wbits asks for. miniz_oxide always searches a 32 KiB
+    // window, so a smaller one is kept by storing the data instead of
+    // deflating it once a back-reference could reach past the window.
+    let bits = match framing {
+        Framing::Raw => -wbits,
+        Framing::Gzip => wbits - 16,
+        _ => wbits,
+    };
+    let stored = bits < 15 && data.len() > 1usize << bits;
+    let body = compress_to_vec(data, if stored { 0 } else { level });
     Ok(match framing {
         Framing::Raw => body,
         Framing::Zlib | Framing::Either => {
@@ -134,7 +143,8 @@ pub fn compress(data: &[u8], level: i64, wbits: i64) -> Result<Vec<u8>, PyExcept
                 6 => 2,
                 _ => 3,
             };
-            let cmf = 0x78u8;
+            // CINFO: the window, as log2 of its size less 8.
+            let cmf = ((bits - 8) as u8) << 4 | 8;
             let mut flg = flevel << 6;
             flg += (31 - ((u16::from(cmf) << 8 | u16::from(flg)) % 31) as u8) % 31;
             let mut out = vec![cmf, flg];
@@ -425,6 +435,41 @@ mod tests {
         assert_eq!(message(compress(b"a", 12, 15)), "Bad compression level");
         assert_eq!(message(compress(b"a", 1, 99)), "Bad compression level");
         assert_eq!(decompress(b"x\x9c\xff\xff", 15).unwrap_err().exception_type, "zlib.error");
+    }
+
+    #[test]
+    fn small_windows_round_trip_with_cpythons_headers() {
+        // CPython 3: zlib.compress(b'hello world ' * 50, 6, w)[:2].hex()
+        // is 1895 2891 388d 4889 5885 6881 789c for w = 9 to 15.
+        let d = b"hello world ".repeat(50);
+        let heads = ["1895", "2891", "388d", "4889", "5885", "6881", "789c"];
+        for (w, head) in (9..=15).zip(heads) {
+            let c = compress(&d, 6, w).unwrap();
+            assert_eq!(format!("{:02x}{:02x}", c[0], c[1]), head);
+            assert_eq!(decompress(&c, w).unwrap(), d);
+            assert_eq!(decompress(&c, w + 32).unwrap(), d);
+        }
+        // Raw and gzip streams with small windows round-trip too.
+        for w in [-9, -12, 25, 28] {
+            let c = compress(&d, 6, w).unwrap();
+            assert_eq!(decompress(&c, w).unwrap(), d);
+        }
+        // Longer than a small window, the body is stored (BTYPE 00), so it
+        // holds no back-reference at all; within the window, a reference
+        // reaches back at most len - 1 bytes. Either way a decoder limited
+        // to that window accepts it.
+        for w in [-9, 9, 25] {
+            let c = compress(&d, 6, w).unwrap();
+            let at = match w {
+                -9 => 0,
+                9 => 2,
+                _ => 10,
+            };
+            assert_eq!((c[at] >> 1) & 3, 0, "wbits {w}");
+        }
+        // Data that fits the window is still deflated.
+        let small = b"abcabcabcabc".repeat(10);
+        assert!(compress(&small, 6, 9).unwrap().len() < small.len());
     }
 
     #[test]

@@ -46,6 +46,11 @@ pub use rust_module::*;
 pub mod exception_tree;
 pub use exception_tree::*;
 
+/// Python literals evaluated by CPython, and the linked CPython's version
+/// (the JIT's command line and cache key, issue #166).
+pub mod literal;
+pub use literal::{is_module_identifier, literal_eval, python_version, PyLiteral};
+
 /// A loud limit on lowering depth (issue #354).
 pub mod stack_guard;
 pub use stack_guard::with_stack_budget;

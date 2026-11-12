@@ -3162,19 +3162,10 @@ impl CodeGen for Module {
                     let renamed_stream_str = Self::rename_main_function_and_references(&stream_str);
                     stream = renamed_stream_str.parse::<proc_macro2::TokenStream>()
                         .unwrap_or_else(|_| stream);
-                    stream.extend(quote! {
-                        #[allow(dead_code)]
-                        fn main() {
-                            let __rython_result = (|| -> Result<(), PyException> {
-                                #startup_init
-                                python_main()?;
-                                Ok(())
-                            })();
-                            if let Err(e) = __rython_result {
-                                stdpython::exit_uncaught(&e);
-                            }
-                        }
-                    });
+                    stream.extend(sync_program_entry(quote! {
+                        #startup_init
+                        python_main()?;
+                    }));
                 }
             } else {
                 // Complex main block - use existing behavior (rename user's main)
@@ -3248,19 +3239,10 @@ impl CodeGen for Module {
                     });
                 } else {
                     let init_call = &startup_init;
-                    stream.extend(quote! {
-                        #[allow(dead_code)]
-                        fn main() {
-                            let __rython_result = (|| -> Result<(), PyException> {
-                                #init_call
-                                #(#main_body_stmts;)*
-                                Ok(())
-                            })();
-                            if let Err(e) = __rython_result {
-                                stdpython::exit_uncaught(&e);
-                            }
-                        }
-                    });
+                    stream.extend(sync_program_entry(quote! {
+                        #init_call
+                        #(#main_body_stmts;)*
+                    }));
                 }
             }
         } else if needs_init_wrapper {
@@ -3278,18 +3260,7 @@ impl CodeGen for Module {
                 let renamed = Self::rename_main_function_and_references(&stream.to_string());
                 stream = renamed.parse::<proc_macro2::TokenStream>().unwrap_or(stream);
             }
-            stream.extend(quote! {
-                #[allow(dead_code)]
-                fn main() {
-                    let __rython_result = (|| -> Result<(), PyException> {
-                        #startup_init
-                        Ok(())
-                    })();
-                    if let Err(e) = __rython_result {
-                        stdpython::exit_uncaught(&e);
-                    }
-                }
-            });
+            stream.extend(sync_program_entry(startup_init));
         }
         // Module-level generated items collected during codegen (issue
         // #109, M3: duck-typing traits like HasSpeak and their per-class
@@ -3304,6 +3275,35 @@ impl CodeGen for Module {
             stream = prefix;
         }
         Ok(stream)
+    }
+}
+
+/// The name of a synchronous program's body as a function: what the
+/// binary's `fn main` runs, and what the JIT's `ry_entry` shim (rypip's
+/// cdylib mode, issue #166) calls without ending the host process.
+pub const PROGRAM_BODY_FN: &str = "__rython_main__";
+
+/// A synchronous program entry: the startup sequence and the program body
+/// as [`PROGRAM_BODY_FN`], returning an escaping exception, and `fn main`,
+/// which reports one as CPython does (`exit_uncaught`). Splitting the two
+/// gives an embedding host the exact body the binary runs, by
+/// construction. Both carry `#[allow(dead_code)]`: in the lib copy of an
+/// entry module nothing calls them (see the comment above the entry
+/// emission).
+fn sync_program_entry(body: TokenStream) -> TokenStream {
+    let body_fn = format_ident!("{}", PROGRAM_BODY_FN);
+    quote! {
+        #[allow(dead_code)]
+        pub(crate) fn #body_fn() -> Result<(), PyException> {
+            #body
+            Ok(())
+        }
+        #[allow(dead_code)]
+        fn main() {
+            if let Err(e) = #body_fn() {
+                stdpython::exit_uncaught(&e);
+            }
+        }
     }
 }
 

@@ -52,19 +52,82 @@ pub static base_prefix: std::sync::LazyLock<String> = std::sync::LazyLock::new(|
 /// This reflects the actual command line arguments, just like Python's sys.argv.
 /// 
 /// Note: This uses lazy evaluation to get the actual command line arguments at runtime.
-pub static argv: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
-    std::env::args_os()
-        .enumerate()
-        .map(|(i, arg)| decode_argument(i, arg))
-        .collect()
-});
+/// The arguments come through [`installed_program_args`], the one seam
+/// both this and [`argv_at`] read.
+pub static argv: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| match installed_program_args() {
+        Some(args) => args,
+        None => std::env::args_os()
+            .enumerate()
+            .map(|(i, arg)| decode_argument(i, arg))
+            .collect(),
+    });
 
 /// One process argument by index, decoded by the same policy as
 /// `sys.argv` without materializing the whole vector: argparse's default
 /// `prog` needs argv[0] only, and must not trip over an unrelated
 /// argument the program never reads (Devin review on #340, round 4).
 pub fn argv_at(index: usize) -> Option<String> {
-    std::env::args_os().nth(index).map(|arg| decode_argument(index, arg))
+    match installed_program_args() {
+        Some(args) => args.get(index).cloned(),
+        None => std::env::args_os().nth(index).map(|arg| decode_argument(index, arg)),
+    }
+}
+
+/// Where the program's arguments come from: the process's own, unless an
+/// embedding host installed the program's before anything read them.
+enum ProgramArgs {
+    Process,
+    Installed(Vec<String>),
+}
+
+/// `None` until the first read or install decides the source; once
+/// decided it never changes, because `sys.argv` initializes once.
+static PROGRAM_ARGS: std::sync::Mutex<Option<ProgramArgs>> = std::sync::Mutex::new(None);
+
+/// The seam every reader of the program's arguments goes through (`sys.argv`,
+/// [`argv_at`] and so argparse's default `prog`; issue #166): the
+/// arguments a host installed with [`install_program_args`], or `None` for
+/// the process's own. The first read fixes the source, so a later install
+/// cannot leave `sys.argv` reporting arguments the program did not get.
+fn installed_program_args() -> Option<Vec<String>> {
+    let mut source = PROGRAM_ARGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match source.get_or_insert(ProgramArgs::Process) {
+        ProgramArgs::Process => None,
+        ProgramArgs::Installed(args) => Some(args.clone()),
+    }
+}
+
+/// Why [`install_program_args`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallArgsError {
+    /// Something already read the arguments (they are the process's now).
+    AlreadyRead,
+    /// A program's arguments were installed already.
+    AlreadyInstalled,
+}
+
+/// Install the program's arguments (`sys.argv`, `argv[0]` first) in this
+/// copy of the runtime, for a program that runs inside a host process
+/// whose own arguments are not the program's: the JIT's `ry_entry` (issue
+/// #166) calls this in the loaded library before the program runs.
+/// Refused once anything has read the arguments or once a program's were
+/// installed, never silently ignored: `sys.argv` is initialized once, and
+/// a late install would leave it reporting other arguments.
+pub fn install_program_args(args: Vec<String>) -> Result<(), InstallArgsError> {
+    let mut source = PROGRAM_ARGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match &*source {
+        None => {
+            *source = Some(ProgramArgs::Installed(args));
+            Ok(())
+        }
+        Some(ProgramArgs::Process) => Err(InstallArgsError::AlreadyRead),
+        Some(ProgramArgs::Installed(_)) => Err(InstallArgsError::AlreadyInstalled),
+    }
 }
 
 /// The runtime's one policy for a process argument: CPython decodes a
@@ -288,3 +351,21 @@ pub mod implementation {
 /// guarded code compiling (the interpreter-identity divergence).
 #[allow(non_upper_case_globals)]
 pub static pypy_version_info: (i64, i64, i64) = (0, 0, 0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installing_program_arguments_after_a_read_is_refused() {
+        // A read fixes the source to the process's own arguments (this
+        // test binary's): an install after it could not change what
+        // `sys.argv` already reported, so it is refused, never ignored.
+        let first = argv_at(0);
+        assert_eq!(
+            install_program_args(vec!["late.py".to_string()]),
+            Err(InstallArgsError::AlreadyRead)
+        );
+        assert_eq!(argv_at(0), first);
+    }
+}

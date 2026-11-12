@@ -1,6 +1,9 @@
 # The Rython JIT: on-demand compilation (issue #166)
 
-**Status: design. Nothing in this document is implemented yet.** It records
+**Status: M1 is implemented** (the `rython-jit` crate, the converter's
+cdylib mode and `rypip jit run` / `rypip jit call`; see [M1 as
+built](#m1-as-built) for what shipped, its measured latency and where it
+deviates from the design below). M2–M6 are design. This document records
 the maintainer's decision that a JIT is a project goal ([`goals-and-design.md`](goals-and-design.md),
 Goal 6), the approach chosen for it, and the milestones that build it. The
 earlier evaluation, [`jit-eval.md`](jit-eval.md), is superseded by this
@@ -94,6 +97,8 @@ time (checklist questions 3 and 4).
   `Jit::new(config)`, `Jit::compile(name, source) -> Module`, and typed
   calls on a `Module`. It depends on the converter and on `libloading`. It
   is the only place that knows about caching, building and loading.
+  (As built, the converter reaches it through a trait rather than a crate
+  dependency: see [Deviations](#deviations-from-the-design).)
 - **A `cdylib` mode in the converter** (new `ConvertOptions` flag; it does
   not exist today). The crate is emitted with `crate-type = ["cdylib"]`,
   plus one generated `extern "C"` shim per public function. Everything
@@ -264,7 +269,8 @@ Each is independently mergeable, gated by tests that diff against
 
 - **M0, this document.** Goal 6 added, the two non-goals narrowed,
   `jit-eval.md` marked superseded. Docs only.
-- **M1, compile, cache, load, call, run.** `rython-jit` with scalar and
+- **M1, compile, cache, load, call, run. Done** ([M1 as built](#m1-as-built)).
+  `rython-jit` with scalar and
   `str` arguments and results, exception mapping, the content-hash cache,
   the artifact-discovery refactor, the `ry_entry` shim and the `sys.argv` seam in `stdpython`, and `rypip jit call`
   and `rypip jit run`. *Useful on its own:* a Rust program can call a Python
@@ -292,6 +298,255 @@ Each is independently mergeable, gated by tests that diff against
   background compilation, cache eviction, and Windows support. Optionally,
   linking `stdpython` dynamically so the host and compiled code share one
   runtime and the stdout/state duplication goes away.
+
+## M1 as built
+
+M1 shipped with the open questions below answered by this document's own
+assumptions, pending the maintainer: a new crate (`crates/rython-jit`,
+`std` only); Unix first (elsewhere `Jit::new` is a loud
+`JitError::Environment`, as `rypip run` refuses); the cache at
+`$XDG_CACHE_HOME/rython/jit` (default `~/.cache/rython/jit`), mode `0700`,
+no eviction (`rypip jit --clear-cache` only); and Python installed at JIT
+time, since the parser is CPython's.
+
+### Surfaces
+
+- **Library** (`rython-jit`): `Jit::new(JitConfig)`,
+  `Jit::compile(name, source)` / `Jit::compile_file(name, path)` returning a
+  `Module`; `Module::call(function, &[Value]) -> Value`,
+  `Module::call_as::<R>` (`R` one of `()`, `bool`, `i64`, `f64`, `String`,
+  `Value`), `Module::run_entry(&argv) -> exit status`,
+  `Module::set_argv(&argv)`, and introspection (`functions()` with M1
+  signatures, `warnings()`, `cache_outcome()`). `Value` is `None`, `Bool`,
+  `Int(i64)`, `Float(f64)` or `Str(String)`; its `repr()` is the runtime's
+  own `repr`. `rypip::jit::new_jit(options, cache_dir)` is the ready-made
+  JIT with rypip's converter.
+- **Command line**: `rypip jit run FILE [ARG ...]`, `rypip jit call FILE
+  FUNCTION [ARG ...]` (ARGs read by CPython's `ast.literal_eval`; prints
+  `repr(result)`), `rypip jit --clear-cache`. `jit call` is defined
+  against `python3 -c 'import M; print(repr(M.FUNCTION(ARG, ...)))'`, so
+  it installs `sys.argv == ['-c']` before the call, and an uncaught
+  exception of a class the module defines is named module-qualified
+  (`calls.Overdrawn: ...`), as CPython's traceback names it. `jit run`
+  takes one `.py` file: a directory, or a file beside a `rython.toml`
+  (whose `[python-modules]` / `[rust-modules]` `rypip run` would honor),
+  is refused rather than compiled differently.
+
+### The converter's cdylib mode
+
+`ConvertOptions::cdylib: Option<CdylibTarget>` (single-module packages)
+emits what `rypip convert` emits for the module, minus the binary
+(`autobins = false`, `[lib] crate-type = ["cdylib"]`), plus one generated
+module, `src/__rython_jit.rs`:
+
+- the boundary vocabulary (`RyValue`, `RyStr`, `RyOutcome`, the tags and
+  statuses), emitted verbatim from `crates/rython-jit/src/abi_types.rs` —
+  the same file the host compiles, so the two sides cannot drift;
+- `ry_abi_version`, `ry_manifest` (a static text manifest: the module,
+  whether it has a program entry, whether calls may import it, each shimmed
+  function's M1 signature, each unshimmed public function with the reason,
+  and the module's classes) and `ry_free`;
+- one `ryfn_<n>` per public module-level `def` whose parameters are
+  annotated `int` / `float` / `bool` / `str` / `None` and whose result the
+  converter resolves (`FunctionDef::resolved_return_type`, the authority
+  the PyO3 bindings use) to one of those types. Defaults, `*args`,
+  `**kwargs`, keyword- or positional-only parameters, decorators,
+  generators and `async def` get no shim; each is listed with its reason.
+  A shim checks its arguments' tags, imports the module (its
+  `__module_init__`, once, as `import` runs the body), calls the function
+  under `catch_unwind`, flushes the library's stdout, and returns a status.
+  A result whose type the prediction got wrong still compiles (method
+  resolution falls back to an "opaque" conversion) and is a loud
+  `JitError::Marshal` naming the Rust type, never a library that fails to
+  build;
+- `ry_entry(argv, argc, out)`, emitted when the module is a program with a
+  synchronous entry: it installs `argv` as this library's `sys.argv`, runs
+  `__rython_main__` — the program body the binary's `fn main` runs (the
+  lowering now emits every synchronous entry as `__rython_main__` plus a
+  `fn main` that reports its error), reports an uncaught exception through
+  `stdpython::report_uncaught` (the binary's `exit_uncaught` minus the
+  process exit) and returns the exit status;
+- `ry_set_argv(argv, argc, out)`: the `sys.argv` function calls see.
+
+### The boundary as built
+
+- **Values**: tagged `RyValue`s; strings are UTF-8 pointer + length,
+  borrowed from the host for arguments and allocated by the library for
+  results (released through `ry_free`). The host checks arity and each
+  argument's type against the manifest before anything runs, and never
+  converts: an `int` passed for a `float` parameter (or a `bool` for an
+  `int`) is `JitError::Marshal`, because CPython would run the function on
+  the `int` itself.
+- **Exceptions**: a raised exception crosses as netstring-encoded (type
+  name, message, argument reprs, user-class ancestors) and is rebuilt as a
+  `stdpython::PyException`, so `type_name()`, `message`, `repr` and
+  `matches("Exception")` answer as in the library. Instance attributes
+  other than those do not cross in M1. `SystemExit` comes back as
+  `JitError::Exit { code, message }` — the message being the line CPython
+  prints for a non-integer code — and the library never calls
+  `process::exit` for it. A panic is caught and becomes `JitError::Panic`
+  after the library's panic hook has reported it (the CLI exits 101, a
+  panicking binary's status).
+- **Standard streams**: the host flushes its stdout before every call into
+  a library (`call`, `run_entry`), and every shim flushes the library's
+  stdout before returning, so partial lines keep program order (pinned by
+  `crates/rypip/tests/jit_interleave.rs` against a python3 transcript).
+  stderr is unbuffered on both sides.
+- **`sys.argv`**: the stdpython seam (`stdlib/sys.rs`): `sys.argv` and
+  `argv_at` (and so argparse's default `prog`) read one source, the
+  process's arguments unless a host installed others with
+  `install_program_args` before the first read. The first read fixes the
+  source; a later install is refused (`InstallArgsError`), never ignored.
+- **One role per loaded library**: CPython would run `__main__` and an
+  imported module as two separate modules, but a library holds one copy of
+  its module state. So a library serves either function calls (the module
+  imported) or its program entry (run as `__main__`), not both; the other
+  is `JitError::Unsupported` naming why. The entry runs once per process
+  (`JitError::EntryAlreadyRun`). A module whose final top-level statement
+  is a bare `main()` call (issue #431) — which CPython runs on import, but
+  which the library compiles as the entry — refuses calls rather than
+  importing without running it.
+- **Libraries are never unloaded**; a process-wide registry maps each
+  artifact path to its one loaded copy.
+
+### The cache as built
+
+```text
+$XDG_CACHE_HOME/rython/jit/       0700, owned by the user (else refused)
+  target/                         the one CARGO_TARGET_DIR (release, --target <host>)
+  target.lock                     held from a build through its artifact copy
+  entries/<key digest>/
+    crate/                        the generated crate
+    lib-<time>-<pid>-<n>.so       the loaded artifact, never rewritten in place
+    entry                         written last: artifact, size, warnings, full key text
+  entries/<key digest>.lock       exclusive for a build, shared for a load
+```
+
+The key is the full text of: the boundary version; the module name and the
+source's length and SHA-256; the compiler's fingerprint — rypip's version,
+a build-time hash of the converter's sources (rypip, python-ast and the
+boundary text, so a rebuilt converter in a checkout never reuses a library
+the old one made), the parser's CPython version (`Py_GetVersion`, read
+without starting the interpreter), the stdpython dependency (a registry
+version, or a checkout's path plus every source file's size and mtime, as
+cargo's own freshness check reads them; the feature set follows from the
+source's imports) and every conversion option; `rustc -vV` (run in the cache root,
+so a rustup directory override resolves as it does for the build; it names
+the host triple); the build-affecting environment (`RUSTFLAGS`,
+`CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS`, `RUSTC_WRAPPER`,
+`RUSTC_WORKSPACE_WRAPPER`, the `CARGO_PROFILE_RELEASE_*` knobs); and the
+release profile. An entry is loaded only when its record's key text matches
+exactly, its artifact has the recorded size and SHA-256, and its generated
+Cargo.lock has the recorded SHA-256. The compiler build identity also
+includes the workspace lockfile and compiler/runtime manifests. Each entry
+pins the dependency versions Cargo resolved on its first build, retaining
+the exact lockfile through artifact rebuilds; a newly
+published registry release does not update that entry. Use `--clear-cache`
+to resolve dependencies again. Explicitly editing or removing that lockfile
+invalidates those pins. A changed or missing lockfile, a mismatch, or a library
+that will not load or reports another boundary version, is reported on
+stderr ("cannot be trusted ... rebuilding it") and rebuilt — never loaded
+on trust. A hit runs neither the converter nor cargo (pinned with a
+counting compiler); the converter's lossy-conversion warnings are stored
+with the entry and reported on every load, as `rypip run` reports them on
+every run.
+
+All cache ancestors must be directories controlled by this user or root,
+without group/world write access (root-owned sticky `/tmp` is allowed).
+Symlink ancestors are refused. Cache clearing takes an exclusive lock next
+to the root, while readers and builders hold it shared through loading;
+clearing waits for active work and never deletes that lock file.
+
+### Deviations from the design
+
+- **The converter is injected, not depended on.** The design has
+  `rython-jit` depend on the converter and `rypip jit` be a CLI over
+  `rython-jit`. The converter lives in `rypip`, so those two dependencies
+  form a cycle cargo refuses. As built, `rython-jit` defines a `Compiler`
+  trait (`fingerprint`, `convert`, `build`) and `rypip::jit::RypipCompiler`
+  implements it with the converter's cdylib mode and the factored artifact
+  helper; `rypip` depends on `rython-jit`. A Rust program using the JIT
+  depends on both (`rypip::jit::new_jit`). Moving the converter out of
+  `rypip` into its own crate would remove the indirection; that is a
+  larger restructuring than M1 and is left to the maintainer.
+- **The work-directory lock is rython-jit's own**, with `lock_work_dir`'s
+  semantics (an advisory lock on a sibling `<entry>.lock`), for the same
+  cycle reason; it adds a shared mode for loads.
+- **Additional error variants.** Besides the design's `Conversion`,
+  `Build`, `Marshal`, `Environment`, `EntryAlreadyRun`, `Exit` and
+  `Python`, `JitError` has `Panic` (a caught panic: the design requires
+  every shim to catch unwinds, so a caught one needs an outcome) and
+  `Unsupported` (an operation M1 refuses rather than approximates: calling
+  a class or a function with defaults, mixing a library's roles, calls
+  into a #431 module). `Exit` carries the `SystemExit` message too, since
+  `sys.exit("text")` prints it.
+- **`ry_set_argv`** is an addition: without it `jit call`'s functions would
+  see rypip's own arguments, where `python3 -c` has `['-c']`.
+- **The entry body is a named function in every conversion**, not only
+  the JIT's: the binary's `fn main` now calls `__rython_main__` and
+  reports its error, so `ry_entry` runs the binary's body by construction
+  instead of a second lowering of it.
+
+### Known limits (all loud)
+
+- Single-module sources only; packages, `rython.toml` manifests and
+  `from rython import rust` path dependencies are refused (the key could
+  not cover them). Cargo configuration *files* (`~/.cargo/config.toml` and
+  the like) are not part of the key: a change there that alters the build
+  needs `--clear-cache`.
+- An `async` program entry is refused (its runtime entry is not part of the
+  boundary); the module's synchronous functions still call.
+- A non-UTF-8 program argument is refused before `jit run` starts (the
+  binary fails only when the argument is read).
+- Runtime paths that end the process themselves — argparse's usage, help
+  and version exits, `unittest.main()`, `os._exit` — end the host process
+  too. Under `rypip jit run` / `jit call` that is exactly the binary's (and
+  CPython's) observable outcome; a Rust host calling such a function loses
+  control rather than receiving `JitError::Exit`.
+- Output a library writes after its shim returned (a thread it started)
+  is not flushed by the shim.
+
+### Measured latency
+
+Measured on 2026-11-11 on the development machine (32 logical CPUs,
+`CARGO_BUILD_JOBS=2`, `CARGO_NET_OFFLINE=true`, rustc 1.98.1,
+release builds, debug `rypip`), for `rypip jit call calls.py add 2 40`
+(wall clock, median of 5 where repeated):
+
+| Case | Latency |
+|---|---|
+| Cold: empty cache, so `stdpython` (std tier) and its dependencies build | 23.958 s (one sample) |
+| Cold entry, warm target directory: a source not seen before | 0.785 s |
+| Warm: cache hit (`rustc -vV`, key, `dlopen`, call) | 51.0 ms |
+
+Raw samples and the input source are in
+[`eval/jit/m1-latency-2026-11-11.json`](../eval/jit/m1-latency-2026-11-11.json).
+Registry downloads were already cached; other workspace test builds were
+active, so these are development-host observations rather than isolated
+performance benchmarks.
+
+The cold number is dominated by the shared target directory's first build
+and is paid once per (stdpython version, features, toolchain); a new source
+then costs its own crate's compile, and an unchanged one a `dlopen`. M6
+remains the place to shorten the first two.
+
+### Tests (the M1 gate)
+
+`crates/rypip/tests/jit_tests.rs` (sharing one cache and target directory
+under cargo's per-target scratch directory) and
+`crates/rypip/tests/jit_interleave.rs`: `jit call` per marshalled type and
+`None` against python3; a builtin exception, a module's own exception
+class, `SystemExit` with a code and with a message; typed library calls and
+the rebuilt `PyException` (type, message, `repr`, ancestry); seven
+whole programs through `jit run` (argv, an uncaught exception, classes and
+dicts, module-level code ending in `sys.exit("...")` with a partial line,
+argparse with arguments and its usage error, a #431 bare `main()`) against
+python3's stdout, stderr minus frames and exit status; host/library stdout
+interleaving; a cache hit that runs neither converter nor cargo; an
+untrusted entry rebuilt; entry-once and role refusals; the converter's
+refusal passed through verbatim; marshal refusals naming the type; and the
+cache directory's permissions. The argv seam has its own pins in
+`crates/stdpython/tests/argv_seam.rs` and `stdlib/sys.rs`.
 
 ## Out of scope
 
@@ -334,3 +589,12 @@ Each is independently mergeable, gated by tests that diff against
 4. **Windows.** Is Unix-first, as `rypip run` is today, acceptable for M1?
 5. **Cache policy.** Is "no eviction until M6" acceptable, and is
    `~/.cache` the right default location?
+
+M1 proceeded on this document's assumptions for questions 2–5 (Python
+required at JIT time; a new crate; Unix first; no eviction under
+`~/.cache`), each of which the maintainer can still redirect. Question 3
+has a consequence the design did not foresee: a separate crate cannot
+depend on `rypip`'s converter while `rypip` depends on it, so the
+converter is injected through a trait (see [Deviations](#deviations-from-the-design));
+a converter crate split out of `rypip` would let `rython-jit` depend on it
+directly.
