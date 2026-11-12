@@ -1207,6 +1207,7 @@ dependencies = [
  "libc",
  "libm",
  "md-5",
+ "miniz_oxide",
  "num-bigint",
  "num-traits",
  "openssl",

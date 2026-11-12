@@ -1676,6 +1676,7 @@ impl CodeGen for Module {
                                 .map_err(|e| wrap_module_error(&module_filename, e.into()))?;
                                 refuse_cross_module_runner_inputs(
                                     &module_raw_body,
+                                    &before,
                                     &cases,
                                     &symbols,
                                     &options,
@@ -2887,8 +2888,11 @@ impl CodeGen for Module {
         if !init_decls.is_empty() {
             module_init_stmts.insert(0, init_decls);
         }
+        // The __main__ block writes the same module statics as init;
+        // hoisting a local with that spelling would shadow their storage.
+        let main_hoist_skip = global_mutables.keys().cloned().collect();
         let main_decls =
-            hoisted_declarations(&main_body_raw, &ctx, &symbols, &options, &Default::default());
+            hoisted_declarations(&main_body_raw, &ctx, &symbols, &options, &main_hoist_skip);
         if !main_decls.is_empty() {
             main_body_stmts.insert(0, main_decls);
         }
@@ -8019,12 +8023,106 @@ fn runner_cases(
     Ok(cases)
 }
 
+/// Module names read by a gate. Use the shared expression enumeration,
+/// excluding store targets and names local to lambdas/comprehensions.
+fn gate_module_reads(expr: &crate::ExprType) -> std::collections::HashSet<String> {
+    use super::visit;
+    use std::collections::HashSet;
+    fn read(expr: &crate::ExprType, shadowed: &HashSet<String>, out: &mut HashSet<String>) {
+        match expr {
+            crate::ExprType::Name(n) if !shadowed.contains(&n.id) => {
+                out.insert(n.id.clone());
+            }
+            crate::ExprType::NamedExpr(ne) => {
+                // The walrus target stores; only its RHS reads a name.
+                read(&ne.right, shadowed, out);
+                return;
+            }
+            crate::ExprType::Lambda(lambda) => {
+                for default in lambda.args.defaults.iter().map(|d| d.as_ref())
+                    .chain(lambda.args.kw_defaults.iter().flatten().map(|d| d.as_ref()))
+                {
+                    read(default, shadowed, out);
+                }
+                let mut inner = shadowed.clone();
+                inner.extend(lambda.args.posonlyargs.iter().chain(lambda.args.args.iter())
+                    .chain(lambda.args.kwonlyargs.iter()).chain(lambda.args.vararg.iter())
+                    .chain(lambda.args.kwarg.iter()).map(|p| p.arg.clone()));
+                // A walrus in the body also declares a lambda-local name.
+                visit::any_expr_for(&lambda.body, Descend::OwnScope, |e| {
+                    if let crate::ExprType::NamedExpr(ne) = e {
+                        inner.extend(visit::target_names(&ne.left).into_iter().map(str::to_owned));
+                    }
+                    false
+                });
+                read(&lambda.body, &inner, out);
+                return;
+            }
+            _ => {}
+        }
+        if let Some((elements, generators)) = visit::comprehension_parts(expr) {
+            if let Some(first) = generators.first() {
+                read(&first.iter, shadowed, out);
+            }
+            let mut inner = shadowed.clone();
+            for generator in generators {
+                inner.extend(visit::target_names(&generator.target).into_iter().map(str::to_owned));
+            }
+            for (index, generator) in generators.iter().enumerate() {
+                if index > 0 { read(&generator.iter, &inner, out); }
+                for filter in &generator.ifs { read(filter, &inner, out); }
+            }
+            for element in elements { read(element, &inner, out); }
+            return;
+        }
+        for sub in visit::subexprs_for(expr, Descend::OwnScope) {
+            read(sub, shadowed, out);
+        }
+    }
+    let mut out = HashSet::new();
+    read(expr, &HashSet::new(), &mut out);
+    out
+}
+
+/// Potential function stores to explicitly declared module globals, keeping
+/// each function's declarations separate from its nested function scopes.
+fn gate_global_writes(stmts: &[crate::Statement]) -> Vec<(String, usize)> {
+    use super::visit::{self, Bindings};
+    let mut writes = Vec::new();
+    walk_stmts(stmts, Descend::All, &mut |s| {
+        let (crate::StatementType::FunctionDef(def) | crate::StatementType::AsyncFunctionDef(def)) =
+            &s.statement else { return Flow::Continue; };
+        let mut globals = std::collections::HashSet::new();
+        let mut stores = Vec::new();
+        walk_stmts(&def.body, Descend::OwnScope, &mut |s| {
+            if let crate::StatementType::Global(names) = &s.statement {
+                globals.extend(names.iter().cloned());
+            }
+            for name in visit::stmt_bound_names(s, Bindings::Scope) {
+                stores.push((name, s.lineno.unwrap_or(0)));
+            }
+            if let crate::StatementType::Delete(targets) = &s.statement {
+                for target in targets {
+                    for name in visit::target_names(target) {
+                        stores.push((name.to_owned(), s.lineno.unwrap_or(0)));
+                    }
+                }
+            }
+            Flow::Continue
+        });
+        writes.extend(stores.into_iter().filter(|(name, _)| globals.contains(name)));
+        Flow::Continue
+    });
+    writes
+}
+
 /// The runner renders gate conditions and test-method defaults in THIS
 /// module. If a class takes one from another module (its own, imported, or
 /// an ancestor's), it would be evaluated against the wrong names, so it is
 /// refused.
 fn refuse_cross_module_runner_inputs(
     module_stmts: &[crate::Statement],
+    before_runner: &[crate::Statement],
     cases: &[(String, RunnerCase)],
     symbols: &crate::SymbolTableScopes,
     options: &crate::PythonOptions,
@@ -8036,6 +8134,66 @@ fn refuse_cross_module_runner_inputs(
     };
     let mut classes: Vec<crate::ClassDef> = Vec::new();
     collect_class_defs(module_stmts, &mut classes);
+    let mut class_positions = std::collections::HashMap::new();
+    let mut module_stores = Vec::new();
+    // Hoisted nested classes may be absent from the runner's binding
+    // prefix; their original definition positions are still relevant.
+    walk_stmts(module_stmts, Descend::SkipDefs, &mut |s| {
+        if let crate::StatementType::ClassDef(c) = &s.statement
+            && let Some(pos) = s.lineno.zip(s.col_offset)
+        {
+            class_positions.insert(c.name.clone(), pos);
+        }
+        Flow::Continue
+    });
+    // Restrict direct stores to the prefix that has executed at THIS
+    // runner call, including earlier __main__ blocks (#521).
+    walk_stmts(before_runner, Descend::SkipDefs, &mut |s| {
+        if let Some(pos) = s.lineno.zip(s.col_offset) {
+            for name in crate::ast::tree::visit::stmt_bound_names(
+                s,
+                crate::ast::tree::visit::Bindings::Scope,
+            ) {
+                module_stores.push((name, pos));
+            }
+        }
+        Flow::Continue
+    });
+    // A helper (or test method) may rebind a global even if its definition
+    // precedes the class. Without call-effect analysis, conservatively
+    // refuse potential global writes in functions available to this runner.
+    let global_writes = gate_global_writes(before_runner);
+    let refuse_rebound_gate = |class_name: &str,
+                               class_pos: (usize, usize),
+                               decorators: &[crate::ExprType]|
+     -> Result<(), String> {
+        for gate in run_gates(decorators) {
+            let (gate_name, condition) = match gate {
+                RunGate::SkipIf(condition) => ("skipIf", condition),
+                RunGate::SkipUnless(condition) => ("skipUnless", condition),
+                _ => continue,
+            };
+            let mut reads: Vec<_> = gate_module_reads(&condition).into_iter().collect();
+            reads.sort();
+            for name in reads {
+                let write = module_stores.iter()
+                    .find(|(stored, pos)| stored == &name && *pos > class_pos)
+                    .map(|(_, (line, _))| (*line, "after its class definition"))
+                    .or_else(|| global_writes.iter().find(|(stored, _)| stored == &name)
+                        .map(|(_, line)| (*line, "by a function declaring it global")));
+                if let Some((line, how)) = write {
+                    return Err(format!(
+                        "unittest.main(): `{gate_name}` condition `{name}` on TestCase \
+                         `{class_name}` may be rebound at line {line} {how}; \
+                         rython cannot preserve the decorator-time value yet; \
+                         move the rebinding before the class or use an unchanged condition; \
+                         rython refuses to silently evaluate it later"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    };
     // A base spelled through its module (`class Child(cases.Base)`) is not
     // followed by the base chain, so a TestCase reached that way would be
     // silently left out of the run.
@@ -8061,6 +8219,32 @@ fn refuse_cross_module_runner_inputs(
     }
     for (name, case) in cases {
         let imported = case.module.is_some();
+        if !imported {
+            let test_names = test_method_names(&case.class, &case.symbols, &case.options);
+            for (ancestor, _, _, path) in
+                case.class.cross_module_chain(&case.symbols, &case.options)
+            {
+                if path.is_none()
+                    && let Some(&class_pos) = class_positions.get(&ancestor.name)
+                {
+                    refuse_rebound_gate(&ancestor.name, class_pos, &ancestor.decorator_list)?;
+                }
+            }
+            // Match the runner's MRO lookup: an overridden ancestor method's
+            // gate is never evaluated for this descendant.
+            for method in &test_names {
+                if let Some((def, other_module)) =
+                    testcase_method(&case.class, method, &case.symbols, &case.options)
+                    && !other_module
+                    && let Some((owner, ..)) = case.class
+                        .cross_module_chain(&case.symbols, &case.options)
+                        .into_iter().find(|(c, ..)| c.methods().any(|m| m.name == *method))
+                    && let Some(&class_pos) = class_positions.get(&owner.name)
+                {
+                    refuse_rebound_gate(&owner.name, class_pos, &def.decorator_list)?;
+                }
+            }
+        }
         let refuse = |what: String| {
             let how = if imported { "is imported with" } else { "inherits" };
             Err(format!(
@@ -8200,9 +8384,10 @@ fn emit_test_runner(
             // The class's gates, then the method's (issue #371). A skipped
             // test is never constructed, set up, or run — CPython decides
             // the skip before setUp. Each condition is evaluated when the
-            // runner reaches the test; CPython evaluates it when the
-            // decorator runs at import, which differs only for a condition
-            // the module rebinds after defining the class.
+            // runner reaches the test, not when its decorator executes.
+            // The preflight refuses a referenced module name rebound after
+            // the class definition (#521); other expressions with observable
+            // evaluation effects remain a documented timing limit.
             let method_decorators = test_def
                 .as_ref()
                 .map(|f| f.decorator_list.clone())
@@ -8223,6 +8408,7 @@ fn emit_test_runner(
                     })),
                     args: vec![cond.clone()],
                     keywords: Vec::new(),
+                    lineno: None,
                 })
                 .to_rust(ctx.clone(), options.clone(), symbols.clone())
                 .ok()

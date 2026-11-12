@@ -3800,6 +3800,7 @@ impl<'a> Collector<'a> {
                             func: Box::new(ExprType::Attribute(a.clone())),
                             args: Vec::new(),
                             keywords: Vec::new(),
+                            lineno: None,
                         }) {
                             let mutates = self.duck_method_mutates(&a.attr);
                             self.duck_method_calls
