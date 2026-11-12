@@ -11383,6 +11383,32 @@ fn compile_with_options(
 }
 
 #[test]
+fn ambiguous_absolute_self_imports_fail_conversion() {
+    let mut defs = std::collections::HashMap::new();
+    for path in [
+        vec![],
+        vec!["absimp".to_string()],
+        vec!["helper".to_string()],
+    ] {
+        defs.insert(path, std::rc::Rc::new(parse("", "fixture.py").unwrap()));
+    }
+    let options = PythonOptions::from(PythonOptionsData {
+        python_namespace: "absimp".to_string(),
+        module_defs: std::rc::Rc::new(defs),
+        ..Default::default()
+    });
+    for source in ["from absimp import helper\n", "import absimp.helper\n"] {
+        let error = compile_with_options(source, "cli.py", options.clone())
+            .expect_err("ambiguous absolute self-import must fail loudly");
+        assert!(
+            error.contains("absolute import") && error.contains("ambiguous"),
+            "{error}"
+        );
+        assert!(error.contains("relative spelling"), "{error}");
+    }
+}
+
+#[test]
 fn async_binary_entry_is_feature_gated_and_imports_runtime() {
     // A BINARY conversion (async_runtime_dep) emits the runtime import and
     // the entry attribute behind the async-tokio feature, plus a
@@ -31665,6 +31691,30 @@ fn unittest_skip_gate_post_runner_write_does_not_hoist_a_static_shadow() {
     let rust = compile(include_str!("../../rypip/tests/fixtures/gate_postrun.py"), "gate_postrun.py");
     assert!(rust.contains("py_global_write"), "{rust}");
     assert!(!rust.contains("let FLAG") && !rust.contains("let mut FLAG"), "{rust}");
+}
+
+#[test]
+fn vendored_relative_function_reexports_remain_callable_module_items() {
+    // Verified against python3: the direct and aliased multi-hop calls
+    // print 8 and 10. End-to-end pin: python_module_tests.rs, issue #557.
+    let source = "import textlib\nprint(textlib.double(4))\nprint(textlib.twice(5))\n";
+    let definitions = [
+        (vec!["app".to_string()], source),
+        (vec!["textlib".to_string()], "from .core import double\nfrom .compat import doubled as twice\n"),
+        (vec!["textlib".to_string(), "compat".to_string()], "from .core import double as doubled\n"),
+        (vec!["textlib".to_string(), "core".to_string()], "def double(n: int) -> int:\n    return n * 2\n"),
+    ];
+    let options = PythonOptions::from(PythonOptionsData {
+        module_defs: std::rc::Rc::new(definitions.into_iter().map(|(path, source)| {
+            (path, std::rc::Rc::new(parse(source, "reexport.py").unwrap()))
+        }).collect()),
+        python_modules: std::rc::Rc::new(std::collections::HashSet::from(["textlib".to_string()])),
+        this_module_path: vec!["app".to_string()],
+        ..Default::default()
+    });
+    let out = compile_with_options(source, "app.py", options).unwrap();
+    assert!(out.contains("crate :: textlib :: double"), "{out}");
+    assert!(out.contains("crate :: textlib :: twice"), "{out}");
 }
 
 #[test]

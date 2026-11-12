@@ -487,6 +487,30 @@ pub struct Import {
     pub names: Vec<Alias>,
 }
 
+impl Import {
+    /// The module path the statement's FIRST alias names (`import a.b.c`
+    /// → `a.b.c`) — see [`import_alias_path`]. Empty only for an empty
+    /// statement.
+    pub(crate) fn first_module_path(&self, options: &PythonOptions) -> Vec<String> {
+        self.names
+            .first()
+            .map(|al| import_alias_path(&al.name, options))
+            .unwrap_or_default()
+    }
+}
+
+/// The module path a dotted `import` names: the dotted name itself, or,
+/// when it names a module of the package being converted (`import
+/// absimp.cases` inside `absimp`), that module's `module_defs` key — the
+/// path the relative spelling (`from . import cases`) resolves to, like
+/// [`ImportFrom::resolved_module_path`] (issue #532).
+pub(crate) fn import_alias_path(dotted: &str, options: &PythonOptions) -> Vec<String> {
+    crate::ast::tree::module::absolute_import_path(
+        options,
+        dotted.split('.').map(str::to_string).collect(),
+    )
+}
+
 /// An Import (or FromImport) statement causes 2 things to occur:
 /// 1. Declares the imported object within the existing scope.
 /// 2. Causes the referenced module to be compiled into the program (only once).
@@ -2095,6 +2119,11 @@ impl CodeGen for Import {
                     .to_string()
                     .into());
             }
+            if let Some(refusal) =
+                crate::ast::tree::module::ambiguous_self_import(&options, &alias.name)
+            {
+                return Err(format!("`import {}`: {refusal}", alias.name).into());
+            }
             // Import of a Rust module: the import is compile-time-only — the
             // name resolves through the symbol table; no `use` is emitted
             // (the crate is a dependency, not a sibling module). Registering
@@ -2314,14 +2343,31 @@ impl CodeGen for Import {
 
                         match &alias.asname {
                             // An unaliased dotted import binds only the ROOT
-                            // name in Python; when that root is the package
-                            // itself (the stripped-key resolution), the
-                            // "bound module" is the crate — a leaf `use`
-                            // would bind a name Python doesn't (`import
-                            // urllib3.connection` clashing with emscripten's
-                            // own `connection` submodule), so nothing is
-                            // emitted.
-                            None if crate_path.len() < path.len() => quote! {},
+                            // name in Python. Crate-rooted attribute chains
+                            // render that root directly; a leaf `use` would
+                            // bind a name Python doesn't, and can collide
+                            // with a separate `from pkg import helper`.
+                            None if crate_path.len() < path.len()
+                                || (path.len() > 1
+                                    && options.module_defs.contains_key(&path[..1])) =>
+                            {
+                                quote! {}
+                            }
+                            // In the BIN copy of the entry module the code
+                            // IS the crate root, which declares the
+                            // root-level modules itself: `import
+                            // absimp.cases as cases` resolving to
+                            // `crate::cases` under its own name would
+                            // re-import the module into the scope that
+                            // defines it (E0255) — the from-import's
+                            // `bin_root_module` rule (issue #532).
+                            Some(n)
+                                if options.bin_crate_root
+                                    && crate_path.len() == 1
+                                    && crate_path[0] == *n =>
+                            {
+                                quote! {}
+                            }
                             None => {
                                 quote! {use crate::#names;}
                             }
@@ -2408,7 +2454,10 @@ impl ImportFrom {
 
     /// The module path this import resolves to inside the generated crate:
     /// for a relative import, the current module path (cut by `level`) plus
-    /// the dotted module; for an absolute import, the dotted module itself.
+    /// the dotted module; for an absolute import, the dotted module itself —
+    /// or, when it names a module of the package being converted (`from
+    /// absimp import helper` inside `absimp`), that module's `module_defs`
+    /// key, the path the relative spelling resolves to (issue #532).
     /// Key into `options.module_defs` to reach the defining module's AST.
     pub(crate) fn resolved_module_path(&self, options: &PythonOptions) -> Vec<String> {
         let parts: Vec<&str> = self.module.split('.').filter(|p| !p.is_empty()).collect();
@@ -2427,8 +2476,21 @@ impl ImportFrom {
                 .map(|s| s.to_string())
                 .collect()
         } else {
-            parts.iter().map(|s| s.to_string()).collect()
+            crate::ast::tree::module::absolute_import_path(
+                options,
+                parts.iter().map(|s| s.to_string()).collect(),
+            )
         }
+    }
+
+    /// Whether this import names a module of the generated crate: every
+    /// relative import, and an absolute one whose resolved path is a crate
+    /// module (`from absimp import helper` inside `absimp`, issue #532) —
+    /// the two spellings lower alike.
+    pub(crate) fn targets_crate(&self, options: &PythonOptions) -> bool {
+        self.level > 0
+            || (!self.module.is_empty()
+                && crate::module_defs_contains(options, &self.resolved_module_path(options)))
     }
 }
 
@@ -2467,12 +2529,18 @@ impl CodeGen for ImportFrom {
         mut symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
         debug!("ctx: {:?}", ctx);
+        if self.level == 0
+            && let Some(refusal) =
+                crate::ast::tree::module::ambiguous_self_import(&options, &self.module)
+        {
+            return Err(format!("`from {} import ...`: {refusal}", self.module).into());
+        }
         for alias in &self.names {
             refuse_self_binding(alias.asname.as_deref().unwrap_or(&alias.name), || {
                 let from = format!("from {}{} import {}", ".".repeat(self.level), self.module, alias.name);
                 match &alias.asname {
-                    Some(asname) => (format!("{} as {}", from, asname), from),
-                    None => (from.clone(), from),
+                   Some(asname) => (format!("{} as {}", from, asname), from),
+                   None => (from.clone(), from),
                 }
             })?;
         }
@@ -2642,7 +2710,11 @@ impl CodeGen for ImportFrom {
         } else {
             parts.iter().map(|part| crate::module_ident(part)).collect()
         };
-        let root = if self.level > 0 {
+        // An import of a crate module lowers alike in either spelling: the
+        // relative one, or the absolute one naming the package's own module
+        // (`from absimp import helper` inside `absimp` — issue #532).
+        let crate_import = self.targets_crate(&options);
+        let root = if crate_import {
             quote!(crate)
         } else if parts
             .first()
@@ -2798,7 +2870,7 @@ impl CodeGen for ImportFrom {
             // py2-compat shim, imported by connectionpool): builtins are
             // string-tagged with no runtime item, and raise/except match
             // by name — the use drops.
-            if self.level > 0
+            if crate_import
                 && crate::ast::tree::raise_stmt::is_builtin_exception_name(&alias.name)
             {
                 options.definition_warnings.borrow_mut().push(format!(
@@ -2872,7 +2944,7 @@ impl CodeGen for ImportFrom {
                 continue;
             }
             if alias.name == "*" {
-                let visibility = if self.level > 0 { quote!(pub) } else { quote!() };
+                let visibility = if crate_import { quote!(pub) } else { quote!() };
                 // A crate source with a literal `__all__` exports THOSE
                 // names, not every public item: the glob would re-export
                 // a name `__all__` leaves out, and a sibling's `from pkg
@@ -2969,8 +3041,10 @@ impl CodeGen for ImportFrom {
             // treats imported names as module attributes (the package
             // `__init__.py` re-export pattern), so they lower to `pub use`
             // — callers reach `textlib.double` through the re-export chain.
-            // Absolute imports of user modules stay plain `use`: callers
-            // import from the defining module directly.
+            // An absolute import of a crate module is the same import
+            // spelled from the root (`from absimp import helper` inside
+            // `absimp` — issue #532) and lowers alike; only an import from
+            // outside the crate stays a plain `use`.
             // An underscore-prefixed sibling ITEM is `pub(crate)` in the
             // defining module (`_wrap_proxy_error` — urllib3's
             // connection.py): the re-export must match, or Rust rejects a
@@ -2982,9 +3056,9 @@ impl CodeGen for ImportFrom {
             // find a public item, not a private use (E0603).
             let stdpython_root = self.level == 0
                 && parts.first().is_some_and(|p| is_stdpython_module(p));
-            let visibility = if self.level > 0 && alias.name.starts_with("_") {
+            let visibility = if crate_import && alias.name.starts_with("_") {
                 quote!(pub(crate))
-            } else if self.level > 0 || stdpython_root {
+            } else if crate_import || stdpython_root {
                 quote!(pub)
             } else {
                 quote!()
@@ -3008,7 +3082,7 @@ impl CodeGen for ImportFrom {
             // module into the scope that defines it (E0255). An alias
             // (`as d`) names a new binding and still needs its use.
             let bin_root_module = options.bin_crate_root
-                && self.level > 0
+                && crate_import
                 && self.resolved_module_path(&options).is_empty()
                 && alias.asname.as_ref().is_none_or(|a| a == &alias.name)
                 && options
@@ -3022,7 +3096,7 @@ impl CodeGen for ImportFrom {
             // `pub use crate::requests::packages;` would re-import the
             // sibling into itself (E0255 — defined multiple times).
             let self_resolved = bin_root_module
-                || (self.level > 0
+                || (crate_import
                     && options.this_module_path == self.resolved_module_path(&options));
             if !self_resolved {
                 tokens.extend(import);

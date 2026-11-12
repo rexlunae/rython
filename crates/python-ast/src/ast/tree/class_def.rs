@@ -4479,15 +4479,7 @@ impl CodeGen for ClassDef {
             let external_import = |sym: &SymbolTableNode| -> bool {
                 match sym {
                     SymbolTableNode::Import(i) => !options.module_defs.contains_key(
-                        &i.names
-                            .first()
-                            .map(|al| {
-                                al.name
-                                    .split('.')
-                                    .map(|s| s.to_string())
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default(),
+                        &i.first_module_path(&options),
                     ),
                     SymbolTableNode::ImportFrom(i) => !options
                         .module_defs
@@ -6748,18 +6740,10 @@ fn infer_field_type(
                         other => other,
                     };
                     let external = match sym {
-                        SymbolTableNode::Import(i) => i
-                            .names
-                            .first()
-                            .map(|al| {
-                                al.name
-                                    .split('.')
-                                    .map(|s| s.to_string())
-                                    .collect::<Vec<_>>()
-                            })
-                            .is_some_and(|path: Vec<String>| {
-                                !options.module_defs.contains_key(&path)
-                            }),
+                        SymbolTableNode::Import(i) => {
+                            !i.names.is_empty()
+                                && !options.module_defs.contains_key(&i.first_module_path(options))
+                        }
                         SymbolTableNode::ImportFrom(i) => !options
                             .module_defs
                             .contains_key(&i.resolved_module_path(options)),
@@ -6821,16 +6805,7 @@ fn infer_field_type(
                 if let Some(sym) = import_sym {
                     let external = match sym {
                         SymbolTableNode::Import(i) => {
-                            let path = i
-                                .names
-                                .first()
-                                .map(|al| {
-                                    al.name
-                                        .split('.')
-                                        .map(|s| s.to_string())
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default();
+                            let path = i.first_module_path(options);
                             !options.module_defs.contains_key(&path)
                         }
                         SymbolTableNode::ImportFrom(i) => {
@@ -6855,16 +6830,7 @@ fn infer_field_type(
                                         cur = symbols.get(next);
                                     }
                                     Some(SymbolTableNode::Import(i)) => {
-                                        let path = i
-                                            .names
-                                            .first()
-                                            .map(|al| {
-                                                al.name
-                                                    .split('.')
-                                                    .map(|s| s.to_string())
-                                                    .collect::<Vec<_>>()
-                                            })
-                                            .unwrap_or_default();
+                                        let path = i.first_module_path(options);
                                         external = !options.module_defs.contains_key(&path);
                                         break;
                                     }
@@ -6898,15 +6864,9 @@ fn infer_field_type(
                     // name): the function's return annotation types the
                     // field; an unannotated function boxes it (PyValue).
                     let path = match sym {
-                        SymbolTableNode::Import(i) => i
-                            .names
-                            .first()
-                            .map(|al| {
-                                al.name
-                                    .split('.')
-                                    .map(|s| s.to_string())
-                                    .collect::<Vec<_>>()
-                            }),
+                        SymbolTableNode::Import(i) if !i.names.is_empty() => {
+                            Some(i.first_module_path(options))
+                        }
                         SymbolTableNode::ImportFrom(i) => {
                             Some(i.resolved_module_path(options))
                         }
@@ -6947,16 +6907,7 @@ fn infer_field_type(
                 {
                     let external = match sym {
                         SymbolTableNode::Import(i) => {
-                            let path = i
-                                .names
-                                .first()
-                                .map(|al| {
-                                    al.name
-                                        .split('.')
-                                        .map(|s| s.to_string())
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default();
+                            let path = i.first_module_path(options);
                             !options.module_defs.contains_key(&path)
                         }
                         SymbolTableNode::ImportFrom(i) => !options
@@ -7023,16 +6974,7 @@ fn infer_field_type(
                     if let Some(root) = crate::root_name(&a.value) {
                         let external = match symbols.get(root) {
                             Some(crate::SymbolTableNode::Import(i)) => {
-                                let path = i
-                                    .names
-                                    .first()
-                                    .map(|al| {
-                                        al.name
-                                            .split('.')
-                                            .map(|s| s.to_string())
-                                            .collect::<Vec<_>>()
-                                    })
-                                    .unwrap_or_default();
+                                let path = i.first_module_path(options);
                                 !options.module_defs.contains_key(&path)
                             }
                             Some(crate::SymbolTableNode::ImportFrom(i)) => !options
@@ -7360,15 +7302,7 @@ fn infer_field_type(
                     let sym = symbols.get(&key);
                     match sym {
                         Some(SymbolTableNode::Import(im)) => !options.module_defs.contains_key(
-                            &im.names
-                                .first()
-                                .map(|al| {
-                                    al.name
-                                        .split('.')
-                                        .map(|s| s.to_string())
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default(),
+                            &im.first_module_path(options),
                         ),
                         Some(SymbolTableNode::ImportFrom(ifm)) => !options
                             .module_defs

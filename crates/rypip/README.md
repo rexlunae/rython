@@ -71,6 +71,14 @@ recursively (skipping hidden and underscore-prefixed directories), and both
 flat and `src/` layouts are recognized. Projects without any packaging
 metadata fall back to the historical layout heuristics.
 
+Absolute self-imports (`from pkg import helper`, `import pkg.helper`,
+including aliases) resolve to the same crate modules as relative imports,
+even when the distribution name differs from `pkg`. In root-relative
+layouts, an inner module or subpackage also named `pkg` makes the absolute
+spelling ambiguous to the converter; use relative imports or rename it.
+Unaliased `import pkg` and `import pkg.helper` both bind `pkg`; reads such
+as `pkg.VALUE` preserve computed package-root values as module items.
+
 A module containing an `if __name__ == "__main__":` block (or a
 `__main__.py`) becomes the binary entry point. So does a module that
 defines `main` and calls it as its last top-level statement with no
@@ -207,7 +215,8 @@ print(pylev.wfi_levenshtein("a", "b"))  # -> crate::pylev::wfi_levenshtein(...)?
 Relative imports inside a vendored package resolve against the package path
 (`from .core import double` in `textlib/__init__.py` becomes
 `pub use crate::textlib::core::double;`, so `textlib.double` is a
-re-exported attribute exactly as in Python). Kernel modules (`--kernel-module`)
+re-exported attribute exactly as in Python). Aliased and multi-hop function
+re-exports remain callable through the package attribute too. Kernel modules (`--kernel-module`)
 compile a single entry file with no module tree and reject `[python-modules]`
 loudly.
 

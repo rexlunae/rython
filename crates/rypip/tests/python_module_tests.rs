@@ -692,12 +692,12 @@ fn package_dir_python_module_resolves_relative_imports() {
     fs::create_dir_all(scratch.path().join("vendor/textlib")).unwrap();
     fs::write(
         scratch.path().join("vendor/textlib/__init__.py"),
-        "from .core import double\n",
+        "from .core import double\nfrom .compat import doubled as twice, paired as combine\n",
     )
     .unwrap();
     fs::write(
         scratch.path().join("vendor/textlib/core.py"),
-        "def double(n: int) -> int:\n    return n * 2\n",
+        "def double(n: int = 6) -> int:\n    return n * 2\ndef pair(a: int, b: int = 2) -> int:\n    return a * 10 + b\n",
     )
     .unwrap();
     fs::write(
@@ -714,9 +714,26 @@ fn package_dir_python_module_resolves_relative_imports() {
             "if __name__ == \"__main__\":\n",
             "    print(double(21))\n",
             "    print(textlib.double(4))\n",
+            "    print(textlib.twice(n=5))\n",
+            "    print(textlib.twice())\n",
+            "    print(textlib.combine(b=3, a=4))\n",
+            "    print(textlib.combine(5))\n",
         ),
     )
     .unwrap();
+    fs::write(
+        scratch.path().join("vendor/textlib/compat.py"),
+        "from .core import double as doubled, pair as paired\n",
+    ).unwrap();
+    let python = Command::new("python3")
+        .arg(scratch.path().join("app.py"))
+        .env("PYTHONPATH", scratch.path().join("vendor"))
+        .env("PYTHONHASHSEED", "0")
+        .output().unwrap();
+    // Verified against python3: direct and aliased, multi-hop re-exports.
+    assert_eq!(python.stdout, b"42\n8\n10\n12\n43\n52\n");
+    assert!(python.stderr.is_empty());
+    assert_eq!(python.status.code(), Some(0));
     let out = scratch.path().join("crate");
 
     let pkg = rypip::discover(&scratch.path().join("app.py")).expect("discover");
@@ -737,8 +754,9 @@ fn package_dir_python_module_resolves_relative_imports() {
         .output()
         .expect("running generated binary");
     assert!(output.status.success(), "binary exited nonzero");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(stdout.lines().collect::<Vec<_>>(), vec!["42", "8"]);
+    assert_eq!(output.stdout, python.stdout);
+    assert_eq!(output.stderr, python.stderr);
+    assert_eq!(output.status.code(), python.status.code());
 }
 
 /// Kernel modules compile a single entry file with no module tree, so a

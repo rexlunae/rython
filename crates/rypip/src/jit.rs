@@ -100,6 +100,7 @@ impl Compiler for RypipCompiler {
                 is_init: false,
             }],
             dependencies: Vec::new(),
+            root_package: None,
         };
         let options = self.effective_options(module.name);
         let krate = convert(&package, crate_dir, &options).map_err(|e| JitError::Conversion(format!("{:#}", e)))?;
