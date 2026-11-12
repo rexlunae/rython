@@ -142,7 +142,7 @@ fn module_runs_top_level_code(source: &str) -> bool {
 /// lines, a docstring and an indented (nested) `main()` are all classified
 /// as CPython classifies them. A parse failure is `false`: the conversion
 /// itself reports it with its own message.
-fn module_level_main_call_is_entry(source: &str) -> bool {
+pub(crate) fn module_level_main_call_is_entry(source: &str) -> bool {
     let Ok(module) = python_ast::parse(source, "entry_probe.py") else {
         return false;
     };

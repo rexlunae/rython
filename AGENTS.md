@@ -39,7 +39,8 @@ message text, ordering, and float formatting.
 |---|---|
 | `crates/python-ast` | Parser (CPython `ast` via PyO3) + Python→Rust codegen |
 | `crates/stdpython` | Runtime: builtins, types, stdlib, exceptions; `core ⊂ alloc ⊂ std` feature tiers |
-| `crates/rypip` | Package converter/builder/installer; pyo3/no_std/kernel targets; FFI manifests |
+| `crates/rypip` | Package converter/builder/installer; pyo3/no_std/kernel targets; FFI manifests; the JIT's compiler (cdylib mode) and `rypip jit` |
+| `crates/rython-jit` | The JIT host (issue #166, `docs/jit.md`): content-hash cache, cargo build, `dlopen`, typed calls and program runs across a C ABI; `std` only, Unix only |
 | `crates/rythonc` | Single-file CLI compiler |
 | `crates/python-mod` | `python_module!` proc-macros |
 | `crates/rykernel-shim` | C-free runtime for kernel modules (unpublished, path-resolved) |
@@ -128,7 +129,8 @@ message text, ordering, and float formatting.
   and the `PyValue` boundary (issue #335)
 - [`docs/testing-under-rython.md`](docs/testing-under-rython.md) — running
   Python test suites under rython (issue #334)
-- [`docs/jit.md`](docs/jit.md) — the JIT design and milestones (issue #166)
+- [`docs/jit.md`](docs/jit.md) — the JIT design and milestones (issue #166),
+  and what M1 shipped
 - [`docs/jit-eval.md`](docs/jit-eval.md) — the earlier JIT evaluation,
   superseded by `jit.md`
 - [`docs/cpython-suite-status.md`](docs/cpython-suite-status.md) — per-file
