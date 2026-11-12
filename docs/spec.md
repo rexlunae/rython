@@ -3016,7 +3016,10 @@ in generated code rather than a conversion-time message:
 - Reading a non-constant module global from inside a function fails in
   rustc (the global lives in `__module_init__`'s scope).
 - Rebinding a local name to a different type fails as a rustc type
-  error against the hoisted declaration.
+  error against the hoisted declaration. This includes repeated tuple
+  targets with heterogeneous values (`t, t = threading.Thread(...), 0`):
+  the last value determines a subsequent field's Python type, but the
+  Rust local itself cannot change types. Unpack into distinct local names.
 - A typo'd or unsupported plain-name annotation (`x: itn`) renders
   verbatim (the mechanism that admits user classes) and fails in rustc.
 - Dunder-protocol *uses* (printing an object, `==`, `len()`, operator

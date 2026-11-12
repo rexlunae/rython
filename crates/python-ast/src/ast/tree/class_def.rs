@@ -4182,15 +4182,37 @@ fn thread_bound_locals(
         {
             let mut leaves = Vec::new();
             paired_leaves(target, StoredValue::Expr(&a.value), &mut leaves);
+            // Python stores targets left to right. A repeated local in
+            // this pattern has only its last value after the statement;
+            // an overwritten constructor must not type a later field.
+            let mut last_bindings = std::collections::BTreeMap::new();
+            let mut possible_threads = std::collections::BTreeSet::new();
             for (leaf, value) in leaves {
-                if let ExprType::Name(n) = leaf
-                    && let StoredValue::Expr(ExprType::Call(c)) = value
-                    && crate::ThreadingType::constructor(&c.func, symbols)
-                        == Some(crate::ThreadingType::Thread)
-                {
-                    names.insert(n.id.clone());
+                if let ExprType::Name(n) = leaf {
+                    let thread = match value {
+                        StoredValue::Expr(ExprType::Call(c))
+                            if crate::ThreadingType::constructor(&c.func, symbols)
+                                == Some(crate::ThreadingType::Thread) => Some(true),
+                        StoredValue::Expr(ExprType::Name(other))
+                            if names.contains(&other.id) => Some(true),
+                        StoredValue::Expr(ExprType::Constant(_) | ExprType::NoneType(_)
+                            | ExprType::Tuple(_) | ExprType::List(_) | ExprType::Dict(_)
+                            | ExprType::Set(_)) => Some(false),
+                        _ => None,
+                    };
+                    if thread == Some(true) {
+                        possible_threads.insert(n.id.clone());
+                    }
+                    last_bindings.insert(n.id.clone(), thread);
                 }
             }
+            // An unknown final value might itself be a Thread. Retain the
+            // conservative guard then; only proven non-Thread values can
+            // discard this statement's earlier constructor evidence.
+            names.extend(last_bindings.into_iter().filter_map(|(name, thread)| {
+                (thread == Some(true) || (thread.is_none() && possible_threads.contains(&name)))
+                    .then_some(name)
+            }));
         }
         Flow::Continue
     });

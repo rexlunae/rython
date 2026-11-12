@@ -31780,6 +31780,29 @@ fn tuple_bound_thread_locals_type_lazy_fields_and_cannot_hide_absent_fields() {
 }
 
 #[test]
+fn overwritten_tuple_local_does_not_misclassify_an_integer_field_as_a_thread() {
+    // Verified against python3: the last target binding wins, prints 0,
+    // and the discarded Thread is constructed but never started.
+    // This pins conversion classification, not dynamic local typing:
+    // heterogeneous rebindings remain loud in rustc (spec §12.1).
+    let source = include_str!("../../rypip/tests/fixtures/thread_tuple_repeated_local.py");
+    for pattern in [
+        "t, t = threading.Thread(target=work), 0",
+        "t, (t, n) = threading.Thread(target=work), (0, 1)",
+    ] {
+        let source = source.replace("t, t = threading.Thread(target=work), 0", pattern);
+        let out = compile(&source, "repeated_thread_local.py");
+        assert!(out.contains("value : i64"), "{out}");
+        assert!(!out.contains("value : Option < threading :: Thread >"), "{out}");
+    }
+    let error = compile_err(
+        "import threading\ndef work() -> None:\n    pass\nclass Runner:\n    def __init__(self):\n        self.value = 0\n    def configure(self, other):\n        t, t = threading.Thread(target=work), other\n        self.value = t\n",
+        "unknown_repeated_thread_local.py",
+    );
+    assert!(error.contains("thread field `self.value`") && error.contains("refuses"), "{error}");
+}
+
+#[test]
 fn unpacking_initializes_locals_without_spurious_mut_but_restores_still_need_it() {
     // Verified against python3: once prints 6, twice prints 7.
     let out = compile(

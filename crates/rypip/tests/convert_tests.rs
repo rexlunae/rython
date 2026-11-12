@@ -26145,3 +26145,16 @@ fn tuple_bound_thread_local_stored_in_a_lazy_field_runs_and_joins() {
     assert_eq!(output.stderr, python.stderr);
     assert_eq!(output.status.code(), python.status.code());
 }
+
+#[test]
+fn distinct_tuple_locals_keep_an_integer_field_integer() {
+    let source = include_str!("fixtures/thread_tuple_repeated_local.py")
+        .replace("t, t = threading.Thread(target=work), 0",
+            "_discarded, t = threading.Thread(target=work), 0");
+    let (stdout, stderr, code) = unittest_run("distinct_tuple_local", &source);
+    // Verified against python3. Distinct names avoid heterogeneous
+    // rebinding of one Rust local; constructing a Thread does not start it.
+    assert_eq!(stdout, "0\n");
+    assert_eq!(stderr, "");
+    assert_eq!(code, 0);
+}
