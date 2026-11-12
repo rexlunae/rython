@@ -25627,3 +25627,17 @@ fn unittest_skip_gate_rebinding_after_exit_false_is_harmless() {
     assert_eq!(stderr, "s\n----------------------------------------------------------------------\nRan 1 test in T\n\nOK (skipped=1)");
     assert_eq!(code, 0);
 }
+
+#[test]
+fn unittest_class_fixture_system_exit_preserves_cleanup_status_and_stops_later_suites() {
+    for (name, source, expected_stdout, expected_stderr, expected_code) in [
+        ("ut_setup_exit", include_str!("fixtures/class_fixture_setup_exit.py"), "setup exit\nfinally\n", "", 3),
+        ("ut_teardown_exit", include_str!("fixtures/class_fixture_teardown_exit.py"), "setup\ntest\nteardown exit\nfinally\n", ".", 4),
+    ] {
+        let (stdout, stderr, code) = unittest_run(name, source);
+        // Verified against python3: no unittest report and no later suite.
+        assert_eq!(stdout, expected_stdout);
+        assert_eq!(stderr, expected_stderr);
+        assert_eq!(code, expected_code);
+    }
+}
