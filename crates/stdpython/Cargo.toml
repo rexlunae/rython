@@ -18,7 +18,7 @@ categories = ["development-tools", "no-std"]
 #   default ("std")                          → the full runtime
 # A strictly-core tier (no alloc) is not implemented yet and fails loudly.
 [features]
-default = ["std", "ssl-rustls", "re-regex", "unicodedata-ucd", "pyo3-interop"]
+default = ["std", "ssl-rustls", "re-regex", "unicodedata-ucd", "pyo3-interop", "zlib"]
 std = ["alloc", "dep:libc", "dep:getrandom", "indexmap/std"]
 alloc = ["dep:hashbrown", "dep:libm", "dep:md-5", "dep:sha1", "dep:sha2", "dep:num-bigint", "dep:num-traits"]
 
@@ -54,6 +54,11 @@ pyo3-interop = ["std", "dep:pyo3"]
 # stdpython dependency when the converted package imports re; it stays
 # in `default` so stdpython's own build and tests are unchanged.
 re-regex = ["std", "dep:regex"]
+
+# The zlib module (deflate/inflate in zlib, raw and gzip framing, crc32,
+# adler32) wraps miniz_oxide, which needs only alloc. It stays in
+# `default` so stdpython's own build and tests are unchanged.
+zlib = ["alloc", "dep:miniz_oxide"]
 
 # The unicodedata module wraps the Unicode Character Database crates,
 # every one pinned to Unicode 16.0.0 — CPython 3.14's `unidata_version` —
@@ -98,6 +103,7 @@ getrandom = { version = "0.3", optional = true }
 hashbrown = { version = "0.15", optional = true }
 libm = { version = "0.2", optional = true }
 regex = { version = "1", optional = true }
+miniz_oxide = { version = "0.8", optional = true, default-features = false, features = ["with-alloc"] }
 # Pinned exactly: every UCD crate here carries Unicode 16.0.0 tables
 # (unicode-normalization 0.1.25 already moved to 17.0).
 unicode-normalization = { version = "=0.1.24", optional = true }
