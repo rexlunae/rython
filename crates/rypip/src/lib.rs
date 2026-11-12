@@ -6,7 +6,9 @@
 //! optionally with PyO3 bindings so the converted crate can still be
 //! imported from Python.
 
+pub(crate) mod cdylib;
 pub mod convert;
+pub mod jit;
 pub mod package;
 pub mod packaging;
 pub mod resolve;
@@ -184,26 +186,143 @@ pub fn lock_work_dir(dir: &Path) -> Result<WorkDirLock> {
 }
 
 /// Build the converted crate quietly (`--release --quiet`, the program's
-/// own output is what the user came for) FOR THE HOST (`--target` the
-/// triple `rustc -vV` reports, so a configured cross target never yields
-/// an artifact this machine cannot run) and return the executable cargo
-/// reports for its binary target — wherever cargo put it: a
-/// `CARGO_TARGET_DIR`, the target's own subdirectory, a platform suffix
-/// (Devin review on #340). The compiler's diagnostics still reach stderr
-/// (`json-render-diagnostics`); the artifact messages are read from
-/// stdout.
+/// own output is what the user came for) FOR THE HOST and return the
+/// executable cargo reports for its binary target (see
+/// [`cargo_build_artifact`]). The compiler's diagnostics reach stderr.
 pub fn cargo_build_executable(krate: &ConvertedCrate) -> Result<PathBuf> {
     require_binary(krate, "run")?;
-    let output = Command::new("cargo")
-        .args(["build", "--release", "--quiet", "--message-format=json-render-diagnostics"])
+    match cargo_build_artifact(&krate.root, &krate.name, ArtifactKind::Bin, None, Diagnostics::Inherit) {
+        Ok(artifact) => Ok(artifact.path),
+        Err(ArtifactError::Spawn(e)) => Err(anyhow::Error::new(e).context("running cargo build")),
+        Err(other) => Err(anyhow::anyhow!("{}", other)),
+    }
+}
+
+/// Which of a crate's targets [`cargo_build_artifact`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactKind {
+    /// The binary (`rypip run`): cargo's `executable`.
+    Bin,
+    /// The shared library (the JIT, docs/jit.md): the file in cargo's
+    /// `filenames` with the platform's library suffix.
+    Cdylib,
+}
+
+impl ArtifactKind {
+    /// The target kind as cargo's artifact messages name it.
+    fn cargo_kind(self) -> &'static str {
+        match self {
+            ArtifactKind::Bin => "bin",
+            ArtifactKind::Cdylib => "cdylib",
+        }
+    }
+
+    /// The artifact's path in a `compiler-artifact` message.
+    fn path_in(self, msg: &serde_json::Value) -> Option<PathBuf> {
+        match self {
+            ArtifactKind::Bin => msg["executable"].as_str().map(PathBuf::from),
+            ArtifactKind::Cdylib => msg["filenames"].as_array()?.iter().find_map(|f| {
+                f.as_str()
+                    .filter(|f| f.ends_with(std::env::consts::DLL_SUFFIX))
+                    .map(PathBuf::from)
+            }),
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            ArtifactKind::Bin => "an executable for its binary target",
+            ArtifactKind::Cdylib => "a shared library for its cdylib target",
+        }
+    }
+}
+
+/// Where a build's diagnostics go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Diagnostics {
+    /// To this process's stderr, as they happen (`rypip run`).
+    Inherit,
+    /// Into [`Artifact::diagnostics`] or [`ArtifactError::Failed`] (the
+    /// JIT, whose errors carry rustc's diagnostics).
+    Capture,
+}
+
+/// A built artifact.
+#[derive(Debug, Clone)]
+pub struct Artifact {
+    pub path: PathBuf,
+    /// The build's captured stderr ([`Diagnostics::Capture`]), else empty.
+    pub diagnostics: String,
+}
+
+/// Why [`cargo_build_artifact`] produced no artifact.
+#[derive(Debug)]
+pub enum ArtifactError {
+    /// The host triple could not be determined (`rustc -vV`).
+    Host(String),
+    /// cargo could not be started.
+    Spawn(std::io::Error),
+    /// cargo ran and failed; its stderr when captured.
+    Failed {
+        status: ExitStatus,
+        diagnostics: String,
+    },
+    /// The build succeeded but cargo reported no artifact of the kind.
+    Missing { name: String, kind: ArtifactKind },
+}
+
+impl std::fmt::Display for ArtifactError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArtifactError::Host(e) => write!(f, "{}", e),
+            ArtifactError::Spawn(e) => write!(f, "running cargo build: {}", e),
+            ArtifactError::Failed { status, .. } => write!(f, "cargo build failed with {}", status),
+            ArtifactError::Missing { name, kind } => {
+                write!(f, "built `{}` but cargo reported no {}", name, kind.describe())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ArtifactError {}
+
+/// Build the crate at `root` quietly (`--release --quiet`) FOR THE HOST
+/// (`--target` the triple `rustc -vV` reports, so a configured cross
+/// target never yields an artifact this machine cannot run or load) and
+/// return the artifact cargo reports for target `name` of `kind` —
+/// wherever cargo put it: a `CARGO_TARGET_DIR`, the target's own
+/// subdirectory, a platform suffix (Devin review on #340). `target_dir`
+/// overrides the target directory (the JIT's shared one). The compiler's
+/// diagnostics are rendered (`json-render-diagnostics`) to stderr, which
+/// is inherited or captured per `diagnostics`; the artifact messages are
+/// read from stdout.
+pub fn cargo_build_artifact(
+    root: &Path,
+    name: &str,
+    kind: ArtifactKind,
+    target_dir: Option<&Path>,
+    diagnostics: Diagnostics,
+) -> std::result::Result<Artifact, ArtifactError> {
+    let host = host_triple().map_err(|e| ArtifactError::Host(format!("{:#}", e)))?;
+    let mut cmd = Command::new("cargo");
+    cmd.args(["build", "--release", "--quiet", "--message-format=json-render-diagnostics"])
         .arg("--target")
-        .arg(host_triple()?)
-        .current_dir(&krate.root)
-        .stderr(Stdio::inherit())
-        .output()
-        .with_context(|| "running cargo build".to_string())?;
+        .arg(host)
+        .current_dir(root)
+        .stderr(match diagnostics {
+            Diagnostics::Inherit => Stdio::inherit(),
+            Diagnostics::Capture => Stdio::piped(),
+        });
+    if let Some(dir) = target_dir {
+        cmd.arg("--target-dir").arg(dir);
+    }
+    let output = cmd.output().map_err(ArtifactError::Spawn)?;
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if !output.status.success() {
-        bail!("cargo build failed with {}", output.status);
+        return Err(ArtifactError::Failed {
+            status: output.status,
+            diagnostics: stderr,
+        });
     }
     for line in output.stdout.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
         let Ok(msg) = serde_json::from_slice::<serde_json::Value>(line) else {
@@ -212,19 +331,22 @@ pub fn cargo_build_executable(krate: &ConvertedCrate) -> Result<PathBuf> {
         if msg["reason"] != "compiler-artifact" {
             continue;
         }
-        let is_bin = msg["target"]["kind"]
+        let is_kind = msg["target"]["kind"]
             .as_array()
-            .is_some_and(|kinds| kinds.iter().any(|k| k == "bin"));
-        if is_bin && msg["target"]["name"] == krate.name.as_str() {
-            if let Some(exe) = msg["executable"].as_str() {
-                return Ok(PathBuf::from(exe));
+            .is_some_and(|kinds| kinds.iter().any(|k| k == kind.cargo_kind()));
+        if is_kind && msg["target"]["name"] == name {
+            if let Some(path) = kind.path_in(&msg) {
+                return Ok(Artifact {
+                    path,
+                    diagnostics: stderr,
+                });
             }
         }
     }
-    bail!(
-        "built `{}` but cargo reported no executable for its binary target",
-        krate.name
-    )
+    Err(ArtifactError::Missing {
+        name: name.to_string(),
+        kind,
+    })
 }
 
 /// Execute a built program as `python program args` would: `sys.argv[0]`

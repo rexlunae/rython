@@ -5281,7 +5281,7 @@ pub(crate) fn collect_local_types(
 /// Whether an annotation expression means `None` (`-> None` marks a
 /// procedure): the parser may surface it as the NoneType variant, a
 /// valueless constant, or the bare name `None`.
-pub(crate) fn is_none_expr(ann: &ExprType) -> bool {
+pub fn is_none_expr(ann: &ExprType) -> bool {
     match ann {
         ExprType::NoneType(_) => true,
         ExprType::Constant(c) => c.0.is_none(),
@@ -6136,6 +6136,13 @@ fn returns_from_body(body: &[Statement]) -> bool {
 }
 
 impl FunctionDef {
+    /// Whether this function is a GENERATOR: a `yield` / `yield from` in
+    /// its own scope (see `body_has_yields`). Tools generating call-through
+    /// code (the JIT's shims) refuse to treat one as a plain function.
+    pub fn is_generator(&self) -> bool {
+        body_has_yields(&self.body)
+    }
+
     /// Whether this method is a property SETTER (`@x.setter def x(...)` —
     /// the `setter` decorator spelling). Only the setter half of a
     /// getter/setter pair gets the distinct Rust name `{name}_set`; the

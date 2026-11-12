@@ -18,6 +18,8 @@ litrs = "1.0"
 sha2 = "0.10"
 clap = { version = "4.4", features = ["derive"] }
 python-ast.workspace = true
+# `rypip jit` and the JIT's compiler (src/jit.rs, issue #166).
+rython-jit.workspace = true
 quote = "1.0"
 proc-macro2 = "1.0"
 rust-format = "0.3"
@@ -28,3 +30,9 @@ tar = "0.4"
 # Reading wheels only needs the zip container + inflate; the default
 # features pull lzma/xz/zstd/aes backends that are never used here.
 zip = { version = "2.0", default-features = false, features = ["deflate"] }
+
+# The JIT's stdout-ordering test runs itself as the host program, so its
+# stdout must be its own, not libtest's.
+[[test]]
+name = "jit_interleave"
+harness = false
