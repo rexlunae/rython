@@ -25755,6 +25755,16 @@ fn pytest_module_value_aliases_are_refused_before_the_runner_is_lost() {
 }
 
 #[test]
+fn composed_branch_initialization_runs_in_source_order() {
+    let (stdout, stderr, code) = unittest_run("composed_branch",
+        include_str!("fixtures/composed_branch.py"));
+    // Verified against python3.
+    assert_eq!(stdout, "7\n7\n7\n7\n7\n");
+    assert_eq!(stderr, "");
+    assert_eq!(code, 0);
+}
+
+#[test]
 fn unittest_adjacent_class_aliases_share_fixture_interval() {
     let (stdout, stderr, code) = unittest_run("ut_fixture_alias",
         include_str!("fixtures/class_fixture_alias.py"));
@@ -25826,6 +25836,16 @@ fn unittest_skip_gate_rebinding_after_exit_false_is_harmless() {
     // Verified against python3. The write runs after the completed test.
     assert_eq!(stdout, "finished\n");
     assert_eq!(stderr, "s\n----------------------------------------------------------------------\nRan 1 test in T\n\nOK (skipped=1)");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn unittest_composed_method_fields_use_the_lifecycle_presence_proof() {
+    let (stdout, stderr, code) = unittest_run("composed_testcase",
+        include_str!("fixtures/composed_testcase.py"));
+    // Verified against python3.
+    assert_eq!(stdout, "7\n");
+    assert_eq!(stderr, "..\n----------------------------------------------------------------------\nRan 2 tests in T\n\nOK");
     assert_eq!(code, 0);
 }
 

@@ -28,23 +28,11 @@ impl Assign {
         line: Option<usize>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         for target in &self.targets {
-            if pattern_has_starred(target)
-                && let Some(ExprType::Attribute(attr)) =
-                    crate::ast::tree::visit::target_leaves(target)
-                        .into_iter()
-                        .find(|leaf| matches!(leaf, ExprType::Attribute(_)))
-            {
-                let place = match attr.value.as_ref() {
-                    ExprType::Name(n) => format!("{}.{}", n.id, attr.attr),
-                    _ => attr.attr.clone(),
-                };
-                return Err(crate::ast::tree::class_def::starred_attribute_store_refusal(
-                    &place, line,
-                ).into());
-            }
+            refuse_starred_attribute_target(target, line)?;
         }
         Ok(())
     }
+
 }
 
 impl<'a, 'py> FromPyObject<'a, 'py> for Assign {
@@ -2197,11 +2185,33 @@ fn render_unpacked(
     leaf(target, value)
 }
 
-/// Whether an unpacking pattern has a starred element at any depth.
-fn pattern_has_starred(target: &ExprType) -> bool {
-    pattern_elts(target).is_some_and(|elts| {
-        elts.iter().any(|e| matches!(e, ExprType::Starred(_)) || pattern_has_starred(e))
-    })
+/// Refuse the whole pattern, preferring the actual starred attribute
+/// when there is one, then any ordinary attribute in the same pattern.
+pub(crate) fn refuse_starred_attribute_target(
+    target: &ExprType,
+    line: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::ast::tree::visit;
+    if !visit::target_has_starred(target) {
+        return Ok(());
+    }
+    let first_attribute = |target| visit::target_leaves(target).into_iter().find_map(|e| {
+        if let ExprType::Attribute(attr) = e { Some(attr) } else { None }
+    });
+    let mut starred_attribute = None;
+    visit::walk_target(target, &mut |e| {
+        if starred_attribute.is_none() && let ExprType::Starred(st) = e {
+            starred_attribute = first_attribute(&st.value);
+        }
+    });
+    if let Some(attr) = starred_attribute.or_else(|| first_attribute(target)) {
+        let place = match attr.value.as_ref() {
+            ExprType::Name(n) => format!("{}.{}", n.id, attr.attr),
+            _ => attr.attr.clone(),
+        };
+        return Err(crate::ast::tree::class_def::starred_attribute_store_refusal(&place, line).into());
+    }
+    Ok(())
 }
 
 /// Whether evaluating `value` after an earlier target store is guaranteed

@@ -449,3 +449,8 @@ Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for detai
 ---
 
 **Note**: This library is experimental and under active development. While basic parsing works reliably, advanced features and code generation should be used with caution in production environments.
+
+Outside unittest’s separately checked lifecycle, composed instance fields
+must be initialized on every normal constructor exit,
+before reads or receiver escapes. Fields first created by other methods are
+refused; move their initialization into `__init__` (spec §12, issue #517).
