@@ -8487,6 +8487,18 @@ impl PyException {
 /// output is flushed first, as interpreter shutdown flushes it.
 #[cfg(feature = "std")]
 pub fn exit_uncaught(e: &PyException) -> ! {
+    std::process::exit(report_uncaught(e))
+}
+
+/// Everything [`exit_uncaught`] does except ending the process: flush
+/// standard output, report the exception on stderr (a `SystemExit`'s
+/// message, or the traceback header and final line), and return the exit
+/// status the process would end with. The JIT's `ry_entry` (issue #166)
+/// runs a program inside a host process it must not end, and reports an
+/// uncaught exception through this, so its output is the binary's by
+/// construction.
+#[cfg(feature = "std")]
+pub fn report_uncaught(e: &PyException) -> i32 {
     use std::io::Write;
     let _ = std::io::stdout().flush();
     match e.system_exit_status() {
@@ -8494,17 +8506,17 @@ pub fn exit_uncaught(e: &PyException) -> ! {
             if let Some(message) = message {
                 let _ = writeln!(std::io::stderr(), "{}", message);
             }
-            std::process::exit(status);
+            return status;
         }
         Ok(None) => {}
         Err(error) => {
             eprintln!("rython: an uncaught SystemExit has no recorded code: {}", error);
-            std::process::exit(1);
+            return 1;
         }
     }
     eprintln!("Traceback (most recent call last):");
     eprintln!("{}", e.format_exception_only());
-    std::process::exit(1);
+    1
 }
 
 impl Display for PyException {

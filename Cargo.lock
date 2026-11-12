@@ -501,6 +501,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22053b6a34f84abc97f9129e61334f40174659a1b9bd18c970b83db6a9a6348b"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1074,11 +1084,22 @@ dependencies = [
  "python-ast",
  "quote",
  "rust-format",
+ "rython-jit",
  "serde_json",
  "sha2",
  "tar",
  "toml",
  "zip",
+]
+
+[[package]]
+name = "rython-jit"
+version = "1.2.0"
+dependencies = [
+ "libc",
+ "libloading",
+ "sha2",
+ "stdpython",
 ]
 
 [[package]]
