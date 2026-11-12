@@ -121,6 +121,10 @@ pub mod module_init;
 /// Python hashlib module - message digests
 pub mod hashlib;
 
+/// Python zlib module - deflate/inflate and checksums (miniz_oxide).
+#[cfg(feature = "zlib")]
+pub mod zlib;
+
 /// Python csv module - CSV reading over line lists
 pub mod csv;
 
