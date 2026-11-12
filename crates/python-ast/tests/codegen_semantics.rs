@@ -5170,6 +5170,75 @@ fn composed_fields_type_and_resolve_through_chains() {
 }
 
 #[test]
+fn composed_field_reads_refuse_uninitialized_default_placeholders() {
+    // Verified against python3 3.14.4: Outer.__init__ raises
+    // `AttributeError: 'Outer' object has no attribute 'inner'` before the
+    // assignment. A default Inner struct would instead expose its `value`.
+    let before_assignment = concat!(
+        "class Inner:\n",
+        "    def __init__(self):\n",
+        "        self.value = 7\n",
+        "\n",
+        "class Outer:\n",
+        "    def __init__(self):\n",
+        "        print(self.inner.value)\n",
+        "        self.inner = Inner()\n",
+    );
+    let error = compile_err(before_assignment, "compose_uninitialized.py");
+    assert!(
+        error.contains("composed field `self.inner`")
+            && error.contains("CPython raises AttributeError")
+            && error.contains("refuses to silently expose"),
+        "{error}"
+    );
+
+    // Verified against python3 3.14.4 with `Outer(False)`: a conditionally
+    // absent composed field raises AttributeError when read by `value`.
+    let conditional = concat!(
+        "class Inner:\n",
+        "    def __init__(self):\n",
+        "        self.value = 7\n",
+        "\n",
+        "class Outer:\n",
+        "    def __init__(self, flag: bool):\n",
+        "        if flag:\n",
+        "            self.inner = Inner()\n",
+        "\n",
+        "    def value(self) -> int:\n",
+        "        return self.inner.value\n",
+    );
+    let error = compile_err(conditional, "compose_conditional.py");
+    assert!(
+        error.contains("composed field `self.inner`")
+            && error.contains("CPython raises AttributeError"),
+        "{error}"
+    );
+
+    // Verified against python3 3.14.4 with `Outer(True)`: the early return
+    // leaves `inner` absent even though a later top-level store exists.
+    let early_return = concat!(
+        "class Inner:\n",
+        "    def __init__(self):\n",
+        "        self.value = 7\n",
+        "\n",
+        "class Outer:\n",
+        "    def __init__(self, flag: bool):\n",
+        "        if flag:\n",
+        "            return\n",
+        "        self.inner = Inner()\n",
+        "\n",
+        "    def value(self) -> int:\n",
+        "        return self.inner.value\n",
+    );
+    let error = compile_err(early_return, "compose_early_return.py");
+    assert!(
+        error.contains("composed field `self.inner`")
+            && error.contains("CPython raises AttributeError"),
+        "{error}"
+    );
+}
+
+#[test]
 fn unsupported_class_constructs_are_tolerated_metadata() {
     // A base rython cannot emit a struct for (an imported module, a
     // builtin) is tolerated as metadata: the class lowers as a plain
@@ -31448,6 +31517,31 @@ fn pytest_operand_preflight_respects_the_stack_budget() {
 }
 
 #[test]
+fn composed_fields_track_branch_stores_and_deferred_readers() {
+    // Verified against python3: Branch(True) prints 7, Branch(False)
+    // prints nothing; Deferred prints 7 after creating the reader first.
+    let inner = "class Inner:\n    def __init__(self):\n        self.value = 7\n";
+    compile(&format!("{inner}class Branch:\n    def __init__(self, flag: bool):\n        if flag:\n            self.inner = Inner()\n            print(self.inner.value)\n        self.inner = Inner()\n"), "composed_branch.py");
+    compile(&format!("{inner}class Deferred:\n    def __init__(self):\n        reader = lambda: self.inner.value\n        self.inner = Inner()\n        print(reader())\n"), "composed_deferred.py");
+    compile(&format!("{inner}class Joined:\n    def __init__(self, flag: bool):\n        if flag:\n            self.inner = Inner()\n        else:\n            self.inner = Inner()\n        print(self.inner.value)\n"), "composed_join.py");
+}
+
+#[test]
+fn composed_fields_refuse_reader_invocation_and_escape_before_assignment() {
+    // Verified against python3: Nested() raises AttributeError for inner.
+    let inner = "class Inner:\n    def __init__(self):\n        self.value = 7\n";
+    for body in [
+        "        def read() -> None:\n            print(self.inner.value)\n        read()\n        self.inner = Inner()\n",
+        "        reader = lambda: self.inner.value\n        print(reader())\n        self.inner = Inner()\n",
+        "        def read() -> None:\n            print(self.inner.value)\n        def wrapper() -> None:\n            read()\n        wrapper()\n        self.inner = Inner()\n",
+        "        print(list(map(lambda unused: self.inner.value, [0])))\n        self.inner = Inner()\n",
+    ] {
+        let error = compile_err(&format!("{inner}class Nested:\n    def __init__(self):\n{body}"), "composed_reader.py");
+        assert!(error.contains("composed field `self.inner`") && error.contains("refuses"), "{error}");
+    }
+}
+
+#[test]
 fn only_known_unittest_fixture_names_allow_non_snake_case() {
     let rust = compile("class C:\n    def calculateTotal(self) -> int:\n        return 1\n", "fixture_lints");
     let compact: String = rust.chars().filter(|c| !c.is_whitespace()).collect();
@@ -31483,6 +31577,15 @@ fn unittest_skip_gate_rebinding_has_compiler_refusal_pins() {
 }
 
 #[test]
+fn method_only_composed_fields_require_constructor_initialization() {
+    // Verified against python3: create(); read() prints 7, but read()
+    // without create() raises AttributeError. §12 records this conservative
+    // model boundary: no whole-program proof of callers' method ordering.
+    let error = compile_err("class Inner:\n    def __init__(self):\n        self.value = 7\nclass Outer:\n    def __init__(self):\n        pass\n    def create(self):\n        self.inner = Inner()\n    def read(self) -> int:\n        return self.inner.value\n", "composed_method_only.py");
+    assert!(error.contains("composed field `self.inner`") && error.contains("__init__"), "{error}");
+}
+
+#[test]
 fn unittest_skip_gate_reads_exclude_walrus_targets_and_nested_locals() {
     // Verified against python3. All three conditions are True and skip T.
     for condition in ["(FLAG := True)", "(lambda FLAG: FLAG)(True)", "[FLAG for FLAG in [True]][0]"] {
@@ -31497,4 +31600,10 @@ fn unittest_skip_gate_post_runner_write_does_not_hoist_a_static_shadow() {
     let rust = compile(include_str!("../../rypip/tests/fixtures/gate_postrun.py"), "gate_postrun.py");
     assert!(rust.contains("py_global_write"), "{rust}");
     assert!(!rust.contains("let FLAG") && !rust.contains("let mut FLAG"), "{rust}");
+}
+
+#[test]
+fn composed_testcase_fields_use_the_separate_lifecycle_proof() {
+    // Verified against python3: both methods initialize inner before any read.
+    compile(include_str!("../../rypip/tests/fixtures/composed_testcase.py"), "composed_testcase.py");
 }
