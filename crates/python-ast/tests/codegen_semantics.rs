@@ -31424,6 +31424,16 @@ fn pytest_operand_preflight_respects_the_stack_budget() {
 }
 
 #[test]
+fn only_known_unittest_fixture_names_allow_non_snake_case() {
+    let rust = compile("class C:\n    def calculateTotal(self) -> int:\n        return 1\n", "fixture_lints");
+    let compact: String = rust.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(!compact.contains("#[allow(non_snake_case)]"), "{rust}");
+    let fixture = compile("import unittest\nclass T(unittest.TestCase):\n    def setUp(self) -> None:\n        pass\n    def test_ok(self) -> None:\n        pass\n", "known_fixture_lint");
+    let compact: String = fixture.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("#[allow(non_snake_case)]"), "{fixture}");
+}
+
+#[test]
 fn unittest_skip_gate_rebinding_has_compiler_refusal_pins() {
     // Verified against python3. Each of these four sources skips its test,
     // including the helper defined before the decorated class and walrus RHS.
