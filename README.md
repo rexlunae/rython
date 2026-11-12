@@ -192,6 +192,10 @@ uncertain attribute presence, receiver escapes, and field reads relying on
 another test or an opaque helper are conversion errors. Manual construction
 of cases with fields is refused; use `unittest.main()` to preserve fixture
 order (issues #480, #511, #526).
+`with self.subTest(name=value):` records each failure with its named context
+and continues the test method. Positional messages, `msg=`, `**kwargs`,
+mutable or unmodeled context-value reprs, `as` targets, additional context managers,
+and control transfers out of a subtest body are refused (issue #525).
 `skipIf`/`skipUnless` conditions must stay unchanged between decoration and
 the runner call; direct rebinding and potential writes through `global`
 functions are conversion errors (#521).
@@ -222,6 +226,9 @@ forms, including the args tuple for multi-argument messages. Mutable or
 unknown arguments and unsupported specialized constructors are conversion
 errors; see [the exception specification](docs/spec.md#8-exceptions).
 `socket.gaierror` and `herror` keep their distinct OSError subtype matching.
+Uncaught imported user exceptions display their defining module
+(`excpkg.errors.BadInput: boom`); builtins and `__main__` classes stay
+unqualified, without changing exception matching or Python str/repr.
 
 Tuple/list unpacking infers instance field types from the stored elements
 and applies the fields' normal assignment coercions. Starred attribute

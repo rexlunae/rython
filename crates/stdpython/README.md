@@ -16,6 +16,11 @@ The default Python runtime library for the Rython compiler ecosystem. This crate
 - **Memory Safe**: All operations maintain Rust's memory safety guarantees
 - **Performance Optimized**: Native Rust implementations provide superior performance to interpreted Python
 
+`PyException::format_exception_only` qualifies imported user exceptions
+with their defining Python module, recorded by the converter with
+`with_module`. Builtins and `__main__` classes remain unqualified; matching,
+`type_name`, and Python str/repr use the original unqualified type.
+
 ## Architecture
 
 `PyInteger` provides the unbounded scalar integer runtime used for oversized
@@ -306,3 +311,8 @@ This project is part of the Rython compiler ecosystem.
 The std-tier unittest runner records direct class-fixture exceptions as errors
 (including AssertionError). The compiler preserves one fixture interval across
 adjacent aliases of the same TestCase; inherited class fixtures remain refused.
+
+The std-tier subtest runner continues ordinary tests after subtest failures,
+ends expected-failure methods at the first failure, and skips the test and
+teardown after unsuccessful setup subtests. Named context values must be
+immutable scalars or immutable tuples; mutable/boxed values are refused.

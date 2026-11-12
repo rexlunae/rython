@@ -576,6 +576,21 @@ fn nested_scope_read(name: &str, line: usize, scope: &str) -> String {
     )
 }
 
+/// Only immutable values can be rendered on entry. Containers and boxed
+/// values can change before failure reporting; copying their repr is wrong.
+fn has_subtest_repr(ty: &crate::TypeInfo) -> bool {
+    match ty {
+        crate::TypeInfo::Int | crate::TypeInfo::BigInt | crate::TypeInfo::Float
+        | crate::TypeInfo::Bool | crate::TypeInfo::StrRef | crate::TypeInfo::String
+        | crate::TypeInfo::Complex => true,
+        crate::TypeInfo::Option(inner) | crate::TypeInfo::Borrowed(inner) => has_subtest_repr(inner),
+        crate::TypeInfo::Tuple(items) => {
+            !items.is_empty() && items.len() <= 8 && items.iter().all(has_subtest_repr)
+        }
+        _ => false,
+    }
+}
+
 /// Whether a with-item's context expression is a threading synchronization
 /// object (Lock/RLock/Semaphore) — constructed inline
 /// (`with threading.Lock():`), a name assigned from such a construction,
@@ -699,26 +714,81 @@ impl CodeGen for With {
         options: Self::Options,
         symbols: Self::SymbolTable,
     ) -> Result<TokenStream, Box<dyn std::error::Error>> {
-        // The TestCase context managers among the items: an assert-family
-        // one wins over a subTest beside it, so it is never dropped.
-        let kinds: Vec<TestCaseContext> = self
-            .items
-            .iter()
+        // Preserve the typed TestCase context dispatch from main. An
+        // assert-family context beside subTest must still be refused.
+        let kinds: Vec<TestCaseContext> = self.items.iter()
             .filter(|item| is_testcase_receiver(&item.context_expr, &ctx, &symbols, &options))
             .filter_map(|item| testcase_context(&item.context_expr).map(|(kind, _)| kind))
             .collect();
-        // `with self.subTest(...):` — the unittest reporting CM (issue #334).
-        // CPython's subTest(**) only REFRAMES reporting (each iteration is
-        // recorded as its own sub-result); it does not suppress exceptions
-        // or alter control flow, so the body runs directly (a closure would
-        // be WRONG here — a subTest body may legitimately
-        // return/break/continue). The per-subtest-named reporting
-        // granularity of CPython's runner is not reproduced (rython's runner
-        // counts whole test methods).
-        if self.items.len() == 1
-            && self.items[0].optional_vars.is_none()
-            && kinds == [TestCaseContext::SubTest]
+        if let Some(kind) = kinds.iter().copied().find(|k| *k != TestCaseContext::SubTest) {
+            return self.lower_assert_raises(kind, ctx, options, symbols);
+        }
+        // A subtest is a failure boundary. Escaping control flow cannot
+        // cross the generated closure and is refused below.
+        if kinds.contains(&TestCaseContext::SubTest)
         {
+            if self.items.len() != 1 || self.items[0].optional_vars.is_some() {
+                return Err(format!(
+                    "`with self.subTest(...)` at line {} must be the only context manager \
+                     and cannot bind an `as` target; rython refuses to silently skip \
+                     subtest failure handling",
+                    self.lineno.unwrap_or(0)
+                )
+                .into());
+            }
+            if body_escapes_a_closure(&self.body) {
+                return Err(format!(
+                    "`with self.subTest(...)` at line {} containing `return`, `break`, or \
+                     `continue` is not supported yet; move that control flow outside the \
+                     subTest body; rython refuses to silently change its target",
+                    self.lineno.unwrap_or(0)
+                )
+                .into());
+            }
+            let ExprType::Call(subtest_call) = &self.items[0].context_expr else {
+                unreachable!("typed SubTest contexts only match calls");
+            };
+            if !subtest_call.args.is_empty()
+                || subtest_call
+                    .keywords
+                    .iter()
+                    .any(|keyword| keyword.arg.is_none() || keyword.arg.as_deref() == Some("msg"))
+            {
+                return Err(format!(
+                     "`self.subTest` at line {} supports named context parameters only; positional \
+                      messages, `msg=`, and `**kwargs` are not supported yet; use \
+                      `name=value`; \
+                     rython refuses to silently change subtest reporting",
+                    self.lineno.unwrap_or(0)
+                )
+                .into());
+            }
+            let mut context_values = Vec::new();
+            for keyword in &subtest_call.keywords {
+                let name = keyword
+                    .arg
+                    .as_ref()
+                    .expect("unpacked kwargs rejected above");
+                let ty = crate::infer_type(Some(&ctx), &keyword.value, &options, &symbols);
+                if !has_subtest_repr(&ty) {
+                    return Err(format!(
+                        "`self.subTest({name}=...)` at line {} has a value without a \
+                         supported immutable Python repr; use a scalar or immutable tuple; \
+                         rython refuses to silently change subtest reporting",
+                        keyword.lineno.or(self.lineno).unwrap_or(0)
+                    )
+                    .into());
+                }
+                let value = keyword.value.clone().to_rust(
+                    ctx.clone(),
+                    options.clone(),
+                    symbols.clone(),
+                )?;
+                context_values.push(quote! {
+                    (#name.to_string(), stdpython::PyRepr::py_repr(&(#value)))
+                });
+            }
+            let context = quote!(vec![#(#context_values),*]);
             let body_tokens: Result<Vec<TokenStream>, Box<dyn std::error::Error>> = self
                 .body
                 .iter()
@@ -728,8 +798,16 @@ impl CodeGen for With {
                 })
                 .collect();
             let body_tokens = body_tokens?;
+            let tail = if crate::ast::tree::function_def::guarantees_return(&self.body) {
+                quote!()
+            } else {
+                quote!(Ok(()))
+            };
             return Ok(quote! {
-                #(#body_tokens;)*
+                stdpython::unittest::run_subtest(#context, || -> Result<(), PyException> {
+                    #(#body_tokens;)*
+                    #tail
+                })?;
             });
         }
         // Every other TestCase context manager is lowered here or refused:
