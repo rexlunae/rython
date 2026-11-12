@@ -646,6 +646,32 @@ fn py_exception_type_name_is_the_raised_class() {
 }
 
 #[test]
+fn py_exception_traceback_module_does_not_change_matching_or_value_display() {
+    // Verified against python3: class BadInput(Exception): pass;
+    // BadInput.__module__ = 'excpkg.errors'; e = BadInput('boom').
+    // traceback.format_exception_only(type(e), e)[-1].rstrip('\n'),
+    // type(e).__name__, str(e), repr(e), isinstance(e, BadInput/Exception).
+    let error = PyException::new_with_attrs_and_ancestors(
+        "BadInput", "boom", vec![], vec!["Exception".to_string()],
+    ).with_args_repr(vec!["'boom'".to_string()]).with_module("excpkg.errors");
+    assert_eq!(error.clone().format_exception_only(), "excpkg.errors.BadInput: boom");
+    assert_eq!(error.type_name(), "BadInput");
+    assert_eq!(error.clone().py_str(), "boom");
+    assert_eq!(error.py_repr(), "BadInput('boom')");
+    assert!(error.matches("BadInput"));
+    assert!(error.matches("Exception"));
+    assert!(!error.matches("ValueError"));
+    // traceback.format_exception_only(BadInput, BadInput())[-1].rstrip('\n').
+    assert_eq!(PyException::new("BadInput", "").with_module("excpkg.errors")
+        .format_exception_only(), "excpkg.errors.BadInput");
+    // Builtins and a class defined in __main__ are unqualified.
+    assert_eq!(PyException::new("ValueError", "boom").with_module("builtins")
+        .format_exception_only(), "ValueError: boom");
+    assert_eq!(PyException::new("BadInput", "boom").with_module("__main__")
+        .format_exception_only(), "BadInput: boom");
+}
+
+#[test]
 fn truthiness_matches_python_bool() {
     // Python: bool("") is False, bool("x") is True
     assert!(!"".is_truthy());

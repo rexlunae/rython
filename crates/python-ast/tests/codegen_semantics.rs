@@ -4796,7 +4796,7 @@ fn python_exception_attributes_do_not_expose_rust_payload_fields() {
         let error = compile_err(&source, "exception_payload.py");
         assert!(error.contains("exception attribute") && error.contains("refuses"), "{statement}: {error}");
     }
-    for field in ["message", "exception_type", "attrs", "args_repr", "discriminant", "user_ancestors"] {
+    for field in ["message", "exception_type", "exception_module", "attrs", "args_repr", "discriminant", "user_ancestors"] {
         let source = format!("def f():\n    error = SystemExit(3)\n    print(error.{field})\n");
         let error = compile_err(&source, "exception_payload.py");
         assert!(error.contains("exception attribute") && error.contains("refuses"), "{field}: {error}");

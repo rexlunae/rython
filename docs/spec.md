@@ -2117,6 +2117,13 @@ the message, `repr(e)` is `Type('message')`. An uncaught exception exits
 with status 1, printing CPython's `Traceback (most recent call last):`
 header and final line (`Type: message`, or just `Type` for an empty
 message) to stderr on every entry path — without the frames (§12.3).
+Imported user exceptions' final lines use their defining Python module
+(`excpkg.errors.BadInput: boom`), including through aliases and re-exports;
+builtins and classes defined in `__main__` stay unqualified. This display
+metadata does not change handler matching, `type(e).__name__`, or `repr(e)`.
+The module name comes from the importable source/package layout, not the
+distribution name in project metadata. An entry module's imported/library
+copy retains its importable name; only its binary-root copy is `__main__`.
 `SystemExit` is the exception to that reporting rule: it propagates through
 handlers and `finally`, then an uncaught exit at program entry uses its
 original `code`. `None` exits 0; an integer (including bool) supplies the C

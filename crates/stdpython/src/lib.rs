@@ -8185,6 +8185,9 @@ impl PyContains<String> for String {
 pub struct PyException {
     pub message: String,
     pub exception_type: String,
+    /// Defining Python module for traceback display only; matching and
+    /// `type(e).__name__` keep the unqualified `exception_type`.
+    pub exception_module: Option<String>,
     /// The raised type's BUILTIN discriminant, computed once at
     /// construction (round 52): `except ValueError:` from generated code
     /// lowers to `matches_builtin(BuiltinException::ValueError)` — an
@@ -8217,6 +8220,7 @@ impl PyException {
         Self {
             message: message.as_ref().to_string(),
             exception_type: exception_type.to_string(),
+            exception_module: None,
             discriminant: crate::builtin_exceptions::BuiltinException::from_name(exception_type),
             attrs: alloc::vec::Vec::new(),
             user_ancestors: alloc::vec::Vec::new(),
@@ -8244,6 +8248,7 @@ impl PyException {
         Self {
             message: message.as_ref().to_string(),
             exception_type: exception_type.to_string(),
+            exception_module: None,
             discriminant: crate::builtin_exceptions::BuiltinException::from_name(exception_type),
             attrs,
             user_ancestors: ancestors,
@@ -8254,6 +8259,11 @@ impl PyException {
     /// Record the constructor arguments' reprs (see `args_repr`).
     pub fn with_args_repr(mut self, reprs: alloc::vec::Vec<alloc::string::String>) -> Self {
         self.args_repr = Some(reprs);
+        self
+    }
+
+    pub fn with_module(mut self, module: &str) -> Self {
+        self.exception_module = Some(module.to_string());
         self
     }
 
@@ -8456,10 +8466,16 @@ impl PyException {
     /// `: message` when the message is not empty (`raise ValueError()`
     /// prints `ValueError`).
     pub fn format_exception_only(&self) -> alloc::string::String {
+        let name = match self.exception_module.as_deref() {
+            Some(module) if !module.is_empty() && module != "builtins" && module != "__main__" => {
+                alloc::format!("{}.{}", module, self.type_name())
+            }
+            _ => self.type_name(),
+        };
         if self.message.is_empty() {
-            self.type_name()
+            name
         } else {
-            alloc::format!("{}: {}", self.type_name(), self.message)
+            alloc::format!("{}: {}", name, self.message)
         }
     }
 }

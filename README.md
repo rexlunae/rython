@@ -226,6 +226,9 @@ forms, including the args tuple for multi-argument messages. Mutable or
 unknown arguments and unsupported specialized constructors are conversion
 errors; see [the exception specification](docs/spec.md#8-exceptions).
 `socket.gaierror` and `herror` keep their distinct OSError subtype matching.
+Uncaught imported user exceptions display their defining module
+(`excpkg.errors.BadInput: boom`); builtins and `__main__` classes stay
+unqualified, without changing exception matching or Python str/repr.
 
 Known gaps:
 
