@@ -273,10 +273,7 @@ fn gzip_body(data: &[u8]) -> Result<usize, PyException> {
     }
     for bit in [8, 16] {
         if flags & bit != 0 {
-            let end = data[at..]
-                .iter()
-                .position(|&b| b == 0)
-                .ok_or_else(truncated)?;
+            let end = data[at..].iter().position(|&b| b == 0).ok_or_else(truncated)?;
             at += end + 1;
         }
     }
@@ -333,10 +330,7 @@ pub struct Decompress {
 /// `zlib.decompressobj(wbits)`.
 pub fn decompressobj(wbits: i64) -> Result<Decompress, PyException> {
     if inflate_framing(wbits).is_none() {
-        return Err(PyException::new(
-            "ValueError",
-            "Invalid initialization option",
-        ));
+        return Err(PyException::new("ValueError", "Invalid initialization option"));
     }
     Ok(Decompress {
         wbits,
@@ -440,10 +434,7 @@ mod tests {
         );
         assert_eq!(message(compress(b"a", 12, 15)), "Bad compression level");
         assert_eq!(message(compress(b"a", 1, 99)), "Bad compression level");
-        assert_eq!(
-            decompress(b"x\x9c\xff\xff", 15).unwrap_err().exception_type,
-            "zlib.error"
-        );
+        assert_eq!(decompress(b"x\x9c\xff\xff", 15).unwrap_err().exception_type, "zlib.error");
     }
 
     #[test]
@@ -505,18 +496,9 @@ mod tests {
         };
         let corrupt = |what: &str| alloc::format!("Error -3 while decompressing data: {what}");
         let short = "Error -5 while decompressing data: incomplete or truncated stream";
-        assert_eq!(
-            message(decompress(&with(3, 0xe0), 31)),
-            corrupt("unknown header flags set")
-        );
-        assert_eq!(
-            message(decompress(&with(1, 0x8c), 31)),
-            corrupt("incorrect header check")
-        );
-        assert_eq!(
-            message(decompress(&with(2, 7), 31)),
-            corrupt("unknown compression method")
-        );
+        assert_eq!(message(decompress(&with(3, 0xe0), 31)), corrupt("unknown header flags set"));
+        assert_eq!(message(decompress(&with(1, 0x8c), 31)), corrupt("incorrect header check"));
+        assert_eq!(message(decompress(&with(2, 7), 31)), corrupt("unknown compression method"));
         // A header CRC: the right one passes, a wrong one is refused.
         let mut header = gzip[..10].to_vec();
         header[3] |= 2;
@@ -540,10 +522,7 @@ mod tests {
         // A zlib header declaring a larger window than wbits allows, or
         // one larger than 32K.
         let zlib = compress(b"hello", 6, 15).unwrap();
-        assert_eq!(
-            message(decompress(&zlib, 9)),
-            corrupt("invalid window size")
-        );
+        assert_eq!(message(decompress(&zlib, 9)), corrupt("invalid window size"));
         let mut big = zlib.clone();
         big[0] = 0x88;
         big[1] = 0x98;
@@ -560,14 +539,7 @@ mod tests {
         let zlib = compress(b"hello", 6, 15).unwrap();
         let raw = compress(b"hello", 6, -15).unwrap();
         let gzip = compress(b"hello", 6, 31).unwrap();
-        for (data, wbits) in [
-            (&zlib, 0),
-            (&raw, -8),
-            (&gzip, 16),
-            (&gzip, 24),
-            (&zlib, 32),
-            (&gzip, 32),
-        ] {
+        for (data, wbits) in [(&zlib, 0), (&raw, -8), (&gzip, 16), (&gzip, 24), (&zlib, 32), (&gzip, 32)] {
             assert_eq!(decompress(data, wbits).unwrap(), b"hello", "wbits {wbits}");
         }
         for wbits in [7, -7, 17, 23, 33, 39, 48] {
