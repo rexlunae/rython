@@ -31593,3 +31593,16 @@ fn tuple_bound_thread_locals_type_lazy_fields_and_cannot_hide_absent_fields() {
         "{error}"
     );
 }
+
+#[test]
+fn unpacking_initializes_locals_without_spurious_mut_but_restores_still_need_it() {
+    // Verified against python3: once prints 6, twice prints 7.
+    let out = compile(
+        "def once() -> None:\n    a, (b, c) = 1, (2, 3)\n    print(a + b + c)\ndef twice() -> None:\n    x, y = 1, 2\n    x, y = 3, 4\n    print(x + y)\n",
+        "unpack_mut.py",
+    );
+    for name in ["a", "b", "c"] {
+        assert!(!out.contains(&format!("let mut {name}")), "{out}");
+    }
+    assert!(out.contains("let mut x") && out.contains("let mut y"), "{out}");
+}

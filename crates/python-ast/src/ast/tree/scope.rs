@@ -366,15 +366,12 @@ pub(crate) fn analyze_scope_typed(
 fn record_target(target: &ExprType, a: &mut Analysis<'_>, multi: bool) {
     match target {
         ExprType::Name(name) => a.record_store(&name.id, multi),
-        ExprType::Tuple(tuple) => {
-            for elt in &tuple.elts {
-                // Destructuring assignment; conservatively mutable.
-                if let ExprType::Name(name) = elt {
-                    a.record_store(&name.id, multi);
-                    a.record_mutation(&name.id);
-                } else {
-                    record_target(elt, a, multi);
-                }
+        ExprType::Tuple(_) | ExprType::List(_) | ExprType::Starred(_) => {
+            // Unpacking initializes each leaf just like a plain store.
+            // Repeated/loop stores still require mut through record_store;
+            // a first store into a hoisted name does not (issue #527).
+            for leaf in crate::ast::tree::visit::target_leaves(target) {
+                record_target(leaf, a, multi);
             }
         }
         // Stores through the base name: `x[i] = v`, `x.f = v`, and nested
