@@ -195,6 +195,9 @@
     "thread_nested_target": {
       "status": "pass"
     },
+    "thread_tuple_local_field": {
+      "status": "pass"
+    },
     "tokenizer": {
       "status": "pass"
     },

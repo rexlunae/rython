@@ -712,8 +712,9 @@ stores one element or the remaining list. When a later RHS element is a
 non-literal expression, attribute unpacking is also rejected: an earlier
 property setter could mutate a global or captured value that the later
 element reads, whereas Python evaluates the entire RHS before any store.
-Unpack into locals first, then assign the attributes separately. The starred-store refusal reports the assignment line
-and indexing/separate-store rewrite even when the attribute is a
+Unpack into locals first, then assign the attributes separately. The
+starred-store refusal reports the assignment line and indexing/separate-store
+rewrite even when the attribute is a
 non-starred leaf (`self.first, *rest = values`).
 
 ### 5.3 `with`

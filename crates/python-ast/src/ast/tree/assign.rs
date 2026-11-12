@@ -32,7 +32,6 @@ impl Assign {
         }
         Ok(())
     }
-
 }
 
 impl<'a, 'py> FromPyObject<'a, 'py> for Assign {
