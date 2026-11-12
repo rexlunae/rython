@@ -5661,22 +5661,16 @@ fn resolve_alias_typeinfo_inner(
                     // boxed value.
                     Some(SymbolTableNode::Import(i))
                         if !options.module_defs.contains_key(
-                            &i.names
-                                .first()
-                                .map(|a| {
-                                    a.name
-                                        .split('.')
-                                        .map(|s| s.to_string())
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default(),
+                            &i.first_module_path(options),
                         ) =>
                     {
                         return Some(TypeInfo::PyValue);
                     }
                     Some(SymbolTableNode::Import(i)) => {
-                        let name = i.names.first()?.name.clone();
-                        break name.split('.').map(|s| s.to_string()).collect();
+                        break crate::ast::tree::import::import_alias_path(
+                            &i.names.first()?.name,
+                            options,
+                        );
                     }
                     Some(SymbolTableNode::ImportFrom(i)) => {
                         let mut path = i.resolved_module_path(options);
@@ -5936,15 +5930,7 @@ fn resolve_alias_typeinfo_inner(
                     // urllib3's ConnectionPool.pool): a boxed value.
                     if let Some(crate::SymbolTableNode::Import(i)) = symbols.get(&module.id)
                         && !options.module_defs.contains_key(
-                            &i.names
-                                .first()
-                                .map(|al| {
-                                    al.name
-                                        .split('.')
-                                        .map(|s| s.to_string())
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default(),
+                            &i.first_module_path(options),
                         )
                     {
                         return Some(TypeInfo::PyValue);

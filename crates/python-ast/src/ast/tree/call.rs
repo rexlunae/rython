@@ -8003,19 +8003,18 @@ impl<'a> CodeGen for Call {
         // api.py, `from . import sessions`): the module-path call must
         // lower to the class constructor `Session::new(args)?`, not
         // `sessions::Session(args)` (E0423 — a struct used as a value).
+        // The module may be bound by either spelling — `from . import
+        // sessions as s`, or the absolute `import absimp.cases as cases` /
+        // `from absimp import cases` naming the package's own module
+        // (issue #532) — so the binding resolves through the one authority.
         if let ExprType::Attribute(attr) = self.func.as_ref()
             && let ExprType::Name(receiver) = attr.value.as_ref()
             && !crate::module_name_shadowed(&receiver.id, &symbols)
-            && let Some(crate::SymbolTableNode::ImportFrom(ifm)) = symbols.get(&receiver.id)
-            && ifm.level > 0
+            && let Some(mod_path) =
+                crate::ast::tree::module::crate_module_bound_to(&receiver.id, &symbols, &options)
         {
-            let mut mod_path = ifm.resolved_module_path(&options);
-            // The submodule the import names (`from . import sessions as s`
-            // binds `s` to `sessions`).
-            mod_path.push(ifm.defining_name(&receiver.id));
-            if options.module_defs.contains_key(&mod_path)
-                && let Some((class, class_symbols)) =
-                    crate::module_class_def(&options, &mod_path, &attr.attr)
+            if let Some((class, class_symbols)) =
+                crate::module_class_def(&options, &mod_path, &attr.attr)
             {
                 class.refuse_manual_testcase_construction(&class_symbols, &options)?;
                 // The FULL crate path: `sessions.Session()` renders as
@@ -13716,6 +13715,13 @@ pub(crate) fn module_path_of(
         match symbols.get(&current) {
             Some(crate::SymbolTableNode::Alias(canonical)) => {
                 current = canonical.clone();
+            }
+            // A name an `import` binds (`import absimp.cases as cases`, or
+            // the package root an unaliased `import absimp.helper` binds —
+            // issue #532): the crate module it names, through the one
+            // authority; None for a module outside the crate.
+            Some(crate::SymbolTableNode::Import(_)) => {
+                return crate::ast::tree::module::crate_module_bound_to(&n.id, symbols, options);
             }
             Some(crate::SymbolTableNode::ImportFrom(ifm)) => {
                 let mut path = ifm.resolved_module_path(options);
