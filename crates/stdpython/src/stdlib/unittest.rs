@@ -2,14 +2,149 @@
 //!
 //! This is the foundation of rython's `unittest` support. The runner's
 //! job — discover the module's `*TestCase` classes, run each `test_*`
-//! method, and report — is emitted per-module by codegen (it is the only
-//! site that knows the concrete test classes and their methods), so the
-//! runtime surface here is deliberately small.
+//! method and its subtests, and report — is emitted per-module by codegen
+//! (it is the only site that knows the concrete test classes and their
+//! methods), so the runtime surface here is deliberately small.
 //!
 //! Until codegen wires a real runner for a module, `main()` returns a
 //! LOUD error (never a silent pass): a test module whose `unittest.main()`
 //! is not yet lowered by codegen must not pretend its tests ran.
 use crate::{PyException, PyValue, Truthy};
+use std::cell::RefCell;
+
+#[derive(Default)]
+struct SubtestState {
+    context: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>,
+    failures: alloc::vec::Vec<(alloc::string::String, PyException)>,
+    expecting_failure: bool,
+}
+
+std::thread_local! {
+    static SUBTEST_STATE: RefCell<Option<SubtestState>> = const { RefCell::new(None) };
+}
+
+fn format_subtest_context(
+    params: &[(alloc::string::String, alloc::string::String)],
+) -> alloc::string::String {
+    if params.is_empty() {
+        return "(<subtest>)".into();
+    }
+    let values = params
+        .iter()
+        .map(|(name, value)| alloc::format!("{name}={value}"))
+        .collect::<alloc::vec::Vec<_>>()
+        .join(", ");
+    alloc::format!("({values})")
+}
+
+/// Run a subtest body and record its exception while allowing the containing
+/// test method to continue. Outside the emitted unittest runner, the
+/// exception propagates normally.
+pub fn run_subtest<F>(
+    context: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>,
+    run: F,
+) -> Result<(), PyException>
+where
+    F: FnOnce() -> Result<(), PyException>,
+{
+    let Some(previous_context) = SUBTEST_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(active) = state.as_mut() else {
+            return None;
+        };
+        let previous = active.context.clone();
+        let mut merged = context;
+        for (name, value) in previous.iter() {
+            if !merged.iter().any(|(existing, _)| existing == name) {
+                merged.push((name.clone(), value.clone()));
+            }
+        }
+        active.context = merged;
+        Some(previous)
+    }) else {
+        return run();
+    };
+
+    let result = run();
+    let mut stop_method = false;
+    SUBTEST_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if let Some(active) = state.as_mut() {
+            let context = format_subtest_context(&active.context);
+            active.context = previous_context;
+            if let Err(exception) = result {
+                // Nested contexts propagate unittest's private stop signal,
+                // without recording a second failure for the outer context.
+                if active.expecting_failure && exception.exception_type == "_ShouldStop" {
+                    stop_method = true;
+                    return;
+                }
+                stop_method = active.expecting_failure;
+                if !active.expecting_failure {
+                    status_char(
+                        if exception.matches_builtin(
+                            crate::builtin_exceptions::BuiltinException::AssertionError,
+                        ) {
+                            'F'
+                        } else {
+                            'E'
+                        },
+                    );
+                }
+                active.failures.push((context, exception));
+            }
+        }
+    });
+    if stop_method {
+        // CPython uses _ShouldStop(Exception), not the user's AssertionError:
+        // finally runs, but an except AssertionError cannot resume the method.
+        Err(PyException::new("_ShouldStop", ""))
+    } else {
+        Ok(())
+    }
+}
+
+fn subtest_description(description: &str, context: &str) -> alloc::string::String {
+    let (identifier, doc) = description.split_once('\n').unwrap_or((description, ""));
+    let mut result = if context.is_empty() {
+        identifier.to_string()
+    } else {
+        alloc::format!("{identifier} {context}")
+    };
+    if !doc.is_empty() {
+        result.push('\n');
+        result.push_str(doc);
+    }
+    result
+}
+
+fn begin_subtests() -> Option<SubtestState> {
+    SUBTEST_STATE.with(|state| state.replace(Some(SubtestState::default())))
+}
+
+fn take_subtest_failures() -> alloc::vec::Vec<(alloc::string::String, PyException)> {
+    SUBTEST_STATE.with(|state| {
+        state
+            .borrow_mut()
+            .as_mut()
+            .map(|active| core::mem::take(&mut active.failures))
+            .unwrap_or_default()
+    })
+}
+
+fn expect_subtest_failure(expected: bool) {
+    SUBTEST_STATE.with(|state| {
+        if let Some(active) = state.borrow_mut().as_mut() {
+            active.expecting_failure = expected;
+        }
+    });
+}
+
+fn finish_subtests(previous: Option<SubtestState>) {
+    SUBTEST_STATE.with(|state| {
+        let _ = state.replace(previous);
+    })
+}
 
 /// Box a lowered Python LIST (`Vec<T>`) as `PyValue::Tuple` — the boxed
 /// model's documented list-as-tuple divergence — for the assert helpers.
@@ -563,7 +698,8 @@ const SEPARATOR2: &str =
 
 /// CPython's `TextTestResult` and `TextTestRunner.run` at the default
 /// verbosity (issue #334, Phase 3): a status character per test as it
-/// finishes (`.` `F` `E` `s` `x` `u`), then the error and failure blocks,
+/// finishes (`.` `F` `E` `s` `x` `u`; subtest failures each report `F`/`E`),
+/// then the error and failure blocks,
 /// the `Ran N tests in T.TTTs` line and the `OK` / `FAILED (...)` /
 /// `NO TESTS RAN` summary — all on stderr, as `unittest.main()` writes
 /// them. The emitted runner (python-ast's `emit_test_runner`) reports
@@ -622,7 +758,7 @@ impl TextTestResult {
 
     /// Run one test the way `TestCase.run` does: `setUp`, then the test
     /// (only when `setUp` succeeded), then `tearDown` (likewise). Every
-    /// part's exception is reported as it happens — a failure when it is
+    /// part's exception is reported — a failure when it is
     /// an `AssertionError` (`failureException`), an error otherwise —
     /// except the test part's under `@expectedFailure`, which is the
     /// expected outcome. The test counts as a success (or, expecting
@@ -637,13 +773,40 @@ impl TextTestResult {
         tear_down: impl FnOnce(&mut T) -> Result<(), PyException>,
     ) {
         self.tests_run += 1;
-        if let Err(e) = set_up(case) {
+        let previous_subtests = begin_subtests();
+        let setup_result = set_up(case);
+        let setup_subtest_failures = take_subtest_failures();
+        for (context, exception) in &setup_subtest_failures {
+            let subtest_description = subtest_description(description, &context);
+            self.record_exception(&subtest_description, exception);
+        }
+        if let Err(e) = setup_result {
+            finish_subtests(previous_subtests);
             self.add_exception(description, &e);
+            return;
+        }
+        if !setup_subtest_failures.is_empty() {
+            finish_subtests(previous_subtests);
             return;
         }
         let mut success = true;
         let mut expected_failure = false;
-        if let Err(e) = test(case) {
+        expect_subtest_failure(expecting_failure);
+        let test_result = test(case);
+        expect_subtest_failure(false);
+        let subtest_failures = take_subtest_failures();
+        if !subtest_failures.is_empty() {
+            if expecting_failure {
+                expected_failure = true;
+            } else {
+                success = false;
+                for (context, exception) in subtest_failures {
+                    let subtest_description = subtest_description(description, &context);
+                    self.record_exception(&subtest_description, &exception);
+                }
+            }
+        }
+        if let Err(e) = test_result {
             if expecting_failure {
                 expected_failure = true;
             } else {
@@ -651,7 +814,14 @@ impl TextTestResult {
                 self.add_exception(description, &e);
             }
         }
-        if let Err(e) = tear_down(case) {
+        let tear_down_result = tear_down(case);
+        for (context, exception) in take_subtest_failures() {
+            let subtest_description = subtest_description(description, &context);
+            success = false;
+            self.record_exception(&subtest_description, &exception);
+        }
+        finish_subtests(previous_subtests);
+        if let Err(e) = tear_down_result {
             success = false;
             self.add_exception(description, &e);
         }
@@ -670,16 +840,25 @@ impl TextTestResult {
     }
 
     fn add_exception(&mut self, description: &str, e: &PyException) {
+        self.record_exception(description, e);
+        status_char(
+            if e.matches_builtin(crate::builtin_exceptions::BuiltinException::AssertionError) {
+                'F'
+            } else {
+                'E'
+            },
+        );
+    }
+
+    fn record_exception(&mut self, description: &str, e: &PyException) {
         let traceback = alloc::format!(
             "Traceback (most recent call last):\n{}\n",
             e.format_exception_only()
         );
         if e.matches_builtin(crate::builtin_exceptions::BuiltinException::AssertionError) {
             self.failures.push((description.into(), traceback));
-            status_char('F');
         } else {
             self.errors.push((description.into(), traceback));
-            status_char('E');
         }
     }
 

@@ -14489,6 +14489,62 @@ fn unittest_main_prints_cpythons_report() {
 }
 
 #[test]
+fn unittest_subtests_record_failures_and_continue() {
+    let (stdout, stderr, code) = unittest_run(
+        "ut_subtests",
+        concat!(
+            "import unittest\n",
+            "\n",
+            "\n",
+            "class T(unittest.TestCase):\n",
+            "    @unittest.expectedFailure\n",
+            "    def test_expected_subtest(self):\n",
+            "        with self.subTest(step=10):\n",
+            "            self.assertEqual(1, 2)\n",
+            "\n",
+            "    def test_subtests(self):\n",
+            "        for i in range(3):\n",
+            "            with self.subTest(group=\"all\"):\n",
+            "                with self.subTest(step=i):\n",
+            "                    print(\"ran\", i)\n",
+            "                    self.assertEqual(i, 1)\n",
+            "\n",
+            "\n",
+            "if __name__ == \"__main__\":\n",
+            "    unittest.main()\n",
+        ),
+    );
+    // Verified against python3: stdout is `ran 0/1/2`; stderr has two
+    // subtest-specific failures plus one expected-failure status, while
+    // `Ran` counts methods, not subtests.
+    // The traceback frame lines are omitted per the no-frames entry in §12.
+    assert_eq!(stdout, "ran 0\nran 1\nran 2\n");
+    assert_eq!(
+        stderr,
+        concat!(
+            "xFF\n",
+            "======================================================================\n",
+            "FAIL: test_subtests (__main__.T.test_subtests) (step=0, group='all')\n",
+            "----------------------------------------------------------------------\n",
+            "Traceback (most recent call last):\n",
+            "AssertionError: 0 != 1\n",
+            "\n",
+            "======================================================================\n",
+            "FAIL: test_subtests (__main__.T.test_subtests) (step=2, group='all')\n",
+            "----------------------------------------------------------------------\n",
+            "Traceback (most recent call last):\n",
+            "AssertionError: 2 != 1\n",
+            "\n",
+            "----------------------------------------------------------------------\n",
+            "Ran 2 tests in T\n",
+            "\n",
+            "FAILED (failures=2, expected failures=1)",
+        )
+    );
+    assert_eq!(code, 1);
+}
+
+#[test]
 fn unittest_main_exit_false_returns_and_a_blank_docstring_adds_no_line() {
     // Devin review on #476. `unittest.main(exit=False)` prints the report
     // and RETURNS, so the statement after it runs; a whitespace-only
@@ -25549,6 +25605,16 @@ fn unittest_class_fixture_assertions_are_errors_and_failed_alias_setup_is_not_re
     // Verified against python3; source traceback frames are the §12 model boundary.
     assert_eq!(stdout, "setup assertion\ntest\nteardown assertion\n");
     assert_eq!(stderr, "E.E\n======================================================================\nERROR: setUpClass (__main__.A)\n----------------------------------------------------------------------\nTraceback (most recent call last):\nAssertionError: setup broken\n\n======================================================================\nERROR: tearDownClass (__main__.B)\n----------------------------------------------------------------------\nTraceback (most recent call last):\nAssertionError: teardown broken\n\n----------------------------------------------------------------------\nRan 1 test in T\n\nFAILED (errors=2)");
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn unittest_subtest_expected_abort_setup_failure_and_docstring_match_cpython() {
+    let (stdout, stderr, code) = unittest_run("ut_subtest_review",
+        include_str!("fixtures/subtest_review.py"));
+    // Verified against python3. Traceback source frames are the §12 model boundary.
+    assert_eq!(stdout, "finally expected\nexpected teardown\nafter setup\n");
+    assert_eq!(stderr, "xFFF\n======================================================================\nFAIL: test_never (__main__.B.test_never) (n=3)\n----------------------------------------------------------------------\nTraceback (most recent call last):\nAssertionError: 1 != 2\n\n======================================================================\nFAIL: test_documented (__main__.C.test_documented) (n=4)\nDocumented test.\n----------------------------------------------------------------------\nTraceback (most recent call last):\nAssertionError: 1 != 2\n\n======================================================================\nFAIL: test_empty (__main__.D.test_empty) (<subtest>)\n----------------------------------------------------------------------\nTraceback (most recent call last):\nAssertionError: 1 != 2\n\n----------------------------------------------------------------------\nRan 4 tests in T\n\nFAILED (failures=3, expected failures=1)");
     assert_eq!(code, 1);
 }
 
