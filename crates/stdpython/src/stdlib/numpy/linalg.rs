@@ -368,7 +368,6 @@ pub fn solve(a: NdArray, b: NdArray) -> Result<NdArray, PyException> {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Blocked FMA matmul kernel (the 2-D·2-D fast path).
 // ---------------------------------------------------------------------------
@@ -586,71 +585,72 @@ mod fast_kernel_neon {
                 let nmb = rows.div_ceil(4);
                 let mut chunk = vec![0.0f64; rows * n];
                 unsafe {
-                for jb in (0..n).step_by(NB) {
-                    let jw = (jb + NB).min(n) - jb;
-                    // k-blocking: accumulate into the C chunk in KB-deep
-                    // passes (each out element's p order stays ascending).
-                    for kb in (0..k).step_by(KB) {
-                        let kw = (kb + KB).min(k) - kb;
-                        for mb in 0..nmb {
-                            let r0 = mb * 4;
-                            let nr = (r0 + 4).min(rows) - r0;
-                            for jt in (0..jw).step_by(8) {
-                                let jend = (jt + 8).min(jw);
-                                let nv = (jend - jt) / 2; // full 2-col vectors
-                                // 8 accumulator vectors: 4 rows × 2 cols.
-                                let mut acc = [[vdupq_n_f64(0.0); 4]; 4];
-                                if kb > 0 {
+                    for jb in (0..n).step_by(NB) {
+                        let jw = (jb + NB).min(n) - jb;
+                        // k-blocking: accumulate into the C chunk in KB-deep
+                        // passes (each out element's p order stays ascending).
+                        for kb in (0..k).step_by(KB) {
+                            let kw = (kb + KB).min(k) - kb;
+                            for mb in 0..nmb {
+                                let r0 = mb * 4;
+                                let nr = (r0 + 4).min(rows) - r0;
+                                for jt in (0..jw).step_by(8) {
+                                    let jend = (jt + 8).min(jw);
+                                    let nv = (jend - jt) / 2; // full 2-col vectors
+                                    // 8 accumulator vectors: 4 rows × 2 cols.
+                                    let mut acc = [[vdupq_n_f64(0.0); 4]; 4];
+                                    if kb > 0 {
+                                        for r in 0..nr {
+                                            for vi in 0..nv {
+                                                acc[r][vi] = vld1q_f64(
+                                                    chunk
+                                                        .as_ptr()
+                                                        .add((r0 + r) * n + jb + jt + vi * 2),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    for p in kb..kb + kw {
+                                        let a01 = vld1q_f64(packed_a.as_ptr().add(p * MR + r0));
+                                        let a23 = vld1q_f64(packed_a.as_ptr().add(p * MR + r0 + 2));
+                                        for vi in 0..nv {
+                                            let bv = vld1q_f64(
+                                                packed_b.as_ptr().add(p * n + jb + jt + vi * 2),
+                                            );
+                                            // vfmaq_laneq_f64::<L>(r, a, b) is
+                                            // r[i] + a[i] * b[L]: the B vector is
+                                            // element-wise, the A vector's LANE
+                                            // selects the row multiplier.
+                                            acc[0][vi] = vfmaq_laneq_f64::<0>(acc[0][vi], bv, a01);
+                                            acc[1][vi] = vfmaq_laneq_f64::<1>(acc[1][vi], bv, a01);
+                                            acc[2][vi] = vfmaq_laneq_f64::<0>(acc[2][vi], bv, a23);
+                                            acc[3][vi] = vfmaq_laneq_f64::<1>(acc[3][vi], bv, a23);
+                                        }
+                                    }
                                     for r in 0..nr {
                                         for vi in 0..nv {
-                                            acc[r][vi] = vld1q_f64(
-                                                chunk.as_ptr()
+                                            vst1q_f64(
+                                                chunk
+                                                    .as_mut_ptr()
                                                     .add((r0 + r) * n + jb + jt + vi * 2),
+                                                acc[r][vi],
                                             );
                                         }
-                                    }
-                                }
-                                for p in kb..kb + kw {
-                                    let a01 = vld1q_f64(packed_a.as_ptr().add(p * MR + r0));
-                                    let a23 =
-                                        vld1q_f64(packed_a.as_ptr().add(p * MR + r0 + 2));
-                                    for vi in 0..nv {
-                                        let bv = vld1q_f64(
-                                            packed_b.as_ptr().add(p * n + jb + jt + vi * 2),
-                                        );
-                                        // vfmaq_laneq_f64::<L>(r, a, b) is
-                                        // r[i] + a[i] * b[L]: the B vector is
-                                        // element-wise, the A vector's LANE
-                                        // selects the row multiplier.
-                                        acc[0][vi] = vfmaq_laneq_f64::<0>(acc[0][vi], bv, a01);
-                                        acc[1][vi] = vfmaq_laneq_f64::<1>(acc[1][vi], bv, a01);
-                                        acc[2][vi] = vfmaq_laneq_f64::<0>(acc[2][vi], bv, a23);
-                                        acc[3][vi] = vfmaq_laneq_f64::<1>(acc[3][vi], bv, a23);
-                                    }
-                                }
-                                for r in 0..nr {
-                                    for vi in 0..nv {
-                                        vst1q_f64(
-                                            chunk.as_mut_ptr()
-                                                .add((r0 + r) * n + jb + jt + vi * 2),
-                                            acc[r][vi],
-                                        );
-                                    }
-                                    // Scalar tail for the 0-1 trailing column.
-                                    if (jend - jt) % 2 == 1 {
-                                        let c = jend - 1;
-                                        let mut sv = chunk[(r0 + r) * n + jb + c];
-                                        for p in kb..kb + kw {
-                                            sv += packed_a[p * MR + r0 + r]
-                                                * packed_b[p * n + jb + c];
+                                        // Scalar tail for the 0-1 trailing column.
+                                        if (jend - jt) % 2 == 1 {
+                                            let c = jend - 1;
+                                            let mut sv = chunk[(r0 + r) * n + jb + c];
+                                            for p in kb..kb + kw {
+                                                sv += packed_a[p * MR + r0 + r]
+                                                    * packed_b[p * n + jb + c];
+                                            }
+                                            chunk[(r0 + r) * n + jb + c] = sv;
                                         }
-                                        chunk[(r0 + r) * n + jb + c] = sv;
                                     }
                                 }
                             }
                         }
                     }
-                }
                 }
                 chunk
             })
@@ -696,17 +696,17 @@ mod matmul_kernel_tests {
         for &(m, k, n) in &[
             (1usize, 1usize, 1usize),
             (4, 4, 4),
-            (7, 5, 9),    // tail micro-block
+            (7, 5, 9), // tail micro-block
             (8, 8, 8),
             (24, 24, 24), // one full panel
             (25, 7, 13),  // panel + tail, non-square
             (3, 9, 5),
-            (30, 300, 40),  // k > KB (exercises the k-block seam)
-            (5, 300, 600),  // n > NB (exercises the j-block stride)
+            (30, 300, 40),   // k > KB (exercises the k-block seam)
+            (5, 300, 600),   // n > NB (exercises the j-block stride)
             (25, 1024, 512), // both seams at once
-            (2, 3, 6),    // n % 4 == 2: the x86 column tail
-            (9, 4, 7),    // n % 4 == 3, partial micro-block
-            (48, 16, 1),  // n < 4: tail only, two panels
+            (2, 3, 6),       // n % 4 == 2: the x86 column tail
+            (9, 4, 7),       // n % 4 == 3, partial micro-block
+            (48, 16, 1),     // n < 4: tail only, two panels
         ] {
             let x: Vec<f64> = (0..m * k).map(|i| ((i * 7) % 13) as f64 - 3.0).collect();
             let y: Vec<f64> = (0..k * n).map(|i| ((i * 5) % 11) as f64 - 2.0).collect();
@@ -715,7 +715,8 @@ mod matmul_kernel_tests {
             assert_eq!(got.len(), want.len(), "{m}x{k}x{n}");
             for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
                 assert_eq!(
-                    g, w,
+                    g,
+                    w,
                     "matmul {m}x{k}x{n} element {i} (row {}, col {}): got {g}, want {w}",
                     i / n,
                     i % n

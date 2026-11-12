@@ -1,11 +1,11 @@
 //! Python datetime module implementation
-//! 
+//!
 //! This module provides classes for manipulating dates and times.
 //! Implementation matches Python's datetime module API.
 
 use crate::PyException;
-use std::time::{SystemTime, Duration, UNIX_EPOCH};
 use std::fmt;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // Days in each month (non-leap year)
 const DAYS_IN_MONTH: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
@@ -25,28 +25,36 @@ impl date {
         if !(1..=12).contains(&month) {
             return Err(crate::value_error("month must be in 1..12"));
         }
-        
-        let max_day = if month == 2 && is_leap_year(year) { 29 } else { DAYS_IN_MONTH[month as usize - 1] };
-        
+
+        let max_day = if month == 2 && is_leap_year(year) {
+            29
+        } else {
+            DAYS_IN_MONTH[month as usize - 1]
+        };
+
         if !(1..=max_day).contains(&day) {
             return Err(crate::value_error(format!("day must be in 1..{}", max_day)));
         }
-        
+
         Ok(Self { year, month, day })
     }
-    
+
     /// Get today's date in LOCAL time, like Python's date.today() (via
     /// localtime on unix; non-unix hosts fall back to UTC). The old
     /// implementation decomposed UTC seconds directly, which was off by a
     /// day for any timezone whose local date differs from UTC (issue #82).
     pub fn today() -> Self {
         let now = SystemTime::now();
-        let duration = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0));
+        let duration = now
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0));
         datetime::from_unix_local(duration.as_secs() as i64, duration.subsec_micros())
-            .unwrap_or_else(|_| datetime::from_unix_utc(duration.as_secs() as i64, duration.subsec_micros()))
+            .unwrap_or_else(|_| {
+                datetime::from_unix_utc(duration.as_secs() as i64, duration.subsec_micros())
+            })
             .date_component()
     }
-    
+
     /// Create date from ordinal day
     pub fn fromordinal(ordinal: i64) -> Result<Self, PyException> {
         if ordinal < 1 {
@@ -58,23 +66,23 @@ impl date {
         check_year(d.year)?;
         Ok(d)
     }
-    
+
     /// Convert to ordinal day
     pub fn toordinal(&self) -> i64 {
         date_to_days(*self)
     }
-    
+
     /// Get weekday (0=Monday, 6=Sunday)
     pub fn weekday(&self) -> u32 {
         // Ordinal 1 (0001-01-01) is a Monday, so subtract 1 before the mod.
         ((self.toordinal() - 1).rem_euclid(7)) as u32
     }
-    
+
     /// Get ISO weekday (1=Monday, 7=Sunday)
     pub fn isoweekday(&self) -> u32 {
         self.weekday() + 1
     }
-    
+
     /// Get ISO calendar (year, week, weekday). ISO weeks start on a
     /// Monday and week 1 is the one containing the first Thursday, so
     /// early-January and late-December dates can belong to the
@@ -93,29 +101,38 @@ impl date {
         // Computed from ordinals (not date::new) because a late-December
         // date near MAXYEAR can have iso_year == 10000, which is out of
         // the validated range (issue #82).
-        let jan4_ordinal = date_to_days(date { year: iso_year, month: 1, day: 4 });
+        let jan4_ordinal = date_to_days(date {
+            year: iso_year,
+            month: 1,
+            day: 4,
+        });
         let jan4_weekday = (jan4_ordinal - 1).rem_euclid(7); // 0 = Monday
         let week1_monday = jan4_ordinal - jan4_weekday;
         let week = ((week_monday - week1_monday) / 7 + 1) as u32;
         (iso_year, week, self.isoweekday())
     }
-    
+
     /// Format as ISO string
     pub fn isoformat(&self) -> String {
         format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
     }
-    
+
     /// Format with strftime
     pub fn strftime(&self, fmt: &str) -> String {
         strftime_pass(fmt, Some(*self), None)
     }
-    
+
     /// Replace components
-    pub fn replace(&self, year: Option<i32>, month: Option<u32>, day: Option<u32>) -> Result<Self, PyException> {
+    pub fn replace(
+        &self,
+        year: Option<i32>,
+        month: Option<u32>,
+        day: Option<u32>,
+    ) -> Result<Self, PyException> {
         Self::new(
             year.unwrap_or(self.year),
             month.unwrap_or(self.month),
-            day.unwrap_or(self.day)
+            day.unwrap_or(self.day),
         )
     }
 }
@@ -137,7 +154,12 @@ pub struct time {
 
 impl time {
     /// Create a new time
-    pub fn new(hour: u32, minute: u32, second: Option<u32>, microsecond: Option<u32>) -> Result<Self, PyException> {
+    pub fn new(
+        hour: u32,
+        minute: u32,
+        second: Option<u32>,
+        microsecond: Option<u32>,
+    ) -> Result<Self, PyException> {
         if hour >= 24 {
             return Err(crate::value_error("hour must be in 0..23"));
         }
@@ -152,10 +174,15 @@ impl time {
         if microsecond >= 1_000_000 {
             return Err(crate::value_error("microsecond must be in 0..999999"));
         }
-        
-        Ok(Self { hour, minute, second, microsecond })
+
+        Ok(Self {
+            hour,
+            minute,
+            second,
+            microsecond,
+        })
     }
-    
+
     /// Format as ISO string
     pub fn isoformat(&self, timespec: Option<&str>) -> String {
         match timespec {
@@ -166,24 +193,33 @@ impl time {
                 if self.microsecond == 0 {
                     format!("{:02}:{:02}:{:02}", self.hour, self.minute, self.second)
                 } else {
-                    format!("{:02}:{:02}:{:02}.{:06}", self.hour, self.minute, self.second, self.microsecond)
+                    format!(
+                        "{:02}:{:02}:{:02}.{:06}",
+                        self.hour, self.minute, self.second, self.microsecond
+                    )
                 }
             }
         }
     }
-    
+
     /// Format with strftime
     pub fn strftime(&self, fmt: &str) -> String {
         strftime_pass(fmt, None, Some(*self))
     }
-    
+
     /// Replace components
-    pub fn replace(&self, hour: Option<u32>, minute: Option<u32>, second: Option<u32>, microsecond: Option<u32>) -> Result<Self, PyException> {
+    pub fn replace(
+        &self,
+        hour: Option<u32>,
+        minute: Option<u32>,
+        second: Option<u32>,
+        microsecond: Option<u32>,
+    ) -> Result<Self, PyException> {
         Self::new(
             hour.unwrap_or(self.hour),
             minute.unwrap_or(self.minute),
             Some(second.unwrap_or(self.second)),
-            Some(microsecond.unwrap_or(self.microsecond))
+            Some(microsecond.unwrap_or(self.microsecond)),
         )
     }
 }
@@ -211,15 +247,17 @@ pub struct datetime {
 
 impl datetime {
     /// Create a new datetime
-    pub fn new(year: i32, month: u32, day: u32, hour: Option<u32>, minute: Option<u32>, 
-               second: Option<u32>, microsecond: Option<u32>) -> Result<Self, PyException> {
+    pub fn new(
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: Option<u32>,
+        minute: Option<u32>,
+        second: Option<u32>,
+        microsecond: Option<u32>,
+    ) -> Result<Self, PyException> {
         let date = date::new(year, month, day)?;
-        let time = time::new(
-            hour.unwrap_or(0),
-            minute.unwrap_or(0),
-            second,
-            microsecond
-        )?;
+        let time = time::new(hour.unwrap_or(0), minute.unwrap_or(0), second, microsecond)?;
         Ok(Self::from_parts(date, time))
     }
 
@@ -234,12 +272,14 @@ impl datetime {
             microsecond: time.microsecond,
         }
     }
-    
+
     /// Get current datetime in LOCAL time, like Python's datetime.now()
     /// (via localtime on unix; non-unix hosts fall back to UTC).
     pub fn now() -> Self {
         let now = SystemTime::now();
-        let duration = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0));
+        let duration = now
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0));
         let micros = duration.subsec_micros();
         Self::from_unix_local(duration.as_secs() as i64, micros)
             .unwrap_or_else(|_| Self::from_unix_utc(duration.as_secs() as i64, micros))
@@ -249,7 +289,9 @@ impl datetime {
     /// alias of now() (which is local time).
     pub fn utcnow() -> Self {
         let now = SystemTime::now();
-        let duration = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0));
+        let duration = now
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0));
         Self::from_unix_utc(duration.as_secs() as i64, duration.subsec_micros())
     }
 
@@ -299,7 +341,9 @@ impl datetime {
     /// Negative timestamps (pre-1970) are valid.
     pub fn fromtimestamp(timestamp: f64) -> Result<Self, PyException> {
         if !timestamp.is_finite() {
-            return Err(crate::value_error("Invalid value NaN or Infinity for timestamp"));
+            return Err(crate::value_error(
+                "Invalid value NaN or Infinity for timestamp",
+            ));
         }
         let secs = timestamp.floor();
         let micros = ((timestamp - secs) * 1_000_000.0).round() as u32;
@@ -358,12 +402,11 @@ impl datetime {
 
     fn unix_seconds_utc(&self) -> i64 {
         let days_since_epoch = self.date_component().toordinal() - 719163;
-        let seconds_since_midnight = self.hour as i64 * 3600
-            + self.minute as i64 * 60
-            + self.second as i64;
+        let seconds_since_midnight =
+            self.hour as i64 * 3600 + self.minute as i64 * 60 + self.second as i64;
         days_since_epoch * 86400 + seconds_since_midnight
     }
-    
+
     /// Get date component
     pub fn date_component(&self) -> date {
         date {
@@ -372,7 +415,7 @@ impl datetime {
             day: self.day,
         }
     }
-    
+
     /// Get time component
     pub fn time_component(&self) -> time {
         time {
@@ -392,24 +435,42 @@ impl datetime {
     pub fn time(&self) -> time {
         self.time_component()
     }
-    
+
     /// Format as ISO string
     pub fn isoformat(&self, sep: Option<char>, timespec: Option<&str>) -> String {
         let sep = sep.unwrap_or('T');
-        format!("{}{}{}", self.date_component().isoformat(), sep, self.time_component().isoformat(timespec))
+        format!(
+            "{}{}{}",
+            self.date_component().isoformat(),
+            sep,
+            self.time_component().isoformat(timespec)
+        )
     }
-    
+
     /// Format with strftime
     pub fn strftime(&self, fmt: &str) -> String {
-        strftime_pass(fmt, Some(self.date_component()), Some(self.time_component()))
+        strftime_pass(
+            fmt,
+            Some(self.date_component()),
+            Some(self.time_component()),
+        )
     }
-    
+
     /// Replace components
-    pub fn replace(&self, year: Option<i32>, month: Option<u32>, day: Option<u32>,
-                   hour: Option<u32>, minute: Option<u32>, second: Option<u32>, 
-                   microsecond: Option<u32>) -> Result<Self, PyException> {
+    pub fn replace(
+        &self,
+        year: Option<i32>,
+        month: Option<u32>,
+        day: Option<u32>,
+        hour: Option<u32>,
+        minute: Option<u32>,
+        second: Option<u32>,
+        microsecond: Option<u32>,
+    ) -> Result<Self, PyException> {
         let new_date = self.date_component().replace(year, month, day)?;
-        let new_time = self.time_component().replace(hour, minute, second, microsecond)?;
+        let new_time = self
+            .time_component()
+            .replace(hour, minute, second, microsecond)?;
         Ok(Self::from_parts(new_date, new_time))
     }
 }
@@ -432,13 +493,19 @@ pub struct timedelta {
 
 impl timedelta {
     /// Create a new timedelta
-    pub fn new(days: Option<i64>, seconds: Option<i64>, microseconds: Option<i64>,
-               milliseconds: Option<i64>, minutes: Option<i64>, hours: Option<i64>,
-               weeks: Option<i64>) -> Self {
+    pub fn new(
+        days: Option<i64>,
+        seconds: Option<i64>,
+        microseconds: Option<i64>,
+        milliseconds: Option<i64>,
+        minutes: Option<i64>,
+        hours: Option<i64>,
+        weeks: Option<i64>,
+    ) -> Self {
         let mut total_days = days.unwrap_or(0);
         let mut total_seconds = seconds.unwrap_or(0);
         let mut total_microseconds = microseconds.unwrap_or(0);
-        
+
         if let Some(ms) = milliseconds {
             total_microseconds += ms * 1000;
         }
@@ -451,7 +518,7 @@ impl timedelta {
         if let Some(wk) = weeks {
             total_days += wk * 7;
         }
-        
+
         // Normalize
         if total_microseconds >= 1_000_000 {
             total_seconds += total_microseconds / 1_000_000;
@@ -460,7 +527,7 @@ impl timedelta {
             total_seconds += (total_microseconds - 999_999) / 1_000_000;
             total_microseconds = ((total_microseconds % 1_000_000) + 1_000_000) % 1_000_000;
         }
-        
+
         if total_seconds >= 86400 {
             total_days += total_seconds / 86400;
             total_seconds %= 86400;
@@ -468,14 +535,14 @@ impl timedelta {
             total_days += (total_seconds - 86399) / 86400;
             total_seconds = ((total_seconds % 86400) + 86400) % 86400;
         }
-        
+
         Self {
             days: total_days,
             seconds: total_seconds,
             microseconds: total_microseconds,
         }
     }
-    
+
     /// Get total seconds
     pub fn total_seconds(&self) -> f64 {
         self.days as f64 * 86400.0 + self.seconds as f64 + self.microseconds as f64 / 1_000_000.0
@@ -484,7 +551,8 @@ impl timedelta {
     /// Total duration in microseconds — the exact integer form the
     /// datetime operators compute with.
     fn total_micros(&self) -> i128 {
-        self.days as i128 * 86_400_000_000 + self.seconds as i128 * 1_000_000
+        self.days as i128 * 86_400_000_000
+            + self.seconds as i128 * 1_000_000
             + self.microseconds as i128
     }
 
@@ -551,8 +619,7 @@ impl core::ops::Sub<timedelta> for date {
 impl datetime {
     fn total_micros(&self) -> i128 {
         self.date_component().toordinal() as i128 * 86_400_000_000
-            + (self.hour as i128 * 3600 + self.minute as i128 * 60
-                + self.second as i128)
+            + (self.hour as i128 * 3600 + self.minute as i128 * 60 + self.second as i128)
                 * 1_000_000
             + self.microsecond as i128
     }
@@ -742,9 +809,9 @@ impl datetime {
                 }
                 return Err(mismatch());
             }
-            let directive = fmt.next().ok_or_else(|| {
-                crate::value_error(format!("stray %% in format '{}'", format))
-            })?;
+            let directive = fmt
+                .next()
+                .ok_or_else(|| crate::value_error(format!("stray %% in format '{}'", format)))?;
             match directive {
                 '%' => {
                     if pos < input.len() && input[pos] == '%' {
@@ -794,7 +861,11 @@ impl datetime {
                     let full = directive == 'A';
                     let mut consumed = None;
                     for w in 0..7u32 {
-                        let name = if full { weekday_name(w) } else { weekday_abbr(w) };
+                        let name = if full {
+                            weekday_name(w)
+                        } else {
+                            weekday_abbr(w)
+                        };
                         let n = name.chars().count();
                         let matches = input[pos..]
                             .iter()
@@ -813,10 +884,7 @@ impl datetime {
                     // LONGEST digit prefix (up to 3) that stays in range:
                     // "367" matches "36" and leaves "7" unconverted.
                     let mut len = 0usize;
-                    while pos + len < input.len()
-                        && len < 3
-                        && input[pos + len].is_ascii_digit()
-                    {
+                    while pos + len < input.len() && len < 3 && input[pos + len].is_ascii_digit() {
                         len += 1;
                     }
                     let mut chosen = None;
@@ -869,10 +937,18 @@ impl datetime {
             }
             hour = match pm {
                 Some(true) => {
-                    if h12 == 12 { 12 } else { h12 + 12 }
+                    if h12 == 12 {
+                        12
+                    } else {
+                        h12 + 12
+                    }
                 }
                 _ => {
-                    if h12 == 12 { 0 } else { h12 }
+                    if h12 == 12 {
+                        0
+                    } else {
+                        h12
+                    }
                 }
             };
         }
@@ -886,8 +962,8 @@ impl datetime {
             day = resolved.day;
         }
         let date = date::new(year, month, day).map_err(|_| mismatch())?;
-        let time = time::new(hour, minute, Some(second), Some(microsecond))
-            .map_err(|_| mismatch())?;
+        let time =
+            time::new(hour, minute, Some(second), Some(microsecond)).map_err(|_| mismatch())?;
         Ok(Self::from_parts(date, time))
     }
 }
@@ -899,13 +975,17 @@ impl fmt::Display for timedelta {
             let plural = if self.days.abs() == 1 { "" } else { "s" };
             write!(f, "{} day{}, ", self.days, plural)?;
         }
-        
+
         let hours = self.seconds / 3600;
         let minutes = (self.seconds % 3600) / 60;
         let seconds = self.seconds % 60;
-        
+
         if self.microseconds != 0 {
-            write!(f, "{}:{:02}:{:02}.{:06}", hours, minutes, seconds, self.microseconds)
+            write!(
+                f,
+                "{}:{:02}:{:02}.{:06}",
+                hours, minutes, seconds, self.microseconds
+            )
         } else {
             write!(f, "{}:{:02}:{:02}", hours, minutes, seconds)
         }
@@ -924,7 +1004,7 @@ fn days_to_date(ordinal: i64) -> date {
     // date::fromordinal), matching CPython's error messages.
     let mut year = 1;
     let mut remaining_days = ordinal - 1;
-    
+
     // Find the year
     while remaining_days >= 365 {
         let year_days = if is_leap_year(year) { 366 } else { 365 };
@@ -934,18 +1014,22 @@ fn days_to_date(ordinal: i64) -> date {
         remaining_days -= year_days;
         year += 1;
     }
-    
+
     // Find the month and day
     let mut month = 1;
     while month <= 12 {
-        let month_days = if month == 2 && is_leap_year(year) { 29 } else { DAYS_IN_MONTH[month as usize - 1] };
+        let month_days = if month == 2 && is_leap_year(year) {
+            29
+        } else {
+            DAYS_IN_MONTH[month as usize - 1]
+        };
         if remaining_days < month_days as i64 {
             break;
         }
         remaining_days -= month_days as i64;
         month += 1;
     }
-    
+
     date {
         year,
         month,
@@ -955,20 +1039,24 @@ fn days_to_date(ordinal: i64) -> date {
 
 fn date_to_days(d: date) -> i64 {
     let mut days = 0i64;
-    
+
     // Add days for complete years. Public constructors guarantee year >= 1
     // (date::new validates against MINYEAR), so `1..d.year` is never the
     // empty range that silently collapsed years <= 1 into year 1 (issue #82).
     for y in 1..d.year {
         days += if is_leap_year(y) { 366 } else { 365 };
     }
-    
+
     // Add days for complete months in the current year
     for m in 1..d.month {
-        let month_days = if m == 2 && is_leap_year(d.year) { 29 } else { DAYS_IN_MONTH[m as usize - 1] };
+        let month_days = if m == 2 && is_leap_year(d.year) {
+            29
+        } else {
+            DAYS_IN_MONTH[m as usize - 1]
+        };
         days += month_days as i64;
     }
-    
+
     // Add remaining days
     days + d.day as i64
 }
@@ -996,18 +1084,39 @@ fn check_year(year: i32) -> Result<(), PyException> {
 /// exactly like CPython (date.strftime('%H') -> "00",
 /// time.strftime('%Y') -> "1900").
 fn strftime_pass(fmt: &str, d: Option<date>, t: Option<time>) -> String {
-    let d = d.unwrap_or(date { year: 1900, month: 1, day: 1 });
-    let t = t.unwrap_or(time { hour: 0, minute: 0, second: 0, microsecond: 0 });
+    let d = d.unwrap_or(date {
+        year: 1900,
+        month: 1,
+        day: 1,
+    });
+    let t = t.unwrap_or(time {
+        hour: 0,
+        minute: 0,
+        second: 0,
+        microsecond: 0,
+    });
 
     let ord = d.toordinal();
-    let jan1_ord = date_to_days(date { year: d.year, month: 1, day: 1 });
+    let jan1_ord = date_to_days(date {
+        year: d.year,
+        month: 1,
+        day: 1,
+    });
     let doy = ord - jan1_ord + 1; // 1-based day of year (%j, %U, %W)
     let jan1_mon = (jan1_ord - 1).rem_euclid(7); // 0 = Monday
     let jan1_sun = jan1_ord.rem_euclid(7); // 0 = Sunday
     let first_monday = ((7 - jan1_mon) % 7) + 1;
     let first_sunday = ((7 - jan1_sun) % 7) + 1;
-    let week_monday = if doy < first_monday { 0 } else { (doy - first_monday) / 7 + 1 };
-    let week_sunday = if doy < first_sunday { 0 } else { (doy - first_sunday) / 7 + 1 };
+    let week_monday = if doy < first_monday {
+        0
+    } else {
+        (doy - first_monday) / 7 + 1
+    };
+    let week_sunday = if doy < first_sunday {
+        0
+    } else {
+        (doy - first_sunday) / 7 + 1
+    };
     let (iso_year, iso_week, _) = d.isocalendar();
     let hour12 = {
         let h = t.hour % 12;
@@ -1081,35 +1190,63 @@ fn strftime_pass(fmt: &str, d: Option<date>, t: Option<time>) -> String {
 
 fn month_name(month: u32) -> &'static str {
     match month {
-        1 => "January", 2 => "February", 3 => "March", 4 => "April",
-        5 => "May", 6 => "June", 7 => "July", 8 => "August",
-        9 => "September", 10 => "October", 11 => "November", 12 => "December",
-        _ => "Unknown"
+        1 => "January",
+        2 => "February",
+        3 => "March",
+        4 => "April",
+        5 => "May",
+        6 => "June",
+        7 => "July",
+        8 => "August",
+        9 => "September",
+        10 => "October",
+        11 => "November",
+        12 => "December",
+        _ => "Unknown",
     }
 }
 
 fn month_abbr(month: u32) -> &'static str {
     match month {
-        1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
-        5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
-        9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
-        _ => "Unk"
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "Unk",
     }
 }
 
 fn weekday_name(weekday: u32) -> &'static str {
     match weekday {
-        0 => "Monday", 1 => "Tuesday", 2 => "Wednesday", 3 => "Thursday",
-        4 => "Friday", 5 => "Saturday", 6 => "Sunday",
-        _ => "Unknown"
+        0 => "Monday",
+        1 => "Tuesday",
+        2 => "Wednesday",
+        3 => "Thursday",
+        4 => "Friday",
+        5 => "Saturday",
+        6 => "Sunday",
+        _ => "Unknown",
     }
 }
 
 fn weekday_abbr(weekday: u32) -> &'static str {
     match weekday {
-        0 => "Mon", 1 => "Tue", 2 => "Wed", 3 => "Thu",
-        4 => "Fri", 5 => "Sat", 6 => "Sun",
-        _ => "Unk"
+        0 => "Mon",
+        1 => "Tue",
+        2 => "Wed",
+        3 => "Thu",
+        4 => "Fri",
+        5 => "Sat",
+        6 => "Sun",
+        _ => "Unk",
     }
 }
 
@@ -1184,16 +1321,14 @@ fn invalid_replace_keyword(field: &str) -> PyException {
 
 fn narrow_i32(v: Option<i64>, field: &str) -> Result<Option<i32>, PyException> {
     v.map(|v| {
-        i32::try_from(v)
-            .map_err(|_| crate::value_error(format!("{} {} is out of range", field, v)))
+        i32::try_from(v).map_err(|_| crate::value_error(format!("{} {} is out of range", field, v)))
     })
     .transpose()
 }
 
 fn narrow_u32(v: Option<i64>, field: &str) -> Result<Option<u32>, PyException> {
     v.map(|v| {
-        u32::try_from(v)
-            .map_err(|_| crate::value_error(format!("{} {} is out of range", field, v)))
+        u32::try_from(v).map_err(|_| crate::value_error(format!("{} {} is out of range", field, v)))
     })
     .transpose()
 }

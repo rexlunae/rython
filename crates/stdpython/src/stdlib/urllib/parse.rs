@@ -89,7 +89,13 @@ impl ParseResult {
     /// FIRST `@` and returned `"user"`, the retrospective's R6 finding).
     pub fn username(&self) -> Option<String> {
         let (userinfo, _) = self.netloc.rsplit_once('@')?;
-        Some(userinfo.split_once(':').map(|(u, _)| u).unwrap_or(userinfo).to_string())
+        Some(
+            userinfo
+                .split_once(':')
+                .map(|(u, _)| u)
+                .unwrap_or(userinfo)
+                .to_string(),
+        )
     }
 
     /// The userinfo's password (`None` without a `:` in the userinfo).
@@ -101,7 +107,11 @@ impl ParseResult {
     /// The netloc's host part (userinfo stripped, brackets kept for
     /// IPv6).
     fn host_part(&self) -> Option<&str> {
-        let host = self.netloc.rsplit_once('@').map(|(_, h)| h).unwrap_or(&self.netloc);
+        let host = self
+            .netloc
+            .rsplit_once('@')
+            .map(|(_, h)| h)
+            .unwrap_or(&self.netloc);
         if host.is_empty() {
             return None;
         }
@@ -140,11 +150,10 @@ fn split_scheme(url: &str) -> (&str, &str) {
     match url.find(':') {
         Some(i) if i > 0 => {
             let scheme = &url[..i];
-            if scheme
-                .chars()
-                .enumerate()
-                .all(|(n, c)| c.is_ascii_alphabetic() || (n > 0 && (c.is_ascii_digit() || matches!(c, '+' | '-' | '.'))))
-            {
+            if scheme.chars().enumerate().all(|(n, c)| {
+                c.is_ascii_alphabetic()
+                    || (n > 0 && (c.is_ascii_digit() || matches!(c, '+' | '-' | '.')))
+            }) {
                 return (scheme, &url[i + 1..]);
             }
             ("", url)
@@ -277,14 +286,24 @@ pub fn urljoin<S: AsStrLike + ?Sized>(base: &S, url: &S) -> Result<String, PyExc
     if !u.scheme.is_empty() {
         return Ok(u.geturl());
     }
-    let scheme = if b.scheme.is_empty() { u.scheme.clone() } else { b.scheme.clone() };
+    let scheme = if b.scheme.is_empty() {
+        u.scheme.clone()
+    } else {
+        b.scheme.clone()
+    };
     if !u.netloc.is_empty() {
         // Network-path reference: same scheme, the target's authority.
-        return Ok(urlunparse((scheme, u.netloc, u.path, u.params, u.query, u.fragment))?);
+        return Ok(urlunparse((
+            scheme, u.netloc, u.path, u.params, u.query, u.fragment,
+        ))?);
     }
     let (path, params) = if u.path.is_empty() {
         // Empty path: keep the base path, take the target's query.
-        let params = if u.params.is_empty() { b.params.clone() } else { u.params.clone() };
+        let params = if u.params.is_empty() {
+            b.params.clone()
+        } else {
+            u.params.clone()
+        };
         (b.path.clone(), params)
     } else if u.path.starts_with('/') {
         (u.path.clone(), u.params.clone())
@@ -294,14 +313,19 @@ pub fn urljoin<S: AsStrLike + ?Sized>(base: &S, url: &S) -> Result<String, PyExc
             Some(i) => &b.path[..=i],
             None => "/",
         };
-        (normalize_dot_segments(&format!("{base_dir}{}", u.path)), u.params.clone())
+        (
+            normalize_dot_segments(&format!("{base_dir}{}", u.path)),
+            u.params.clone(),
+        )
     };
     let query = if u.query.is_empty() && u.path.is_empty() {
         b.query.clone()
     } else {
         u.query.clone()
     };
-    Ok(urlunparse((scheme, b.netloc, path, params, query, u.fragment))?)
+    Ok(urlunparse((
+        scheme, b.netloc, path, params, query, u.fragment,
+    ))?)
 }
 
 /// RFC 3986 remove_dot_segments, applied to a path.
@@ -332,9 +356,8 @@ fn normalize_dot_segments(path: &str) -> String {
 /// always-safe characters.
 pub fn quote<S: AsStrLike + ?Sized>(s: &S, safe: Option<&str>) -> Result<String, PyException> {
     let s = s.as_str_like();
-    let always = |c: char| -> bool {
-        c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~')
-    };
+    let always =
+        |c: char| -> bool { c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') };
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if always(c) || safe.is_some_and(|sf| sf.contains(c)) {

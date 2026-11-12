@@ -68,7 +68,11 @@ pub fn assert_eq(a: &PyValue, b: &PyValue, ctx: alloc::string::String) -> Result
     if crate::py_value_eq(a, b) {
         Ok(())
     } else if ctx.is_empty() {
-        assertion_failed(format!("{} != {}", crate::py_display(a), crate::py_display(b)))
+        assertion_failed(format!(
+            "{} != {}",
+            crate::py_display(a),
+            crate::py_display(b)
+        ))
     } else {
         assertion_failed(format!(
             "{}: {} != {}",
@@ -102,11 +106,19 @@ pub fn assert_false(x: &PyValue, ctx: alloc::string::String) -> Result<(), PyExc
 }
 
 /// `self.assertNotEqual(a, b)` — raise AssertionError when they ARE equal.
-pub fn assert_not_eq(a: &PyValue, b: &PyValue, ctx: alloc::string::String) -> Result<(), PyException> {
+pub fn assert_not_eq(
+    a: &PyValue,
+    b: &PyValue,
+    ctx: alloc::string::String,
+) -> Result<(), PyException> {
     if !crate::py_value_eq(a, b) {
         Ok(())
     } else if ctx.is_empty() {
-        assertion_failed(format!("{} == {}", crate::py_display(a), crate::py_display(b)))
+        assertion_failed(format!(
+            "{} == {}",
+            crate::py_display(a),
+            crate::py_display(b)
+        ))
     } else {
         assertion_failed(format!(
             "{}: {} == {}",
@@ -556,10 +568,8 @@ pub fn assert_less_equal(
 }
 
 /// `unittest.TestResult.separator1` / `separator2`.
-const SEPARATOR1: &str =
-    "======================================================================";
-const SEPARATOR2: &str =
-    "----------------------------------------------------------------------";
+const SEPARATOR1: &str = "======================================================================";
+const SEPARATOR2: &str = "----------------------------------------------------------------------";
 
 /// CPython's `TextTestResult` and `TextTestRunner.run` at the default
 /// verbosity (issue #334, Phase 3): a status character per test as it
@@ -727,7 +737,10 @@ impl TextTestResult {
             infos.push(alloc::format!("skipped={}", self.skipped));
         }
         if self.expected_failures != 0 {
-            infos.push(alloc::format!("expected failures={}", self.expected_failures));
+            infos.push(alloc::format!(
+                "expected failures={}",
+                self.expected_failures
+            ));
         }
         if !self.unexpected_successes.is_empty() {
             infos.push(alloc::format!(

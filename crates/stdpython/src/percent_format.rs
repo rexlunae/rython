@@ -57,8 +57,12 @@ pub struct PercentSpec {
 /// engine advances `at` as it consumes; a leaf advances it by one.
 pub trait PyFormatValue {
     fn count(&self) -> usize;
-    fn render_str(&self, at: &mut usize, spec: &PercentSpec, out: &mut String)
-        -> Result<(), PyException>;
+    fn render_str(
+        &self,
+        at: &mut usize,
+        spec: &PercentSpec,
+        out: &mut String,
+    ) -> Result<(), PyException>;
     fn render_bytes(
         &self,
         at: &mut usize,
@@ -119,10 +123,7 @@ impl<T: PyFormatValue> PyFormatRhs for T {
         _spec: &PercentSpec,
         _out: &mut String,
     ) -> Result<(), PyException> {
-        Err(PyException::new(
-            "TypeError",
-            "format requires a mapping",
-        ))
+        Err(PyException::new("TypeError", "format requires a mapping"))
     }
     fn render_at_bytes(
         &self,
@@ -168,14 +169,16 @@ impl<V: PercentValue> PyFormatRhs for crate::PyDict<String, V> {
 /// One concrete value that a %-conversion can render (the leaves of a
 /// tuple RHS).
 pub trait PercentValue {
-    fn percent_render(&self, spec: &PercentSpec, out: &mut String)
-        -> Result<(), PyException>;
+    fn percent_render(&self, spec: &PercentSpec, out: &mut String) -> Result<(), PyException>;
     /// The bytes-mode render (the `fmt % values` engine for a bytes
     /// format string): default is the str-mode render re-encoded, which
     /// the bytes leaf overrides (raw bytes for %s/%b) and the str leaf
     /// overrides to raise CPython's TypeError.
-    fn percent_render_bytes(&self, spec: &PercentSpec, out: &mut Vec<u8>)
-        -> Result<(), PyException> {
+    fn percent_render_bytes(
+        &self,
+        spec: &PercentSpec,
+        out: &mut Vec<u8>,
+    ) -> Result<(), PyException> {
         let mut s = String::new();
         self.percent_render(spec, &mut s)?;
         out.extend_from_slice(s.as_bytes());
@@ -385,11 +388,7 @@ impl<T: PercentValue> PyFormatValue for T {
 }
 
 impl<T: PercentValue + ?Sized> PercentValue for &T {
-    fn percent_render(
-        &self,
-        spec: &PercentSpec,
-        out: &mut String,
-    ) -> Result<(), PyException> {
+    fn percent_render(&self, spec: &PercentSpec, out: &mut String) -> Result<(), PyException> {
         (**self).percent_render(spec, out)
     }
 }
@@ -616,10 +615,7 @@ fn parse_percent_spec(fmt: &[u8], pos: &mut usize) -> Result<PercentSpec, PyExce
             .position(|c| *c == b')')
             .map(|i| *pos + i);
         let Some(close) = close else {
-            return Err(PyException::new(
-                "ValueError",
-                "incomplete format key",
-            ));
+            return Err(PyException::new("ValueError", "incomplete format key"));
         };
         let key = core::str::from_utf8(&fmt[*pos + 1..close])
             .map_err(|_| PyException::new("ValueError", "incomplete format key"))?
@@ -688,17 +684,12 @@ fn parse_percent_spec(fmt: &[u8], pos: &mut usize) -> Result<PercentSpec, PyExce
                 "ValueError",
                 format!(
                     "unsupported format character '{}' (0x{:x}) at index {}",
-                    other as char,
-                    other,
-                    *pos
+                    other as char, other, *pos
                 ),
             ));
         }
         None => {
-            return Err(PyException::new(
-                "ValueError",
-                "incomplete format",
-            ));
+            return Err(PyException::new("ValueError", "incomplete format"));
         }
     };
     *pos += 1;
@@ -729,13 +720,15 @@ fn percent_render_int(v: i64, spec: &PercentSpec) -> String {
     if spec.code == PercentCode::C {
         return char::from_u32(v as u32)
             .map(|c| c.to_string())
-            .unwrap_or_else(|| {
-                panic!("%c: chr() arg out of range")
-            });
+            .unwrap_or_else(|| panic!("%c: chr() arg out of range"));
     }
     // Rust's {:x}/{:o} of a negative i64 render the two's-complement
     // bit pattern; CPython renders the signed magnitude ("-ff").
-    let s = if v < 0 && matches!(spec.code, PercentCode::X | PercentCode::BigX | PercentCode::O) {
+    let s = if v < 0
+        && matches!(
+            spec.code,
+            PercentCode::X | PercentCode::BigX | PercentCode::O
+        ) {
         let mag = v.unsigned_abs();
         match spec.code {
             PercentCode::X => format!("-{:x}", mag),
@@ -778,11 +771,19 @@ fn percent_render_float(f: f64, spec: &PercentSpec) -> Result<String, PyExceptio
         // %d/%x/%o with a float truncate toward zero, like CPython's
         // int() conversion.
         PercentCode::D | PercentCode::U => {
-            let tmp_spec = PercentSpec { key: None, code: PercentCode::D, ..*spec };
+            let tmp_spec = PercentSpec {
+                key: None,
+                code: PercentCode::D,
+                ..*spec
+            };
             Ok(percent_render_int(f as i64, &tmp_spec))
         }
         PercentCode::X | PercentCode::BigX | PercentCode::O => {
-            let tmp_spec = PercentSpec { key: None, code: spec.code, ..*spec };
+            let tmp_spec = PercentSpec {
+                key: None,
+                code: spec.code,
+                ..*spec
+            };
             Ok(percent_render_int(f as i64, &tmp_spec))
         }
         PercentCode::E | PercentCode::BigE => {
@@ -852,7 +853,11 @@ fn percent_g_trim(s: &str, upper: bool) -> String {
     };
     match exp {
         Some(e) => {
-            let e = if upper { e.to_uppercase() } else { e.to_string() };
+            let e = if upper {
+                e.to_uppercase()
+            } else {
+                e.to_string()
+            };
             format!("{}{}", mantissa, e)
         }
         None => mantissa,
@@ -868,17 +873,21 @@ fn percent_render_str(s: &str, spec: &PercentSpec) -> Result<String, PyException
             if s.chars().count() == 1 {
                 Ok(s.to_string())
             } else {
-                Err(PyException::new(
-                    "TypeError",
-                    "%c requires int or char",
-                ))
+                Err(PyException::new("TypeError", "%c requires int or char"))
             }
         }
         // A string value for a numeric code is a TypeError, as CPython
         // reports it.
-        PercentCode::D | PercentCode::U | PercentCode::X | PercentCode::BigX
-        | PercentCode::O | PercentCode::E | PercentCode::BigE | PercentCode::F
-        | PercentCode::G | PercentCode::BigG => Err(PyException::new(
+        PercentCode::D
+        | PercentCode::U
+        | PercentCode::X
+        | PercentCode::BigX
+        | PercentCode::O
+        | PercentCode::E
+        | PercentCode::BigE
+        | PercentCode::F
+        | PercentCode::G
+        | PercentCode::BigG => Err(PyException::new(
             "TypeError",
             "%d format: a real number is required, not str",
         )),
@@ -984,7 +993,11 @@ impl PercentValue for bool {
         let s = match spec.code {
             // str(True) is "True", repr(True) is "True".
             PercentCode::S | PercentCode::R => {
-                if *self { "True".to_string() } else { "False".to_string() }
+                if *self {
+                    "True".to_string()
+                } else {
+                    "False".to_string()
+                }
             }
             _ => percent_render_int(if *self { 1 } else { 0 }, spec),
         };
@@ -1098,7 +1111,11 @@ impl PercentValue for PyValue {
 /// The code-independent post-processing shared by every leaf: precision
 /// truncation (strings), the `#` alternate form, the `+`/space sign
 /// flags, and width padding.
-fn percent_apply(spec: &PercentSpec, mut rendered: String, is_numeric: bool) -> Result<String, PyException> {
+fn percent_apply(
+    spec: &PercentSpec,
+    mut rendered: String,
+    is_numeric: bool,
+) -> Result<String, PyException> {
     if let Some(p) = spec.precision {
         match spec.code {
             PercentCode::S | PercentCode::R | PercentCode::A => {
@@ -1124,18 +1141,10 @@ fn percent_apply(spec: &PercentSpec, mut rendered: String, is_numeric: bool) -> 
             _ => {}
         }
     }
-    if spec.plus
-        && is_numeric
-        && !rendered.starts_with('-')
-        && !rendered.starts_with('+')
-    {
+    if spec.plus && is_numeric && !rendered.starts_with('-') && !rendered.starts_with('+') {
         rendered = format!("+{}", rendered);
     }
-    if spec.space
-        && is_numeric
-        && !rendered.starts_with('-')
-        && !rendered.starts_with('+')
-    {
+    if spec.space && is_numeric && !rendered.starts_with('-') && !rendered.starts_with('+') {
         rendered = format!(" {}", rendered);
     }
     let width = spec.width.unwrap_or(0).max(0) as usize;

@@ -1,24 +1,29 @@
 //! Python collections module implementation
-//! 
+//!
 //! This module provides specialized container datatypes.
 //! Implementation matches Python's collections module API.
 
-use crate::{PyException, Len, Truthy, PyRepr, python_function};
+use crate::{Len, PyException, PyRepr, Truthy, python_function};
 use alloc::collections::VecDeque;
-use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 use core::hash::Hash;
 
 /// Counter - dict subclass for counting hashable objects
 #[derive(Debug, Clone)]
-pub struct Counter<T> 
-where 
+pub struct Counter<T>
+where
     T: Hash + Eq + Clone + core::fmt::Debug,
 {
     counts: crate::PyDict<T, i64>,
 }
 
-impl<T> Counter<T> 
-where 
+impl<T> Counter<T>
+where
     T: Hash + Eq + Clone + core::fmt::Debug,
 {
     /// Create a new Counter
@@ -27,10 +32,10 @@ where
             counts: crate::PyDict::default(),
         }
     }
-    
+
     /// Create Counter from iterable
-    pub fn from_iter<I>(iterable: I) -> Self 
-    where 
+    pub fn from_iter<I>(iterable: I) -> Self
+    where
         I: IntoIterator<Item = T>,
     {
         let mut counter = Self::new();
@@ -39,7 +44,7 @@ where
         }
         counter
     }
-    
+
     /// Create a Counter from a MAPPING, adding each value to the count
     /// rather than counting one per key.
     ///
@@ -58,22 +63,22 @@ where
     }
 
     /// Update counts with elements from iterable
-    pub fn update<I>(&mut self, iterable: I) 
-    where 
+    pub fn update<I>(&mut self, iterable: I)
+    where
         I: IntoIterator<Item = T>,
     {
         for item in iterable {
             self.update_one(&item, 1);
         }
     }
-    
+
     /// Update count for single element
     pub fn update_one(&mut self, element: &T, count: i64) {
         // Python's Counter keeps zero and negative counts after update() and
         // subtract(); only the +/- operators drop them.
         *self.counts.entry(element.clone()).or_insert(0) += count;
     }
-    
+
     /// Whether the element has been counted. `Counter.get(key, default)`
     /// needs it: `get` answers 0 for a missing key, so a caller that
     /// supplied its own default has to tell the two cases apart.
@@ -98,22 +103,20 @@ where
     pub fn get(&self, element: &T) -> i64 {
         self.counts.get(element).copied().unwrap_or(0)
     }
-    
+
     /// Get most common elements
     pub fn most_common(&self, n: Option<usize>) -> Vec<(T, i64)> {
-        let mut items: Vec<(T, i64)> = self.counts.iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
+        let mut items: Vec<(T, i64)> = self.counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
         // Stable sort by count only: Python breaks ties by FIRST-INSERTION
         // order (the old Debug-string comparison invented an ordering).
         items.sort_by(|a, b| b.1.cmp(&a.1));
-        
+
         match n {
             Some(limit) => items.into_iter().take(limit).collect(),
             None => items,
         }
     }
-    
+
     /// Get all elements (with repetitions)
     pub fn elements(&self) -> Vec<T> {
         let mut result = Vec::new();
@@ -124,34 +127,34 @@ where
         }
         result
     }
-    
+
     /// Subtract counts from another counter
     pub fn subtract(&mut self, other: &Counter<T>) {
         for (element, count) in &other.counts {
             self.update_one(element, -count);
         }
     }
-    
+
     /// Get total count
     pub fn total(&self) -> i64 {
         self.counts.values().sum()
     }
-    
+
     /// Clear all counts
     pub fn clear(&mut self) {
         self.counts.clear();
     }
-    
+
     /// Get keys (elements)
     pub fn keys(&self) -> Vec<T> {
         self.counts.keys().cloned().collect()
     }
-    
+
     /// Get values (counts)
     pub fn values(&self) -> Vec<i64> {
         self.counts.values().copied().collect()
     }
-    
+
     /// Get items (element, count pairs)
     pub fn items(&self) -> Vec<(T, i64)> {
         self.counts.iter().map(|(k, v)| (k.clone(), *v)).collect()
@@ -186,8 +189,8 @@ impl crate::PyIndex<&str> for Counter<String> {
     }
 }
 
-impl<T> Default for Counter<T> 
-where 
+impl<T> Default for Counter<T>
+where
     T: Hash + Eq + Clone + core::fmt::Debug,
 {
     fn default() -> Self {
@@ -195,8 +198,8 @@ where
     }
 }
 
-impl<T> Len for Counter<T> 
-where 
+impl<T> Len for Counter<T>
+where
     T: Hash + Eq + Clone + core::fmt::Debug,
 {
     fn len(&self) -> usize {
@@ -204,8 +207,8 @@ where
     }
 }
 
-impl<T> Truthy for Counter<T> 
-where 
+impl<T> Truthy for Counter<T>
+where
     T: Hash + Eq + Clone + core::fmt::Debug,
 {
     fn is_truthy(&self) -> bool {
@@ -342,7 +345,10 @@ impl<T> deque<T> {
             self.inner.remove(pos);
             Ok(())
         } else {
-            Err(crate::value_error(format!("{} is not in deque", value.py_repr())))
+            Err(crate::value_error(format!(
+                "{} is not in deque",
+                value.py_repr()
+            )))
         }
     }
 
@@ -374,7 +380,12 @@ impl<T> deque<T> {
     }
 
     /// Find index of first occurrence
-    pub fn index(&self, value: &T, start: Option<usize>, stop: Option<usize>) -> Result<usize, PyException>
+    pub fn index(
+        &self,
+        value: &T,
+        start: Option<usize>,
+        stop: Option<usize>,
+    ) -> Result<usize, PyException>
     where
         T: PartialEq + crate::PyRepr,
     {
@@ -396,7 +407,10 @@ impl<T> deque<T> {
         // CPython names the missing value with repr(): "9 is not in deque",
         // "'x' is not in deque" — single quotes for str, not Rust Debug's
         // double quotes.
-        Err(crate::value_error(format!("{} is not in deque", value.py_repr())))
+        Err(crate::value_error(format!(
+            "{} is not in deque",
+            value.py_repr()
+        )))
     }
 
     /// Insert item at position. A bounded deque at its maximum size raises
@@ -404,9 +418,7 @@ impl<T> deque<T> {
     pub fn insert(&mut self, index: usize, item: T) -> Result<(), PyException> {
         if let Some(max_len) = self.maxlen {
             if self.inner.len() >= max_len {
-                return Err(crate::index_error(
-                    "deque already at its maximum size",
-                ));
+                return Err(crate::index_error("deque already at its maximum size"));
             }
         }
         if index >= self.inner.len() {
@@ -688,9 +700,7 @@ impl<T> crate::PyListOps<T> for deque<T> {
     fn py_insert(&mut self, index: i64, item: T) -> Result<(), crate::PyException> {
         if let Some(max_len) = self.maxlen {
             if self.inner.len() >= max_len {
-                return Err(crate::index_error(
-                    "deque already at its maximum size",
-                ));
+                return Err(crate::index_error("deque already at its maximum size"));
             }
         }
         let len = self.inner.len() as i64;
@@ -1041,11 +1051,7 @@ where
         self.items()
     }
     fn py_setdefault(&mut self, key: K, default: V) -> V {
-        self.inner
-            .get_mut()
-            .entry(key)
-            .or_insert(default)
-            .clone()
+        self.inner.get_mut().entry(key).or_insert(default).clone()
     }
     fn update(&mut self, other: crate::PyDict<K, V>) {
         let inner = self.inner.get_mut();
@@ -1142,7 +1148,9 @@ where
         }
         let factory = match self.default_factory {
             None => String::from("None"),
-            Some(DefaultFactory { class: Some(name), .. }) => format!("<class '{}'>", name),
+            Some(DefaultFactory {
+                class: Some(name), ..
+            }) => format!("<class '{}'>", name),
             Some(DefaultFactory { class: None, .. }) => panic!(
                 "repr of a defaultdict whose default_factory is a lambda or user function \
                  prints a memory address in CPython (`<function <lambda> at 0x...>`); \
@@ -1768,16 +1776,16 @@ fn boxed_key(key: crate::PyValue) -> Result<String, PyException> {
 /// order that was also randomized per process — the same program printed
 /// different key orders run to run.
 #[derive(Debug)]
-pub struct ChainMap<K, V> 
-where 
+pub struct ChainMap<K, V>
+where
     K: Hash + Eq + Clone,
     V: Clone,
 {
     maps: Vec<crate::PyDict<K, V>>,
 }
 
-impl<K, V> ChainMap<K, V> 
-where 
+impl<K, V> ChainMap<K, V>
+where
     K: Hash + Eq + Clone,
     V: Clone,
 {
@@ -1785,12 +1793,14 @@ where
     pub fn new(maps: Vec<crate::PyDict<K, V>>) -> Self {
         Self { maps }
     }
-    
+
     /// Create empty ChainMap
     pub fn empty() -> Self {
-        Self { maps: vec![crate::PyDict::default()] }
+        Self {
+            maps: vec![crate::PyDict::default()],
+        }
     }
-    
+
     /// Get value by key: the FIRST map holding it wins.
     pub fn get(&self, key: &K) -> Option<&V> {
         for map in &self.maps {
@@ -1800,7 +1810,7 @@ where
         }
         None
     }
-    
+
     /// Set value (writes go to the first map only, as in Python).
     pub fn insert(&mut self, key: K, value: V) {
         if self.maps.is_empty() {
@@ -1808,7 +1818,7 @@ where
         }
         self.maps[0].insert(key, value);
     }
-    
+
     /// Remove key from the first map. `shift_remove`, not `swap_remove`:
     /// the first map is a Python dict, whose remaining keys keep their
     /// relative order after a deletion.
@@ -1819,7 +1829,7 @@ where
             None
         }
     }
-    
+
     /// All keys, in CPython's iteration order: the maps walked from LAST
     /// to first, each key placed where it is first seen. Re-inserting an
     /// already-present key into the IndexMap keeps its original position,
@@ -1833,47 +1843,54 @@ where
         }
         order.into_keys().collect()
     }
-    
+
     /// All values, in key order, each resolved with first-map-wins lookup
     /// — CPython's ValuesView yields `self[key]` for each key it iterates.
     pub fn values(&self) -> Vec<V> {
         self.keys()
             .iter()
-            .map(|key| self.get(key).cloned().expect("every iterated key is present"))
+            .map(|key| {
+                self.get(key)
+                    .cloned()
+                    .expect("every iterated key is present")
+            })
             .collect()
     }
-    
+
     /// All (key, value) pairs, in key order, first-map-wins.
     pub fn items(&self) -> Vec<(K, V)> {
         self.keys()
             .into_iter()
             .map(|key| {
-                let value = self.get(&key).cloned().expect("every iterated key is present");
+                let value = self
+                    .get(&key)
+                    .cloned()
+                    .expect("every iterated key is present");
                 (key, value)
             })
             .collect()
     }
-    
+
     /// Check if key exists
     pub fn contains_key(&self, key: &K) -> bool {
         self.maps.iter().any(|map| map.contains_key(key))
     }
-    
+
     /// Add new child map (pushed on the FRONT, so its keys shadow the
     /// rest for lookup — and, being first, iterate last).
     pub fn new_child(&mut self, map: crate::PyDict<K, V>) -> &mut Self {
         self.maps.insert(0, map);
         self
     }
-    
+
     /// Get number of maps
     pub fn num_maps(&self) -> usize {
         self.maps.len()
     }
 }
 
-impl<K, V> Len for ChainMap<K, V> 
-where 
+impl<K, V> Len for ChainMap<K, V>
+where
     K: Hash + Eq + Clone,
     V: Clone,
 {

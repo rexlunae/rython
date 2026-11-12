@@ -128,25 +128,26 @@ fn pairwise_block_scalar(v: &[f64]) -> f64 {
 unsafe fn pairwise_block_avx2(v: &[f64]) -> f64 {
     use std::arch::x86_64::*;
     unsafe {
-    let mut acc0 = _mm256_setzero_pd();
-    let mut acc1 = _mm256_setzero_pd();
-    let blocks = v.len() / 8;
-    let mut b = 0;
-    while b < blocks {
-        let base = b * 8;
-        acc0 = _mm256_add_pd(acc0, _mm256_loadu_pd(v.as_ptr().add(base)));
-        acc1 = _mm256_add_pd(acc1, _mm256_loadu_pd(v.as_ptr().add(base + 4)));
-        b += 1;
-    }
-    let mut tmp = [0.0f64; 8];
-    _mm256_storeu_pd(tmp.as_mut_ptr(), acc0);
-    _mm256_storeu_pd(tmp.as_mut_ptr().add(4), acc1);
-    let tail = &v[blocks * 8..];
-    let mut res = ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
-    for &x in tail {
-        res += x;
-    }
-    res
+        let mut acc0 = _mm256_setzero_pd();
+        let mut acc1 = _mm256_setzero_pd();
+        let blocks = v.len() / 8;
+        let mut b = 0;
+        while b < blocks {
+            let base = b * 8;
+            acc0 = _mm256_add_pd(acc0, _mm256_loadu_pd(v.as_ptr().add(base)));
+            acc1 = _mm256_add_pd(acc1, _mm256_loadu_pd(v.as_ptr().add(base + 4)));
+            b += 1;
+        }
+        let mut tmp = [0.0f64; 8];
+        _mm256_storeu_pd(tmp.as_mut_ptr(), acc0);
+        _mm256_storeu_pd(tmp.as_mut_ptr().add(4), acc1);
+        let tail = &v[blocks * 8..];
+        let mut res =
+            ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
+        for &x in tail {
+            res += x;
+        }
+        res
     }
 }
 
@@ -156,31 +157,32 @@ unsafe fn pairwise_block_avx2(v: &[f64]) -> f64 {
 unsafe fn pairwise_block_neon(v: &[f64]) -> f64 {
     use std::arch::aarch64::*;
     unsafe {
-    let mut acc0 = vdupq_n_f64(0.0);
-    let mut acc1 = vdupq_n_f64(0.0);
-    let mut acc2 = vdupq_n_f64(0.0);
-    let mut acc3 = vdupq_n_f64(0.0);
-    let blocks = v.len() / 8;
-    let mut b = 0;
-    while b < blocks {
-        let base = b * 8;
-        acc0 = vaddq_f64(acc0, vld1q_f64(v.as_ptr().add(base)));
-        acc1 = vaddq_f64(acc1, vld1q_f64(v.as_ptr().add(base + 2)));
-        acc2 = vaddq_f64(acc2, vld1q_f64(v.as_ptr().add(base + 4)));
-        acc3 = vaddq_f64(acc3, vld1q_f64(v.as_ptr().add(base + 6)));
-        b += 1;
-    }
-    let mut tmp = [0.0f64; 8];
-    vst1q_f64(tmp.as_mut_ptr(), acc0);
-    vst1q_f64(tmp.as_mut_ptr().add(2), acc1);
-    vst1q_f64(tmp.as_mut_ptr().add(4), acc2);
-    vst1q_f64(tmp.as_mut_ptr().add(6), acc3);
-    let tail = &v[blocks * 8..];
-    let mut res = ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
-    for &x in tail {
-        res += x;
-    }
-    res
+        let mut acc0 = vdupq_n_f64(0.0);
+        let mut acc1 = vdupq_n_f64(0.0);
+        let mut acc2 = vdupq_n_f64(0.0);
+        let mut acc3 = vdupq_n_f64(0.0);
+        let blocks = v.len() / 8;
+        let mut b = 0;
+        while b < blocks {
+            let base = b * 8;
+            acc0 = vaddq_f64(acc0, vld1q_f64(v.as_ptr().add(base)));
+            acc1 = vaddq_f64(acc1, vld1q_f64(v.as_ptr().add(base + 2)));
+            acc2 = vaddq_f64(acc2, vld1q_f64(v.as_ptr().add(base + 4)));
+            acc3 = vaddq_f64(acc3, vld1q_f64(v.as_ptr().add(base + 6)));
+            b += 1;
+        }
+        let mut tmp = [0.0f64; 8];
+        vst1q_f64(tmp.as_mut_ptr(), acc0);
+        vst1q_f64(tmp.as_mut_ptr().add(2), acc1);
+        vst1q_f64(tmp.as_mut_ptr().add(4), acc2);
+        vst1q_f64(tmp.as_mut_ptr().add(6), acc3);
+        let tail = &v[blocks * 8..];
+        let mut res =
+            ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
+        for &x in tail {
+            res += x;
+        }
+        res
     }
 }
 

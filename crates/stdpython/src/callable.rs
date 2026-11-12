@@ -65,7 +65,11 @@ impl<A, R> PyCallable<A, R> {
     where
         F: Fn(A) -> Result<R, PyException> + Send + Sync + 'static,
     {
-        Self { name: Arc::from(name), f: Arc::new(f), identity: None }
+        Self {
+            name: Arc::from(name),
+            f: Arc::new(f),
+            identity: None,
+        }
     }
 
     /// A module-level function as a value (see the `identity` field):
@@ -75,7 +79,11 @@ impl<A, R> PyCallable<A, R> {
     where
         F: Fn(A) -> Result<R, PyException> + Send + Sync + 'static,
     {
-        Self { name: Arc::from(name), f: Arc::new(f), identity: Some(identity) }
+        Self {
+            name: Arc::from(name),
+            f: Arc::new(f),
+            identity: Some(identity),
+        }
     }
 
     /// A module-level function as a value (no_std tier).
@@ -84,7 +92,11 @@ impl<A, R> PyCallable<A, R> {
     where
         F: Fn(A) -> Result<R, PyException> + 'static,
     {
-        Self { name: Arc::from(name), f: Arc::new(f), identity: Some(identity) }
+        Self {
+            name: Arc::from(name),
+            f: Arc::new(f),
+            identity: Some(identity),
+        }
     }
 
     /// Wrap a Rust closure as a Python callable value (no_std tier — see
@@ -94,7 +106,11 @@ impl<A, R> PyCallable<A, R> {
     where
         F: Fn(A) -> Result<R, PyException> + 'static,
     {
-        Self { name: Arc::from(name), f: Arc::new(f), identity: None }
+        Self {
+            name: Arc::from(name),
+            f: Arc::new(f),
+            identity: None,
+        }
     }
 
     /// Call the value: `f(x, y)` in Python is `f.call((x, y))` here.
@@ -128,7 +144,11 @@ impl<A, R> PyCallable<A, R> {
 /// captures.
 impl<A, R> Clone for PyCallable<A, R> {
     fn clone(&self) -> Self {
-        Self { name: Arc::clone(&self.name), f: Arc::clone(&self.f), identity: self.identity }
+        Self {
+            name: Arc::clone(&self.name),
+            f: Arc::clone(&self.f),
+            identity: self.identity,
+        }
     }
 }
 
@@ -208,12 +228,9 @@ mod tests {
         fn hello(x: i64) -> Result<i64, PyException> {
             Ok(x)
         }
-        let a: PyCallable<(i64,), i64> =
-            PyCallable::function("hello", "m.hello", |(x,)| hello(x));
-        let b: PyCallable<(i64,), i64> =
-            PyCallable::function("hello", "m.hello", |(x,)| hello(x));
-        let other: PyCallable<(i64,), i64> =
-            PyCallable::function("bye", "m.bye", |(x,)| hello(x));
+        let a: PyCallable<(i64,), i64> = PyCallable::function("hello", "m.hello", |(x,)| hello(x));
+        let b: PyCallable<(i64,), i64> = PyCallable::function("hello", "m.hello", |(x,)| hello(x));
+        let other: PyCallable<(i64,), i64> = PyCallable::function("bye", "m.bye", |(x,)| hello(x));
         assert!(a == b);
         assert!(a != other);
         assert_eq!(a.to_string(), b.to_string());
@@ -238,8 +255,7 @@ mod tests {
             PyCallable::new("double", |(x,)| Ok(x * 2)),
             PyCallable::new("square", |(x,)| Ok(x * x)),
         ];
-        let applied: Vec<i64> =
-            table.iter().map(|f| f.call((5,)).unwrap()).collect();
+        let applied: Vec<i64> = table.iter().map(|f| f.call((5,)).unwrap()).collect();
         assert_eq!(applied, vec![10, 25]);
     }
 
@@ -302,12 +318,18 @@ type CellGuard<'a, T> = core::cell::RefMut<'a, Option<T>>;
 impl<T> PyCell<T> {
     /// The cell of a local that has not been assigned yet.
     pub fn empty(name: &str) -> Self {
-        Self { name: Arc::from(name), slot: Arc::new(CellSlot::new(None)) }
+        Self {
+            name: Arc::from(name),
+            slot: Arc::new(CellSlot::new(None)),
+        }
     }
 
     /// The cell of a name that is already bound (a captured parameter).
     pub fn new(name: &str, value: T) -> Self {
-        Self { name: Arc::from(name), slot: Arc::new(CellSlot::new(Some(value))) }
+        Self {
+            name: Arc::from(name),
+            slot: Arc::new(CellSlot::new(Some(value))),
+        }
     }
 
     /// Bind the name — an assignment to it in any scope that holds the
@@ -318,7 +340,10 @@ impl<T> PyCell<T> {
 
     /// Borrow the bound object — the receiver of a read.
     pub fn borrow(&self) -> PyCellRef<'_, T> {
-        PyCellRef { guard: self.lock(), name: &self.name }
+        PyCellRef {
+            guard: self.lock(),
+            name: &self.name,
+        }
     }
 
     /// Borrow the bound object mutably — the receiver of a store.
@@ -332,7 +357,9 @@ impl<T> PyCell<T> {
     /// would turn one loud failure into an unrelated cascade.
     #[cfg(feature = "std")]
     fn lock(&self) -> CellGuard<'_, T> {
-        self.slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The no_std tier's slot: a `RefCell`, borrowed for the access.
@@ -386,7 +413,10 @@ impl<T: Clone> PyCell<T> {
 /// scope's binding.
 impl<T> Clone for PyCell<T> {
     fn clone(&self) -> Self {
-        Self { name: Arc::clone(&self.name), slot: Arc::clone(&self.slot) }
+        Self {
+            name: Arc::clone(&self.name),
+            slot: Arc::clone(&self.slot),
+        }
     }
 }
 

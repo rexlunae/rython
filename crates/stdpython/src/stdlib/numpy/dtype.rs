@@ -87,7 +87,7 @@ pub fn dtype_from_str(s: &str) -> Result<Dtype, PyException> {
                      float32, float64)",
                     other
                 ),
-            ))
+            ));
         }
     })
 }

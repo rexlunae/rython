@@ -463,6 +463,19 @@ mod tests {
             let c = compress(&d, 6, w).unwrap();
             assert_eq!(decompress(&c, w).unwrap(), d);
         }
+        // Longer than a small window, the body is stored (BTYPE 00), so it
+        // holds no back-reference at all; within the window, a reference
+        // reaches back at most len - 1 bytes. Either way a decoder limited
+        // to that window accepts it.
+        for w in [-9, 9, 25] {
+            let c = compress(&d, 6, w).unwrap();
+            let at = match w {
+                -9 => 0,
+                9 => 2,
+                _ => 10,
+            };
+            assert_eq!((c[at] >> 1) & 3, 0, "wbits {w}");
+        }
         // Data that fits the window is still deflated.
         let small = b"abcabcabcabc".repeat(10);
         assert!(compress(&small, 6, 9).unwrap().len() < small.len());

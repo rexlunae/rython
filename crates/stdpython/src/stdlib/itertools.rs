@@ -1,5 +1,5 @@
 //! Python itertools module implementation
-//! 
+//!
 //! This module provides functions creating iterators for efficient looping.
 //! Implementation matches Python's itertools module API.
 
@@ -13,7 +13,7 @@ pub struct Count<T> {
     step: T,
 }
 
-impl<T> Count<T> 
+impl<T> Count<T>
 where
     T: Clone + core::ops::Add<Output = T>,
 {
@@ -24,14 +24,14 @@ where
             step,
         }
     }
-    
+
     /// Get next value
     pub fn next(&mut self) -> T {
         let result = self.current.clone();
         self.current = self.current.clone() + self.step.clone();
         result
     }
-    
+
     /// Take n values from count
     pub fn take(&mut self, n: usize) -> Vec<T> {
         let mut result = Vec::with_capacity(n);
@@ -49,12 +49,12 @@ pub struct Cycle<T> {
     index: usize,
 }
 
-impl<T> Cycle<T> 
+impl<T> Cycle<T>
 where
     T: Clone,
 {
     /// Create new cycle iterator
-    pub fn new<I>(iterable: I) -> Self 
+    pub fn new<I>(iterable: I) -> Self
     where
         I: IntoIterator<Item = T>,
     {
@@ -63,18 +63,18 @@ where
             index: 0,
         }
     }
-    
+
     /// Get next value (cycles through items)
     pub fn next(&mut self) -> Option<T> {
         if self.items.is_empty() {
             return None;
         }
-        
+
         let result = self.items[self.index].clone();
         self.index = (self.index + 1) % self.items.len();
         Some(result)
     }
-    
+
     /// Take n values from cycle
     pub fn take(&mut self, n: usize) -> Vec<T> {
         let mut result = Vec::with_capacity(n);
@@ -95,7 +95,7 @@ pub struct Repeat<T> {
     count: usize,
 }
 
-impl<T> Repeat<T> 
+impl<T> Repeat<T>
 where
     T: Clone,
 {
@@ -107,7 +107,7 @@ where
             count: 0,
         }
     }
-    
+
     /// Create repeat iterator with limit
     pub fn times(item: T, times: usize) -> Self {
         Self {
@@ -116,7 +116,7 @@ where
             count: 0,
         }
     }
-    
+
     /// Get next value
     pub fn next(&mut self) -> Option<T> {
         if let Some(limit) = self.times {
@@ -124,11 +124,11 @@ where
                 return None;
             }
         }
-        
+
         self.count += 1;
         Some(self.item.clone())
     }
-    
+
     /// Take n values from repeat
     pub fn take(&mut self, n: usize) -> Vec<T> {
         let mut result = Vec::new();
@@ -150,7 +150,7 @@ pub struct Chain<T> {
     current: usize,
 }
 
-impl<T> Chain<T> 
+impl<T> Chain<T>
 where
     T: Clone,
 {
@@ -161,15 +161,15 @@ where
             current: 0,
         }
     }
-    
+
     /// Add iterable to chain
-    pub fn add<I>(&mut self, iterable: I) 
+    pub fn add<I>(&mut self, iterable: I)
     where
         I: IntoIterator<Item = T>,
     {
         self.iterables.push_back(iterable.into_iter().collect());
     }
-    
+
     /// Get next value from chain
     pub fn next(&mut self) -> Option<T> {
         while !self.iterables.is_empty() {
@@ -188,7 +188,7 @@ where
         }
         None
     }
-    
+
     /// Collect all remaining items
     pub fn collect(mut self) -> Vec<T> {
         let mut result = Vec::new();
@@ -199,7 +199,7 @@ where
     }
 }
 
-impl<T> Default for Chain<T> 
+impl<T> Default for Chain<T>
 where
     T: Clone,
 {
@@ -217,12 +217,12 @@ pub struct ISlice<T> {
     current: usize,
 }
 
-impl<T> ISlice<T> 
+impl<T> ISlice<T>
 where
     T: Clone,
 {
     /// Create islice iterator
-    pub fn new<I>(iterable: I, start: usize, stop: Option<usize>, step: usize) -> Self 
+    pub fn new<I>(iterable: I, start: usize, stop: Option<usize>, step: usize) -> Self
     where
         I: IntoIterator<Item = T>,
     {
@@ -245,24 +245,24 @@ where
             current: start,
         }
     }
-    
+
     /// Get next value from slice
     pub fn next(&mut self) -> Option<T> {
         if self.current >= self.items.len() {
             return None;
         }
-        
+
         if let Some(stop) = self.stop {
             if self.current >= stop {
                 return None;
             }
         }
-        
+
         let result = self.items.get(self.current).cloned();
         self.current += self.step;
         result
     }
-    
+
     /// Collect all remaining items
     pub fn collect(mut self) -> Vec<T> {
         let mut result = Vec::new();
@@ -282,13 +282,13 @@ pub struct TakeWhile<T, F> {
     stopped: bool,
 }
 
-impl<T, F> TakeWhile<T, F> 
+impl<T, F> TakeWhile<T, F>
 where
     T: Clone,
     F: Fn(&T) -> bool,
 {
     /// Create takewhile iterator
-    pub fn new<I>(iterable: I, predicate: F) -> Self 
+    pub fn new<I>(iterable: I, predicate: F) -> Self
     where
         I: IntoIterator<Item = T>,
     {
@@ -299,13 +299,13 @@ where
             stopped: false,
         }
     }
-    
+
     /// Get next value while predicate is true
     pub fn next(&mut self) -> Option<T> {
         if self.stopped || self.index >= self.items.len() {
             return None;
         }
-        
+
         if let Some(item) = self.items.get(self.index) {
             if (self.predicate)(item) {
                 self.index += 1;
@@ -318,7 +318,7 @@ where
             None
         }
     }
-    
+
     /// Collect all remaining items
     pub fn collect(mut self) -> Vec<T> {
         let mut result = Vec::new();
@@ -338,13 +338,13 @@ pub struct DropWhile<T, F> {
     started: bool,
 }
 
-impl<T, F> DropWhile<T, F> 
+impl<T, F> DropWhile<T, F>
 where
     T: Clone,
     F: Fn(&T) -> bool,
 {
     /// Create dropwhile iterator
-    pub fn new<I>(iterable: I, predicate: F) -> Self 
+    pub fn new<I>(iterable: I, predicate: F) -> Self
     where
         I: IntoIterator<Item = T>,
     {
@@ -355,7 +355,7 @@ where
             started: false,
         }
     }
-    
+
     /// Get next value after dropping initial items
     pub fn next(&mut self) -> Option<T> {
         if !self.started {
@@ -372,7 +372,7 @@ where
                 }
             }
         }
-        
+
         if self.index < self.items.len() {
             let result = self.items.get(self.index).cloned();
             self.index += 1;
@@ -381,7 +381,7 @@ where
             None
         }
     }
-    
+
     /// Collect all remaining items
     pub fn collect(mut self) -> Vec<T> {
         let mut result = Vec::new();
@@ -400,13 +400,13 @@ pub struct FilterFalse<T, F> {
     index: usize,
 }
 
-impl<T, F> FilterFalse<T, F> 
+impl<T, F> FilterFalse<T, F>
 where
     T: Clone,
     F: Fn(&T) -> bool,
 {
     /// Create filterfalse iterator
-    pub fn new<I>(iterable: I, predicate: F) -> Self 
+    pub fn new<I>(iterable: I, predicate: F) -> Self
     where
         I: IntoIterator<Item = T>,
     {
@@ -416,7 +416,7 @@ where
             index: 0,
         }
     }
-    
+
     /// Get next value where predicate is false
     pub fn next(&mut self) -> Option<T> {
         while self.index < self.items.len() {
@@ -431,7 +431,7 @@ where
         }
         None
     }
-    
+
     /// Collect all remaining items
     pub fn collect(mut self) -> Vec<T> {
         let mut result = Vec::new();
@@ -450,12 +450,12 @@ pub struct Compress<T> {
     index: usize,
 }
 
-impl<T> Compress<T> 
+impl<T> Compress<T>
 where
     T: Clone,
 {
     /// Create compress iterator
-    pub fn new<I, S>(data: I, selectors: S) -> Self 
+    pub fn new<I, S>(data: I, selectors: S) -> Self
     where
         I: IntoIterator<Item = T>,
         S: IntoIterator<Item = bool>,
@@ -466,20 +466,20 @@ where
             index: 0,
         }
     }
-    
+
     /// Get next selected value
     pub fn next(&mut self) -> Option<T> {
         while self.index < self.data.len().min(self.selectors.len()) {
             let current_index = self.index;
             self.index += 1;
-            
+
             if self.selectors.get(current_index).copied().unwrap_or(false) {
                 return self.data.get(current_index).cloned();
             }
         }
         None
     }
-    
+
     /// Collect all remaining items
     pub fn collect(mut self) -> Vec<T> {
         let mut result = Vec::new();
@@ -493,7 +493,7 @@ where
 // Module-level convenience functions
 
 /// count - create count iterator
-pub fn count<T>(start: T, step: T) -> Count<T> 
+pub fn count<T>(start: T, step: T) -> Count<T>
 where
     T: Clone + core::ops::Add<Output = T>,
 {
@@ -501,7 +501,7 @@ where
 }
 
 /// cycle - create cycle iterator
-pub fn cycle<T, I>(iterable: I) -> Cycle<T> 
+pub fn cycle<T, I>(iterable: I) -> Cycle<T>
 where
     T: Clone,
     I: IntoIterator<Item = T>,
@@ -510,7 +510,7 @@ where
 }
 
 /// repeat - create repeat iterator
-pub fn repeat<T>(item: T) -> Repeat<T> 
+pub fn repeat<T>(item: T) -> Repeat<T>
 where
     T: Clone,
 {
@@ -518,7 +518,7 @@ where
 }
 
 /// repeat_times - create limited repeat iterator
-pub fn repeat_times<T>(item: T, times: usize) -> Repeat<T> 
+pub fn repeat_times<T>(item: T, times: usize) -> Repeat<T>
 where
     T: Clone,
 {
@@ -526,7 +526,7 @@ where
 }
 
 /// chain - chain multiple iterables
-pub fn chain_from_iterable<T, I>(iterables: I) -> Vec<T> 
+pub fn chain_from_iterable<T, I>(iterables: I) -> Vec<T>
 where
     I: IntoIterator<Item = Vec<T>>,
 {
@@ -538,7 +538,7 @@ where
 }
 
 /// islice - slice iterator
-pub fn islice<T, I>(iterable: I, start: usize, stop: Option<usize>, step: usize) -> Vec<T> 
+pub fn islice<T, I>(iterable: I, start: usize, stop: Option<usize>, step: usize) -> Vec<T>
 where
     T: Clone,
     I: IntoIterator<Item = T>,
@@ -547,7 +547,7 @@ where
 }
 
 /// takewhile - take while predicate is true
-pub fn takewhile<T, I, F>(iterable: I, predicate: F) -> Vec<T> 
+pub fn takewhile<T, I, F>(iterable: I, predicate: F) -> Vec<T>
 where
     T: Clone,
     I: IntoIterator<Item = T>,
@@ -557,7 +557,7 @@ where
 }
 
 /// dropwhile - drop while predicate is true
-pub fn dropwhile<T, I, F>(iterable: I, predicate: F) -> Vec<T> 
+pub fn dropwhile<T, I, F>(iterable: I, predicate: F) -> Vec<T>
 where
     T: Clone,
     I: IntoIterator<Item = T>,
@@ -567,7 +567,7 @@ where
 }
 
 /// filterfalse - filter where predicate is false
-pub fn filterfalse<T, I, F>(iterable: I, predicate: F) -> Vec<T> 
+pub fn filterfalse<T, I, F>(iterable: I, predicate: F) -> Vec<T>
 where
     T: Clone,
     I: IntoIterator<Item = T>,
@@ -577,7 +577,7 @@ where
 }
 
 /// compress - select items based on selectors
-pub fn compress<T, I, S>(data: I, selectors: S) -> Vec<T> 
+pub fn compress<T, I, S>(data: I, selectors: S) -> Vec<T>
 where
     T: Clone,
     I: IntoIterator<Item = T>,
@@ -600,22 +600,22 @@ where
     if r == 0 {
         return Ok(vec![vec![]]);
     }
-    
+
     if r > iterable.len() {
         return Ok(vec![]);
     }
-    
+
     let mut result = Vec::new();
     combinations_helper(iterable, r, 0, &mut vec![], &mut result);
     Ok(result)
 }
 
 fn combinations_helper<T>(
-    iterable: &[T], 
-    r: usize, 
-    start: usize, 
-    current: &mut Vec<T>, 
-    result: &mut Vec<Vec<T>>
+    iterable: &[T],
+    r: usize,
+    start: usize,
+    current: &mut Vec<T>,
+    result: &mut Vec<Vec<T>>,
 ) where
     T: Clone,
 {
@@ -623,7 +623,7 @@ fn combinations_helper<T>(
         result.push(current.clone());
         return;
     }
-    
+
     for i in start..iterable.len() {
         current.push(iterable[i].clone());
         combinations_helper(iterable, r, i + 1, current, result);
@@ -641,15 +641,15 @@ where
         return Err(crate::value_error("r must be non-negative"));
     }
     let r = r.map_or(iterable.len(), |r| r as usize);
-    
+
     if r == 0 {
         return Ok(vec![vec![]]);
     }
-    
+
     if r > iterable.len() {
         return Ok(vec![]);
     }
-    
+
     let mut result = Vec::new();
     let mut used = vec![false; iterable.len()];
     permutations_helper(iterable, r, &mut vec![], &mut used, &mut result);
@@ -657,11 +657,11 @@ where
 }
 
 fn permutations_helper<T>(
-    iterable: &[T], 
-    r: usize, 
-    current: &mut Vec<T>, 
-    used: &mut [bool], 
-    result: &mut Vec<Vec<T>>
+    iterable: &[T],
+    r: usize,
+    current: &mut Vec<T>,
+    used: &mut [bool],
+    result: &mut Vec<Vec<T>>,
 ) where
     T: Clone,
 {
@@ -669,7 +669,7 @@ fn permutations_helper<T>(
         result.push(current.clone());
         return;
     }
-    
+
     for i in 0..iterable.len() {
         if !used[i] {
             current.push(iterable[i].clone());
@@ -682,16 +682,16 @@ fn permutations_helper<T>(
 }
 
 /// product - cartesian product of iterables
-pub fn product<T>(iterables: &[Vec<T>]) -> Vec<Vec<T>> 
+pub fn product<T>(iterables: &[Vec<T>]) -> Vec<Vec<T>>
 where
     T: Clone,
 {
     if iterables.is_empty() {
         return vec![vec![]];
     }
-    
+
     let mut result = vec![vec![]];
-    
+
     for iterable in iterables {
         let mut new_result = Vec::new();
         for existing in &result {
@@ -703,12 +703,12 @@ where
         }
         result = new_result;
     }
-    
+
     result
 }
 
 /// accumulate - running totals
-pub fn accumulate<T, F>(iterable: &[T], func: Option<F>) -> Vec<T> 
+pub fn accumulate<T, F>(iterable: &[T], func: Option<F>) -> Vec<T>
 where
     T: Clone + core::ops::Add<Output = T>,
     F: Fn(&T, &T) -> T,
@@ -716,9 +716,9 @@ where
     if iterable.is_empty() {
         return vec![];
     }
-    
+
     let mut result = vec![iterable[0].clone()];
-    
+
     for i in 1..iterable.len() {
         let next_val = if let Some(ref f) = func {
             f(&result[i - 1], &iterable[i])
@@ -727,7 +727,7 @@ where
         };
         result.push(next_val);
     }
-    
+
     result
 }
 
@@ -968,28 +968,35 @@ mod tests {
         let mut counter = count(0, 2);
         assert_eq!(counter.take(5), vec![0, 2, 4, 6, 8]);
     }
-    
+
     #[test]
     fn test_cycle() {
         let mut cycler = cycle(vec![1, 2, 3]);
         assert_eq!(cycler.take(7), vec![1, 2, 3, 1, 2, 3, 1]);
     }
-    
+
     #[test]
     fn test_repeat() {
         let mut repeater = repeat_times(5, 3);
         assert_eq!(repeater.take(5), vec![5, 5, 5]); // Only 3 items available
     }
-    
+
     #[test]
     fn test_combinations() {
         let result = combinations(&[1, 2, 3, 4], 2).unwrap();
-        assert_eq!(result, vec![
-            vec![1, 2], vec![1, 3], vec![1, 4],
-            vec![2, 3], vec![2, 4], vec![3, 4]
-        ]);
+        assert_eq!(
+            result,
+            vec![
+                vec![1, 2],
+                vec![1, 3],
+                vec![1, 4],
+                vec![2, 3],
+                vec![2, 4],
+                vec![3, 4]
+            ]
+        );
     }
-    
+
     #[test]
     fn test_permutations() {
         let result = permutations(&[1, 2], None).unwrap();
@@ -997,13 +1004,10 @@ mod tests {
         assert!(result.contains(&vec![1, 2]));
         assert!(result.contains(&vec![2, 1]));
     }
-    
+
     #[test]
     fn test_compress() {
-        let result = compress(
-            vec!['A', 'B', 'C', 'D'],
-            vec![true, false, true, false]
-        );
+        let result = compress(vec!['A', 'B', 'C', 'D'], vec![true, false, true, false]);
         assert_eq!(result, vec!['A', 'C']);
     }
 }

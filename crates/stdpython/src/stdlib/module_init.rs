@@ -234,9 +234,9 @@ impl Drop for ModuleInitGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
-    use std::sync::Arc;
 
     /// Block until a thread is waiting for `lock`'s body: the tests'
     /// ordering signal, a state the lock records rather than a delay.
@@ -273,7 +273,10 @@ mod tests {
             panic!("first entry runs");
         };
         assert!(matches!(LOCK.enter(true), ModuleInitEntry::Cycle));
-        guard.finish(Err(crate::PyException::new("RuntimeError", "first attempt fails")));
+        guard.finish(Err(crate::PyException::new(
+            "RuntimeError",
+            "first attempt fails",
+        )));
         // The failed body is NOT STARTED again: the next import runs it.
         let ModuleInitEntry::Run(guard) = LOCK.enter(true) else {
             panic!("a failed module runs again");
@@ -288,7 +291,10 @@ mod tests {
         let ModuleInitEntry::Run(guard) = LOCK.enter(false) else {
             panic!("first entry runs");
         };
-        guard.finish(Err(crate::PyException::new("RuntimeError", "first attempt fails")));
+        guard.finish(Err(crate::PyException::new(
+            "RuntimeError",
+            "first attempt fails",
+        )));
         for _ in 0..2 {
             let ModuleInitEntry::Failed(e) = LOCK.enter(false) else {
                 panic!("a failed module that cannot retry never runs again");
@@ -307,7 +313,10 @@ mod tests {
             std::thread::spawn(move || matches!(LOCK.enter(true), ModuleInitEntry::Run(_)));
         until_waited_on(&LOCK);
         drop(guard); // the body unwound
-        assert!(waiter.join().unwrap(), "the waiter runs the body after the unwind");
+        assert!(
+            waiter.join().unwrap(),
+            "the waiter runs the body after the unwind"
+        );
     }
 
     #[test]
@@ -337,7 +346,9 @@ mod tests {
         let (a_running, a_running_seen) = mpsc::channel();
         let (go_wait_for_b, go_wait_for_b_seen) = mpsc::channel();
         let t1 = std::thread::spawn(move || {
-            let ModuleInitEntry::Run(ga) = A.enter(true) else { panic!() };
+            let ModuleInitEntry::Run(ga) = A.enter(true) else {
+                panic!()
+            };
             a_running.send(()).unwrap();
             go_wait_for_b_seen.recv().unwrap();
             let b = B.enter(true);
@@ -348,7 +359,9 @@ mod tests {
         let (b_running, b_running_seen) = mpsc::channel();
         let (go_ask_for_a, go_ask_for_a_seen) = mpsc::channel();
         let t2 = std::thread::spawn(move || {
-            let ModuleInitEntry::Run(gb) = B.enter(true) else { panic!() };
+            let ModuleInitEntry::Run(gb) = B.enter(true) else {
+                panic!()
+            };
             b_running.send(()).unwrap();
             go_ask_for_a_seen.recv().unwrap();
             let a = A.enter(true);
@@ -359,7 +372,13 @@ mod tests {
         go_wait_for_b.send(()).unwrap();
         until_waited_on(&B);
         go_ask_for_a.send(()).unwrap();
-        assert!(t2.join().unwrap(), "the later importer proceeds with the partial module");
-        assert!(t1.join().unwrap(), "the first importer finds the other module done");
+        assert!(
+            t2.join().unwrap(),
+            "the later importer proceeds with the partial module"
+        );
+        assert!(
+            t1.join().unwrap(),
+            "the first importer finds the other module done"
+        );
     }
 }

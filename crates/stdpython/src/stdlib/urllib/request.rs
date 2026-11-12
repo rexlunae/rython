@@ -99,11 +99,7 @@ pub fn urlopen<S: AsRef<str>>(url: S) -> Result<HTTPResponse, PyException> {
                 ureq::http::Version::HTTP_11 => 11,
                 _ => 11,
             };
-            let reason = resp
-                .status()
-                .canonical_reason()
-                .unwrap_or("")
-                .to_string();
+            let reason = resp.status().canonical_reason().unwrap_or("").to_string();
             Ok(HTTPResponse {
                 status,
                 version,

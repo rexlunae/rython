@@ -1,5 +1,5 @@
 //! Python string module implementation
-//! 
+//!
 //! This module provides string-related constants and template classes.
 //! Implementation matches Python's string module API.
 
@@ -75,7 +75,7 @@ impl Template {
             delimiter: '$',
         }
     }
-    
+
     /// Create template with custom delimiter
     pub fn with_delimiter<S: AsRef<str>>(template: S, delimiter: char) -> Self {
         Self {
@@ -83,7 +83,7 @@ impl Template {
             delimiter,
         }
     }
-    
+
     /// Substitute variables from mapping. A single left-to-right scan
     /// (issue #82): `$$` is an escaped delimiter, `$name`/`${name}` resolve
     /// to the longest identifier, and substituted VALUES are never
@@ -96,14 +96,15 @@ impl Template {
     {
         self.substitute_impl(mapping, false)
     }
-    
+
     /// Safe substitute - leave unmatched and invalid placeholders as-is
     pub fn safe_substitute<K, V>(&self, mapping: &[(K, V)]) -> String
     where
         K: AsRef<str>,
         V: AsRef<str>,
     {
-        self.substitute_impl(mapping, true).expect("safe_substitute never errors")
+        self.substitute_impl(mapping, true)
+            .expect("safe_substitute never errors")
     }
 
     fn substitute_impl<K, V>(&self, mapping: &[(K, V)], safe: bool) -> Result<String, PyException>
@@ -146,8 +147,7 @@ impl Template {
             }
             if next == '{' {
                 let mut end = i + 2;
-                while end < chars.len()
-                    && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
+                while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
                 {
                     end += 1;
                 }
@@ -188,8 +188,7 @@ impl Template {
                 // characters so `$ab` never shadows `$ab` with a prefix
                 // key `a` (issue #82).
                 let mut end = i + 2;
-                while end < chars.len()
-                    && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
+                while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
                 {
                     end += 1;
                 }
@@ -219,12 +218,12 @@ impl Template {
         }
         Ok(result)
     }
-    
+
     /// Get template string
     pub fn template_string(&self) -> &str {
         &self.template
     }
-    
+
     /// Get delimiter
     pub fn delimiter(&self) -> char {
         self.delimiter
@@ -259,47 +258,47 @@ impl Formatter {
     pub fn format<S: AsRef<str>>(template: S, args: &[&dyn core::fmt::Display]) -> String {
         let template = template.as_ref();
         let mut result = template.to_string();
-        
+
         for (i, arg) in args.iter().enumerate() {
             let placeholder = format!("{{{}}}", i);
             result = result.replace(&placeholder, &format!("{}", arg));
         }
-        
+
         result
     }
-    
+
     /// Format string with named arguments
     pub fn format_map<S: AsRef<str>, K: AsRef<str>, V: core::fmt::Display>(
-        template: S, 
-        kwargs: &[(K, V)]
+        template: S,
+        kwargs: &[(K, V)],
     ) -> String {
         let template = template.as_ref();
         let mut result = template.to_string();
-        
+
         for (key, value) in kwargs {
             let placeholder = format!("{{{}}}", key.as_ref());
             result = result.replace(&placeholder, &format!("{}", value));
         }
-        
+
         result
     }
-    
+
     /// Validate format string
     pub fn vformat<S: AsRef<str>>(template: S) -> Result<Vec<String>, PyException> {
         let template = template.as_ref();
         let mut placeholders = Vec::new();
         let mut chars = template.chars().peekable();
-        
+
         while let Some(ch) = chars.next() {
             if ch == '{' {
                 if chars.peek() == Some(&'{') {
                     chars.next(); // Skip escaped brace
                     continue;
                 }
-                
+
                 let mut placeholder = String::new();
                 let mut found_end = false;
-                
+
                 while let Some(ch) = chars.next() {
                     if ch == '}' {
                         found_end = true;
@@ -307,11 +306,11 @@ impl Formatter {
                     }
                     placeholder.push(ch);
                 }
-                
+
                 if !found_end {
                     return Err(crate::value_error("Unmatched '{' in format string"));
                 }
-                
+
                 placeholders.push(placeholder);
             } else if ch == '}' {
                 if chars.peek() != Some(&'}') {
@@ -320,53 +319,55 @@ impl Formatter {
                 chars.next(); // Skip escaped brace
             }
         }
-        
+
         Ok(placeholders)
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_capwords() {
         assert_eq!(capwords("hello world", None), "Hello World");
-        assert_eq!(capwords("hello-world", Some("-".to_string())), "Hello-World");
+        assert_eq!(
+            capwords("hello-world", Some("-".to_string())),
+            "Hello-World"
+        );
         assert_eq!(capwords("HELLO WORLD", None), "Hello World");
     }
-    
+
     #[test]
     fn test_template() {
         let tmpl = Template::new("Hello $name! Welcome to $place.");
         let mapping = [("name", "Alice"), ("place", "Wonderland")];
-        
+
         assert_eq!(
             tmpl.substitute(&mapping).unwrap(),
             "Hello Alice! Welcome to Wonderland."
         );
-        
+
         let tmpl2 = Template::new("Hello ${name}! Welcome to ${place}.");
         assert_eq!(
             tmpl2.substitute(&mapping).unwrap(),
             "Hello Alice! Welcome to Wonderland."
         );
     }
-    
+
     #[test]
     fn test_template_missing_var() {
         let tmpl = Template::new("Hello $name! Welcome to $place.");
         let mapping = [("name", "Alice")]; // missing 'place'
-        
+
         assert!(tmpl.substitute(&mapping).is_err());
     }
-    
+
     #[test]
     fn test_safe_substitute() {
         let tmpl = Template::new("Hello $name! Welcome to $place.");
         let mapping = [("name", "Alice")]; // missing 'place'
-        
+
         assert_eq!(
             tmpl.safe_substitute(&mapping),
             "Hello Alice! Welcome to $place."

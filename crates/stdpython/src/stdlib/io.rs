@@ -59,7 +59,10 @@ pub struct PyBytesIO {
 pub type PyBinaryFile = PyBytesIO;
 
 enum BytesBackend {
-    Buffer { data: Vec<u8>, pos: usize },
+    Buffer {
+        data: Vec<u8>,
+        pos: usize,
+    },
     /// A readable byte stream: a buffered disk file, or the live
     /// standard input (`FileType("rb")("-")`).
     #[cfg(feature = "std")]
@@ -111,7 +114,10 @@ impl PyBytesIO {
 
     #[cfg(feature = "std")]
     pub(crate) fn new_disk_write(writer: impl std::io::Write + 'static, name: &str) -> Self {
-        Self::from_backend(BytesBackend::DiskWrite(alloc::boxed::Box::new(writer)), name)
+        Self::from_backend(
+            BytesBackend::DiskWrite(alloc::boxed::Box::new(writer)),
+            name,
+        )
     }
 
     /// The live standard input as a binary file (`sys.stdin.buffer`;
@@ -258,9 +264,7 @@ impl PyBytesIO {
             #[cfg(feature = "std")]
             BytesBackend::DiskWrite(writer) => {
                 use std::io::Write;
-                writer
-                    .flush()
-                    .map_err(|e| crate::stream_error(&e))
+                writer.flush().map_err(|e| crate::stream_error(&e))
             }
             #[cfg(feature = "std")]
             BytesBackend::Stdout => {

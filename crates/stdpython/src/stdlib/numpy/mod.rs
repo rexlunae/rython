@@ -1023,10 +1023,7 @@ mod divmod_tests {
         // Euclidean -1); np.mod -> array([1, 1, -1, -1]) — divisor sign.
         let a = array(vec![7i64, -7, 3, -3]);
         let b = array(vec![2i64, 2, -2, -2]);
-        assert_eq!(
-            i64s(&floor_divide(&a, &b).unwrap()),
-            vec![3, -4, -2, 1]
-        );
+        assert_eq!(i64s(&floor_divide(&a, &b).unwrap()), vec![3, -4, -2, 1]);
         assert_eq!(i64s(&mod_(&a, &b).unwrap()), vec![1, 1, -1, -1]);
         // i64::MIN // -1 wraps to i64::MIN (numpy, with an overflow warning)
         assert_eq!(
@@ -1175,49 +1172,25 @@ mod weak_promotion_tests {
         let i64a = array(vec![1i64, 2]);
         let b = array(vec![true, false]);
         // Python float + f32 array stays f32
-        assert!(matches!(
-            add(&f32a, 0.0f64).unwrap().dtype,
-            Dtype::Float32
-        ));
-        assert!(matches!(
-            add(0.0f64, &f32a).unwrap().dtype,
-            Dtype::Float32
-        ));
+        assert!(matches!(add(&f32a, 0.0f64).unwrap().dtype, Dtype::Float32));
+        assert!(matches!(add(0.0f64, &f32a).unwrap().dtype, Dtype::Float32));
         assert!(matches!(
             divide(&f32a, 0.0f64).unwrap().dtype,
             Dtype::Float32
         ));
         // Python int + i32 array stays i32; + f32 stays f32
-        assert!(matches!(
-            add(&i32a, 1i64).unwrap().dtype,
-            Dtype::Int32
-        ));
-        assert!(matches!(
-            add(&f32a, 1i64).unwrap().dtype,
-            Dtype::Float32
-        ));
+        assert!(matches!(add(&i32a, 1i64).unwrap().dtype, Dtype::Int32));
+        assert!(matches!(add(&f32a, 1i64).unwrap().dtype, Dtype::Float32));
         // Python float + int array -> f64
-        assert!(matches!(
-            add(&i32a, 0.0f64).unwrap().dtype,
-            Dtype::Float64
-        ));
-        assert!(matches!(
-            add(&i64a, 0.0f64).unwrap().dtype,
-            Dtype::Float64
-        ));
+        assert!(matches!(add(&i32a, 0.0f64).unwrap().dtype, Dtype::Float64));
+        assert!(matches!(add(&i64a, 0.0f64).unwrap().dtype, Dtype::Float64));
         // bool arrays: + Python int -> int64, + Python bool stays bool
         assert!(matches!(add(&b, 1i64).unwrap().dtype, Dtype::Int64));
         assert!(matches!(add(&b, true).unwrap().dtype, Dtype::Bool));
-        assert!(matches!(
-            add(&f32a, true).unwrap().dtype,
-            Dtype::Float32
-        ));
+        assert!(matches!(add(&f32a, true).unwrap().dtype, Dtype::Float32));
         // int64 + Python int stays int64; comparison outputs are bool anyway
         assert!(matches!(add(&i64a, 1i64).unwrap().dtype, Dtype::Int64));
-        assert!(matches!(
-            equal(&f32a, 1i64).unwrap().dtype,
-            Dtype::Bool
-        ));
+        assert!(matches!(equal(&f32a, 1i64).unwrap().dtype, Dtype::Bool));
         // a large-but-fitting Python int scalar stays int32
         let r = add(&i32a, 1i64 << 30).unwrap();
         assert!(matches!(r.dtype, Dtype::Int32));
