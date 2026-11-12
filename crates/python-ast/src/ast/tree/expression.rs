@@ -991,7 +991,8 @@ mod tests {
         let out = tokens.to_string();
         assert!(out.contains("pub (crate) fn __module_init__ () -> Result < () , PyException >"), "{}", out);
         assert!(out.contains("test () ;"), "{}", out);
-        assert!(out.contains("fn main () { let __rython_result = (|| -> Result < () , PyException > { __module_init__ () ? ; Ok (()) }) () ;"), "{}", out);
+        assert!(out.contains("fn __rython_main__ () -> Result < () , PyException > { __module_init__ () ? ; Ok (()) }"), "{}", out);
+        assert!(out.contains("fn main () { if let Err (e) = __rython_main__ () { stdpython :: exit_uncaught (& e) ; } }"), "{}", out);
     }
 }
 

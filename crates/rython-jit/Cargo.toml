@@ -1,0 +1,22 @@
+[package]
+name = "rython-jit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "On-demand compilation of Python through the rython converter: convert, build with cargo, cache by content, load in-process, call."
+documentation = "https://docs.rs/rython-jit"
+homepage.workspace = true
+readme = "README.md"
+keywords = ["python", "jit", "transpiler", "compiler"]
+categories = ["development-tools", "compilers"]
+
+[dependencies]
+libloading = "0.8"
+sha2 = "0.10"
+libc = "0.2"
+# The host's own copy of the runtime, for the PyException a raised Python
+# exception is rebuilt as and the repr of returned values. The std tier
+# only: none of the platform surfaces.
+stdpython = { path = "../stdpython", version = "1.2.0", default-features = false, features = ["std"] }

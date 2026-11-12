@@ -31,6 +31,18 @@ rypip build path/to/package
 # your sources). Unix only for now: sys.argv[0] is set through the exec,
 # and a platform that cannot do that is refused loudly.
 rypip run program.py -- args
+
+# The JIT (docs/jit.md): convert a single file, build it into a shared
+# library cached by content under $XDG_CACHE_HOME/rython/jit (default
+# ~/.cache/rython/jit), load it into rypip's process and run it — an
+# unchanged file is a cache hit (a dlopen, no build). Unix only.
+rypip jit run program.py args
+# Call one function, like python3 -c 'import module; print(repr(module.add(2, 40)))';
+# arguments are Python literals of the types that cross the JIT boundary
+# (int, float, bool, str, None).
+rypip jit call module.py add 2 40
+# Remove the JIT's cache.
+rypip jit --clear-cache
 ```
 
 ## Package discovery

@@ -122,6 +122,19 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<std::ffi::OsString>,
     },
+    /// Compile Python on demand and run it in this process (the JIT,
+    /// docs/jit.md): the file is converted, built into a shared library,
+    /// cached by content under $XDG_CACHE_HOME/rython/jit (default
+    /// ~/.cache/rython/jit), and loaded. Unix only for now; needs the Rust
+    /// toolchain (and the CPython the parser uses).
+    Jit {
+        /// Remove the JIT's cache — every compiled module and the shared
+        /// build directory — before anything else.
+        #[arg(long)]
+        clear_cache: bool,
+        #[command(subcommand)]
+        action: Option<JitCmd>,
+    },
     /// Build a Python package as a native binary and install it where cargo
     /// installs binaries (~/.cargo/bin unless --root is given).
     Install {
@@ -142,8 +155,47 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum JitCmd {
+    /// Run a program in-process, like `python FILE ARG...`: the arguments
+    /// after FILE are its own (sys.argv[0] is FILE as given), its output is
+    /// yours, and its exit status is rypip's.
+    Run {
+        /// The program: a single .py file.
+        file: PathBuf,
+        #[arg(long)]
+        stdpython: Option<PathBuf>,
+        /// How to treat lossy-conversion warnings: warn, deny, or allow.
+        #[arg(long, short = 'W', value_enum, default_value_t = WarningMode::Warn)]
+        warnings: WarningMode,
+        /// The program's own arguments (sys.argv[1:]).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
+    /// Call one function of a module and print the repr of its result,
+    /// like `python -c 'import M; print(repr(M.FUNCTION(ARG, ...)))'`.
+    /// ARGs are Python literals of the types that cross the JIT boundary:
+    /// int, float, bool, str and None.
+    Call {
+        /// The module: a single .py file with an importable name.
+        file: PathBuf,
+        /// A public module-level function of the module.
+        function: String,
+        #[arg(long)]
+        stdpython: Option<PathBuf>,
+        /// How to treat lossy-conversion warnings: warn, deny, or allow.
+        #[arg(long, short = 'W', value_enum, default_value_t = WarningMode::Warn)]
+        warnings: WarningMode,
+        /// The arguments, as Python literals (`3`, `-2.5`, `'text'`, `True`,
+        /// `None`).
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Cmd::Jit { clear_cache, action } => jit(clear_cache, action)?,
         Cmd::Convert {
             package,
             out,
@@ -169,6 +221,7 @@ fn main() -> Result<()> {
                     driver,
                     rust_for_linux,
                     no_deps,
+                    cdylib: None,
                 },
             )?;
             report_warnings(&krate);
@@ -204,6 +257,7 @@ fn main() -> Result<()> {
                     driver: false,
                     rust_for_linux: false,
                     no_deps,
+                    cdylib: None,
                 },
             )?;
             report_warnings(&krate);
@@ -235,6 +289,7 @@ fn main() -> Result<()> {
                     driver: false,
                     rust_for_linux: false,
                     no_deps,
+                    cdylib: None,
                 },
                 package.as_os_str(),
                 &args,
@@ -276,6 +331,7 @@ fn main() -> Result<()> {
                     driver: false,
                     rust_for_linux: false,
                     no_deps,
+                    cdylib: None,
                 },
             )?;
             report_warnings(&krate);
@@ -284,6 +340,107 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `rypip jit`: a thin layer over rython-jit (rypip::jit holds the
+/// rest). Each outcome maps to what the program's own process would show:
+/// its exit status, an uncaught exception's traceback header and final
+/// line, a `SystemExit`'s message — and a panic's 101, the exit status of
+/// a panicking Rust binary (the library has already printed the panic).
+fn jit(clear_cache: bool, action: Option<JitCmd>) -> Result<()> {
+    use rython_jit::JitError;
+    use std::io::Write;
+    if clear_cache {
+        let dir = rython_jit::default_cache_dir()?;
+        rython_jit::Jit::clear_cache(&dir)?;
+        eprintln!("removed the JIT cache {}", dir.display());
+    }
+    let Some(action) = action else {
+        if clear_cache {
+            return Ok(());
+        }
+        anyhow::bail!("rypip jit needs a subcommand (run, call) or --clear-cache");
+    };
+    let options = |stdpython, warnings| ConvertOptions {
+        stdpython_path: stdpython,
+        warnings,
+        ..ConvertOptions::default()
+    };
+    let compile = |file: &std::path::Path, importing: bool, options: ConvertOptions| -> Result<rython_jit::Module> {
+        let name = rypip::jit::module_name_for(file, importing)?;
+        let jit = rypip::jit::new_jit(options, None)?;
+        let module = jit.compile_file(&name, file)?;
+        for warning in module.warnings() {
+            eprintln!("warning: {}", warning);
+        }
+        Ok(module)
+    };
+    let finish = |code: i32| -> ! {
+        let _ = std::io::stdout().flush();
+        std::process::exit(code)
+    };
+    match action {
+        JitCmd::Run {
+            file,
+            stdpython,
+            warnings,
+            args,
+        } => {
+            let argv = rypip::jit::program_argv(file.as_os_str(), &args)?;
+            let module = compile(&file, false, options(stdpython, warnings))?;
+            match module.run_entry(&argv) {
+                Ok(status) => finish(status),
+                Err(JitError::Panic(_)) => finish(101),
+                Err(e) => Err(e.into()),
+            }
+        }
+        JitCmd::Call {
+            file,
+            function,
+            stdpython,
+            warnings,
+            args,
+        } => {
+            let values = args
+                .iter()
+                .enumerate()
+                .map(|(i, a)| rypip::jit::literal_argument(i, a))
+                .collect::<Result<Vec<_>>>()?;
+            let module = compile(&file, true, options(stdpython, warnings))?;
+            // `python3 -c 'import M; print(repr(M.F(...)))'` has sys.argv
+            // == ['-c'], not rypip's own arguments.
+            module.set_argv(&["-c".to_string()])?;
+            match module.call(&function, &values) {
+                Ok(value) => {
+                    println!("{}", value.repr());
+                    finish(0)
+                }
+                Err(JitError::Python(e)) => {
+                    let _ = std::io::stdout().flush();
+                    // CPython names a class of an imported module
+                    // module-qualified in the traceback's last line.
+                    let line = e.format_exception_only();
+                    let line = if module.defines_class(&e.exception_type) {
+                        format!("{}.{}", module.name(), line)
+                    } else {
+                        line
+                    };
+                    eprintln!("Traceback (most recent call last):");
+                    eprintln!("{}", line);
+                    finish(1)
+                }
+                Err(JitError::Exit { code, message }) => {
+                    let _ = std::io::stdout().flush();
+                    if let Some(message) = message {
+                        eprintln!("{}", message);
+                    }
+                    finish(code)
+                }
+                Err(JitError::Panic(_)) => finish(101),
+                Err(e) => Err(e.into()),
+            }
+        }
+    }
 }
 
 /// Surface lossy-conversion warnings on stderr as they happen.
